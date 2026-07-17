@@ -11,8 +11,8 @@ use aruna_core::metadata::{
     MetadataMaterializationStatusRecord,
 };
 use aruna_core::storage_entries::{
-    metadata_iri_reference_prefix, metadata_iri_reference_write_entry,
-    metadata_materialization_status_key,
+    metadata_iri_reference_key_ids, metadata_iri_reference_prefix,
+    metadata_iri_reference_write_entry, metadata_materialization_status_key,
 };
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_storage::StorageHandle;
@@ -165,6 +165,7 @@ pub(crate) async fn rebuild_metadata_iri_reference_index(
         .ok_or(MetadataError::HandleMissing)?;
     let registry_records = metadata_handle.list_cached_registry_records().await?;
     let mut written = 0usize;
+    let mut reprojected: HashMap<Ulid, Ulid> = HashMap::new();
 
     for record in registry_records.iter() {
         let Some(status) =
@@ -185,10 +186,93 @@ pub(crate) async fn rebuild_metadata_iri_reference_index(
         let projected =
             project_metadata_iri_references(record.document_id, record.last_event_id, references);
         write_metadata_iri_references(&context.storage_handle, &projected).await?;
+        reprojected.insert(record.document_id, record.last_event_id);
         written = written.saturating_add(projected.len());
     }
 
+    // Drop rows left under prior cursors for the documents just rebuilt so the
+    // index and the predicate-less backlink scan stay bounded.
+    let stale = superseded_iri_reference_keys(&context.storage_handle, None, &reprojected).await?;
+    delete_iri_reference_keys(&context.storage_handle, stale).await?;
+
     Ok(written)
+}
+
+/// Keys of index rows whose document is re-projected under a newer cursor.
+/// Superseded rows are already fenced from results but bloat storage and the
+/// predicate-less scan, so callers delete them alongside the current projection.
+pub(crate) async fn superseded_iri_reference_keys(
+    storage: &StorageHandle,
+    txn_id: Option<Ulid>,
+    current_cursors: &HashMap<Ulid, Ulid>,
+) -> Result<Vec<(String, ByteView)>, MetadataError> {
+    let mut start_after = None;
+    let mut stale = Vec::new();
+    loop {
+        let event = storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
+                prefix: None,
+                start: start_after.take().map(IterStart::After),
+                limit: IRI_INDEX_PAGE_SIZE,
+                txn_id,
+            })
+            .await;
+        let (values, next_start_after) = match event {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            Event::Storage(StorageEvent::Error { error }) => {
+                return Err(MetadataError::Backend(error.to_string()));
+            }
+            other => {
+                return Err(MetadataError::Backend(format!(
+                    "unexpected metadata IRI reference index event: {other:?}"
+                )));
+            }
+        };
+        for (key, _) in values {
+            if let Some((document_id, cursor)) = metadata_iri_reference_key_ids(key.as_ref())
+                && current_cursors
+                    .get(&document_id)
+                    .is_some_and(|current| *current != cursor)
+            {
+                stale.push((METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(), key));
+            }
+        }
+        match next_start_after {
+            Some(next) => start_after = Some(next),
+            None => break,
+        }
+    }
+    Ok(stale)
+}
+
+async fn delete_iri_reference_keys(
+    storage: &StorageHandle,
+    keys: Vec<(String, ByteView)>,
+) -> Result<(), MetadataError> {
+    for chunk in keys.chunks(IRI_INDEX_WRITE_BATCH_SIZE) {
+        match storage
+            .send_storage_effect(StorageEffect::BatchDelete {
+                deletes: chunk.to_vec(),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
+            Event::Storage(StorageEvent::Error { error }) => {
+                return Err(MetadataError::Backend(error.to_string()));
+            }
+            other => {
+                return Err(MetadataError::Backend(format!(
+                    "unexpected metadata IRI reference index delete event: {other:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn collect_matching_iri_references(

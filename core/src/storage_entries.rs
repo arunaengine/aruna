@@ -115,6 +115,22 @@ pub fn metadata_iri_reference_key(
     ByteView::from(bytes)
 }
 
+/// Document id and cursor packed into an IRI reference index key, or `None` when
+/// the key is not the expected 96-byte layout.
+pub fn metadata_iri_reference_key_ids(key: &[u8]) -> Option<(Ulid, Ulid)> {
+    if key.len() != 96 {
+        return None;
+    }
+    let mut document_id = [0u8; 16];
+    document_id.copy_from_slice(&key[64..80]);
+    let mut document_cursor = [0u8; 16];
+    document_cursor.copy_from_slice(&key[80..96]);
+    Some((
+        Ulid::from_bytes(document_id),
+        Ulid::from_bytes(document_cursor),
+    ))
+}
+
 pub fn metadata_create_acceptance_key(document_id: Ulid) -> Key {
     metadata_document_key(document_id)
 }

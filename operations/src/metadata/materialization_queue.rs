@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
@@ -452,11 +452,13 @@ async fn finish_completed_materialization_jobs_in_txn(
 ) -> Result<(), MetadataMaterializationQueueError> {
     let mut writes = Vec::new();
     let mut deletes = Vec::with_capacity(completed.len().saturating_mul(2));
+    let mut superseding: HashMap<Ulid, Ulid> = HashMap::new();
     for job in completed {
         if let Some(status) = job.status {
             let current =
                 read_materialization_status(storage, status.document_id, Some(txn_id)).await?;
             if should_write_final_materialization_status(current.as_ref(), &status) {
+                superseding.insert(status.document_id, status.event_id);
                 writes.extend(job.iri_index_writes);
                 writes.push(metadata_materialization_status_write_entry(&status)?);
             }
@@ -471,6 +473,14 @@ async fn finish_completed_materialization_jobs_in_txn(
                 ByteView::from(document_job_key),
             ));
         }
+    }
+
+    // Delete prior-cursor index rows for the re-projected documents so fenced
+    // rows do not accumulate in storage or the predicate-less backlink scan.
+    if !superseding.is_empty() {
+        let stale =
+            super::iri_index::superseded_iri_reference_keys(storage, None, &superseding).await?;
+        deletes.extend(stale);
     }
 
     transactional_batch_write(storage, txn_id, writes).await?;
@@ -3211,6 +3221,78 @@ mod tests {
             Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {}
             other => panic!("unexpected storage event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn supersedes_prior_rows() {
+        // A second revision must leave only its own cursor's IRI index rows.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let document_id = Ulid::from_bytes([5u8; 16]);
+
+        let build = |event_id: Ulid| {
+            let event = create_event(document_id, event_id, "rev");
+            let job = MetadataMaterializationJobRecord {
+                document_id,
+                event_id,
+                due_at_ms: 1,
+                attempts: 0,
+            };
+            CompletedMaterializationJob {
+                job_key: metadata_materialization_job_write_entry(&job)
+                    .unwrap()
+                    .1
+                    .to_vec(),
+                document_job_key: Some(
+                    metadata_materialization_document_job_key(document_id, event_id).to_vec(),
+                ),
+                status: Some(materialization_success_status(&job, &event)),
+                iri_index_writes: vec![(
+                    METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
+                    aruna_core::storage_entries::metadata_iri_reference_key(
+                        "p",
+                        "o",
+                        document_id,
+                        event_id,
+                    ),
+                    ByteView::from(vec![1u8]),
+                )],
+                sync: None,
+            }
+        };
+
+        let first = Ulid::from_parts(1, 1);
+        let second = Ulid::from_parts(2, 1);
+        finish_completed_materialization_jobs(&storage, vec![build(first)])
+            .await
+            .unwrap();
+        finish_completed_materialization_jobs(&storage, vec![build(second)])
+            .await
+            .unwrap();
+
+        let key_of = |cursor: Ulid| {
+            aruna_core::storage_entries::metadata_iri_reference_key("p", "o", document_id, cursor)
+                .as_ref()
+                .to_vec()
+        };
+        assert!(
+            !storage_key_exists(
+                &storage,
+                METADATA_IRI_REFERENCE_INDEX_KEYSPACE,
+                key_of(first)
+            )
+            .await,
+            "prior cursor rows must be removed"
+        );
+        assert!(
+            storage_key_exists(
+                &storage,
+                METADATA_IRI_REFERENCE_INDEX_KEYSPACE,
+                key_of(second)
+            )
+            .await,
+            "current cursor rows must remain"
+        );
     }
 
     #[tokio::test]
