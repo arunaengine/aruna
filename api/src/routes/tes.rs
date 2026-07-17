@@ -849,6 +849,7 @@ fn map_task_to_spec(
         executor_constraint: task.tags.get(EXECUTOR_TAG_KEY).cloned(),
         inputs,
         file_outputs,
+        workspace_outputs: Vec::new(),
         output_prefixes: Vec::new(),
     };
 
@@ -1895,6 +1896,7 @@ mod tests {
             executor_constraint: None,
             inputs: Vec::new(),
             file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
             output_prefixes: Vec::new(),
         };
         let mut record = execution_record(JobId::from_bytes([1u8; 16]), user(2), spec());
@@ -2032,6 +2034,7 @@ mod tests {
             executor_constraint: None,
             inputs: Vec::new(),
             file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
             output_prefixes: Vec::new(),
         };
         let record = execution_record(JobId::from_bytes([3u8; 16]), user(2), spec.clone());

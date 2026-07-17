@@ -41,9 +41,10 @@ impl ComputeReconciler {
 impl ExternalReconciler for ComputeReconciler {
     async fn reconcile_lost_attempt(&self, storage: &StorageHandle, record: JobRecord) {
         let job_id = record.job_id;
-        let JobPayload::Execution(spec) = record.payload.clone() else {
+        let JobPayload::Execution(mut spec) = record.payload.clone() else {
             return;
         };
+        spec.resolve_outputs(&JobRecord::workspace_bucket_name(job_id));
 
         // Take over with a fresh claim token, but only if the old holder is really gone.
         let (adopted, control) = match adopt_external_attempt(

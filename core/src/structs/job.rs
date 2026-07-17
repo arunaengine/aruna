@@ -163,6 +163,15 @@ pub struct OutputSelection {
     pub description: Option<String>,
 }
 
+/// A native output intent bound to the workspace bucket, which is derived from
+/// the `JobId` and therefore unknown at submit time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceOutput {
+    pub container_path: String,
+    /// Destination key inside the workspace bucket.
+    pub dest_key: String,
+}
+
 /// Resource ceilings requested for the container. `None` fills from backend defaults.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComputeResources {
@@ -192,8 +201,29 @@ pub struct ExecutionSpec {
     pub executor_constraint: Option<String>,
     pub inputs: Vec<InputSelection>,
     pub file_outputs: Vec<OutputSelection>,
+    /// Native output intents, materialized into `file_outputs` by
+    /// `resolve_outputs` once the workspace bucket name exists.
+    pub workspace_outputs: Vec<WorkspaceOutput>,
     /// Declared output prefixes in the workspace, inventoried at completion.
     pub output_prefixes: Vec<String>,
+}
+
+impl ExecutionSpec {
+    /// Materialize workspace output intents against the resolved bucket.
+    /// Deterministic across retries: the bucket name derives from the `JobId`.
+    pub fn resolve_outputs(&mut self, bucket: &str) {
+        for output in std::mem::take(&mut self.workspace_outputs) {
+            self.file_outputs.push(OutputSelection {
+                container_path: output.container_path,
+                destination: OutputDestination::S3 {
+                    bucket: bucket.to_string(),
+                    key: output.dest_key,
+                },
+                name: None,
+                description: None,
+            });
+        }
+    }
 }
 
 /// Closed job payload enum, keeping the typed-queue discipline of `TaskKey` and
@@ -992,6 +1022,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn resolves_workspace_outputs() {
+        // Intents materialize against the derived bucket and drain once.
+        let mut spec = ExecutionSpec {
+            group_id: Ulid::from_bytes([2u8; 16]),
+            name: None,
+            description: None,
+            tags: Default::default(),
+            image: "alpine".to_string(),
+            entrypoint: None,
+            command: Vec::new(),
+            workdir: None,
+            env: Default::default(),
+            resources: Default::default(),
+            executor_constraint: None,
+            inputs: Vec::new(),
+            file_outputs: Vec::new(),
+            workspace_outputs: vec![WorkspaceOutput {
+                container_path: "/out/report.txt".to_string(),
+                dest_key: "outputs/report.txt".to_string(),
+            }],
+            output_prefixes: vec!["outputs/".to_string()],
+        };
+
+        spec.resolve_outputs("ws-job");
+
+        assert!(spec.workspace_outputs.is_empty());
+        assert_eq!(
+            spec.file_outputs,
+            vec![OutputSelection {
+                container_path: "/out/report.txt".to_string(),
+                destination: OutputDestination::S3 {
+                    bucket: "ws-job".to_string(),
+                    key: "outputs/report.txt".to_string(),
+                },
+                name: None,
+                description: None,
+            }]
+        );
+
+        spec.resolve_outputs("ws-job");
+        assert_eq!(spec.file_outputs.len(), 1);
     }
 
     #[test]

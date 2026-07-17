@@ -792,6 +792,7 @@ mod tests {
             executor_constraint: None,
             inputs: Vec::new(),
             file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
             output_prefixes,
         }
     }

@@ -305,6 +305,7 @@ mod tests {
                 executor_constraint: None,
                 inputs: Vec::new(),
                 file_outputs: Vec::new(),
+                workspace_outputs: Vec::new(),
                 output_prefixes: Vec::new(),
             }),
             UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32])),

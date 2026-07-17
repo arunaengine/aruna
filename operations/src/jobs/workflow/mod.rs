@@ -56,9 +56,10 @@ pub async fn run_execution_job(
         warn!(job_id = %job_id, "Execution job has no claim token; skipping");
         return;
     };
-    let JobPayload::Execution(spec) = record.payload.clone() else {
+    let JobPayload::Execution(mut spec) = record.payload.clone() else {
         return;
     };
+    spec.resolve_outputs(&JobRecord::workspace_bucket_name(job_id));
 
     // A fresh cancel before any attempt was submitted: no container exists, so
     // terminalize directly (Claimed -> Cancelled).
@@ -1504,6 +1505,7 @@ mod tests {
             executor_constraint: None,
             inputs: Vec::new(),
             file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
             output_prefixes: Vec::new(),
         }
     }

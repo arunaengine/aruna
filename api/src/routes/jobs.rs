@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use aruna_core::compute::normalize_container_path;
 use aruna_core::structs::{
     AuthContext, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId,
-    JobRecord, JobState, Permission, blob_group_permission_path,
+    JobRecord, JobState, Permission, WorkspaceOutput, blob_group_permission_path,
 };
 use aruna_operations::jobs::service::{
     CancelJobOutcome, cancel_owned_job, list_owned_jobs, read_job_run_crate_status, read_owned_job,
@@ -51,6 +52,17 @@ pub struct ExecutionInputRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_id: Option<String>,
     pub dest_key: String,
+    /// Absolute container path; defaults to `/inputs/<dest_key>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ExecutionOutputRequest {
+    /// Absolute container path captured after the task exits.
+    pub container_path: String,
+    /// Destination key inside the workspace bucket.
+    pub dest_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -73,6 +85,8 @@ pub struct SubmitExecutionRequest {
     pub executor_constraint: Option<String>,
     #[serde(default)]
     pub inputs: Vec<ExecutionInputRequest>,
+    #[serde(default)]
+    pub outputs: Vec<ExecutionOutputRequest>,
     #[serde(default)]
     pub output_prefixes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -215,6 +229,49 @@ fn map_submit_error(error: aruna_operations::jobs::submit::SubmitJobError) -> Se
     }
 }
 
+/// Canonical absolute container path or 400.
+fn container_path(path: &str) -> ServerResult<String> {
+    let normalized = normalize_container_path(path).map_err(|_| ServerError::BadRequest)?;
+    normalized
+        .to_str()
+        .map(str::to_string)
+        .ok_or(ServerError::BadRequest)
+}
+
+/// Native inputs land in the container at the given path, defaulting to
+/// `/inputs/<dest_key>` so `load_inputs` always stages them.
+fn native_input(input: ExecutionInputRequest) -> ServerResult<InputSelection> {
+    if input.dest_key.is_empty() {
+        return Err(ServerError::BadRequest);
+    }
+    let path = match &input.container_path {
+        Some(path) => container_path(path)?,
+        None => container_path(&format!("/inputs/{}", input.dest_key))?,
+    };
+    Ok(InputSelection {
+        source: InputSource::S3 {
+            bucket: input.bucket,
+            key: input.key,
+            version_id: input.version_id,
+        },
+        dest_key: input.dest_key,
+        mode: InputMode::Snapshot,
+        container_path: Some(path),
+        name: None,
+        description: None,
+    })
+}
+
+fn native_output(output: ExecutionOutputRequest) -> ServerResult<WorkspaceOutput> {
+    if output.dest_key.is_empty() {
+        return Err(ServerError::BadRequest);
+    }
+    Ok(WorkspaceOutput {
+        container_path: container_path(&output.container_path)?,
+        dest_key: output.dest_key,
+    })
+}
+
 fn validate_output_prefixes(prefixes: Vec<String>) -> ServerResult<Vec<String>> {
     if prefixes.len() > MAX_OUTPUT_PREFIXES || prefixes.iter().any(String::is_empty) {
         return Err(ServerError::BadRequest);
@@ -318,30 +375,29 @@ pub async fn submit_job(
     )
     .await?;
 
-    if request.inputs.len() > MAX_INPUTS {
+    if request.inputs.len() > MAX_INPUTS || request.outputs.len() > MAX_INPUTS {
         return Err(ServerError::BadRequest);
     }
     let mut inputs: Vec<InputSelection> = Vec::with_capacity(request.inputs.len());
     for input in request.inputs {
-        let input = InputSelection {
-            source: InputSource::S3 {
-                bucket: input.bucket,
-                key: input.key,
-                version_id: input.version_id,
-            },
-            dest_key: input.dest_key,
-            mode: InputMode::Snapshot,
-            container_path: None,
-            name: None,
-            description: None,
-        };
-        if inputs
-            .iter()
-            .any(|existing| existing.dest_key == input.dest_key)
-        {
+        let input = native_input(input)?;
+        if inputs.iter().any(|existing| {
+            existing.dest_key == input.dest_key || existing.container_path == input.container_path
+        }) {
             return Err(ServerError::BadRequest);
         }
         inputs.push(input);
+    }
+    let mut workspace_outputs: Vec<WorkspaceOutput> = Vec::with_capacity(request.outputs.len());
+    for output in request.outputs {
+        let output = native_output(output)?;
+        if workspace_outputs.iter().any(|existing| {
+            existing.dest_key == output.dest_key
+                || existing.container_path == output.container_path
+        }) {
+            return Err(ServerError::BadRequest);
+        }
+        workspace_outputs.push(output);
     }
 
     let spec = ExecutionSpec {
@@ -364,6 +420,7 @@ pub async fn submit_job(
         executor_constraint: request.executor_constraint,
         inputs,
         file_outputs: Vec::new(),
+        workspace_outputs,
         output_prefixes,
     };
     let result = submit_execution_job(
@@ -734,6 +791,7 @@ mod tests {
                 max_walltime_ms: None,
                 executor_constraint: None,
                 inputs: Vec::new(),
+                outputs: Vec::new(),
                 output_prefixes: Vec::new(),
                 idempotency_key: None,
             };
@@ -748,6 +806,64 @@ mod tests {
                 "ram_bytes {ram_bytes} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn maps_native_input() {
+        // Missing container_path defaults to /inputs/<dest_key>.
+        let input = ExecutionInputRequest {
+            bucket: "src".to_string(),
+            key: "data.csv".to_string(),
+            version_id: None,
+            dest_key: "in/data.csv".to_string(),
+            container_path: None,
+        };
+        let mapped = native_input(input.clone()).unwrap();
+        assert_eq!(
+            mapped.container_path.as_deref(),
+            Some("/inputs/in/data.csv")
+        );
+
+        let explicit = ExecutionInputRequest {
+            container_path: Some("/data/input.csv".to_string()),
+            ..input.clone()
+        };
+        assert_eq!(
+            native_input(explicit).unwrap().container_path.as_deref(),
+            Some("/data/input.csv")
+        );
+
+        let traversal = ExecutionInputRequest {
+            container_path: Some("/in/../etc".to_string()),
+            ..input
+        };
+        assert!(native_input(traversal).is_err());
+    }
+
+    #[test]
+    fn maps_native_output() {
+        let mapped = native_output(ExecutionOutputRequest {
+            container_path: "/out/report.txt".to_string(),
+            dest_key: "outputs/report.txt".to_string(),
+        })
+        .unwrap();
+        assert_eq!(mapped.container_path, "/out/report.txt");
+        assert_eq!(mapped.dest_key, "outputs/report.txt");
+
+        assert!(
+            native_output(ExecutionOutputRequest {
+                container_path: "relative/path".to_string(),
+                dest_key: "k".to_string(),
+            })
+            .is_err()
+        );
+        assert!(
+            native_output(ExecutionOutputRequest {
+                container_path: "/out".to_string(),
+                dest_key: String::new(),
+            })
+            .is_err()
+        );
     }
 
     #[test]
