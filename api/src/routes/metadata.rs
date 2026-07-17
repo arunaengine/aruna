@@ -257,6 +257,8 @@ pub struct MetadataSearchParams {
     #[serde(default)]
     pub conforms_to: Option<String>,
     #[serde(default)]
+    pub group_id: Option<String>,
+    #[serde(default)]
     pub limit: Option<usize>,
     /// Opaque continuation token from a previous response's `next_cursor`. Bound
     /// to the original query; a changed query is rejected with `400`.
@@ -1192,6 +1194,7 @@ pub async fn query_all_metadata(
     params(
         ("q" = Option<String>, Query, description = "Search query; optional when conforms_to is set"),
         ("conforms_to" = Option<String>, Query, description = "Exact schema.org conformsTo profile IRI"),
+        ("group_id" = Option<String>, Query, description = "Restrict hits to a single group id"),
         ("limit" = Option<usize>, Query, description = "Page size (default 25, silently clamped to a maximum of 100). Hits are ordered by descending score"),
         ("cursor" = Option<String>, Query, description = "Opaque continuation token from a previous response's next_cursor. Bound to the original query; replaying it with a changed query returns 400. Paging is best-effort: results may shift under concurrent metadata churn or node failures"),
         ("mode" = Option<MetadataQueryMode>, Query, description = "Search mode: local or distributed. Distributed mode is best-effort and may return partial results if realm node discovery or remote requests fail")
@@ -1208,6 +1211,7 @@ pub async fn search_metadata(
     Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Query(params): Query<MetadataSearchParams>,
 ) -> ServerResult<(StatusCode, Json<MetadataSearchResponse>)> {
+    let group_id = params.group_id.as_deref().map(parse_group_id).transpose()?;
     let ctx = state.get_ctx();
     let result = run_search_metadata(
         ctx.as_ref(),
@@ -1219,6 +1223,7 @@ pub async fn search_metadata(
             graph_iris: None,
             query: params.q,
             conforms_to: params.conforms_to,
+            group_id,
             limit: params.limit,
             cursor: params.cursor,
             mode: map_query_mode(params.mode),
@@ -1913,6 +1918,7 @@ mod tests {
             Query(MetadataSearchParams {
                 q: "Public".to_string(),
                 conforms_to: None,
+                group_id: None,
                 limit: Some(10),
                 cursor: None,
                 mode: None,
@@ -1944,6 +1950,7 @@ mod tests {
             Query(MetadataSearchParams {
                 q: String::new(),
                 conforms_to: Some("https://w3id.org/ro/crate/1.2".to_string()),
+                group_id: None,
                 limit: Some(10),
                 cursor: None,
                 mode: None,
@@ -1961,6 +1968,7 @@ mod tests {
             Query(MetadataSearchParams {
                 q: "Public".to_string(),
                 conforms_to: Some("https://w3id.org/ro/crate/1.1".to_string()),
+                group_id: None,
                 limit: Some(10),
                 cursor: None,
                 mode: None,
@@ -3005,6 +3013,7 @@ mod tests {
             Query(MetadataSearchParams {
                 q: query.to_string(),
                 conforms_to: None,
+                group_id: None,
                 limit: Some(limit),
                 cursor,
                 mode,
@@ -3114,6 +3123,7 @@ mod tests {
                 graph_iris: None,
                 query: query.to_string(),
                 conforms_to: None,
+                group_id: None,
                 limit: Some(limit),
                 cursor,
                 mode: Some(MetadataApiQueryMode::Distributed),
@@ -3212,6 +3222,92 @@ mod tests {
         cluster.shutdown().await;
     }
 
+    async fn search_cluster_group(
+        cluster: &SearchPaginationCluster,
+        query: &str,
+        group_id: Option<Ulid>,
+    ) -> aruna_operations::metadata::api::MetadataSearchExecution {
+        let coordinator = cluster.coordinator();
+        let ctx = coordinator.state.get_ctx();
+        let target_nodes = cluster
+            .nodes
+            .iter()
+            .map(|node| node.net.node_id())
+            .collect();
+        run_search_metadata(
+            ctx.as_ref(),
+            coordinator.state.get_realm_id(),
+            coordinator.state.get_node_id(),
+            MetadataSearchRequest {
+                auth: Some(cluster.auth.clone()),
+                bearer_token: None,
+                graph_iris: None,
+                query: query.to_string(),
+                conforms_to: None,
+                group_id,
+                limit: Some(50),
+                cursor: None,
+                mode: Some(MetadataApiQueryMode::Distributed),
+                target_nodes: Some(target_nodes),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn group_filter_fanout() {
+        // Group filter must hold across every fanned-out node.
+        let cluster = setup_search_pagination_cluster(3).await;
+        let other_group = Ulid::r#gen();
+        for node in &cluster.nodes {
+            install_metadata_auth_documents(
+                node,
+                node.state.get_realm_id(),
+                cluster.auth.user_id,
+                other_group,
+            )
+            .await;
+        }
+        for index in 0..6 {
+            let node = &cluster.nodes[index % cluster.nodes.len()];
+            let (group_id, label) = if index % 2 == 0 {
+                (cluster.group_id, "primary")
+            } else {
+                (other_group, "other")
+            };
+            seed_public_document(
+                node,
+                &cluster.auth,
+                group_id,
+                &format!("datasets/fanout-{label}-{index}"),
+                &format!("Fanout Document {index}"),
+            )
+            .await;
+        }
+
+        let filtered = search_cluster_group(&cluster, "Fanout", Some(cluster.group_id)).await;
+        assert!(!filtered.hits.is_empty());
+        assert!(
+            filtered
+                .hits
+                .iter()
+                .all(|hit| hit.group_id == cluster.group_id.to_string()),
+            "the group filter must hold across every fanned-out node"
+        );
+
+        let unfiltered = search_cluster_group(&cluster, "Fanout", None).await;
+        let groups: HashSet<String> = unfiltered
+            .hits
+            .iter()
+            .map(|hit| hit.group_id.clone())
+            .collect();
+        assert!(groups.contains(&cluster.group_id.to_string()));
+        assert!(groups.contains(&other_group.to_string()));
+
+        cluster.shutdown().await;
+    }
+
     #[tokio::test]
     async fn metadata_search_marks_realm_discovery_failure_partial() {
         let test = setup_state().await;
@@ -3255,6 +3351,7 @@ mod tests {
                 graph_iris: None,
                 query: "Discovery".to_string(),
                 conforms_to: None,
+                group_id: None,
                 limit: Some(10),
                 cursor: None,
                 mode: Some(MetadataApiQueryMode::Distributed),
@@ -3547,6 +3644,176 @@ mod tests {
             response.next_cursor.is_some(),
             "a corpus larger than the cap must offer a continuation"
         );
+
+        // A request at exactly the cap fills a full page rather than being reduced.
+        let boundary = run_search_route(
+            &test.state,
+            &test.auth,
+            "Capacity",
+            100,
+            None,
+            Some(MetadataQueryMode::Local),
+        )
+        .await
+        .unwrap();
+        assert_eq!(boundary.hits.len(), 100);
+        assert!(boundary.next_cursor.is_some());
+    }
+
+    async fn install_group_auth(test: &TestState, group_id: Ulid) {
+        let realm_id = test.state.get_realm_id();
+        let actor = Actor {
+            node_id: test.state.get_node_id(),
+            user_id: test.auth.user_id,
+            realm_id,
+        };
+        let group_auth = GroupAuthorizationDocument::new_default_group_doc(
+            test.auth.user_id,
+            realm_id,
+            group_id,
+        );
+        let group = Group {
+            display_name: "second-metadata-group".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner: test.auth.user_id,
+        };
+        let ctx = test.state.get_ctx();
+        write_doc(
+            &ctx,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().into(),
+            group_auth.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+        write_doc(
+            &ctx,
+            GROUP_KEYSPACE,
+            group_id.to_bytes().into(),
+            group.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+    }
+
+    async fn search_group_scoped(
+        test: &TestState,
+        query: &str,
+        group_id: Option<Ulid>,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> ServerResult<MetadataSearchResponse> {
+        search_metadata(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Extension(None),
+            Query(MetadataSearchParams {
+                q: query.to_string(),
+                conforms_to: None,
+                group_id: group_id.map(|id| id.to_string()),
+                limit: Some(limit),
+                cursor,
+                mode: Some(MetadataQueryMode::Local),
+            }),
+        )
+        .await
+        .map(|(_, Json(response))| response)
+    }
+
+    #[tokio::test]
+    async fn group_filter_scopes() {
+        // Filtered search returns only the named group's hits; unfiltered spans groups.
+        let test = setup_state_with_net().await;
+        let other_group = Ulid::r#gen();
+        install_group_auth(&test, other_group).await;
+        create_test_metadata_document(
+            test.state.clone(),
+            test.auth.clone(),
+            test.group_id,
+            "datasets/scoped-alpha",
+            "Scoped Alpha",
+            true,
+        )
+        .await;
+        create_test_metadata_document(
+            test.state.clone(),
+            test.auth.clone(),
+            other_group,
+            "datasets/scoped-beta",
+            "Scoped Beta",
+            true,
+        )
+        .await;
+        drain_metadata_background(test.state.as_ref()).await;
+        let ctx = test.state.get_ctx();
+        installed_metadata_handle(ctx.as_ref())
+            .flush_search_updates()
+            .await
+            .unwrap();
+
+        let unfiltered = search_group_scoped(&test, "Scoped", None, 10, None)
+            .await
+            .unwrap();
+        let paths: HashSet<String> = unfiltered
+            .hits
+            .iter()
+            .map(|hit| hit.document_path.clone())
+            .collect();
+        assert!(paths.contains("datasets/scoped-alpha"));
+        assert!(paths.contains("datasets/scoped-beta"));
+
+        let primary = search_group_scoped(&test, "Scoped", Some(test.group_id), 10, None)
+            .await
+            .unwrap();
+        assert_eq!(primary.hits.len(), 1);
+        assert_eq!(primary.hits[0].group_id, test.group_id.to_string());
+        assert_eq!(primary.hits[0].document_path, "datasets/scoped-alpha");
+
+        let other = search_group_scoped(&test, "Scoped", Some(other_group), 10, None)
+            .await
+            .unwrap();
+        assert_eq!(other.hits.len(), 1);
+        assert_eq!(other.hits[0].group_id, other_group.to_string());
+    }
+
+    #[tokio::test]
+    async fn cursor_binds_filter() {
+        // A cursor is bound to its group filter: adding or dropping the filter on
+        // replay must be rejected rather than silently paging a different set.
+        let test = setup_state_with_net().await;
+        for index in 0..2 {
+            create_test_metadata_document(
+                test.state.clone(),
+                test.auth.clone(),
+                test.group_id,
+                &format!("datasets/bound-{index}"),
+                &format!("Bound Widget {index}"),
+                true,
+            )
+            .await;
+        }
+        drain_metadata_background(test.state.as_ref()).await;
+        let ctx = test.state.get_ctx();
+        installed_metadata_handle(ctx.as_ref())
+            .flush_search_updates()
+            .await
+            .unwrap();
+
+        let filtered = search_group_scoped(&test, "Bound", Some(test.group_id), 1, None)
+            .await
+            .unwrap();
+        let filtered_cursor = filtered.next_cursor.expect("filtered page continues");
+        let dropped =
+            search_group_scoped(&test, "Bound", None, 1, Some(filtered_cursor.clone())).await;
+        assert!(matches!(dropped, Err(ServerError::BadRequestMessage(_))));
+
+        let plain = search_group_scoped(&test, "Bound", None, 1, None)
+            .await
+            .unwrap();
+        let plain_cursor = plain.next_cursor.expect("plain page continues");
+        let added =
+            search_group_scoped(&test, "Bound", Some(test.group_id), 1, Some(plain_cursor)).await;
+        assert!(matches!(added, Err(ServerError::BadRequestMessage(_))));
     }
 
     #[tokio::test]
@@ -3887,6 +4154,7 @@ mod tests {
                 graph_iris: None,
                 query: "Remote".to_string(),
                 conforms_to: None,
+                group_id: None,
                 limit: Some(10),
                 cursor: None,
                 mode: Some(MetadataApiQueryMode::Distributed),
