@@ -16,6 +16,7 @@ use futures_util::StreamExt;
 use std::sync::Arc;
 use ulid::Ulid;
 
+use super::DEFAULT_WALLTIME;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::get_realm_config::GetRealmConfigOperation;
@@ -162,7 +163,7 @@ pub async fn mint_workspace_credential(
         .resources
         .max_walltime_ms
         .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(24 * 60 * 60));
+        .unwrap_or(DEFAULT_WALLTIME);
     let expiry = SystemTime::now() + walltime + CREDENTIAL_SLACK;
     let (_, access) = drive(
         CreateUserAccessOperation::new_with_key(

@@ -18,8 +18,8 @@ use super::super::store::{
 };
 use super::workspace::load_inputs;
 use super::{
-    build_task_spec, fail_and_crate, finalize_attempt, finalize_cancel, requeue_after_tombstone,
-    supervise_and_finalize, with_execution_heartbeat,
+    DEFAULT_WALLTIME, build_task_spec, fail_and_crate, finalize_attempt, finalize_cancel,
+    requeue_after_tombstone, supervise_and_finalize, with_execution_heartbeat,
 };
 use crate::driver::DriverContext;
 
@@ -206,7 +206,7 @@ impl ExternalReconciler for ComputeReconciler {
                 let max_walltime_ms = spec
                     .resources
                     .max_walltime_ms
-                    .unwrap_or(24 * 60 * 60 * 1_000);
+                    .unwrap_or(DEFAULT_WALLTIME.as_millis() as u64);
                 if status.started_at_ms.zip(status.finished_at_ms).is_some_and(
                     |(started, finished)| finished.saturating_sub(started) > max_walltime_ms,
                 ) {

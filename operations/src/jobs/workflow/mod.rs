@@ -42,6 +42,10 @@ use workspace::{
     stage_inputs,
 };
 
+/// Fallback walltime when a spec declares none. Enforcement, reconcile
+/// validation, and credential expiry must all agree on this value.
+pub(crate) const DEFAULT_WALLTIME: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Drive a claimed execution job through prepare -> submit -> supervise -> finalize.
 /// External attempts never share the generic in-process supervisor because a lost
 /// lease must not requeue a container (spec 16.7); this owns the fenced lifecycle.
@@ -349,7 +353,7 @@ fn build_task_spec(
             .resources
             .max_walltime_ms
             .map(Duration::from_millis)
-            .or(Some(Duration::from_secs(24 * 60 * 60))),
+            .or(Some(DEFAULT_WALLTIME)),
         preemptible: spec.resources.preemptible,
         backend_extensions: std::collections::BTreeMap::new(),
     };
@@ -642,7 +646,7 @@ pub async fn supervise_and_finalize(
     let walltime_ms = spec
         .resources
         .max_walltime_ms
-        .unwrap_or(24 * 60 * 60 * 1_000);
+        .unwrap_or(DEFAULT_WALLTIME.as_millis() as u64);
     let walltime_left = read_job_record(&storage, job_id, None)
         .await
         .ok()
