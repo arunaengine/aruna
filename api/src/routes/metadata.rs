@@ -21,12 +21,14 @@ use aruna_operations::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
     ListVisibleMetadataDocumentsRequest, MetadataApiError, MetadataApiQueryMode,
     MetadataDocumentQueryRequest, MetadataFanoutStats, MetadataQueryRequest,
+    MetadataReferenceEntry, MetadataReferencesExecution, MetadataReferencesRequest,
     MetadataRoCrateExportView as OperationMetadataRoCrateExportView, MetadataSearchRequest,
     export_metadata_rocrate as run_export_metadata_rocrate,
     get_visible_metadata_document as run_get_visible_metadata_document,
     list_visible_metadata_documents as run_list_visible_metadata_documents,
     metadata_auth_token_from_bearer, query_metadata as run_query_metadata,
-    query_metadata_document as run_query_metadata_document, search_metadata as run_search_metadata,
+    query_metadata_document as run_query_metadata_document,
+    references_metadata as run_references_metadata, search_metadata as run_search_metadata,
 };
 use aruna_operations::metadata::forward::{
     MetadataWriteError, create_metadata_document_routed as run_create_metadata_document,
@@ -72,6 +74,7 @@ use std::time::Duration;
         get_metadata_document,
         delete_metadata_document,
         search_metadata,
+        metadata_references,
         export_metadata_rocrate,
         replace_metadata_rocrate,
         add_metadata_data_entity,
@@ -89,6 +92,7 @@ pub fn router() -> Router<Arc<ServerState>> {
             get(list_all_metadata_documents).post(create_metadata_document),
         )
         .route("/metadata/search", get(search_metadata))
+        .route("/metadata/references", get(metadata_references))
         .route("/metadata/sparql/query", post(query_all_metadata))
         .route("/groups/{group_id}/metadata", get(list_metadata_documents))
         .route(
@@ -298,6 +302,51 @@ pub struct MetadataSearchResponse {
     /// True when pagination stopped at the server-side depth cap before the
     /// result set was exhausted.
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct MetadataReferencesParams {
+    /// Referenced object IRI to find backlinks for, such as a document graph IRI
+    /// or any IRI that appears as a triple object.
+    pub iri: String,
+    /// Optional exact predicate IRI filter, such as http://schema.org/conformsTo.
+    #[serde(default)]
+    pub predicate: Option<String>,
+    /// Page size (default 25, silently clamped to a maximum of 100).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Resolve `iri` as a document graph IRI and return that document's summary
+    /// as a single predicate-less entry, skipping the backlink scan.
+    #[serde(default)]
+    pub resolve: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataReferenceItem {
+    pub document_id: String,
+    pub group_id: String,
+    pub document_path: String,
+    pub graph_iri: String,
+    /// Predicate that names the queried IRI, or absent for a resolved graph-IRI
+    /// entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<String>,
+    /// Subjects in the referencing document that name the queried IRI; empty for
+    /// a resolved graph-IRI entry.
+    pub subject_iris: Vec<String>,
+    /// Human-readable title for the referencing document, from its root
+    /// schema:name with a document-path fallback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataReferencesResponse {
+    pub references: Vec<MetadataReferenceItem>,
+    /// Reserved for pagination. Always `null` in v1: results are capped at
+    /// `limit` and continuation is not yet supported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1242,6 +1291,70 @@ pub async fn search_metadata(
             truncated: result.truncated,
         }),
     ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/metadata/references",
+    tag = "metadata",
+    params(
+        ("iri" = String, Query, description = "Referenced object IRI to find backlinks for, such as a document graph IRI or any IRI appearing as a triple object"),
+        ("predicate" = Option<String>, Query, description = "Optional exact predicate IRI filter, such as http://schema.org/conformsTo"),
+        ("limit" = Option<usize>, Query, description = "Page size (default 25, silently clamped to a maximum of 100)"),
+        ("resolve" = Option<bool>, Query, description = "Resolve iri as a document graph IRI and return that document's summary as a single predicate-less entry, skipping the backlink scan")
+    ),
+    responses(
+        (status = 200, description = "Documents referencing the IRI the caller may read. When the scan is empty and iri is a known graph IRI, or when resolve is set, the matching document's summary is returned as a single predicate-less entry. Local-node-only in v1: only references indexed on the answering node are returned", body = MetadataReferencesResponse),
+        (status = 400, description = "Invalid or missing iri", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn metadata_references(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(params): Query<MetadataReferencesParams>,
+) -> ServerResult<(StatusCode, Json<MetadataReferencesResponse>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let ctx = state.get_ctx();
+    let execution = run_references_metadata(
+        ctx.as_ref(),
+        state.get_realm_id(),
+        MetadataReferencesRequest {
+            auth: Some(auth),
+            iri: params.iri,
+            predicate: params.predicate,
+            limit: params.limit,
+            resolve: params.resolve,
+        },
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
+    Ok((StatusCode::OK, Json(map_references_response(execution))))
+}
+
+fn map_references_response(execution: MetadataReferencesExecution) -> MetadataReferencesResponse {
+    MetadataReferencesResponse {
+        references: execution
+            .references
+            .into_iter()
+            .map(map_reference_entry)
+            .collect(),
+        next_cursor: execution.next_cursor,
+    }
+}
+
+fn map_reference_entry(entry: MetadataReferenceEntry) -> MetadataReferenceItem {
+    MetadataReferenceItem {
+        document_id: entry.document_id,
+        group_id: entry.group_id,
+        document_path: entry.document_path,
+        graph_iri: entry.graph_iri,
+        predicate: entry.predicate,
+        subject_iris: entry.subject_iris,
+        title: entry.title,
+    }
 }
 
 fn parse_document_id(document_id: &str) -> ServerResult<Ulid> {
@@ -4074,6 +4187,402 @@ mod tests {
             group.to_bytes(&actor).unwrap().into(),
         )
         .await;
+    }
+
+    async fn references_route(
+        test: &TestState,
+        auth: Option<AuthContext>,
+        iri: &str,
+        predicate: Option<&str>,
+        limit: Option<usize>,
+        resolve: bool,
+    ) -> ServerResult<MetadataReferencesResponse> {
+        metadata_references(
+            State(test.state.clone()),
+            Extension(auth),
+            Query(MetadataReferencesParams {
+                iri: iri.to_string(),
+                predicate: predicate.map(str::to_string),
+                limit,
+                resolve,
+            }),
+        )
+        .await
+        .map(|(_, Json(response))| response)
+    }
+
+    async fn create_linking_doc(
+        test: &TestState,
+        auth: AuthContext,
+        group_id: Ulid,
+        path: &str,
+        name: &str,
+        public: bool,
+        links: &[(&str, &str)],
+    ) -> String {
+        let mut root = serde_json::Map::new();
+        root.insert("@id".to_string(), json!("urn:aruna-test:root"));
+        root.insert("@type".to_string(), json!("Dataset"));
+        root.insert("name".to_string(), json!(name));
+        root.insert("description".to_string(), json!("Reference lookup fixture"));
+        root.insert("datePublished".to_string(), json!("2026-01-01"));
+        root.insert(
+            "license".to_string(),
+            json!({ "@id": "https://creativecommons.org/licenses/by/4.0/" }),
+        );
+        for (predicate, object) in links {
+            root.insert((*predicate).to_string(), json!({ "@id": object }));
+        }
+        let rocrate = json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                    "about": { "@id": "urn:aruna-test:root" }
+                },
+                Value::Object(root)
+            ]
+        });
+        let (_, Json(created)) = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(auth)),
+            Extension(None),
+            Json(CreateMetadataRequest::RoCrate(
+                CreateMetadataRoCrateRequest {
+                    group_id: group_id.to_string(),
+                    path: path.to_string(),
+                    public,
+                    rocrate,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        created.summary.document_id
+    }
+
+    async fn seed_group_owned_by(test: &TestState, group_id: Ulid, owner: aruna_core::UserId) {
+        let realm_id = test.state.get_realm_id();
+        let actor = Actor {
+            node_id: test.state.get_node_id(),
+            user_id: owner,
+            realm_id,
+        };
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let group = Group {
+            display_name: "foreign-metadata-group".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner,
+        };
+        let ctx = test.state.get_ctx();
+        write_doc(
+            &ctx,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().into(),
+            group_auth.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+        write_doc(
+            &ctx,
+            GROUP_KEYSPACE,
+            group_id.to_bytes().into(),
+            group.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn references_lists_docs() {
+        let test = setup_state().await;
+        let alpha = create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/alpha",
+            "Alpha",
+            true,
+            &[("license", "https://example.test/target-a")],
+        )
+        .await;
+        create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/beta",
+            "Beta",
+            true,
+            &[("license", "https://example.test/target-b")],
+        )
+        .await;
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let response = references_route(
+            &test,
+            Some(test.auth.clone()),
+            "https://example.test/target-a",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.references.len(), 1);
+        let entry = &response.references[0];
+        assert_eq!(entry.document_id, alpha);
+        assert_eq!(entry.document_path, "datasets/alpha");
+        assert_eq!(
+            entry.predicate.as_deref(),
+            Some("http://schema.org/license")
+        );
+        assert_eq!(entry.title.as_deref(), Some("Alpha"));
+        assert!(!entry.subject_iris.is_empty());
+        assert!(response.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn references_filters_predicate() {
+        let test = setup_state().await;
+        let doc = create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/linker",
+            "Linker",
+            true,
+            &[
+                ("license", "https://example.test/shared"),
+                ("creator", "https://example.test/shared"),
+            ],
+        )
+        .await;
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let all = references_route(
+            &test,
+            Some(test.auth.clone()),
+            "https://example.test/shared",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(all.references.len(), 2);
+        let predicates: HashSet<String> = all
+            .references
+            .iter()
+            .filter_map(|r| r.predicate.clone())
+            .collect();
+        assert!(predicates.contains("http://schema.org/license"));
+        assert!(predicates.contains("http://schema.org/creator"));
+
+        let filtered = references_route(
+            &test,
+            Some(test.auth.clone()),
+            "https://example.test/shared",
+            Some("http://schema.org/license"),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(filtered.references.len(), 1);
+        assert_eq!(
+            filtered.references[0].predicate.as_deref(),
+            Some("http://schema.org/license")
+        );
+        assert_eq!(filtered.references[0].document_id, doc);
+    }
+
+    #[tokio::test]
+    async fn references_omits_unauthorized() {
+        // A private backlink from a group the caller cannot read is dropped.
+        let test = setup_state().await;
+        let realm_id = test.state.get_realm_id();
+        let foreign_user = aruna_core::UserId::local(Ulid::r#gen(), realm_id);
+        let foreign_group = Ulid::r#gen();
+        seed_group_owned_by(&test, foreign_group, foreign_user).await;
+        let foreign_auth = AuthContext {
+            user_id: foreign_user,
+            realm_id,
+            path_restrictions: None,
+        };
+
+        let visible = create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/visible",
+            "Visible",
+            true,
+            &[("license", "https://example.test/shared")],
+        )
+        .await;
+        let hidden = create_linking_doc(
+            &test,
+            foreign_auth.clone(),
+            foreign_group,
+            "datasets/hidden",
+            "Hidden",
+            false,
+            &[("license", "https://example.test/shared")],
+        )
+        .await;
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let caller = references_route(
+            &test,
+            Some(test.auth.clone()),
+            "https://example.test/shared",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(caller.references.len(), 1);
+        assert_eq!(caller.references[0].document_id, visible);
+
+        // The owner sees the hidden doc, proving the filter is authorization.
+        let owner = references_route(
+            &test,
+            Some(foreign_auth),
+            "https://example.test/shared",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let ids: HashSet<String> = owner
+            .references
+            .iter()
+            .map(|r| r.document_id.clone())
+            .collect();
+        assert!(ids.contains(&hidden));
+        assert!(ids.contains(&visible));
+    }
+
+    #[tokio::test]
+    async fn references_resolves_graph() {
+        let test = setup_state().await;
+        let doc = create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/graphdoc",
+            "Graph Doc",
+            true,
+            &[],
+        )
+        .await;
+        drain_metadata_background(test.state.as_ref()).await;
+        let graph_iri = format!("https://w3id.org/aruna/{doc}");
+
+        let response =
+            references_route(&test, Some(test.auth.clone()), &graph_iri, None, None, true)
+                .await
+                .unwrap();
+        assert_eq!(response.references.len(), 1);
+        let entry = &response.references[0];
+        assert_eq!(entry.document_id, doc);
+        assert_eq!(entry.graph_iri, graph_iri);
+        assert!(entry.predicate.is_none());
+        assert!(entry.subject_iris.is_empty());
+        assert_eq!(entry.title.as_deref(), Some("Graph Doc"));
+    }
+
+    #[tokio::test]
+    async fn references_unknown_empty() {
+        let test = setup_state().await;
+        create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/any",
+            "Any",
+            true,
+            &[("license", "https://example.test/known")],
+        )
+        .await;
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let response = references_route(
+            &test,
+            Some(test.auth.clone()),
+            "https://example.test/absent",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(response.references.is_empty());
+        assert!(response.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn references_requires_auth() {
+        let test = setup_state().await;
+        let result =
+            references_route(&test, None, "https://example.test/x", None, None, false).await;
+        assert!(matches!(result, Err(ServerError::Unauthorized)));
+    }
+
+    #[tokio::test]
+    async fn references_clamps_limit() {
+        // limit 0 clamps up to 1; a small limit caps the returned backlinks.
+        let test = setup_state().await;
+        create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/one",
+            "One",
+            true,
+            &[("license", "https://example.test/shared")],
+        )
+        .await;
+        create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/two",
+            "Two",
+            true,
+            &[("license", "https://example.test/shared")],
+        )
+        .await;
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let clamped = references_route(
+            &test,
+            Some(test.auth.clone()),
+            "https://example.test/shared",
+            None,
+            Some(0),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(clamped.references.len(), 1);
+
+        let full = references_route(
+            &test,
+            Some(test.auth.clone()),
+            "https://example.test/shared",
+            None,
+            Some(100),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(full.references.len(), 2);
     }
 
     async fn create_test_metadata_document(
