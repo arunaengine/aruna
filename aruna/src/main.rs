@@ -496,10 +496,9 @@ async fn build_docker(
             .ok()
             .as_deref(),
     )?;
-    let endpoint = config
-        .s3_public_url
-        .clone()
-        .ok_or_else(|| "Docker executor requires S3_PUBLIC_URL".to_string())?;
+    let endpoint = compute_s3_endpoint(config).ok_or_else(|| {
+        "Docker executor requires ARUNA_COMPUTE_S3_URL or S3_PUBLIC_URL".to_string()
+    })?;
     if container_local_endpoint(&endpoint) {
         return Err(
             "Docker executor requires a container-reachable S3_PUBLIC_URL"
@@ -570,7 +569,7 @@ async fn build_apptainer(
     info!("Apptainer executor backend enabled");
     Ok(aruna_compute::ExecutorRegistry::new()
         .with_backend(Arc::new(backend))
-        .with_workspace_endpoint(config.s3_public_url.clone(), "eu-central-1".to_string()))
+        .with_workspace_endpoint(compute_s3_endpoint(config), "eu-central-1".to_string()))
 }
 
 #[cfg(not(feature = "apptainer"))]
@@ -618,7 +617,7 @@ async fn build_kubernetes(
     info!("Kubernetes executor backend enabled");
     Ok(aruna_compute::ExecutorRegistry::new()
         .with_backend(Arc::new(backend))
-        .with_workspace_endpoint(config.s3_public_url.clone(), "eu-central-1".to_string()))
+        .with_workspace_endpoint(compute_s3_endpoint(config), "eu-central-1".to_string()))
 }
 
 #[cfg(not(feature = "kubernetes"))]
@@ -735,6 +734,17 @@ async fn shutdown_runtime(
 }
 
 #[cfg(feature = "docker")]
+/// Containers may need a different S3 endpoint than browsers: the override
+/// keeps the portal-facing url on loopback (strict CSP) while container
+/// workloads get a host-reachable one.
+fn compute_s3_endpoint(config: &Config) -> Option<String> {
+    dotenvy::var("ARUNA_COMPUTE_S3_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| config.s3_public_url.clone())
+}
+
 fn container_local_endpoint(endpoint: &str) -> bool {
     let Some(host) = reqwest::Url::parse(endpoint)
         .ok()

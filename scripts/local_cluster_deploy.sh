@@ -161,15 +161,17 @@ write_node_env() {
     printf 'P2P_SOCKET_ADDRESS=127.0.0.1:%s\n' "$p2p_port"
     printf 'OPS_SOCKET_ADDRESS=127.0.0.1:%s\n' "$ops_port"
     printf 'API_PUBLIC_URL=http://127.0.0.1:%s\n' "$http_port"
+    printf 'S3_HOST=127.0.0.1:%s\n' "$s3_port"
+    printf 'S3_PUBLIC_URL=http://127.0.0.1:%s\n' "$s3_port"
     if [[ "$COMPUTE_EXECUTOR" != "none" ]]; then
-      printf 'S3_HOST=%s:%s\n' "$HOST_IP" "$s3_port"
-      printf 'S3_PUBLIC_URL=http://%s:%s\n' "$HOST_IP" "$s3_port"
+      # Containers cannot reach loopback: bind all interfaces and hand the
+      # executor its own host-reachable S3 url. The portal stays on loopback
+      # so the strict CSP (http only for loopback) keeps working.
       printf 'S3_ADDRESS=0.0.0.0:%s\n' "$s3_port"
+      printf 'ARUNA_COMPUTE_S3_URL=http://%s:%s\n' "$HOST_IP" "$s3_port"
       printf 'ARUNA_COMPUTE_EXECUTOR=%s\n' "$COMPUTE_EXECUTOR"
       printf 'ARUNA_COMPUTE_OPTIONAL=true\n'
     else
-      printf 'S3_HOST=127.0.0.1:%s\n' "$s3_port"
-      printf 'S3_PUBLIC_URL=http://127.0.0.1:%s\n' "$s3_port"
       printf 'S3_ADDRESS=127.0.0.1:%s\n' "$s3_port"
     fi
     printf 'REALM_DESCRIPTION=Test_Deploy_Realm\n'
@@ -537,12 +539,6 @@ prepare_nodes
 
 if [[ -n "$PORTAL_DIR" ]]; then
   PORTAL_CORS_ORIGINS="$(IFS=,; printf '%s' "${NODE_BASE_URLS[*]}"),$(printf 'http://127.0.0.1:%s,' "${NODE_S3_PORTS[@]}")http://localhost:5173"
-  if [[ "$COMPUTE_EXECUTOR" != "none" ]]; then
-    # Compute deploys advertise S3 on the host address; the portal must be
-    # allowed to connect to those origins too (CSP connect-src + CORS).
-    PORTAL_CORS_ORIGINS="$PORTAL_CORS_ORIGINS,$(printf "http://$HOST_IP:%s," "${NODE_S3_PORTS[@]}")"
-    PORTAL_CORS_ORIGINS="${PORTAL_CORS_ORIGINS%,}"
-  fi
 fi
 
 assert_node_ports_free
