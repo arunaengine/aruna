@@ -749,6 +749,22 @@ fn marker_continuation_token(
     }))
 }
 
+/// V1 `NextMarker`. A delimited page may end on a common prefix, and a page whose keys
+/// were all filtered out has no trailing `<Key>` to resume from, so both dead-end without
+/// one. An undelimited page with contents needs none: the client resumes from its last key.
+fn next_marker_for(
+    delimiter: Option<&str>,
+    token: Option<&ListObjectsV2ContinuationToken>,
+    contents_empty: bool,
+) -> Option<String> {
+    let token = token?;
+    if delimiter.is_some() || contents_empty {
+        next_marker_of(token)
+    } else {
+        None
+    }
+}
+
 /// Names the last entry of a truncated page, preferring the common prefix the
 /// page stopped inside.
 fn next_marker_of(token: &ListObjectsV2ContinuationToken) -> Option<String> {
@@ -1247,12 +1263,12 @@ impl S3 for ArunaS3Service {
             continuation_token: result_token,
         } = page;
         let is_truncated = result_token.is_some();
-        // A truncated delimited listing must report the resume marker, because
-        // a trailing common prefix is absent from `Contents`.
-        let next_marker = match (delimiter.as_ref(), result_token.as_ref()) {
-            (Some(_), Some(token)) => next_marker_of(token).map(&encode_field),
-            _ => None,
-        };
+        let next_marker = next_marker_for(
+            delimiter.as_deref(),
+            result_token.as_ref(),
+            contents.is_empty(),
+        )
+        .map(&encode_field);
 
         Ok(S3Response::new(ListObjectsOutput {
             name: Some(bucket),
@@ -4194,6 +4210,30 @@ mod tests {
             last_common_prefix: None,
         };
         assert_eq!(next_marker_of(&token).as_deref(), Some("b.txt"));
+    }
+
+    #[test]
+    fn marker_rescues_page() {
+        // An undelimited page that filtered every key it scanned is truncated with
+        // no `<Key>` to resume from, so it must carry the token-derived marker.
+        let token = ListObjectsV2ContinuationToken {
+            last_key: BlobHeadKey::object_prefix("bucket", "b.txt").unwrap(),
+            last_common_prefix: None,
+        };
+
+        assert_eq!(
+            next_marker_for(None, Some(&token), true).as_deref(),
+            Some("b.txt")
+        );
+        // A page with contents resumes from its last key: S3 sends no NextMarker.
+        assert_eq!(next_marker_for(None, Some(&token), false), None);
+        // A delimited page may end on a common prefix, so it always reports one.
+        assert_eq!(
+            next_marker_for(Some("/"), Some(&token), false).as_deref(),
+            Some("b.txt")
+        );
+        // A complete listing has nothing to resume.
+        assert_eq!(next_marker_for(None, None, true), None);
     }
 
     #[tokio::test]
