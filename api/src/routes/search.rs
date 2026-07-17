@@ -6,6 +6,7 @@ use crate::routes::metadata::{
 };
 use crate::routes::users::MIN_SEARCH_QUERY_CHARS;
 use crate::server_state::ServerState;
+use aruna_core::UserId;
 use aruna_core::structs::AuthContext;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::{
@@ -188,8 +189,17 @@ pub async fn unified_search(
 ) -> ServerResult<(StatusCode, Json<SearchResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let types = parse_search_types(params.types.as_deref())?;
-    if params.cursor.is_some() && types.count() != 1 {
-        return Err(ServerError::BadRequest);
+    if let Some(cursor) = params.cursor.as_deref() {
+        if types.count() != 1 {
+            return Err(ServerError::BadRequest);
+        }
+        // Validate the selected section's cursor shape up front so a malformed
+        // group or user id returns 400 rather than a downstream 500.
+        if types.groups {
+            parse_group_id(cursor)?;
+        } else if types.users {
+            UserId::from_string(cursor).map_err(|_| ServerError::BadRequest)?;
+        }
     }
     let q = params.q.trim().to_string();
     if q.chars().count() < MIN_SEARCH_QUERY_CHARS {
@@ -641,6 +651,27 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(ServerError::BadRequest)));
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_cursor() {
+        // A garbage single-type cursor is caller input: 400, never a 500.
+        let fx = setup().await;
+        for section in ["groups", "users"] {
+            let result = search(
+                &fx,
+                SearchParams {
+                    types: Some(section.to_string()),
+                    cursor: Some("garbage".to_string()),
+                    ..params("alpha")
+                },
+            )
+            .await;
+            assert!(
+                matches!(result, Err(ServerError::BadRequest)),
+                "{section} cursor should be rejected"
+            );
+        }
     }
 
     #[tokio::test]
