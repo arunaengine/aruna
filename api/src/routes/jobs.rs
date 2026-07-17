@@ -310,6 +310,7 @@ pub async fn list_jobs(
     let cursor = decode_cursor(query.cursor.as_deref())?;
     let limit = query
         .limit
+        .filter(|limit| *limit > 0)
         .unwrap_or(DEFAULT_LIST_LIMIT)
         .min(MAX_LIST_LIMIT);
     let state_filter = query.state.as_deref().map(parse_state).transpose()?;

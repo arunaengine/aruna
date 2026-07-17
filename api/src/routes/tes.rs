@@ -572,6 +572,7 @@ pub async fn list_tasks(
     };
     let limit = query
         .page_size
+        .filter(|size| *size > 0)
         .unwrap_or(DEFAULT_PAGE_SIZE)
         .min(MAX_PAGE_SIZE);
 
@@ -2202,6 +2203,42 @@ mod tests {
         let page: TesListTasksResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(page.tasks.len(), 1);
         assert_eq!(page.tasks[0].id, Some(visible_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn lists_zero_pagesize() {
+        // page_size=0 must fall back to the default, not report an empty page.
+        let (_dir, state) = build_state().await;
+        let owner = user(2);
+        let group = Ulid::from_bytes([5u8; 16]);
+        let access = credential(group);
+        write_credential(&state, &access).await;
+        let headers = basic_headers(&access, access.secret.as_str());
+        let (spec, _) = map_task_to_spec(&sample_task(group), None).unwrap();
+        insert_job(
+            &state.get_ctx().storage_handle,
+            &execution_record(JobId::from_bytes([9u8; 16]), owner, spec),
+        )
+        .await
+        .unwrap();
+
+        let listed = list_tasks(
+            State(state),
+            Extension(None),
+            headers,
+            RawQuery(None),
+            Query(ListTasksQuery {
+                page_size: Some(0),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(listed.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(listed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: TesListTasksResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page.tasks.len(), 1);
     }
 
     #[tokio::test]
