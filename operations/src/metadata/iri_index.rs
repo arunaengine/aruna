@@ -69,14 +69,54 @@ pub(crate) async fn lookup_metadata_iri_references(
     object_iri: &str,
 ) -> Result<BTreeMap<Ulid, Vec<String>>, MetadataError> {
     let prefix = metadata_iri_reference_prefix(predicate_iri, object_iri);
+    let records = scan_iri_reference_records(storage, Some(prefix)).await?;
+    Ok(collect_matching_iri_references(
+        records,
+        registry_records,
+        predicate_iri,
+        object_iri,
+    ))
+}
+
+/// One referencing document's link to a scanned object, at one predicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IriBacklink {
+    pub document_id: Ulid,
+    pub predicate_iri: String,
+    pub subject_iris: Vec<String>,
+}
+
+/// Backlinks to `object_iri`. A `predicate_iri` uses the predicate-first index
+/// prefix; without it the keyspace is scanned and filtered on the object, since
+/// the object is not a key prefix. Both fence stale document cursors.
+pub(crate) async fn lookup_iri_backlinks(
+    storage: &StorageHandle,
+    registry_records: &[MetadataRegistryRecord],
+    object_iri: &str,
+    predicate_iri: Option<&str>,
+) -> Result<Vec<IriBacklink>, MetadataError> {
+    let prefix =
+        predicate_iri.map(|predicate| metadata_iri_reference_prefix(predicate, object_iri));
+    let records = scan_iri_reference_records(storage, prefix).await?;
+    Ok(collect_iri_backlinks(
+        records,
+        registry_records,
+        object_iri,
+        predicate_iri,
+    ))
+}
+
+async fn scan_iri_reference_records(
+    storage: &StorageHandle,
+    prefix: Option<ByteView>,
+) -> Result<Vec<MetadataIriReferenceIndexRecord>, MetadataError> {
     let mut start_after = None;
     let mut records = Vec::new();
-
     loop {
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
                 key_space: METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
-                prefix: Some(prefix.clone()),
+                prefix: prefix.clone(),
                 start: start_after.map(IterStart::After),
                 limit: IRI_INDEX_PAGE_SIZE,
                 txn_id: None,
@@ -113,13 +153,7 @@ pub(crate) async fn lookup_metadata_iri_references(
             }
         }
     }
-
-    Ok(collect_matching_iri_references(
-        records,
-        registry_records,
-        predicate_iri,
-        object_iri,
-    ))
+    Ok(records)
 }
 
 pub(crate) async fn rebuild_metadata_iri_reference_index(
@@ -183,6 +217,39 @@ fn collect_matching_iri_references(
     matches
         .into_iter()
         .map(|(document_id, subject_iris)| (document_id, subject_iris.into_iter().collect()))
+        .collect()
+}
+
+fn collect_iri_backlinks(
+    records: Vec<MetadataIriReferenceIndexRecord>,
+    registry_records: &[MetadataRegistryRecord],
+    object_iri: &str,
+    predicate_iri: Option<&str>,
+) -> Vec<IriBacklink> {
+    let current_cursors = registry_records
+        .iter()
+        .map(|record| (record.document_id, record.last_event_id))
+        .collect::<HashMap<_, _>>();
+    let mut grouped = BTreeMap::<(Ulid, String), BTreeSet<String>>::new();
+    for record in records {
+        if record.object_iri != object_iri
+            || predicate_iri.is_some_and(|predicate| record.predicate_iri != predicate)
+            || current_cursors.get(&record.document_id) != Some(&record.document_cursor)
+        {
+            continue;
+        }
+        grouped
+            .entry((record.document_id, record.predicate_iri))
+            .or_default()
+            .extend(record.subject_iris);
+    }
+    grouped
+        .into_iter()
+        .map(|((document_id, predicate_iri), subject_iris)| IriBacklink {
+            document_id,
+            predicate_iri,
+            subject_iris: subject_iris.into_iter().collect(),
+        })
         .collect()
 }
 
@@ -356,6 +423,62 @@ mod tests {
         assert_eq!(
             matches.get(&current_document_id),
             Some(&vec!["https://example.test/current".to_string()])
+        );
+    }
+
+    #[test]
+    fn backlinks_by_predicate() {
+        // Object match and cursor fence hold across predicates; a predicate
+        // filter narrows the grouped backlinks.
+        let document_id = Ulid::from_parts(1, 1);
+        let cursor = Ulid::from_parts(2, 1);
+        let object = "https://example.test/object";
+        let records = vec![
+            MetadataIriReferenceIndexRecord {
+                document_id,
+                document_cursor: cursor,
+                predicate_iri: "https://example.test/license".to_string(),
+                object_iri: object.to_string(),
+                subject_iris: vec!["https://example.test/root".to_string()],
+            },
+            MetadataIriReferenceIndexRecord {
+                document_id,
+                document_cursor: cursor,
+                predicate_iri: "https://example.test/based-on".to_string(),
+                object_iri: object.to_string(),
+                subject_iris: vec!["https://example.test/root".to_string()],
+            },
+            MetadataIriReferenceIndexRecord {
+                document_id,
+                document_cursor: Ulid::from_parts(2, 0),
+                predicate_iri: "https://example.test/license".to_string(),
+                object_iri: object.to_string(),
+                subject_iris: vec!["https://example.test/stale".to_string()],
+            },
+            MetadataIriReferenceIndexRecord {
+                document_id,
+                document_cursor: cursor,
+                predicate_iri: "https://example.test/license".to_string(),
+                object_iri: "https://example.test/other".to_string(),
+                subject_iris: vec!["https://example.test/miss".to_string()],
+            },
+        ];
+        let registry_records = vec![registry_record(document_id, cursor)];
+
+        let all = collect_iri_backlinks(records.clone(), &registry_records, object, None);
+        assert_eq!(all.len(), 2);
+
+        let filtered = collect_iri_backlinks(
+            records,
+            &registry_records,
+            object,
+            Some("https://example.test/license"),
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].predicate_iri, "https://example.test/license");
+        assert_eq!(
+            filtered[0].subject_iris,
+            vec!["https://example.test/root".to_string()]
         );
     }
 }

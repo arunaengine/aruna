@@ -716,6 +716,26 @@ impl MetadataHandle {
         .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
     }
 
+    /// Best-effort properties of a document's root subject (its graph IRI), for
+    /// title enrichment. Returns empty on any backend error so a lookup never
+    /// fails on a pending or raced projection.
+    pub(crate) async fn describe_root_properties(&self, graph_iri: String) -> Vec<(String, Term)> {
+        let inner = self.inner.clone();
+        let _permit = inner.craqle_read_permits.clone().acquire_owned().await.ok();
+        tokio::task::spawn_blocking(move || {
+            let authorizer = AllowedGraphAuthorizer {
+                graph_iris: HashSet::from([graph_iri.clone()]),
+            };
+            inner
+                .node
+                .describe_subject(&authorizer, &GraphId::new(&graph_iri), &graph_iri)
+                .map(decode_hit_properties)
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
     /// Test hook: marks all visibility cache entries as expired so the next
     /// read exercises the stale-serving + background-refill path.
     #[doc(hidden)]
