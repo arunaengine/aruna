@@ -69,6 +69,8 @@ pub enum PutObjectError {
     MissingExpectedChecksum(&'static str),
     #[error("checksum mismatch for {0}")]
     ChecksumMismatch(&'static str),
+    #[error("blob write failed: {0}")]
+    WriteFailed(String),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
@@ -163,40 +165,45 @@ impl PutObjectOperation {
     }
 
     fn handle_write_finished(&mut self, event: Event) -> Effects {
-        if let Event::Blob(BlobEvent::WriteFinished { location }) = event {
-            self.written_location = Some(location.clone());
-
-            // Check if the body was fully written
-            if self
-                .config
-                .request
-                .content_length
-                .is_some_and(|expected| location.blob_size != expected)
-            {
-                return self.cleanup_failed_write(PutObjectError::IncompleteBody);
+        let location = match event {
+            Event::Blob(BlobEvent::WriteFinished { location }) => location,
+            // A failed body stream (e.g. trailer checksum mismatch) must map
+            // to a client error, not an invalid-state 500.
+            Event::Blob(BlobEvent::Error(error)) => {
+                return self.cleanup_failed_write(PutObjectError::WriteFailed(error.to_string()));
             }
+            _ => return self.emit_error(PutObjectError::InvalidOperationState),
+        };
+        self.written_location = Some(location.clone());
 
-            for expected in &self.config.expected_checksums {
-                let Some(actual) = location.hashes.get(expected.algorithm.hash_key()) else {
-                    return self.cleanup_failed_write(PutObjectError::MissingExpectedChecksum(
-                        expected.algorithm.s3_name(),
-                    ));
-                };
-
-                if actual != &expected.digest {
-                    return self.cleanup_failed_write(PutObjectError::ChecksumMismatch(
-                        expected.algorithm.s3_name(),
-                    ));
-                }
-            }
-
-            self.state = PutObjectState::StartTransaction;
-            smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })]
-        } else {
-            self.emit_error(PutObjectError::InvalidOperationState)
+        // Check if the body was fully written
+        if self
+            .config
+            .request
+            .content_length
+            .is_some_and(|expected| location.blob_size != expected)
+        {
+            return self.cleanup_failed_write(PutObjectError::IncompleteBody);
         }
+
+        for expected in &self.config.expected_checksums {
+            let Some(actual) = location.hashes.get(expected.algorithm.hash_key()) else {
+                return self.cleanup_failed_write(PutObjectError::MissingExpectedChecksum(
+                    expected.algorithm.s3_name(),
+                ));
+            };
+
+            if actual != &expected.digest {
+                return self.cleanup_failed_write(PutObjectError::ChecksumMismatch(
+                    expected.algorithm.s3_name(),
+                ));
+            }
+        }
+
+        self.state = PutObjectState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
     }
 
     fn handle_transaction_started(&mut self, event: Event) -> Effects {
@@ -821,7 +828,7 @@ impl Operation for PutObjectOperation {
 mod test {
     use crate::driver::{DriverContext, drive};
     use crate::s3::put_object::{
-        PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectState,
+        PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectState,
     };
     use crate::usage_stats::{QuotaGate, UsageCounterUpdate};
     use aruna_blob::blob::BlobHandler;
@@ -915,6 +922,27 @@ mod test {
             version_source: None,
             quota_ceiling: Some(1),
         }
+    }
+
+    #[test]
+    fn rejects_write_error() {
+        // A rejected body stream (e.g. trailer checksum mismatch) must
+        // surface WriteFailed instead of InvalidOperationState.
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let mut op = PutObjectOperation::new(put_config(
+            realm_id,
+            Ulid::r#gen(),
+            iroh::SecretKey::generate().public(),
+        ));
+        op.state = PutObjectState::WriteBlob;
+
+        let effects = op.step(Event::Blob(BlobEvent::Error(
+            aruna_core::errors::BlobError::WriteError("checksum mismatch".to_string()),
+        )));
+
+        assert!(effects.is_empty());
+        assert!(op.is_complete());
+        assert!(matches!(op.finalize(), Err(PutObjectError::WriteFailed(_))));
     }
 
     #[test]

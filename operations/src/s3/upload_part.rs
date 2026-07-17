@@ -56,6 +56,8 @@ pub enum UploadPartError {
     MissingExpectedChecksum(&'static str),
     #[error("checksum mismatch for {0}")]
     ChecksumMismatch(&'static str),
+    #[error("blob write failed: {0}")]
+    WriteFailed(String),
     #[error("UploadPart failed")]
     UploadPartFailed,
 }
@@ -159,8 +161,14 @@ impl UploadPartOperation {
     }
 
     fn handle_write_finished(&mut self, event: Event) -> Effects {
-        let Event::Blob(BlobEvent::WriteFinished { location }) = event else {
-            return self.emit_error(UploadPartError::InvalidOperationState);
+        let location = match event {
+            Event::Blob(BlobEvent::WriteFinished { location }) => location,
+            // A failed body stream (e.g. trailer checksum mismatch) must map
+            // to a client error, not an invalid-state 500.
+            Event::Blob(BlobEvent::Error(error)) => {
+                return self.cleanup_failed_write(UploadPartError::WriteFailed(error.to_string()));
+            }
+            _ => return self.emit_error(UploadPartError::InvalidOperationState),
         };
         self.written_location = Some(location.clone());
 
@@ -410,6 +418,36 @@ mod test {
 
     fn test_user_id() -> UserId {
         UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32]))
+    }
+
+    #[test]
+    fn rejects_write_error() {
+        // A rejected body stream (e.g. trailer checksum mismatch) must
+        // surface WriteFailed instead of InvalidOperationState.
+        let mut op = UploadPartOperation::new(UploadPartInput {
+            bucket: "mybucket".to_string(),
+            key: "object.txt".to_string(),
+            upload_id: Ulid::r#gen(),
+            part_number: 1,
+            content_length: None,
+            body: None,
+            created_by: test_user_id(),
+            compressed: false,
+            encrypted: false,
+            expected_checksums: Vec::new(),
+        });
+        op.state = UploadPartState::WritePart;
+
+        let effects = op.step(Event::Blob(BlobEvent::Error(
+            aruna_core::errors::BlobError::WriteError("checksum mismatch".to_string()),
+        )));
+
+        assert!(effects.is_empty());
+        assert!(op.is_complete());
+        assert!(matches!(
+            op.finalize(),
+            Err(UploadPartError::WriteFailed(_))
+        ));
     }
 
     #[tokio::test]
