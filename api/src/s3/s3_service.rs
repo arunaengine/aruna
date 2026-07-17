@@ -75,8 +75,8 @@ use aruna_operations::s3::list_object_versions::{
 use aruna_operations::s3::list_objects_v2::{
     ListObjectsV2ContinuationToken, ListObjectsV2Input as LOV2I, ListObjectsV2Operation,
 };
-use aruna_operations::s3::listing::common_prefix_of;
 use aruna_operations::s3::list_parts::{ListPartsInput as LPI, ListPartsOperation};
+use aruna_operations::s3::listing::common_prefix_of;
 use aruna_operations::s3::put_bucket_replication::{
     DeleteBucketReplicationOperation, GetBucketReplicationOperation, PutBucketReplicationOperation,
 };
@@ -108,13 +108,13 @@ use s3s::dto::{
     Initiator, LastModified, ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput,
     ListMultipartUploadsOutput, ListObjectVersionsInput, ListObjectVersionsOutput,
     ListObjectsInput, ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, ListPartsInput,
-    ListPartsOutput, MetadataDirective,
-    MultipartUpload as S3MultipartUpload, Object, ObjectAttributes, ObjectPart, ObjectVersion,
-    ObjectVersionStorageClass, Owner, Part, PutBucketCorsInput, PutBucketCorsOutput,
-    PutBucketReplicationInput, PutBucketReplicationOutput, PutBucketVersioningInput,
-    PutBucketVersioningOutput, PutObjectInput, PutObjectOutput, ReplicationConfiguration,
-    ReplicationRule, ReplicationRuleStatus, StorageClass, StreamingBlob, Timestamp,
-    TimestampFormat, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
+    ListPartsOutput, MetadataDirective, MultipartUpload as S3MultipartUpload, Object,
+    ObjectAttributes, ObjectPart, ObjectVersion, ObjectVersionStorageClass, Owner, Part,
+    PutBucketCorsInput, PutBucketCorsOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
+    PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput, PutObjectOutput,
+    ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, StorageClass, StreamingBlob,
+    Timestamp, TimestampFormat, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput,
+    UploadPartOutput,
 };
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
@@ -1197,13 +1197,12 @@ impl S3 for ArunaS3Service {
             .map(|bucket_info| bucket_info.group_id)
             .unwrap_or(user_access.group_id);
 
-        let continuation_token =
-            marker_continuation_token(
-                &bucket,
-                marker.as_deref(),
-                prefix.as_deref(),
-                delimiter.as_deref(),
-            )?;
+        let continuation_token = marker_continuation_token(
+            &bucket,
+            marker.as_deref(),
+            prefix.as_deref(),
+            delimiter.as_deref(),
+        )?;
         let start_after = continuation_token
             .is_none()
             .then(|| marker.clone())
