@@ -537,6 +537,12 @@ prepare_nodes
 
 if [[ -n "$PORTAL_DIR" ]]; then
   PORTAL_CORS_ORIGINS="$(IFS=,; printf '%s' "${NODE_BASE_URLS[*]}"),$(printf 'http://127.0.0.1:%s,' "${NODE_S3_PORTS[@]}")http://localhost:5173"
+  if [[ "$COMPUTE_EXECUTOR" != "none" ]]; then
+    # Compute deploys advertise S3 on the host address; the portal must be
+    # allowed to connect to those origins too (CSP connect-src + CORS).
+    PORTAL_CORS_ORIGINS="$PORTAL_CORS_ORIGINS,$(printf "http://$HOST_IP:%s," "${NODE_S3_PORTS[@]}")"
+    PORTAL_CORS_ORIGINS="${PORTAL_CORS_ORIGINS%,}"
+  fi
 fi
 
 assert_node_ports_free
