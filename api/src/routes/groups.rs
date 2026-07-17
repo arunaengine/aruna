@@ -1135,6 +1135,14 @@ pub async fn list_data_paths(
 
     let response = match remainder.split_once('/') {
         Some((bucket, key_prefix)) => {
+            // Listing inside a bucket requires READ on the bucket, or the prefix
+            // being browsed, so path-restricted tokens see only what they may read.
+            let listing_path = if key_prefix.is_empty() {
+                blob_bucket_permission_path(realm_id, group_id, node_id, bucket)
+            } else {
+                blob_object_permission_path(realm_id, group_id, node_id, bucket, key_prefix)
+            };
+            require_data_read(&state, &auth, listing_path).await?;
             list_bucket_objects(
                 &state,
                 group_id,
@@ -1147,6 +1155,8 @@ pub async fn list_data_paths(
             .await?
         }
         None => {
+            // Browsing the bucket level requires READ on the group data root.
+            require_data_read(&state, &auth, group_path).await?;
             let name_filter = (!remainder.is_empty()).then_some(remainder.as_str());
             list_group_buckets(
                 &state,
@@ -1160,6 +1170,37 @@ pub async fn list_data_paths(
     };
 
     Ok((StatusCode::OK, Json(response)))
+}
+
+/// Authorizes READ on a data permission path via the shared CheckPermissions
+/// flow, matching the S3 surface: a caller without READ (empty role, DENY, or a
+/// path restriction that excludes the path) is forbidden.
+async fn require_data_read(
+    state: &ServerState,
+    auth: &AuthContext,
+    path: String,
+) -> ServerResult<()> {
+    let allowed = drive(
+        CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: auth.clone(),
+            path,
+            required_permission: Permission::READ,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| match err {
+        AuthorizationError::InvalidRealmId
+        | AuthorizationError::InvalidGroupId
+        | AuthorizationError::GroupNotFound
+        | AuthorizationError::AuthDocNotFound => ServerError::Forbidden,
+        _ => ServerError::InternalError(err.to_string()),
+    })?;
+    if allowed {
+        Ok(())
+    } else {
+        Err(ServerError::Forbidden)
+    }
 }
 
 async fn list_group_buckets(
@@ -1335,8 +1376,9 @@ mod tests {
     };
     use aruna_core::structs::{
         Actor, AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BucketInfo,
-        CurrentVersionPointer, Group, GroupAuthorizationDocument, NodeCapabilities, RealmId, User,
-        VersionKey, blob_bucket_permission_path, blob_object_permission_path,
+        CurrentVersionPointer, Group, GroupAuthorizationDocument, NodeCapabilities,
+        RealmAuthorizationDocument, RealmId, Role, User, VersionKey, blob_bucket_permission_path,
+        blob_object_permission_path,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_storage::storage;
@@ -1345,7 +1387,7 @@ mod tests {
     use axum::{Extension, Json};
     use byteview::ByteView;
     use ed25519_dalek::SigningKey;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tempfile::{TempDir, tempdir};
@@ -1457,6 +1499,23 @@ mod tests {
             )
             .await,
         );
+
+        // The data permission check reads the realm auth doc; seed an empty one
+        // so authority comes solely from group roles.
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        store_bytes(
+            &state,
+            AUTH_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+                .to_bytes(&actor)
+                .unwrap(),
+        )
+        .await;
 
         (state, tempdir)
     }
@@ -1856,6 +1915,50 @@ mod tests {
         let result = list_data_paths(
             State(state),
             Extension(Some(outsider)),
+            Path(group_id.to_string()),
+            Query(DataPathsQuery::default()),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn empty_role_forbidden() {
+        // Membership alone is not enough: a role granting no READ is forbidden.
+        let (state, _tempdir) = setup_state().await;
+        let realm_id = state.get_realm_id();
+        let owner = UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = seed_group(&state, owner).await;
+        let limited = UserId::local(Ulid::r#gen(), realm_id);
+
+        let mut auth_doc =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let role_id = Ulid::r#gen();
+        auth_doc.roles.insert(
+            role_id,
+            Role {
+                role_id,
+                name: "empty".to_string(),
+                permissions: HashMap::new(),
+                assigned_users: HashSet::from([limited]),
+            },
+        );
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: owner,
+            realm_id,
+        };
+        store_bytes(
+            &state,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            auth_doc.to_bytes(&actor).unwrap(),
+        )
+        .await;
+
+        let result = list_data_paths(
+            State(state),
+            Extension(Some(member_auth(limited))),
             Path(group_id.to_string()),
             Query(DataPathsQuery::default()),
         )
