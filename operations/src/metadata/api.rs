@@ -32,13 +32,13 @@ use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
 
 use super::MetadataAuthToken;
+use super::handle::{
+    METADATA_QUERY_MAX_BYTES, METADATA_QUERY_MAX_RESULT_BYTES, METADATA_QUERY_MAX_ROWS,
+};
 use super::search_cursor::{
     METADATA_SEARCH_DEFAULT_PAGE_SIZE, METADATA_SEARCH_MAX_PAGE_SIZE,
     METADATA_SEARCH_MAX_PAGINATION_DEPTH, NodeSearchResult, SearchCursor, SearchCursorError,
     SearchPageCursor, SearchWatermark, paginate, query_fingerprint, resume_fetch_limit,
-};
-use super::handle::{
-    METADATA_QUERY_MAX_BYTES, METADATA_QUERY_MAX_RESULT_BYTES, METADATA_QUERY_MAX_ROWS,
 };
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};

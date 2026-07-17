@@ -4535,7 +4535,11 @@ async fn search_local_graphs(
                     let subject_iri = matches.get(&record.document_id)?.first()?.clone();
                     let properties = inner
                         .node
-                        .describe_subject(&authorizer, &GraphId::new(&record.graph_iri), &subject_iri)
+                        .describe_subject(
+                            &authorizer,
+                            &GraphId::new(&record.graph_iri),
+                            &subject_iri,
+                        )
                         .map(decode_hit_properties)
                         .unwrap_or_default();
                     let title = super::search_enrichment::hit_title(
