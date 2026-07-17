@@ -8,6 +8,7 @@ use aruna_operations::s3::complete_multipart_upload::CompleteMultipartPart;
 use aruna_operations::s3::get_object::ObjectRangeRequest;
 use aruna_operations::s3::put_object::PutObjectInput as BlobPutObjectInput;
 use base64::prelude::*;
+use http::HeaderMap;
 use s3s::dto::ChecksumAlgorithm as S3ChecksumAlgorithm;
 use s3s::dto::{
     ChecksumType, CompletedPart, CopySource, CreateMultipartUploadInput, PartNumber, PutObjectInput,
@@ -345,6 +346,19 @@ pub(crate) fn checksum_algorithm_from_s3(
     }
 }
 
+/// s3s attaches a trailing-headers handle to every streaming payload, so only
+/// an `x-amz-trailer` declaration announces an actual checksum trailer.
+pub(crate) fn declared_trailer_algorithm(
+    headers: &HeaderMap,
+    has_handle: bool,
+    algorithm: Option<&S3ChecksumAlgorithm>,
+) -> S3Result<Option<ChecksumAlgorithm>> {
+    algorithm
+        .filter(|_| has_handle && headers.contains_key("x-amz-trailer"))
+        .map(checksum_algorithm_from_s3)
+        .transpose()
+}
+
 pub(crate) fn s3_checksum_algorithm_from_core(
     algorithm: ChecksumAlgorithm,
 ) -> Option<S3ChecksumAlgorithm> {
@@ -371,17 +385,43 @@ pub(crate) fn s3_checksum_algorithm_from_core(
 #[cfg(test)]
 mod tests {
     use super::{
-        checksum_response_hashes, get_s3_operation_permission, is_anonymous_object_read_operation,
-        parse_copy_source, parse_copy_source_range, parse_multipart_part_number,
-        validate_object_key,
+        S3ChecksumAlgorithm, checksum_response_hashes, declared_trailer_algorithm,
+        get_s3_operation_permission, is_anonymous_object_read_operation, parse_copy_source,
+        parse_copy_source_range, parse_multipart_part_number, validate_object_key,
     };
     use crate::s3::auth::Action;
+    use crate::s3::checksum::parse_upload_checksum_request;
     use aruna_core::structs::MultipartChecksumType;
+    use aruna_core::structs::checksum::ChecksumAlgorithm;
     use aruna_operations::s3::get_object::ObjectRangeRequest;
+    use http::HeaderMap;
     use s3s::S3ErrorCode;
     use s3s::dto::CopySource;
     use std::collections::HashMap;
     use ulid::Ulid;
+
+    #[test]
+    fn accepts_untrailered_streaming() {
+        // Streaming PUT without x-amz-trailer but with a precomputed checksum
+        // header must skip trailer verification and stay accepted.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-sdk-checksum-algorithm", "CRC32".parse().unwrap());
+        headers.insert("x-amz-checksum-crc32", "y/Q5Jg==".parse().unwrap());
+        let algorithm = S3ChecksumAlgorithm::from_static(S3ChecksumAlgorithm::CRC32);
+
+        let derived = declared_trailer_algorithm(&headers, true, Some(&algorithm)).unwrap();
+        assert_eq!(derived, None);
+        let request = parse_upload_checksum_request(&headers, derived).unwrap();
+        assert_eq!(request.expected.len(), 1);
+
+        headers.insert("x-amz-trailer", "x-amz-checksum-crc32".parse().unwrap());
+        let derived = declared_trailer_algorithm(&headers, true, Some(&algorithm)).unwrap();
+        assert_eq!(derived, Some(ChecksumAlgorithm::Crc32));
+        assert_eq!(
+            declared_trailer_algorithm(&headers, false, Some(&algorithm)).unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn composite_uploads_surface_composite_hashes() {

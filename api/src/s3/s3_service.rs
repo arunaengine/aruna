@@ -10,7 +10,7 @@ use crate::s3::cors::{bucket_cors_to_get_output, dto_to_bucket_cors};
 use crate::s3::error::IntoS3Error;
 use crate::s3::s3_server::DeleteObjectsBody;
 use crate::s3::util::{
-    checked_size, checksum_algorithm_from_s3, checksum_response_hashes, convert_input,
+    checked_size, checksum_response_hashes, convert_input, declared_trailer_algorithm,
     multipart_checksum_type_from_s3, parse_completed_part, parse_copy_source,
     parse_copy_source_range, parse_multipart_checksum_hint, parse_multipart_part_number,
     parse_upload_id, parse_version_id, reject_sse, s3_checksum_algorithm_from_core,
@@ -1117,12 +1117,11 @@ impl S3 for ArunaS3Service {
         )?;
         validate_object_key(&req.input.key)?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
-        let trailer_algorithm = req
-            .trailing_headers
-            .as_ref()
-            .and(req.input.checksum_algorithm.as_ref())
-            .map(checksum_algorithm_from_s3)
-            .transpose()?;
+        let trailer_algorithm = declared_trailer_algorithm(
+            &req.headers,
+            req.trailing_headers.is_some(),
+            req.input.checksum_algorithm.as_ref(),
+        )?;
         let checksum_request = parse_upload_checksum_request(&req.headers, trailer_algorithm)?;
         let trailing_headers = req.trailing_headers.clone();
         let replication_auth = AuthContext {
@@ -1434,12 +1433,11 @@ impl S3 for ArunaS3Service {
                 || req.input.sse_customer_key_md5.is_some(),
         )?;
         validate_object_key(&req.input.key)?;
-        let trailer_algorithm = req
-            .trailing_headers
-            .as_ref()
-            .and(req.input.checksum_algorithm.as_ref())
-            .map(checksum_algorithm_from_s3)
-            .transpose()?;
+        let trailer_algorithm = declared_trailer_algorithm(
+            &req.headers,
+            req.trailing_headers.is_some(),
+            req.input.checksum_algorithm.as_ref(),
+        )?;
         let checksum_request = parse_upload_checksum_request(&req.headers, trailer_algorithm)?;
         let trailing_headers = req.trailing_headers.clone();
         let upload_id = parse_upload_id(&req.input.upload_id)?;
