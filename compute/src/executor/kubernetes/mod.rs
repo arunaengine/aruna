@@ -850,7 +850,10 @@ impl ExecutorBackend for KubernetesBackend {
             return Ok(CancelEvidence::Stopped(status));
         }
         self.remove_helpers(context).await?;
-        self.save_logs(context).await?;
+        // Logs from a stuck pod may be unavailable; that must not block cancel.
+        if let Err(error) = self.save_logs(context).await {
+            tracing::warn!(%error, "log capture failed during cancel");
+        }
         for pod in self.task_pods(context).await? {
             self.delete_pod(&pod).await?;
         }
@@ -1619,6 +1622,109 @@ mod tests {
             attempt: AttemptRef::new("job", 1),
             attempt_epoch: 7,
             controller_generation: 3,
+        }
+    }
+
+    fn test_config() -> KubernetesConfig {
+        KubernetesConfig {
+            namespace: "compute".to_string(),
+            storage_class: "csi".to_string(),
+            helper_image: "helper:latest".to_string(),
+            pull_deadline: Duration::from_secs(30),
+            s3_cidrs: Vec::new(),
+            s3_port: 443,
+        }
+    }
+
+    fn fake_client<F>(handler: F) -> Client
+    where
+        F: Fn(&str, &str) -> (u16, Value) + Send + Sync + 'static,
+    {
+        let handler = std::sync::Arc::new(handler);
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let handler = handler.clone();
+            async move {
+                let (status, body) = handler(request.method().as_str(), request.uri().path());
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(
+                            serde_json::to_vec(&body).expect("serialize fake response"),
+                        ))
+                        .expect("build fake response"),
+                )
+            }
+        });
+        Client::new(service, "compute")
+    }
+
+    fn status_json(code: u16) -> Value {
+        let reason = if code == 404 { "NotFound" } else { "BadRequest" };
+        json!({
+            "kind": "Status", "apiVersion": "v1", "status": "Failure",
+            "message": "fake error", "reason": reason, "code": code
+        })
+    }
+
+    fn job_json(state: &str) -> Value {
+        json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {
+                "name": "aruna-job-a1", "namespace": "compute",
+                "uid": "job-uid", "resourceVersion": "1",
+                "annotations": {
+                    EPOCH_ANNOTATION: "7",
+                    GENERATION_ANNOTATION: "3",
+                    STATE_ANNOTATION: state,
+                }
+            },
+            "spec": {"suspend": false},
+            "status": {"active": 1}
+        })
+    }
+
+    fn pod_list() -> Value {
+        json!({
+            "apiVersion": "v1", "kind": "PodList", "metadata": {},
+            "items": [{
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {
+                    "name": "task-pod", "namespace": "compute", "uid": "pod-uid",
+                    "labels": {ROLE_LABEL: "task"}
+                }
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn cancels_without_logs() {
+        // A stuck pod rejects log reads with 400; cancel must still complete.
+        let client = fake_client(|method, path| match (method, path) {
+            ("GET", "/apis/batch/v1/namespaces/compute/jobs/aruna-job-a1") => {
+                (200, job_json("running"))
+            }
+            ("PATCH", "/apis/batch/v1/namespaces/compute/jobs/aruna-job-a1") => {
+                (200, job_json("cancelled"))
+            }
+            ("GET", "/api/v1/namespaces/compute/pods") => (200, pod_list()),
+            ("GET", "/api/v1/namespaces/compute/pods/task-pod/log") => (400, status_json(400)),
+            ("DELETE", "/api/v1/namespaces/compute/pods/task-pod") => (
+                200,
+                json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"task-pod","uid":"pod-uid"}}),
+            ),
+            _ => (404, status_json(404)),
+        });
+        let backend = KubernetesBackend {
+            client,
+            config: test_config(),
+        };
+
+        let evidence = backend.cancel(&context()).await.unwrap();
+
+        match evidence {
+            CancelEvidence::Stopped(status) => assert_eq!(status.phase, AttemptPhase::Cancelled),
+            other => panic!("unexpected cancel evidence: {other:?}"),
         }
     }
 

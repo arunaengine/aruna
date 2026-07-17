@@ -329,6 +329,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures-util",
+ "http 1.4.2",
  "json-patch",
  "k8s-openapi",
  "kube",
@@ -341,6 +342,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
 ]
 
