@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataSearchHit;
@@ -67,10 +67,16 @@ impl SearchCursor {
         sign: impl FnOnce(&[u8]) -> iroh::Signature,
     ) -> Self {
         let signer = *signer.as_bytes();
-        let resume: Vec<_> = resume
+        let mut resume: Vec<_> = resume
             .into_iter()
             .map(|(node_id, position)| (*node_id.as_bytes(), position))
             .collect();
+        // Never emit more resume entries than decode accepts, or the served
+        // cursor 400s on replay; keep the deepest-progress nodes on overflow.
+        if resume.len() > SEARCH_CURSOR_MAX_RESUME_NODES {
+            resume.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1));
+            resume.truncate(SEARCH_CURSOR_MAX_RESUME_NODES);
+        }
         let signing_bytes = cursor_signing_bytes(
             SEARCH_CURSOR_VERSION,
             signer,
@@ -322,13 +328,27 @@ pub fn paginate(
     let next = if has_more {
         match next_watermark {
             Some(mark) => {
+                let pending: HashSet<(&str, &str)> = remaining
+                    .iter()
+                    .map(|hit| (hit.graph_iri.as_str(), hit.subject_iri.as_str()))
+                    .collect();
                 let resume: Vec<(NodeId, u32)> = node_results
                     .iter()
                     .map(|node| {
+                        // Count hits at or above the watermark, plus a saturated
+                        // node's below-watermark duplicates that will not re-emit,
+                        // so a duplicate-only prefix advances instead of stalling.
                         let position = node
                             .hits
                             .iter()
-                            .filter(|hit| !hit_after_watermark(hit, &mark))
+                            .filter(|hit| {
+                                !hit_after_watermark(hit, &mark)
+                                    || (node.saturated
+                                        && !pending.contains(&(
+                                            hit.graph_iri.as_str(),
+                                            hit.subject_iri.as_str(),
+                                        )))
+                            })
                             .count() as u32;
                         (node.node_id, position)
                     })
@@ -507,24 +527,65 @@ mod tests {
 
     #[test]
     fn cursor_decode_caps_resume_entries() {
-        let cursor_with = |count: usize| {
-            signed_cursor(
-                [0u8; 32],
-                SearchWatermark {
-                    score: 1.0,
-                    graph_iri: "g".to_string(),
-                    subject_iri: "s".to_string(),
-                },
-                (0..count).map(|index| (node_id(index as u8), 0)).collect(),
-                1,
-            )
+        let watermark = || SearchWatermark {
+            score: 1.0,
+            graph_iri: "g".to_string(),
+            subject_iri: "s".to_string(),
         };
+        let at_cap = signed_cursor(
+            [0u8; 32],
+            watermark(),
+            (0..SEARCH_CURSOR_MAX_RESUME_NODES)
+                .map(|index| (node_id(index as u8), 0))
+                .collect(),
+            1,
+        );
+        assert!(SearchCursor::decode(&at_cap.encode(), &[node_id(1)]).is_ok());
 
-        assert!(SearchCursor::decode(&cursor_with(64).encode(), &[node_id(1)]).is_ok());
+        // A cursor forged past the cap (bypassing issuance) is still rejected.
+        let secret = secret_key(1);
+        let resume: Vec<_> = (0..=SEARCH_CURSOR_MAX_RESUME_NODES)
+            .map(|index| (*node_id(index as u8).as_bytes(), 0u32))
+            .collect();
+        let mark = watermark();
+        let signing_bytes = cursor_signing_bytes(
+            SEARCH_CURSOR_VERSION,
+            *secret.public().as_bytes(),
+            [0u8; 32],
+            &mark,
+            &resume,
+        );
+        let forged = SearchCursor {
+            version: SEARCH_CURSOR_VERSION,
+            signer: *secret.public().as_bytes(),
+            fingerprint: [0u8; 32],
+            watermark: mark,
+            resume,
+            signature: secret.sign(&signing_bytes),
+        };
         assert_eq!(
-            SearchCursor::decode(&cursor_with(65).encode(), &[node_id(1)]),
+            SearchCursor::decode(&forged.encode(), &[secret.public()]),
             Err(SearchCursorError::Invalid)
         );
+    }
+
+    #[test]
+    fn issuance_caps_resume() {
+        // Above-cap fan-out is truncated at issuance so replay never 400s.
+        let over = signed_cursor(
+            [0u8; 32],
+            SearchWatermark {
+                score: 1.0,
+                graph_iri: "g".to_string(),
+                subject_iri: "s".to_string(),
+            },
+            (0..=SEARCH_CURSOR_MAX_RESUME_NODES)
+                .map(|index| (node_id(index as u8), index as u32))
+                .collect(),
+            1,
+        );
+        assert_eq!(over.resume.len(), SEARCH_CURSOR_MAX_RESUME_NODES);
+        assert!(SearchCursor::decode(&over.encode(), &[node_id(1)]).is_ok());
     }
 
     #[test]
@@ -820,6 +881,55 @@ mod tests {
         let next = page.next.expect("saturation keeps paging");
         assert_eq!(next.watermark, watermark);
         assert_eq!(next.resume, vec![(node_id(1), 1)]);
+    }
+
+    #[test]
+    fn saturated_duplicate_progresses() {
+        // Node 1 owns the winning copy and is exhausted; node 2 holds the same
+        // hit at a lower score plus a deeper unique hit that paging must reach.
+        let a_hits = [hit("01S", "./shared", 0.9)];
+        let b_hits = [hit("01S", "./shared", 0.5), hit("01U", "./unique", 0.3)];
+        let mut watermark = Some(SearchWatermark {
+            score: 0.9,
+            graph_iri: "https://w3id.org/aruna/01S".to_string(),
+            subject_iri: "./shared".to_string(),
+        });
+        let mut resume: HashMap<NodeId, u32> = HashMap::new();
+        let mut emitted = Vec::new();
+
+        for _ in 0..4 {
+            let depth = METADATA_SEARCH_MAX_PAGINATION_DEPTH;
+            let a_limit = resume_fetch_limit(&resume, node_id(1), 1, depth);
+            let b_limit = resume_fetch_limit(&resume, node_id(2), 1, depth);
+            let a_page: Vec<_> = a_hits.iter().take(a_limit).cloned().collect();
+            let b_page: Vec<_> = b_hits.iter().take(b_limit).cloned().collect();
+            let node_results = vec![
+                NodeSearchResult {
+                    node_id: node_id(1),
+                    saturated: a_page.len() >= a_limit,
+                    hits: a_page,
+                },
+                NodeSearchResult {
+                    node_id: node_id(2),
+                    saturated: b_page.len() >= b_limit,
+                    hits: b_page,
+                },
+            ];
+            let page = paginate(node_results, watermark.clone(), 1, depth);
+            emitted.extend(page.hits.iter().map(|hit| hit.subject_iri.clone()));
+            match page.next {
+                Some(cursor) => {
+                    watermark = Some(cursor.watermark);
+                    resume = cursor.resume.into_iter().collect();
+                }
+                None => break,
+            }
+        }
+
+        assert!(
+            emitted.iter().any(|subject| subject == "./unique"),
+            "duplicate-only prefix stalled paging: {emitted:?}"
+        );
     }
 
     #[test]
