@@ -4,6 +4,11 @@ pub const MAX_USER_ATTRIBUTES: usize = 128;
 pub const MAX_USER_ATTRIBUTE_KEY_BYTES: usize = 128;
 pub const MAX_USER_ATTRIBUTE_VALUE_BYTES: usize = 4096;
 
+/// Attribute keys directory endpoints may expose. Keys are free-form, so this
+/// explicit allowlist is the contract; `email` is deliberately excluded and
+/// must never appear in resolve or member output.
+pub const SAFE_USER_ATTRIBUTE_KEYS: &[&str] = &["orcid", "affiliation", "department"];
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum UserAttributeValidationError {
     #[error("invalid user attribute key: {0}")]
