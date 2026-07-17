@@ -98,7 +98,7 @@ impl ApptainerBackend {
         let plan = StagePlan::from_spec(spec)?;
         let directory = self.state.attempt_dir(context);
         let temp = directory.with_extension(format!("{}.tmp", context.controller_generation));
-        remove_tree(&temp)?;
+        remove_staging_temps(&directory)?;
         std::fs::create_dir_all(temp.join("workspace/root")).map_err(io_error)?;
         std::fs::create_dir_all(temp.join("logs")).map_err(io_error)?;
         let layout_digest = plan.layout.digest();
@@ -604,7 +604,7 @@ impl ExecutorBackend for ApptainerBackend {
             || (status.is_none() && !self.state.attempt_dir(context).exists()))
             && runtime::cgroup_empty(&self.cgroup_path(context))?
         {
-            return Ok(());
+            return remove_staging_temps(&self.state.attempt_dir(context));
         }
         Err(BackendError::Conflict(
             "Apptainer cleanup requires terminal evidence and an empty cgroup".to_string(),
@@ -1029,6 +1029,29 @@ fn validate_env_key(key: &str) -> Result<(), BackendError> {
     Ok(())
 }
 
+/// Staging temps are generation-keyed, so a handoff strands foreign generations
+/// that only a prefix sweep reclaims.
+fn remove_staging_temps(directory: &Path) -> Result<(), BackendError> {
+    let (Some(parent), Some(name)) = (directory.parent(), directory.file_name()) else {
+        return Ok(());
+    };
+    let prefix = format!("{}.", name.to_string_lossy());
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error(error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(io_error)?;
+        let entry_name = entry.file_name();
+        let entry_name = entry_name.to_string_lossy();
+        if entry_name.starts_with(&prefix) && entry_name.ends_with(".tmp") {
+            remove_tree(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 fn remove_tree(path: &Path) -> Result<(), BackendError> {
     match std::fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
@@ -1082,6 +1105,42 @@ mod tests {
         };
 
         backend.cleanup(&context).await.unwrap();
+    }
+
+    #[test]
+    fn sweeps_generation_temps() {
+        // Only this attempt's temps go, whatever generation named them.
+        let root = tempdir().unwrap();
+        let directory = root.path().join("job-1");
+        let foreign = root.path().join("job-1.7.tmp");
+        let sibling = root.path().join("job-12.7.tmp");
+        for path in [&directory, &foreign, &sibling] {
+            std::fs::create_dir_all(path.join("workspace")).unwrap();
+        }
+
+        remove_staging_temps(&directory).unwrap();
+
+        assert!(!foreign.exists());
+        assert!(directory.exists());
+        assert!(sibling.exists());
+    }
+
+    #[tokio::test]
+    async fn removes_foreign_temps() {
+        // A temp stranded by an earlier generation must not survive cleanup.
+        let root = tempdir().unwrap();
+        let backend = test_backend(root.path());
+        let context = FenceContext {
+            attempt: AttemptRef::new("job", 9),
+            attempt_epoch: 1,
+            controller_generation: 3,
+        };
+        let foreign = backend.state.attempt_dir(&context).with_extension("1.tmp");
+        std::fs::create_dir_all(foreign.join("workspace")).unwrap();
+
+        backend.cleanup(&context).await.unwrap();
+
+        assert!(!foreign.exists());
     }
 
     fn test_backend(root: &Path) -> ApptainerBackend {
