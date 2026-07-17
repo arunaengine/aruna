@@ -295,12 +295,12 @@ impl ExecutorBackend for ApptainerBackend {
     async fn resolve_image(
         &self,
         image: &str,
-        _cancel: &CancellationToken,
+        cancel: &CancellationToken,
     ) -> Result<String, BackendError> {
         if digest_pinned(image) {
             Ok(image.to_string())
         } else {
-            resolve_digest(image).await
+            resolve_digest(image, self.config.pull_deadline, cancel).await
         }
     }
 
@@ -790,13 +790,22 @@ fn find_strings(value: &serde_json::Value, key: &str) -> Option<Vec<String>> {
     }
 }
 
-async fn resolve_digest(image: &str) -> Result<String, BackendError> {
-    let output = TokioCommand::new("apptainer")
+async fn resolve_digest(
+    image: &str,
+    deadline: Duration,
+    cancel: &CancellationToken,
+) -> Result<String, BackendError> {
+    let mut command = TokioCommand::new("apptainer");
+    command
         .args(["inspect", "--json"])
         .arg(format!("docker://{image}"))
-        .output()
-        .await
-        .map_err(io_error)?;
+        .kill_on_drop(true);
+    let output = tokio::select! {
+        _ = cancel.cancelled() => return Err(BackendError::Cancelled),
+        result = tokio::time::timeout(deadline, command.output()) => result
+            .map_err(|_| BackendError::Timeout("Apptainer image inspect timed out".to_string()))?
+            .map_err(io_error)?,
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if image_missing(&stderr) {
