@@ -8,7 +8,7 @@ use crate::usage_stats::{
     schedule_usage_snapshot_publish_effect,
 };
 use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::operation::Operation;
@@ -69,6 +69,10 @@ pub enum PutObjectError {
     MissingExpectedChecksum(&'static str),
     #[error("checksum mismatch for {0}")]
     ChecksumMismatch(&'static str),
+    #[error("blob write failed: {0}")]
+    WriteFailed(String),
+    #[error("blob backend write failed: {0}")]
+    BlobWriteFailed(String),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
@@ -163,40 +167,49 @@ impl PutObjectOperation {
     }
 
     fn handle_write_finished(&mut self, event: Event) -> Effects {
-        if let Event::Blob(BlobEvent::WriteFinished { location }) = event {
-            self.written_location = Some(location.clone());
-
-            // Check if the body was fully written
-            if self
-                .config
-                .request
-                .content_length
-                .is_some_and(|expected| location.blob_size != expected)
-            {
-                return self.cleanup_failed_write(PutObjectError::IncompleteBody);
+        let location = match event {
+            Event::Blob(BlobEvent::WriteFinished { location }) => location,
+            // Only a client-sourced stream fault may become a client error; a
+            // server-side write fault must stay retryable, never a bad digest.
+            Event::Blob(BlobEvent::Error(BlobError::StreamFailed(message))) => {
+                return self.cleanup_failed_write(PutObjectError::WriteFailed(message));
             }
-
-            for expected in &self.config.expected_checksums {
-                let Some(actual) = location.hashes.get(expected.algorithm.hash_key()) else {
-                    return self.cleanup_failed_write(PutObjectError::MissingExpectedChecksum(
-                        expected.algorithm.s3_name(),
-                    ));
-                };
-
-                if actual != &expected.digest {
-                    return self.cleanup_failed_write(PutObjectError::ChecksumMismatch(
-                        expected.algorithm.s3_name(),
-                    ));
-                }
+            Event::Blob(BlobEvent::Error(error)) => {
+                return self
+                    .cleanup_failed_write(PutObjectError::BlobWriteFailed(error.to_string()));
             }
+            _ => return self.emit_error(PutObjectError::InvalidOperationState),
+        };
+        self.written_location = Some(location.clone());
 
-            self.state = PutObjectState::StartTransaction;
-            smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })]
-        } else {
-            self.emit_error(PutObjectError::InvalidOperationState)
+        // Check if the body was fully written
+        if self
+            .config
+            .request
+            .content_length
+            .is_some_and(|expected| location.blob_size != expected)
+        {
+            return self.cleanup_failed_write(PutObjectError::IncompleteBody);
         }
+
+        for expected in &self.config.expected_checksums {
+            let Some(actual) = location.hashes.get(expected.algorithm.hash_key()) else {
+                return self.cleanup_failed_write(PutObjectError::MissingExpectedChecksum(
+                    expected.algorithm.s3_name(),
+                ));
+            };
+
+            if actual != &expected.digest {
+                return self.cleanup_failed_write(PutObjectError::ChecksumMismatch(
+                    expected.algorithm.s3_name(),
+                ));
+            }
+        }
+
+        self.state = PutObjectState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
     }
 
     fn handle_transaction_started(&mut self, event: Event) -> Effects {
@@ -821,12 +834,12 @@ impl Operation for PutObjectOperation {
 mod test {
     use crate::driver::{DriverContext, drive};
     use crate::s3::put_object::{
-        PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectState,
+        PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectState,
     };
     use crate::usage_stats::{QuotaGate, UsageCounterUpdate};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-    use aruna_core::errors::StorageError;
+    use aruna_core::errors::{BlobError, StorageError};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE,
@@ -915,6 +928,50 @@ mod test {
             version_source: None,
             quota_ceiling: Some(1),
         }
+    }
+
+    #[test]
+    fn rejects_write_error() {
+        // A rejected body stream (e.g. trailer checksum mismatch) must
+        // surface WriteFailed instead of InvalidOperationState.
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let mut op = PutObjectOperation::new(put_config(
+            realm_id,
+            Ulid::r#gen(),
+            iroh::SecretKey::generate().public(),
+        ));
+        op.state = PutObjectState::WriteBlob;
+
+        let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::StreamFailed(
+            "checksum mismatch".to_string(),
+        ))));
+
+        assert!(effects.is_empty());
+        assert!(op.is_complete());
+        assert!(matches!(op.finalize(), Err(PutObjectError::WriteFailed(_))));
+    }
+
+    #[test]
+    fn rejects_server_write() {
+        // A full or flapping disk must never be reported as a client bad digest.
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let mut op = PutObjectOperation::new(put_config(
+            realm_id,
+            Ulid::r#gen(),
+            iroh::SecretKey::generate().public(),
+        ));
+        op.state = PutObjectState::WriteBlob;
+
+        let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::WriteError(
+            "No space left on device".to_string(),
+        ))));
+
+        assert!(effects.is_empty());
+        assert!(op.is_complete());
+        assert!(matches!(
+            op.finalize(),
+            Err(PutObjectError::BlobWriteFailed(_))
+        ));
     }
 
     #[test]
@@ -1095,6 +1152,7 @@ mod test {
             blob_handle: Some(blob_handle),
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
         // Jesus, Take the Wheel!
         let result = drive(put_operation, &context)
@@ -1261,6 +1319,7 @@ mod test {
             blob_handle: Some(blob_handle),
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let data = b"hello, world!";
@@ -1480,6 +1539,7 @@ mod test {
             blob_handle: Some(blob_handle),
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let realm_id = RealmId::from_bytes([1u8; 32]);
@@ -1663,6 +1723,7 @@ mod test {
             blob_handle: Some(blob_handle),
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let data = b"hello, world!";

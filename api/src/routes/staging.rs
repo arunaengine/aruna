@@ -596,6 +596,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
 
         let bucket_group_id = Ulid::r#gen();
@@ -704,6 +705,7 @@ mod tests {
                 NodeCapabilities::local_node(realm_id).unwrap(),
                 false,
                 None,
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );

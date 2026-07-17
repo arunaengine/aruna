@@ -31,8 +31,10 @@ impl ApiDoc {
         openapi.merge(crate::routes::blobs::BlobsApiDoc::openapi());
         openapi.merge(crate::routes::drs::DrsApiDoc::openapi());
         openapi.merge(crate::routes::info::InfoApiDoc::openapi());
+        openapi.merge(crate::routes::jobs::JobsApiDoc::openapi());
         openapi.merge(crate::routes::notifications::NotificationsApiDoc::openapi());
         openapi.merge(crate::routes::onboarding::OnboardingApiDoc::openapi());
+        openapi.merge(crate::routes::tes::TesApiDoc::openapi());
         openapi.merge(crate::routes::users::UsersApiDoc::openapi());
         openapi
     }
@@ -46,6 +48,10 @@ impl Modify for SecurityAddon {
             components.add_security_scheme(
                 "bearer_auth",
                 SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
+            );
+            components.add_security_scheme(
+                "basic_auth",
+                SecurityScheme::Http(Http::new(HttpAuthScheme::Basic)),
             );
         }
     }

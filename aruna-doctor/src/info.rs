@@ -337,9 +337,15 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(task_handle.clone()),
+            compute_handle: None,
         });
         initialize_net_incoming(context.clone());
-        initialize_task_incoming(context.clone(), task_handle).await;
+        initialize_task_incoming(
+            context.clone(),
+            task_handle,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
+        )
+        .await;
 
         let realm_signing_key =
             SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
@@ -375,7 +381,16 @@ mod tests {
         .unwrap();
 
         let state = Arc::new(
-            ServerState::new(context, realm_id, net.node_id(), capabilities, false, None).await,
+            ServerState::new(
+                context,
+                realm_id,
+                net.node_id(),
+                capabilities,
+                false,
+                None,
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
+            )
+            .await,
         );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

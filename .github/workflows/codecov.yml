@@ -1,0 +1,72 @@
+name: coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  report:
+    name: Generate Coverage Report
+    environment: coverage
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      # Source-based coverage reads __llvm_covmap from the binary, so DWARF is
+      # dead weight that OOM-kills the 16 GB runner during linking.
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_BUILD_JOBS: 2
+      RUSTFLAGS: -Cinstrument-coverage -Cdebuginfo=0
+      LLVM_PROFILE_FILE: cargo-test-%p-%m.profraw
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y clang mold
+
+      - name: Install Rust with LLVM tools
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: "1.95.0"
+          components: llvm-tools-preview
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install grcov
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: grcov
+
+      - name: Run instrumented tests
+        run: cargo test --workspace --all-features --locked
+
+      - name: Collect coverage
+        run: |
+          grcov . \
+            --binary-path ./target/debug/deps/ \
+            --source-dir . \
+            --output-type lcov \
+            --output-path coverage.lcov \
+            --branch \
+            --ignore-not-existing \
+            --ignore "/*" \
+            --ignore "target/*" \
+            --keep-only "*/src/*"
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.lcov
+          fail_ci_if_error: true

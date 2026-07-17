@@ -1088,13 +1088,19 @@ async fn spawn_node_configured(
         blob_handle: None,
         metadata_handle: Some(metadata_handle),
         task_handle: Some(task_handle.clone()),
+        compute_handle: None,
     });
 
     initialize_net_incoming(context.clone());
     // A node without the auto task loop leaves its outbox drain (and every other
     // timer) for the test to drive by hand.
     if start_tasks {
-        initialize_task_incoming(context.clone(), task_handle).await;
+        initialize_task_incoming(
+            context.clone(),
+            task_handle,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
+        )
+        .await;
     }
 
     Ok(TestNode {

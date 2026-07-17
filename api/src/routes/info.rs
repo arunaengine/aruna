@@ -724,7 +724,7 @@ pub struct RealmNodeInfoResponse {
     pub connection_status: RealmNodeConnectionStatus,
     /// Placement map entry (location/weight/status) when the node is mapped.
     pub placement: Option<RealmNodePlacementResponse>,
-    /// Latest published node info document (labels/urls/utilization) if received.
+    /// Latest published node info document (capabilities/labels/urls/utilization) if received.
     pub info: Option<RealmNodeInfoDocumentResponse>,
 }
 
@@ -738,10 +738,18 @@ pub struct RealmNodePlacementResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct RealmNodeInfoDocumentResponse {
+    pub executors: Vec<ExecutorCapabilityResponse>,
     pub labels: std::collections::BTreeMap<String, String>,
     pub urls: RealmNodeUrlsResponse,
     pub utilization: RealmNodeUtilizationResponse,
     pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ExecutorCapabilityResponse {
+    pub kind: String,
+    pub file_staging: bool,
+    pub direct_s3: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -887,6 +895,15 @@ fn map_node_info_document(
     document: &aruna_core::structs::NodeInfoDocument,
 ) -> RealmNodeInfoDocumentResponse {
     RealmNodeInfoDocumentResponse {
+        executors: document
+            .executors
+            .iter()
+            .map(|executor| ExecutorCapabilityResponse {
+                kind: executor.kind.clone(),
+                file_staging: executor.file_staging,
+                direct_s3: executor.direct_s3,
+            })
+            .collect(),
         labels: document.labels.clone(),
         urls: RealmNodeUrlsResponse {
             api: document.urls.api.clone(),
@@ -1586,6 +1603,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
 
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
@@ -1601,6 +1619,7 @@ mod tests {
                 NodeCapabilities::local_node(realm_id).unwrap(),
                 false,
                 None,
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );
@@ -1995,6 +2014,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
         });
 
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
@@ -2041,6 +2061,7 @@ mod tests {
                 NodeCapabilities::management_node(realm_signing_key).unwrap(),
                 false,
                 None,
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );
@@ -2551,6 +2572,11 @@ mod tests {
         // the default location/weight. Publish a node info document for it too.
         let document = NodeInfoDocument {
             node_id,
+            executors: vec![aruna_core::compute::ExecutorCapability {
+                kind: "docker".to_string(),
+                file_staging: true,
+                direct_s3: true,
+            }],
             labels: std::collections::BTreeMap::from([("tier".to_string(), "hot".to_string())]),
             urls: NodeUrls {
                 api: None,
@@ -2593,6 +2619,8 @@ mod tests {
         assert!(!placement.draining);
 
         let node_info = node.info.as_ref().expect("node info document present");
+        assert_eq!(node_info.executors.len(), 1);
+        assert_eq!(node_info.executors[0].kind, "docker");
         assert_eq!(node_info.labels.get("tier"), Some(&"hot".to_string()));
         assert_eq!(node_info.urls.s3.as_deref(), Some("s3.example"));
         assert_eq!(node_info.utilization.storage_bytes_used, 4_096);

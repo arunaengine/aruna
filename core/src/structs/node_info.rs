@@ -1,10 +1,11 @@
 use crate::NodeId;
+use crate::compute::ExecutorCapability;
 use crate::errors::ConversionError;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Derived read-only label carrying a node's `RealmNode.kind`; writes are rejected.
-pub const KIND_LABEL_KEY: &str = "aruna.io/kind";
+pub const KIND_LABEL_KEY: &str = "aruna-engine.org/kind";
 
 /// Storage key for a node's info document. One document per node, so the raw
 /// node id is unambiguous within the dedicated `NODE_INFO_KEYSPACE`.
@@ -15,6 +16,7 @@ pub fn node_info_storage_key(node_id: NodeId) -> Vec<u8> {
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct NodeInfoDocument {
     pub node_id: NodeId,
+    pub executors: Vec<ExecutorCapability>,
     pub labels: BTreeMap<String, String>,
     pub urls: NodeUrls,
     pub utilization: NodeUtilization,
@@ -57,6 +59,11 @@ mod tests {
     fn node_info_document_round_trips() {
         let document = NodeInfoDocument {
             node_id: node(1),
+            executors: vec![ExecutorCapability {
+                kind: "docker".to_string(),
+                file_staging: true,
+                direct_s3: true,
+            }],
             labels: BTreeMap::from([(KIND_LABEL_KEY.to_string(), "server".to_string())]),
             urls: NodeUrls {
                 api: Some("https://api.example".to_string()),

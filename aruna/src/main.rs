@@ -30,6 +30,9 @@ use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_operations::incoming::initialize_net_incoming;
+use aruna_operations::jobs::JOB_SHUTDOWN_GRACE;
+use aruna_operations::jobs::drain::restore_job_queue_timer;
+use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_metadata_warmup};
 use aruna_operations::startup::restore_shard_subscriptions;
@@ -41,8 +44,15 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
+fn main() {
+    if let Some(code) = aruna_compute::dispatch_helper() {
+        std::process::exit(code);
+    }
+    async_main();
+}
+
 #[tokio::main]
-async fn main() {
+async fn async_main() {
     dotenvy::dotenv().expect("Failed to load .env file");
     init_tracing();
 
@@ -106,12 +116,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
+    let compute_handle = build_compute_registry(&config)
+        .await
+        .map_err(std::io::Error::other)?;
+
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
         net_handle: Some(net_handle.clone()),
         blob_handle: Some(blob_handle),
         metadata_handle: Some(metadata_handle),
         task_handle: Some(task_handle.clone()),
+        compute_handle: compute_handle.clone(),
     });
 
     // Start the ops listener before realm bootstrap so `/readyz` reports 503
@@ -132,8 +147,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     ensure_usage_counters(driver_ctx.as_ref()).await?;
 
+    // Task initialization binds the compute reconciler before startup recovery.
+    let jobs_runtime = JobsRuntime::new_paused();
     initialize_net_incoming(driver_ctx.clone());
-    initialize_task_incoming(driver_ctx.clone(), task_handle).await;
+    initialize_task_incoming(
+        driver_ctx.clone(),
+        task_handle.clone(),
+        jobs_runtime.clone(),
+    )
+    .await;
 
     // Republish a full set of node usage snapshots at startup so realm peers see
     // this node's totals again after a restart, dirty-marker loss, or a counter
@@ -341,6 +363,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config.node_capabilities,
             is_initial_node,
             Some(Arc::new(OidcValidator::new()?)),
+            jobs_runtime.clone(),
         )
         .await
         .with_metrics(metrics.clone()),
@@ -378,6 +401,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await;
     let (_s3_addr, server_handle) = s3_server.run_with_listener(s3_listener).unwrap();
+    if let Err(error) = jobs_runtime
+        .recover_stale_jobs(&driver_ctx.storage_handle)
+        .await
+    {
+        warn!(error = %error, "Failed to recover stale jobs at startup");
+    }
+    jobs_runtime.start();
+    restore_job_queue_timer(&driver_ctx.storage_handle, &task_handle).await;
 
     let rest_listener = TcpListener::bind(config.http_socket_addr).await?;
 
@@ -409,10 +440,251 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         driver_ctx.net_handle.as_ref(),
         driver_ctx.metadata_handle.as_ref(),
         &driver_ctx.storage_handle,
+        jobs_runtime.clone(),
     )
     .await;
 
     Ok(())
+}
+
+async fn build_compute_registry(
+    config: &Config,
+) -> Result<Option<Arc<aruna_compute::ExecutorRegistry>>, String> {
+    let selected = dotenvy::var("ARUNA_COMPUTE_EXECUTOR").unwrap_or_else(|_| "none".to_string());
+    let result = match selected.as_str() {
+        "none" => return Ok(None),
+        "docker" => build_docker(config).await,
+        "apptainer" => build_apptainer(config).await,
+        "kubernetes" => build_kubernetes(config).await,
+        other => Err(ComputeBuildError::Config(format!(
+            "unknown ARUNA_COMPUTE_EXECUTOR `{other}`"
+        ))),
+    };
+    match result {
+        Ok(registry) => Ok(Some(Arc::new(registry))),
+        Err(ComputeBuildError::Unavailable(error)) if env_true("ARUNA_COMPUTE_OPTIONAL") => {
+            warn!(executor = %selected, reason = %error, "Compute executor unavailable; running without compute");
+            Ok(None)
+        }
+        Err(ComputeBuildError::Config(error) | ComputeBuildError::Unavailable(error)) => Err(error),
+    }
+}
+
+enum ComputeBuildError {
+    Config(String),
+    Unavailable(String),
+}
+
+impl From<String> for ComputeBuildError {
+    fn from(error: String) -> Self {
+        Self::Config(error)
+    }
+}
+
+impl From<&'static str> for ComputeBuildError {
+    fn from(error: &'static str) -> Self {
+        Self::Config(error.to_string())
+    }
+}
+
+#[cfg(feature = "docker")]
+async fn build_docker(
+    config: &Config,
+) -> Result<aruna_compute::ExecutorRegistry, ComputeBuildError> {
+    let disk_bytes = parse_disk_limit(
+        dotenvy::var("ARUNA_COMPUTE_DOCKER_DISK_BYTES")
+            .ok()
+            .as_deref(),
+    )?;
+    let endpoint = config
+        .s3_public_url
+        .clone()
+        .ok_or_else(|| "Docker executor requires S3_PUBLIC_URL".to_string())?;
+    if container_local_endpoint(&endpoint) {
+        return Err(
+            "Docker executor requires a container-reachable S3_PUBLIC_URL"
+                .to_string()
+                .into(),
+        );
+    }
+    if !config
+        .s3_address
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|address| !address.ip().is_loopback())
+    {
+        return Err("Docker executor requires a non-loopback S3_ADDRESS"
+            .to_string()
+            .into());
+    }
+    let docker_config = aruna_compute::DockerConfig {
+        default_disk_bytes: disk_bytes,
+        pull_deadline: env_duration("ARUNA_COMPUTE_DOCKER_PULL_DEADLINE", 300)?,
+        ..aruna_compute::DockerConfig::default()
+    };
+    let backend = aruna_compute::executor::docker::DockerBackend::with_config(docker_config)
+        .map_err(|error| error.to_string())?;
+    aruna_compute::ExecutorBackend::health(&backend)
+        .await
+        .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
+    info!("Docker executor backend enabled");
+    Ok(aruna_compute::ExecutorRegistry::new()
+        .with_backend(Arc::new(backend))
+        .with_workspace_endpoint(Some(endpoint), "eu-central-1".to_string()))
+}
+
+#[cfg(not(feature = "docker"))]
+async fn build_docker(
+    _config: &Config,
+) -> Result<aruna_compute::ExecutorRegistry, ComputeBuildError> {
+    Err("Docker executor feature is not compiled".to_string().into())
+}
+
+#[cfg(feature = "apptainer")]
+async fn build_apptainer(
+    config: &Config,
+) -> Result<aruna_compute::ExecutorRegistry, ComputeBuildError> {
+    let cgroup_root = dotenvy::var("ARUNA_COMPUTE_APPTAINER_CGROUP_ROOT")
+        .map(std::path::PathBuf::from)
+        .map_err(|_| {
+            "Apptainer executor requires ARUNA_COMPUTE_APPTAINER_CGROUP_ROOT".to_string()
+        })?;
+    let state_root = dotenvy::var("ARUNA_COMPUTE_APPTAINER_STATE_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("./compute-state/apptainer"));
+    let sif_cache = dotenvy::var("ARUNA_COMPUTE_APPTAINER_SIF_CACHE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("./compute-state/sif"));
+    let backend = aruna_compute::executor::apptainer::ApptainerBackend::with_config(
+        aruna_compute::ApptainerConfig {
+            state_root,
+            sif_cache,
+            cgroup_root,
+            stop_grace: env_duration("ARUNA_COMPUTE_STOP_GRACE", 10)?,
+            pull_deadline: env_duration("ARUNA_COMPUTE_APPTAINER_PULL_DEADLINE", 300)?,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    aruna_compute::ExecutorBackend::health(&backend)
+        .await
+        .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
+    info!("Apptainer executor backend enabled");
+    Ok(aruna_compute::ExecutorRegistry::new()
+        .with_backend(Arc::new(backend))
+        .with_workspace_endpoint(config.s3_public_url.clone(), "eu-central-1".to_string()))
+}
+
+#[cfg(not(feature = "apptainer"))]
+async fn build_apptainer(
+    _config: &Config,
+) -> Result<aruna_compute::ExecutorRegistry, ComputeBuildError> {
+    Err("Apptainer executor feature is not compiled"
+        .to_string()
+        .into())
+}
+
+#[cfg(feature = "kubernetes")]
+async fn build_kubernetes(
+    config: &Config,
+) -> Result<aruna_compute::ExecutorRegistry, ComputeBuildError> {
+    let storage_class = dotenvy::var("ARUNA_COMPUTE_K8S_STORAGE_CLASS")
+        .map_err(|_| "Kubernetes executor requires ARUNA_COMPUTE_K8S_STORAGE_CLASS".to_string())?;
+    let helper_image = dotenvy::var("ARUNA_COMPUTE_K8S_HELPER_IMAGE")
+        .map_err(|_| "Kubernetes executor requires ARUNA_COMPUTE_K8S_HELPER_IMAGE".to_string())?;
+    let s3_cidrs = dotenvy::var("ARUNA_COMPUTE_K8S_S3_CIDRS")
+        .ok()
+        .map(|value| parse_s3_cidrs(&value))
+        .transpose()?
+        .unwrap_or_default();
+    let s3_port = dotenvy::var("ARUNA_COMPUTE_K8S_S3_PORT")
+        .map(|value| value.parse::<u16>())
+        .unwrap_or(Ok(443))
+        .map_err(|_| "ARUNA_COMPUTE_K8S_S3_PORT must be a valid port".to_string())?;
+    let backend = aruna_compute::executor::kubernetes::KubernetesBackend::with_config(
+        aruna_compute::KubernetesConfig {
+            namespace: dotenvy::var("ARUNA_COMPUTE_K8S_NAMESPACE")
+                .unwrap_or_else(|_| "default".to_string()),
+            storage_class,
+            helper_image,
+            pull_deadline: env_duration("ARUNA_COMPUTE_K8S_PULL_DEADLINE", 300)?,
+            s3_cidrs,
+            s3_port,
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    aruna_compute::ExecutorBackend::health(&backend)
+        .await
+        .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
+    info!("Kubernetes executor backend enabled");
+    Ok(aruna_compute::ExecutorRegistry::new()
+        .with_backend(Arc::new(backend))
+        .with_workspace_endpoint(config.s3_public_url.clone(), "eu-central-1".to_string()))
+}
+
+#[cfg(not(feature = "kubernetes"))]
+async fn build_kubernetes(
+    _config: &Config,
+) -> Result<aruna_compute::ExecutorRegistry, ComputeBuildError> {
+    Err("Kubernetes executor feature is not compiled"
+        .to_string()
+        .into())
+}
+
+fn env_true(name: &str) -> bool {
+    dotenvy::var(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "kubernetes")]
+fn parse_s3_cidrs(value: &str) -> Result<Vec<String>, String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|cidr| !cidr.is_empty())
+        .map(|cidr| {
+            let (address, prefix) = cidr
+                .split_once('/')
+                .ok_or_else(|| format!("invalid Kubernetes S3 CIDR `{cidr}`"))?;
+            let address = address
+                .parse::<std::net::IpAddr>()
+                .map_err(|_| format!("invalid Kubernetes S3 CIDR `{cidr}`"))?;
+            let prefix = prefix
+                .parse::<u8>()
+                .map_err(|_| format!("invalid Kubernetes S3 CIDR `{cidr}`"))?;
+            let max_prefix = if address.is_ipv4() { 32 } else { 128 };
+            if prefix > max_prefix {
+                return Err(format!("invalid Kubernetes S3 CIDR `{cidr}`"));
+            }
+            Ok(cidr.to_string())
+        })
+        .collect()
+}
+
+#[cfg(any(feature = "docker", feature = "apptainer", feature = "kubernetes"))]
+fn env_duration(name: &str, default: u64) -> Result<std::time::Duration, String> {
+    let seconds = dotenvy::var(name)
+        .map(|value| value.parse::<u64>())
+        .unwrap_or(Ok(default))
+        .map_err(|_| format!("{name} must be a positive integer"))?;
+    if seconds == 0 {
+        return Err(format!("{name} must be greater than zero"));
+    }
+    Ok(std::time::Duration::from_secs(seconds))
+}
+
+#[cfg(any(feature = "docker", test))]
+fn parse_disk_limit(value: Option<&str>) -> Result<Option<u64>, &'static str> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let bytes = value
+        .parse::<u64>()
+        .map_err(|_| "disk ceiling must be an integer byte count")?;
+    if bytes == 0 {
+        return Err("disk ceiling must be greater than zero");
+    }
+    Ok(Some(bytes))
 }
 
 async fn seed_local_node_info(ctx: &DriverContext, config: &Config) -> Result<(), String> {
@@ -424,6 +696,10 @@ async fn seed_local_node_info(ctx: &DriverContext, config: &Config) -> Result<()
             api: config.api_public_url.clone(),
             s3: config.s3_public_url.clone(),
         },
+        ctx.compute_handle
+            .as_ref()
+            .map(|registry| registry.capabilities())
+            .unwrap_or_default(),
     )
     .await
 }
@@ -433,8 +709,13 @@ async fn shutdown_runtime(
     net_handle: Option<&NetHandle>,
     metadata_handle: Option<&MetadataHandle>,
     storage_handle: &StorageHandle,
+    jobs_runtime: Arc<JobsRuntime>,
 ) {
     readiness.begin_drain();
+
+    jobs_runtime
+        .shutdown(storage_handle, JOB_SHUTDOWN_GRACE)
+        .await;
 
     if let Some(net_handle) = net_handle {
         info!("Shutting down network services");
@@ -451,6 +732,20 @@ async fn shutdown_runtime(
     if let Err(error) = storage_handle.sync_all().await {
         error!(error = %error, "Failed to sync storage during shutdown");
     }
+}
+
+#[cfg(feature = "docker")]
+fn container_local_endpoint(endpoint: &str) -> bool {
+    let Some(host) = reqwest::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+    else {
+        return true;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback() || address.is_unspecified())
 }
 
 /// Ensures the maintained usage counter shards exist before background writes start.
@@ -517,7 +812,35 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         }
+    }
+
+    #[test]
+    fn accepts_disk_limit() {
+        assert_eq!(
+            parse_disk_limit(Some("10737418240")),
+            Ok(Some(10_737_418_240))
+        );
+    }
+
+    #[test]
+    fn rejects_disk_limit() {
+        assert_eq!(parse_disk_limit(None), Ok(None));
+        assert!(parse_disk_limit(Some("invalid")).is_err());
+        assert!(parse_disk_limit(Some("0")).is_err());
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn validates_k8s_cidrs() {
+        assert_eq!(
+            parse_s3_cidrs(" 10.0.0.0/8, 2001:db8::/32 ").unwrap(),
+            ["10.0.0.0/8", "2001:db8::/32"]
+        );
+        assert!(parse_s3_cidrs("10.0.0.0/33").is_err());
+        assert!(parse_s3_cidrs("2001:db8::/129").is_err());
+        assert!(parse_s3_cidrs("invalid/8").is_err());
     }
 
     #[tokio::test]
@@ -538,7 +861,7 @@ mod tests {
             response_tx.send(StorageEvent::SyncAllFinished);
         });
 
-        shutdown_runtime(&readiness, None, None, &storage_handle).await;
+        shutdown_runtime(&readiness, None, None, &storage_handle, JobsRuntime::new()).await;
 
         assert!(readiness.is_draining());
         worker.join().expect("storage responder should finish");

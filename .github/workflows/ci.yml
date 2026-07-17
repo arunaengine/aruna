@@ -2,10 +2,15 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -34,7 +39,7 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Run workspace tests
-        run: cargo test --workspace --all-targets --locked
+        run: cargo test --workspace --all-targets --all-features --locked
 
   fmt:
     runs-on: ubuntu-latest
@@ -72,7 +77,7 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Run clippy
-        run: cargo +nightly clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo +nightly clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   deny:
     runs-on: ubuntu-latest

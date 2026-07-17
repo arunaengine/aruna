@@ -6,3 +6,6 @@ docker/
 **/.env
 !.env.example
 docker/*
+demo/nextflow/.nextflow/
+demo/nextflow/.nextflow.log*
+demo/nextflow/work/

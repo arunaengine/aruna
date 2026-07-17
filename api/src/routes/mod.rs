@@ -11,10 +11,12 @@ pub mod credentials;
 pub mod drs;
 pub mod groups;
 pub mod info;
+pub mod jobs;
 pub mod metadata;
 pub mod notifications;
 pub mod onboarding;
 pub mod staging;
+pub mod tes;
 pub mod users;
 
 pub fn rest_router(state: Arc<ServerState>) -> Router {
@@ -27,8 +29,10 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
         .merge(connectors::router())
         .merge(credentials::router())
         .merge(groups::router())
+        .merge(jobs::router())
         .merge(metadata::router())
         .merge(notifications::router())
+        .merge(tes::router())
         .merge(users::router())
         .layer(from_fn_with_state(state.clone(), auth_middleware))
         .layer(from_fn_with_state(

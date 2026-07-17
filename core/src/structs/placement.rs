@@ -215,7 +215,7 @@ mod tests {
             affinity: vec![
                 AffinityRule {
                     matcher: LabelMatch {
-                        key: "aruna.io/kind".to_string(),
+                        key: "aruna-engine.org/kind".to_string(),
                         value: "Server".to_string(),
                     },
                     effect: AffinityEffect::Filter,

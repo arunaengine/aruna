@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::compute::ExecutorCapability;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -34,18 +35,20 @@ pub fn schedule_node_info_publish_effect(after: Duration) -> Effect {
     })
 }
 
-/// Assembles this node's info document from its current placement-view labels,
-/// the given urls, and current local usage, then persists it under the
+/// Assembles this node's info document from its executors, current
+/// placement-view labels, given urls, and local usage, then persists it under the
 /// single-writer node-info key without queuing replication.
 pub async fn seed_node_info_document(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
     urls: NodeUrls,
+    executors: Vec<ExecutorCapability>,
 ) -> Result<(), String> {
     let now = unix_timestamp_millis();
     let document = NodeInfoDocument {
         node_id,
+        executors,
         labels: current_placement_labels(ctx, node_id, realm_id).await?,
         urls,
         utilization: NodeUtilization {
@@ -68,8 +71,9 @@ pub async fn publish_node_info(
     node_id: NodeId,
     realm_id: RealmId,
     urls: NodeUrls,
+    executors: Vec<ExecutorCapability>,
 ) -> Result<(), String> {
-    seed_node_info_document(ctx, node_id, realm_id, urls).await?;
+    seed_node_info_document(ctx, node_id, realm_id, urls, executors).await?;
     replicate_node_info(ctx, node_id, realm_id).await
 }
 
@@ -235,6 +239,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         }
     }
 
@@ -317,6 +322,7 @@ mod tests {
                 api: None,
                 s3: Some("s3.example".to_string()),
             },
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -327,6 +333,7 @@ mod tests {
             .expect("seeded node info document");
         assert_eq!(stored.labels.get("tier").unwrap(), "hot");
         assert_eq!(stored.labels.get(KIND_LABEL_KEY).unwrap(), "server");
+        assert!(stored.executors.is_empty());
         assert_eq!(stored.utilization.storage_bytes_used, 0);
         assert!(read_outbox(&ctx).await.is_empty());
     }
@@ -362,6 +369,7 @@ mod tests {
                 api: None,
                 s3: Some("s3.example".to_string()),
             },
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -420,6 +428,11 @@ mod tests {
                 api: None,
                 s3: None,
             },
+            vec![ExecutorCapability {
+                kind: "docker".to_string(),
+                file_staging: true,
+                direct_s3: true,
+            }],
         )
         .await
         .unwrap();
@@ -446,6 +459,7 @@ mod tests {
         assert_eq!(second.labels, expected_labels);
         assert_eq!(second.labels.get("zone").unwrap(), "b");
         assert!(!second.labels.contains_key("stale"));
+        assert_eq!(second.executors.len(), 1);
         assert!(second.updated_at_ms >= first.updated_at_ms);
         assert!(second.utilization.heartbeat_at_ms >= first.utilization.heartbeat_at_ms);
 

@@ -1160,9 +1160,15 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(task_handle.clone()),
+            compute_handle: None,
         });
         initialize_net_incoming(driver_ctx.clone());
-        initialize_task_incoming(driver_ctx.clone(), task_handle).await;
+        initialize_task_incoming(
+            driver_ctx.clone(),
+            task_handle,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
+        )
+        .await;
 
         let realm_signing_key =
             SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
@@ -1246,6 +1252,7 @@ mod tests {
                 NodeCapabilities::management_node(realm_signing_key).unwrap(),
                 false,
                 Some(Arc::new(OidcValidator::new().unwrap())),
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );

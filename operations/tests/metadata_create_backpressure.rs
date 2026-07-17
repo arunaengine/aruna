@@ -57,9 +57,15 @@ async fn spawn_probe_node(with_drains: bool) -> Result<ProbeNode, BoxError> {
         blob_handle: None,
         metadata_handle: Some(metadata_handle),
         task_handle: task_handle.clone(),
+        compute_handle: None,
     });
     if let Some(task_handle) = task_handle {
-        initialize_task_incoming(context.clone(), task_handle).await;
+        initialize_task_incoming(
+            context.clone(),
+            task_handle,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
+        )
+        .await;
     }
     Ok(ProbeNode {
         _temp_dir: temp_dir,

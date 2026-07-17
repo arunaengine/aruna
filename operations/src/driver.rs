@@ -1,4 +1,5 @@
 use aruna_blob::blob::BlobHandle;
+use aruna_compute::ExecutorRegistry;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, NetEvent, SubOperationEvent};
@@ -21,13 +22,27 @@ use aruna_core::metadata::{MetadataError, MetadataEvent};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DriverContext {
     pub storage_handle: storage::StorageHandle,
     pub net_handle: Option<NetHandle>,
     pub blob_handle: Option<BlobHandle>,
     pub metadata_handle: Option<MetadataHandle>,
     pub task_handle: Option<TaskHandle>,
+    /// Enabled executor backends; `None` on nodes with no compute plane.
+    pub compute_handle: Option<std::sync::Arc<ExecutorRegistry>>,
+}
+
+impl std::fmt::Debug for DriverContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DriverContext")
+            .field("net_handle", &self.net_handle)
+            .field("blob_handle", &self.blob_handle.is_some())
+            .field("metadata_handle", &self.metadata_handle.is_some())
+            .field("task_handle", &self.task_handle.is_some())
+            .field("compute_handle", &self.compute_handle.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 const MAX_SUBOP_DEPTH: usize = 32;
@@ -447,6 +462,7 @@ mod test {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let operation = TestOperation::new();
@@ -516,6 +532,7 @@ mod test {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let operation = EffectOrderOperation::new();
@@ -610,6 +627,7 @@ mod test {
             blob_handle: Some(blob_handle),
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let observed = drive(StagingSourceDispatchOperation::new(), &context)
@@ -674,6 +692,7 @@ mod test {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let event = drive(RecursiveSubOperation::new(), &context)

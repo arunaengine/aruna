@@ -62,14 +62,20 @@ pub struct CreateUserAccessConfig {
 #[derive(Debug, PartialEq)]
 pub struct CreateUserAccessOperation {
     config: CreateUserAccessConfig,
+    key_id: String,
     state: CreateUserAccessState,
     output: Result<(String, UserAccess), CreateUserAccessError>,
 }
 
 impl CreateUserAccessOperation {
     pub fn new(config: CreateUserAccessConfig) -> Self {
+        Self::new_with_key(config, Ulid::r#gen().to_string())
+    }
+
+    pub fn new_with_key(config: CreateUserAccessConfig, key_id: String) -> Self {
         Self {
             config,
+            key_id,
             state: CreateUserAccessState::Init,
             output: Err(CreateUserAccessError::NotFinished),
         }
@@ -77,12 +83,11 @@ impl CreateUserAccessOperation {
 
     fn handle_init(&mut self) -> Effects {
         if let CreateUserAccessState::Init = self.state {
-            let key_id = Ulid::r#gen().to_string();
-            let access_key = match UserAccess::build_access_key(&self.config.user_identity, &key_id)
-            {
-                Ok(access_key) => access_key,
-                Err(err) => return self.handle_error(err.into()),
-            };
+            let access_key =
+                match UserAccess::build_access_key(&self.config.user_identity, &self.key_id) {
+                    Ok(access_key) => access_key,
+                    Err(err) => return self.handle_error(err.into()),
+                };
             let access = UserAccess {
                 access_key: access_key.clone(),
                 user_identity: self.config.user_identity,

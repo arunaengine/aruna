@@ -791,7 +791,10 @@ async fn failed_write_cleans() {
         .write_stream_to_location(location.clone(), operator, blob)
         .await;
 
-    assert!(matches!(event, BlobEvent::Error(BlobError::WriteError(_))));
+    assert!(matches!(
+        event,
+        BlobEvent::Error(BlobError::StreamFailed(_))
+    ));
     assert!(
         !std::path::Path::new(&location.get_full_path().unwrap()).exists(),
         "partial filesystem target remains"

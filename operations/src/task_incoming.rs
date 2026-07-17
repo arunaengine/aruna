@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::structs::{NotificationRecord, RealmConfigDocument, RealmId};
+use aruna_core::structs::{JobExecutionClass, NotificationRecord, RealmConfigDocument, RealmId};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::util::unix_timestamp_millis;
@@ -27,6 +27,11 @@ use crate::document_sync_outbox::{
     restore_document_sync_outbox_timers,
 };
 use crate::driver::{DriverContext, drive};
+use crate::jobs::drain::{JobClassBudget, process_job_queue_batch, restore_job_queue_timer};
+use crate::jobs::prune::{process_job_prune_batch, restore_job_prune_timer};
+use crate::jobs::runtime::JobsRuntime;
+use crate::jobs::store::release_job;
+use crate::jobs::{JOB_DRAIN_RETRY_AFTER, JOB_PRUNE_POLL_AFTER, JOB_PRUNE_RETRY_AFTER};
 use crate::metadata::materialization_queue::{
     METADATA_MATERIALIZATION_POLL_AFTER, METADATA_MATERIALIZATION_RETRY_AFTER,
     metadata_materialization_jobs_exist, process_metadata_materialization_batch,
@@ -98,9 +103,9 @@ type DrainRecord = (
     irokle::TopicId,
 );
 
-#[derive(Debug)]
 struct OperationsTaskHandler {
     context: Arc<DriverContext>,
+    jobs_runtime: Arc<JobsRuntime>,
     // In-memory retry-attempt counters keyed by timer. Loss on restart is fine:
     // a restarted node simply retries from the base interval.
     retry_backoff: std::sync::Mutex<HashMap<TaskKey, u32>>,
@@ -340,9 +345,10 @@ fn classify_deferred_record(
 }
 
 impl OperationsTaskHandler {
-    fn new(context: Arc<DriverContext>) -> Self {
+    fn new(context: Arc<DriverContext>, jobs_runtime: Arc<JobsRuntime>) -> Self {
         Self {
             context,
+            jobs_runtime,
             retry_backoff: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -1558,6 +1564,112 @@ impl OperationsTaskHandler {
         self.reschedule_timer(TaskKey::PruneNotifications, after)
             .await;
     }
+
+    async fn drain_job_queue(&self) {
+        if !self.jobs_runtime.is_started() {
+            return;
+        }
+        let Some(net_handle) = self.context.net_handle.as_ref() else {
+            warn!(key = ?TaskKey::DrainJobQueue, "Cannot drain job queue without net handle");
+            self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
+                .await;
+            return;
+        };
+        let node_id = net_handle.node_id();
+        let Some(claim_producer) = self.jobs_runtime.claim_producer().await else {
+            return;
+        };
+        // Per class: one aggregate would claim rows of a saturated class only to
+        // release them again on every pass.
+        let budget = JobClassBudget {
+            in_process: self
+                .jobs_runtime
+                .available_slots_for(JobExecutionClass::InProcess),
+            external: self
+                .jobs_runtime
+                .available_slots_for(JobExecutionClass::ExternalAttempt),
+        };
+
+        let reconciler = self.jobs_runtime.reconciler();
+        let result = match process_job_queue_batch(
+            &self.context.storage_handle,
+            node_id,
+            budget,
+            reconciler.as_ref(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                warn!(error = %error, "Failed to drain job queue");
+                self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
+                    .await;
+                return;
+            }
+        };
+
+        for record in result.claimed {
+            if self
+                .jobs_runtime
+                .available_slots_for(record.execution_class)
+                == 0
+            {
+                let Some(token) = record.claim.as_ref().map(|claim| claim.claim_token) else {
+                    warn!(job_id = %record.job_id, "Claimed job has no claim token; cannot release");
+                    continue;
+                };
+                if let Err(error) = release_job(
+                    &self.context.storage_handle,
+                    record.job_id,
+                    token,
+                    unix_timestamp_millis(),
+                )
+                .await
+                {
+                    warn!(job_id = %record.job_id, error = %error, "Failed to release excess job claim");
+                }
+                continue;
+            }
+            self.jobs_runtime.spawn(self.context.clone(), record);
+        }
+        drop(claim_producer);
+
+        // A per-job error stopped the batch after handing off what was claimed; back off
+        // and re-drive the remainder rather than hot-looping on the failure.
+        if result.retry_after_error {
+            self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
+                .await;
+            return;
+        }
+
+        // Due work left behind by a saturated class: wait for a completion kick, not
+        // a ZERO hot-loop.
+        match result.next_due_after {
+            Some(after) if after.is_zero() && result.deferred_saturated => {
+                self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
+                    .await;
+            }
+            Some(after) => {
+                self.reschedule_timer(TaskKey::DrainJobQueue, after).await;
+            }
+            None => {}
+        }
+    }
+
+    async fn prune_jobs(&self) {
+        let after = match process_job_prune_batch(&self.context).await {
+            Ok(outcome) if outcome.has_more => Duration::ZERO,
+            Ok(outcome) => outcome
+                .next_due_after
+                .unwrap_or(JOB_PRUNE_POLL_AFTER)
+                .min(JOB_PRUNE_POLL_AFTER),
+            Err(error) => {
+                warn!(error = %error, "Failed to prune jobs");
+                JOB_PRUNE_RETRY_AFTER
+            }
+        };
+        self.reschedule_timer(TaskKey::PruneJobs, after).await;
+    }
 }
 
 fn spawn_durable_queue_rearm(context: &Arc<DriverContext>, task_handle: &TaskHandle) {
@@ -1593,13 +1705,36 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
         restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
         restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
         restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
+        restore_job_queue_timer(&context.storage_handle, &task_handle).await;
+        restore_job_prune_timer(&context.storage_handle, &task_handle).await;
     }
 }
 
-pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: TaskHandle) {
+pub async fn initialize_task_incoming(
+    context: Arc<DriverContext>,
+    task_handle: TaskHandle,
+    jobs_runtime: Arc<JobsRuntime>,
+) {
     let handler_context = context.clone();
+    if context.compute_handle.is_some() {
+        jobs_runtime.set_reconciler(crate::jobs::workflow::reconcile::ComputeReconciler::new(
+            context.clone(),
+            Arc::downgrade(&jobs_runtime),
+        ));
+    }
+    let jobs_started = jobs_runtime.is_started();
+    if jobs_started
+        && let Err(error) = jobs_runtime
+            .recover_stale_jobs(&context.storage_handle)
+            .await
+    {
+        warn!(error = %error, "Failed to recover stale jobs at startup");
+    }
     task_handle
-        .set_inbound_handler(Arc::new(OperationsTaskHandler::new(handler_context)))
+        .set_inbound_handler(Arc::new(OperationsTaskHandler::new(
+            handler_context,
+            jobs_runtime,
+        )))
         .await;
     // Prime the origin-side watch interest cache from any digests already in
     // local storage so matching works before the first reconcile.
@@ -1620,6 +1755,10 @@ pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: 
     restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
     restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
     restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
+    if jobs_started {
+        restore_job_queue_timer(&context.storage_handle, &task_handle).await;
+    }
+    restore_job_prune_timer(&context.storage_handle, &task_handle).await;
 }
 
 /// Runs one document sync outbox drain pass synchronously against `context`.
@@ -1628,7 +1767,7 @@ pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: 
 /// window before the asynchronous drain timer fires; the flush is best-effort,
 /// so a failure simply leaves the records for the retryable drain.
 pub async fn drive_document_sync_outbox_drain(context: Arc<DriverContext>) {
-    OperationsTaskHandler::new(context)
+    OperationsTaskHandler::new(context, JobsRuntime::new())
         .drain_document_sync_outbox()
         .await;
 }
@@ -1701,6 +1840,12 @@ impl InboundTaskHandler for OperationsTaskHandler {
             TaskKey::PublishWatchInterest => {
                 self.publish_watch_interest().await;
             }
+            TaskKey::DrainJobQueue => {
+                self.drain_job_queue().await;
+            }
+            TaskKey::PruneJobs => {
+                self.prune_jobs().await;
+            }
         }
     }
 }
@@ -1711,6 +1856,7 @@ mod tests {
     use crate::document_sync_outbox::{
         outbox_key, read_outbox_record, restore_document_sync_outbox_timers, write_outbox_effect,
     };
+    use crate::jobs::store::{ClaimOutcome, claim_job, insert_job, read_job_record};
     use aruna_core::document::{
         DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent,
         DocumentSyncOutboxRecord, DocumentSyncRevision,
@@ -1723,8 +1869,8 @@ mod tests {
     use aruna_core::metadata::{MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord};
     use aruna_core::storage_entries::notification_outbox_write_entry;
     use aruna_core::structs::{
-        Actor, NotificationClass, NotificationKind, NotificationOutboxRecord, RealmConfigDocument,
-        RealmId, RealmNodeKind,
+        Actor, JobId, JobPayload, JobRecord, JobState, NotificationClass, NotificationKind,
+        NotificationOutboxRecord, RealmConfigDocument, RealmId, RealmNodeKind,
     };
     use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -1752,6 +1898,60 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = seed;
         iroh::SecretKey::from_bytes(&bytes).public()
+    }
+
+    #[tokio::test]
+    async fn paused_runtime_waits() {
+        // Startup recovery must wait until production has made S3 reachable.
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let task_handle = TaskHandle::new();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(task_handle.clone()),
+            compute_handle: None,
+        });
+        let job_id = JobId::new();
+        let record = JobRecord::new(
+            job_id,
+            JobPayload::Probe {
+                steps: 1,
+                step_sleep_ms: 0,
+                fail_at: None,
+                panic_at: None,
+                cleanup_marker: None,
+            },
+            UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
+            node(7),
+            1,
+            1,
+            None,
+        );
+        insert_job(&storage, &record).await.expect("insert job");
+        assert!(matches!(
+            claim_job(&storage, job_id, node(7), 2).await,
+            Ok(ClaimOutcome::Claimed(_))
+        ));
+        let runtime = JobsRuntime::new_paused();
+
+        initialize_task_incoming(context, task_handle, runtime.clone()).await;
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .expect("read job")
+            .expect("job exists");
+        assert_eq!(stored.state, JobState::Claimed);
+        assert_eq!(runtime.recover_stale_jobs(&storage).await.unwrap(), 1);
+        runtime.start();
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .expect("read job")
+            .expect("job exists");
+        assert_eq!(stored.state, JobState::Queued);
     }
 
     fn target() -> DocumentSyncTarget {
@@ -1836,10 +2036,11 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(task_handle),
+            compute_handle: None,
         });
 
         let before_ms = unix_timestamp_millis();
-        OperationsTaskHandler::new(context)
+        OperationsTaskHandler::new(context, JobsRuntime::new())
             .handle_timer(key.clone())
             .await;
         let after_ms = unix_timestamp_millis();
@@ -2051,6 +2252,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
         });
 
         // Every head-page record targets one shard topic with no local genesis,
@@ -2122,7 +2324,7 @@ mod tests {
             other => panic!("unexpected batch write event: {other:?}"),
         }
 
-        let handler = OperationsTaskHandler::new(context);
+        let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
         handler.drain_document_sync_outbox().await;
 
         assert_eq!(
@@ -2172,6 +2374,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(task_handle.clone()),
+            compute_handle: None,
         });
 
         // Install the config so this sole node is rank-0 of every shard, but do
@@ -2200,7 +2403,7 @@ mod tests {
             .await
             .expect("refresh peers");
 
-        initialize_task_incoming(context.clone(), task_handle.clone()).await;
+        initialize_task_incoming(context.clone(), task_handle.clone(), JobsRuntime::new()).await;
 
         let strategy_id = config.strategies.first().expect("a strategy").strategy_id;
         let topic = aruna_core::document::shard_topic_id(
@@ -2296,6 +2499,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
         }));
 
         // The live config resolves the shard's holders to this node only: the
@@ -2362,8 +2566,9 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
         });
-        let handler = OperationsTaskHandler::new(context);
+        let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             handler.drain_document_sync_outbox().await;
@@ -2484,8 +2689,9 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
-        let handler = OperationsTaskHandler::new(context);
+        let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
         let record = crate::document_sync_outbox::new_outbox_record(
             node(1),
             target(),
@@ -2532,8 +2738,9 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
-        let handler = OperationsTaskHandler::new(context);
+        let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
         let record = crate::document_sync_outbox::new_outbox_record(
             node(1),
             target(),
@@ -2583,8 +2790,9 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
-        let handler = OperationsTaskHandler::new(context);
+        let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
         let document_id = Ulid::from_parts(17, 1);
         let tombstone = MetadataGraphLifecycleRecord::deleted(
             "urn:graph:tombstone-before-retry".to_string(),
@@ -2703,8 +2911,9 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
-        let handler = OperationsTaskHandler::new(context);
+        let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
 
         let outcome = handler
             .finish_sync_drain_subbatch(
@@ -2797,8 +3006,9 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
-        let handler = OperationsTaskHandler::new(context);
+        let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
 
         let outcome = handler
             .finish_sync_drain_subbatch(
@@ -2957,8 +3167,9 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
-        let handler = OperationsTaskHandler::new(context);
+        let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
         handler.drain_notification_outbox().await;
 
         let inbox = read_inbox_records(&storage).await;
@@ -2988,8 +3199,9 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(task_handle.clone()),
+            compute_handle: None,
         });
-        let handler = OperationsTaskHandler::new(context);
+        let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
         handler.drain_notification_outbox().await;
 
         let remaining = read_notification_outbox_batch(&storage, None, 1024, None)
@@ -3037,8 +3249,9 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
-        let handler = OperationsTaskHandler::new(context);
+        let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
         handler.drain_notification_outbox().await;
 
         assert!(read_inbox_records(&storage).await.is_empty());
@@ -3096,6 +3309,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         crate::incoming::initialize_net_incoming(context_b.clone());
 
@@ -3105,8 +3319,9 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
-        let handler = OperationsTaskHandler::new(context_a);
+        let handler = OperationsTaskHandler::new(context_a, JobsRuntime::new());
         handler.drain_notification_outbox().await;
 
         assert_eq!(read_inbox_records(&storage_b).await, vec![record]);

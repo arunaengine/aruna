@@ -190,6 +190,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
         });
 
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
@@ -205,6 +206,7 @@ mod tests {
                 NodeCapabilities::local_node(realm_id).unwrap(),
                 false,
                 None,
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );

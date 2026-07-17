@@ -1051,6 +1051,7 @@ mod test {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let result = drive(
@@ -1103,6 +1104,7 @@ mod test {
             blob_handle: Some(blob_handle),
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let user_id = aruna_core::UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32]));
@@ -1254,6 +1256,7 @@ mod test {
             blob_handle: Some(blob_handle),
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let user_id = aruna_core::UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32]));

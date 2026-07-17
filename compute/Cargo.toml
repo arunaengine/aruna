@@ -1,0 +1,41 @@
+[package]
+name = "aruna-compute"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["docker", "apptainer", "kubernetes"]
+docker = ["dep:bollard"]
+apptainer = ["dep:nix", "dep:rustix"]
+kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:json-patch"]
+
+[dependencies]
+aruna-core = { workspace = true }
+async-trait = { workspace = true }
+bollard = { workspace = true, optional = true, features = ["ssl"] }
+bytes = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tar = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+nix = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true }
+kube = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, optional = true }
+json-patch = { workspace = true, optional = true }
+
+[dev-dependencies]
+http = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true, features = ["util"] }

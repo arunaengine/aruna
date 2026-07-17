@@ -470,6 +470,20 @@ pub(crate) fn require_realm_auth(
     Ok(auth)
 }
 
+/// Realm auth that additionally rejects path-restricted (delegated) tokens. User-scoped
+/// surfaces cannot honour a token's path confinement, so a delegated token must not reach
+/// them even when a per-resource permission check would otherwise pass.
+pub(crate) fn require_unrestricted_realm_auth(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+) -> ServerResult<AuthContext> {
+    let auth = require_realm_auth(state, auth)?;
+    if auth.path_restrictions.is_some() {
+        return Err(ServerError::Forbidden);
+    }
+    Ok(auth)
+}
+
 pub(crate) async fn ensure_permission(
     state: &ServerState,
     auth: &AuthContext,
@@ -576,12 +590,14 @@ mod test {
                 blob_handle: None,
                 metadata_handle: None,
                 task_handle: None,
+                compute_handle: None,
             }),
             realm_id,
             node_id,
             NodeCapabilities::local_node(realm_id).unwrap(),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -796,6 +812,7 @@ mod test {
             net_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
             blob_handle: None,
         });
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
@@ -828,6 +845,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
         let token = drive(
@@ -1213,6 +1231,7 @@ mod test {
             net_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
             blob_handle: None,
         });
 
@@ -1275,6 +1294,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1316,6 +1336,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1350,6 +1371,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1396,6 +1418,7 @@ mod test {
             net_handle: Some(net_handle.clone()),
             metadata_handle: None,
             task_handle: Some(task_handle),
+            compute_handle: None,
             blob_handle: None,
         });
 
@@ -1451,6 +1474,7 @@ mod test {
             capabilities.clone(),
             true,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1498,6 +1522,7 @@ mod test {
             net_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
             blob_handle: None,
         });
 
@@ -1562,6 +1587,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1642,6 +1668,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1682,6 +1709,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1715,6 +1743,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1770,6 +1799,7 @@ mod test {
             net_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
             blob_handle: None,
         });
 
@@ -1804,6 +1834,7 @@ mod test {
             capabilities,
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1827,6 +1858,7 @@ mod test {
             net_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
             blob_handle: None,
         });
 
@@ -1866,6 +1898,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 

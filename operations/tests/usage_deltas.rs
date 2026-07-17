@@ -82,6 +82,7 @@ async fn setup() -> Harness {
             blob_handle: Some(blob_handle),
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         },
         realm_id,
         node_id,

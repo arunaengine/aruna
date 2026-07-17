@@ -3,24 +3,25 @@
 use crate::s3::checksum::{
     ApplyChecksums, ChecksumSelection, UploadChecksumRequest, checksum_mode_enabled,
     encode_checksums, parse_complete_multipart_checksum_request, parse_upload_checksum_request,
-    validate_composite_part_count, validate_delete_checksum,
+    validate_composite_part_count, validate_delete_checksum, validate_trailing_checksum,
+    verify_trailer_stream,
 };
 use crate::s3::cors::{bucket_cors_to_get_output, dto_to_bucket_cors};
 use crate::s3::error::IntoS3Error;
 use crate::s3::s3_server::DeleteObjectsBody;
 use crate::s3::util::{
-    checked_size, checksum_response_hashes, convert_input, multipart_checksum_type_from_s3,
-    parse_completed_part, parse_copy_source, parse_copy_source_range,
-    parse_multipart_checksum_hint, parse_multipart_part_number, parse_upload_id, parse_version_id,
-    reject_sse, s3_checksum_algorithm_from_core, s3_checksum_type_from_multipart,
-    validate_object_key,
+    checked_size, checksum_response_hashes, convert_input, declared_trailer_algorithm,
+    multipart_checksum_type_from_s3, parse_completed_part, parse_copy_source,
+    parse_copy_source_range, parse_multipart_checksum_hint, parse_multipart_part_number,
+    parse_upload_id, parse_version_id, reject_sse, s3_checksum_algorithm_from_core,
+    s3_checksum_type_from_multipart, validate_object_key,
 };
 use aruna_core::NodeId;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
-    AuthContext, BucketInfo, Permission, RealmId, UserAccess, WatchEvent, WatchEventDetail,
-    WatchEventKind, blob_bucket_permission_path, blob_object_permission_path,
+    AuthContext, BlobHeadKey, BucketInfo, Permission, RealmId, UserAccess, WatchEvent,
+    WatchEventDetail, WatchEventKind, blob_bucket_permission_path, blob_object_permission_path,
     data_watch_resource_path,
 };
 use aruna_core::types::UserId;
@@ -75,6 +76,7 @@ use aruna_operations::s3::list_objects_v2::{
     ListObjectsV2ContinuationToken, ListObjectsV2Input as LOV2I, ListObjectsV2Operation,
 };
 use aruna_operations::s3::list_parts::{ListPartsInput as LPI, ListPartsOperation};
+use aruna_operations::s3::listing::common_prefix_of;
 use aruna_operations::s3::put_bucket_replication::{
     DeleteBucketReplicationOperation, GetBucketReplicationOperation, PutBucketReplicationOperation,
 };
@@ -105,13 +107,14 @@ use s3s::dto::{
     GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput,
     Initiator, LastModified, ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput,
     ListMultipartUploadsOutput, ListObjectVersionsInput, ListObjectVersionsOutput,
-    ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, MetadataDirective,
-    MultipartUpload as S3MultipartUpload, Object, ObjectAttributes, ObjectPart, ObjectVersion,
-    ObjectVersionStorageClass, Owner, Part, PutBucketCorsInput, PutBucketCorsOutput,
-    PutBucketReplicationInput, PutBucketReplicationOutput, PutBucketVersioningInput,
-    PutBucketVersioningOutput, PutObjectInput, PutObjectOutput, ReplicationConfiguration,
-    ReplicationRule, ReplicationRuleStatus, StorageClass, StreamingBlob, Timestamp,
-    TimestampFormat, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
+    ListObjectsInput, ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, ListPartsInput,
+    ListPartsOutput, MetadataDirective, MultipartUpload as S3MultipartUpload, Object,
+    ObjectAttributes, ObjectPart, ObjectVersion, ObjectVersionStorageClass, Owner, Part,
+    PutBucketCorsInput, PutBucketCorsOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
+    PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput, PutObjectOutput,
+    ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, StorageClass, StreamingBlob,
+    Timestamp, TimestampFormat, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput,
+    UploadPartOutput,
 };
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
@@ -659,6 +662,118 @@ impl ArunaS3Service {
             })
             .transpose()
     }
+
+    /// Runs one listing page shared by ListObjects and ListObjectsV2.
+    async fn run_object_listing(
+        &self,
+        input: LOV2I,
+        owner: Option<Owner>,
+        url_encoded: bool,
+    ) -> S3Result<ObjectListingPage> {
+        let result = drive(ListObjectsV2Operation::new(input), &self.state)
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to list objects"))?;
+
+        let encode_field = |value: String| -> String {
+            if url_encoded {
+                utf8_percent_encode(&value, S3_URL_ENCODE_SET).to_string()
+            } else {
+                value
+            }
+        };
+
+        let contents: Vec<Object> = result
+            .objects
+            .into_iter()
+            .map(|object| {
+                let response_fields = self.build_object_response_fields(
+                    object.location.as_ref(),
+                    object.source_metadata.as_ref(),
+                    object.last_refresh,
+                    object.version_created_at,
+                );
+                Object {
+                    e_tag: response_fields.e_tag,
+                    key: Some(encode_field(object.head.key)),
+                    last_modified: response_fields.last_modified,
+                    owner: owner.clone(),
+                    size: response_fields.content_length,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let common_prefixes: Vec<CommonPrefix> = result
+            .common_prefixes
+            .into_iter()
+            .map(|prefix| CommonPrefix {
+                prefix: Some(encode_field(prefix)),
+            })
+            .collect();
+
+        Ok(ObjectListingPage {
+            contents,
+            common_prefixes,
+            continuation_token: result.continuation_token,
+        })
+    }
+}
+
+/// One page of a shared object listing before protocol-specific mapping.
+struct ObjectListingPage {
+    contents: Vec<Object>,
+    common_prefixes: Vec<CommonPrefix>,
+    continuation_token: Option<ListObjectsV2ContinuationToken>,
+}
+
+/// Resumes a delimited ListObjects page past the group the marker collapses
+/// into, because such a marker names an already returned common prefix.
+fn marker_continuation_token(
+    bucket: &str,
+    marker: Option<&str>,
+    prefix: Option<&str>,
+    delimiter: Option<&str>,
+) -> S3Result<Option<ListObjectsV2ContinuationToken>> {
+    let Some(marker) = marker.filter(|marker| !marker.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(group) = common_prefix_of(marker, prefix, delimiter) else {
+        return Ok(None);
+    };
+    let last_key = BlobHeadKey::object_prefix(bucket, marker)
+        .map_err(|_| s3_error!(InvalidArgument, "Invalid marker"))?;
+    Ok(Some(ListObjectsV2ContinuationToken {
+        last_key,
+        last_common_prefix: Some(group),
+    }))
+}
+
+/// V1 `NextMarker`. A delimited page may end on a common prefix, and a page whose keys
+/// were all filtered out has no trailing `<Key>` to resume from, so both dead-end without
+/// one. An undelimited page with contents needs none: the client resumes from its last key.
+fn next_marker_for(
+    delimiter: Option<&str>,
+    token: Option<&ListObjectsV2ContinuationToken>,
+    contents_empty: bool,
+) -> Option<String> {
+    let token = token?;
+    if delimiter.is_some() || contents_empty {
+        next_marker_of(token)
+    } else {
+        None
+    }
+}
+
+/// Names the last entry of a truncated page, preferring the common prefix the
+/// page stopped inside.
+fn next_marker_of(token: &ListObjectsV2ContinuationToken) -> Option<String> {
+    if let Some(group) = token.last_common_prefix.clone() {
+        return Some(group);
+    }
+    BlobHeadKey::from_bytes(&token.last_key)
+        .ok()
+        .map(|head| head.key)
 }
 
 fn reference_metadata_refresh(
@@ -1004,23 +1119,6 @@ impl S3 for ArunaS3Service {
             .map(|bucket_info| bucket_info.group_id)
             .unwrap_or(user_access.group_id);
 
-        let result = drive(
-            ListObjectsV2Operation::new(LOV2I {
-                bucket: bucket.clone(),
-                group_id,
-                continuation_token,
-                max_keys: Some(max_keys),
-                prefix: prefix.clone(),
-                delimiter: delimiter.clone(),
-                start_after: start_after.clone(),
-            }),
-            &self.state,
-        )
-        .await
-        .and_then(|result| result.transpose())
-        .map_err(IntoS3Error::into_s3_error)?
-        .ok_or_else(|| s3_error!(InternalError, "Failed to list objects"))?;
-
         let owner = req.input.fetch_owner.unwrap_or(false).then(|| Owner {
             display_name: None,
             id: Some(group_id.to_string()),
@@ -1038,36 +1136,30 @@ impl S3 for ArunaS3Service {
             }
         };
 
-        let contents: Vec<Object> = result
-            .objects
-            .into_iter()
-            .map(|object| {
-                let response_fields = self.build_object_response_fields(
-                    object.location.as_ref(),
-                    object.source_metadata.as_ref(),
-                    object.last_refresh,
-                    object.version_created_at,
-                );
-                Object {
-                    e_tag: response_fields.e_tag,
-                    key: Some(encode_field(object.head.key)),
-                    last_modified: response_fields.last_modified,
-                    owner: owner.clone(),
-                    size: response_fields.content_length,
-                    ..Default::default()
-                }
-            })
-            .collect();
-        let common_prefixes: Vec<CommonPrefix> = result
-            .common_prefixes
-            .into_iter()
-            .map(|prefix| CommonPrefix {
-                prefix: Some(encode_field(prefix)),
-            })
-            .collect();
+        let page = self
+            .run_object_listing(
+                LOV2I {
+                    bucket: bucket.clone(),
+                    group_id,
+                    continuation_token,
+                    max_keys: Some(max_keys),
+                    prefix: prefix.clone(),
+                    delimiter: delimiter.clone(),
+                    start_after: start_after.clone(),
+                },
+                owner,
+                url_encoded,
+            )
+            .await?;
+
+        let ObjectListingPage {
+            contents,
+            common_prefixes,
+            continuation_token: result_token,
+        } = page;
         let key_count = contents.len() + common_prefixes.len();
         let next_continuation_token =
-            Self::encode_list_objects_v2_continuation_token(result.continuation_token.as_ref())?;
+            Self::encode_list_objects_v2_continuation_token(result_token.as_ref())?;
         let is_truncated = next_continuation_token.is_some();
 
         Ok(S3Response::new(ListObjectsV2Output {
@@ -1089,9 +1181,115 @@ impl S3 for ArunaS3Service {
 
     #[tracing::instrument(err, skip(self, req))]
     #[allow(clippy::blocks_in_conditions)]
+    async fn list_objects(
+        &self,
+        req: S3Request<ListObjectsInput>,
+    ) -> S3Result<S3Response<ListObjectsOutput>> {
+        debug!(
+            bucket = %req.input.bucket,
+            prefix = ?req.input.prefix,
+            max_keys = ?req.input.max_keys,
+            "Received LIST OBJECTS Request"
+        );
+
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+        let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        let max_keys = match req.input.max_keys {
+            None => ListObjectsV2Operation::DEFAULT_MAX_KEYS,
+            Some(max_keys) => usize::try_from(max_keys)
+                .map_err(|_| s3_error!(InvalidArgument, "max-keys must be non-negative"))?
+                .min(ListObjectsV2Operation::DEFAULT_MAX_KEYS),
+        };
+        let bucket = req.input.bucket.clone();
+        let prefix = req.input.prefix.clone();
+        let delimiter = req.input.delimiter.clone();
+        let marker = req.input.marker.clone();
+
+        let group_id = bucket_info
+            .as_ref()
+            .map(|bucket_info| bucket_info.group_id)
+            .unwrap_or(user_access.group_id);
+
+        let continuation_token = marker_continuation_token(
+            &bucket,
+            marker.as_deref(),
+            prefix.as_deref(),
+            delimiter.as_deref(),
+        )?;
+        let start_after = continuation_token
+            .is_none()
+            .then(|| marker.clone())
+            .flatten();
+
+        let owner = Some(Owner {
+            display_name: None,
+            id: Some(group_id.to_string()),
+        });
+        let url_encoded = req
+            .input
+            .encoding_type
+            .as_ref()
+            .is_some_and(|encoding_type| encoding_type.as_str() == EncodingType::URL);
+        let encode_field = |value: String| -> String {
+            if url_encoded {
+                utf8_percent_encode(&value, S3_URL_ENCODE_SET).to_string()
+            } else {
+                value
+            }
+        };
+
+        let page = self
+            .run_object_listing(
+                LOV2I {
+                    bucket: bucket.clone(),
+                    group_id,
+                    continuation_token,
+                    max_keys: Some(max_keys),
+                    prefix: prefix.clone(),
+                    delimiter: delimiter.clone(),
+                    start_after,
+                },
+                owner,
+                url_encoded,
+            )
+            .await?;
+
+        let ObjectListingPage {
+            contents,
+            common_prefixes,
+            continuation_token: result_token,
+        } = page;
+        let is_truncated = result_token.is_some();
+        let next_marker = next_marker_for(
+            delimiter.as_deref(),
+            result_token.as_ref(),
+            contents.is_empty(),
+        )
+        .map(&encode_field);
+
+        Ok(S3Response::new(ListObjectsOutput {
+            name: Some(bucket),
+            prefix: prefix.map(&encode_field),
+            marker: marker.map(&encode_field),
+            max_keys: Some(i32::try_from(max_keys).unwrap_or(i32::MAX)),
+            is_truncated: Some(is_truncated),
+            next_marker,
+            contents: Some(contents),
+            common_prefixes: Some(common_prefixes),
+            delimiter: delimiter.map(&encode_field),
+            encoding_type: req.input.encoding_type,
+            ..Default::default()
+        }))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    #[allow(clippy::blocks_in_conditions)]
     async fn put_object(
         &self,
-        req: S3Request<PutObjectInput>,
+        mut req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
         debug!(
             bucket = %req.input.bucket,
@@ -1116,7 +1314,13 @@ impl S3 for ArunaS3Service {
         )?;
         validate_object_key(&req.input.key)?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
-        let checksum_request = parse_upload_checksum_request(&req.headers)?;
+        let trailer_algorithm = declared_trailer_algorithm(
+            &req.headers,
+            req.trailing_headers.is_some(),
+            req.input.checksum_algorithm.as_ref(),
+        )?;
+        let checksum_request = parse_upload_checksum_request(&req.headers, trailer_algorithm)?;
+        let trailing_headers = req.trailing_headers.clone();
         let replication_auth = AuthContext {
             user_id: user_access.user_identity,
             realm_id: user_access.user_identity.realm_id,
@@ -1130,6 +1334,16 @@ impl S3 for ArunaS3Service {
             .map(|bucket_info| bucket_info.group_id)
             .unwrap_or(user_access.group_id);
         let quota_ceiling = self.resolve_quota_ceiling(group_id).await?;
+        if let (Some(algorithm), Some(headers)) = (trailer_algorithm, trailing_headers.clone())
+            && let Some(body) = req.input.body.take()
+        {
+            req.input.body = Some(verify_trailer_stream(
+                body,
+                algorithm,
+                checksum_request.checksum_type.as_str() == ChecksumType::COMPOSITE,
+                move || headers.read(Clone::clone),
+            ));
+        }
         let input = convert_input(req.input)?;
         let config = PutObjectConfig {
             user_id: user_access.user_identity,
@@ -1150,6 +1364,12 @@ impl S3 for ArunaS3Service {
             .and_then(|result| result.transpose())
             .map_err(IntoS3Error::into_s3_error)?
             .ok_or_else(|| s3_error!(InternalError, "Failed to process PUT request"))?;
+        validate_trailing_checksum(
+            trailer_algorithm,
+            &checksum_request.checksum_type,
+            trailing_headers.as_ref(),
+            &result.location.hashes,
+        )?;
 
         self.put_object_response(
             &checksum_request,
@@ -1390,7 +1610,7 @@ impl S3 for ArunaS3Service {
     #[allow(clippy::blocks_in_conditions)]
     async fn upload_part(
         &self,
-        req: S3Request<UploadPartInput>,
+        mut req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
         debug!(
             bucket = %req.input.bucket,
@@ -1410,11 +1630,27 @@ impl S3 for ArunaS3Service {
                 || req.input.sse_customer_key_md5.is_some(),
         )?;
         validate_object_key(&req.input.key)?;
-        let checksum_request = parse_upload_checksum_request(&req.headers)?;
+        let trailer_algorithm = declared_trailer_algorithm(
+            &req.headers,
+            req.trailing_headers.is_some(),
+            req.input.checksum_algorithm.as_ref(),
+        )?;
+        let checksum_request = parse_upload_checksum_request(&req.headers, trailer_algorithm)?;
+        let trailing_headers = req.trailing_headers.clone();
         let upload_id = parse_upload_id(&req.input.upload_id)?;
         let body = req
             .input
             .body
+            .take()
+            .map(|body| match (trailer_algorithm, trailing_headers.clone()) {
+                (Some(algorithm), Some(headers)) => verify_trailer_stream(
+                    body,
+                    algorithm,
+                    checksum_request.checksum_type.as_str() == ChecksumType::COMPOSITE,
+                    move || headers.read(Clone::clone),
+                ),
+                _ => body,
+            })
             .map(BackendStream::new_from_boxed)
             .ok_or_else(|| s3_error!(InvalidRequest, "Missing body"))?;
 
@@ -1439,6 +1675,12 @@ impl S3 for ArunaS3Service {
             .and_then(|result| result.transpose())
             .map_err(IntoS3Error::into_s3_error)?
             .ok_or_else(|| s3_error!(InternalError, "Failed to upload part"))?;
+        validate_trailing_checksum(
+            trailer_algorithm,
+            &checksum_request.checksum_type,
+            trailing_headers.as_ref(),
+            &result.location.hashes,
+        )?;
 
         let mut output = UploadPartOutput {
             e_tag: result
@@ -2802,6 +3044,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([40u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
@@ -2915,6 +3158,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         (storage_dir, context, net)
     }
@@ -3135,6 +3379,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let refresh = ReferenceMetadataRefresh {
             bucket: "bucket".to_string(),
@@ -3232,6 +3477,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = aruna_core::structs::RealmId([9u8; 32]);
 
@@ -3559,6 +3805,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([36u8; 32]);
         let node_id = NodeId::from_bytes(&[0u8; 32]).unwrap();
@@ -3767,6 +4014,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([2u8; 32]);
         let group_id = Ulid::r#gen();
@@ -3845,6 +4093,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([3u8; 32]);
         let group_id = Ulid::r#gen();
@@ -3920,6 +4169,73 @@ mod tests {
         assert_eq!(total_pages, 2);
     }
 
+    #[test]
+    fn marker_resumes_past_group() {
+        // A delimited marker names an already returned common prefix, so the
+        // next page must skip that whole group instead of re-listing it.
+        let token = marker_continuation_token("bucket", Some("a/"), None, Some("/"))
+            .unwrap()
+            .expect("delimited marker must resume past its group");
+        assert_eq!(token.last_common_prefix.as_deref(), Some("a/"));
+        assert_eq!(
+            BlobHeadKey::from_bytes(&token.last_key).unwrap().key,
+            "a/".to_string()
+        );
+    }
+
+    #[test]
+    fn marker_without_delimiter_is_plain() {
+        assert!(
+            marker_continuation_token("bucket", Some("a/b.txt"), None, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            marker_continuation_token("bucket", None, None, Some("/"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn next_marker_prefers_group() {
+        let token = ListObjectsV2ContinuationToken {
+            last_key: BlobHeadKey::object_prefix("bucket", "a/z.txt").unwrap(),
+            last_common_prefix: Some("a/".to_string()),
+        };
+        assert_eq!(next_marker_of(&token).as_deref(), Some("a/"));
+
+        let token = ListObjectsV2ContinuationToken {
+            last_key: BlobHeadKey::object_prefix("bucket", "b.txt").unwrap(),
+            last_common_prefix: None,
+        };
+        assert_eq!(next_marker_of(&token).as_deref(), Some("b.txt"));
+    }
+
+    #[test]
+    fn marker_rescues_page() {
+        // An undelimited page that filtered every key it scanned is truncated with
+        // no `<Key>` to resume from, so it must carry the token-derived marker.
+        let token = ListObjectsV2ContinuationToken {
+            last_key: BlobHeadKey::object_prefix("bucket", "b.txt").unwrap(),
+            last_common_prefix: None,
+        };
+
+        assert_eq!(
+            next_marker_for(None, Some(&token), true).as_deref(),
+            Some("b.txt")
+        );
+        // A page with contents resumes from its last key: S3 sends no NextMarker.
+        assert_eq!(next_marker_for(None, Some(&token), false), None);
+        // A delimited page may end on a common prefix, so it always reports one.
+        assert_eq!(
+            next_marker_for(Some("/"), Some(&token), false).as_deref(),
+            Some("b.txt")
+        );
+        // A complete listing has nothing to resume.
+        assert_eq!(next_marker_for(None, None, true), None);
+    }
+
     #[tokio::test]
     async fn test_list_objects_v2_prefix_only_page_is_not_truncated() {
         let storage_dir = tempfile::tempdir().unwrap();
@@ -3931,6 +4247,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([33u8; 32]);
         let group_id = Ulid::r#gen();
@@ -3997,6 +4314,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([34u8; 32]);
         let group_id = Ulid::r#gen();
@@ -4118,6 +4436,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([4u8; 32]);
         let group_id = Ulid::r#gen();
@@ -4203,6 +4522,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([5u8; 32]);
         let group_id = Ulid::r#gen();
@@ -4300,6 +4620,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([6u8; 32]);
         let group_id = Ulid::r#gen();
@@ -4365,6 +4686,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([7u8; 32]);
         let group_id = Ulid::r#gen();
@@ -4440,6 +4762,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([8u8; 32]);
         let service =
@@ -4477,6 +4800,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([35u8; 32]);
         let group_id = Ulid::r#gen();
@@ -4538,6 +4862,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([36u8; 32]);
         let group_id = Ulid::r#gen();
@@ -4613,6 +4938,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([37u8; 32]);
         let group_id = Ulid::r#gen();

@@ -399,6 +399,7 @@ async fn build_context(with_metadata: bool) -> Result<TestContext, Box<dyn std::
         blob_handle: None,
         metadata_handle,
         task_handle: None,
+        compute_handle: None,
     });
     Ok(TestContext {
         _storage_dir: storage_dir,

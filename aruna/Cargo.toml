@@ -6,10 +6,17 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["docker", "apptainer", "kubernetes"]
+docker = ["aruna-compute/docker"]
+apptainer = ["aruna-compute/apptainer"]
+kubernetes = ["aruna-compute/kubernetes"]
+
 [dependencies]
 # Aruna modules
 aruna-api = { workspace = true }
 aruna-blob = { workspace = true }
+aruna-compute = { workspace = true, default-features = false }
 aruna-core = { workspace = true }
 aruna-net = { workspace = true }
 aruna-operations = { workspace = true }
@@ -50,3 +57,4 @@ rand = { workspace = true }
 axum = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 tempfile = { workspace = true }
+tokio-util = { workspace = true }

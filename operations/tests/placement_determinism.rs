@@ -151,6 +151,11 @@ async fn shared_node_info_topic_propagates_placement_authoritative_document()
         publisher_id,
         realm_id,
         urls.clone(),
+        vec![aruna_core::compute::ExecutorCapability {
+            kind: "docker".to_string(),
+            file_staging: true,
+            direct_s3: true,
+        }],
     )
     .await
     .map_err(std::io::Error::other)?;
@@ -197,6 +202,7 @@ async fn shared_node_info_topic_propagates_placement_authoritative_document()
     };
 
     assert_eq!(received.node_id, publisher_id);
+    assert_eq!(received.executors.len(), 1);
     assert_eq!(received.labels, expected_labels);
     assert_eq!(received.labels.get("tier").map(String::as_str), Some("hot"));
     assert_eq!(received.urls, urls);
@@ -486,10 +492,16 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
         blob_handle: None,
         metadata_handle: Some(metadata_handle),
         task_handle: Some(task_handle.clone()),
+        compute_handle: None,
     });
 
     initialize_net_incoming(context.clone());
-    initialize_task_incoming(context.clone(), task_handle).await;
+    initialize_task_incoming(
+        context.clone(),
+        task_handle,
+        aruna_operations::jobs::runtime::JobsRuntime::new(),
+    )
+    .await;
 
     Ok(TestNode {
         _temp_dir: temp_dir,

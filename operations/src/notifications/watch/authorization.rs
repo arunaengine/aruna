@@ -580,6 +580,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
         let prefix = data_watch_resource_path(group_id, node_id, "bucket", "");
 
@@ -617,6 +618,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         assert_eq!(

@@ -63,11 +63,13 @@ pub(crate) type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 pub(crate) const AWS_REGION: &str = "eu-central-1";
 
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct S3Endpoint {
     pub(crate) endpoint_url: String,
     pub(crate) host: String,
 }
 
+#[derive(Clone)]
 pub(crate) struct S3Credentials {
     pub(crate) access_key_id: String,
     pub(crate) access_secret: String,
@@ -615,6 +617,7 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
             api: None,
             s3: None,
         },
+        Vec::new(),
     )
     .await
     .map_err(std::io::Error::other)?;
@@ -744,6 +747,7 @@ async fn spawn_joiner_node_with_mode(
             api: config.api_public_url.clone(),
             s3: config.s3_public_url.clone(),
         },
+        Vec::new(),
     )
     .await
     .map_err(std::io::Error::other)?;
@@ -837,9 +841,15 @@ async fn initialize_context(
         blob_handle,
         metadata_handle,
         task_handle: Some(task_handle.clone()),
+        compute_handle: None,
     });
     initialize_net_incoming(context.clone());
-    initialize_task_incoming(context.clone(), task_handle).await;
+    initialize_task_incoming(
+        context.clone(),
+        task_handle,
+        aruna_operations::jobs::runtime::JobsRuntime::new(),
+    )
+    .await;
     Ok(context)
 }
 
@@ -872,8 +882,18 @@ async fn spawn_rest_server(
     node_id: iroh::PublicKey,
     capabilities: NodeCapabilities,
 ) -> TestResult<(String, Arc<ServerState>, JoinHandle<()>)> {
-    let state =
-        Arc::new(ServerState::new(context, realm_id, node_id, capabilities, false, None).await);
+    let state = Arc::new(
+        ServerState::new(
+            context,
+            realm_id,
+            node_id,
+            capabilities,
+            false,
+            None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
+        )
+        .await,
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let server = Server::new(

@@ -690,6 +690,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         initialize_net_incoming(context.clone());
         Node {

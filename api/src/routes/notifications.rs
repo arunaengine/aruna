@@ -1,4 +1,6 @@
-use crate::auth::{ValidatedArunaBearerTokenCarrier, require_realm_auth};
+use crate::auth::{
+    ValidatedArunaBearerTokenCarrier, require_realm_auth, require_unrestricted_realm_auth,
+};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
@@ -219,20 +221,6 @@ fn record_watch_creation_denial(state: &ServerState, reason: WatchAuthorizationM
         reason = reason.as_str(),
         "Notification watch creation denied"
     );
-}
-
-/// Watch subscriptions cannot retain token-only path restrictions on their
-/// holder, so path-restricted (delegated) tokens must not reach notification
-/// endpoints even though create performs a resource permission check.
-fn require_unrestricted_realm_auth(
-    state: &ServerState,
-    auth: Option<AuthContext>,
-) -> ServerResult<AuthContext> {
-    let auth = require_realm_auth(state, auth)?;
-    if auth.path_restrictions.is_some() {
-        return Err(ServerError::Forbidden);
-    }
-    Ok(auth)
 }
 
 fn decode_cursor(cursor: Option<&str>) -> ServerResult<Option<Vec<u8>>> {
@@ -905,6 +893,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let state = ServerState::new(
             ctx,
@@ -913,6 +902,7 @@ mod tests {
             NodeCapabilities::local_node(realm_id).expect("capabilities"),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
         (dir, Arc::new(state))
@@ -945,6 +935,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let state = ServerState::new(
             ctx,
@@ -953,6 +944,7 @@ mod tests {
             NodeCapabilities::local_node(realm_id).expect("capabilities"),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
         (dir, Arc::new(state), net)

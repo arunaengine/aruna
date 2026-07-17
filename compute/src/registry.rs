@@ -1,0 +1,220 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use aruna_core::compute::{ExecutorCapability, ExecutorKind};
+
+use crate::executor::ExecutorBackend;
+
+/// Container-facing S3 endpoint the workspace credential targets. Injected into
+/// the attempt env so unconfigured tooling reaches the node's S3 plane.
+#[derive(Clone, Debug)]
+pub struct WorkspaceEndpoint {
+    pub endpoint: Option<String>,
+    pub region: String,
+}
+
+impl Default for WorkspaceEndpoint {
+    fn default() -> Self {
+        Self {
+            endpoint: None,
+            region: "eu-central-1".to_string(),
+        }
+    }
+}
+
+/// Enabled executor backends keyed by their wire kind. The driver selects a
+/// backend per execution job; advertisement (Stage 3) reads `kinds()`.
+#[derive(Default)]
+pub struct ExecutorRegistry {
+    backends: BTreeMap<String, Arc<dyn ExecutorBackend>>,
+    workspace: WorkspaceEndpoint,
+}
+
+impl ExecutorRegistry {
+    pub fn new() -> Self {
+        Self {
+            backends: BTreeMap::new(),
+            workspace: WorkspaceEndpoint::default(),
+        }
+    }
+
+    pub fn with_backend(mut self, backend: Arc<dyn ExecutorBackend>) -> Self {
+        self.register(backend);
+        self
+    }
+
+    pub fn with_workspace_endpoint(mut self, endpoint: Option<String>, region: String) -> Self {
+        self.workspace = WorkspaceEndpoint { endpoint, region };
+        self
+    }
+
+    pub fn workspace_endpoint(&self) -> &WorkspaceEndpoint {
+        &self.workspace
+    }
+
+    pub fn register(&mut self, backend: Arc<dyn ExecutorBackend>) {
+        self.backends.insert(backend.kind().as_wire(), backend);
+    }
+
+    pub fn get(&self, kind: &ExecutorKind) -> Option<&Arc<dyn ExecutorBackend>> {
+        self.backends.get(&kind.as_wire())
+    }
+
+    /// Pick a backend satisfying the constraint, or the first enabled one when
+    /// unconstrained. `None` means no enabled backend can run the job.
+    pub fn select(&self, constraint: Option<&ExecutorKind>) -> Option<&Arc<dyn ExecutorBackend>> {
+        match constraint {
+            Some(kind) => self.get(kind),
+            None => self.backends.values().next(),
+        }
+    }
+
+    /// Advertised wire kinds for the Node Descriptor.
+    pub fn kinds(&self) -> BTreeSet<String> {
+        self.backends.keys().cloned().collect()
+    }
+
+    pub fn capabilities(&self) -> Vec<ExecutorCapability> {
+        self.backends
+            .values()
+            .map(|backend| {
+                let capabilities = backend.capabilities();
+                ExecutorCapability {
+                    kind: backend.kind().as_wire(),
+                    file_staging: capabilities.file_staging,
+                    direct_s3: capabilities.direct_s3,
+                }
+            })
+            .collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.backends.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::logs::LogSink;
+    use crate::executor::{BackendCaps, ExecutorBackend};
+    use aruna_core::compute::{
+        AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,
+        LogTails, NOBODY, ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence,
+        TombstoneSpec, UserSpec,
+    };
+    use async_trait::async_trait;
+    use tokio_util::sync::CancellationToken;
+
+    struct StubBackend(ExecutorKind);
+
+    #[async_trait]
+    impl ExecutorBackend for StubBackend {
+        fn kind(&self) -> ExecutorKind {
+            self.0.clone()
+        }
+        fn capabilities(&self) -> BackendCaps {
+            BackendCaps {
+                file_staging: true,
+                direct_s3: false,
+            }
+        }
+        fn run_identity(&self) -> UserSpec {
+            NOBODY
+        }
+        async fn health(&self) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn resolve_image(
+            &self,
+            image: &str,
+            _cancel: &CancellationToken,
+        ) -> Result<String, BackendError> {
+            Ok(image.to_string())
+        }
+        async fn fence(&self, _context: &FenceContext) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn submit(
+            &self,
+            _context: &FenceContext,
+            _spec: &TaskSpec,
+            _cancel: &CancellationToken,
+        ) -> Result<AttemptStatus, BackendError> {
+            unimplemented!()
+        }
+        async fn stage(
+            &self,
+            _context: &FenceContext,
+            _spec: &TaskSpec,
+            _cancel: &CancellationToken,
+        ) -> Result<(), BackendError> {
+            unimplemented!()
+        }
+        async fn unsuspend(
+            &self,
+            _context: &FenceContext,
+            _cancel: &CancellationToken,
+        ) -> Result<AttemptStatus, BackendError> {
+            unimplemented!()
+        }
+        async fn status(&self, _context: &FenceContext) -> Result<AttemptStatus, BackendError> {
+            unimplemented!()
+        }
+        async fn cancel(&self, _context: &FenceContext) -> Result<CancelEvidence, BackendError> {
+            unimplemented!()
+        }
+        async fn fetch_logs(
+            &self,
+            _context: &FenceContext,
+            _limits: &LogLimits,
+            _sink: &dyn LogSink,
+        ) -> Result<LogTails, BackendError> {
+            unimplemented!()
+        }
+        async fn fetch_output(
+            &self,
+            _context: &FenceContext,
+            _path: &str,
+        ) -> Result<TaskOutput, BackendError> {
+            unimplemented!()
+        }
+        async fn reconcile(&self, _context: &FenceContext) -> ReconcileEvidence {
+            ReconcileEvidence::Absent
+        }
+        async fn tombstone(
+            &self,
+            _context: &FenceContext,
+            _spec: &TombstoneSpec,
+        ) -> Result<TombstoneEvidence, BackendError> {
+            unimplemented!()
+        }
+        async fn cleanup(&self, _context: &FenceContext) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn sweep_orphans(&self, _grace: std::time::Duration) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn select_by_kind() {
+        let registry =
+            ExecutorRegistry::new().with_backend(Arc::new(StubBackend(ExecutorKind::Docker)));
+        assert!(registry.get(&ExecutorKind::Docker).is_some());
+        assert!(registry.get(&ExecutorKind::Slurm).is_none());
+        // Unconstrained selects the only enabled backend.
+        assert!(registry.select(None).is_some());
+        // A constraint the node cannot satisfy selects nothing.
+        assert!(registry.select(Some(&ExecutorKind::Slurm)).is_none());
+        assert_eq!(registry.kinds().len(), 1);
+        assert_eq!(
+            registry.capabilities(),
+            [ExecutorCapability {
+                kind: "docker".to_string(),
+                file_staging: true,
+                direct_s3: false,
+            }]
+        );
+    }
+}

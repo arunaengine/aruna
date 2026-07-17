@@ -120,6 +120,7 @@ pub(crate) mod test_utils {
                 blob_handle: Some(blob_handle),
                 metadata_handle: None,
                 task_handle: None,
+                compute_handle: None,
             },
         }
     }

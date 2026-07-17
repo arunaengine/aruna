@@ -1,6 +1,6 @@
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
-use aruna_core::structs::MetadataRegistryRecord;
-use aruna_core::types::GroupId;
+use aruna_core::structs::{MetadataRegistryRecord, RealmId};
+use aruna_core::types::{GroupId, UserId};
 use aruna_net::streams::BiStream;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
@@ -16,11 +16,16 @@ pub const MAX_METADATA_BEARER_TOKEN_LEN: usize = 4096;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetadataAuthToken {
     Bearer(MetadataBearerToken),
+    Internal { user_id: UserId, realm_id: RealmId },
 }
 
 impl MetadataAuthToken {
     pub fn bearer(token: impl Into<String>) -> Result<Self, MetadataAuthTokenError> {
         MetadataBearerToken::new(token).map(Self::Bearer)
+    }
+
+    pub fn internal(user_id: UserId, realm_id: RealmId) -> Self {
+        Self::Internal { user_id, realm_id }
     }
 }
 
@@ -275,7 +280,9 @@ mod tests {
         let decoded = postcard::from_bytes::<MetadataAuthToken>(&bytes).unwrap();
 
         assert_eq!(decoded, token);
-        let MetadataAuthToken::Bearer(bearer) = decoded;
+        let MetadataAuthToken::Bearer(bearer) = decoded else {
+            panic!("expected bearer token");
+        };
         assert_eq!(bearer.as_str(), "bearer-token");
     }
 

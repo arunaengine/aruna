@@ -1,0 +1,552 @@
+use std::collections::BTreeMap;
+use std::fmt;
+use std::io;
+use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use bytes::Bytes;
+use futures::Stream;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use zeroize::Zeroize;
+
+pub const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+pub type InputStream = Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>;
+pub type OutputChunks = Pin<Box<dyn Stream<Item = Result<Bytes, BackendError>> + Send + Sync>>;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ExecutorKind {
+    Docker,
+    Apptainer,
+    Kubernetes,
+    Slurm,
+    Ext(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutorCapability {
+    pub kind: String,
+    pub file_staging: bool,
+    pub direct_s3: bool,
+}
+
+impl ExecutorKind {
+    pub fn as_wire(&self) -> String {
+        match self {
+            ExecutorKind::Docker => "docker".to_string(),
+            ExecutorKind::Apptainer => "apptainer".to_string(),
+            ExecutorKind::Kubernetes => "kubernetes".to_string(),
+            ExecutorKind::Slurm => "slurm".to_string(),
+            ExecutorKind::Ext(name) => name.clone(),
+        }
+    }
+
+    pub fn from_wire(value: &str) -> Self {
+        match value {
+            "docker" => ExecutorKind::Docker,
+            "apptainer" => ExecutorKind::Apptainer,
+            "kubernetes" => ExecutorKind::Kubernetes,
+            "slurm" => ExecutorKind::Slurm,
+            other => ExecutorKind::Ext(other.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum BackendError {
+    #[error("image not found: {0}")]
+    ImageNotFound(String),
+    #[error("image access unauthorized: {0}")]
+    ImageUnauthorized(String),
+    #[error("invalid spec: {0}")]
+    InvalidSpec(String),
+    #[error("backend submission cancelled")]
+    Cancelled,
+    #[error("attempt not found: {0}")]
+    NotFound(String),
+    #[error("backend unavailable: {0}")]
+    Unavailable(String),
+    #[error("backend conflict: {0}")]
+    Conflict(String),
+    #[error("backend timeout: {0}")]
+    Timeout(String),
+    #[error("backend api error: {0}")]
+    Api(String),
+    #[error("controller generation is fenced")]
+    Fenced,
+}
+
+impl BackendError {
+    pub fn retryable(&self) -> bool {
+        match self {
+            BackendError::ImageNotFound(_)
+            | BackendError::ImageUnauthorized(_)
+            | BackendError::InvalidSpec(_)
+            | BackendError::Cancelled
+            | BackendError::Fenced => false,
+            BackendError::NotFound(_)
+            | BackendError::Unavailable(_)
+            | BackendError::Conflict(_)
+            | BackendError::Timeout(_)
+            | BackendError::Api(_) => true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptRef {
+    pub job_id: String,
+    pub attempt: u32,
+}
+
+impl AttemptRef {
+    pub fn new(job_id: impl Into<String>, attempt: u32) -> Self {
+        Self {
+            job_id: job_id.into(),
+            attempt,
+        }
+    }
+
+    pub fn external_name(&self) -> String {
+        format!("aruna-{}-a{}", self.job_id.to_lowercase(), self.attempt)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.job_id.is_empty() {
+            return Err("job_id is empty".to_string());
+        }
+        let valid = self
+            .job_id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'));
+        if !valid {
+            return Err(format!(
+                "job_id `{}` contains characters outside [a-z0-9._-]",
+                self.job_id
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn labels(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("aruna-engine.org/job-id".to_string(), self.job_id.clone()),
+            (
+                "aruna-engine.org/attempt".to_string(),
+                self.attempt.to_string(),
+            ),
+        ])
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FenceContext {
+    pub attempt: AttemptRef,
+    pub attempt_epoch: u64,
+    pub controller_generation: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceRequest {
+    pub cpu_cores: Option<u32>,
+    pub ram_bytes: Option<u64>,
+    pub disk_bytes: Option<u64>,
+    pub max_walltime: Option<Duration>,
+    pub preemptible: bool,
+    pub backend_extensions: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceBinding {
+    pub s3_endpoint: String,
+    pub bucket_name: String,
+    pub region: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StagingMode {
+    Files,
+    DirectS3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserSpec {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// The unprivileged identity backends pin when they perform a real user switch.
+pub const NOBODY: UserSpec = UserSpec {
+    uid: 65_534,
+    gid: 65_534,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NetworkAccess {
+    Isolated,
+    S3Only,
+    Open,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityContext {
+    pub run_as: UserSpec,
+    pub drop_all_caps: bool,
+    pub no_new_privileges: bool,
+    pub network: NetworkAccess,
+    pub read_only_rootfs: bool,
+    pub pids_limit: Option<u64>,
+    pub seccomp_default: bool,
+}
+
+impl Default for SecurityContext {
+    fn default() -> Self {
+        Self {
+            run_as: NOBODY,
+            drop_all_caps: true,
+            no_new_privileges: true,
+            network: NetworkAccess::Isolated,
+            read_only_rootfs: false,
+            pids_limit: Some(2048),
+            seccomp_default: true,
+        }
+    }
+}
+
+pub struct TaskInput {
+    pub path: String,
+    pub workspace_key: String,
+    size: u64,
+    stream: Mutex<Option<InputStream>>,
+}
+
+impl TaskInput {
+    pub fn from_stream(path: impl Into<String>, size: u64, stream: InputStream) -> Self {
+        let path = path.into();
+        Self {
+            workspace_key: path.clone(),
+            path,
+            size,
+            stream: Mutex::new(Some(stream)),
+        }
+    }
+
+    pub fn from_workspace(
+        path: impl Into<String>,
+        workspace_key: impl Into<String>,
+        size: u64,
+        stream: InputStream,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            workspace_key: workspace_key.into(),
+            size,
+            stream: Mutex::new(Some(stream)),
+        }
+    }
+
+    pub fn from_bytes(path: impl Into<String>, bytes: impl Into<Bytes>) -> Self {
+        let bytes = bytes.into();
+        let size = bytes.len() as u64;
+        Self::from_stream(path, size, Box::pin(futures::stream::iter([Ok(bytes)])))
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn take_stream(&self) -> Option<InputStream> {
+        self.stream.lock().ok()?.take()
+    }
+}
+
+impl fmt::Debug for TaskInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskInput")
+            .field("path", &self.path)
+            .field("workspace_key", &self.workspace_key)
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for TaskInput {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.workspace_key == other.workspace_key
+            && self.size == other.size
+    }
+}
+
+impl Eq for TaskInput {}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Secret(***)")
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogLimits {
+    pub max_bytes_per_stream: usize,
+    pub inline_tail_bytes: usize,
+}
+
+impl Default for LogLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes_per_stream: 256 * 1024,
+            inline_tail_bytes: 8 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct TaskSpec {
+    pub attempt: AttemptRef,
+    pub image: String,
+    pub entrypoint: Option<Vec<String>>,
+    pub command: Vec<String>,
+    pub workdir: Option<String>,
+    pub inputs: Vec<TaskInput>,
+    pub staging_mode: StagingMode,
+    pub output_paths: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub secret_env: BTreeMap<String, Secret>,
+    pub resources: ResourceRequest,
+    pub workspace: Option<WorkspaceBinding>,
+    pub security: SecurityContext,
+    pub log_limits: LogLimits,
+}
+
+impl TaskSpec {
+    pub fn new(attempt: AttemptRef, image: impl Into<String>) -> Self {
+        Self {
+            attempt,
+            image: image.into(),
+            entrypoint: None,
+            command: Vec::new(),
+            workdir: None,
+            inputs: Vec::new(),
+            staging_mode: StagingMode::Files,
+            output_paths: Vec::new(),
+            env: BTreeMap::new(),
+            secret_env: BTreeMap::new(),
+            resources: ResourceRequest::default(),
+            workspace: None,
+            security: SecurityContext::default(),
+            log_limits: LogLimits::default(),
+        }
+    }
+
+    pub fn effective_env(&self) -> BTreeMap<String, String> {
+        let mut env = self.env.clone();
+        env.insert("ARUNA_JOB_ID".to_string(), self.attempt.job_id.clone());
+        if self.staging_mode == StagingMode::DirectS3 {
+            if let Some(workspace) = &self.workspace {
+                env.insert(
+                    "AWS_ENDPOINT_URL".to_string(),
+                    workspace.s3_endpoint.clone(),
+                );
+                env.insert("AWS_REGION".to_string(), workspace.region.clone());
+                env.insert(
+                    "ARUNA_WORKSPACE_BUCKET".to_string(),
+                    workspace.bucket_name.clone(),
+                );
+            }
+            for (key, value) in &self.secret_env {
+                env.insert(key.clone(), value.expose().to_string());
+            }
+        }
+        env
+    }
+}
+
+pub fn normalize_container_path(path: &str) -> Result<PathBuf, String> {
+    let path = Path::new(path);
+    if !path.is_absolute() || path == Path::new("/") {
+        return Err("container path must be absolute and non-root".to_string());
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => normalized.push("/"),
+            Component::Normal(part) if !part.as_encoded_bytes().contains(&0) => {
+                normalized.push(part)
+            }
+            _ => return Err("container path contains an unsafe component".to_string()),
+        }
+    }
+    Ok(normalized)
+}
+
+pub fn paths_overlap(input: &str, output_parent: &str) -> Result<bool, String> {
+    let input = normalize_container_path(input)?;
+    let output_parent = normalize_container_path(output_parent)?;
+    Ok(input == output_parent || output_parent.starts_with(&input))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttemptPhase {
+    Submitted,
+    Running,
+    Exited { code: i32 },
+    Failed { reason: String },
+    Cancelled,
+}
+
+impl AttemptPhase {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            AttemptPhase::Exited { .. } | AttemptPhase::Failed { .. } | AttemptPhase::Cancelled
+        )
+    }
+
+    pub fn tes_state(&self) -> TesState {
+        match self {
+            AttemptPhase::Submitted => TesState::Initializing,
+            AttemptPhase::Running => TesState::Running,
+            AttemptPhase::Exited { code: 0 } => TesState::Complete,
+            AttemptPhase::Exited { .. } => TesState::ExecutorError,
+            AttemptPhase::Failed { .. } => TesState::SystemError,
+            AttemptPhase::Cancelled => TesState::Canceled,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TesState {
+    Queued,
+    Initializing,
+    Running,
+    Complete,
+    ExecutorError,
+    SystemError,
+    Canceled,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptStatus {
+    pub phase: AttemptPhase,
+    pub backend_ref: String,
+    pub started_at_ms: Option<u64>,
+    pub finished_at_ms: Option<u64>,
+}
+
+impl AttemptStatus {
+    pub fn is_terminal(&self) -> bool {
+        self.phase.is_terminal()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumePoint {
+    Observe,
+    Submit,
+    Stage,
+    Unsuspend,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdoptableEvidence {
+    pub status: AttemptStatus,
+    pub resume: ResumePoint,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactEvidence {
+    pub artifact_kind: String,
+    pub backend_ref: Option<String>,
+    pub observed_epoch: Option<u64>,
+    pub observed_generation: Option<u64>,
+    pub exact_identity: bool,
+    pub multiple: bool,
+    pub foreign: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReconcileEvidence {
+    Adoptable(AdoptableEvidence),
+    Unadoptable(ArtifactEvidence),
+    Absent,
+    Tombstoned(TombstoneEvidence),
+    Unavailable(BackendError),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CancelEvidence {
+    Stopped(AttemptStatus),
+    Requested,
+    AlreadyGone,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LogTails {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub stdout_total: u64,
+    pub stderr_total: u64,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogStream {
+    Stdout,
+    Stderr,
+}
+
+pub struct TaskOutput {
+    pub size: u64,
+    pub chunks: OutputChunks,
+}
+
+impl fmt::Debug for TaskOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskOutput")
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for TaskOutput {
+    fn eq(&self, other: &Self) -> bool {
+        self.size == other.size
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TombstoneSpec {
+    pub terminal_ref: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TombstoneEvidence {
+    pub backend_ref: String,
+    pub attempt_epoch: u64,
+}

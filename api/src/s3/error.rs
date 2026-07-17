@@ -107,6 +107,13 @@ fn missing_expected_checksum_s3_error(algorithm: &'static str, operation: &'stat
     s3_error!(InternalError, "Missing stored checksum")
 }
 
+/// A rejected body stream (trailer checksum mismatch or interrupted upload)
+/// must surface as a client error so SDKs do not retry it as a server fault.
+fn write_failed_error(message: &str, operation: &'static str) -> S3Error {
+    warn!(message, "Blob write failed during {}", operation);
+    checksum_mismatch_error()
+}
+
 pub(crate) trait IntoS3Error {
     fn into_s3_error(self) -> S3Error;
 }
@@ -166,6 +173,7 @@ impl IntoS3Error for PutObjectError {
             }
             PutObjectError::QuotaExceeded { limit, usage } => quota_exceeded_error(limit, usage),
             PutObjectError::IncompleteBody => incomplete_body_error(),
+            PutObjectError::WriteFailed(message) => write_failed_error(&message, "PutObject"),
             err => internal_error(err),
         }
     }
@@ -187,6 +195,7 @@ impl IntoS3Error for UploadPartError {
                 checksum_mismatch_s3_error(algorithm, "UploadPart")
             }
             UploadPartError::IncompleteBody => incomplete_body_error(),
+            UploadPartError::WriteFailed(message) => write_failed_error(&message, "UploadPart"),
             err => internal_error(err),
         }
     }
@@ -425,6 +434,35 @@ mod tests {
             *UploadPartError::IncompleteBody.into_s3_error().code(),
             S3ErrorCode::IncompleteBody
         );
+    }
+
+    // A failed blob write maps to BadDigest (400) so SDKs do not retry it.
+    #[test]
+    fn maps_write_failed() {
+        assert_eq!(
+            *PutObjectError::WriteFailed("mismatch".to_string())
+                .into_s3_error()
+                .code(),
+            S3ErrorCode::BadDigest
+        );
+        assert_eq!(
+            *UploadPartError::WriteFailed("mismatch".to_string())
+                .into_s3_error()
+                .code(),
+            S3ErrorCode::BadDigest
+        );
+    }
+
+    // A server-side write fault (full or flapping disk) must stay a retryable
+    // InternalError; reporting BadDigest would tell SDKs the data was corrupt.
+    #[test]
+    fn maps_backend_write() {
+        for error in [
+            PutObjectError::BlobWriteFailed("No space left on device".to_string()).into_s3_error(),
+            UploadPartError::BlobWriteFailed("No space left on device".to_string()).into_s3_error(),
+        ] {
+            assert_eq!(*error.code(), S3ErrorCode::InternalError);
+        }
     }
 
     // UploadNotOpen from upload/complete/abort maps to NoSuchUpload (404).

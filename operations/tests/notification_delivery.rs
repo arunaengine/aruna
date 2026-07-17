@@ -290,6 +290,7 @@ async fn dispatch_proxies_inbox_ops_from_non_holder() -> Result<(), Box<dyn std:
         blob_handle: None,
         metadata_handle: None,
         task_handle: None,
+        compute_handle: None,
     });
     let unavailable = list_notifications_for_user(
         no_net.as_ref(),
@@ -518,10 +519,16 @@ async fn build_node(
         blob_handle: None,
         metadata_handle: None,
         task_handle: Some(task_handle.clone()),
+        compute_handle: None,
     });
 
     initialize_net_incoming(context.clone());
-    initialize_task_incoming(context.clone(), task_handle).await;
+    initialize_task_incoming(
+        context.clone(),
+        task_handle,
+        aruna_operations::jobs::runtime::JobsRuntime::new(),
+    )
+    .await;
 
     Ok(TestNode {
         _temp_dir: temp_dir,
