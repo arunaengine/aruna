@@ -701,14 +701,13 @@ where
 
             match step {
                 NotificationStateStep::Unread(Some((count, capped))) => {
-                    let unread = UnreadCountApiResponse {
+                    // Every source emission is a wake or a real change; unchanged
+                    // poll ticks were already dropped upstream, so a repeated
+                    // aggregate still forwards a frame for clients to refetch.
+                    state.current_unread = Some(UnreadCountApiResponse {
                         count: count as u32,
                         capped,
-                    };
-                    if state.current_unread.as_ref() == Some(&unread) {
-                        continue;
-                    }
-                    state.current_unread = Some(unread);
+                    });
                 }
                 NotificationStateStep::Unread(None) => {
                     state.unread_open = false;
@@ -1453,6 +1452,26 @@ mod tests {
         );
         changes.send_replace(4);
         assert_eq!(states.next().await.expect("dashboard state").revision, 4);
+    }
+
+    #[tokio::test]
+    async fn wake_emits_unchanged() {
+        // A wake repeats the aggregate at the unread cap; the frame must still fire.
+        let (_changes, revisions) = watch::channel(3);
+        let unread = stream::iter([(100, true), (100, true)]).chain(stream::pending());
+        let mut states = Box::pin(notification_state_stream(
+            unread,
+            "test-epoch".to_string(),
+            revisions,
+            Duration::from_secs(20),
+        ));
+
+        let capped = UnreadCountApiResponse {
+            count: 100,
+            capped: true,
+        };
+        assert_eq!(states.next().await.expect("initial state").unread, capped);
+        assert_eq!(states.next().await.expect("wake state").unread, capped);
     }
 
     #[tokio::test]
