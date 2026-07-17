@@ -27,6 +27,8 @@ use crate::server_state::ServerState;
 const DEFAULT_LIST_LIMIT: usize = 50;
 const MAX_LIST_LIMIT: usize = 200;
 const MAX_OUTPUT_PREFIXES: usize = 32;
+/// Bounds the quadratic duplicate-input validation.
+const MAX_INPUTS: usize = 512;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -316,6 +318,9 @@ pub async fn submit_job(
     )
     .await?;
 
+    if request.inputs.len() > MAX_INPUTS {
+        return Err(ServerError::BadRequest);
+    }
     let mut inputs: Vec<InputSelection> = Vec::with_capacity(request.inputs.len());
     for input in request.inputs {
         let input = InputSelection {

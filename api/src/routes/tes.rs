@@ -43,6 +43,8 @@ const IDEMPOTENCY_TAG_KEY: &str = "aruna-engine.org/idempotency-key";
 
 const DEFAULT_PAGE_SIZE: usize = 256;
 const MAX_PAGE_SIZE: usize = 512;
+/// Bounds the quadratic input/output path-overlap validation.
+const MAX_TASK_IO: usize = 512;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -437,16 +439,20 @@ pub async fn create_task(
         Err(error) => return error.into_response(),
     };
 
+    // Authorize before parsing: the group comes from the tag or credential
+    // alone, so the unbounded payload is only validated for permitted callers.
+    let group_id = match resolve_task_group(&task, caller.credential_group) {
+        Ok(group_id) => group_id,
+        Err(error) => return error.into_response(),
+    };
+    if let Err(error) = ensure_group_write(&state, &caller.auth, group_id).await {
+        return error.into_response();
+    }
+
     let (spec, idempotency_key) = match map_task_to_spec(&task, caller.credential_group) {
         Ok(mapped) => mapped,
         Err(error) => return error.into_response(),
     };
-
-    // Group-write authorization at the facade boundary (the raw internal POST /jobs/
-    // path does not yet check this; see #420). Rejecting here never widens that gap.
-    if let Err(error) = ensure_group_write(&state, &caller.auth, spec.group_id).await {
-        return error.into_response();
-    }
 
     match submit_execution_job(
         &state.get_ctx(),
@@ -656,6 +662,30 @@ pub async fn cancel_task(
 // Mapping: TesTask -> ExecutionSpec
 // ---------------------------------------------------------------------------
 
+/// Resolve the effective group from the tag or credential alone, without
+/// touching the rest of the untrusted task payload.
+fn resolve_task_group(
+    task: &TesTask,
+    credential_group: Option<Ulid>,
+) -> Result<Ulid, TesError> {
+    let group_id = match task.tags.get(GROUP_TAG_KEY) {
+        Some(group) => Ulid::from_string(group).map_err(|_| {
+            TesError::bad_request(format!("`{GROUP_TAG_KEY}` is not a valid group id"))
+        })?,
+        None => credential_group.ok_or_else(|| {
+            TesError::bad_request(format!(
+                "a `{GROUP_TAG_KEY}` tag is required for bearer authentication"
+            ))
+        })?,
+    };
+    if credential_group.is_some_and(|credential_group| credential_group != group_id) {
+        return Err(TesError::forbidden(
+            "group tag does not match the caller credential",
+        ));
+    }
+    Ok(group_id)
+}
+
 /// Map a TES task onto the internal execution plan and optional dedup key.
 /// Pure and self-contained: the group-write permission check happens separately.
 fn map_task_to_spec(
@@ -703,22 +733,11 @@ fn map_task_to_spec(
         return Err(TesError::bad_request("task volumes are not supported"));
     }
 
-    let group_id = match task.tags.get(GROUP_TAG_KEY) {
-        Some(group) => Ulid::from_string(group).map_err(|_| {
-            TesError::bad_request(format!("`{GROUP_TAG_KEY}` is not a valid group id"))
-        })?,
-        None => credential_group.ok_or_else(|| {
-            TesError::bad_request(format!(
-                "a `{GROUP_TAG_KEY}` tag is required for bearer authentication"
-            ))
-        })?,
-    };
-    if credential_group.is_some_and(|credential_group| credential_group != group_id) {
-        return Err(TesError::forbidden(
-            "group tag does not match the caller credential",
-        ));
-    }
+    let group_id = resolve_task_group(task, credential_group)?;
 
+    if task.inputs.len() > MAX_TASK_IO {
+        return Err(TesError::bad_request("too many task inputs"));
+    }
     let mut inputs: Vec<InputSelection> = Vec::with_capacity(task.inputs.len());
     for input in &task.inputs {
         let input = map_input(input)?;
@@ -738,6 +757,9 @@ fn map_task_to_spec(
             return Err(TesError::bad_request("input paths overlap"));
         }
         inputs.push(input);
+    }
+    if task.outputs.len() > MAX_TASK_IO {
+        return Err(TesError::bad_request("too many task outputs"));
     }
     let mut file_outputs: Vec<OutputSelection> = Vec::with_capacity(task.outputs.len());
     for output in &task.outputs {
@@ -1567,6 +1589,43 @@ mod tests {
             .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["msg"], "visible reason");
+    }
+
+    #[test]
+    fn resolves_task_group() {
+        // Pre-authorization group resolution must mirror the mapping rules.
+        let group = Ulid::from_bytes([5u8; 16]);
+        let other = Ulid::from_bytes([6u8; 16]);
+        let task = sample_task(group);
+        assert_eq!(resolve_task_group(&task, None).unwrap(), group);
+        assert_eq!(resolve_task_group(&task, Some(group)).unwrap(), group);
+        assert_eq!(
+            resolve_task_group(&task, Some(other)).unwrap_err().status,
+            StatusCode::FORBIDDEN
+        );
+
+        let mut untagged = task.clone();
+        untagged.tags.remove(GROUP_TAG_KEY);
+        assert_eq!(resolve_task_group(&untagged, Some(other)).unwrap(), other);
+        assert_eq!(
+            resolve_task_group(&untagged, None).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn caps_task_io() {
+        // Input and output counts are bounded before quadratic validation.
+        let group = Ulid::from_bytes([5u8; 16]);
+        let mut task = sample_task(group);
+        task.inputs = vec![task.inputs[0].clone(); MAX_TASK_IO + 1];
+        let error = map_task_to_spec(&task, None).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+
+        let mut task = sample_task(group);
+        task.outputs = vec![task.outputs[0].clone(); MAX_TASK_IO + 1];
+        let error = map_task_to_spec(&task, None).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]
