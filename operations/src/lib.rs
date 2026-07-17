@@ -59,6 +59,7 @@ pub mod replication;
 pub mod reserve_onboarding_secret;
 pub mod resolve_users;
 pub mod s3;
+pub mod search_groups;
 pub mod search_users;
 pub mod set_realm_quota;
 pub mod shard;
