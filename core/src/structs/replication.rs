@@ -42,6 +42,38 @@ impl ArunaArn {
         Self::new(realm_id, node_id, ArunaArnType::S3, bucket)
     }
 
+    pub fn s3_object_prefix(
+        realm_id: RealmId,
+        node_id: NodeId,
+        bucket: impl Into<String>,
+        prefix: impl Into<String>,
+    ) -> Result<Self, ConversionError> {
+        Self::new(
+            realm_id,
+            node_id,
+            ArunaArnType::S3,
+            format!("{}/{}", bucket.into(), prefix.into()),
+        )
+    }
+
+    pub fn bucket(&self) -> Option<&str> {
+        if self.resource_type != ArunaArnType::S3 {
+            return None;
+        }
+        Some(
+            self.path
+                .split_once('/')
+                .map_or(self.path.as_str(), |(bucket, _)| bucket),
+        )
+    }
+
+    pub fn key_prefix(&self) -> Option<&str> {
+        if self.resource_type != ArunaArnType::S3 {
+            return None;
+        }
+        self.path.split_once('/').map(|(_, prefix)| prefix)
+    }
+
     pub fn parse(input: &str) -> Result<Self, ConversionError> {
         let prefix = "arn:aruna:";
         let remainder = input.strip_prefix(prefix).ok_or_else(|| {
@@ -163,6 +195,7 @@ pub enum ReplicationNegotiationResult {
 pub enum ReplicationSuboperationResult {
     Replicated,
     Skipped,
+    ReplicatedBytes(u64),
 }
 
 #[cfg(test)]
@@ -201,6 +234,32 @@ mod tests {
         assert_eq!(parsed.resource_type, ArunaArnType::S3);
         assert_eq!(parsed.path, "mybucket");
         assert_eq!(parsed.to_string(), arn);
+    }
+
+    #[test]
+    fn roundtrips_s3_prefix() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let node_id = test_node_id();
+        let arn =
+            ArunaArn::s3_object_prefix(realm_id, node_id, "mybucket", "nested/object-prefix/")
+                .unwrap();
+
+        let canonical = format!("arn:aruna:{realm_id}:{node_id}:s3/mybucket/nested/object-prefix/");
+        assert_eq!(arn.to_string(), canonical);
+
+        let parsed = ArunaArn::parse(&canonical).unwrap();
+        assert_eq!(parsed, arn);
+        assert_eq!(parsed.bucket(), Some("mybucket"));
+        assert_eq!(parsed.key_prefix(), Some("nested/object-prefix/"));
+    }
+
+    #[test]
+    fn reads_s3_parts() {
+        let arn = ArunaArn::s3_bucket(RealmId::from_bytes([1u8; 32]), test_node_id(), "mybucket")
+            .unwrap();
+
+        assert_eq!(arn.bucket(), Some("mybucket"));
+        assert_eq!(arn.key_prefix(), None);
     }
 
     #[test]
