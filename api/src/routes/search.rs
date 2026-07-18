@@ -10,7 +10,7 @@ use aruna_core::UserId;
 use aruna_core::structs::AuthContext;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::{
-    MetadataSearchRequest, search_metadata as run_search_metadata,
+    MetadataSearchExecution, MetadataSearchRequest, search_metadata as run_search_metadata,
 };
 use aruna_operations::search_groups::{SearchGroupsInput, SearchGroupsOperation};
 use aruna_operations::search_users::{SearchUsersInput, SearchUsersOperation};
@@ -82,6 +82,9 @@ pub struct DocumentsSection {
     pub next_cursor: Option<String>,
     pub nodes_queried: usize,
     pub nodes_failed: usize,
+    /// True when pagination stopped at the server-side depth cap before the
+    /// result set was exhausted.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -275,12 +278,17 @@ async fn run_documents(
     )
     .await
     .map_err(map_metadata_api_error)?;
-    Ok(Some(DocumentsSection {
+    Ok(Some(map_documents_section(result)))
+}
+
+fn map_documents_section(result: MetadataSearchExecution) -> DocumentsSection {
+    DocumentsSection {
         hits: result.hits.into_iter().map(map_search_hit).collect(),
         next_cursor: result.next_cursor,
         nodes_queried: result.fanout_stats.nodes_queried,
         nodes_failed: result.fanout_stats.nodes_failed,
-    }))
+        truncated: result.truncated,
+    }
 }
 
 async fn run_groups(
@@ -807,6 +815,25 @@ mod tests {
         assert!(matches!(wrong_realm, Err(ServerError::Forbidden)));
     }
 
+    #[test]
+    fn passes_documents_truncated() {
+        // The depth-cap truncation signal must survive the unified mapping.
+        let result = MetadataSearchExecution {
+            hits: Vec::new(),
+            next_cursor: None,
+            truncated: true,
+            fanout_stats: aruna_operations::metadata::api::MetadataFanoutStats {
+                nodes_queried: 1,
+                nodes_failed: 0,
+                failed_partitions: Vec::new(),
+                discovery_failed: false,
+            },
+        };
+        let section = map_documents_section(result);
+        assert!(section.truncated);
+        assert!(section.next_cursor.is_none());
+    }
+
     #[tokio::test]
     async fn empty_shape() {
         let fx = setup().await;
@@ -822,6 +849,7 @@ mod tests {
         let documents = resp.documents.unwrap();
         assert!(documents.hits.is_empty());
         assert!(documents.next_cursor.is_none());
+        assert!(!documents.truncated);
         let groups = resp.groups.unwrap();
         assert!(groups.hits.is_empty());
         assert!(groups.next_cursor.is_none());
