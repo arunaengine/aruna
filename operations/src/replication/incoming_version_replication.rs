@@ -2868,7 +2868,12 @@ mod tests {
         op.start();
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: b"bucket".to_vec().into(),
-            value: Some(make_bucket_info(Ulid::generate()).to_bytes().unwrap().into()),
+            value: Some(
+                make_bucket_info(Ulid::generate())
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            ),
         }));
         assert_eq!(op.state, IncomingVersionReplicationState::CheckPermissions);
         assert!(matches!(effects[0], Effect::SubOperation(_)));
@@ -2905,7 +2910,12 @@ mod tests {
         op.start();
         op.step(Event::Storage(StorageEvent::ReadResult {
             key: b"bucket".to_vec().into(),
-            value: Some(make_bucket_info(Ulid::generate()).to_bytes().unwrap().into()),
+            value: Some(
+                make_bucket_info(Ulid::generate())
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            ),
         }));
 
         let effects = op.step(Event::SubOperation(

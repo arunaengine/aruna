@@ -1394,7 +1394,8 @@ mod tests {
             .expect("first authorized page");
         assert_eq!(first_page, vec![watch_three]);
         let retry_cursor = retry_cursor.expect("cursor after first authorized page");
-        install_watch_authorization(&b, realm_id, UserId::new(Ulid::generate(), realm_id), &[]).await;
+        install_watch_authorization(&b, realm_id, UserId::new(Ulid::generate(), realm_id), &[])
+            .await;
 
         let (listed, next_cursor) = list_remote(&a.net, b.net.node_id(), recipient, None, 1)
             .await
@@ -1855,7 +1856,8 @@ mod tests {
 
         let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
         // The watched group exists and is readable, just not by `owner`.
-        install_watch_authorization(&b, realm_id, UserId::new(Ulid::generate(), realm_id), &[]).await;
+        install_watch_authorization(&b, realm_id, UserId::new(Ulid::generate(), realm_id), &[])
+            .await;
 
         let error = create_watch_remote(
             &a.net,
@@ -1918,7 +1920,8 @@ mod tests {
         );
 
         // Re-owning the group drops the original owner's READ.
-        install_watch_authorization(&b, realm_id, UserId::new(Ulid::generate(), realm_id), &[]).await;
+        install_watch_authorization(&b, realm_id, UserId::new(Ulid::generate(), realm_id), &[])
+            .await;
 
         let listed = list_watches_remote(&a.net, b.net.node_id(), owner)
             .await

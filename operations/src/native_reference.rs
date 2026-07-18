@@ -425,10 +425,7 @@ fn validate_relationship(
     // reference records the target retained; every other non-enabled state
     // still refuses access.
     if relationship.mode != SyncMode::Reference
-        || !matches!(
-            relationship.state,
-            SyncState::Enabled | SyncState::Detached
-        )
+        || !matches!(relationship.state, SyncState::Enabled | SyncState::Detached)
         || relationship.source.realm_id != *net_handle.realm_id()
         || relationship.source.node_id != net_handle.node_id()
         || relationship.target.node_id != peer

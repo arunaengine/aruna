@@ -558,9 +558,8 @@ fn validate_endpoint(bucket: &str, prefix: Option<&str>) -> ServerResult<()> {
         // Replicated keys inherit the prefix via the sync key mapping, so the
         // same confinement rules as object keys must hold here; otherwise
         // replication produces keys that normal S3 operations reject.
-        ensure_confined_relative_path(StdPath::new(prefix)).map_err(|error| {
-            ServerError::BadRequestReason(format!("invalid prefix: {error}"))
-        })?;
+        ensure_confined_relative_path(StdPath::new(prefix))
+            .map_err(|error| ServerError::BadRequestReason(format!("invalid prefix: {error}")))?;
     }
     Ok(())
 }
@@ -818,9 +817,7 @@ async fn load_relationship(
     )
     .await
     {
-        Ok(relationship) => {
-            Ok((visible(relationship)?, SyncRelationshipDirection::Outgoing))
-        }
+        Ok(relationship) => Ok((visible(relationship)?, SyncRelationshipDirection::Outgoing)),
         Err(SyncRelationshipError::NotFound) => {
             get_relationship(state, id, SyncRelationshipDirection::Incoming)
                 .await
@@ -1144,10 +1141,7 @@ mod tests {
 
         // The outgoing record survives as a detached serving stub ...
         let stored = drive(
-            GetSyncRelationshipOperation::new(
-                relationship.id,
-                SyncRelationshipDirection::Outgoing,
-            ),
+            GetSyncRelationshipOperation::new(relationship.id, SyncRelationshipDirection::Outgoing),
             &state.get_ctx(),
         )
         .await

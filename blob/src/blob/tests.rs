@@ -64,10 +64,10 @@ mod failing_close {
             info.set_scheme("close_fails")
                 .set_root("/")
                 .set_native_capability(Capability {
-                write: true,
-                write_can_empty: true,
-                write_can_multi: true,
-                ..Default::default()
+                    write: true,
+                    write_can_empty: true,
+                    write_can_multi: true,
+                    ..Default::default()
                 });
             info
         }

@@ -1729,7 +1729,10 @@ mod test {
         let data = b"hello, world!";
         let err = drive(
             PutObjectOperation::new(PutObjectConfig {
-                user_id: aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
+                user_id: aruna_core::UserId::local(
+                    Ulid::generate(),
+                    RealmId::from_bytes([1u8; 32]),
+                ),
                 group_id: Ulid::generate(),
                 realm_id: RealmId::from_bytes([1u8; 32]),
                 node_id: context.net_handle.as_ref().unwrap().node_id(),

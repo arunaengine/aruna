@@ -18,7 +18,9 @@ pub enum SyncMode {
 pub enum SyncState {
     Enabled,
     Paused,
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
     /// Serving-only stub left behind when a reference relationship is
     /// deleted: the target retains `BlobVersion::Reference` records that
     /// authorize reads through this relationship id, so the source keeps

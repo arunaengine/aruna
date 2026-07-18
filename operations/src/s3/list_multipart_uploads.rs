@@ -425,7 +425,11 @@ mod test {
             &upload_record(Ulid::generate(), "bucket", "a"),
         )
         .await;
-        seed_upload(&storage_handle, &upload_record(Ulid::generate(), "other", "b")).await;
+        seed_upload(
+            &storage_handle,
+            &upload_record(Ulid::generate(), "other", "b"),
+        )
+        .await;
         seed_upload(
             &storage_handle,
             &upload_record(Ulid::generate(), "bucket", "c"),
