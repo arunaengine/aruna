@@ -78,7 +78,20 @@ impl BlobHandle {
 
     pub async fn send_staging_source_effect(&self, effect: StagingSourceEffect) -> Event {
         let staging_source_event = match effect {
+            StagingSourceEffect::Check { access } => {
+                self.handler.check_staging_source(access).await
+            }
             StagingSourceEffect::Head { access } => self.handler.head_staging_source(access).await,
+            StagingSourceEffect::List {
+                access,
+                limit,
+                recursive,
+                files_only,
+            } => {
+                self.handler
+                    .list_staging_source(access, limit, recursive, files_only)
+                    .await
+            }
             StagingSourceEffect::Read { access, range } => {
                 self.handler.read_staging_source(access, range).await
             }

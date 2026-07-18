@@ -6,7 +6,11 @@ use crate::auth::{parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::errors::AuthorizationError;
-use aruna_core::structs::{AuthContext, Permission, SourceConnector, SourceConnectorKind};
+use aruna_core::errors::SourceConnectorResolutionError;
+use aruna_core::structs::{
+    AuthContext, Permission, ResolvedSourceAccess, SourceConnector, SourceConnectorKind,
+    SourceEntryKind,
+};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::connectors::create_source_connector::{
     CreateSourceConnectorError, CreateSourceConnectorInput, CreateSourceConnectorOperation,
@@ -26,14 +30,27 @@ use aruna_operations::connectors::list_source_connectors::{
 use aruna_operations::connectors::replace_source_connector::{
     ReplaceSourceConnectorError, ReplaceSourceConnectorInput, ReplaceSourceConnectorOperation,
 };
+use aruna_operations::connectors::resolver::{resolve_inline_access, validate_source_path};
+use aruna_operations::connectors::validation::validate_connector_input;
+use aruna_operations::connectors::{ResolveSourceConnectorInput, ResolveSourceConnectorOperation};
 use aruna_operations::driver::drive;
-use axum::extract::{Path, State};
+use aruna_operations::staging::check_source::CheckStagingSourceOperation;
+use aruna_operations::staging::list_source::{
+    ListStagingSourceError, ListStagingSourceInput, ListStagingSourceOperation,
+};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant, UNIX_EPOCH};
+use tokio::time::timeout;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
+
+const CONNECTOR_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_ENTRY_LIMIT: usize = 200;
+const MAX_ENTRY_LIMIT: usize = 1000;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -43,13 +60,20 @@ use utoipa::{OpenApi, ToSchema};
         list_source_connectors,
         get_source_connector,
         replace_source_connector,
-        delete_source_connector
+        delete_source_connector,
+        check_source_connector,
+        check_stored_connector,
+        list_connector_entries
     )
 )]
 pub struct ConnectorsApiDoc;
 
 pub fn router() -> Router<Arc<ServerState>> {
     Router::new()
+        .route(
+            "/groups/{group_id}/connectors/check",
+            post(check_source_connector),
+        )
         .route(
             "/groups/{group_id}/connectors",
             post(create_source_connector).get(list_source_connectors),
@@ -59,6 +83,14 @@ pub fn router() -> Router<Arc<ServerState>> {
             get(get_source_connector)
                 .put(replace_source_connector)
                 .delete(delete_source_connector),
+        )
+        .route(
+            "/groups/{group_id}/connectors/{connector_id}/check",
+            post(check_stored_connector),
+        )
+        .route(
+            "/groups/{group_id}/connectors/{connector_id}/entries",
+            get(list_connector_entries),
         )
 }
 
@@ -112,6 +144,65 @@ pub struct ReplaceSourceConnectorRequest {
     pub public_config: HashMap<String, String>,
     #[serde(default)]
     pub secret_config: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SourceConnectorRequest {
+    pub name: String,
+    pub kind: ApiSourceConnectorKind,
+    pub public_config: HashMap<String, String>,
+    #[serde(default)]
+    pub secret_config: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ConnectorCheckSuccess {
+    pub ok: bool,
+    pub latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ConnectorCheckFailure {
+    pub ok: bool,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ConnectorCheckResponse {
+    Success(ConnectorCheckSuccess),
+    Failure(ConnectorCheckFailure),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConnectorEntriesQuery {
+    #[serde(default)]
+    pub path: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnectorEntryKind {
+    File,
+    Dir,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ConnectorEntryResponse {
+    pub name: String,
+    pub path: String,
+    pub kind: ConnectorEntryKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ConnectorEntriesResponse {
+    pub entries: Vec<ConnectorEntryResponse>,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -359,11 +450,222 @@ pub async fn delete_source_connector(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    post,
+    path = "/groups/{group_id}/connectors/check",
+    tag = "connectors",
+    params(("group_id" = String, Path, description = "Group id")),
+    request_body = SourceConnectorRequest,
+    responses(
+        (status = 200, description = "Connector check result", body = ConnectorCheckResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn check_source_connector(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(group_id): Path<String>,
+    Json(request): Json<SourceConnectorRequest>,
+) -> ServerResult<Json<ConnectorCheckResponse>> {
+    let auth = require_realm_auth(&state, auth)?;
+    let group_id = parse_group_id(&group_id)?;
+    ensure_group_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
+
+    let kind: SourceConnectorKind = request.kind.into();
+    validate_connector_input(
+        &request.name,
+        kind,
+        &request.public_config,
+        &request.secret_config,
+    )
+    .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
+
+    let access = resolve_inline_access(kind, &request.public_config, request.secret_config)
+        .map_err(map_resolution_error)?;
+    Ok(Json(run_connector_check(&state, access).await))
+}
+
+#[utoipa::path(
+    post,
+    path = "/groups/{group_id}/connectors/{connector_id}/check",
+    tag = "connectors",
+    params(
+        ("group_id" = String, Path, description = "Group id"),
+        ("connector_id" = String, Path, description = "Connector id")
+    ),
+    responses(
+        (status = 200, description = "Connector check result", body = ConnectorCheckResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Not found", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn check_stored_connector(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((group_id, connector_id)): Path<(String, String)>,
+) -> ServerResult<Json<ConnectorCheckResponse>> {
+    let auth = require_realm_auth(&state, auth)?;
+    let group_id = parse_group_id(&group_id)?;
+    let connector_id = parse_connector_id(&connector_id)?;
+    ensure_group_data_permission(&state, &auth, group_id, Permission::READ).await?;
+
+    let resolved = drive(
+        ResolveSourceConnectorOperation::new(ResolveSourceConnectorInput {
+            group_id,
+            connector_id,
+            source_path: String::new(),
+            allow_root: true,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_resolution_error)?;
+
+    Ok(Json(run_connector_check(&state, resolved.access).await))
+}
+
+#[utoipa::path(
+    get,
+    path = "/groups/{group_id}/connectors/{connector_id}/entries",
+    tag = "connectors",
+    params(
+        ("group_id" = String, Path, description = "Group id"),
+        ("connector_id" = String, Path, description = "Connector id"),
+        ("path" = Option<String>, Query, description = "Path relative to connector root"),
+        ("limit" = Option<usize>, Query, description = "Maximum entries, capped at 1000")
+    ),
+    responses(
+        (status = 200, description = "Connector entries", body = ConnectorEntriesResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 502, description = "Bad gateway", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_connector_entries(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((group_id, connector_id)): Path<(String, String)>,
+    Query(query): Query<ConnectorEntriesQuery>,
+) -> ServerResult<Json<ConnectorEntriesResponse>> {
+    let auth = require_realm_auth(&state, auth)?;
+    let group_id = parse_group_id(&group_id)?;
+    let connector_id = parse_connector_id(&connector_id)?;
+    ensure_group_data_permission(&state, &auth, group_id, Permission::READ).await?;
+    let source_path = normalize_browse_path(&query.path)?;
+    let limit = query.limit.unwrap_or(DEFAULT_ENTRY_LIMIT);
+    if limit == 0 {
+        return Err(ServerError::BadRequestReason(
+            "limit must be greater than zero".to_string(),
+        ));
+    }
+
+    let result = drive(
+        ListStagingSourceOperation::new(ListStagingSourceInput {
+            group_id,
+            connector_id,
+            source_path,
+            limit: limit.min(MAX_ENTRY_LIMIT),
+            recursive: false,
+            files_only: false,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_list_error)?;
+
+    Ok(Json(ConnectorEntriesResponse {
+        entries: result
+            .entries
+            .into_iter()
+            .map(|entry| ConnectorEntryResponse {
+                name: entry.name,
+                path: entry.path,
+                kind: match entry.kind {
+                    SourceEntryKind::File => ConnectorEntryKind::File,
+                    SourceEntryKind::Directory => ConnectorEntryKind::Dir,
+                },
+                size: entry.size,
+                modified_ms: entry.modified.and_then(|modified| {
+                    modified
+                        .duration_since(UNIX_EPOCH)
+                        .ok()
+                        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+                }),
+            })
+            .collect(),
+        truncated: result.truncated,
+    }))
+}
+
+async fn run_connector_check(
+    state: &ServerState,
+    access: ResolvedSourceAccess,
+) -> ConnectorCheckResponse {
+    let started = Instant::now();
+    match timeout(
+        CONNECTOR_CHECK_TIMEOUT,
+        drive(CheckStagingSourceOperation::new(access), &state.get_ctx()),
+    )
+    .await
+    {
+        Ok(Ok(())) => ConnectorCheckResponse::Success(ConnectorCheckSuccess {
+            ok: true,
+            latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        }),
+        Ok(Err(error)) => ConnectorCheckResponse::Failure(ConnectorCheckFailure {
+            ok: false,
+            error: check_error_message(&error),
+        }),
+        Err(_) => ConnectorCheckResponse::Failure(ConnectorCheckFailure {
+            ok: false,
+            error: "connector check timed out".to_string(),
+        }),
+    }
+}
+
+fn check_error_message(
+    error: &aruna_operations::staging::check_source::CheckStagingSourceError,
+) -> String {
+    use aruna_core::errors::StagingSourceError;
+    use aruna_operations::staging::check_source::CheckStagingSourceError;
+
+    match error {
+        CheckStagingSourceError::Staging(StagingSourceError::OperatorCreationFailed(_)) => {
+            "connector configuration is invalid".to_string()
+        }
+        CheckStagingSourceError::Staging(StagingSourceError::UnsupportedKind(_)) => {
+            "connector kind is not supported".to_string()
+        }
+        CheckStagingSourceError::Staging(StagingSourceError::HandleMissing)
+        | CheckStagingSourceError::Staging(StagingSourceError::ChannelClosed) => {
+            "connector check is unavailable".to_string()
+        }
+        _ => "connector is unreachable".to_string(),
+    }
+}
+
+fn normalize_browse_path(path: &str) -> ServerResult<String> {
+    if path.trim().is_empty() {
+        return Ok(String::new());
+    }
+    validate_source_path(path, false).map_err(map_resolution_error)?;
+    Ok(format!("{}/", path.trim().trim_end_matches('/')))
+}
+
 fn parse_connector_id(connector_id: &str) -> ServerResult<Ulid> {
     Ulid::from_str(connector_id).map_err(|_| ServerError::BadRequest)
 }
 
-async fn ensure_group_data_permission(
+pub(crate) async fn ensure_group_data_permission(
     state: &ServerState,
     auth: &AuthContext,
     group_id: Ulid,
@@ -466,6 +768,26 @@ fn map_replace_connector_error(error: ReplaceSourceConnectorError) -> ServerErro
 fn map_delete_connector_error(error: DeleteSourceConnectorError) -> ServerError {
     match error {
         DeleteSourceConnectorError::NotFound => ServerError::NotFound,
+        _ => ServerError::InternalError(error.to_string()),
+    }
+}
+
+fn map_resolution_error(error: SourceConnectorResolutionError) -> ServerError {
+    match error {
+        SourceConnectorResolutionError::NotFound => ServerError::NotFound,
+        SourceConnectorResolutionError::InvalidSourcePath
+        | SourceConnectorResolutionError::UnsupportedConnectorKind(_) => ServerError::BadRequest,
+        _ => ServerError::InternalError(error.to_string()),
+    }
+}
+
+fn map_list_error(error: ListStagingSourceError) -> ServerError {
+    match error {
+        ListStagingSourceError::Resolve(error) => map_resolution_error(error),
+        ListStagingSourceError::Staging(aruna_core::errors::StagingSourceError::NotFound) => {
+            ServerError::NotFound
+        }
+        ListStagingSourceError::Staging(_) => ServerError::BadGateway,
         _ => ServerError::InternalError(error.to_string()),
     }
 }
@@ -605,6 +927,161 @@ mod tests {
         assert!(matches!(result, Err(ServerError::Forbidden)));
     }
 
+    #[tokio::test]
+    async fn check_requires_permission() {
+        let test = setup_state().await;
+
+        let result = check_source_connector(
+            State(test.state),
+            Extension(Some(test.other_auth)),
+            Path(test.group_id.to_string()),
+            Json(SourceConnectorRequest {
+                name: "source".to_string(),
+                kind: ApiSourceConnectorKind::Http,
+                public_config: HashMap::from([(
+                    "endpoint".to_string(),
+                    "https://example.org".to_string(),
+                )]),
+                secret_config: HashMap::new(),
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServerError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn check_returns_failure() {
+        let test = setup_state().await;
+
+        let Json(result) = check_source_connector(
+            State(test.state),
+            Extension(Some(test.auth)),
+            Path(test.group_id.to_string()),
+            Json(SourceConnectorRequest {
+                name: "source".to_string(),
+                kind: ApiSourceConnectorKind::Http,
+                public_config: HashMap::from([(
+                    "endpoint".to_string(),
+                    "https://example.org".to_string(),
+                )]),
+                secret_config: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            result,
+            ConnectorCheckResponse::Failure(ConnectorCheckFailure { ok: false, .. })
+        ));
+    }
+
+    #[test]
+    fn check_maps_unreachable() {
+        let error = aruna_operations::staging::check_source::CheckStagingSourceError::Staging(
+            aruna_core::errors::StagingSourceError::CheckError("connection refused".to_string()),
+        );
+
+        assert_eq!(check_error_message(&error), "connector is unreachable");
+    }
+
+    #[tokio::test]
+    async fn stored_check_resolves() {
+        let test = setup_state().await;
+        let (_, Json(connector)) = create_source_connector(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Path(test.group_id.to_string()),
+            Json(CreateSourceConnectorRequest {
+                name: "stored-source".to_string(),
+                kind: ApiSourceConnectorKind::S3,
+                public_config: HashMap::from([
+                    ("bucket".to_string(), "reads".to_string()),
+                    ("endpoint".to_string(), "https://s3.example.org".to_string()),
+                ]),
+                secret_config: HashMap::from([(
+                    "access_key_id".to_string(),
+                    "stored-secret".to_string(),
+                )]),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let Json(result) = check_stored_connector(
+            State(test.state),
+            Extension(Some(test.auth)),
+            Path((test.group_id.to_string(), connector.connector_id)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result,
+            ConnectorCheckResponse::Failure(ConnectorCheckFailure {
+                ok: false,
+                error: "connector check is unavailable".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn check_serializes_success() {
+        let result = ConnectorCheckResponse::Success(ConnectorCheckSuccess {
+            ok: true,
+            latency_ms: 12,
+        });
+
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            json!({"ok": true, "latency_ms": 12})
+        );
+    }
+
+    #[tokio::test]
+    async fn entries_reject_traversal() {
+        let test = setup_state().await;
+
+        let result = list_connector_entries(
+            State(test.state),
+            Extension(Some(test.auth)),
+            Path((test.group_id.to_string(), Ulid::r#gen().to_string())),
+            Query(ConnectorEntriesQuery {
+                path: "../secret".to_string(),
+                limit: None,
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServerError::BadRequest)));
+    }
+
+    #[tokio::test]
+    async fn entries_require_permission() {
+        let test = setup_state().await;
+
+        let result = list_connector_entries(
+            State(test.state),
+            Extension(Some(test.other_auth)),
+            Path((test.group_id.to_string(), Ulid::r#gen().to_string())),
+            Query(ConnectorEntriesQuery {
+                path: String::new(),
+                limit: None,
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServerError::Forbidden)));
+    }
+
+    #[test]
+    fn entries_normalize_prefix() {
+        assert_eq!(normalize_browse_path("prefix").unwrap(), "prefix/");
+        assert_eq!(normalize_browse_path("prefix/").unwrap(), "prefix/");
+        assert_eq!(normalize_browse_path("").unwrap(), "");
+    }
+
     #[test]
     fn openapi_includes_connector_paths() {
         let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
@@ -617,6 +1094,21 @@ mod tests {
         assert!(
             openapi["paths"]
                 .get("/groups/{group_id}/connectors/{connector_id}")
+                .is_some()
+        );
+        assert!(
+            openapi["paths"]
+                .get("/groups/{group_id}/connectors/check")
+                .is_some()
+        );
+        assert!(
+            openapi["paths"]
+                .get("/groups/{group_id}/connectors/{connector_id}/check")
+                .is_some()
+        );
+        assert!(
+            openapi["paths"]
+                .get("/groups/{group_id}/connectors/{connector_id}/entries")
                 .is_some()
         );
         assert_eq!(

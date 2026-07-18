@@ -3,7 +3,7 @@ use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::{
     BackendLocation, RealmId, ReplicationSuboperationResult, ResolvedSourceAccess,
-    ResolvedSourceConnector, SourceMetadata,
+    ResolvedSourceConnector, SourceEntry, SourceMetadata,
 };
 use crate::{
     document::DocumentSyncNetEvent,
@@ -94,8 +94,13 @@ pub enum BlobEvent {
 
 #[derive(Debug, PartialEq)]
 pub enum StagingSourceEvent {
+    CheckResult,
     HeadResult {
         metadata: SourceMetadata,
+    },
+    ListResult {
+        entries: Vec<SourceEntry>,
+        truncated: bool,
     },
     ReadResult {
         metadata: SourceMetadata,

@@ -82,8 +82,12 @@ pub enum StagingSourceError {
     UnsupportedKind(String),
     #[error("Operator creation failed: {0}")]
     OperatorCreationFailed(String),
+    #[error("Check error: {0}")]
+    CheckError(String),
     #[error("Stat error: {0}")]
     StatError(String),
+    #[error("List error: {0}")]
+    ListError(String),
     #[error("Read error: {0}")]
     ReadError(String),
 }

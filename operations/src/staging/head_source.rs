@@ -90,6 +90,7 @@ impl HeadStagingSourceOperation {
                 group_id: self.input.group_id,
                 connector_id: self.input.connector_id,
                 source_path: self.input.source_path.clone(),
+                allow_root: false,
             }
         )]
     }

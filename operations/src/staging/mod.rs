@@ -1,11 +1,15 @@
+pub mod check_source;
 pub mod descriptor;
 pub mod head_source;
+pub mod list_source;
 pub mod read_source;
 pub mod reference;
 pub mod snapshot;
 
+pub use check_source::*;
 pub use descriptor::*;
 pub use head_source::*;
+pub use list_source::*;
 pub use read_source::*;
 pub use reference::*;
 pub use snapshot::*;
@@ -16,8 +20,14 @@ pub(crate) fn describe_event(event: &Event) -> String {
     match event {
         Event::Blob(_) => "Event::Blob".to_string(),
         Event::StagingSource(staging_event) => match staging_event {
+            StagingSourceEvent::CheckResult => {
+                "Event::StagingSource(StagingSourceEvent::CheckResult)".to_string()
+            }
             StagingSourceEvent::HeadResult { .. } => {
                 "Event::StagingSource(StagingSourceEvent::HeadResult)".to_string()
+            }
+            StagingSourceEvent::ListResult { .. } => {
+                "Event::StagingSource(StagingSourceEvent::ListResult)".to_string()
             }
             StagingSourceEvent::ReadResult { .. } => {
                 "Event::StagingSource(StagingSourceEvent::ReadResult)".to_string()

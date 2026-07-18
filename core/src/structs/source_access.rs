@@ -29,3 +29,18 @@ pub struct SourceMetadata {
     #[serde(skip)]
     pub source_version: Option<String>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceEntryKind {
+    File,
+    Directory,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceEntry {
+    pub name: String,
+    pub path: String,
+    pub kind: SourceEntryKind,
+    pub size: Option<u64>,
+    pub modified: Option<SystemTime>,
+}

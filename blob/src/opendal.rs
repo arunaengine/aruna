@@ -4,8 +4,9 @@ use aruna_core::structs::{
     Backend, BackendConfig, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata,
 };
 use bytes::Bytes;
+use futures::TryStreamExt;
 use opendal::layers::{LoggingLayer, RetryLayer};
-use opendal::{Builder, Operator, services};
+use opendal::{Builder, EntryMode, Operator, services};
 use std::collections::HashMap;
 
 pub(crate) async fn abort_partial_writer(
@@ -62,6 +63,30 @@ pub(crate) fn init_operator(
     }
 }
 
+pub(crate) async fn check_staging_source(
+    access: &ResolvedSourceAccess,
+) -> Result<(), StagingSourceError> {
+    let (operator, ..) = build_staging_source_operator(access)?;
+    let ResolvedSourceAccess::OpenDal { kind, .. } = access;
+    check_operator(&operator, *kind).await
+}
+
+async fn check_operator(
+    operator: &Operator,
+    kind: SourceConnectorKind,
+) -> Result<(), StagingSourceError> {
+    let result = if kind == SourceConnectorKind::Http {
+        match operator.stat("__aruna_connector_check__").await {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    } else {
+        operator.check().await
+    };
+    result.map_err(|error| StagingSourceError::CheckError(error.to_string()))
+}
+
 pub(crate) async fn head_staging_source(
     access: &ResolvedSourceAccess,
 ) -> Result<SourceMetadata, StagingSourceError> {
@@ -110,6 +135,62 @@ pub(crate) async fn read_staging_source(
     };
 
     Ok((metadata, BackendStream::new(stream)))
+}
+
+pub(crate) async fn list_staging_source(
+    access: &ResolvedSourceAccess,
+    limit: usize,
+    recursive: bool,
+    files_only: bool,
+) -> Result<(Vec<aruna_core::structs::SourceEntry>, bool), StagingSourceError> {
+    let (operator, path, ..) = build_staging_source_operator(access)?;
+    list_operator(&operator, path, limit, recursive, files_only).await
+}
+
+async fn list_operator(
+    operator: &Operator,
+    path: &str,
+    limit: usize,
+    recursive: bool,
+    files_only: bool,
+) -> Result<(Vec<aruna_core::structs::SourceEntry>, bool), StagingSourceError> {
+    let mut lister = operator
+        .lister_with(path)
+        .recursive(recursive)
+        .await
+        .map_err(|error| StagingSourceError::ListError(error.to_string()))?;
+    let mut entries = Vec::with_capacity(limit);
+
+    while let Some(entry) = lister
+        .try_next()
+        .await
+        .map_err(|error| StagingSourceError::ListError(error.to_string()))?
+    {
+        if entry.metadata().is_dir()
+            && entry.path().trim_end_matches('/') == path.trim_end_matches('/')
+        {
+            continue;
+        }
+        let kind = match entry.metadata().mode() {
+            EntryMode::FILE => aruna_core::structs::SourceEntryKind::File,
+            EntryMode::DIR if !files_only => aruna_core::structs::SourceEntryKind::Directory,
+            EntryMode::DIR | EntryMode::Unknown => continue,
+        };
+        if entries.len() == limit {
+            return Ok((entries, true));
+        }
+
+        entries.push(aruna_core::structs::SourceEntry {
+            name: entry.name().trim_end_matches('/').to_string(),
+            path: entry.path().trim_end_matches('/').to_string(),
+            kind,
+            size: (kind == aruna_core::structs::SourceEntryKind::File)
+                .then(|| entry.metadata().content_length()),
+            modified: entry.metadata().last_modified().map(Into::into),
+        });
+    }
+
+    Ok((entries, false))
 }
 
 fn build_staging_source_operator(
@@ -220,5 +301,98 @@ mod tests {
             build_service::<services::Fs>(HashMap::from([("root".to_string(), root)])).unwrap();
         let metadata = operator.stat("hello.txt").await.unwrap();
         assert_eq!(metadata.content_length(), 11);
+    }
+
+    #[tokio::test]
+    async fn check_reports_success() {
+        let dir = tempdir().unwrap();
+        let operator = build_service::<services::Fs>(HashMap::from([(
+            "root".to_string(),
+            dir.path().to_str().unwrap().to_string(),
+        )]))
+        .unwrap();
+
+        check_operator(&operator, SourceConnectorKind::S3)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_applies_limit() {
+        let dir = tempdir().unwrap();
+        tokio::fs::create_dir(dir.path().join("prefix"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("prefix/a.txt"), b"a")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("prefix/b.txt"), b"bb")
+            .await
+            .unwrap();
+        let operator = build_service::<services::Fs>(HashMap::from([(
+            "root".to_string(),
+            dir.path().to_str().unwrap().to_string(),
+        )]))
+        .unwrap();
+
+        let (entries, truncated) = list_operator(&operator, "prefix/", 1, false, false)
+            .await
+            .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].path.starts_with("prefix/"));
+        assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn list_filters_directories() {
+        let dir = tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join("prefix/nested"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("prefix/nested/file.txt"), b"data")
+            .await
+            .unwrap();
+        let operator = build_service::<services::Fs>(HashMap::from([(
+            "root".to_string(),
+            dir.path().to_str().unwrap().to_string(),
+        )]))
+        .unwrap();
+
+        let (entries, truncated) = list_operator(&operator, "prefix/", 10, true, true)
+            .await
+            .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "prefix/nested/file.txt");
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn recursive_list_truncates() {
+        let dir = tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join("prefix/nested"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("prefix/a.txt"), b"a")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("prefix/nested/b.txt"), b"b")
+            .await
+            .unwrap();
+        let operator = build_service::<services::Fs>(HashMap::from([(
+            "root".to_string(),
+            dir.path().to_str().unwrap().to_string(),
+        )]))
+        .unwrap();
+
+        let (entries, truncated) = list_operator(&operator, "prefix/", 1, true, true)
+            .await
+            .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].path.starts_with("prefix/"));
+        assert_eq!(entries[0].kind, aruna_core::structs::SourceEntryKind::File);
+        assert!(truncated);
     }
 }
