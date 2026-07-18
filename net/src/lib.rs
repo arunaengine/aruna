@@ -1097,6 +1097,28 @@ impl NetHandle {
         self.inner.watch_interest.write().set_realm(realm_id, nodes);
     }
 
+    /// Records a locally-known holder for a freshly created watch so the node
+    /// that handled the create routes matching events to the holder before the
+    /// holder's digest replicates back. Retracted by
+    /// [`Self::retract_local_watch_interest`].
+    pub fn register_local_watch_interest(
+        &self,
+        watch_id: Ulid,
+        realm_id: RealmId,
+        holder: NodeId,
+        entry: WatchInterestEntry,
+    ) {
+        self.inner
+            .watch_interest
+            .write()
+            .register_local(watch_id, realm_id, holder, entry);
+    }
+
+    /// Drops the local watch-interest registration for a deleted watch.
+    pub fn retract_local_watch_interest(&self, watch_id: Ulid) {
+        self.inner.watch_interest.write().retract_local(watch_id);
+    }
+
     async fn refresh_realm_peers(&self, peers: Vec<NodeId>) {
         *self.inner.realm_peers.write() = peers.clone();
         replace_dht_signed_authorized_nodes(
