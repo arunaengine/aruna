@@ -9,7 +9,7 @@ use iroh::Endpoint;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use super::constants::{CMD_CHANNEL_CAPACITY, INBOUND_STREAM_CAPACITY};
 use super::driver::{CallerOutcome, DhtDriver, DriverCmd, DriverCmdSender, InboundSender};
@@ -172,7 +172,7 @@ impl DhtHandle {
 
         match result {
             Ok(DhtOutputValue::GetValues { values, stats }) => {
-                info!(
+                debug!(
                     event = "dht.get.completed",
                     key = %key,
                     realm_id = ?realm_filter,

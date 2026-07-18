@@ -19,7 +19,7 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::sync::oneshot;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, Span, debug_span, field, info_span, trace, warn};
+use tracing::{Instrument, Span, debug, debug_span, field, info_span, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::constants::{
@@ -2442,7 +2442,7 @@ async fn rpc_request(
         Err(error) => {
             let elapsed = connect_started.elapsed();
             record_duration_ms(&span, "iroh.connect_ms", elapsed);
-            warn!(
+            debug!(
                 event = "dht.rpc.iroh_connect_failed",
                 op_id,
                 phase = ?phase,
@@ -2477,7 +2477,7 @@ async fn rpc_request(
         Ok(Err(error)) => {
             let elapsed = open_started.elapsed();
             record_duration_ms(&span, "iroh.open_bi_ms", elapsed);
-            warn!(
+            debug!(
                 event = "dht.rpc.iroh_open_bi_failed",
                 op_id,
                 phase = ?phase,
@@ -2491,7 +2491,7 @@ async fn rpc_request(
         Err(error) => {
             let elapsed = open_started.elapsed();
             record_duration_ms(&span, "iroh.open_bi_ms", elapsed);
-            warn!(
+            debug!(
                 event = "dht.rpc.iroh_open_bi_timeout",
                 op_id,
                 phase = ?phase,
@@ -2522,7 +2522,7 @@ async fn rpc_request(
         Ok(Err(error)) => {
             let elapsed = write_started.elapsed();
             record_duration_ms(&span, "iroh.write_request_ms", elapsed);
-            warn!(
+            debug!(
                 event = "dht.rpc.write_request_failed",
                 op_id,
                 phase = ?phase,
@@ -2536,7 +2536,7 @@ async fn rpc_request(
         Err(error) => {
             let elapsed = write_started.elapsed();
             record_duration_ms(&span, "iroh.write_request_ms", elapsed);
-            warn!(
+            debug!(
                 event = "dht.rpc.write_request_timeout",
                 op_id,
                 phase = ?phase,
@@ -2588,7 +2588,7 @@ async fn rpc_request(
         Err(error) => {
             let elapsed = wait_response_started.elapsed();
             record_duration_ms(&span, "iroh.wait_response_header_ms", elapsed);
-            warn!(
+            debug!(
                 event = "dht.rpc.iroh_response_timeout",
                 op_id,
                 phase = ?phase,
@@ -2633,7 +2633,7 @@ async fn rpc_request(
         Err(error) => {
             let elapsed = read_body_started.elapsed();
             record_duration_ms(&span, "iroh.read_response_body_ms", elapsed);
-            warn!(
+            debug!(
                 event = "dht.rpc.iroh_response_timeout",
                 op_id,
                 phase = ?phase,
@@ -2746,7 +2746,7 @@ async fn write_response_to_stream(
     {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            warn!(
+            debug!(
                 event = "dht.rpc.write_response_failed",
                 duration_ms = duration_ms(started.elapsed()),
                 error = %error,
@@ -2755,7 +2755,7 @@ async fn write_response_to_stream(
             return Err(error);
         }
         Err(error) => {
-            warn!(
+            debug!(
                 event = "dht.rpc.write_response_timeout",
                 duration_ms = duration_ms(started.elapsed()),
                 timeout_ms = duration_ms(RPC_TIMEOUT),
