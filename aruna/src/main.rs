@@ -733,7 +733,7 @@ async fn shutdown_runtime(
     }
 }
 
-#[cfg(feature = "docker")]
+#[cfg(any(feature = "docker", feature = "apptainer", feature = "kubernetes"))]
 /// Containers may need a different S3 endpoint than browsers: the override
 /// keeps the portal-facing url on loopback (strict CSP) while container
 /// workloads get a host-reachable one.
@@ -745,6 +745,7 @@ fn compute_s3_endpoint(config: &Config) -> Option<String> {
         .or_else(|| config.s3_public_url.clone())
 }
 
+#[cfg(feature = "docker")]
 fn container_local_endpoint(endpoint: &str) -> bool {
     let Some(host) = reqwest::Url::parse(endpoint)
         .ok()
