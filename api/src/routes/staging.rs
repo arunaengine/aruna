@@ -4,8 +4,9 @@ use crate::auth::{
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
+use aruna_core::NodeId;
 use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
-use aruna_core::structs::{AuthContext, BucketInfo, Permission};
+use aruna_core::structs::{AuthContext, BucketInfo, Permission, SourceEntry, SourceEntryKind};
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::replication::queue::{
@@ -14,6 +15,9 @@ use aruna_operations::replication::queue::{
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::put_object::PutObjectError;
 use aruna_operations::staging::head_source::HeadStagingSourceError;
+use aruna_operations::staging::list_source::{
+    ListStagingSourceError, ListStagingSourceInput, ListStagingSourceOperation,
+};
 use aruna_operations::staging::read_source::ReadStagingSourceError;
 use aruna_operations::staging::reference::{
     MaterializeReferenceError, MaterializeReferenceInput, stage_reference_blob,
@@ -27,6 +31,7 @@ use axum::routing::post;
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path};
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::warn;
 use utoipa::{OpenApi, ToSchema};
@@ -34,12 +39,14 @@ use utoipa::{OpenApi, ToSchema};
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "staging", description = "Blob staging")),
-    paths(stage_blob)
+    paths(stage_blob, stage_batch)
 )]
 pub struct StagingApiDoc;
 
 pub fn router() -> Router<Arc<ServerState>> {
-    Router::new().route("/staging/", post(stage_blob))
+    Router::new()
+        .route("/staging/", post(stage_blob))
+        .route("/staging/batch", post(stage_batch))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -82,6 +89,53 @@ pub struct StageBlobResponse {
     pub last_modified: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct StageBatchItem {
+    pub source_path: String,
+    pub target_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct StageBatchPrefix {
+    pub source_prefix: String,
+    pub target_prefix: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct StageBatchRequest {
+    pub group_id: String,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    pub connector_id: String,
+    pub bucket: String,
+    pub strategy: ApiStagingStrategy,
+    #[serde(default)]
+    pub items: Option<Vec<StageBatchItem>>,
+    #[serde(default)]
+    pub prefixes: Option<Vec<StageBatchPrefix>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StageBatchStatus {
+    Ok,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct StageBatchResult {
+    pub source_path: String,
+    pub target_key: String,
+    pub status: StageBatchStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct StageBatchResponse {
+    pub results: Vec<StageBatchResult>,
+}
+
 #[utoipa::path(
     post,
     path = "/staging/",
@@ -110,6 +164,225 @@ pub async fn stage_blob(
         StageBlobRequest::Reference(request) => reference_blob(state, auth, request).await,
         StageBlobRequest::Sync(_) => Err(ServerError::Unimplemented),
     }
+}
+
+#[utoipa::path(
+    post,
+    path = "/staging/batch",
+    tag = "staging",
+    request_body = StageBatchRequest,
+    responses(
+        (status = 200, description = "Batch staging results", body = StageBatchResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 501, description = "Not implemented", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn stage_batch(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(request): Json<StageBatchRequest>,
+) -> ServerResult<(StatusCode, Json<StageBatchResponse>)> {
+    const BATCH_LIMIT: usize = 1000;
+
+    let auth = require_realm_auth(&state, auth)?;
+    let group_id = parse_group_id(&request.group_id)?;
+    let connector_id = parse_source_connector_id(&request.connector_id)?;
+    if request.strategy == ApiStagingStrategy::Sync {
+        return Err(ServerError::Unimplemented);
+    }
+    let node_id = request
+        .node_id
+        .as_deref()
+        .map(NodeId::from_str)
+        .transpose()
+        .map_err(|_| ServerError::BadRequest)?
+        .unwrap_or_else(|| state.get_node_id());
+    if node_id != state.get_node_id() {
+        return Err(ServerError::BadRequestReason(
+            "staging node must be the local node".to_string(),
+        ));
+    }
+    let mut items = request.items.unwrap_or_default();
+    ensure_batch_capacity(0, items.len(), BATCH_LIMIT)?;
+    let prefixes = request.prefixes.unwrap_or_default();
+    if !prefixes.is_empty() {
+        crate::routes::connectors::ensure_group_data_permission(
+            &state,
+            &auth,
+            group_id,
+            Permission::READ,
+        )
+        .await?;
+    }
+    let mut expansion_errors = Vec::new();
+    for prefix in prefixes {
+        let source_prefix = match normalize_prefix(&prefix.source_prefix) {
+            Ok(prefix) => prefix,
+            Err(error) => {
+                expansion_errors.push(StageBatchResult {
+                    source_path: prefix.source_prefix,
+                    target_key: prefix.target_prefix,
+                    status: StageBatchStatus::Error,
+                    error: Some(batch_error_message(&error)),
+                });
+                continue;
+            }
+        };
+        let remaining = BATCH_LIMIT - items.len();
+        match drive(
+            ListStagingSourceOperation::new(ListStagingSourceInput {
+                group_id,
+                connector_id,
+                source_path: source_prefix.clone(),
+                limit: remaining,
+                recursive: true,
+                files_only: true,
+            }),
+            &state.get_ctx(),
+        )
+        .await
+        {
+            Ok(result) => {
+                if result.truncated {
+                    return Err(ServerError::BadRequestReason(format!(
+                        "batch expands beyond {BATCH_LIMIT} items"
+                    )));
+                }
+                let expanded =
+                    map_prefix_entries(result.entries, &source_prefix, &prefix.target_prefix);
+                ensure_batch_capacity(items.len(), expanded.len(), BATCH_LIMIT)?;
+                items.extend(expanded);
+            }
+            Err(error) => {
+                let error = map_list_error(error);
+                expansion_errors.push(StageBatchResult {
+                    source_path: prefix.source_prefix,
+                    target_key: prefix.target_prefix,
+                    status: StageBatchStatus::Error,
+                    error: Some(batch_error_message(&error)),
+                });
+            }
+        }
+    }
+
+    let mut results = Vec::with_capacity(items.len() + expansion_errors.len());
+    for item in items {
+        let result = stage_item(
+            state.clone(),
+            auth.clone(),
+            group_id,
+            connector_id,
+            &request.bucket,
+            request.strategy,
+            &item,
+        )
+        .await;
+        results.push(stage_result(item, result));
+    }
+    results.extend(expansion_errors);
+
+    Ok((StatusCode::OK, Json(StageBatchResponse { results })))
+}
+
+async fn stage_item(
+    state: Arc<ServerState>,
+    auth: AuthContext,
+    group_id: ulid::Ulid,
+    connector_id: ulid::Ulid,
+    bucket: &str,
+    strategy: ApiStagingStrategy,
+    item: &StageBatchItem,
+) -> ServerResult<()> {
+    let target = StageBlobTargetRequest {
+        group_id: group_id.to_string(),
+        connector_id: connector_id.to_string(),
+        source_path: item.source_path.clone(),
+        bucket: bucket.to_string(),
+        key: item.target_key.clone(),
+    };
+    let _ = match strategy {
+        ApiStagingStrategy::Snapshot => snapshot_blob(state, auth, target).await?,
+        ApiStagingStrategy::Reference => reference_blob(state, auth, target).await?,
+        ApiStagingStrategy::Sync => return Err(ServerError::Unimplemented),
+    };
+    Ok(())
+}
+
+fn stage_result(item: StageBatchItem, result: ServerResult<()>) -> StageBatchResult {
+    match result {
+        Ok(()) => StageBatchResult {
+            source_path: item.source_path,
+            target_key: item.target_key,
+            status: StageBatchStatus::Ok,
+            error: None,
+        },
+        Err(error) => StageBatchResult {
+            source_path: item.source_path,
+            target_key: item.target_key,
+            status: StageBatchStatus::Error,
+            error: Some(batch_error_message(&error)),
+        },
+    }
+}
+
+fn batch_error_message(error: &ServerError) -> String {
+    match error {
+        ServerError::InternalError(_) => "Internal server error".to_string(),
+        ServerError::BadGateway => "Bad gateway".to_string(),
+        _ => error.to_string(),
+    }
+}
+
+fn ensure_batch_capacity(current: usize, additional: usize, limit: usize) -> ServerResult<()> {
+    if current
+        .checked_add(additional)
+        .is_none_or(|total| total > limit)
+    {
+        return Err(ServerError::BadRequestReason(format!(
+            "batch expands beyond {limit} items"
+        )));
+    }
+    Ok(())
+}
+
+fn normalize_prefix(prefix: &str) -> ServerResult<String> {
+    if prefix.trim().is_empty() {
+        return Ok(String::new());
+    }
+    validate_relative_source_path(prefix)?;
+    Ok(format!("{}/", prefix.trim().trim_end_matches('/')))
+}
+
+fn map_prefix_entries(
+    entries: Vec<SourceEntry>,
+    source_prefix: &str,
+    target_prefix: &str,
+) -> Vec<StageBatchItem> {
+    entries
+        .into_iter()
+        .filter(|entry| entry.kind == SourceEntryKind::File)
+        .map(|entry| {
+            let relative = entry
+                .path
+                .strip_prefix(source_prefix)
+                .unwrap_or(&entry.path)
+                .trim_start_matches('/');
+            let target_prefix = target_prefix.trim_matches('/');
+            let target_key = if target_prefix.is_empty() {
+                relative.to_string()
+            } else if relative.is_empty() {
+                target_prefix.to_string()
+            } else {
+                format!("{target_prefix}/{relative}")
+            };
+            StageBatchItem {
+                source_path: entry.path,
+                target_key,
+            }
+        })
+        .collect()
 }
 
 async fn snapshot_blob(
@@ -374,6 +647,14 @@ fn map_staging_source_error(error: StagingSourceError) -> ServerError {
     }
 }
 
+fn map_list_error(error: ListStagingSourceError) -> ServerError {
+    match error {
+        ListStagingSourceError::Resolve(error) => map_connector_resolution_error(error),
+        ListStagingSourceError::Staging(error) => map_staging_source_error(error),
+        _ => ServerError::InternalError(error.to_string()),
+    }
+}
+
 async fn queue_live_version_replication(
     state: &ServerState,
     auth_context: AuthContext,
@@ -568,10 +849,138 @@ mod tests {
     }
 
     #[test]
+    fn batch_keeps_failures() {
+        let success = stage_result(
+            StageBatchItem {
+                source_path: "a.txt".to_string(),
+                target_key: "a.txt".to_string(),
+            },
+            Ok(()),
+        );
+        let failure = stage_result(
+            StageBatchItem {
+                source_path: "missing.txt".to_string(),
+                target_key: "missing.txt".to_string(),
+            },
+            Err(ServerError::NotFound),
+        );
+
+        assert_eq!(success.status, StageBatchStatus::Ok);
+        assert_eq!(failure.status, StageBatchStatus::Error);
+        assert_eq!(failure.error.as_deref(), Some("Not found"));
+    }
+
+    #[test]
+    fn prefix_expands_paths() {
+        let items = map_prefix_entries(
+            vec![SourceEntry {
+                name: "file.txt".to_string(),
+                path: "folder/nested/file.txt".to_string(),
+                kind: SourceEntryKind::File,
+                size: Some(4),
+                modified: None,
+            }],
+            "folder/",
+            "imported",
+        );
+
+        assert_eq!(
+            items,
+            vec![StageBatchItem {
+                source_path: "folder/nested/file.txt".to_string(),
+                target_key: "imported/nested/file.txt".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn batch_enforces_cap() {
+        assert!(ensure_batch_capacity(999, 1, 1000).is_ok());
+        assert!(matches!(
+            ensure_batch_capacity(1000, 1, 1000),
+            Err(ServerError::BadRequestReason(message)) if message.contains("1000")
+        ));
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_cap() {
+        let test = setup_state().await;
+        let items = (0..1001)
+            .map(|index| StageBatchItem {
+                source_path: format!("source-{index}"),
+                target_key: format!("target-{index}"),
+            })
+            .collect();
+
+        let result = stage_batch(
+            State(test.state),
+            Extension(Some(test.auth_with_source_read)),
+            Json(StageBatchRequest {
+                group_id: test.bucket_group_id.to_string(),
+                node_id: None,
+                connector_id: test.connector_id.to_string(),
+                bucket: test.bucket,
+                strategy: ApiStagingStrategy::Snapshot,
+                items: Some(items),
+                prefixes: None,
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServerError::BadRequestReason(_))));
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_node() {
+        let test = setup_state().await;
+        let other_node = iroh::SecretKey::from_bytes(&[17u8; 32]).public();
+
+        let result = stage_batch(
+            State(test.state),
+            Extension(Some(test.auth_with_source_read)),
+            Json(StageBatchRequest {
+                group_id: test.bucket_group_id.to_string(),
+                node_id: Some(other_node.to_string()),
+                connector_id: test.connector_id.to_string(),
+                bucket: test.bucket,
+                strategy: ApiStagingStrategy::Snapshot,
+                items: None,
+                prefixes: None,
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServerError::BadRequestReason(_))));
+    }
+
+    #[tokio::test]
+    async fn batch_sync_unimplemented() {
+        let test = setup_state().await;
+
+        let result = stage_batch(
+            State(test.state),
+            Extension(Some(test.auth_with_source_read)),
+            Json(StageBatchRequest {
+                group_id: test.bucket_group_id.to_string(),
+                node_id: None,
+                connector_id: test.connector_id.to_string(),
+                bucket: test.bucket,
+                strategy: ApiStagingStrategy::Sync,
+                items: None,
+                prefixes: None,
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServerError::Unimplemented)));
+    }
+
+    #[test]
     fn openapi_includes_staging_path() {
         let openapi = ApiDoc::openapi();
 
         assert!(openapi.paths.paths.contains_key("/staging/"));
+        assert!(openapi.paths.paths.contains_key("/staging/batch"));
         assert!(!openapi.paths.paths.contains_key("/blobs/staging"));
     }
 
@@ -710,8 +1119,12 @@ mod tests {
             .await,
         );
 
-        let target_path =
-            bucket_blob_permission_path(state.as_ref(), bucket_group_id, &bucket, &key);
+        let target_path = crate::auth::bucket_blob_permission_path(
+            state.as_ref(),
+            bucket_group_id,
+            &bucket,
+            &key,
+        );
         let source_path_restriction = source_connector_permission_path(
             state.as_ref(),
             bucket_group_id,
