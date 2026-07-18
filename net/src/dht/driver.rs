@@ -1634,9 +1634,10 @@ async fn run_storage_txn(
         },
         None => Vec::new(),
     };
+    let original_entries = entries;
     let entries = match mutation {
         StorageMutation::Merge { entry, now_secs } => {
-            match merge_entry(&key, entries, entry.clone(), *now_secs) {
+            match merge_entry(&key, original_entries.clone(), entry.clone(), *now_secs) {
                 Ok(entries) => entries,
                 Err(MergeError::Stale) => {
                     abort_storage_txn(storage, op_id, stage, txn_id).await;
@@ -1663,13 +1664,18 @@ async fn run_storage_txn(
             }
         }
         StorageMutation::Prune { now_secs } => {
-            if let Err(error) = validate_entries(&key, &entries, *now_secs) {
+            if let Err(error) = validate_entries(&key, &original_entries, *now_secs) {
                 abort_storage_txn(storage, op_id, stage, txn_id).await;
                 return Err(TransactionFailure::Failed(DhtIoError::storage(error)));
             }
-            retained_entries(entries, *now_secs)
+            retained_entries(original_entries.clone(), *now_secs)
         }
     };
+
+    if had_value && !entries.is_empty() && entries == original_entries {
+        abort_storage_txn(storage, op_id, stage, txn_id).await;
+        return Ok(());
+    }
 
     let count_result = if !had_value && !entries.is_empty() {
         update_key_count(storage, op_id, stage, txn_id, true).await
@@ -2500,6 +2506,58 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn replay_skips_write() {
+        let (storage, receiver) = StorageHandle::new();
+        let key = DhtKeyId::from_data(b"unchanged-replay");
+        let entry = make_entry(1, key, 200);
+        let encoded = encode_entries(std::slice::from_ref(&entry)).expect("encode entry");
+        let txn_id = TxnId::new();
+        let worker = std::thread::spawn(move || {
+            let (effect, response, ..) = receiver.recv().expect("transaction start");
+            assert!(matches!(
+                effect,
+                StorageEffect::StartTransaction { read: false }
+            ));
+            response.send(StorageEvent::TransactionStarted { txn_id });
+
+            let (effect, response, ..) = receiver.recv().expect("transaction read");
+            assert!(matches!(
+                effect,
+                StorageEffect::Read {
+                    txn_id: Some(id),
+                    ..
+                } if id == txn_id
+            ));
+            response.send(StorageEvent::ReadResult {
+                key: ByteView::from(key.as_bytes().as_slice()),
+                value: Some(ByteView::from(encoded)),
+            });
+
+            let (effect, response, ..) = receiver.recv().expect("transaction abort");
+            assert!(matches!(
+                effect,
+                StorageEffect::AbortTransaction { txn_id: id } if id == txn_id
+            ));
+            response.send(StorageEvent::TransactionAborted { txn_id });
+        });
+
+        let mutation = StorageMutation::Merge {
+            entry,
+            now_secs: 100,
+        };
+        mutate_storage_entries(
+            &storage,
+            6,
+            StorageStage::InboundPutMerge,
+            key,
+            &mutation,
+        )
+        .await
+        .expect("duplicate succeeds");
+        worker.join().expect("storage worker");
     }
 
     fn open_storage() -> (TempDir, StorageHandle) {
