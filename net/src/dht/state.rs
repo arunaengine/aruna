@@ -217,9 +217,22 @@ impl LookupFrontier {
         }
     }
 
-    fn add_candidates<I: IntoIterator<Item = NodeId>>(&mut self, nodes: I, local_id: NodeId) {
+    fn add_candidates<I: IntoIterator<Item = NodeId>>(
+        &mut self,
+        nodes: I,
+        local_id: NodeId,
+        target: &[u8; 32],
+    ) {
         for node_id in nodes {
             self.add_candidate(node_id, local_id);
+        }
+        self.pending
+            .sort_unstable_by(|left, right| compare_distance(target, left, right));
+        let pending_limit = LOOKUP_MAX_QUERIES.saturating_sub(self.queried.len());
+        while self.pending.len() > pending_limit {
+            if let Some(removed) = self.pending.pop() {
+                self.discovered.remove(&removed);
+            }
         }
     }
 
@@ -702,7 +715,8 @@ impl DhtStateMachine {
                     DhtResponse::Nodes { nodes } => {
                         op.frontier.responsive.insert(peer);
                         self.insert_peer(peer, out);
-                        op.frontier.add_candidates(nodes, self.local_id);
+                        op.frontier
+                            .add_candidates(nodes, self.local_id, op.key.as_bytes());
                     }
                     DhtResponse::Pong
                     | DhtResponse::Value { .. }
@@ -767,7 +781,8 @@ impl DhtStateMachine {
                     op.frontier.responsive.insert(peer);
                     self.insert_peer(peer, out);
                 }
-                op.frontier.add_candidates(closer_nodes, self.local_id);
+                op.frontier
+                    .add_candidates(closer_nodes, self.local_id, op.key.as_bytes());
             }
             DhtResponse::Error { code, .. } => {
                 record_get_peer_error(&mut op, peer, format!("remote_error:{code:?}"));
@@ -1107,6 +1122,7 @@ impl DhtStateMachine {
                         .into_iter()
                         .map(|peer| peer.node_id),
                     self.local_id,
+                    op.key.as_bytes(),
                 );
 
                 self.dispatch_get_requests(op_id, &mut op, out);
@@ -1196,6 +1212,7 @@ impl DhtStateMachine {
                         .into_iter()
                         .map(|peer| peer.node_id),
                     self.local_id,
+                    op.key.as_bytes(),
                 );
 
                 self.dispatch_put_lookup_requests(op_id, &mut op, out);
@@ -2953,6 +2970,25 @@ mod tests {
             panic!("expected put operation");
         };
         assert_eq!(put.frontier.discovered.len(), K + 1);
+    }
+
+    #[test]
+    fn frontier_stays_bounded() {
+        let target = [0u8; 32];
+        let local_id = make_node(255);
+        let mut nodes = (1..=LOOKUP_MAX_QUERIES + 1)
+            .map(|seed| make_node(seed as u8))
+            .collect::<Vec<_>>();
+        nodes.sort_unstable_by(|left, right| compare_distance(&target, left, right));
+        let closest = nodes[0];
+        let mut frontier = LookupFrontier::default();
+        frontier.add_candidates(nodes.into_iter().skip(1), local_id, &target);
+        assert_eq!(frontier.discovered.len(), LOOKUP_MAX_QUERIES);
+
+        frontier.add_candidates([closest], local_id, &target);
+
+        assert_eq!(frontier.discovered.len(), LOOKUP_MAX_QUERIES);
+        assert!(frontier.discovered.contains(&closest));
     }
 
     #[test]

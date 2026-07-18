@@ -24,9 +24,10 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::constants::{
     DHT_KEY_COUNT_KEY, DHT_META_KEYSPACE, DHT_REVISION_KEY, DRIVER_IO_EVENT_CAPACITY,
-    DRIVER_TICK_INTERVAL, MAX_MESSAGE_SIZE, MAX_STORED_KEYS, RPC_TIMEOUT, STORAGE_MUTATION_RETRIES,
-    STORAGE_TIMEOUT,
+    DRIVER_TICK_INTERVAL, MAX_ENTRIES_PER_KEY, MAX_MESSAGE_SIZE, MAX_STORED_KEYS, RPC_TIMEOUT,
+    STORAGE_MUTATION_RETRIES, STORAGE_TIMEOUT,
 };
+use super::kbucket::K;
 use super::protocol::{
     CLEANUP_OP_ID, DhtCmd, DhtEffect, DhtInput, DhtIo, DhtIoError, DhtIoRequest, DhtOutput,
     DhtOutputValue, InboundId, OpId, RpcPhase, StorageStage,
@@ -2315,7 +2316,24 @@ async fn rpc_request(
         "Completed Iroh DHT RPC"
     );
 
-    Ok(decode_response(&response_bytes)?)
+    let response = decode_response(&response_bytes)?;
+    validate_response(&response)?;
+    Ok(response)
+}
+
+fn validate_response(response: &DhtResponse) -> Result<(), DhtIoError> {
+    match response {
+        DhtResponse::Nodes { nodes } if nodes.len() > K => {
+            Err(DhtIoError::invalid_response("too many DHT nodes"))
+        }
+        DhtResponse::Value {
+            entries,
+            closer_nodes,
+        } if entries.len() > MAX_ENTRIES_PER_KEY || closer_nodes.len() > K => {
+            Err(DhtIoError::invalid_response("too many DHT values or nodes"))
+        }
+        _ => Ok(()),
+    }
 }
 
 fn record_selected_path(span: &Span, conn: &Connection) {
@@ -2444,6 +2462,32 @@ mod tests {
             signature: secret.sign(&signed),
             retain_until: expires_at,
         }
+    }
+
+    #[test]
+    fn response_bounds_reject() {
+        let nodes = (1..=K + 1)
+            .map(|seed| make_node(seed as u8))
+            .collect();
+        assert!(validate_response(&DhtResponse::Nodes { nodes }).is_err());
+
+        let key = DhtKeyId::from_data(b"response-entry-limit");
+        let entry = make_entry(1, key, 200);
+        let value = super::super::rpc::StoredValue {
+            publisher: entry.publisher,
+            realm_id: entry.realm_id,
+            value: entry.value,
+            expires_at: entry.expires_at,
+            revision: entry.revision,
+            signature: entry.signature,
+        };
+        assert!(
+            validate_response(&DhtResponse::Value {
+                entries: vec![value; MAX_ENTRIES_PER_KEY + 1],
+                closer_nodes: Vec::new(),
+            })
+            .is_err()
+        );
     }
 
     fn open_storage() -> (TempDir, StorageHandle) {
