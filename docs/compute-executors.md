@@ -9,9 +9,11 @@ An explicitly selected executor must pass its startup health checks. Set
 health failure. Invalid configuration is still rejected.
 
 Task images are resolved before the attempt intent is committed and the
-digest-pinned reference is retained for recovery. Kubernetes requires the task
-image to be supplied by digest. The Kubernetes helper image also has no default
-and must be configured as an immutable digest reference.
+digest-pinned reference is retained for exact-bits recovery. Kubernetes also
+accepts tagged task images without a registry lookup and always pulls them;
+retries may therefore run newer bits if the tag moves. The Kubernetes helper
+image still has no default and must be configured as an immutable digest
+reference.
 
 ## Shared security and recovery
 
