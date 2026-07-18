@@ -465,11 +465,48 @@ pub fn watch_interest_dirty_realm_id(key: &[u8]) -> Option<RealmId> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WatchInterestTable {
     realms: HashMap<RealmId, HashMap<NodeId, Vec<WatchInterestEntry>>>,
+    local: HashMap<Ulid, LocalWatchInterest>,
+}
+
+/// Interest a node recorded when it handled a watch create, before the holder's
+/// durable digest replicated back over the shared realm topic. Keyed by watch id
+/// so a delete retracts exactly one subscription's contribution. Consulted by
+/// `matching_nodes` alongside `realms`, and never touched by `set_realm`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalWatchInterest {
+    realm_id: RealmId,
+    holder: NodeId,
+    entry: WatchInterestEntry,
 }
 
 impl WatchInterestTable {
     pub fn is_empty(&self) -> bool {
-        self.realms.is_empty()
+        self.realms.is_empty() && self.local.is_empty()
+    }
+
+    /// Records a locally-known holder for a freshly created watch so the node
+    /// that handled the create routes matching events before the holder's digest
+    /// propagates. A repeated watch id overwrites, keeping the map idempotent.
+    pub fn register_local(
+        &mut self,
+        watch_id: Ulid,
+        realm_id: RealmId,
+        holder: NodeId,
+        entry: WatchInterestEntry,
+    ) {
+        self.local.insert(
+            watch_id,
+            LocalWatchInterest {
+                realm_id,
+                holder,
+                entry,
+            },
+        );
+    }
+
+    /// Drops the local registration for a deleted watch.
+    pub fn retract_local(&mut self, watch_id: Ulid) {
+        self.local.remove(&watch_id);
     }
 
     /// Records a node's interest entries for a realm. An empty entry set drops
@@ -522,19 +559,23 @@ impl WatchInterestTable {
         path: &str,
         kind: WatchEventKind,
     ) -> Vec<NodeId> {
-        let Some(nodes) = self.realms.get(&realm_id) else {
-            return Vec::new();
+        let entry_matches = |entry: &WatchInterestEntry| {
+            entry.event_mask.contains(kind) && path.starts_with(entry.path_prefix.as_str())
         };
-        let mut matched: Vec<NodeId> = nodes
-            .iter()
-            .filter(|(_, entries)| {
-                entries.iter().any(|entry| {
-                    entry.event_mask.contains(kind) && path.starts_with(entry.path_prefix.as_str())
-                })
-            })
-            .map(|(node_id, _)| *node_id)
-            .collect();
+        let mut matched: Vec<NodeId> = self.realms.get(&realm_id).map_or_else(Vec::new, |nodes| {
+            nodes
+                .iter()
+                .filter(|(_, entries)| entries.iter().any(&entry_matches))
+                .map(|(node_id, _)| *node_id)
+                .collect()
+        });
+        for interest in self.local.values() {
+            if interest.realm_id == realm_id && entry_matches(&interest.entry) {
+                matched.push(interest.holder);
+            }
+        }
         matched.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        matched.dedup();
         matched
     }
 }
@@ -963,6 +1004,63 @@ mod tests {
         // An empty entry set drops the holder, and the realm once empty.
         table.insert(realm_id, holder, Vec::new());
         assert!(table.nodes(realm_id).is_none());
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn local_registration_matches_and_retracts() {
+        // A creating node knows the holder before the digest replicates back.
+        let realm_id = RealmId([1u8; 32]);
+        let holder = node(10);
+        let watch_id = Ulid::from_bytes([7u8; 16]);
+        let mut table = WatchInterestTable::default();
+        table.register_local(
+            watch_id,
+            realm_id,
+            holder,
+            WatchInterestEntry {
+                path_prefix: "s3/bucket/".to_string(),
+                event_mask: WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            },
+        );
+
+        assert!(!table.is_empty());
+        assert!(table.nodes(realm_id).is_none());
+        assert_eq!(
+            table.matching_nodes(realm_id, "s3/bucket/object", WatchEventKind::DataUploaded),
+            vec![holder]
+        );
+        assert!(
+            table
+                .matching_nodes(
+                    realm_id,
+                    "s3/bucket/object",
+                    WatchEventKind::MetadataCreated
+                )
+                .is_empty()
+        );
+
+        // A durable digest for the same holder does not duplicate the match.
+        table.insert(
+            realm_id,
+            holder,
+            vec![WatchInterestEntry {
+                path_prefix: "s3/bucket/".to_string(),
+                event_mask: WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            }],
+        );
+        assert_eq!(
+            table.matching_nodes(realm_id, "s3/bucket/object", WatchEventKind::DataUploaded),
+            vec![holder]
+        );
+
+        table.retract_local(watch_id);
+        table.insert(realm_id, holder, Vec::new());
+        assert!(
+            table
+                .matching_nodes(realm_id, "s3/bucket/object", WatchEventKind::DataUploaded)
+                .is_empty()
+        );
         assert!(table.is_empty());
     }
 }

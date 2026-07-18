@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use crate::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, schedule_outbox_drain_effect, write_outbox_effect,
 };
@@ -185,6 +186,7 @@ async fn reconcile_inbound_document_sync_topics(
     if applied == 0 {
         return true;
     }
+    let dashboard_changed = targets_change_dashboard(&targets.targets);
     let metadata_graph_tombstones = targets.metadata_graph_tombstones.clone();
     let realm_config_changed = targets
         .targets
@@ -210,6 +212,9 @@ async fn reconcile_inbound_document_sync_topics(
         total_ms = duration_ms(run_started.elapsed()),
         "Inbound document sync reconcile summary"
     );
+    if dashboard_changed {
+        notify_dashboard_change(context);
+    }
     true
 }
 

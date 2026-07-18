@@ -29,6 +29,7 @@ use aruna_operations::read_user_document::{ReadUserDocumentError, ReadUserDocume
 use aruna_operations::register_or_get_oidc_user::{
     RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
 };
+use aruna_operations::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use aruna_operations::search_users::{SearchUsersInput, SearchUsersOperation};
 use aruna_operations::update_user::{UpdateUserInput, UpdateUserOperation};
 use axum::extract::{Path, Query, State};
@@ -52,6 +53,7 @@ use utoipa::{OpenApi, ToSchema};
         patch_user_info,
         list_users,
         search_users,
+        resolve_users,
         get_user,
         update_user,
     )
@@ -65,6 +67,7 @@ pub fn router() -> Router<Arc<ServerState>> {
         .route("/users/info", get(get_user_info).patch(patch_user_info))
         .route("/users", get(list_users))
         .route("/users/search", get(search_users))
+        .route("/users/resolve", post(resolve_users))
         .route("/users/{id}", get(get_user).patch(update_user))
 }
 
@@ -126,6 +129,19 @@ pub struct SearchUsersResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResolveUsersRequest {
+    pub user_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResolveUserResult {
+    pub user_id: String,
+    pub name: String,
+    /// Scholarly attributes only; sensitive keys such as email are excluded.
+    pub attributes: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UserInfoRoleResponse {
     pub role_id: String,
     pub name: String,
@@ -174,8 +190,9 @@ pub type PatchUserInfoRequest = UpdateUserRequest;
 
 const DEFAULT_LIST_USERS_LIMIT: usize = 100;
 const MAX_LIST_USERS_LIMIT: usize = 1_000;
-const MIN_SEARCH_QUERY_CHARS: usize = 2;
+pub(crate) const MIN_SEARCH_QUERY_CHARS: usize = 2;
 const MAX_SEARCH_USERS_LIMIT: usize = 20;
+const MAX_RESOLVE_USER_IDS: usize = 100;
 
 impl From<User> for GetUserResponse {
     fn from(value: User) -> Self {
@@ -809,6 +826,61 @@ async fn search_users(
                 .collect(),
             next_start_after: output.next_start_after,
         }),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/users/resolve",
+    tag = "users",
+    request_body = ResolveUsersRequest,
+    responses(
+        (status = 200, description = "Resolved users", body = [ResolveUserResult]),
+        (status = 400, description = "Too many or invalid user ids", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn resolve_users(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(request): Json<ResolveUsersRequest>,
+) -> ServerResult<(StatusCode, Json<Vec<ResolveUserResult>>)> {
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let realm_id = state.get_realm_id();
+    if auth.realm_id != realm_id {
+        return Err(ServerError::Forbidden);
+    }
+    if request.user_ids.len() > MAX_RESOLVE_USER_IDS {
+        return Err(ServerError::BadRequest);
+    }
+    let user_ids = request
+        .user_ids
+        .iter()
+        .map(|user_id| UserId::from_string(user_id).map_err(|_| ServerError::BadRequest))
+        .collect::<ServerResult<Vec<_>>>()?;
+
+    let output = drive(
+        ResolveUsersOperation::new(ResolveUsersInput { realm_id, user_ids }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+
+    Ok((
+        StatusCode::OK,
+        Json(
+            output
+                .users
+                .into_iter()
+                .map(|user| ResolveUserResult {
+                    user_id: user.user_id.to_string(),
+                    name: user.name,
+                    attributes: user.attributes,
+                })
+                .collect(),
+        ),
     ))
 }
 
@@ -1728,5 +1800,115 @@ mod tests {
         node.server_task.abort();
         node.net.shutdown().await;
         oidc_task.abort();
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::{ResolveUsersRequest, resolve_users};
+    use crate::error::ServerError;
+    use crate::server_state::ServerState;
+    use aruna_core::UserId;
+    use aruna_core::structs::{AuthContext, NodeCapabilities, RealmId};
+    use aruna_operations::driver::DriverContext;
+    use aruna_storage::FjallStorage;
+    use axum::extract::State;
+    use axum::{Extension, Json};
+    use ed25519_dalek::SigningKey;
+    use std::sync::Arc;
+    use tempfile::{TempDir, tempdir};
+    use ulid::Ulid;
+
+    async fn setup_state() -> (Arc<ServerState>, TempDir) {
+        let tempdir = tempdir().unwrap();
+        let storage_handle = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let realm_signing_key =
+            SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+        let state = Arc::new(
+            ServerState::new(
+                driver_ctx,
+                realm_id,
+                iroh::SecretKey::generate().public(),
+                NodeCapabilities::local_node(realm_id).unwrap(),
+                false,
+                None,
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
+            )
+            .await,
+        );
+        (state, tempdir)
+    }
+
+    fn realm_auth(realm_id: RealmId) -> AuthContext {
+        AuthContext {
+            user_id: UserId::local(Ulid::r#gen(), realm_id),
+            realm_id,
+            path_restrictions: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn requires_auth() {
+        let (state, _tempdir) = setup_state().await;
+        let result = resolve_users(
+            State(state),
+            Extension(None),
+            Json(ResolveUsersRequest { user_ids: vec![] }),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::Unauthorized)));
+    }
+
+    #[tokio::test]
+    async fn rejects_foreign_realm() {
+        let (state, _tempdir) = setup_state().await;
+        let foreign = realm_auth(RealmId::from_bytes([7u8; 32]));
+        let result = resolve_users(
+            State(state),
+            Extension(Some(foreign)),
+            Json(ResolveUsersRequest { user_ids: vec![] }),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn caps_batch_size() {
+        let (state, _tempdir) = setup_state().await;
+        let realm_id = state.get_realm_id();
+        let user_ids = (0..=super::MAX_RESOLVE_USER_IDS)
+            .map(|_| UserId::local(Ulid::r#gen(), realm_id).to_string())
+            .collect();
+        let result = resolve_users(
+            State(state),
+            Extension(Some(realm_auth(realm_id))),
+            Json(ResolveUsersRequest { user_ids }),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::BadRequest)));
+    }
+
+    #[tokio::test]
+    async fn rejects_bad_id() {
+        let (state, _tempdir) = setup_state().await;
+        let realm_id = state.get_realm_id();
+        let result = resolve_users(
+            State(state),
+            Extension(Some(realm_auth(realm_id))),
+            Json(ResolveUsersRequest {
+                user_ids: vec!["not-a-user-id".to_string()],
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::BadRequest)));
     }
 }

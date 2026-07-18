@@ -207,8 +207,8 @@ async fn shared_node_info_topic_propagates_placement_authoritative_document()
     assert_eq!(received.labels.get("tier").map(String::as_str), Some("hot"));
     assert_eq!(received.urls, urls);
     assert_eq!(received.utilization.storage_bytes_used, 0);
-    assert_eq!(received.utilization.documents_held, None);
-    assert_eq!(received.utilization.load_permille, None);
+    assert_eq!(received.utilization.documents_held, Some(0));
+    assert!(received.utilization.load_permille.is_some());
     assert!(received.utilization.heartbeat_at_ms > 0);
     assert!(received.updated_at_ms > 0);
 

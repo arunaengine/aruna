@@ -5,6 +5,7 @@ use aruna_core::UserId;
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, RealmId, Role,
+    blob_bucket_permission_path, blob_group_permission_path, blob_object_permission_path,
     usage_group_key,
 };
 use aruna_core::types::RoleId;
@@ -26,10 +27,18 @@ use aruna_operations::remove_group_role::{
 use aruna_operations::remove_user_from_group::{
     RemoveUserFromGroupError, RemoveUserFromGroupInput, RemoveUserFromGroupOperation,
 };
+use aruna_operations::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
+use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::list_buckets::{ListBucketsInput, ListBucketsOperation};
+use aruna_operations::s3::list_objects_v2::{
+    ListObjectsV2ContinuationToken, ListObjectsV2Input, ListObjectsV2Operation,
+};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -51,6 +60,7 @@ use utoipa::{OpenApi, ToSchema};
         leave_group,
         create_group_role,
         delete_group_role,
+        list_data_paths,
     )
 )]
 pub struct GroupsApiDoc;
@@ -61,6 +71,7 @@ pub fn router() -> Router<Arc<ServerState>> {
         .route("/groups", get(list_groups))
         .route("/groups/{id}", get(get_group))
         .route("/groups/{id}/usage", get(get_group_usage))
+        .route("/groups/{id}/data-paths", get(list_data_paths))
         .route(
             "/groups/{id}/members",
             get(list_group_members).post(add_group_member),
@@ -144,6 +155,8 @@ pub struct GroupMemberRoleResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GroupMemberResponse {
     pub user_id: String,
+    /// Display name from the user directory; None when the user is unresolvable.
+    pub name: Option<String>,
     pub roles: Vec<GroupMemberRoleResponse>,
 }
 
@@ -685,14 +698,14 @@ pub async fn list_group_members(
         return Err(ServerError::Forbidden);
     }
 
-    let mut members: HashMap<String, Vec<GroupMemberRoleResponse>> = HashMap::new();
+    let mut roles_by_user: HashMap<UserId, Vec<GroupMemberRoleResponse>> = HashMap::new();
     for (role_id, role) in &auth_doc.roles {
         for user in &role.assigned_users {
             if user.is_nil() {
                 continue;
             }
-            members
-                .entry(user.to_string())
+            roles_by_user
+                .entry(*user)
                 .or_default()
                 .push(GroupMemberRoleResponse {
                     role_id: role_id.to_string(),
@@ -700,16 +713,49 @@ pub async fn list_group_members(
                 });
         }
     }
-    let mut members: Vec<GroupMemberResponse> = members
+
+    let names = resolve_member_names(&state, roles_by_user.keys().copied().collect()).await;
+    let mut members: Vec<GroupMemberResponse> = roles_by_user
         .into_iter()
         .map(|(user_id, mut roles)| {
             roles.sort_by(|a, b| a.name.cmp(&b.name));
-            GroupMemberResponse { user_id, roles }
+            GroupMemberResponse {
+                name: names.get(&user_id).cloned(),
+                user_id: user_id.to_string(),
+                roles,
+            }
         })
         .collect();
     members.sort_by(|a, b| a.user_id.cmp(&b.user_id));
 
     Ok((StatusCode::OK, Json(GroupMembersResponse { members })))
+}
+
+/// Best-effort name lookup: a resolve failure leaves every member unnamed
+/// rather than failing the members listing.
+async fn resolve_member_names(
+    state: &ServerState,
+    user_ids: Vec<UserId>,
+) -> HashMap<UserId, String> {
+    match drive(
+        ResolveUsersOperation::new(ResolveUsersInput {
+            realm_id: state.get_realm_id(),
+            user_ids,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    {
+        Ok(output) => output
+            .users
+            .into_iter()
+            .map(|user| (user.user_id, user.name))
+            .collect(),
+        Err(error) => {
+            trace!(event = "group.members.resolve_failed", error = %error);
+            HashMap::new()
+        }
+    }
 }
 
 #[utoipa::path(
@@ -1004,21 +1050,446 @@ pub async fn delete_group_role(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DataPathKind {
+    Folder,
+    Object,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DataPathEntry {
+    /// Node-scoped data permission path as consumed by role permissions.
+    pub permission_path: String,
+    pub kind: DataPathKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DataPathsResponse {
+    pub entries: Vec<DataPathEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct DataPathsQuery {
+    /// Data permission path to browse under; empty lists the group's buckets, a
+    /// bucket path lists its contents, any other bare segment filters bucket
+    /// names by that prefix.
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default)]
+    pub delimiter: Option<String>,
+    #[serde(default)]
+    pub continuation_token: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/groups/{id}/data-paths",
+    tag = "groups",
+    params(
+        ("id" = String, Path, description = "Group id"),
+        ("prefix" = Option<String>, Query, description = "Data permission path to browse under; empty or the group data path lists buckets; a bucket path lists that bucket's contents; any other bare segment filters bucket names by that prefix"),
+        ("delimiter" = Option<String>, Query, description = "Folder delimiter, typically '/'"),
+        ("continuation_token" = Option<String>, Query, description = "Opaque token from a previous page"),
+        ("limit" = Option<u32>, Query, description = "Maximum entries per page (1-1000)")
+    ),
+    responses(
+        (status = 200, description = "Browsable data permission paths. v1 lists the local node only.", body = DataPathsResponse),
+        (status = 400, description = "Invalid group id or prefix", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_data_paths(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(group_id): Path<String>,
+    Query(query): Query<DataPathsQuery>,
+) -> ServerResult<(StatusCode, Json<DataPathsResponse>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let group_id = parse_group_id(&group_id)?;
+    let (_, auth_doc) = load_group(&state, group_id).await?;
+    if !is_group_member(&auth_doc, auth.user_id) {
+        return Err(ServerError::Forbidden);
+    }
+
+    let realm_id = state.get_realm_id();
+    let node_id = state.get_node_id();
+    let limit = query.limit.unwrap_or(1_000).clamp(1, 1_000) as usize;
+
+    // Permission paths are node-scoped; only paths under this node's group data
+    // root are browsable, so a foreign prefix is rejected outright.
+    let group_path = blob_group_permission_path(realm_id, group_id, node_id);
+    let remainder = match query.prefix.as_deref().filter(|prefix| !prefix.is_empty()) {
+        Some(prefix) => {
+            let rest = prefix
+                .strip_prefix(group_path.as_str())
+                .ok_or(ServerError::BadRequest)?;
+            rest.strip_prefix('/').unwrap_or(rest).to_string()
+        }
+        None => String::new(),
+    };
+
+    // A bare segment that names an existing bucket browses into that bucket's
+    // root so a returned bucket path round-trips; any other bare segment stays a
+    // bucket-name filter.
+    let bucket_target = match remainder.split_once('/') {
+        Some((bucket, key_prefix)) => Some((bucket.to_string(), key_prefix.to_string())),
+        None => {
+            if !remainder.is_empty()
+                && get_bucket_group(&state, &remainder).await? == Some(group_id)
+            {
+                Some((remainder.clone(), String::new()))
+            } else {
+                None
+            }
+        }
+    };
+
+    let response = match bucket_target {
+        Some((bucket, key_prefix)) => {
+            // Listing inside a bucket requires READ on the bucket, or the prefix
+            // being browsed, so path-restricted tokens see only what they may read.
+            let listing_path = if key_prefix.is_empty() {
+                blob_bucket_permission_path(realm_id, group_id, node_id, &bucket)
+            } else {
+                blob_object_permission_path(realm_id, group_id, node_id, &bucket, &key_prefix)
+            };
+            require_data_read(&state, &auth, listing_path).await?;
+            list_bucket_objects(
+                &state,
+                group_id,
+                &bucket,
+                &key_prefix,
+                query.delimiter.as_deref(),
+                query.continuation_token.as_deref(),
+                limit,
+            )
+            .await?
+        }
+        None => {
+            // Browsing the bucket level requires READ on the group data root.
+            require_data_read(&state, &auth, group_path).await?;
+            let name_filter = (!remainder.is_empty()).then_some(remainder.as_str());
+            list_group_buckets(
+                &state,
+                group_id,
+                name_filter,
+                query.continuation_token.as_deref(),
+                limit,
+            )
+            .await?
+        }
+    };
+
+    Ok((StatusCode::OK, Json(response)))
+}
+
+/// Authorizes READ on a data permission path via the shared CheckPermissions
+/// flow, matching the S3 surface: a caller without READ (empty role, DENY, or a
+/// path restriction that excludes the path) is forbidden.
+async fn require_data_read(
+    state: &ServerState,
+    auth: &AuthContext,
+    path: String,
+) -> ServerResult<()> {
+    let allowed = drive(
+        CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: auth.clone(),
+            path,
+            required_permission: Permission::READ,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| match err {
+        AuthorizationError::InvalidRealmId
+        | AuthorizationError::InvalidGroupId
+        | AuthorizationError::GroupNotFound
+        | AuthorizationError::AuthDocNotFound => ServerError::Forbidden,
+        _ => ServerError::InternalError(err.to_string()),
+    })?;
+    if allowed {
+        Ok(())
+    } else {
+        Err(ServerError::Forbidden)
+    }
+}
+
+async fn list_group_buckets(
+    state: &ServerState,
+    group_id: Ulid,
+    name_filter: Option<&str>,
+    continuation_token: Option<&str>,
+    limit: usize,
+) -> ServerResult<DataPathsResponse> {
+    let realm_id = state.get_realm_id();
+    let node_id = state.get_node_id();
+    let continuation_token = decode_bucket_token(continuation_token)?;
+    let result = drive(
+        ListBucketsOperation::new(ListBucketsInput {
+            group_id,
+            prefix: name_filter.map(str::to_string),
+            continuation_token,
+            max_buckets: Some(limit),
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .and_then(|output| output.transpose())
+    .map_err(|err| ServerError::InternalError(err.to_string()))?
+    .ok_or_else(|| ServerError::InternalError("bucket listing produced no result".to_string()))?;
+
+    let entries = result
+        .buckets
+        .into_iter()
+        .map(|(bucket, _info)| DataPathEntry {
+            permission_path: blob_bucket_permission_path(realm_id, group_id, node_id, &bucket),
+            kind: DataPathKind::Folder,
+        })
+        .collect();
+    Ok(DataPathsResponse {
+        entries,
+        continuation_token: result.continuation_token.map(encode_bucket_token),
+    })
+}
+
+async fn list_bucket_objects(
+    state: &ServerState,
+    group_id: Ulid,
+    bucket: &str,
+    key_prefix: &str,
+    delimiter: Option<&str>,
+    continuation_token: Option<&str>,
+    limit: usize,
+) -> ServerResult<DataPathsResponse> {
+    let realm_id = state.get_realm_id();
+    let node_id = state.get_node_id();
+    // Bucket names are globally unique; refuse to enumerate a bucket owned by
+    // another group to avoid leaking its keys under this group's path.
+    if get_bucket_group(state, bucket).await? != Some(group_id) {
+        return Ok(DataPathsResponse {
+            entries: Vec::new(),
+            continuation_token: None,
+        });
+    }
+
+    let continuation_token = decode_object_token(continuation_token)?;
+    let result = drive(
+        ListObjectsV2Operation::new(ListObjectsV2Input {
+            bucket: bucket.to_string(),
+            group_id,
+            continuation_token,
+            max_keys: Some(limit),
+            prefix: (!key_prefix.is_empty()).then(|| key_prefix.to_string()),
+            delimiter: delimiter.map(str::to_string),
+            start_after: None,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .and_then(|output| output.transpose())
+    .map_err(|err| ServerError::InternalError(err.to_string()))?
+    .ok_or_else(|| ServerError::InternalError("object listing produced no result".to_string()))?;
+
+    let mut entries = Vec::with_capacity(result.objects.len() + result.common_prefixes.len());
+    for prefix in result.common_prefixes {
+        entries.push(DataPathEntry {
+            permission_path: blob_object_permission_path(
+                realm_id, group_id, node_id, bucket, &prefix,
+            ),
+            kind: DataPathKind::Folder,
+        });
+    }
+    for object in result.objects {
+        entries.push(DataPathEntry {
+            permission_path: blob_object_permission_path(
+                realm_id,
+                group_id,
+                node_id,
+                bucket,
+                &object.head.key,
+            ),
+            kind: DataPathKind::Object,
+        });
+    }
+    Ok(DataPathsResponse {
+        entries,
+        continuation_token: result
+            .continuation_token
+            .map(encode_object_token)
+            .transpose()?,
+    })
+}
+
+async fn get_bucket_group(state: &ServerState, bucket: &str) -> ServerResult<Option<Ulid>> {
+    match drive(
+        GetBucketInfoOperation::new(bucket.to_string()),
+        &state.get_ctx(),
+    )
+    .await
+    .and_then(|output| output.transpose())
+    {
+        Ok(Some(info)) => Ok(Some(info.group_id)),
+        Ok(None) | Err(GetBucketInfoError::NotFound) => Ok(None),
+        Err(err) => Err(ServerError::InternalError(err.to_string())),
+    }
+}
+
+fn decode_bucket_token(token: Option<&str>) -> ServerResult<Option<String>> {
+    token
+        .map(|token| {
+            let bytes = STANDARD
+                .decode(token)
+                .map_err(|_| ServerError::BadRequest)?;
+            String::from_utf8(bytes).map_err(|_| ServerError::BadRequest)
+        })
+        .transpose()
+}
+
+fn encode_bucket_token(bucket: String) -> String {
+    STANDARD.encode(bucket.as_bytes())
+}
+
+fn decode_object_token(
+    token: Option<&str>,
+) -> ServerResult<Option<ListObjectsV2ContinuationToken>> {
+    token
+        .map(|token| {
+            let bytes = STANDARD
+                .decode(token)
+                .map_err(|_| ServerError::BadRequest)?;
+            ListObjectsV2ContinuationToken::from_bytes(&bytes).map_err(|_| ServerError::BadRequest)
+        })
+        .transpose()
+}
+
+fn encode_object_token(token: ListObjectsV2ContinuationToken) -> ServerResult<String> {
+    token
+        .to_bytes()
+        .map(|bytes| STANDARD.encode(bytes))
+        .map_err(|err| ServerError::InternalError(err.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ListGroupsQuery, get_group, get_group_usage, list_group_members, list_groups};
+    use super::{
+        DataPathKind, DataPathsQuery, ListGroupsQuery, get_group, get_group_usage, list_data_paths,
+        list_group_members, list_groups,
+    };
     use crate::error::ServerError;
     use crate::server_state::ServerState;
     use aruna_core::UserId;
-    use aruna_core::structs::{AuthContext, NodeCapabilities, RealmId};
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::handle::Handle;
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+        GROUP_KEYSPACE, S3_BUCKET_KEYSPACE, USER_KEYSPACE,
+    };
+    use aruna_core::structs::{
+        Actor, AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BucketInfo,
+        CurrentVersionPointer, Group, GroupAuthorizationDocument, NodeCapabilities,
+        RealmAuthorizationDocument, RealmId, Role, User, VersionKey, blob_bucket_permission_path,
+        blob_object_permission_path,
+    };
     use aruna_operations::driver::DriverContext;
     use aruna_storage::storage;
-    use axum::Extension;
     use axum::extract::{Path, Query, State};
+    use axum::http::StatusCode;
+    use axum::{Extension, Json};
+    use byteview::ByteView;
     use ed25519_dalek::SigningKey;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
+
+    async fn store_bytes(state: &ServerState, keyspace: &str, key: Vec<u8>, value: Vec<u8>) {
+        match state
+            .get_ctx()
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: keyspace.to_string(),
+                key: ByteView::from(key),
+                value: ByteView::from(value),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected write result: {other:?}"),
+        }
+    }
+
+    async fn seed_group(state: &ServerState, owner: UserId) -> Ulid {
+        let realm_id = state.get_realm_id();
+        let group_id = Ulid::r#gen();
+        let auth_doc = GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let group = Group {
+            display_name: "Test".to_string(),
+            group_id,
+            realm_id,
+            roles: auth_doc.roles.keys().copied().collect(),
+            owner,
+        };
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: owner,
+            realm_id,
+        };
+        store_bytes(
+            state,
+            GROUP_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            group.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        store_bytes(
+            state,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            auth_doc.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        group_id
+    }
+
+    async fn store_user(state: &ServerState, user_id: UserId, name: &str) {
+        let user = User {
+            user_id,
+            name: name.to_string(),
+            subject_ids: Vec::new(),
+            alias_user_ids: Default::default(),
+            attributes: Default::default(),
+        };
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id,
+            realm_id: user_id.realm_id,
+        };
+        store_bytes(
+            state,
+            USER_KEYSPACE,
+            user_id.to_bytes(),
+            user.to_bytes(&actor).unwrap(),
+        )
+        .await;
+    }
+
+    fn member_auth(user_id: UserId) -> AuthContext {
+        AuthContext {
+            user_id,
+            realm_id: user_id.realm_id,
+            path_restrictions: None,
+        }
+    }
 
     async fn setup_state() -> (Arc<ServerState>, TempDir) {
         let tempdir = tempdir().unwrap();
@@ -1046,6 +1517,23 @@ mod tests {
             )
             .await,
         );
+
+        // The data permission check reads the realm auth doc; seed an empty one
+        // so authority comes solely from group roles.
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        store_bytes(
+            &state,
+            AUTH_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+                .to_bytes(&actor)
+                .unwrap(),
+        )
+        .await;
 
         (state, tempdir)
     }
@@ -1121,5 +1609,445 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn joins_member_names() {
+        let (state, _tempdir) = setup_state().await;
+        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let group_id = seed_group(&state, owner).await;
+        store_user(&state, owner, "Owner").await;
+
+        let (status, Json(body)) = list_group_members(
+            State(state.clone()),
+            Extension(Some(member_auth(owner))),
+            Path(group_id.to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let member = body
+            .members
+            .iter()
+            .find(|member| member.user_id == owner.to_string())
+            .unwrap();
+        assert_eq!(member.name.as_deref(), Some("Owner"));
+    }
+
+    #[tokio::test]
+    async fn unresolved_member_none() {
+        // A member without a stored user record still lists, with name None.
+        let (state, _tempdir) = setup_state().await;
+        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let group_id = seed_group(&state, owner).await;
+
+        let (status, Json(body)) = list_group_members(
+            State(state),
+            Extension(Some(member_auth(owner))),
+            Path(group_id.to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let member = body
+            .members
+            .iter()
+            .find(|member| member.user_id == owner.to_string())
+            .unwrap();
+        assert_eq!(member.name, None);
+    }
+
+    async fn seed_bucket(state: &ServerState, bucket: &str, group_id: Ulid) {
+        let info = BucketInfo {
+            group_id,
+            created_at: SystemTime::now(),
+            created_by: Default::default(),
+            cors_configuration: None,
+        };
+        store_bytes(
+            state,
+            S3_BUCKET_KEYSPACE,
+            bucket.as_bytes().to_vec(),
+            info.to_bytes().unwrap(),
+        )
+        .await;
+    }
+
+    async fn seed_object(state: &ServerState, bucket: &str, key: &str, owner: UserId, tag: u8) {
+        let version_id = Ulid::r#gen();
+        let created_at = UNIX_EPOCH + Duration::from_secs(5);
+        let hash = [tag; 32];
+        store_bytes(
+            state,
+            BLOB_HEAD_KEYSPACE,
+            BlobHeadKey::new(bucket, key).to_bytes().unwrap(),
+            CurrentVersionPointer::new(version_id).to_bytes().unwrap(),
+        )
+        .await;
+        store_bytes(
+            state,
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new(bucket, key, version_id).to_bytes().unwrap(),
+            BlobVersion::materialized(hash, created_at, owner, None)
+                .to_bytes()
+                .unwrap(),
+        )
+        .await;
+        store_bytes(
+            state,
+            BLOB_LOCATIONS_KEYSPACE,
+            hash.to_vec(),
+            BackendLocation {
+                root: "/tmp".to_string(),
+                storage_bucket: "objects".to_string(),
+                backend_path: format!("path/{key}"),
+                ulid: Ulid::r#gen(),
+                compressed: false,
+                encrypted: false,
+                created_by: owner,
+                created_at,
+                staging: false,
+                partial: false,
+                blob_size: 42,
+                hashes: HashMap::new(),
+            }
+            .to_bytes()
+            .unwrap(),
+        )
+        .await;
+    }
+
+    fn browse(prefix: Option<String>) -> DataPathsQuery {
+        DataPathsQuery {
+            prefix,
+            delimiter: Some("/".to_string()),
+            continuation_token: None,
+            limit: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn folds_group_buckets() {
+        let (state, _tempdir) = setup_state().await;
+        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let group_id = seed_group(&state, owner).await;
+        seed_bucket(&state, "alpha", group_id).await;
+        seed_bucket(&state, "beta", group_id).await;
+        seed_bucket(&state, "foreign", Ulid::r#gen()).await;
+
+        let (status, Json(body)) = list_data_paths(
+            State(state.clone()),
+            Extension(Some(member_auth(owner))),
+            Path(group_id.to_string()),
+            Query(DataPathsQuery::default()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        let realm_id = state.get_realm_id();
+        let node_id = state.get_node_id();
+        let mut paths: Vec<_> = body
+            .entries
+            .iter()
+            .map(|entry| {
+                assert_eq!(entry.kind, DataPathKind::Folder);
+                entry.permission_path.clone()
+            })
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                blob_bucket_permission_path(realm_id, group_id, node_id, "alpha"),
+                blob_bucket_permission_path(realm_id, group_id, node_id, "beta"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn bucket_folds_objects() {
+        let (state, _tempdir) = setup_state().await;
+        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let group_id = seed_group(&state, owner).await;
+        seed_bucket(&state, "data", group_id).await;
+        for (index, key) in ["a.txt", "dir/1", "dir/2", "z.txt"].iter().enumerate() {
+            seed_object(&state, "data", key, owner, index as u8 + 1).await;
+        }
+        let realm_id = state.get_realm_id();
+        let node_id = state.get_node_id();
+        let prefix = blob_bucket_permission_path(realm_id, group_id, node_id, "data") + "/";
+
+        let (status, Json(body)) = list_data_paths(
+            State(state.clone()),
+            Extension(Some(member_auth(owner))),
+            Path(group_id.to_string()),
+            Query(browse(Some(prefix))),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        let folders: Vec<_> = body
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == DataPathKind::Folder)
+            .map(|entry| entry.permission_path.clone())
+            .collect();
+        let mut objects: Vec<_> = body
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == DataPathKind::Object)
+            .map(|entry| entry.permission_path.clone())
+            .collect();
+        objects.sort();
+
+        assert_eq!(
+            folders,
+            vec![blob_object_permission_path(
+                realm_id, group_id, node_id, "data", "dir/"
+            )]
+        );
+        assert_eq!(
+            objects,
+            vec![
+                blob_object_permission_path(realm_id, group_id, node_id, "data", "a.txt"),
+                blob_object_permission_path(realm_id, group_id, node_id, "data", "z.txt"),
+            ]
+        );
+        assert!(body.continuation_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn round_trips_bucket() {
+        // A returned bucket folder path must list the bucket's children verbatim.
+        let (state, _tempdir) = setup_state().await;
+        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let group_id = seed_group(&state, owner).await;
+        seed_bucket(&state, "data", group_id).await;
+        for (index, key) in ["a.txt", "dir/1"].iter().enumerate() {
+            seed_object(&state, "data", key, owner, index as u8 + 1).await;
+        }
+        let realm_id = state.get_realm_id();
+        let node_id = state.get_node_id();
+
+        let (_status, Json(listing)) = list_data_paths(
+            State(state.clone()),
+            Extension(Some(member_auth(owner))),
+            Path(group_id.to_string()),
+            Query(DataPathsQuery::default()),
+        )
+        .await
+        .unwrap();
+        let bucket_path = listing.entries[0].permission_path.clone();
+        assert_eq!(
+            bucket_path,
+            blob_bucket_permission_path(realm_id, group_id, node_id, "data")
+        );
+
+        let (_status, Json(body)) = list_data_paths(
+            State(state.clone()),
+            Extension(Some(member_auth(owner))),
+            Path(group_id.to_string()),
+            Query(browse(Some(bucket_path.clone()))),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            body.entries
+                .iter()
+                .all(|entry| entry.permission_path != bucket_path)
+        );
+        let paths: Vec<_> = body
+            .entries
+            .iter()
+            .map(|entry| entry.permission_path.clone())
+            .collect();
+        assert!(paths.contains(&blob_object_permission_path(
+            realm_id, group_id, node_id, "data", "a.txt"
+        )));
+        assert!(paths.contains(&blob_object_permission_path(
+            realm_id, group_id, node_id, "data", "dir/"
+        )));
+    }
+
+    #[tokio::test]
+    async fn paginates_object_pages() {
+        let (state, _tempdir) = setup_state().await;
+        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let group_id = seed_group(&state, owner).await;
+        seed_bucket(&state, "data", group_id).await;
+        for (index, key) in ["a", "b", "c", "d"].iter().enumerate() {
+            seed_object(&state, "data", key, owner, index as u8 + 1).await;
+        }
+        let realm_id = state.get_realm_id();
+        let node_id = state.get_node_id();
+        let prefix = blob_bucket_permission_path(realm_id, group_id, node_id, "data") + "/";
+
+        let mut token = None;
+        let mut collected = Vec::new();
+        let mut pages = 0;
+        loop {
+            let (_status, Json(body)) = list_data_paths(
+                State(state.clone()),
+                Extension(Some(member_auth(owner))),
+                Path(group_id.to_string()),
+                Query(DataPathsQuery {
+                    prefix: Some(prefix.clone()),
+                    delimiter: Some("/".to_string()),
+                    continuation_token: token.take(),
+                    limit: Some(2),
+                }),
+            )
+            .await
+            .unwrap();
+            collected.extend(body.entries.into_iter().map(|entry| entry.permission_path));
+            pages += 1;
+            assert!(pages <= 5);
+            token = body.continuation_token;
+            if token.is_none() {
+                break;
+            }
+        }
+
+        collected.sort();
+        let expected: Vec<_> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|key| blob_object_permission_path(realm_id, group_id, node_id, "data", key))
+            .collect();
+        assert_eq!(collected, expected);
+        assert!(pages >= 2);
+    }
+
+    #[tokio::test]
+    async fn path_matches_helper() {
+        let (state, _tempdir) = setup_state().await;
+        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let group_id = seed_group(&state, owner).await;
+        seed_bucket(&state, "data", group_id).await;
+        seed_object(&state, "data", "reports/q1.csv", owner, 9).await;
+        let realm_id = state.get_realm_id();
+        let node_id = state.get_node_id();
+        let prefix = blob_bucket_permission_path(realm_id, group_id, node_id, "data") + "/reports/";
+
+        let (_status, Json(body)) = list_data_paths(
+            State(state.clone()),
+            Extension(Some(member_auth(owner))),
+            Path(group_id.to_string()),
+            Query(browse(Some(prefix))),
+        )
+        .await
+        .unwrap();
+
+        let object = body
+            .entries
+            .iter()
+            .find(|entry| entry.kind == DataPathKind::Object)
+            .unwrap();
+        assert_eq!(
+            object.permission_path,
+            blob_object_permission_path(realm_id, group_id, node_id, "data", "reports/q1.csv")
+        );
+    }
+
+    #[tokio::test]
+    async fn hides_foreign_bucket() {
+        // A crafted path naming another group's bucket must not leak its keys.
+        let (state, _tempdir) = setup_state().await;
+        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let group_id = seed_group(&state, owner).await;
+        seed_bucket(&state, "secret", Ulid::r#gen()).await;
+        seed_object(&state, "secret", "k", owner, 1).await;
+        let realm_id = state.get_realm_id();
+        let node_id = state.get_node_id();
+        let prefix = blob_bucket_permission_path(realm_id, group_id, node_id, "secret") + "/";
+
+        let (_status, Json(body)) = list_data_paths(
+            State(state.clone()),
+            Extension(Some(member_auth(owner))),
+            Path(group_id.to_string()),
+            Query(browse(Some(prefix))),
+        )
+        .await
+        .unwrap();
+
+        assert!(body.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_member_forbidden() {
+        let (state, _tempdir) = setup_state().await;
+        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let group_id = seed_group(&state, owner).await;
+        let outsider = member_auth(UserId::local(Ulid::r#gen(), state.get_realm_id()));
+
+        let result = list_data_paths(
+            State(state),
+            Extension(Some(outsider)),
+            Path(group_id.to_string()),
+            Query(DataPathsQuery::default()),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn empty_role_forbidden() {
+        // Membership alone is not enough: a role granting no READ is forbidden.
+        let (state, _tempdir) = setup_state().await;
+        let realm_id = state.get_realm_id();
+        let owner = UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = seed_group(&state, owner).await;
+        let limited = UserId::local(Ulid::r#gen(), realm_id);
+
+        let mut auth_doc =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let role_id = Ulid::r#gen();
+        auth_doc.roles.insert(
+            role_id,
+            Role {
+                role_id,
+                name: "empty".to_string(),
+                permissions: HashMap::new(),
+                assigned_users: HashSet::from([limited]),
+            },
+        );
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: owner,
+            realm_id,
+        };
+        store_bytes(
+            &state,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            auth_doc.to_bytes(&actor).unwrap(),
+        )
+        .await;
+
+        let result = list_data_paths(
+            State(state),
+            Extension(Some(member_auth(limited))),
+            Path(group_id.to_string()),
+            Query(DataPathsQuery::default()),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn rejects_anonymous_caller() {
+        let (state, _tempdir) = setup_state().await;
+        let result = list_data_paths(
+            State(state),
+            Extension(None),
+            Path(Ulid::r#gen().to_string()),
+            Query(DataPathsQuery::default()),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::Unauthorized)));
     }
 }

@@ -19,6 +19,11 @@ KEYCLOAK_OIDC_USERNAME="${ARUNA_TEST_DEPLOY_OIDC_USERNAME:-aruna-admin}"
 KEYCLOAK_OIDC_PASSWORD="${ARUNA_TEST_DEPLOY_OIDC_PASSWORD:-aruna-admin}"
 PORTAL_DIR="${ARUNA_TEST_DEPLOY_PORTAL_DIR:-}"
 PORTAL_CORS_ORIGINS=""
+COMPUTE_EXECUTOR="${ARUNA_TEST_DEPLOY_COMPUTE_EXECUTOR:-docker}"
+# Containers must reach the host's S3 listener; loopback endpoints are rejected
+# by the docker executor, so advertise the primary host address instead.
+HOST_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }' || true)"
+[[ -n "$HOST_IP" ]] || HOST_IP="172.17.0.1"
 WITH_KEYCLOAK=0
 AUTO_PORTAL_DIR=0
 AUTO_PORTAL_DOWNLOAD=0
@@ -70,6 +75,16 @@ Environment overrides:
   ARUNA_TEST_DEPLOY_OIDC_USERNAME
   ARUNA_TEST_DEPLOY_OIDC_PASSWORD
   ARUNA_TEST_DEPLOY_PORTAL_DIR
+  ARUNA_TEST_DEPLOY_COMPUTE_EXECUTOR   docker (default) | apptainer | kubernetes | none
+                                       docker and none are turnkey; apptainer and
+                                       kubernetes need the vars below.
+
+Compute passthrough:
+  Every ARUNA_COMPUTE_* variable set in the caller's environment is copied into
+  each node .env (the generated EXECUTOR, OPTIONAL and S3_URL win over inherited
+  values). Required per backend:
+    apptainer    ARUNA_COMPUTE_APPTAINER_CGROUP_ROOT
+    kubernetes   ARUNA_COMPUTE_K8S_STORAGE_CLASS, ARUNA_COMPUTE_K8S_HELPER_IMAGE
 EOF
 }
 
@@ -144,6 +159,7 @@ write_node_env() {
   local onboarding_secret=${6:-}
   local max_concurrent_uni_streams="${MAX_CONCURRENT_UNI_STREAMS:-}"
   local max_concurrent_bidi_streams="${MAX_CONCURRENT_BIDI_STREAMS:-}"
+  local compute_var
 
   mkdir -p "$node_dir/storage" "$node_dir/blob"
   {
@@ -157,7 +173,26 @@ write_node_env() {
     printf 'API_PUBLIC_URL=http://127.0.0.1:%s\n' "$http_port"
     printf 'S3_HOST=127.0.0.1:%s\n' "$s3_port"
     printf 'S3_PUBLIC_URL=http://127.0.0.1:%s\n' "$s3_port"
-    printf 'S3_ADDRESS=127.0.0.1:%s\n' "$s3_port"
+    if [[ "$COMPUTE_EXECUTOR" != "none" ]]; then
+      # Containers cannot reach loopback: bind all interfaces and hand the
+      # executor its own host-reachable S3 url. The portal stays on loopback
+      # so the strict CSP (http only for loopback) keeps working.
+      printf 'S3_ADDRESS=0.0.0.0:%s\n' "$s3_port"
+      printf 'ARUNA_COMPUTE_S3_URL=http://%s:%s\n' "$HOST_IP" "$s3_port"
+      printf 'ARUNA_COMPUTE_EXECUTOR=%s\n' "$COMPUTE_EXECUTOR"
+      printf 'ARUNA_COMPUTE_OPTIONAL=true\n'
+      # Forward backend settings (apptainer cgroup root, K8s storage class and
+      # helper image, ...) from the caller. The generated selector/S3/optional
+      # above win, so those three keys are skipped to avoid duplicate entries.
+      for compute_var in ${!ARUNA_COMPUTE_@}; do
+        case "$compute_var" in
+          ARUNA_COMPUTE_EXECUTOR | ARUNA_COMPUTE_OPTIONAL | ARUNA_COMPUTE_S3_URL) continue ;;
+        esac
+        printf '%s=%s\n' "$compute_var" "${!compute_var}"
+      done
+    else
+      printf 'S3_ADDRESS=127.0.0.1:%s\n' "$s3_port"
+    fi
     printf 'REALM_DESCRIPTION=Test_Deploy_Realm\n'
     printf 'METADATA_REPLICATION_FACTOR=3\n'
     if [[ -n "$PORTAL_DIR" ]]; then

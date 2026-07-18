@@ -15,6 +15,7 @@ pub mod jobs;
 pub mod metadata;
 pub mod notifications;
 pub mod onboarding;
+pub mod search;
 pub mod staging;
 pub mod tes;
 pub mod users;
@@ -32,6 +33,7 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
         .merge(jobs::router())
         .merge(metadata::router())
         .merge(notifications::router())
+        .merge(search::router())
         .merge(tes::router())
         .merge(users::router())
         .layer(from_fn_with_state(state.clone(), auth_middleware))

@@ -90,6 +90,7 @@ pub enum MetadataTransportMessage {
         graph_iris: Option<Vec<String>>,
         query: String,
         limit: usize,
+        group_id: Option<GroupId>,
     },
     SearchResults {
         hits: Vec<MetadataSearchHit>,
@@ -127,6 +128,15 @@ pub enum MetadataTransportMessage {
     /// postcard discriminants of existing control messages remain stable.
     ForwardedUpdateInvalidInput {
         message: String,
+    },
+    FilteredSearchGraphs {
+        auth_token: Option<MetadataAuthToken>,
+        graph_iris: Option<Vec<String>>,
+        query: String,
+        limit: usize,
+        predicate_iri: String,
+        object_iri: String,
+        group_id: Option<GroupId>,
     },
 }
 
@@ -202,6 +212,16 @@ mod tests {
             graph_iris: None,
             query: "dataset".to_string(),
             limit: 10,
+            group_id: None,
+        });
+        assert_has_auth_token_field(MetadataTransportMessage::FilteredSearchGraphs {
+            auth_token: Some(MetadataAuthToken::bearer("filtered-search-token").unwrap()),
+            graph_iris: None,
+            query: String::new(),
+            limit: 10,
+            predicate_iri: "http://schema.org/conformsTo".to_string(),
+            object_iri: "https://example.com/profile".to_string(),
+            group_id: None,
         });
     }
 
@@ -262,6 +282,13 @@ mod tests {
         assert_eq!(
             postcard::to_allocvec(&MetadataTransportMessage::Reject(String::new())).unwrap(),
             vec![9, 0]
+        );
+        assert_eq!(
+            postcard::to_allocvec(&MetadataTransportMessage::ForwardedUpdateInvalidInput {
+                message: String::new(),
+            })
+            .unwrap(),
+            vec![10, 0]
         );
     }
 

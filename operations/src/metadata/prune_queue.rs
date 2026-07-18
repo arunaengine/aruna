@@ -280,12 +280,14 @@ pub async fn process_metadata_graph_tombstones(
 ) -> MetadataGraphTombstoneProcessingResult {
     let mut result = MetadataGraphTombstoneProcessingResult::default();
     let mut seen_graphs = BTreeSet::new();
+    let mut deleted_documents = BTreeSet::new();
     let metadata_handle = context.metadata_handle.clone();
     for tombstone in tombstones {
         if !tombstone.is_deleted() || !seen_graphs.insert(tombstone.graph_iri.clone()) {
             continue;
         }
 
+        deleted_documents.insert(tombstone.document_id);
         if let Some(metadata_handle) = metadata_handle.as_ref() {
             metadata_handle.remove_cached_registry_record(tombstone.document_id);
         }
@@ -312,7 +314,25 @@ pub async fn process_metadata_graph_tombstones(
             }
         }
     }
+
+    // A deleted document is absent from the registry, so its IRI index rows are
+    // pruned here rather than left to leak into the predicate-less backlink scan.
+    if let Err(error) = prune_deleted_iri_index_rows(context, &deleted_documents).await {
+        warn!(error = ?error, "Failed to prune IRI index rows for deleted documents");
+    }
     result
+}
+
+async fn prune_deleted_iri_index_rows(
+    context: &DriverContext,
+    document_ids: &BTreeSet<Ulid>,
+) -> Result<(), MetadataError> {
+    if document_ids.is_empty() {
+        return Ok(());
+    }
+    let keys = super::iri_index::document_iri_reference_keys(&context.storage_handle, document_ids)
+        .await?;
+    super::iri_index::delete_iri_reference_keys(&context.storage_handle, keys).await
 }
 
 fn group_prune_jobs(
@@ -901,6 +921,20 @@ mod tests {
         }
     }
 
+    async fn index_row_exists(storage: &StorageHandle, key: ByteView) -> bool {
+        match storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: aruna_core::keyspaces::METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
+                key,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value.is_some(),
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
     async fn read_jobs(storage: &StorageHandle) -> Vec<MetadataGraphPruneJobRecord> {
         match storage
             .send_storage_effect(StorageEffect::Iter {
@@ -1000,6 +1034,60 @@ mod tests {
         let jobs = read_jobs(&storage).await;
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].graph_iri, record.graph_iri);
+    }
+
+    #[tokio::test]
+    async fn prunes_index_rows() {
+        // Deleting a document drops its IRI reference index rows.
+        let dir = tempdir().expect("temp dir");
+        let metadata_dir = tempdir().expect("metadata dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+        let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
+        let metadata_handle = MetadataHandle::new(
+            metadata_dir.path(),
+            node_id,
+            storage.clone(),
+            None,
+            None,
+            None,
+        )
+        .expect("metadata handle opens");
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: Some(metadata_handle),
+            task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
+        };
+        let record = registry_record(Ulid::from_parts(9, 1), "docs/deleted");
+        let index_key = aruna_core::storage_entries::metadata_iri_reference_key(
+            "https://schema.org/conformsTo",
+            "https://example.test/profile",
+            record.document_id,
+            Ulid::from_parts(3, 1),
+        );
+        write_entries(
+            &storage,
+            vec![(
+                aruna_core::keyspaces::METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
+                index_key.clone(),
+                ByteView::from(vec![1u8]),
+            )],
+        )
+        .await;
+        let tombstone = MetadataGraphLifecycleRecord::deleted(
+            record.graph_iri.clone(),
+            record.realm_id,
+            record.group_id,
+            record.document_id,
+            2,
+        );
+
+        process_metadata_graph_tombstones(&context, vec![tombstone]).await;
+
+        assert!(!index_row_exists(&storage, index_key).await);
     }
 
     #[tokio::test]

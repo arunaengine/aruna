@@ -263,7 +263,9 @@ fn content_security_policy(origins: &ResolvedOrigins) -> String {
         "default-src 'self'",
         "base-uri 'self'",
         "object-src 'none'",
-        "frame-src 'none'",
+        // blob: frames are page-created (inline PDF viewing); external frames
+        // stay blocked.
+        "frame-src blob:",
         "frame-ancestors 'none'",
         "form-action 'self'",
         "script-src 'self' 'wasm-unsafe-eval'",

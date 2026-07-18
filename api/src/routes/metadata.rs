@@ -21,12 +21,14 @@ use aruna_operations::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
     ListVisibleMetadataDocumentsRequest, MetadataApiError, MetadataApiQueryMode,
     MetadataDocumentQueryRequest, MetadataFanoutStats, MetadataQueryRequest,
+    MetadataReferenceEntry, MetadataReferencesExecution, MetadataReferencesRequest,
     MetadataRoCrateExportView as OperationMetadataRoCrateExportView, MetadataSearchRequest,
     export_metadata_rocrate as run_export_metadata_rocrate,
     get_visible_metadata_document as run_get_visible_metadata_document,
     list_visible_metadata_documents as run_list_visible_metadata_documents,
     metadata_auth_token_from_bearer, query_metadata as run_query_metadata,
-    query_metadata_document as run_query_metadata_document, search_metadata as run_search_metadata,
+    query_metadata_document as run_query_metadata_document,
+    references_metadata as run_references_metadata, search_metadata as run_search_metadata,
 };
 use aruna_operations::metadata::forward::{
     MetadataWriteError, create_metadata_document_routed as run_create_metadata_document,
@@ -56,7 +58,7 @@ use aruna_operations::metadata::MetadataAuthToken;
 #[cfg(test)]
 use aruna_operations::metadata::api::{
     MetadataQueryForm as QueryForm, aggregate_query_results, deduplicate_fanout_nodes,
-    deduplicate_search_hits, load_metadata_realm_nodes, query_select_limit,
+    load_metadata_realm_nodes, query_select_limit,
 };
 #[cfg(test)]
 use std::time::Duration;
@@ -72,6 +74,7 @@ use std::time::Duration;
         get_metadata_document,
         delete_metadata_document,
         search_metadata,
+        metadata_references,
         export_metadata_rocrate,
         replace_metadata_rocrate,
         add_metadata_data_entity,
@@ -89,6 +92,7 @@ pub fn router() -> Router<Arc<ServerState>> {
             get(list_all_metadata_documents).post(create_metadata_document),
         )
         .route("/metadata/search", get(search_metadata))
+        .route("/metadata/references", get(metadata_references))
         .route("/metadata/sparql/query", post(query_all_metadata))
         .route("/groups/{group_id}/metadata", get(list_metadata_documents))
         .route(
@@ -252,9 +256,18 @@ pub struct MetadataRoCrateExportParams {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct MetadataSearchParams {
+    #[serde(default)]
     pub q: String,
     #[serde(default)]
+    pub conforms_to: Option<String>,
+    #[serde(default)]
+    pub group_id: Option<String>,
+    #[serde(default)]
     pub limit: Option<usize>,
+    /// Opaque continuation token from a previous response's `next_cursor`. Bound
+    /// to the original query; a changed query is rejected with `400`.
+    #[serde(default)]
+    pub cursor: Option<String>,
     #[serde(default)]
     pub mode: Option<MetadataQueryMode>,
 }
@@ -267,16 +280,73 @@ pub struct MetadataSearchHitResponse {
     pub graph_iri: String,
     pub subject_iri: String,
     pub score: f32,
+    /// Human-readable title for the hit, populated by the answering node from
+    /// the resource's `schema:name` with a path-based fallback.
+    pub title: String,
+    /// Query-relevant text excerpt, populated by the answering node. Absent when
+    /// the resource has no indexed literals to window.
+    pub snippet: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MetadataSearchResponse {
     pub hits: Vec<MetadataSearchHitResponse>,
+    /// Continuation token for the next page, or `null` when the results are
+    /// exhausted. Pass it back as `cursor` to fetch the next page.
+    pub next_cursor: Option<String>,
     /// Number of node partitions this search was executed against.
     pub nodes_queried: usize,
     /// Number of node partitions that failed or timed out; a non-zero value
     /// means the result is partial.
     pub nodes_failed: usize,
+    /// True when pagination stopped at the server-side depth cap before the
+    /// result set was exhausted.
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct MetadataReferencesParams {
+    /// Referenced object IRI to find backlinks for, such as a document graph IRI
+    /// or any IRI that appears as a triple object.
+    pub iri: String,
+    /// Optional exact predicate IRI filter, such as http://schema.org/conformsTo.
+    #[serde(default)]
+    pub predicate: Option<String>,
+    /// Page size (default 25, silently clamped to a maximum of 100).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Resolve `iri` as a document graph IRI and return that document's summary
+    /// as a single predicate-less entry, skipping the backlink scan.
+    #[serde(default)]
+    pub resolve: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataReferenceItem {
+    pub document_id: String,
+    pub group_id: String,
+    pub document_path: String,
+    pub graph_iri: String,
+    /// Predicate that names the queried IRI, or absent for a resolved graph-IRI
+    /// entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<String>,
+    /// Subjects in the referencing document that name the queried IRI; empty for
+    /// a resolved graph-IRI entry.
+    pub subject_iris: Vec<String>,
+    /// Human-readable title for the referencing document, from its root
+    /// schema:name with a document-path fallback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataReferencesResponse {
+    pub references: Vec<MetadataReferenceItem>,
+    /// Reserved for pagination. Always `null` in v1: results are capped at
+    /// `limit` and continuation is not yet supported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -293,11 +363,19 @@ pub struct SparqlQueryRequest {
     /// `local` runs only against metadata indexed on the current node.
     /// `distributed` fans out to all known realm nodes for all-metadata queries,
     /// or to the document's registry replica nodes for document-scoped queries,
-    /// and merges the results.
+    /// and returns one complete replica result.
     /// Distributed mode is best-effort and may return partial results if realm
     /// node discovery or remote requests fail.
     #[serde(default)]
     pub mode: Option<MetadataQueryMode>,
+    /// Keep successful partitions when distributed execution is incomplete.
+    /// Defaults to `true` for compatibility with the existing best-effort API.
+    #[serde(default = "default_allow_partial")]
+    pub allow_partial: bool,
+}
+
+fn default_allow_partial() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -305,7 +383,7 @@ pub struct SparqlQueryRequest {
 pub enum MetadataQueryMode {
     /// Run the query only on the current node.
     Local,
-    /// Run the query across all known realm nodes and merge the results.
+    /// Run the query across the selected metadata partitions.
     /// This is best-effort and may return partial results if discovery or
     /// remote requests fail.
     Distributed,
@@ -320,6 +398,10 @@ pub struct MetadataQueryResponse {
     /// Number of node partitions that failed or timed out; a non-zero value
     /// means the result is partial.
     pub nodes_failed: usize,
+    /// Whether every selected partition completed successfully.
+    pub complete: bool,
+    /// Node partitions that failed, timed out, or exceeded the fan-out bound.
+    pub failed_partitions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1033,7 +1115,7 @@ pub async fn add_metadata_contextual_entity(
     params(("document_id" = String, Path, description = "Metadata document id")),
     request_body(
         content = SparqlQueryRequest,
-        description = "Run a SPARQL `SELECT` or `ASK` query against one metadata document. `mode=local` only queries the current node, while `mode=distributed` queries the document's registry replica nodes and merges the results. Distributed mode is best-effort and may return partial results if replica requests fail. Omitting `mode` defaults to `distributed`.",
+        description = "Run a SPARQL `SELECT` or `ASK` query against one metadata document. `mode=local` only queries the current node, while `mode=distributed` queries the document's registry replicas and returns the first successful complete result. Distributed mode is best-effort by default; set `allow_partial=false` to fail if any selected replica fails.",
         examples(
             (
                 "DocumentAsk" = (
@@ -1081,6 +1163,7 @@ pub async fn query_metadata_document(
             bearer_token: bearer_token_to_string(bearer_token),
             query: request.query,
             mode: map_query_mode(request.mode),
+            allow_partial: request.allow_partial,
         },
     )
     .await
@@ -1097,13 +1180,13 @@ pub async fn query_metadata_document(
     tag = "metadata",
     request_body(
         content = SparqlQueryRequest,
-        description = "Run a SPARQL `SELECT` or `ASK` query across all visible metadata. `mode=local` only queries the current node, while `mode=distributed` queries all known realm nodes and merges the results. Distributed mode is best-effort and may return partial results if realm node discovery or remote requests fail. Omitting `mode` defaults to `distributed`.",
+        description = "Run a SPARQL `SELECT` or `ASK` query across all visible metadata. `mode=local` evaluates the current node's authorized graph union. `mode=distributed` accepts only union-safe `ASK` or `SELECT DISTINCT` single-pattern queries and merges partition sets. Distributed mode is best-effort by default; set `allow_partial=false` to fail if any partition is unavailable.",
         examples(
             (
                 "SelectDatasets" = (
                     summary = "List dataset names across visible metadata graphs",
                     value = json!({
-                        "query": "SELECT ?dataset ?name WHERE { ?dataset a <http://schema.org/Dataset> ; <http://schema.org/name> ?name . } LIMIT 25"
+                        "query": "SELECT DISTINCT ?dataset WHERE { ?dataset a <http://schema.org/Dataset> } LIMIT 25"
                     })
                 )
             ),
@@ -1142,6 +1225,7 @@ pub async fn query_all_metadata(
             query: request.query,
             mode: map_query_mode(request.mode),
             target_nodes: None,
+            allow_partial: request.allow_partial,
         },
     )
     .await
@@ -1157,8 +1241,11 @@ pub async fn query_all_metadata(
     path = "/metadata/search",
     tag = "metadata",
     params(
-        ("q" = String, Query, description = "Search query"),
-        ("limit" = Option<usize>, Query, description = "Maximum number of hits"),
+        ("q" = Option<String>, Query, description = "Search query; optional when conforms_to is set"),
+        ("conforms_to" = Option<String>, Query, description = "Exact schema.org conformsTo profile IRI"),
+        ("group_id" = Option<String>, Query, description = "Restrict hits to a single group id"),
+        ("limit" = Option<usize>, Query, description = "Page size (default 25, silently clamped to a maximum of 100). Hits are ordered by descending score"),
+        ("cursor" = Option<String>, Query, description = "Opaque continuation token from a previous response's next_cursor. Bound to the original query; replaying it with a changed query returns 400. Paging is best-effort: results may shift under concurrent metadata churn or node failures"),
         ("mode" = Option<MetadataQueryMode>, Query, description = "Search mode: local or distributed. Distributed mode is best-effort and may return partial results if realm node discovery or remote requests fail")
     ),
     responses(
@@ -1173,6 +1260,7 @@ pub async fn search_metadata(
     Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Query(params): Query<MetadataSearchParams>,
 ) -> ServerResult<(StatusCode, Json<MetadataSearchResponse>)> {
+    let group_id = params.group_id.as_deref().map(parse_group_id).transpose()?;
     let ctx = state.get_ctx();
     let result = run_search_metadata(
         ctx.as_ref(),
@@ -1183,7 +1271,10 @@ pub async fn search_metadata(
             bearer_token: bearer_token_to_string(bearer_token),
             graph_iris: None,
             query: params.q,
+            conforms_to: params.conforms_to,
+            group_id,
             limit: params.limit,
+            cursor: params.cursor,
             mode: map_query_mode(params.mode),
             target_nodes: None,
         },
@@ -1194,10 +1285,76 @@ pub async fn search_metadata(
         StatusCode::OK,
         Json(MetadataSearchResponse {
             hits: result.hits.into_iter().map(map_search_hit).collect(),
+            next_cursor: result.next_cursor,
             nodes_queried: result.fanout_stats.nodes_queried,
             nodes_failed: result.fanout_stats.nodes_failed,
+            truncated: result.truncated,
         }),
     ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/metadata/references",
+    tag = "metadata",
+    params(
+        ("iri" = String, Query, description = "Referenced object IRI to find backlinks for, such as a document graph IRI or any IRI appearing as a triple object"),
+        ("predicate" = Option<String>, Query, description = "Optional exact predicate IRI filter, such as http://schema.org/conformsTo"),
+        ("limit" = Option<usize>, Query, description = "Page size (default 25, silently clamped to a maximum of 100)"),
+        ("resolve" = Option<bool>, Query, description = "Resolve iri as a document graph IRI and return that document's summary as a single predicate-less entry, skipping the backlink scan")
+    ),
+    responses(
+        (status = 200, description = "Documents referencing the IRI the caller may read. When the scan is empty and iri is a known graph IRI, or when resolve is set, the matching document's summary is returned as a single predicate-less entry. Local-node-only in v1: only references indexed on the answering node are returned", body = MetadataReferencesResponse),
+        (status = 400, description = "Invalid or missing iri", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn metadata_references(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(params): Query<MetadataReferencesParams>,
+) -> ServerResult<(StatusCode, Json<MetadataReferencesResponse>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let ctx = state.get_ctx();
+    let execution = run_references_metadata(
+        ctx.as_ref(),
+        state.get_realm_id(),
+        MetadataReferencesRequest {
+            auth: Some(auth),
+            iri: params.iri,
+            predicate: params.predicate,
+            limit: params.limit,
+            resolve: params.resolve,
+        },
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
+    Ok((StatusCode::OK, Json(map_references_response(execution))))
+}
+
+fn map_references_response(execution: MetadataReferencesExecution) -> MetadataReferencesResponse {
+    MetadataReferencesResponse {
+        references: execution
+            .references
+            .into_iter()
+            .map(map_reference_entry)
+            .collect(),
+        next_cursor: execution.next_cursor,
+    }
+}
+
+fn map_reference_entry(entry: MetadataReferenceEntry) -> MetadataReferenceItem {
+    MetadataReferenceItem {
+        document_id: entry.document_id,
+        group_id: entry.group_id,
+        document_path: entry.document_path,
+        graph_iri: entry.graph_iri,
+        predicate: entry.predicate,
+        subject_iris: entry.subject_iris,
+        title: entry.title,
+    }
 }
 
 fn parse_document_id(document_id: &str) -> ServerResult<Ulid> {
@@ -1337,18 +1494,19 @@ fn map_metadata_error(error: MetadataError) -> ServerError {
     }
 }
 
-fn map_metadata_api_error(error: MetadataApiError) -> ServerError {
+pub(crate) fn map_metadata_api_error(error: MetadataApiError) -> ServerError {
     match error {
         MetadataApiError::BadRequest => ServerError::BadRequest,
         MetadataApiError::Unauthorized => ServerError::Unauthorized,
         MetadataApiError::Forbidden => ServerError::Forbidden,
         MetadataApiError::NotFound => ServerError::NotFound,
         MetadataApiError::ServiceUnavailable => ServerError::ServiceUnavailable,
+        MetadataApiError::InvalidCursor(message) => ServerError::BadRequestMessage(message),
         MetadataApiError::Internal(message) => ServerError::InternalError(message),
     }
 }
 
-fn map_query_mode(mode: Option<MetadataQueryMode>) -> Option<MetadataApiQueryMode> {
+pub(crate) fn map_query_mode(mode: Option<MetadataQueryMode>) -> Option<MetadataApiQueryMode> {
     mode.map(|mode| match mode {
         MetadataQueryMode::Local => MetadataApiQueryMode::Local,
         MetadataQueryMode::Distributed => MetadataApiQueryMode::Distributed,
@@ -1576,10 +1734,20 @@ fn map_query_results(
         MetadataQueryResults::Boolean(value) => MetadataQueryResult::Boolean(value),
         MetadataQueryResults::Graph(_) => return Err(ServerError::BadRequest),
     };
+    let mut failed_partitions = fanout_stats
+        .failed_partitions
+        .into_iter()
+        .map(|node_id| node_id.to_string())
+        .collect::<Vec<_>>();
+    if fanout_stats.discovery_failed {
+        failed_partitions.push("partition-discovery".to_string());
+    }
     Ok(MetadataQueryResponse {
         result,
         nodes_queried: fanout_stats.nodes_queried,
         nodes_failed: fanout_stats.nodes_failed,
+        complete: fanout_stats.nodes_failed == 0,
+        failed_partitions,
     })
 }
 
@@ -1589,7 +1757,7 @@ async fn load_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::N
     Ok(load_metadata_realm_nodes(ctx.as_ref(), state.get_realm_id(), state.get_node_id()).await)
 }
 
-fn map_search_hit(hit: MetadataSearchHit) -> MetadataSearchHitResponse {
+pub(crate) fn map_search_hit(hit: MetadataSearchHit) -> MetadataSearchHitResponse {
     MetadataSearchHitResponse {
         document_id: hit.document_id,
         group_id: hit.group_id,
@@ -1597,6 +1765,8 @@ fn map_search_hit(hit: MetadataSearchHit) -> MetadataSearchHitResponse {
         graph_iri: hit.graph_iri,
         subject_iri: hit.subject_iri,
         score: hit.score,
+        title: hit.title,
+        snippet: hit.snippet,
     }
 }
 
@@ -1644,7 +1814,7 @@ mod tests {
     use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde_json::json;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
     use tempfile::TempDir;
 
     struct TestState {
@@ -1664,7 +1834,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_metadata_routes_support_create_list_export_and_query() {
-        let test = setup_state().await;
+        let test = setup_state_with_net().await;
 
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
@@ -1839,6 +2009,7 @@ mod tests {
             Json(SparqlQueryRequest {
                 query: "ASK WHERE { ?s <http://schema.org/name> \"Public Dataset\" }".to_string(),
                 mode: None,
+                allow_partial: true,
             }),
         )
         .await
@@ -1859,7 +2030,10 @@ mod tests {
             Extension(None),
             Query(MetadataSearchParams {
                 q: "Public".to_string(),
+                conforms_to: None,
+                group_id: None,
                 limit: Some(10),
+                cursor: None,
                 mode: None,
             }),
         )
@@ -1868,6 +2042,54 @@ mod tests {
         assert!(!search.hits.is_empty());
         assert_eq!(search.nodes_queried, 1);
         assert_eq!(search.nodes_failed, 0);
+        let dataset_hit = search
+            .hits
+            .iter()
+            .find(|hit| hit.title == "Public Dataset")
+            .expect("root dataset hit is enriched with its schema:name title");
+        assert!(
+            dataset_hit
+                .snippet
+                .as_deref()
+                .is_some_and(|snippet| snippet.to_lowercase().contains("public")),
+            "snippet should window the matched query term: {:?}",
+            dataset_hit.snippet
+        );
+
+        let (_, Json(conforming)) = search_metadata(
+            State(test.state.clone()),
+            Extension(None),
+            Extension(None),
+            Query(MetadataSearchParams {
+                q: String::new(),
+                conforms_to: Some("https://w3id.org/ro/crate/1.2".to_string()),
+                group_id: None,
+                limit: Some(10),
+                cursor: None,
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(conforming.hits.len(), 1);
+        assert_eq!(conforming.hits[0].document_id, document_id);
+
+        let (_, Json(nonconforming)) = search_metadata(
+            State(test.state.clone()),
+            Extension(None),
+            Extension(None),
+            Query(MetadataSearchParams {
+                q: "Public".to_string(),
+                conforms_to: Some("https://w3id.org/ro/crate/1.1".to_string()),
+                group_id: None,
+                limit: Some(10),
+                cursor: None,
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(nonconforming.hits.is_empty());
     }
 
     #[tokio::test]
@@ -2192,6 +2414,7 @@ mod tests {
             Json(SparqlQueryRequest {
                 query: "ASK WHERE { ?s ?p ?o }".to_string(),
                 mode: None,
+                allow_partial: true,
             }),
         )
         .await;
@@ -2525,6 +2748,16 @@ mod tests {
                 .unwrap()
                 .contains("best-effort")
         );
+        let search_cursor_param = search_params
+            .iter()
+            .find(|param| param["name"] == "cursor")
+            .unwrap();
+        assert!(
+            search_cursor_param["description"]
+                .as_str()
+                .unwrap()
+                .contains("best-effort")
+        );
 
         let data_entity_examples = openapi["paths"]["/metadata/{document_id}/rocrate/data-entities"]
             ["post"]["requestBody"]["content"]["application/json"]["examples"]
@@ -2626,12 +2859,16 @@ mod tests {
             result: MetadataQueryResult::Boolean(true),
             nodes_queried: 3,
             nodes_failed: 1,
+            complete: false,
+            failed_partitions: vec!["partition-a".to_string()],
         };
         let value = serde_json::to_value(&response).unwrap();
         assert_eq!(value["kind"], json!("Boolean"));
         assert_eq!(value["value"], json!(true));
         assert_eq!(value["nodes_queried"], json!(3));
         assert_eq!(value["nodes_failed"], json!(1));
+        assert_eq!(value["complete"], json!(false));
+        assert_eq!(value["failed_partitions"], json!(["partition-a"]));
 
         let roundtrip: MetadataQueryResponse = serde_json::from_value(value).unwrap();
         assert!(matches!(
@@ -2640,11 +2877,13 @@ mod tests {
         ));
         assert_eq!(roundtrip.nodes_queried, 3);
         assert_eq!(roundtrip.nodes_failed, 1);
+        assert!(!roundtrip.complete);
+        assert_eq!(roundtrip.failed_partitions, vec!["partition-a"]);
     }
 
     #[tokio::test]
     async fn distributed_query_executes_local_partition_in_process() {
-        let test = setup_state().await;
+        let test = setup_state_with_net().await;
 
         let _ = create_metadata_document(
             State(test.state.clone()),
@@ -2674,9 +2913,10 @@ mod tests {
             Extension(None),
             Extension(None),
             Json(SparqlQueryRequest {
-                query: "SELECT ?name WHERE { ?s <http://schema.org/name> ?name } LIMIT 10"
+                query: "SELECT DISTINCT ?name WHERE { ?s <http://schema.org/name> ?name } LIMIT 10"
                     .to_string(),
                 mode: Some(MetadataQueryMode::Distributed),
+                allow_partial: true,
             }),
         )
         .await
@@ -2730,6 +2970,7 @@ mod tests {
                 Json(SparqlQueryRequest {
                     query: "SELECT ?name WHERE { ?s <http://schema.org/name> ?name }".to_string(),
                     mode: Some(MetadataQueryMode::Local),
+                    allow_partial: true,
                 }),
             )
             .await
@@ -2823,8 +3064,31 @@ mod tests {
         .await;
         assert_eq!(invalid_forwarded_token.nodes_queried, 1);
         assert_eq!(invalid_forwarded_token.nodes_failed, 1);
+        assert_eq!(
+            invalid_forwarded_token.failed_partitions,
+            vec![test.remote.net.node_id()]
+        );
         assert_excludes_dataset_name(&invalid_forwarded_token.names, "Remote Public Dataset");
         assert_excludes_dataset_name(&invalid_forwarded_token.names, "Remote Private Dataset");
+
+        let ctx = test.coordinator.state.get_ctx();
+        let strict = run_query_metadata(
+            ctx.as_ref(),
+            test.coordinator.state.get_realm_id(),
+            test.coordinator.state.get_node_id(),
+            MetadataQueryRequest {
+                auth: None,
+                bearer_token: Some("not-a-jwt".to_string()),
+                graph_iris: None,
+                query: "SELECT DISTINCT ?name WHERE { ?s <http://schema.org/name> ?name }"
+                    .to_string(),
+                mode: Some(MetadataApiQueryMode::Distributed),
+                target_nodes: Some(vec![test.remote.net.node_id()]),
+                allow_partial: false,
+            },
+        )
+        .await;
+        assert!(matches!(strict, Err(MetadataApiError::ServiceUnavailable)));
 
         test.shutdown().await;
     }
@@ -2847,76 +3111,861 @@ mod tests {
         test.shutdown().await;
     }
 
-    #[test]
-    fn deduplicates_search_hits_across_replicas() {
-        let hits = deduplicate_search_hits(
-            vec![
-                MetadataSearchHit {
-                    document_id: "01A".to_string(),
-                    group_id: "01G".to_string(),
-                    document_path: "datasets/a".to_string(),
-                    graph_iri: "https://w3id.org/aruna/01A".to_string(),
-                    subject_iri: "./file.txt".to_string(),
-                    score: 0.5,
-                },
-                MetadataSearchHit {
-                    document_id: "01A".to_string(),
-                    group_id: "01G".to_string(),
-                    document_path: "datasets/a".to_string(),
-                    graph_iri: "https://w3id.org/aruna/01A".to_string(),
-                    subject_iri: "./file.txt".to_string(),
-                    score: 0.8,
-                },
-                MetadataSearchHit {
-                    document_id: "01B".to_string(),
-                    group_id: "01G".to_string(),
-                    document_path: "datasets/b".to_string(),
-                    graph_iri: "https://w3id.org/aruna/01B".to_string(),
-                    subject_iri: "./file.txt".to_string(),
-                    score: 0.7,
-                },
-            ],
-            2,
-        );
-
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].graph_iri, "https://w3id.org/aruna/01A");
-        assert_eq!(hits[0].score, 0.8);
-        assert_eq!(hits[1].graph_iri, "https://w3id.org/aruna/01B");
+    async fn run_search_route(
+        state: &Arc<ServerState>,
+        auth: &AuthContext,
+        query: &str,
+        limit: usize,
+        cursor: Option<String>,
+        mode: Option<MetadataQueryMode>,
+    ) -> ServerResult<MetadataSearchResponse> {
+        search_metadata(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Extension(None),
+            Query(MetadataSearchParams {
+                q: query.to_string(),
+                conforms_to: None,
+                group_id: None,
+                limit: Some(limit),
+                cursor,
+                mode,
+            }),
+        )
+        .await
+        .map(|(_, Json(response))| response)
     }
 
-    #[test]
-    fn search_hit_dedup_orders_equal_scores_stably() {
-        let hit = |document_id: &str, subject_iri: &str| MetadataSearchHit {
-            document_id: document_id.to_string(),
-            group_id: "01G".to_string(),
-            document_path: format!("datasets/{document_id}"),
-            graph_iri: format!("https://w3id.org/aruna/{document_id}"),
-            subject_iri: subject_iri.to_string(),
-            score: 0.7,
+    async fn flush_node_search(node: &DistributedMetadataNode) {
+        let ctx = node.state.get_ctx();
+        installed_metadata_handle(ctx.as_ref())
+            .flush_search_updates()
+            .await
+            .unwrap();
+    }
+
+    struct SearchPaginationCluster {
+        auth: AuthContext,
+        group_id: Ulid,
+        nodes: Vec<DistributedMetadataNode>,
+    }
+
+    impl SearchPaginationCluster {
+        fn coordinator(&self) -> &DistributedMetadataNode {
+            &self.nodes[0]
+        }
+
+        async fn shutdown(self) {
+            for node in self.nodes {
+                node.net.shutdown().await;
+            }
+        }
+    }
+
+    async fn setup_search_pagination_cluster(node_count: usize) -> SearchPaginationCluster {
+        let realm_signing_key = test_realm_signing_key();
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+        let user_id = aruna_core::UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::r#gen();
+
+        let mut nodes = Vec::new();
+        for _ in 0..node_count {
+            nodes.push(spawn_distributed_metadata_node(realm_id).await);
+        }
+        for i in 0..nodes.len() {
+            for j in 0..nodes.len() {
+                if i != j {
+                    let addr = nodes[j].net.endpoint_addr();
+                    nodes[i].net.add_peer_addr(addr).await;
+                }
+            }
+        }
+        let node_refs: Vec<&DistributedMetadataNode> = nodes.iter().collect();
+        install_distributed_realm_config(&node_refs, realm_id).await;
+        for node in &nodes {
+            install_metadata_auth_documents(node, realm_id, user_id, group_id).await;
+        }
+
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+        };
+        SearchPaginationCluster {
+            auth,
+            group_id,
+            nodes,
+        }
+    }
+
+    async fn seed_public_document(
+        node: &DistributedMetadataNode,
+        auth: &AuthContext,
+        group_id: Ulid,
+        path: &str,
+        name: &str,
+    ) {
+        create_test_metadata_document(node.state.clone(), auth.clone(), group_id, path, name, true)
+            .await;
+        drain_metadata_background(node.state.as_ref()).await;
+        flush_node_search(node).await;
+    }
+
+    // Drives the coordinator against an explicit node set, matching how the other
+    // distributed metadata tests fan out (the REST route never sets target_nodes).
+    async fn search_cluster_page(
+        cluster: &SearchPaginationCluster,
+        query: &str,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> aruna_operations::metadata::api::MetadataSearchExecution {
+        let coordinator = cluster.coordinator();
+        let ctx = coordinator.state.get_ctx();
+        let target_nodes = cluster
+            .nodes
+            .iter()
+            .map(|node| node.net.node_id())
+            .collect();
+        run_search_metadata(
+            ctx.as_ref(),
+            coordinator.state.get_realm_id(),
+            coordinator.state.get_node_id(),
+            MetadataSearchRequest {
+                auth: Some(cluster.auth.clone()),
+                bearer_token: None,
+                graph_iris: None,
+                query: query.to_string(),
+                conforms_to: None,
+                group_id: None,
+                limit: Some(limit),
+                cursor,
+                mode: Some(MetadataApiQueryMode::Distributed),
+                target_nodes: Some(target_nodes),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn metadata_search_paginates_across_nodes_without_duplicates() {
+        let cluster = setup_search_pagination_cluster(3).await;
+        for index in 0..9 {
+            let node = &cluster.nodes[index % cluster.nodes.len()];
+            seed_public_document(
+                node,
+                &cluster.auth,
+                cluster.group_id,
+                &format!("datasets/corpus-{index}"),
+                &format!("Corpus Document {index}"),
+            )
+            .await;
+        }
+
+        let mut seen_keys: Vec<(String, String)> = Vec::new();
+        let mut seen_paths: HashSet<String> = HashSet::new();
+        let mut cursor = None;
+        let mut last_score = f32::INFINITY;
+        let mut pages = 0;
+        loop {
+            let response = search_cluster_page(&cluster, "Corpus", 3, cursor.clone()).await;
+            assert_eq!(response.fanout_stats.nodes_failed, 0);
+            assert!(response.hits.len() <= 3);
+            for hit in &response.hits {
+                assert!(
+                    hit.score <= last_score,
+                    "scores must be non-increasing across pages"
+                );
+                last_score = hit.score;
+                seen_keys.push((hit.graph_iri.clone(), hit.subject_iri.clone()));
+                seen_paths.insert(hit.document_path.clone());
+            }
+            pages += 1;
+            assert!(pages <= 20, "pagination failed to terminate");
+            match response.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        let unique: HashSet<_> = seen_keys.iter().cloned().collect();
+        assert_eq!(
+            unique.len(),
+            seen_keys.len(),
+            "pages must not repeat a (graph_iri, subject_iri)"
+        );
+        for index in 0..9 {
+            assert!(
+                seen_paths.contains(&format!("datasets/corpus-{index}")),
+                "every seeded document must appear across the pages"
+            );
+        }
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn metadata_search_pagination_survives_node_failure() {
+        let cluster = setup_search_pagination_cluster(3).await;
+        for index in 0..9 {
+            let node = &cluster.nodes[index % cluster.nodes.len()];
+            seed_public_document(
+                node,
+                &cluster.auth,
+                cluster.group_id,
+                &format!("datasets/corpus-{index}"),
+                &format!("Corpus Document {index}"),
+            )
+            .await;
+        }
+
+        let page1 = search_cluster_page(&cluster, "Corpus", 3, None).await;
+        assert_eq!(page1.fanout_stats.nodes_failed, 0);
+        let cursor = page1.next_cursor.clone().expect("more pages remain");
+
+        // Drop a non-coordinator holder mid-session; paging must continue.
+        cluster.nodes[2].net.shutdown().await;
+
+        let page2 = search_cluster_page(&cluster, "Corpus", 3, Some(cursor)).await;
+        assert!(
+            page2.fanout_stats.nodes_failed >= 1,
+            "the downed node must surface as a failed partition"
+        );
+
+        cluster.shutdown().await;
+    }
+
+    async fn search_cluster_group(
+        cluster: &SearchPaginationCluster,
+        query: &str,
+        group_id: Option<Ulid>,
+    ) -> aruna_operations::metadata::api::MetadataSearchExecution {
+        let coordinator = cluster.coordinator();
+        let ctx = coordinator.state.get_ctx();
+        let target_nodes = cluster
+            .nodes
+            .iter()
+            .map(|node| node.net.node_id())
+            .collect();
+        run_search_metadata(
+            ctx.as_ref(),
+            coordinator.state.get_realm_id(),
+            coordinator.state.get_node_id(),
+            MetadataSearchRequest {
+                auth: Some(cluster.auth.clone()),
+                bearer_token: None,
+                graph_iris: None,
+                query: query.to_string(),
+                conforms_to: None,
+                group_id,
+                limit: Some(50),
+                cursor: None,
+                mode: Some(MetadataApiQueryMode::Distributed),
+                target_nodes: Some(target_nodes),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn group_filter_fanout() {
+        // Group filter must hold across every fanned-out node.
+        let cluster = setup_search_pagination_cluster(3).await;
+        let other_group = Ulid::r#gen();
+        for node in &cluster.nodes {
+            install_metadata_auth_documents(
+                node,
+                node.state.get_realm_id(),
+                cluster.auth.user_id,
+                other_group,
+            )
+            .await;
+        }
+        for index in 0..6 {
+            let node = &cluster.nodes[index % cluster.nodes.len()];
+            let (group_id, label) = if index % 2 == 0 {
+                (cluster.group_id, "primary")
+            } else {
+                (other_group, "other")
+            };
+            seed_public_document(
+                node,
+                &cluster.auth,
+                group_id,
+                &format!("datasets/fanout-{label}-{index}"),
+                &format!("Fanout Document {index}"),
+            )
+            .await;
+        }
+
+        let filtered = search_cluster_group(&cluster, "Fanout", Some(cluster.group_id)).await;
+        assert!(!filtered.hits.is_empty());
+        assert!(
+            filtered
+                .hits
+                .iter()
+                .all(|hit| hit.group_id == cluster.group_id.to_string()),
+            "the group filter must hold across every fanned-out node"
+        );
+
+        let unfiltered = search_cluster_group(&cluster, "Fanout", None).await;
+        let groups: HashSet<String> = unfiltered
+            .hits
+            .iter()
+            .map(|hit| hit.group_id.clone())
+            .collect();
+        assert!(groups.contains(&cluster.group_id.to_string()));
+        assert!(groups.contains(&other_group.to_string()));
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn metadata_search_marks_realm_discovery_failure_partial() {
+        let test = setup_state().await;
+        let _ = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Extension(None),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/discovery-partial".to_string(),
+                    name: "Discovery Partial Dataset".to_string(),
+                    description: "discovery failure fixture".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
+        let ctx = test.state.get_ctx();
+        installed_metadata_handle(ctx.as_ref())
+            .flush_search_updates()
+            .await
+            .unwrap();
+
+        let no_net_ctx = DriverContext {
+            net_handle: None,
+            ..ctx.as_ref().clone()
         };
 
-        let hits = deduplicate_search_hits(
-            vec![
-                hit("01B", "./file-b.txt"),
-                hit("01A", "./file-b.txt"),
-                hit("01A", "./file-a.txt"),
-            ],
+        let result = run_search_metadata(
+            &no_net_ctx,
+            test.state.get_realm_id(),
+            test.state.get_node_id(),
+            MetadataSearchRequest {
+                auth: Some(test.auth.clone()),
+                bearer_token: None,
+                graph_iris: None,
+                query: "Discovery".to_string(),
+                conforms_to: None,
+                group_id: None,
+                limit: Some(10),
+                cursor: None,
+                mode: Some(MetadataApiQueryMode::Distributed),
+                target_nodes: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.fanout_stats.nodes_queried, 1);
+        assert_eq!(result.fanout_stats.nodes_failed, 1);
+        assert!(!result.truncated);
+    }
+
+    #[tokio::test]
+    async fn metadata_search_rejects_cursor_on_query_change_and_malformed_input() {
+        let test = setup_state_with_net().await;
+        let _ = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Extension(None),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/alpha".to_string(),
+                    name: "Alpha Widget".to_string(),
+                    description: "cursor fixture".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
+        let ctx = test.state.get_ctx();
+        installed_metadata_handle(ctx.as_ref())
+            .flush_search_updates()
+            .await
+            .unwrap();
+
+        let page = run_search_route(
+            &test.state,
+            &test.auth,
+            "Widget",
+            1,
+            None,
+            Some(MetadataQueryMode::Local),
+        )
+        .await
+        .unwrap();
+        let cursor = page.next_cursor.clone();
+
+        let malformed = run_search_route(
+            &test.state,
+            &test.auth,
+            "Widget",
+            1,
+            Some("!!!not-a-cursor!!!".to_string()),
+            Some(MetadataQueryMode::Local),
+        )
+        .await;
+        assert!(matches!(malformed, Err(ServerError::BadRequestMessage(_))));
+
+        if let Some(cursor) = cursor {
+            let mut tampered = cursor.as_bytes().to_vec();
+            let tamper_index = tampered.len() / 2;
+            tampered[tamper_index] = if tampered[tamper_index] == b'A' {
+                b'B'
+            } else {
+                b'A'
+            };
+            let tampered = String::from_utf8(tampered).unwrap();
+            let tampered_result = run_search_route(
+                &test.state,
+                &test.auth,
+                "Widget",
+                1,
+                Some(tampered),
+                Some(MetadataQueryMode::Local),
+            )
+            .await;
+            assert!(matches!(
+                tampered_result,
+                Err(ServerError::BadRequestMessage(_))
+            ));
+
+            let mismatched = run_search_route(
+                &test.state,
+                &test.auth,
+                "Different",
+                1,
+                Some(cursor),
+                Some(MetadataQueryMode::Local),
+            )
+            .await;
+            match mismatched {
+                Err(ServerError::BadRequestMessage(message)) => {
+                    assert!(message.contains("does not match query"), "{message}");
+                }
+                other => panic!("expected a query-mismatch rejection, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_search_cursor_suppresses_churned_hits() {
+        let test = setup_state_with_net().await;
+        for index in 0..5 {
+            let _ = create_metadata_document(
+                State(test.state.clone()),
+                Extension(Some(test.auth.clone())),
+                Extension(None),
+                Json(CreateMetadataRequest::Scaffold(
+                    CreateMetadataScaffoldRequest {
+                        group_id: test.group_id.to_string(),
+                        path: format!("datasets/widget-{index}"),
+                        name: format!("Widget {index}"),
+                        description: "churn fixture".to_string(),
+                        date_published: "2026-01-01".to_string(),
+                        license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                        public: true,
+                    },
+                )),
+            )
+            .await
+            .unwrap();
+        }
+        drain_metadata_background(test.state.as_ref()).await;
+        let ctx = test.state.get_ctx();
+        installed_metadata_handle(ctx.as_ref())
+            .flush_search_updates()
+            .await
+            .unwrap();
+
+        let page1 = run_search_route(
+            &test.state,
+            &test.auth,
+            "Widget",
+            2,
+            None,
+            Some(MetadataQueryMode::Local),
+        )
+        .await
+        .unwrap();
+        let page1_keys: HashSet<(String, String)> = page1
+            .hits
+            .iter()
+            .map(|hit| (hit.graph_iri.clone(), hit.subject_iri.clone()))
+            .collect();
+        let cursor = page1.next_cursor.clone().expect("more pages remain");
+
+        // Introduce a matching document between pages (churn).
+        let _ = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Extension(None),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/widget-extra".to_string(),
+                    name: "Widget Extra".to_string(),
+                    description: "churn fixture".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
+        installed_metadata_handle(ctx.as_ref())
+            .flush_search_updates()
+            .await
+            .unwrap();
+
+        let page2 = run_search_route(
+            &test.state,
+            &test.auth,
+            "Widget",
+            2,
+            Some(cursor),
+            Some(MetadataQueryMode::Local),
+        )
+        .await
+        .unwrap();
+        for hit in &page2.hits {
+            let key = (hit.graph_iri.clone(), hit.subject_iri.clone());
+            assert!(
+                !page1_keys.contains(&key),
+                "already emitted hits must not repeat under churn"
+            );
+        }
+
+        let fresh = run_search_route(
+            &test.state,
+            &test.auth,
+            "Widget",
             10,
+            None,
+            Some(MetadataQueryMode::Local),
+        )
+        .await
+        .unwrap();
+        assert!(
+            fresh
+                .hits
+                .iter()
+                .any(|hit| hit.document_path == "datasets/widget-extra"),
+            "a fresh search must surface the churned document"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_search_clamps_page_size_to_cap() {
+        let test = setup_state_with_net().await;
+        let (_, Json(created)) = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Extension(None),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/capacity".to_string(),
+                    name: "Capacity Dataset".to_string(),
+                    description: "capacity".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        let document_id = created.summary.document_id.clone();
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let files: String = (0..105)
+            .map(|index| {
+                format!(
+                    r#"{{"@id":"./data/capacity-{index}.txt","@type":"File","name":"Capacity file {index}"}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let parts: String = (0..105)
+            .map(|index| format!(r#"{{"@id":"./data/capacity-{index}.txt"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let rocrate = format!(
+            r#"{{"@context":"https://w3id.org/ro/crate/1.2/context","@graph":[{{"@id":"ro-crate-metadata.json","@type":"CreativeWork","conformsTo":{{"@id":"https://w3id.org/ro/crate/1.2"}},"about":{{"@id":"https://w3id.org/aruna/{document_id}"}}}},{{"@id":"https://w3id.org/aruna/{document_id}","@type":"Dataset","name":"Capacity Dataset","description":"capacity","datePublished":"2026-01-01","license":{{"@id":"https://creativecommons.org/licenses/by/4.0/"}},"hasPart":[{parts}]}},{files}]}}"#
+        );
+        let _ = replace_metadata_rocrate(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Extension(None),
+            Path(document_id.clone()),
+            Json(ReplaceMetadataRoCrateRequest {
+                rocrate: serde_json::from_str(&rocrate).unwrap(),
+                public: Some(true),
+            }),
+        )
+        .await
+        .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
+        let ctx = test.state.get_ctx();
+        installed_metadata_handle(ctx.as_ref())
+            .flush_search_updates()
+            .await
+            .unwrap();
+
+        let response = run_search_route(
+            &test.state,
+            &test.auth,
+            "Capacity",
+            250,
+            None,
+            Some(MetadataQueryMode::Local),
+        )
+        .await
+        .unwrap();
+        assert!(
+            response.hits.len() <= 100,
+            "page size must be clamped to the cap, got {}",
+            response.hits.len()
+        );
+        assert!(
+            response.next_cursor.is_some(),
+            "a corpus larger than the cap must offer a continuation"
         );
 
-        let keys = hits
-            .iter()
-            .map(|hit| (hit.graph_iri.as_str(), hit.subject_iri.as_str()))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            keys,
-            vec![
-                ("https://w3id.org/aruna/01A", "./file-a.txt"),
-                ("https://w3id.org/aruna/01A", "./file-b.txt"),
-                ("https://w3id.org/aruna/01B", "./file-b.txt"),
-            ]
+        // A request at exactly the cap fills a full page rather than being reduced.
+        let boundary = run_search_route(
+            &test.state,
+            &test.auth,
+            "Capacity",
+            100,
+            None,
+            Some(MetadataQueryMode::Local),
+        )
+        .await
+        .unwrap();
+        assert_eq!(boundary.hits.len(), 100);
+        assert!(boundary.next_cursor.is_some());
+    }
+
+    async fn install_group_auth(test: &TestState, group_id: Ulid) {
+        let realm_id = test.state.get_realm_id();
+        let actor = Actor {
+            node_id: test.state.get_node_id(),
+            user_id: test.auth.user_id,
+            realm_id,
+        };
+        let group_auth = GroupAuthorizationDocument::new_default_group_doc(
+            test.auth.user_id,
+            realm_id,
+            group_id,
         );
+        let group = Group {
+            display_name: "second-metadata-group".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner: test.auth.user_id,
+        };
+        let ctx = test.state.get_ctx();
+        write_doc(
+            &ctx,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().into(),
+            group_auth.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+        write_doc(
+            &ctx,
+            GROUP_KEYSPACE,
+            group_id.to_bytes().into(),
+            group.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+    }
+
+    async fn search_group_scoped(
+        test: &TestState,
+        query: &str,
+        group_id: Option<Ulid>,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> ServerResult<MetadataSearchResponse> {
+        search_metadata(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Extension(None),
+            Query(MetadataSearchParams {
+                q: query.to_string(),
+                conforms_to: None,
+                group_id: group_id.map(|id| id.to_string()),
+                limit: Some(limit),
+                cursor,
+                mode: Some(MetadataQueryMode::Local),
+            }),
+        )
+        .await
+        .map(|(_, Json(response))| response)
+    }
+
+    #[tokio::test]
+    async fn group_filter_scopes() {
+        // Filtered search returns only the named group's hits; unfiltered spans groups.
+        let test = setup_state_with_net().await;
+        let other_group = Ulid::r#gen();
+        install_group_auth(&test, other_group).await;
+        create_test_metadata_document(
+            test.state.clone(),
+            test.auth.clone(),
+            test.group_id,
+            "datasets/scoped-alpha",
+            "Scoped Alpha",
+            true,
+        )
+        .await;
+        create_test_metadata_document(
+            test.state.clone(),
+            test.auth.clone(),
+            other_group,
+            "datasets/scoped-beta",
+            "Scoped Beta",
+            true,
+        )
+        .await;
+        drain_metadata_background(test.state.as_ref()).await;
+        let ctx = test.state.get_ctx();
+        installed_metadata_handle(ctx.as_ref())
+            .flush_search_updates()
+            .await
+            .unwrap();
+
+        let unfiltered = search_group_scoped(&test, "Scoped", None, 10, None)
+            .await
+            .unwrap();
+        let paths: HashSet<String> = unfiltered
+            .hits
+            .iter()
+            .map(|hit| hit.document_path.clone())
+            .collect();
+        assert!(paths.contains("datasets/scoped-alpha"));
+        assert!(paths.contains("datasets/scoped-beta"));
+
+        let primary = search_group_scoped(&test, "Scoped", Some(test.group_id), 10, None)
+            .await
+            .unwrap();
+        assert_eq!(primary.hits.len(), 1);
+        assert_eq!(primary.hits[0].group_id, test.group_id.to_string());
+        assert_eq!(primary.hits[0].document_path, "datasets/scoped-alpha");
+
+        let other = search_group_scoped(&test, "Scoped", Some(other_group), 10, None)
+            .await
+            .unwrap();
+        assert_eq!(other.hits.len(), 1);
+        assert_eq!(other.hits[0].group_id, other_group.to_string());
+    }
+
+    #[tokio::test]
+    async fn cursor_binds_filter() {
+        // A cursor is bound to its group filter: adding or dropping the filter on
+        // replay must be rejected rather than silently paging a different set.
+        let test = setup_state_with_net().await;
+        for index in 0..2 {
+            create_test_metadata_document(
+                test.state.clone(),
+                test.auth.clone(),
+                test.group_id,
+                &format!("datasets/bound-{index}"),
+                &format!("Bound Widget {index}"),
+                true,
+            )
+            .await;
+        }
+        drain_metadata_background(test.state.as_ref()).await;
+        let ctx = test.state.get_ctx();
+        installed_metadata_handle(ctx.as_ref())
+            .flush_search_updates()
+            .await
+            .unwrap();
+
+        let filtered = search_group_scoped(&test, "Bound", Some(test.group_id), 1, None)
+            .await
+            .unwrap();
+        let filtered_cursor = filtered.next_cursor.expect("filtered page continues");
+        let dropped =
+            search_group_scoped(&test, "Bound", None, 1, Some(filtered_cursor.clone())).await;
+        assert!(matches!(dropped, Err(ServerError::BadRequestMessage(_))));
+
+        let plain = search_group_scoped(&test, "Bound", None, 1, None)
+            .await
+            .unwrap();
+        let plain_cursor = plain.next_cursor.expect("plain page continues");
+        let added =
+            search_group_scoped(&test, "Bound", Some(test.group_id), 1, Some(plain_cursor)).await;
+        assert!(matches!(added, Err(ServerError::BadRequestMessage(_))));
+    }
+
+    #[tokio::test]
+    async fn metadata_search_tolerates_pending_projection() {
+        let test = setup_state().await;
+        let _ = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Extension(None),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/pending".to_string(),
+                    name: "Pending Dataset".to_string(),
+                    description: "pending fixture".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+
+        // Search before draining the projection queue: it must not 5xx, and any
+        // hit that does surface must still carry an enriched, non-empty title.
+        let response = run_search_route(
+            &test.state,
+            &test.auth,
+            "Pending",
+            10,
+            None,
+            Some(MetadataQueryMode::Local),
+        )
+        .await
+        .unwrap();
+        for hit in &response.hits {
+            assert!(!hit.title.is_empty(), "title must always be populated");
+        }
     }
 
     struct DistributedMetadataAccessState {
@@ -2943,6 +3992,7 @@ mod tests {
         names: Vec<String>,
         nodes_queried: usize,
         nodes_failed: usize,
+        failed_partitions: Vec<aruna_core::NodeId>,
     }
 
     struct SearchPathsResult {
@@ -3139,6 +4189,402 @@ mod tests {
         .await;
     }
 
+    async fn references_route(
+        test: &TestState,
+        auth: Option<AuthContext>,
+        iri: &str,
+        predicate: Option<&str>,
+        limit: Option<usize>,
+        resolve: bool,
+    ) -> ServerResult<MetadataReferencesResponse> {
+        metadata_references(
+            State(test.state.clone()),
+            Extension(auth),
+            Query(MetadataReferencesParams {
+                iri: iri.to_string(),
+                predicate: predicate.map(str::to_string),
+                limit,
+                resolve,
+            }),
+        )
+        .await
+        .map(|(_, Json(response))| response)
+    }
+
+    async fn create_linking_doc(
+        test: &TestState,
+        auth: AuthContext,
+        group_id: Ulid,
+        path: &str,
+        name: &str,
+        public: bool,
+        links: &[(&str, &str)],
+    ) -> String {
+        let mut root = serde_json::Map::new();
+        root.insert("@id".to_string(), json!("urn:aruna-test:root"));
+        root.insert("@type".to_string(), json!("Dataset"));
+        root.insert("name".to_string(), json!(name));
+        root.insert("description".to_string(), json!("Reference lookup fixture"));
+        root.insert("datePublished".to_string(), json!("2026-01-01"));
+        root.insert(
+            "license".to_string(),
+            json!({ "@id": "https://creativecommons.org/licenses/by/4.0/" }),
+        );
+        for (predicate, object) in links {
+            root.insert((*predicate).to_string(), json!({ "@id": object }));
+        }
+        let rocrate = json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                    "about": { "@id": "urn:aruna-test:root" }
+                },
+                Value::Object(root)
+            ]
+        });
+        let (_, Json(created)) = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(auth)),
+            Extension(None),
+            Json(CreateMetadataRequest::RoCrate(
+                CreateMetadataRoCrateRequest {
+                    group_id: group_id.to_string(),
+                    path: path.to_string(),
+                    public,
+                    rocrate,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        created.summary.document_id
+    }
+
+    async fn seed_group_owned_by(test: &TestState, group_id: Ulid, owner: aruna_core::UserId) {
+        let realm_id = test.state.get_realm_id();
+        let actor = Actor {
+            node_id: test.state.get_node_id(),
+            user_id: owner,
+            realm_id,
+        };
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let group = Group {
+            display_name: "foreign-metadata-group".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner,
+        };
+        let ctx = test.state.get_ctx();
+        write_doc(
+            &ctx,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().into(),
+            group_auth.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+        write_doc(
+            &ctx,
+            GROUP_KEYSPACE,
+            group_id.to_bytes().into(),
+            group.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn references_lists_docs() {
+        let test = setup_state().await;
+        let alpha = create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/alpha",
+            "Alpha",
+            true,
+            &[("license", "https://example.test/target-a")],
+        )
+        .await;
+        create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/beta",
+            "Beta",
+            true,
+            &[("license", "https://example.test/target-b")],
+        )
+        .await;
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let response = references_route(
+            &test,
+            Some(test.auth.clone()),
+            "https://example.test/target-a",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.references.len(), 1);
+        let entry = &response.references[0];
+        assert_eq!(entry.document_id, alpha);
+        assert_eq!(entry.document_path, "datasets/alpha");
+        assert_eq!(
+            entry.predicate.as_deref(),
+            Some("http://schema.org/license")
+        );
+        assert_eq!(entry.title.as_deref(), Some("Alpha"));
+        assert!(!entry.subject_iris.is_empty());
+        assert!(response.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn references_filters_predicate() {
+        let test = setup_state().await;
+        let doc = create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/linker",
+            "Linker",
+            true,
+            &[
+                ("license", "https://example.test/shared"),
+                ("creator", "https://example.test/shared"),
+            ],
+        )
+        .await;
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let all = references_route(
+            &test,
+            Some(test.auth.clone()),
+            "https://example.test/shared",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(all.references.len(), 2);
+        let predicates: HashSet<String> = all
+            .references
+            .iter()
+            .filter_map(|r| r.predicate.clone())
+            .collect();
+        assert!(predicates.contains("http://schema.org/license"));
+        assert!(predicates.contains("http://schema.org/creator"));
+
+        let filtered = references_route(
+            &test,
+            Some(test.auth.clone()),
+            "https://example.test/shared",
+            Some("http://schema.org/license"),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(filtered.references.len(), 1);
+        assert_eq!(
+            filtered.references[0].predicate.as_deref(),
+            Some("http://schema.org/license")
+        );
+        assert_eq!(filtered.references[0].document_id, doc);
+    }
+
+    #[tokio::test]
+    async fn references_omits_unauthorized() {
+        // A private backlink from a group the caller cannot read is dropped.
+        let test = setup_state().await;
+        let realm_id = test.state.get_realm_id();
+        let foreign_user = aruna_core::UserId::local(Ulid::r#gen(), realm_id);
+        let foreign_group = Ulid::r#gen();
+        seed_group_owned_by(&test, foreign_group, foreign_user).await;
+        let foreign_auth = AuthContext {
+            user_id: foreign_user,
+            realm_id,
+            path_restrictions: None,
+        };
+
+        let visible = create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/visible",
+            "Visible",
+            true,
+            &[("license", "https://example.test/shared")],
+        )
+        .await;
+        let hidden = create_linking_doc(
+            &test,
+            foreign_auth.clone(),
+            foreign_group,
+            "datasets/hidden",
+            "Hidden",
+            false,
+            &[("license", "https://example.test/shared")],
+        )
+        .await;
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let caller = references_route(
+            &test,
+            Some(test.auth.clone()),
+            "https://example.test/shared",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(caller.references.len(), 1);
+        assert_eq!(caller.references[0].document_id, visible);
+
+        // The owner sees the hidden doc, proving the filter is authorization.
+        let owner = references_route(
+            &test,
+            Some(foreign_auth),
+            "https://example.test/shared",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let ids: HashSet<String> = owner
+            .references
+            .iter()
+            .map(|r| r.document_id.clone())
+            .collect();
+        assert!(ids.contains(&hidden));
+        assert!(ids.contains(&visible));
+    }
+
+    #[tokio::test]
+    async fn references_resolves_graph() {
+        let test = setup_state().await;
+        let doc = create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/graphdoc",
+            "Graph Doc",
+            true,
+            &[],
+        )
+        .await;
+        drain_metadata_background(test.state.as_ref()).await;
+        let graph_iri = format!("https://w3id.org/aruna/{doc}");
+
+        let response =
+            references_route(&test, Some(test.auth.clone()), &graph_iri, None, None, true)
+                .await
+                .unwrap();
+        assert_eq!(response.references.len(), 1);
+        let entry = &response.references[0];
+        assert_eq!(entry.document_id, doc);
+        assert_eq!(entry.graph_iri, graph_iri);
+        assert!(entry.predicate.is_none());
+        assert!(entry.subject_iris.is_empty());
+        assert_eq!(entry.title.as_deref(), Some("Graph Doc"));
+    }
+
+    #[tokio::test]
+    async fn references_unknown_empty() {
+        let test = setup_state().await;
+        create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/any",
+            "Any",
+            true,
+            &[("license", "https://example.test/known")],
+        )
+        .await;
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let response = references_route(
+            &test,
+            Some(test.auth.clone()),
+            "https://example.test/absent",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(response.references.is_empty());
+        assert!(response.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn references_requires_auth() {
+        let test = setup_state().await;
+        let result =
+            references_route(&test, None, "https://example.test/x", None, None, false).await;
+        assert!(matches!(result, Err(ServerError::Unauthorized)));
+    }
+
+    #[tokio::test]
+    async fn references_clamps_limit() {
+        // limit 0 clamps up to 1; a small limit caps the returned backlinks.
+        let test = setup_state().await;
+        create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/one",
+            "One",
+            true,
+            &[("license", "https://example.test/shared")],
+        )
+        .await;
+        create_linking_doc(
+            &test,
+            test.auth.clone(),
+            test.group_id,
+            "datasets/two",
+            "Two",
+            true,
+            &[("license", "https://example.test/shared")],
+        )
+        .await;
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let clamped = references_route(
+            &test,
+            Some(test.auth.clone()),
+            "https://example.test/shared",
+            None,
+            Some(0),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(clamped.references.len(), 1);
+
+        let full = references_route(
+            &test,
+            Some(test.auth.clone()),
+            "https://example.test/shared",
+            None,
+            Some(100),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(full.references.len(), 2);
+    }
+
     async fn create_test_metadata_document(
         state: Arc<ServerState>,
         auth: AuthContext,
@@ -3181,9 +4627,11 @@ mod tests {
                 auth,
                 bearer_token: bearer_token_to_string(bearer_token),
                 graph_iris: None,
-                query: "SELECT ?name WHERE { ?s <http://schema.org/name> ?name }".to_string(),
+                query: "SELECT DISTINCT ?name WHERE { ?s <http://schema.org/name> ?name }"
+                    .to_string(),
                 mode: Some(MetadataApiQueryMode::Distributed),
                 target_nodes: Some(vec![test.remote.net.node_id()]),
+                allow_partial: true,
             },
         )
         .await
@@ -3195,6 +4643,7 @@ mod tests {
             names: rows.into_iter().flat_map(|row| row.into_values()).collect(),
             nodes_queried: result.fanout_stats.nodes_queried,
             nodes_failed: result.fanout_stats.nodes_failed,
+            failed_partitions: result.fanout_stats.failed_partitions,
         }
     }
 
@@ -3213,7 +4662,10 @@ mod tests {
                 bearer_token: bearer_token_to_string(bearer_token),
                 graph_iris: None,
                 query: "Remote".to_string(),
+                conforms_to: None,
+                group_id: None,
                 limit: Some(10),
+                cursor: None,
                 mode: Some(MetadataApiQueryMode::Distributed),
                 target_nodes: Some(vec![test.remote.net.node_id()]),
             },
@@ -3327,6 +4779,128 @@ mod tests {
             task_handle: Some(task_handle),
             compute_handle: None,
         });
+        let group_id = Ulid::r#gen();
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
+        let group = Group {
+            display_name: "metadata-group".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner: user_id,
+        };
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+
+        write_doc(
+            &driver_ctx,
+            AUTH_KEYSPACE,
+            (*realm_id.as_bytes()).into(),
+            realm_auth.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+        write_doc(
+            &driver_ctx,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().into(),
+            group_auth.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+        write_doc(
+            &driver_ctx,
+            GROUP_KEYSPACE,
+            group_id.to_bytes().into(),
+            group.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+
+        let state = Arc::new(
+            ServerState::new(
+                driver_ctx,
+                realm_id,
+                node_id,
+                NodeCapabilities::local_node(realm_id).unwrap(),
+                false,
+                None,
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
+            )
+            .await,
+        );
+
+        TestState {
+            _storage_dir: storage_dir,
+            _metadata_dir: metadata_dir,
+            auth: AuthContext {
+                user_id,
+                realm_id,
+                path_restrictions: None,
+            },
+            group_id,
+            state,
+        }
+    }
+
+    // Net-capable variant for tests that need node discovery or cursor signing.
+    async fn setup_state_with_net() -> TestState {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let realm_id = test_realm_id(3);
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                secret_key: Some(iroh::SecretKey::from_bytes(&[11u8; 32])),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let node_id = net.node_id();
+        let user_id = aruna_core::UserId::local(Ulid::r#gen(), realm_id);
+        let actor = Actor {
+            node_id,
+            user_id,
+            realm_id,
+        };
+        let metadata_handle = MetadataHandle::new(
+            metadata_dir.path(),
+            node_id,
+            storage_handle.clone(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let task_handle = TaskHandle::new();
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: Some(metadata_handle),
+            task_handle: Some(task_handle),
+            compute_handle: None,
+        });
+        // Single-node realm config so the holder proxy serves mutations locally.
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.ensure_node(node_id, RealmNodeKind::Server);
+        write_doc(
+            &driver_ctx,
+            REALM_CONFIG_KEYSPACE,
+            (*realm_id.as_bytes()).into(),
+            config
+                .to_bytes(&Actor {
+                    node_id,
+                    user_id: aruna_core::UserId::nil(realm_id),
+                    realm_id,
+                })
+                .unwrap()
+                .into(),
+        )
+        .await;
         let group_id = Ulid::r#gen();
         let group_auth =
             GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);

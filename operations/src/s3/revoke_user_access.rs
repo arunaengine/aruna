@@ -1,6 +1,9 @@
+use crate::replicate_documents::replicate_documents_effect;
+use aruna_core::NodeId;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::UserAccess;
@@ -8,6 +11,7 @@ use aruna_core::types::Effects;
 use smallvec::smallvec;
 use std::time::SystemTime;
 use thiserror::Error;
+use tracing::warn;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RevokeUserAccessState {
@@ -16,6 +20,7 @@ pub enum RevokeUserAccessState {
     ReadUserAccess,
     WriteUserAccess,
     CommitTransaction,
+    ReplicateAccess,
     Finish,
     Error,
 }
@@ -41,6 +46,7 @@ pub struct RevokeUserAccessOperation {
     access_key: String,
     state: RevokeUserAccessState,
     txn_id: Option<ulid::Ulid>,
+    mutated: bool,
     output: Option<Result<UserAccess, RevokeUserAccessError>>,
 }
 
@@ -50,6 +56,7 @@ impl RevokeUserAccessOperation {
             access_key,
             state: RevokeUserAccessState::Init,
             txn_id: None,
+            mutated: false,
             output: None,
         }
     }
@@ -108,6 +115,7 @@ impl RevokeUserAccessOperation {
         };
 
         self.output = Some(Ok(access));
+        self.mutated = true;
         self.state = RevokeUserAccessState::WriteUserAccess;
         smallvec![Effect::Storage(StorageEffect::Write {
             key_space: USER_ACCESS_KEYSPACE.to_string(),
@@ -135,6 +143,42 @@ impl RevokeUserAccessOperation {
         };
 
         self.txn_id = None;
+        if self.mutated {
+            return self.replicate_revocation();
+        }
+        self.state = RevokeUserAccessState::Finish;
+        smallvec![]
+    }
+
+    /// Propagates the revoked credential realm-wide over the same shared topic
+    /// its creation used, so the revocation takes effect on every realm node.
+    fn replicate_revocation(&mut self) -> Effects {
+        let Some(Ok(access)) = self.output.as_ref() else {
+            self.state = RevokeUserAccessState::Finish;
+            return smallvec![];
+        };
+        let realm_id = access.user_identity.realm_id;
+        let Ok(local_node_id) = NodeId::from_bytes(&access.issued_by) else {
+            self.state = RevokeUserAccessState::Finish;
+            return smallvec![];
+        };
+        self.state = RevokeUserAccessState::ReplicateAccess;
+        smallvec![replicate_documents_effect(
+            realm_id,
+            local_node_id,
+            vec![DocumentSyncTarget::UserAccess {
+                realm_id,
+                access_key: self.access_key.clone(),
+            }],
+        )]
+    }
+
+    fn handle_access_replicated(&mut self, event: Event) -> Effects {
+        if let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event
+            && let Err(error) = result
+        {
+            warn!(%error, "revocation replication failed; revoked locally");
+        }
         self.state = RevokeUserAccessState::Finish;
         smallvec![]
     }
@@ -155,6 +199,7 @@ impl Operation for RevokeUserAccessOperation {
             RevokeUserAccessState::ReadUserAccess => self.handle_user_access_read(event),
             RevokeUserAccessState::WriteUserAccess => self.handle_user_access_written(event),
             RevokeUserAccessState::CommitTransaction => self.handle_transaction_committed(event),
+            RevokeUserAccessState::ReplicateAccess => self.handle_access_replicated(event),
             RevokeUserAccessState::Finish => smallvec![],
             RevokeUserAccessState::Error => self.abort(),
         }
@@ -190,11 +235,52 @@ impl Operation for RevokeUserAccessOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use aruna_core::structs::UserAccess;
+    use aruna_core::structs::{RealmId, UserAccess};
+    use aruna_core::types::UserId;
     use aruna_storage::storage;
     use std::time::Duration;
     use tempfile::tempdir;
     use ulid::Ulid;
+
+    #[test]
+    fn revoke_replicates_after_commit() {
+        // A real revocation queues realm-wide propagation of the revoked record.
+        let issued_by = *iroh::SecretKey::from_bytes(&[9u8; 32]).public().as_bytes();
+        let access = UserAccess {
+            access_key: "user:key".to_string(),
+            user_identity: UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32])),
+            group_id: Ulid::r#gen(),
+            secret: "secret".to_string(),
+            expiry: SystemTime::now() + Duration::from_secs(60),
+            path_restrictions: None,
+            issued_by,
+            revoked_at: None,
+        };
+        let mut op = RevokeUserAccessOperation::new(access.access_key.clone());
+        op.start();
+        op.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::r#gen(),
+        }));
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: access.access_key.as_bytes().to_vec().into(),
+            value: Some(access.to_bytes().unwrap().into()),
+        }));
+        op.step(Event::Storage(StorageEvent::WriteResult {
+            key: access.access_key.as_bytes().to_vec().into(),
+        }));
+
+        let effects = op.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: Ulid::r#gen(),
+        }));
+        assert_eq!(op.state, RevokeUserAccessState::ReplicateAccess);
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+
+        let effects = op.step(Event::SubOperation(SubOperationEvent::DocumentSyncResult {
+            result: Ok(()),
+        }));
+        assert!(effects.is_empty());
+        assert_eq!(op.state, RevokeUserAccessState::Finish);
+    }
 
     #[tokio::test]
     async fn test_revoke_user_access() {

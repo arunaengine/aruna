@@ -1,15 +1,16 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::compute::ExecutorCapability;
 use aruna_core::document::DocumentSyncTarget;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
+use aruna_core::keyspaces::{METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE};
 use aruna_core::structs::{
-    NodeInfoDocument, NodeUrls, NodeUtilization, RealmId, node_info_storage_key,
+    NodeInfoDocument, NodeUrls, NodeUtilization, PlacementRef, RealmConfigDocument, RealmId,
+    node_info_storage_key,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, Value};
@@ -17,10 +18,12 @@ use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use tracing::warn;
+use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::get_realm_config::GetRealmConfigOperation;
-use crate::placement::build_view;
+use crate::metadata::repository::{REGISTRY_FILL_PAGE_SIZE, parse_registry_iter};
+use crate::placement::{build_view, held_buckets};
 use crate::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
 /// Interval between node-info heartbeat republishes. Peers treat a node's
@@ -46,15 +49,16 @@ pub async fn seed_node_info_document(
     executors: Vec<ExecutorCapability>,
 ) -> Result<(), String> {
     let now = unix_timestamp_millis();
+    let config = load_realm_config(ctx, realm_id).await?;
     let document = NodeInfoDocument {
         node_id,
         executors,
-        labels: current_placement_labels(ctx, node_id, realm_id).await?,
+        labels: placement_labels(&config, node_id)?,
         urls,
         utilization: NodeUtilization {
             storage_bytes_used: local_storage_bytes(ctx).await?,
-            documents_held: None,
-            load_permille: None,
+            documents_held: held_documents(ctx, node_id, &config).await,
+            load_permille: read_load_permille(),
             heartbeat_at_ms: now,
         },
         updated_at_ms: now,
@@ -90,23 +94,31 @@ pub async fn refresh_node_info_heartbeat(
         return Ok(());
     };
     let now = unix_timestamp_millis();
-    document.labels = current_placement_labels(ctx, node_id, realm_id).await?;
+    let config = load_realm_config(ctx, realm_id).await?;
+    document.labels = placement_labels(&config, node_id)?;
     document.utilization.storage_bytes_used = local_storage_bytes(ctx).await?;
+    document.utilization.documents_held = held_documents(ctx, node_id, &config).await;
+    document.utilization.load_permille = read_load_permille();
     document.utilization.heartbeat_at_ms = now;
     document.updated_at_ms = now;
     write_node_info_document(&ctx.storage_handle, &document).await?;
     replicate_node_info(ctx, node_id, realm_id).await
 }
 
-async fn current_placement_labels(
+async fn load_realm_config(
     ctx: &DriverContext,
-    node_id: NodeId,
     realm_id: RealmId,
-) -> Result<BTreeMap<String, String>, String> {
-    let config = drive(GetRealmConfigOperation::new(realm_id), ctx)
+) -> Result<RealmConfigDocument, String> {
+    drive(GetRealmConfigOperation::new(realm_id), ctx)
         .await
-        .map_err(|error| format!("failed to read realm config for node info: {error}"))?;
-    build_view(&config)
+        .map_err(|error| format!("failed to read realm config for node info: {error}"))
+}
+
+fn placement_labels(
+    config: &RealmConfigDocument,
+    node_id: NodeId,
+) -> Result<BTreeMap<String, String>, String> {
+    build_view(config)
         .nodes
         .into_iter()
         .find(|node| node.node_id == node_id)
@@ -118,6 +130,98 @@ async fn local_storage_bytes(ctx: &DriverContext) -> Result<u64, String> {
     Ok(crate::usage_stats::read_local_global(&ctx.storage_handle)
         .await?
         .stored_bytes)
+}
+
+/// Counts documents this node holds, degrading to `None` with a warning so a
+/// storage hiccup never fails the heartbeat.
+async fn held_documents(
+    ctx: &DriverContext,
+    node_id: NodeId,
+    config: &RealmConfigDocument,
+) -> Option<u64> {
+    match count_held_documents(ctx, node_id, config).await {
+        Ok(count) => Some(count),
+        Err(error) => {
+            warn!(%error, "failed to count documents held for node info");
+            None
+        }
+    }
+}
+
+/// The `(strategy, shard)` buckets `node_id` holds across every strategy. A
+/// document counts as held when its recorded placement bucket is in this set,
+/// so everywhere-replicated registry rows are not each counted as local.
+fn held_placement_set(config: &RealmConfigDocument, node_id: NodeId) -> HashSet<(Ulid, u32)> {
+    let mut held = HashSet::new();
+    for strategy in &config.strategies {
+        for shard in held_buckets(config, strategy, node_id) {
+            held.insert((strategy.strategy_id, shard));
+        }
+    }
+    held
+}
+
+async fn count_held_documents(
+    ctx: &DriverContext,
+    node_id: NodeId,
+    config: &RealmConfigDocument,
+) -> Result<u64, String> {
+    let held = held_placement_set(config, node_id);
+    let mut count = 0u64;
+    let mut start_after: Option<Key> = None;
+    loop {
+        let event = ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: METADATA_INDEX_KEYSPACE.to_string(),
+                prefix: None,
+                start: start_after.map(IterStart::After),
+                limit: REGISTRY_FILL_PAGE_SIZE,
+                txn_id: None,
+            })
+            .await;
+        let (page, next) = parse_registry_iter(event)
+            .map_err(|error| format!("metadata registry iteration failed: {error:?}"))?;
+        for record in &page {
+            // NIL placements predate any strategy and are held by every local
+            // node, matching holds_placement; count them alongside held buckets.
+            if record.placement == PlacementRef::NIL
+                || held.contains(&(record.placement.strategy_id, record.placement.shard))
+            {
+                count += 1;
+            }
+        }
+        match next {
+            Some(cursor) => start_after = Some(cursor),
+            None => break,
+        }
+    }
+    Ok(count)
+}
+
+/// 1-minute OS load average scaled to permille of logical core capacity, or
+/// `None` (with a warning) when the core count is unavailable.
+fn read_load_permille() -> Option<u32> {
+    match std::thread::available_parallelism() {
+        Ok(cores) => Some(permille_of(current_load1(), cores.get() as u64)),
+        Err(error) => {
+            warn!(%error, "failed to read logical core count for node info load");
+            None
+        }
+    }
+}
+
+fn current_load1() -> f64 {
+    sysinfo::System::load_average().one
+}
+
+/// Load average per core scaled to permille and clamped to `0..=1000`. Zero
+/// cores yields `0` instead of dividing by zero.
+fn permille_of(load1: f64, cores: u64) -> u32 {
+    if cores == 0 {
+        return 0;
+    }
+    (load1 / cores as f64 * 1000.0).round().clamp(0.0, 1000.0) as u32
 }
 
 async fn replicate_node_info(
@@ -222,8 +326,10 @@ mod tests {
     use super::*;
     use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord};
     use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
+    use aruna_core::storage_entries::metadata_registry_key;
     use aruna_core::structs::{
-        KIND_LABEL_KEY, NodePlacementEntry, RealmConfigDocument, RealmNodeKind,
+        KIND_LABEL_KEY, MetadataRegistryRecord, NodePlacementEntry, PlacementRef,
+        PlacementStrategy, RealmConfigDocument, RealmNodeKind,
     };
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
@@ -382,8 +488,8 @@ mod tests {
         assert_eq!(stored.labels, expected_labels);
         assert_eq!(stored.labels.get(KIND_LABEL_KEY).unwrap(), "server");
         assert_eq!(stored.urls.s3.as_deref(), Some("s3.example"));
-        assert_eq!(stored.utilization.documents_held, None);
-        assert_eq!(stored.utilization.load_permille, None);
+        assert_eq!(stored.utilization.documents_held, Some(0));
+        assert!(stored.utilization.load_permille.is_some());
 
         let outbox = read_outbox(&ctx).await;
         let record = outbox
@@ -495,5 +601,141 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn sharded_config(realm_id: RealmId) -> RealmConfigDocument {
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        let strategy = PlacementStrategy {
+            strategy_id: Ulid::from_bytes([5u8; 16]),
+            name: "default".to_string(),
+            replica_count: Some(2),
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 64,
+        };
+        config.default_strategy_id = Some(strategy.strategy_id);
+        config.strategies = vec![strategy];
+        for seed in 1..=4u8 {
+            config.ensure_node(node(seed), RealmNodeKind::Server);
+        }
+        config
+    }
+
+    fn registry_record(
+        realm_id: RealmId,
+        seed: u8,
+        placement: PlacementRef,
+    ) -> MetadataRegistryRecord {
+        let id = Ulid::from_bytes([seed; 16]);
+        MetadataRegistryRecord {
+            realm_id,
+            group_id: id,
+            document_id: id,
+            document_path: String::new(),
+            graph_iri: String::new(),
+            public: false,
+            permission_path: String::new(),
+            placement,
+            holder_node_ids: Vec::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            last_event_id: Ulid::nil(),
+        }
+    }
+
+    async fn write_registry(ctx: &DriverContext, record: &MetadataRegistryRecord) {
+        let event = ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: METADATA_INDEX_KEYSPACE.to_string(),
+                key: metadata_registry_key(record.group_id, record.document_id),
+                value: postcard::to_allocvec(record).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    #[test]
+    fn permille_exact_values() {
+        assert_eq!(permille_of(1.0, 4), 250);
+        assert_eq!(permille_of(3.0, 4), 750);
+        assert_eq!(permille_of(0.0, 8), 0);
+        assert_eq!(permille_of(4.0, 4), 1000);
+    }
+
+    #[test]
+    fn permille_clamps_high() {
+        assert_eq!(permille_of(9.0, 4), 1000);
+        assert_eq!(permille_of(10.0, 2), 1000);
+    }
+
+    #[test]
+    fn permille_zero_cores() {
+        assert_eq!(permille_of(5.0, 0), 0);
+    }
+
+    #[tokio::test]
+    async fn counts_held_documents() {
+        // Records whose placement bucket the node holds, plus NIL placements, count.
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let local = node(1);
+        let config = sharded_config(realm_id);
+        let strategy = &config.strategies[0];
+        let held = held_buckets(&config, strategy, local);
+        assert!(!held.is_empty() && held.len() < strategy.shard_count as usize);
+        let unheld = (0..strategy.shard_count)
+            .find(|shard| !held.contains(shard))
+            .unwrap();
+        let placed = |shard| PlacementRef {
+            strategy_id: strategy.strategy_id,
+            epoch: 0,
+            shard,
+        };
+
+        write_registry(&ctx, &registry_record(realm_id, 1, placed(held[0]))).await;
+        write_registry(&ctx, &registry_record(realm_id, 2, placed(held[0]))).await;
+        write_registry(&ctx, &registry_record(realm_id, 3, placed(unheld))).await;
+        write_registry(&ctx, &registry_record(realm_id, 4, PlacementRef::NIL)).await;
+
+        let count = count_held_documents(&ctx, local, &config).await.unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_populates_utilization() {
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let local = node(1);
+        write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
+
+        publish_node_info(
+            &ctx,
+            local,
+            realm_id,
+            NodeUrls {
+                api: None,
+                s3: None,
+            },
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        refresh_node_info_heartbeat(&ctx, local, realm_id)
+            .await
+            .unwrap();
+
+        let stored = read_node_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.utilization.documents_held, Some(0));
+        assert!(stored.utilization.load_permille.is_some());
     }
 }

@@ -2833,6 +2833,11 @@ impl DocumentSyncService {
             // persist an unvalidated node info document.
             validate_node_info_upsert(&target, &bytes).map_err(NetError::Bootstrap)?;
         }
+        if let DocumentSyncTarget::UserAccess { .. } = target {
+            // Structural guard for the shared user-access keyspace so a replicated
+            // credential's key always matches the storage key it lands under.
+            validate_user_access_upsert(&target, &bytes).map_err(NetError::Bootstrap)?;
+        }
         self.storage_write(
             target.storage_keyspace().to_string(),
             target.storage_key(),
@@ -5699,6 +5704,24 @@ fn validate_node_info_upsert(
         return Err(format!(
             "node info document node id {} does not match target node id {node_id}",
             document.node_id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_user_access_upsert(
+    target: &DocumentSyncTarget,
+    bytes: &[u8],
+) -> std::result::Result<(), String> {
+    let DocumentSyncTarget::UserAccess { access_key, .. } = target else {
+        return Err("target is not a user access document".to_string());
+    };
+    let document = aruna_core::structs::UserAccess::from_bytes(bytes)
+        .map_err(|error| format!("undecodable user access document: {error}"))?;
+    if document.access_key != *access_key {
+        return Err(format!(
+            "user access document key {} does not match target key {access_key}",
+            document.access_key
         ));
     }
     Ok(())
