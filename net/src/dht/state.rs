@@ -1342,8 +1342,24 @@ impl DhtStateMachine {
         }
 
         match op_state {
-            OpState::Put(_) | OpState::Get(_) | OpState::Bootstrap(_) => {
+            OpState::Put(_) | OpState::Bootstrap(_) => {
                 out.push(DhtEffect::Output(DhtOutput::Failed { op_id, error }));
+            }
+            OpState::Get(mut op) => {
+                if stage != StorageStage::GetLocalRead {
+                    out.push(DhtEffect::Output(DhtOutput::Failed { op_id, error }));
+                    return;
+                }
+                op.frontier.add_candidates(
+                    self.routing_table
+                        .closest(op.key.as_bytes(), LOOKUP_MAX_QUERIES)
+                        .into_iter()
+                        .map(|peer| peer.node_id),
+                    self.local_id,
+                    op.key.as_bytes(),
+                );
+                self.dispatch_get_requests(op_id, &mut op, out);
+                self.maybe_complete_get(op_id, op, out);
             }
             OpState::InboundGet(op) => {
                 out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
@@ -2489,6 +2505,57 @@ mod tests {
                 result: DhtOutputValue::GetValues { values, .. },
                 ..
             })] if values.is_empty()
+        ));
+    }
+
+    #[test]
+    fn get_storage_fallback() {
+        let local_secret = make_secret(83);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let key = DhtKeyId::from_data(b"storage-fallback");
+        let peer = make_node(84);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id: 80,
+            key,
+            realm_filter: None,
+            trace_context: None,
+        }));
+
+        let effects = state.step(DhtInput::Io(DhtIo::StorageError {
+            op_id: 80,
+            stage: StorageStage::GetLocalRead,
+            error: DhtIoError::storage("local read failed"),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [DhtEffect::IoRequest(request)]
+                if matches!(
+                    &**request,
+                    DhtIoRequest::RpcRequest {
+                        phase: RpcPhase::GetLookup,
+                        peer: request_peer,
+                        ..
+                    } if *request_peer == peer
+                )
+        ));
+
+        let value = make_value(85, key, make_realm(1), b"remote", 2_000);
+        let effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 80,
+            phase: RpcPhase::GetLookup,
+            peer,
+            response: DhtResponse::Value {
+                entries: vec![value],
+                closer_nodes: Vec::new(),
+            },
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [DhtEffect::Output(DhtOutput::Completed {
+                result: DhtOutputValue::GetValues { values, .. },
+                ..
+            })] if values.len() == 1 && values[0].value == b"remote"
         ));
     }
 
