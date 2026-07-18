@@ -646,7 +646,6 @@ impl DhtDriver {
         self.next_inbound_id = self.next_inbound_id.saturating_add(1);
 
         self.inbound_contexts.insert(inbound_id, send);
-        self.process_input_for_io(DhtIo::PeerSeen { peer });
 
         let io_tx = self.io_tx.clone();
         tokio::spawn(async move {

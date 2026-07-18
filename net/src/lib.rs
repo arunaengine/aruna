@@ -623,16 +623,8 @@ impl NetHandle {
         let (stream_tx, mut stream_rx) = mpsc::channel(64);
 
         let dht_inbound_tx = dht_resources.inbound_stream_tx.clone();
-        let dht_for_inbound = dht.clone();
         let dht_task = tokio::spawn(async move {
             while let Some((send, recv, peer_id)) = dht_rx.recv().await {
-                if let Err(err) = dht_for_inbound.add_peer(peer_id) {
-                    warn!(
-                        node_id = %peer_id,
-                        error = %err,
-                        "Failed to add inbound DHT peer to routing queue"
-                    );
-                }
                 match dht_inbound_tx.try_send((send, recv, peer_id)) {
                     Ok(()) => {}
                     Err(TrySendError::Full(_)) => {
