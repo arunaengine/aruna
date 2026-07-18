@@ -148,7 +148,9 @@ async fn stage_watch_expansion(
     for (_, event, _) in &candidates {
         let group_id = match &event.detail {
             WatchEventDetail::MetadataCreated { group_id, .. }
-            | WatchEventDetail::DataUploaded { group_id, .. } => *group_id,
+            | WatchEventDetail::DataUploaded { group_id, .. }
+            | WatchEventDetail::SyncCompleted { group_id, .. }
+            | WatchEventDetail::SyncFailed { group_id, .. } => *group_id,
         };
         let key: Key = group_id.to_bytes().to_vec().into();
         if !reads

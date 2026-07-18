@@ -342,6 +342,26 @@ mod tests {
         }
     }
 
+    fn sync_event(actor: UserId, path: &str) -> WatchEvent {
+        let resource = aruna_core::structs::parse_data_watch_resource_path(path)
+            .expect("canonical data watch path");
+        WatchEvent {
+            event_id: Ulid::from_bytes([9u8; 16]),
+            realm_id: REALM,
+            kind: WatchEventKind::SyncCompleted,
+            path: path.to_string(),
+            actor,
+            occurred_at_ms: 5_000,
+            detail: WatchEventDetail::SyncCompleted {
+                group_id: resource.group_id,
+                node_id: resource.node_id,
+                bucket: resource.bucket.to_string(),
+                relationship_id: Ulid::from_bytes([10u8; 16]),
+                versions_synced: 4,
+            },
+        }
+    }
+
     fn data_path(node_id: aruna_core::NodeId, bucket: &str, key: &str) -> String {
         aruna_core::structs::data_watch_resource_path(
             Ulid::from_bytes([6u8; 16]),
@@ -449,6 +469,31 @@ mod tests {
             } if path == &format!("meta/{group_id}/datasets/project/runs/run-42")
                 && event_group_id == &group_id
                 && event_document_id == &document_id
+        ));
+    }
+
+    #[test]
+    fn routes_sync_events() {
+        let owner = user(1);
+        let actor = user(2);
+        let node_id = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
+        let path = data_path(node_id, "bucket", "prefix/");
+        let subscription = watch_subscription(
+            owner,
+            &data_path(node_id, "bucket", ""),
+            WatchEventMask::from_kinds([WatchEventKind::SyncCompleted]),
+        );
+
+        let records = route_watch_event(&sync_event(actor, &path), &[subscription]);
+
+        assert_eq!(records.len(), 1);
+        assert!(matches!(
+            &records[0].kind,
+            NotificationKind::SyncCompleted {
+                relationship_id,
+                versions_synced: 4,
+                ..
+            } if relationship_id == &Ulid::from_bytes([10u8; 16])
         ));
     }
 

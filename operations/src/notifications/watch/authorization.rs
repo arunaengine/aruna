@@ -6,8 +6,8 @@ use aruna_core::metrics::WatchAuthorizationMetricReason;
 use aruna_core::structs::{
     AuthContext, MetadataRegistryRecord, NotificationKind, Permission, RealmId,
     WatchAuthorizationBinding, WatchEvent, WatchEventDetail, WatchEventKind, WatchEventMask,
-    WatchSubscription, blob_object_permission_path, data_watch_resource_path,
-    parse_data_watch_resource_path, watch_path_matches,
+    WatchSubscription, blob_bucket_permission_path, blob_object_permission_path,
+    data_watch_resource_path, parse_data_watch_resource_path, watch_path_matches,
 };
 use aruna_core::types::UserId;
 use tracing::warn;
@@ -75,7 +75,13 @@ pub fn watch_permission_path(
                 "/{realm_id}/g/{group_id}/meta/{document_path_prefix}"
             ))
         }
-        WatchEventMask::DATA_UPLOADED => {
+        bits if bits != 0
+            && bits
+                & !(WatchEventMask::DATA_UPLOADED
+                    | WatchEventMask::SYNC_COMPLETED
+                    | WatchEventMask::SYNC_FAILED)
+                == 0 =>
+        {
             let resource = parse_data_watch_resource_path(path_prefix)?;
             Some(blob_object_permission_path(
                 realm_id,
@@ -249,6 +255,24 @@ pub async fn evaluate_watch_notification_authorization(
         {
             WatchEventMask::from_kinds([WatchEventKind::DataUploaded])
         }
+        NotificationKind::SyncCompleted { path, .. }
+            if watch_path_matches(
+                WatchEventKind::SyncCompleted,
+                path,
+                &authorization.watch_path_prefix,
+            ) =>
+        {
+            WatchEventMask::from_kinds([WatchEventKind::SyncCompleted])
+        }
+        NotificationKind::SyncFailed { path, .. }
+            if watch_path_matches(
+                WatchEventKind::SyncFailed,
+                path,
+                &authorization.watch_path_prefix,
+            ) =>
+        {
+            WatchEventMask::from_kinds([WatchEventKind::SyncFailed])
+        }
         _ => {
             return Ok(WatchAuthorization::Denied(
                 WatchAuthorizationDenial::InvalidState,
@@ -315,6 +339,33 @@ pub fn watch_event_permission_path(event: &WatchEvent) -> Option<String> {
             bucket,
             key,
         ),
+        (
+            WatchEventKind::SyncCompleted,
+            WatchEventDetail::SyncCompleted {
+                group_id,
+                node_id,
+                bucket,
+                relationship_id,
+                ..
+            },
+        )
+        | (
+            WatchEventKind::SyncFailed,
+            WatchEventDetail::SyncFailed {
+                group_id,
+                node_id,
+                bucket,
+                relationship_id,
+                ..
+            },
+        ) => sync_permission_path(
+            event.realm_id,
+            &event.path,
+            *group_id,
+            *node_id,
+            bucket,
+            *relationship_id,
+        ),
         _ => None,
     }
 }
@@ -343,6 +394,31 @@ fn watch_notification_permission_path(
         } if !actor_user_id.is_nil() && actor_user_id.realm_id == realm_id => {
             data_permission_path(realm_id, path, *group_id, *node_id, bucket, key)
         }
+        NotificationKind::SyncCompleted {
+            path,
+            group_id,
+            node_id,
+            bucket,
+            relationship_id,
+            actor_user_id,
+            ..
+        }
+        | NotificationKind::SyncFailed {
+            path,
+            group_id,
+            node_id,
+            bucket,
+            relationship_id,
+            actor_user_id,
+            ..
+        } if !actor_user_id.is_nil() && actor_user_id.realm_id == realm_id => sync_permission_path(
+            realm_id,
+            path,
+            *group_id,
+            *node_id,
+            bucket,
+            *relationship_id,
+        ),
         _ => None,
     }
 }
@@ -388,6 +464,38 @@ fn data_permission_path(
     Some(blob_object_permission_path(
         realm_id, group_id, node_id, bucket, key,
     ))
+}
+
+fn sync_permission_path(
+    realm_id: RealmId,
+    path: &str,
+    group_id: Ulid,
+    node_id: NodeId,
+    bucket: &str,
+    relationship_id: Ulid,
+) -> Option<String> {
+    let resource = parse_data_watch_resource_path(path)?;
+    if group_id.is_nil()
+        || relationship_id.is_nil()
+        || resource.group_id != group_id
+        || resource.node_id != node_id
+        || resource.bucket != bucket
+    {
+        return None;
+    }
+    if resource.key_prefix.is_empty() {
+        Some(blob_bucket_permission_path(
+            realm_id, group_id, node_id, bucket,
+        ))
+    } else {
+        Some(blob_object_permission_path(
+            realm_id,
+            group_id,
+            node_id,
+            bucket,
+            resource.key_prefix,
+        ))
+    }
 }
 
 /// Holder-side enumeration of one user's watches through the same authorization
@@ -655,6 +763,19 @@ mod tests {
             ),
             Some(format!("/{realm_id}/g/{group_id}/meta/datasets/project"))
         );
+        assert_eq!(
+            watch_permission_path(
+                realm_id,
+                &data_prefix,
+                WatchEventMask::from_kinds([
+                    WatchEventKind::SyncCompleted,
+                    WatchEventKind::SyncFailed,
+                ]),
+            ),
+            Some(blob_object_permission_path(
+                realm_id, group_id, node_id, "bucket", "reports/"
+            ))
+        );
     }
 
     #[test]
@@ -687,6 +808,28 @@ mod tests {
                 node_id,
                 "bucket",
                 "reports/a.csv",
+            ))
+        );
+
+        let sync = WatchEvent {
+            event_id: Ulid::from_bytes([9u8; 16]),
+            realm_id,
+            kind: WatchEventKind::SyncCompleted,
+            path: data_watch_resource_path(group_id, node_id, "bucket", ""),
+            actor,
+            occurred_at_ms: 1,
+            detail: WatchEventDetail::SyncCompleted {
+                group_id,
+                node_id,
+                bucket: "bucket".to_string(),
+                relationship_id: Ulid::from_bytes([10u8; 16]),
+                versions_synced: 2,
+            },
+        };
+        assert_eq!(
+            watch_event_permission_path(&sync),
+            Some(blob_bucket_permission_path(
+                realm_id, group_id, node_id, "bucket"
             ))
         );
 

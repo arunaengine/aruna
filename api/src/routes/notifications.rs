@@ -127,6 +127,12 @@ pub struct NotificationResponse {
     pub key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub versions_synced: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -276,6 +282,9 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
         bucket: None,
         key: None,
         size_bytes: None,
+        relationship_id: None,
+        versions_synced: None,
+        error: None,
     };
     match &record.kind {
         NotificationKind::AddedToGroup {
@@ -328,6 +337,40 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
             response.bucket = Some(bucket.clone());
             response.key = Some(key.clone());
             response.size_bytes = Some(*size_bytes);
+            response.actor_user_id = Some(actor_user_id.to_string());
+        }
+        NotificationKind::SyncCompleted {
+            path,
+            group_id,
+            node_id,
+            bucket,
+            relationship_id,
+            versions_synced,
+            actor_user_id,
+        } => {
+            response.path = Some(path.clone());
+            response.group_id = Some(group_id.to_string());
+            response.node_id = Some(node_id.to_string());
+            response.bucket = Some(bucket.clone());
+            response.relationship_id = Some(relationship_id.to_string());
+            response.versions_synced = Some(*versions_synced);
+            response.actor_user_id = Some(actor_user_id.to_string());
+        }
+        NotificationKind::SyncFailed {
+            path,
+            group_id,
+            node_id,
+            bucket,
+            relationship_id,
+            error,
+            actor_user_id,
+        } => {
+            response.path = Some(path.clone());
+            response.group_id = Some(group_id.to_string());
+            response.node_id = Some(node_id.to_string());
+            response.bucket = Some(bucket.clone());
+            response.relationship_id = Some(relationship_id.to_string());
+            response.error = Some(error.clone());
             response.actor_user_id = Some(actor_user_id.to_string());
         }
     }

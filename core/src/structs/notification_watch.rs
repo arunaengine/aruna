@@ -59,7 +59,10 @@ pub fn watch_path_matches(kind: WatchEventKind, path: &str, prefix: &str) -> boo
     if path.starts_with(prefix) {
         return true;
     }
-    if kind != WatchEventKind::DataUploaded {
+    if !matches!(
+        kind,
+        WatchEventKind::DataUploaded | WatchEventKind::SyncCompleted | WatchEventKind::SyncFailed
+    ) {
         return false;
     }
     let (Some(path), Some(prefix)) = (
@@ -77,6 +80,8 @@ pub fn watch_path_matches(kind: WatchEventKind, path: &str, prefix: &str) -> boo
 pub enum WatchEventKind {
     MetadataCreated,
     DataUploaded,
+    SyncCompleted,
+    SyncFailed,
 }
 
 impl WatchEventKind {
@@ -85,6 +90,8 @@ impl WatchEventKind {
         match self {
             WatchEventKind::MetadataCreated => "metadata_created",
             WatchEventKind::DataUploaded => "data_uploaded",
+            WatchEventKind::SyncCompleted => "sync_completed",
+            WatchEventKind::SyncFailed => "sync_failed",
         }
     }
 
@@ -92,6 +99,8 @@ impl WatchEventKind {
         match name {
             "metadata_created" => Some(WatchEventKind::MetadataCreated),
             "data_uploaded" => Some(WatchEventKind::DataUploaded),
+            "sync_completed" => Some(WatchEventKind::SyncCompleted),
+            "sync_failed" => Some(WatchEventKind::SyncFailed),
             _ => None,
         }
     }
@@ -100,6 +109,8 @@ impl WatchEventKind {
         match self {
             WatchEventKind::MetadataCreated => WatchEventMask::METADATA_CREATED,
             WatchEventKind::DataUploaded => WatchEventMask::DATA_UPLOADED,
+            WatchEventKind::SyncCompleted => WatchEventMask::SYNC_COMPLETED,
+            WatchEventKind::SyncFailed => WatchEventMask::SYNC_FAILED,
         }
     }
 }
@@ -112,6 +123,8 @@ pub struct WatchEventMask(u32);
 impl WatchEventMask {
     pub const METADATA_CREATED: u32 = 1;
     pub const DATA_UPLOADED: u32 = 2;
+    pub const SYNC_COMPLETED: u32 = 4;
+    pub const SYNC_FAILED: u32 = 8;
 
     pub const fn empty() -> Self {
         Self(0)
@@ -155,6 +168,12 @@ impl WatchEventMask {
         if self.contains(WatchEventKind::DataUploaded) {
             kinds.push(WatchEventKind::DataUploaded);
         }
+        if self.contains(WatchEventKind::SyncCompleted) {
+            kinds.push(WatchEventKind::SyncCompleted);
+        }
+        if self.contains(WatchEventKind::SyncFailed) {
+            kinds.push(WatchEventKind::SyncFailed);
+        }
         kinds
     }
 }
@@ -188,6 +207,20 @@ pub enum WatchEventDetail {
         bucket: String,
         key: String,
         size_bytes: u64,
+    },
+    SyncCompleted {
+        group_id: GroupId,
+        node_id: NodeId,
+        bucket: String,
+        relationship_id: Ulid,
+        versions_synced: u64,
+    },
+    SyncFailed {
+        group_id: GroupId,
+        node_id: NodeId,
+        bucket: String,
+        relationship_id: Ulid,
+        error: String,
     },
 }
 
@@ -226,6 +259,36 @@ impl WatchEvent {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 size_bytes: *size_bytes,
+                actor_user_id: self.actor,
+            },
+            WatchEventDetail::SyncCompleted {
+                group_id,
+                node_id,
+                bucket,
+                relationship_id,
+                versions_synced,
+            } => NotificationKind::SyncCompleted {
+                path: self.path.clone(),
+                group_id: *group_id,
+                node_id: *node_id,
+                bucket: bucket.clone(),
+                relationship_id: *relationship_id,
+                versions_synced: *versions_synced,
+                actor_user_id: self.actor,
+            },
+            WatchEventDetail::SyncFailed {
+                group_id,
+                node_id,
+                bucket,
+                relationship_id,
+                error,
+            } => NotificationKind::SyncFailed {
+                path: self.path.clone(),
+                group_id: *group_id,
+                node_id: *node_id,
+                bucket: bucket.clone(),
+                relationship_id: *relationship_id,
+                error: error.clone(),
                 actor_user_id: self.actor,
             },
         }
@@ -633,6 +696,7 @@ mod tests {
                 WatchEventKind::MetadataCreated,
                 WatchEventKind::DataUploaded,
             ]),
+            WatchEventMask::from_kinds([WatchEventKind::SyncCompleted, WatchEventKind::SyncFailed]),
         ] {
             let record = WatchSubscription::new(owner, "/data".to_string(), mask, 42);
             let bytes = record.to_bytes().unwrap();
@@ -705,6 +769,24 @@ mod tests {
             mask.bits(),
             WatchEventMask::METADATA_CREATED | WatchEventMask::DATA_UPLOADED
         );
+        mask.insert(WatchEventKind::SyncCompleted);
+        mask.insert(WatchEventKind::SyncFailed);
+        assert_eq!(
+            mask.kinds(),
+            vec![
+                WatchEventKind::MetadataCreated,
+                WatchEventKind::DataUploaded,
+                WatchEventKind::SyncCompleted,
+                WatchEventKind::SyncFailed,
+            ]
+        );
+        assert_eq!(
+            mask.bits(),
+            WatchEventMask::METADATA_CREATED
+                | WatchEventMask::DATA_UPLOADED
+                | WatchEventMask::SYNC_COMPLETED
+                | WatchEventMask::SYNC_FAILED
+        );
     }
 
     fn metadata_event(actor: UserId) -> WatchEvent {
@@ -752,6 +834,43 @@ mod tests {
         assert_eq!(
             WatchEvent::from_bytes(&uploaded.to_bytes().unwrap()).unwrap(),
             uploaded
+        );
+
+        let completed = WatchEvent {
+            event_id: Ulid::from_bytes([11u8; 16]),
+            realm_id: RealmId([1u8; 32]),
+            kind: WatchEventKind::SyncCompleted,
+            path: data_watch_resource_path(group_id, node_id, "bucket", "prefix/"),
+            actor,
+            occurred_at_ms: 43,
+            detail: WatchEventDetail::SyncCompleted {
+                group_id,
+                node_id,
+                bucket: "bucket".to_string(),
+                relationship_id: Ulid::from_bytes([12u8; 16]),
+                versions_synced: 3,
+            },
+        };
+        assert_eq!(
+            WatchEvent::from_bytes(&completed.to_bytes().unwrap()).unwrap(),
+            completed
+        );
+
+        let failed = WatchEvent {
+            event_id: Ulid::from_bytes([13u8; 16]),
+            kind: WatchEventKind::SyncFailed,
+            detail: WatchEventDetail::SyncFailed {
+                group_id,
+                node_id,
+                bucket: "bucket".to_string(),
+                relationship_id: Ulid::from_bytes([12u8; 16]),
+                error: "quota".to_string(),
+            },
+            ..completed
+        };
+        assert_eq!(
+            WatchEvent::from_bytes(&failed.to_bytes().unwrap()).unwrap(),
+            failed
         );
     }
 
@@ -896,6 +1015,8 @@ mod tests {
     fn event_kind_names_are_stable() {
         assert_eq!(WatchEventKind::MetadataCreated.name(), "metadata_created");
         assert_eq!(WatchEventKind::DataUploaded.name(), "data_uploaded");
+        assert_eq!(WatchEventKind::SyncCompleted.name(), "sync_completed");
+        assert_eq!(WatchEventKind::SyncFailed.name(), "sync_failed");
         assert_eq!(
             WatchEventKind::from_name("metadata_created"),
             Some(WatchEventKind::MetadataCreated)
@@ -903,6 +1024,14 @@ mod tests {
         assert_eq!(
             WatchEventKind::from_name("data_uploaded"),
             Some(WatchEventKind::DataUploaded)
+        );
+        assert_eq!(
+            WatchEventKind::from_name("sync_completed"),
+            Some(WatchEventKind::SyncCompleted)
+        );
+        assert_eq!(
+            WatchEventKind::from_name("sync_failed"),
+            Some(WatchEventKind::SyncFailed)
         );
         assert_eq!(WatchEventKind::from_name("nope"), None);
     }

@@ -178,7 +178,12 @@ fn validate_subscription_fields(
     if event_mask.is_empty() {
         return Err(WatchSubscriptionError::EmptyMask);
     }
-    if event_mask.bits() & !(WatchEventMask::METADATA_CREATED | WatchEventMask::DATA_UPLOADED) != 0
+    if event_mask.bits()
+        & !(WatchEventMask::METADATA_CREATED
+            | WatchEventMask::DATA_UPLOADED
+            | WatchEventMask::SYNC_COMPLETED
+            | WatchEventMask::SYNC_FAILED)
+        != 0
     {
         return Err(WatchSubscriptionError::InvalidMask);
     }

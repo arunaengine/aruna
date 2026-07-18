@@ -61,6 +61,24 @@ pub enum NotificationKind {
         size_bytes: u64,
         actor_user_id: UserId,
     },
+    SyncCompleted {
+        path: String,
+        group_id: GroupId,
+        node_id: NodeId,
+        bucket: String,
+        relationship_id: Ulid,
+        versions_synced: u64,
+        actor_user_id: UserId,
+    },
+    SyncFailed {
+        path: String,
+        group_id: GroupId,
+        node_id: NodeId,
+        bucket: String,
+        relationship_id: Ulid,
+        error: String,
+        actor_user_id: UserId,
+    },
 }
 
 impl NotificationKind {
@@ -72,9 +90,10 @@ impl NotificationKind {
             | NotificationKind::RemovedFromGroup { .. }
             | NotificationKind::GroupMemberAdded { .. } => "group.membership",
             NotificationKind::NodeOnboarded { .. } => "node.onboarding",
-            NotificationKind::MetadataCreated { .. } | NotificationKind::DataUploaded { .. } => {
-                "resource.watch"
-            }
+            NotificationKind::MetadataCreated { .. }
+            | NotificationKind::DataUploaded { .. }
+            | NotificationKind::SyncCompleted { .. }
+            | NotificationKind::SyncFailed { .. } => "resource.watch",
         }
     }
 
@@ -87,6 +106,8 @@ impl NotificationKind {
             NotificationKind::NodeOnboarded { .. } => "node_onboarded",
             NotificationKind::MetadataCreated { .. } => "metadata_created",
             NotificationKind::DataUploaded { .. } => "data_uploaded",
+            NotificationKind::SyncCompleted { .. } => "sync_completed",
+            NotificationKind::SyncFailed { .. } => "sync_failed",
         }
     }
 }
@@ -366,6 +387,34 @@ mod tests {
                 size_bytes: 4096,
                 actor_user_id: user(1, 6),
             },
+            NotificationKind::SyncCompleted {
+                path: crate::structs::data_watch_resource_path(
+                    data_group_id,
+                    data_node_id,
+                    "bucket",
+                    "prefix/",
+                ),
+                group_id: data_group_id,
+                node_id: data_node_id,
+                bucket: "bucket".to_string(),
+                relationship_id: Ulid::r#gen(),
+                versions_synced: 3,
+                actor_user_id: user(1, 6),
+            },
+            NotificationKind::SyncFailed {
+                path: crate::structs::data_watch_resource_path(
+                    data_group_id,
+                    data_node_id,
+                    "bucket",
+                    "prefix/",
+                ),
+                group_id: data_group_id,
+                node_id: data_node_id,
+                bucket: "bucket".to_string(),
+                relationship_id: Ulid::r#gen(),
+                error: "quota".to_string(),
+                actor_user_id: user(1, 6),
+            },
         ] {
             let record = NotificationRecord::new(recipient, NotificationClass::Direct, kind, 1234);
             let bytes = record.to_bytes().unwrap();
@@ -544,17 +593,49 @@ mod tests {
             size_bytes: 1,
             actor_user_id: user(1, 6),
         };
+        let sync_completed = NotificationKind::SyncCompleted {
+            path: crate::structs::data_watch_resource_path(
+                data_group_id,
+                data_node_id,
+                "bucket",
+                "",
+            ),
+            group_id: data_group_id,
+            node_id: data_node_id,
+            bucket: "bucket".to_string(),
+            relationship_id: Ulid::r#gen(),
+            versions_synced: 2,
+            actor_user_id: user(1, 6),
+        };
+        let sync_failed = NotificationKind::SyncFailed {
+            path: crate::structs::data_watch_resource_path(
+                data_group_id,
+                data_node_id,
+                "bucket",
+                "",
+            ),
+            group_id: data_group_id,
+            node_id: data_node_id,
+            bucket: "bucket".to_string(),
+            relationship_id: Ulid::r#gen(),
+            error: "quota".to_string(),
+            actor_user_id: user(1, 6),
+        };
         assert_eq!(added.category(), "group.membership");
         assert_eq!(removed.category(), "group.membership");
         assert_eq!(member.category(), "group.membership");
         assert_eq!(onboarded.category(), "node.onboarding");
         assert_eq!(metadata_created.category(), "resource.watch");
         assert_eq!(data_uploaded.category(), "resource.watch");
+        assert_eq!(sync_completed.category(), "resource.watch");
+        assert_eq!(sync_failed.category(), "resource.watch");
         assert_eq!(added.name(), "added_to_group");
         assert_eq!(removed.name(), "removed_from_group");
         assert_eq!(member.name(), "group_member_added");
         assert_eq!(onboarded.name(), "node_onboarded");
         assert_eq!(metadata_created.name(), "metadata_created");
         assert_eq!(data_uploaded.name(), "data_uploaded");
+        assert_eq!(sync_completed.name(), "sync_completed");
+        assert_eq!(sync_failed.name(), "sync_failed");
     }
 }

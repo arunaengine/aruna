@@ -5,7 +5,7 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::{
     MetadataRegistryRecord, NotificationClass, NotificationKind, NotificationRecord,
     RealmConfigDocument, RealmId, WatchEvent, WatchEventDetail, WatchEventKind,
-    data_watch_resource_path,
+    data_watch_resource_path, parse_data_watch_resource_path,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
@@ -366,6 +366,33 @@ fn validate_inbound_watch_event(
                 return Err("watch event data path does not match detail".to_string());
             }
         }
+        (
+            WatchEventKind::SyncCompleted,
+            WatchEventDetail::SyncCompleted {
+                group_id,
+                node_id,
+                bucket,
+                relationship_id,
+                ..
+            },
+        )
+        | (
+            WatchEventKind::SyncFailed,
+            WatchEventDetail::SyncFailed {
+                group_id,
+                node_id,
+                bucket,
+                relationship_id,
+                ..
+            },
+        ) => {
+            validate_sync_detail(event, *group_id, *node_id, bucket, *relationship_id)?;
+            if let WatchEventDetail::SyncFailed { error, .. } = &event.detail
+                && error.is_empty()
+            {
+                return Err("watch event has empty sync error".to_string());
+            }
+        }
         _ => return Err("watch event kind does not match detail".to_string()),
     }
 
@@ -376,7 +403,10 @@ fn validate_inbound_record(record: &NotificationRecord, now_ms: u64) -> Result<(
     if record.watch_authorization.is_some()
         || matches!(
             record.kind,
-            NotificationKind::MetadataCreated { .. } | NotificationKind::DataUploaded { .. }
+            NotificationKind::MetadataCreated { .. }
+                | NotificationKind::DataUploaded { .. }
+                | NotificationKind::SyncCompleted { .. }
+                | NotificationKind::SyncFailed { .. }
         )
     {
         return Err("resource watch records must use watch event delivery".to_string());
@@ -473,6 +503,67 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
             }
             validate_kind_user("actor_user_id", actor_user_id, recipient_realm)?;
         }
+        NotificationKind::SyncCompleted {
+            path,
+            group_id,
+            node_id,
+            bucket,
+            relationship_id,
+            actor_user_id,
+            ..
+        }
+        | NotificationKind::SyncFailed {
+            path,
+            group_id,
+            node_id,
+            bucket,
+            relationship_id,
+            actor_user_id,
+            ..
+        } => {
+            validate_sync_path(path, *group_id, *node_id, bucket, *relationship_id)?;
+            if let NotificationKind::SyncFailed { error, .. } = kind
+                && error.is_empty()
+            {
+                return Err("notification record has empty sync error".to_string());
+            }
+            validate_kind_user("actor_user_id", actor_user_id, recipient_realm)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_sync_detail(
+    event: &WatchEvent,
+    group_id: ulid::Ulid,
+    node_id: NodeId,
+    bucket: &str,
+    relationship_id: ulid::Ulid,
+) -> Result<(), String> {
+    validate_sync_path(&event.path, group_id, node_id, bucket, relationship_id)
+        .map_err(|error| error.replace("notification record", "watch event"))
+}
+
+fn validate_sync_path(
+    path: &str,
+    group_id: ulid::Ulid,
+    node_id: NodeId,
+    bucket: &str,
+    relationship_id: ulid::Ulid,
+) -> Result<(), String> {
+    if group_id.is_nil() {
+        return Err("notification record has empty group_id".to_string());
+    }
+    if bucket.is_empty() {
+        return Err("notification record has empty bucket".to_string());
+    }
+    if relationship_id.is_nil() {
+        return Err("notification record has empty relationship_id".to_string());
+    }
+    let resource = parse_data_watch_resource_path(path)
+        .ok_or_else(|| "notification record sync path is not canonical".to_string())?;
+    if resource.group_id != group_id || resource.node_id != node_id || resource.bucket != bucket {
+        return Err("notification record sync path does not match detail".to_string());
     }
     Ok(())
 }
@@ -1930,6 +2021,38 @@ mod tests {
             validate_inbound_watch_event(&event, realm_id, event.occurred_at_ms),
             Err("watch event data path does not match detail".to_string())
         );
+    }
+
+    #[test]
+    fn validates_sync_watch() {
+        let realm_id = RealmId::from_bytes([77u8; 32]);
+        let actor = UserId::new(Ulid::r#gen(), realm_id);
+        let group_id = data_group_id();
+        let node_id = data_node_id();
+        let mut event = WatchEvent {
+            event_id: Ulid::r#gen(),
+            realm_id,
+            kind: WatchEventKind::SyncCompleted,
+            path: data_watch_resource_path(group_id, node_id, "bucket", "prefix/"),
+            actor,
+            occurred_at_ms: 1_000,
+            detail: WatchEventDetail::SyncCompleted {
+                group_id,
+                node_id,
+                bucket: "bucket".to_string(),
+                relationship_id: Ulid::r#gen(),
+                versions_synced: 2,
+            },
+        };
+
+        assert!(validate_inbound_watch_event(&event, realm_id, 1_000).is_ok());
+        if let WatchEventDetail::SyncCompleted {
+            relationship_id, ..
+        } = &mut event.detail
+        {
+            *relationship_id = Ulid::nil();
+        }
+        assert!(validate_inbound_watch_event(&event, realm_id, 1_000).is_err());
     }
 
     #[tokio::test]
