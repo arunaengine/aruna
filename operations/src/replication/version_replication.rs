@@ -3,7 +3,7 @@ use crate::connectors::{
 };
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{
-    MaterializedBlobInfo, MultipartObjectReplicationMetadata, ReplicationMode,
+    MaterializedBlobInfo, MultipartObjectReplicationMetadata, ReplicationMode, SyncOrigin,
     VersionReplicationManifest, VersionReplicationMessage, VersionReplicationRequest,
 };
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
@@ -15,10 +15,10 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
+    ArunaArn, AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
     CurrentVersionPointer, MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
     ReplicationItemKind, ReplicationNegotiationResult, ReplicationSuboperationResult,
-    SourceMetadata, VersionKey, VersionSourceBinding,
+    SourceMetadata, SyncMode, SyncRelationship, VersionKey, VersionSourceBinding,
 };
 use aruna_core::types::{Effects, GroupId, Key, NodeId};
 use serde::{Deserialize, Serialize};
@@ -59,6 +59,17 @@ struct PendingMaterializedReplicationVersion {
     source: Option<VersionSourceBinding>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SyncTransferContext {
+    target_bucket: String,
+    source_prefix: Option<String>,
+    target_prefix: Option<String>,
+    reference_intent: bool,
+    origin: Option<SyncOrigin>,
+    upstream_sources: Vec<ArunaArn>,
+    writer_auth_context: Option<AuthContext>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ReplicateScopeTarget {
     Bucket,
@@ -80,8 +91,10 @@ pub struct ReplicateScopeInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicateScopeResult {
     pub replicated: u64,
+    pub replicated_bytes: u64,
     pub skipped: u64,
     pub failed: u64,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -124,6 +137,7 @@ pub struct ReplicateScopeOperation {
     iteration_prefix: Option<String>,
     next_start_after: Option<Key>,
     source_group_id: Option<GroupId>,
+    sync: Option<SyncTransferContext>,
     pending_versions: Vec<VersionReplicationRequest>,
     result: ReplicateScopeResult,
     output: Option<Result<ReplicateScopeResult, ReplicateScopeError>>,
@@ -138,14 +152,45 @@ impl ReplicateScopeOperation {
             iteration_prefix: None,
             next_start_after: None,
             source_group_id: None,
+            sync: None,
             pending_versions: Vec::new(),
             result: ReplicateScopeResult {
                 replicated: 0,
+                replicated_bytes: 0,
                 skipped: 0,
                 failed: 0,
+                last_error: None,
             },
             output: None,
         }
+    }
+
+    pub fn with_relationship(
+        mut self,
+        relationship: SyncRelationship,
+        origin: Option<SyncOrigin>,
+        mut upstream_sources: Vec<ArunaArn>,
+        writer_auth_context: Option<AuthContext>,
+    ) -> Self {
+        if !upstream_sources
+            .iter()
+            .any(|source| source == &relationship.source)
+        {
+            upstream_sources.push(relationship.source.clone());
+        }
+        self.sync = Some(SyncTransferContext {
+            target_bucket: relationship.target.bucket().unwrap_or_default().to_string(),
+            source_prefix: relationship.source.key_prefix().map(ToOwned::to_owned),
+            target_prefix: relationship.target.key_prefix().map(ToOwned::to_owned),
+            reference_intent: relationship.mode == SyncMode::Reference,
+            origin: Some(origin.unwrap_or(SyncOrigin {
+                relationship_id: relationship.id,
+                hop_count: 0,
+            })),
+            upstream_sources,
+            writer_auth_context,
+        });
+        self
     }
 
     fn state_name(&self) -> &'static str {
@@ -262,6 +307,16 @@ impl ReplicateScopeOperation {
     }
 
     fn enqueue_version_request(&mut self, version_key: VersionKey) {
+        if self.sync.as_ref().is_some_and(|sync| {
+            map_sync_key(
+                &version_key.key,
+                sync.source_prefix.as_deref(),
+                sync.target_prefix.as_deref(),
+            )
+            .is_none()
+        }) {
+            return;
+        }
         if self.pending_versions.iter().any(|request| {
             request.bucket == version_key.bucket
                 && request.key == version_key.key
@@ -307,6 +362,7 @@ impl ReplicateScopeOperation {
                 target = ?self.input.target,
                 target_node = %self.input.target_node_id,
                 replicated = self.result.replicated,
+                replicated_bytes = self.result.replicated_bytes,
                 skipped = self.result.skipped,
                 failed = self.result.failed,
                 "Scope replication finished"
@@ -326,8 +382,23 @@ impl ReplicateScopeOperation {
             "Starting version replication suboperation"
         );
         self.state = ReplicateScopeState::RunVersionReplication;
+        let operation = match self.sync.clone() {
+            Some(mut sync) => {
+                let Some(target_key) = map_sync_key(
+                    &request.key,
+                    sync.source_prefix.as_deref(),
+                    sync.target_prefix.as_deref(),
+                ) else {
+                    self.result.failed = self.result.failed.saturating_add(1);
+                    return self.run_next_replication();
+                };
+                sync.target_prefix = Some(target_key);
+                ReplicateObjectVersionOperation::new(request).with_sync(sync)
+            }
+            None => ReplicateObjectVersionOperation::new(request),
+        };
         smallvec![Effect::SubOperation(boxed_suboperation(
-            ReplicateObjectVersionOperation::new(request),
+            operation,
             |result| Event::SubOperation(SubOperationEvent::ReplicationItemResult {
                 result: result
                     .map_err(|err| err.to_string())
@@ -335,6 +406,29 @@ impl ReplicateScopeOperation {
             }),
         ))]
     }
+}
+
+fn map_sync_key(
+    source_key: &str,
+    source_prefix: Option<&str>,
+    target_prefix: Option<&str>,
+) -> Option<String> {
+    let suffix = match source_prefix {
+        Some(prefix) => source_key.strip_prefix(prefix)?,
+        None => source_key,
+    };
+    Some(match target_prefix {
+        Some(prefix) if prefix.ends_with('/') && suffix.starts_with('/') => {
+            format!("{}{}", prefix, &suffix[1..])
+        }
+        Some(prefix)
+            if !prefix.ends_with('/') && !suffix.is_empty() && !suffix.starts_with('/') =>
+        {
+            format!("{prefix}/{suffix}")
+        }
+        Some(prefix) => format!("{prefix}{suffix}"),
+        None => suffix.trim_start_matches('/').to_string(),
+    })
 }
 
 impl Operation for ReplicateScopeOperation {
@@ -514,10 +608,18 @@ impl Operation for ReplicateScopeOperation {
                     });
                 };
 
-                match result {
+                match &result {
                     Ok(ReplicationSuboperationResult::Replicated) => self.result.replicated += 1,
                     Ok(ReplicationSuboperationResult::Skipped) => self.result.skipped += 1,
-                    Err(_) => self.result.failed += 1,
+                    Ok(ReplicationSuboperationResult::ReplicatedBytes(bytes)) => {
+                        self.result.replicated = self.result.replicated.saturating_add(1);
+                        self.result.replicated_bytes =
+                            self.result.replicated_bytes.saturating_add(*bytes);
+                    }
+                    Err(error) => {
+                        self.result.failed += 1;
+                        self.result.last_error = Some(error.clone());
+                    }
                 }
 
                 debug!(
@@ -526,6 +628,7 @@ impl Operation for ReplicateScopeOperation {
                     target_node = %self.input.target_node_id,
                     result = ?result,
                     replicated = self.result.replicated,
+                    replicated_bytes = self.result.replicated_bytes,
                     skipped = self.result.skipped,
                     failed = self.result.failed,
                     "Completed version replication suboperation"
@@ -618,6 +721,7 @@ pub struct ReplicateObjectVersionOperation {
     manifest: Option<VersionReplicationManifest>,
     blob_replication_id: Option<Ulid>,
     cleanup_reference_blob: Option<BackendLocation>,
+    sync: Option<SyncTransferContext>,
     result: Result<ReplicationSuboperationResult, ReplicateObjectVersionError>,
 }
 
@@ -635,8 +739,14 @@ impl ReplicateObjectVersionOperation {
             manifest: None,
             blob_replication_id: None,
             cleanup_reference_blob: None,
+            sync: None,
             result: Ok(ReplicationSuboperationResult::Replicated),
         }
+    }
+
+    fn with_sync(mut self, sync: SyncTransferContext) -> Self {
+        self.sync = Some(sync);
+        self
     }
 
     fn state_name(&self) -> &'static str {
@@ -1020,8 +1130,14 @@ impl ReplicateObjectVersionOperation {
                 });
 
         self.manifest = Some(VersionReplicationManifest {
-            bucket: self.request.bucket.clone(),
-            key: self.request.key.clone(),
+            bucket: self.sync.as_ref().map_or_else(
+                || self.request.bucket.clone(),
+                |sync| sync.target_bucket.clone(),
+            ),
+            key: self.sync.as_ref().map_or_else(
+                || self.request.key.clone(),
+                |sync| sync.target_prefix.clone().unwrap_or_default(),
+            ),
             version_id: self.request.version_id,
             group_id: self.request.source_group_id,
             kind,
@@ -1033,6 +1149,16 @@ impl ReplicateObjectVersionOperation {
             blob,
             source,
             multipart,
+            reference_intent: self.sync.as_ref().is_some_and(|sync| sync.reference_intent),
+            origin: self.sync.as_ref().and_then(|sync| sync.origin.clone()),
+            upstream_sources: self
+                .sync
+                .as_ref()
+                .map_or_else(Vec::new, |sync| sync.upstream_sources.clone()),
+            writer_auth_context: self
+                .sync
+                .as_ref()
+                .and_then(|sync| sync.writer_auth_context.clone()),
         });
         if let Some(manifest) = self.manifest.as_ref() {
             debug!(
@@ -1475,7 +1601,17 @@ impl Operation for ReplicateObjectVersionOperation {
                             target_node = %self.request.target_node_id,
                             "Target completed version apply"
                         );
-                        self.result = Ok(ReplicationSuboperationResult::Replicated);
+                        let replicated_bytes = if self.blob_replication_id.is_some() {
+                            self.manifest
+                                .as_ref()
+                                .and_then(|manifest| manifest.blob.as_ref())
+                                .map_or(0, |blob| blob.size)
+                        } else {
+                            0
+                        };
+                        self.result = Ok(ReplicationSuboperationResult::ReplicatedBytes(
+                            replicated_bytes,
+                        ));
                         self.cleanup_reference_blob_or_close()
                     }
                     Ok(VersionReplicationMessage::VersionApplyRejected(reason)) => {
@@ -1577,6 +1713,22 @@ mod tests {
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;
+
+    #[test]
+    fn maps_sync_prefix() {
+        assert_eq!(
+            super::map_sync_key("photos/2026/a.jpg", Some("photos/"), Some("archive/")),
+            Some("archive/2026/a.jpg".to_string())
+        );
+        assert_eq!(
+            super::map_sync_key("photos/a.jpg", Some("photos/"), None),
+            Some("a.jpg".to_string())
+        );
+        assert_eq!(
+            super::map_sync_key("other/a.jpg", Some("photos/"), Some("archive/")),
+            None
+        );
+    }
 
     fn test_realm_id() -> RealmId {
         RealmId::from_bytes([7u8; 32])
@@ -1805,6 +1957,22 @@ mod tests {
         assert_eq!(op.result.replicated, 0);
         assert_eq!(op.result.skipped, 0);
         assert_eq!(op.result.failed, 0);
+        assert_eq!(op.state, super::ReplicateScopeState::Finish);
+    }
+
+    #[test]
+    fn scope_counts_bytes() {
+        let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
+        op.state = super::ReplicateScopeState::RunVersionReplication;
+
+        op.step(Event::SubOperation(
+            SubOperationEvent::ReplicationItemResult {
+                result: Ok(ReplicationSuboperationResult::ReplicatedBytes(42)),
+            },
+        ));
+
+        assert_eq!(op.result.replicated, 1);
+        assert_eq!(op.result.replicated_bytes, 42);
         assert_eq!(op.state, super::ReplicateScopeState::Finish);
     }
 
@@ -2193,6 +2361,10 @@ mod tests {
             [Effect::Blob(BlobEffect::Delete {
                 location: temp_location
             })]
+        );
+        assert_eq!(
+            op.result,
+            Ok(ReplicationSuboperationResult::ReplicatedBytes(42))
         );
     }
 }

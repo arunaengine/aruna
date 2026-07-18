@@ -3,7 +3,7 @@ use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::{
-    AuthContext, BackendLocation, MultipartChecksumType, MultipartObjectPart,
+    ArunaArn, AuthContext, BackendLocation, MultipartChecksumType, MultipartObjectPart,
     MultipartObjectSummary, ReplicationItemKind, ReplicationNegotiationResult,
     VersionSourceBinding,
 };
@@ -28,6 +28,16 @@ pub struct VersionReplicationManifest {
     pub blob: Option<MaterializedBlobInfo>,
     pub source: Option<VersionSourceBinding>,
     pub multipart: Option<MultipartObjectReplicationMetadata>,
+    pub reference_intent: bool,
+    pub origin: Option<SyncOrigin>,
+    pub upstream_sources: Vec<ArunaArn>,
+    pub writer_auth_context: Option<AuthContext>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SyncOrigin {
+    pub relationship_id: Ulid,
+    pub hop_count: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -127,7 +137,38 @@ impl VersionReplicationMessage {
                     "invalid version replication message prefix".to_string(),
                 )
             })?;
-        Ok(postcard::from_bytes(payload)?)
+        match postcard::from_bytes(payload) {
+            Ok(message) => Ok(message),
+            Err(postcard::Error::DeserializeUnexpectedEnd) => {
+                let writer_none = postcard::to_allocvec(&Option::<AuthContext>::None)?;
+                let mut current = payload.to_vec();
+                current.extend_from_slice(&writer_none);
+                if let Ok(message) = postcard::from_bytes(&current) {
+                    return Ok(message);
+                }
+                let empty_sources = postcard::to_allocvec(&Vec::<ArunaArn>::new())?;
+                let mut origin_only = payload.to_vec();
+                origin_only.extend_from_slice(&empty_sources);
+                origin_only.extend_from_slice(&writer_none);
+                if let Ok(message) = postcard::from_bytes(&origin_only) {
+                    return Ok(message);
+                }
+                let mut previous = payload.to_vec();
+                previous.extend(postcard::to_allocvec(&Option::<SyncOrigin>::None)?);
+                previous.extend_from_slice(&empty_sources);
+                previous.extend_from_slice(&writer_none);
+                if let Ok(message) = postcard::from_bytes(&previous) {
+                    return Ok(message);
+                }
+                let mut legacy = payload.to_vec();
+                legacy.extend(postcard::to_allocvec(&false)?);
+                legacy.extend(postcard::to_allocvec(&Option::<SyncOrigin>::None)?);
+                legacy.extend_from_slice(&empty_sources);
+                legacy.extend_from_slice(&writer_none);
+                Ok(postcard::from_bytes(&legacy)?)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -151,16 +192,16 @@ pub struct VersionReplicationRequest {
 #[cfg(test)]
 mod tests {
     use super::{
-        MaterializedBlobInfo, MultipartObjectReplicationMetadata, VERSION_REPLICATION_MAGIC,
-        VersionReplicationManifest, VersionReplicationMessage,
+        MaterializedBlobInfo, MultipartObjectReplicationMetadata, SyncOrigin,
+        VERSION_REPLICATION_MAGIC, VersionReplicationManifest, VersionReplicationMessage,
     };
     use aruna_blob::hash::Hasher;
     use aruna_core::UserId;
     use aruna_core::errors::ConversionError;
     use aruna_core::structs::checksum::HASH_SHA256;
     use aruna_core::structs::{
-        AuthContext, MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary, RealmId,
-        ReplicationItemKind, VersionSourceBinding,
+        ArunaArn, AuthContext, MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary,
+        RealmId, ReplicationItemKind, VersionSourceBinding,
     };
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
@@ -229,12 +270,29 @@ mod tests {
             blob: None,
             source: None,
             multipart: None,
+            reference_intent: false,
+            origin: None,
+            upstream_sources: Vec::new(),
+            writer_auth_context: None,
         }
     }
 
     #[test]
     fn version_replication_messages_roundtrip_with_magic_prefix() {
-        let message = VersionReplicationMessage::VersionManifest(make_manifest());
+        let mut manifest = make_manifest();
+        manifest.origin = Some(SyncOrigin {
+            relationship_id: Ulid::from(7u128),
+            hop_count: 3,
+        });
+        manifest.upstream_sources.push(
+            ArunaArn::s3_bucket(
+                test_realm_id(),
+                iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
+                "source",
+            )
+            .unwrap(),
+        );
+        let message = VersionReplicationMessage::VersionManifest(manifest);
         let bytes = message.to_bytes().unwrap();
 
         assert_eq!(
@@ -252,6 +310,39 @@ mod tests {
         assert_eq!(
             VersionReplicationMessage::from_bytes(&bytes).unwrap_err(),
             ConversionError::FromStrError("invalid version replication message prefix".to_string())
+        );
+    }
+
+    #[test]
+    fn decodes_previous_manifest() {
+        let mut manifest = make_manifest();
+        manifest.reference_intent = true;
+        manifest.origin = Some(SyncOrigin {
+            relationship_id: Ulid::from(8u128),
+            hop_count: 2,
+        });
+        let mut bytes = VersionReplicationMessage::VersionManifest(manifest.clone())
+            .to_bytes()
+            .unwrap();
+        assert_eq!(bytes.pop(), Some(0));
+
+        let decoded = VersionReplicationMessage::from_bytes(&bytes).unwrap();
+
+        assert_eq!(
+            decoded,
+            VersionReplicationMessage::VersionManifest(manifest)
+        );
+
+        let mut intermediate = make_manifest();
+        intermediate.reference_intent = true;
+        let mut bytes = VersionReplicationMessage::VersionManifest(intermediate.clone())
+            .to_bytes()
+            .unwrap();
+        assert_eq!(bytes.pop(), Some(0));
+        assert_eq!(bytes.pop(), Some(0));
+        assert_eq!(
+            VersionReplicationMessage::from_bytes(&bytes).unwrap(),
+            VersionReplicationMessage::VersionManifest(intermediate)
         );
     }
 
@@ -309,5 +400,8 @@ mod tests {
                 .get(HASH_SHA256),
             Some(&composite_sha256)
         );
+        assert!(!decoded.reference_intent);
+        assert!(decoded.origin.is_none());
+        assert!(decoded.upstream_sources.is_empty());
     }
 }
