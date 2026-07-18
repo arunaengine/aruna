@@ -24,8 +24,8 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::constants::{
     DHT_KEY_COUNT_KEY, DHT_META_KEYSPACE, DHT_REVISION_KEY, DRIVER_IO_EVENT_CAPACITY,
-    DRIVER_TICK_INTERVAL, MAX_ENTRIES_PER_KEY, MAX_MESSAGE_SIZE, MAX_STORED_KEYS, RPC_TIMEOUT,
-    STORAGE_MUTATION_RETRIES, STORAGE_TIMEOUT,
+    DRIVER_TICK_INTERVAL, MAX_ENTRIES_PER_KEY, MAX_INBOUND_RPCS, MAX_MESSAGE_SIZE, MAX_STORED_KEYS,
+    RPC_TIMEOUT, STORAGE_MUTATION_RETRIES, STORAGE_TIMEOUT,
 };
 use super::kbucket::K;
 use super::protocol::{
@@ -153,7 +153,7 @@ pub struct DhtDriver {
     pending_callers: HashMap<OpId, oneshot::Sender<CallerOutcome>>,
     op_spans: HashMap<OpId, Span>,
     next_op_id: OpId,
-    inbound_contexts: HashMap<InboundId, SendStream>,
+    inbound_contexts: HashMap<InboundId, Option<SendStream>>,
     inbound_spans: HashMap<InboundId, Span>,
     next_inbound_id: InboundId,
 }
@@ -642,11 +642,17 @@ impl DhtDriver {
         fields(peer = %inbound.2)
     )]
     fn handle_inbound_stream(&mut self, inbound: InboundDhtStream) {
-        let (send, mut recv, peer) = inbound;
+        let (mut send, mut recv, peer) = inbound;
+        if self.inbound_contexts.len() >= MAX_INBOUND_RPCS {
+            warn!(peer = %peer, "Dropping inbound DHT stream: active RPC limit reached");
+            let _ = send.finish();
+            let _ = recv.stop(0u32.into());
+            return;
+        }
         let inbound_id = self.next_inbound_id;
         self.next_inbound_id = self.next_inbound_id.saturating_add(1);
 
-        self.inbound_contexts.insert(inbound_id, send);
+        self.inbound_contexts.insert(inbound_id, Some(send));
 
         let io_tx = self.io_tx.clone();
         tokio::spawn(async move {
@@ -739,7 +745,10 @@ impl DhtDriver {
         }
 
         if let DhtIo::InboundReadError { inbound_id, error } = io {
-            let maybe_send = self.inbound_contexts.remove(&inbound_id);
+            let maybe_send = self
+                .inbound_contexts
+                .get_mut(&inbound_id)
+                .and_then(Option::take);
             let io_tx = self.io_tx.clone();
             let span = self.inbound_spans.get(&inbound_id).cloned();
             let future = async move {
@@ -959,7 +968,10 @@ impl DhtDriver {
         fields(inbound_id, response = response_kind(&response))
     )]
     fn dispatch_rpc_response(&mut self, inbound_id: InboundId, response: DhtResponse) {
-        let maybe_send = self.inbound_contexts.remove(&inbound_id);
+        let maybe_send = self
+            .inbound_contexts
+            .get_mut(&inbound_id)
+            .and_then(Option::take);
         let io_tx = self.io_tx.clone();
         tokio::spawn(
             async move {

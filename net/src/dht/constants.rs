@@ -3,6 +3,7 @@ use std::time::Duration;
 pub const CMD_CHANNEL_CAPACITY: usize = 1024;
 pub const DRIVER_IO_EVENT_CAPACITY: usize = 2048;
 pub const INBOUND_STREAM_CAPACITY: usize = 256;
+pub const MAX_INBOUND_RPCS: usize = INBOUND_STREAM_CAPACITY;
 
 pub const LOOKUP_ALPHA: usize = 3;
 pub const LOOKUP_MAX_QUERIES: usize = 64;
