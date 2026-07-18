@@ -197,11 +197,19 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
             }
         }
         Effect::Search() => {
-            tracing::warn!("Search effect is not handled by driver yet");
+            tracing::warn!(
+                depth,
+                effect = effect_name,
+                "Search effect is not handled by driver yet"
+            );
             Event::Search()
         }
         Effect::Stream() => {
-            tracing::warn!("Top-level stream effect is not handled by driver yet");
+            tracing::warn!(
+                depth,
+                effect = effect_name,
+                "Top-level stream effect is not handled by driver yet"
+            );
             Event::Stream()
         }
     };

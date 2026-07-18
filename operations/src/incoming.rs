@@ -33,7 +33,7 @@ use aruna_core::id::NodeId;
 use aruna_core::structs::{
     ReplicationItemKind, WatchEvent, WatchEventDetail, WatchEventKind, data_watch_resource_path,
 };
-use aruna_core::task::TaskEvent;
+use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
@@ -373,7 +373,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                 }
                 Alpn::DocumentSync => {
                     let Some(net_handle) = self.context.net_handle.clone() else {
-                        warn!(node_id = %node_id, "Dropping inbound document sync stream without net handle");
+                        warn!(peer = %node_id, "Dropping inbound document sync stream without net handle");
                         return;
                     };
                     match net_handle.handle_document_sync_stream(stream, node_id).await {
@@ -390,7 +390,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                 }
                 Alpn::Metadata => {
                     let Some(metadata_handle) = self.context.metadata_handle.clone() else {
-                        warn!(node_id = %node_id, "Dropping inbound metadata stream without metadata handle");
+                        warn!(peer = %node_id, "Dropping inbound metadata stream without metadata handle");
                         return;
                     };
                     if let Err(err) = metadata_handle
@@ -426,7 +426,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                 }
                 Alpn::Dht => {
                     warn!(
-                        node_id = %node_id,
+                        peer = %node_id,
                         "Ignoring inbound stream for non-stream ALPN"
                     );
                 }
@@ -463,7 +463,7 @@ async fn reemit_evicted_documents(
     documents: Vec<DocumentSyncEvictedDocument>,
 ) {
     let Some(net_handle) = context.net_handle.as_ref() else {
-        warn!("Cannot re-emit evicted documents without net handle");
+        warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, "Cannot re-emit evicted documents without net handle");
         return;
     };
     let node_id = net_handle.node_id();
@@ -481,17 +481,17 @@ async fn reemit_evicted_documents(
         let effect = match write_outbox_effect(&record) {
             Ok(effect) => effect,
             Err(error) => {
-                warn!(error = %error, "Failed to encode re-emitted eviction outbox record");
+                warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, error = %error, "Failed to encode re-emitted eviction outbox record");
                 continue;
             }
         };
         match context.storage_handle.send_effect(effect).await {
             Event::Storage(StorageEvent::WriteResult { .. }) => written += 1,
             Event::Storage(StorageEvent::Error { error }) => {
-                warn!(error = %error, "Failed to write re-emitted eviction outbox record");
+                warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, error = %error, "Failed to write re-emitted eviction outbox record");
             }
             other => {
-                warn!(event = ?other, "Unexpected event writing re-emitted eviction outbox record");
+                warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, event = ?other, "Unexpected event writing re-emitted eviction outbox record");
             }
         }
     }
@@ -499,14 +499,14 @@ async fn reemit_evicted_documents(
         return;
     }
     let Some(task_handle) = context.task_handle.as_ref() else {
-        warn!("Cannot schedule outbox drain for re-emitted evictions without task handle");
+        warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, "Cannot schedule outbox drain for re-emitted evictions without task handle");
         return;
     };
     if let Event::Task(TaskEvent::Error { message, .. }) = task_handle
         .send_effect(schedule_outbox_drain_effect())
         .await
     {
-        warn!(message = %message, "Failed to schedule outbox drain after re-emitting evictions");
+        warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, message = %message, "Failed to schedule outbox drain after re-emitting evictions");
     }
     info!(
         count = written,
@@ -561,7 +561,7 @@ async fn schedule_projection_retry(context: &DriverContext) {
     if let Err(error) =
         schedule_pending_metadata_projection_drain(context, METADATA_PROJECTION_RETRY_AFTER).await
     {
-        warn!(error = ?error, "Failed to schedule metadata projection retry");
+        warn!(task_id = ?TaskKey::DrainMetadataProjectionQueue, error = ?error, "Failed to schedule metadata projection retry");
     }
 }
 

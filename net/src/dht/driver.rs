@@ -219,7 +219,7 @@ impl DhtDriver {
 
     #[tracing::instrument(
         name = "dht.driver.process_input",
-        level = "debug",
+        level = "trace",
         skip(self),
         fields(input = dht_input_kind(&input))
     )]
@@ -233,7 +233,7 @@ impl DhtDriver {
 
     #[tracing::instrument(
         name = "dht.driver.process_input_for_op",
-        level = "debug",
+        level = "trace",
         skip(self),
         fields(op_id, input = dht_input_kind(&input))
     )]
