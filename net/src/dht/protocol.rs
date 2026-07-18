@@ -186,7 +186,6 @@ pub enum DhtIoRequest {
         stage: StorageStage,
         key: DhtKeyId,
         entry: StoredEntry,
-        now_secs: u64,
     },
     StorageDelete {
         op_id: OpId,

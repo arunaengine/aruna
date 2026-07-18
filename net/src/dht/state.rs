@@ -1929,7 +1929,6 @@ impl DhtStateMachine {
             stage,
             key,
             entry,
-            now_secs: self.now_secs,
         })));
     }
 

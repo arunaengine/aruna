@@ -830,8 +830,7 @@ impl DhtDriver {
                 stage,
                 key,
                 entry,
-                now_secs,
-            } => self.dispatch_storage_merge(op_id, stage, key, entry, now_secs),
+            } => self.dispatch_storage_merge(op_id, stage, key, entry),
             DhtIoRequest::StorageDelete { op_id, stage, key } => {
                 self.dispatch_storage_delete(op_id, stage, key)
             }
@@ -1225,13 +1224,12 @@ impl DhtDriver {
         stage: StorageStage,
         key: DhtKeyId,
         entry: StoredEntry,
-        now_secs: u64,
     ) {
         let storage = self.storage.clone();
         let io_tx = self.io_tx.clone();
         tokio::spawn(
             async move {
-                let mutation = StorageMutation::Merge { entry, now_secs };
+                let mutation = StorageMutation::Merge { entry };
                 match mutate_storage_entries(&storage, op_id, stage, key, &mutation).await {
                     Ok(()) => {
                         let _ = io_tx.send(DhtIo::StorageWriteResult { op_id, stage }).await;
@@ -1453,7 +1451,7 @@ impl DhtDriver {
 }
 
 enum StorageMutation {
-    Merge { entry: StoredEntry, now_secs: u64 },
+    Merge { entry: StoredEntry },
     Prune { now_secs: u64 },
 }
 
@@ -1636,8 +1634,9 @@ async fn run_storage_txn(
     };
     let original_entries = entries;
     let entries = match mutation {
-        StorageMutation::Merge { entry, now_secs } => {
-            match merge_entry(&key, original_entries.clone(), entry.clone(), *now_secs) {
+        StorageMutation::Merge { entry } => {
+            let now_secs = now_unix_secs();
+            match merge_entry(&key, original_entries.clone(), entry.clone(), now_secs) {
                 Ok(entries) => entries,
                 Err(MergeError::Stale) => {
                     abort_storage_txn(storage, op_id, stage, txn_id).await;
@@ -2512,7 +2511,7 @@ mod tests {
     async fn replay_skips_write() {
         let (storage, receiver) = StorageHandle::new();
         let key = DhtKeyId::from_data(b"unchanged-replay");
-        let entry = make_entry(1, key, 200);
+        let entry = make_entry(1, key, now_unix_secs().saturating_add(200));
         let encoded = encode_entries(std::slice::from_ref(&entry)).expect("encode entry");
         let txn_id = TxnId::new();
         let worker = std::thread::spawn(move || {
@@ -2544,10 +2543,7 @@ mod tests {
             response.send(StorageEvent::TransactionAborted { txn_id });
         });
 
-        let mutation = StorageMutation::Merge {
-            entry,
-            now_secs: 100,
-        };
+        let mutation = StorageMutation::Merge { entry };
         mutate_storage_entries(
             &storage,
             6,
@@ -2679,8 +2675,7 @@ mod tests {
 
         let key = DhtKeyId::from_data(b"full-keyspace");
         let mutation = StorageMutation::Merge {
-            entry: make_entry(1, key, 200),
-            now_secs: 100,
+            entry: make_entry(1, key, now_unix_secs().saturating_add(200)),
         };
         assert!(matches!(
             mutate_storage_entries(&storage, 12, StorageStage::InboundPutMerge, key, &mutation,)
@@ -2705,13 +2700,12 @@ mod tests {
     async fn concurrent_merges_preserve() {
         let (_directory, storage) = open_storage();
         let key = DhtKeyId::from_data(b"concurrent-merges");
+        let expires_at = now_unix_secs().saturating_add(200);
         let first = StorageMutation::Merge {
-            entry: make_entry(1, key, 200),
-            now_secs: 100,
+            entry: make_entry(1, key, expires_at),
         };
         let second = StorageMutation::Merge {
-            entry: make_entry(2, key, 200),
-            now_secs: 100,
+            entry: make_entry(2, key, expires_at),
         };
 
         let (first_result, second_result) = tokio::join!(
@@ -2729,18 +2723,19 @@ mod tests {
     async fn cleanup_preserves_fresh() {
         let (_directory, storage) = open_storage();
         let key = DhtKeyId::from_data(b"cleanup-race");
+        let now_secs = now_unix_secs();
         let old = StorageMutation::Merge {
-            entry: make_entry(1, key, 50),
-            now_secs: 0,
+            entry: make_entry(1, key, now_secs.saturating_add(50)),
         };
         mutate_storage_entries(&storage, 3, StorageStage::InboundPutMerge, key, &old)
             .await
             .expect("store old entry");
 
-        let prune = StorageMutation::Prune { now_secs: 400 };
+        let prune = StorageMutation::Prune {
+            now_secs: now_secs.saturating_add(400),
+        };
         let merge = StorageMutation::Merge {
-            entry: make_entry(2, key, 500),
-            now_secs: 400,
+            entry: make_entry(2, key, now_secs.saturating_add(500)),
         };
         let (prune_result, merge_result) = tokio::join!(
             mutate_storage_entries(&storage, 3, StorageStage::CleanupPrune, key, &prune),
@@ -2774,8 +2769,7 @@ mod tests {
         ));
 
         let mutation = StorageMutation::Merge {
-            entry: make_entry(1, key, 200),
-            now_secs: 100,
+            entry: make_entry(1, key, now_unix_secs().saturating_add(200)),
         };
         assert!(
             mutate_storage_entries(&storage, 5, StorageStage::InboundPutMerge, key, &mutation,)
@@ -2793,6 +2787,33 @@ mod tests {
         assert!(matches!(
             event,
             Event::Storage(StorageEvent::ReadResult { value: Some(value), .. }) if value == corrupt
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_merge_rejected() {
+        let (_directory, storage) = open_storage();
+        let key = DhtKeyId::from_data(b"stale-merge");
+        let mutation = StorageMutation::Merge {
+            entry: make_entry(1, key, now_unix_secs()),
+        };
+
+        assert!(matches!(
+            mutate_storage_entries(&storage, 6, StorageStage::InboundPutMerge, key, &mutation)
+                .await,
+            Err(DhtIoError::InvalidRequest(_))
+        ));
+
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: DHT_KEYSPACE.to_string(),
+                key: ByteView::from(key.as_bytes().as_slice()),
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::ReadResult { value: None, .. })
         ));
     }
 }
