@@ -11,7 +11,11 @@ use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_REPLICATION_JOB_KEYSPACE,
+    BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+    BLOB_REPLICATION_JOB_KEYSPACE, BLOB_VERSIONS_KEYSPACE, USAGE_STATS_KEYSPACE,
+};
+use aruna_core::structs::{
+    BlobVersion, BlobVersionState, SourceConnectorKind, StagingStrategy, UsageCounters, VersionKey,
 };
 use aruna_operations::driver::DriverContext;
 use aws_sdk_s3::Client as S3Client;
@@ -29,6 +33,7 @@ use shared::{
     spawn_full_seed_node, wait_for_group_via_http, wait_for_realm_nodes, wait_until,
 };
 use std::time::Duration;
+use ulid::Ulid;
 
 fn error_code<T, E>(result: &Result<T, aws_sdk_s3::error::SdkError<E>>) -> Option<String>
 where
@@ -687,6 +692,227 @@ async fn once_syncs_prefix() -> TestResult<()> {
                 Duration::from_millis(200),
             )
             .await?;
+        Ok(())
+    }
+    .await;
+
+    harness.shutdown().await;
+    result
+}
+
+#[tokio::test]
+async fn reference_syncs_lazily() -> TestResult<()> {
+    async fn read_value(
+        context: &DriverContext,
+        keyspace: &str,
+        key: Vec<u8>,
+    ) -> TestResult<Option<Vec<u8>>> {
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: keyspace.to_string(),
+                key: key.into(),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                Ok(value.map(|value| value.as_ref().to_vec()))
+            }
+            event => Err(std::io::Error::other(format!(
+                "unexpected storage read event: {event:?}"
+            ))
+            .into()),
+        }
+    }
+
+    async fn read_usage(context: &DriverContext) -> TestResult<UsageCounters> {
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: USAGE_STATS_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 4096,
+                txn_id: None,
+            })
+            .await
+        else {
+            return Err(std::io::Error::other("unexpected usage iteration event").into());
+        };
+        let mut usage = UsageCounters::default();
+        for (key, value) in values {
+            if key.as_ref().starts_with(b"global/") {
+                usage.add(&UsageCounters::from_bytes(value.as_ref())?)?;
+            }
+        }
+        Ok(usage)
+    }
+
+    let harness = ReplicationHarness::new("reference-sync-group").await?;
+
+    let result = async {
+        let source_bucket = "reference-sync-source";
+        let target_bucket = "reference-sync-target";
+        let key = "archive/large-object.bin";
+        let body = vec![0x5au8; 512 * 1024];
+
+        harness
+            .create_bucket_pair(source_bucket, target_bucket)
+            .await?;
+        let initial_usage = read_usage(harness.joiner.context.as_ref()).await?;
+        assert_eq!(initial_usage.stored_blobs, 0);
+        assert_eq!(initial_usage.stored_bytes, 0);
+        assert_eq!(initial_usage.logical_bytes, 0);
+
+        let put_output = harness
+            .seed_client
+            .put_object()
+            .bucket(source_bucket)
+            .key(key)
+            .body(ByteStream::from(body.clone()))
+            .send()
+            .await?;
+        let source_version_id = put_output
+            .version_id()
+            .ok_or_else(|| std::io::Error::other("source put did not return version id"))?
+            .parse::<Ulid>()?;
+        let source_version = read_value(
+            harness.seed.context.as_ref(),
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new(source_bucket, key, source_version_id).to_bytes()?,
+        )
+        .await?
+        .ok_or_else(|| std::io::Error::other("missing source version record"))?;
+        let source_hash = BlobVersion::from_bytes(&source_version)?
+            .blob_hash()
+            .copied()
+            .ok_or_else(|| std::io::Error::other("source version is not materialized"))?;
+
+        let relationship = harness
+            .post_sync(
+                &harness.seed.base_url,
+                &harness.seed_token,
+                CreateSyncRequest {
+                    source: SyncSourceRequest {
+                        bucket: source_bucket.to_string(),
+                        prefix: None,
+                    },
+                    target: SyncTargetRequest {
+                        node_id: harness.joiner.config.node_id.to_string(),
+                        bucket: target_bucket.to_string(),
+                        prefix: None,
+                    },
+                    mode: ApiSyncMode::Reference,
+                    replicate_deletes: true,
+                },
+            )
+            .await?;
+        assert_eq!(relationship.mode, ApiSyncMode::Reference);
+
+        harness.wait_for_object(target_bucket, key).await?;
+        let target_version = read_value(
+            harness.joiner.context.as_ref(),
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new(target_bucket, key, source_version_id).to_bytes()?,
+        )
+        .await?
+        .ok_or_else(|| std::io::Error::other("missing target reference version"))?;
+        let target_version = BlobVersion::from_bytes(&target_version)?;
+        let BlobVersionState::Reference { source, .. } = &target_version.state else {
+            return Err(std::io::Error::other("target version is not a reference").into());
+        };
+        assert_eq!(source.strategy, StagingStrategy::Reference);
+        assert_eq!(source.connector_id, None);
+        assert_eq!(source.descriptor.kind, SourceConnectorKind::ArunaNative);
+        assert_eq!(
+            source.descriptor.origin_node_id,
+            Some(harness.seed.net.node_id())
+        );
+        assert_eq!(
+            source.descriptor.source_path,
+            format!("{source_bucket}/{key}")
+        );
+        assert!(
+            read_value(
+                harness.joiner.context.as_ref(),
+                BLOB_LOCATIONS_KEYSPACE,
+                source_hash.to_vec(),
+            )
+            .await?
+            .is_none()
+        );
+
+        harness
+            .assert_object_matches(target_bucket, key, &body)
+            .await?;
+        assert!(
+            read_value(
+                harness.joiner.context.as_ref(),
+                BLOB_LOCATIONS_KEYSPACE,
+                source_hash.to_vec(),
+            )
+            .await?
+            .is_none()
+        );
+        let reference_usage = read_usage(harness.joiner.context.as_ref()).await?;
+        assert_eq!(reference_usage.stored_blobs, 0);
+        assert_eq!(reference_usage.stored_bytes, 0);
+        assert!(reference_usage.logical_bytes > 0);
+        assert!(reference_usage.logical_bytes < body.len() as u64);
+
+        let delete_output = harness
+            .seed_client
+            .delete_object()
+            .bucket(source_bucket)
+            .key(key)
+            .send()
+            .await?;
+        assert_eq!(delete_output.delete_marker(), Some(true));
+        let delete_version_id = delete_output
+            .version_id()
+            .ok_or_else(|| std::io::Error::other("source delete did not return version id"))?
+            .parse::<Ulid>()?;
+        wait_until(
+            "reference delete marker",
+            Duration::from_secs(20),
+            Duration::from_millis(200),
+            || {
+                let context = harness.joiner.context.clone();
+                async move {
+                    read_value(
+                        context.as_ref(),
+                        BLOB_VERSIONS_KEYSPACE,
+                        VersionKey::new(target_bucket, key, delete_version_id)
+                            .to_bytes()
+                            .unwrap(),
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|bytes| BlobVersion::from_bytes(&bytes).ok())
+                    .is_some_and(|version| version.is_deleted())
+                }
+            },
+        )
+        .await?;
+
+        let target_head = harness
+            .joiner_client
+            .head_object()
+            .bucket(target_bucket)
+            .key(key)
+            .send()
+            .await;
+        assert!(target_head.is_err());
+        let delete_version = read_value(
+            harness.joiner.context.as_ref(),
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new(target_bucket, key, delete_version_id).to_bytes()?,
+        )
+        .await?
+        .ok_or_else(|| std::io::Error::other("missing target delete marker"))?;
+        assert!(BlobVersion::from_bytes(&delete_version)?.is_deleted());
         Ok(())
     }
     .await;
