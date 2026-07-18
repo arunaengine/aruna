@@ -1349,6 +1349,12 @@ enum TransactionFailure {
     Failed(DhtIoError),
 }
 
+struct ReclaimRow {
+    index: DeadlineIndex,
+    entry: DeadlineEntry,
+    entries: Vec<StoredEntry>,
+}
+
 async fn start_storage_txn(
     storage: &StorageHandle,
     op_id: OpId,
@@ -1635,6 +1641,159 @@ async fn iter_deadlines(
     }
 }
 
+async fn delete_deadline(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    txn_id: TxnId,
+    index: DeadlineIndex,
+    entry: DeadlineEntry,
+) -> Result<(), TransactionFailure> {
+    apply_batch_delete(
+        storage,
+        op_id,
+        stage,
+        txn_id,
+        vec![(
+            DHT_META_KEYSPACE.to_string(),
+            ByteView::from(deadline_key(index, entry)),
+        )],
+    )
+    .await
+}
+
+async fn find_reclaimable(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    txn_id: TxnId,
+    now_secs: u64,
+) -> Result<Option<ReclaimRow>, TransactionFailure> {
+    let mut remaining = CLEANUP_PAGE_SIZE;
+    for index in [DeadlineIndex::Floor, DeadlineIndex::Active] {
+        loop {
+            if remaining == 0 {
+                return Ok(None);
+            }
+            let Some(entry) = iter_deadlines(storage, op_id, stage, index, 1, Some(txn_id))
+                .await?
+                .into_iter()
+                .next()
+            else {
+                break;
+            };
+            if entry.deadline > now_secs {
+                break;
+            }
+            remaining -= 1;
+
+            let read = Effect::Storage(StorageEffect::Read {
+                key_space: DHT_KEYSPACE.to_string(),
+                key: ByteView::from(entry.key.as_bytes().as_slice()),
+                txn_id: Some(txn_id),
+            });
+            let value =
+                match send_storage_effect_with_timeout(storage, read, op_id, stage, "reclaim_read")
+                    .await
+                {
+                    Ok(Event::Storage(StorageEvent::ReadResult { value, .. })) => value,
+                    Ok(Event::Storage(StorageEvent::Error { error })) => {
+                        return Err(storage_transaction_error(error));
+                    }
+                    Ok(other) => {
+                        return Err(TransactionFailure::Failed(DhtIoError::storage(format!(
+                            "unexpected reclaim read event: {other:?}"
+                        ))));
+                    }
+                    Err(error) => return Err(TransactionFailure::Failed(error)),
+                };
+            let Some(value) = value else {
+                delete_deadline(storage, op_id, stage, txn_id, index, entry).await?;
+                continue;
+            };
+            let entries = match decode_entries(&value) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    warn!(key = %entry.key, error = %error, "Preserving corrupt DHT row during capacity reclaim");
+                    delete_deadline(storage, op_id, stage, txn_id, index, entry).await?;
+                    continue;
+                }
+            };
+            if let Err(error) = validate_entries(&entry.key, &entries, now_secs) {
+                warn!(key = %entry.key, error = %error, "Preserving invalid DHT row during capacity reclaim");
+                delete_deadline(storage, op_id, stage, txn_id, index, entry).await?;
+                continue;
+            }
+            let Some((current_index, current_entry)) = row_deadline(entry.key, &entries, now_secs)
+            else {
+                return Ok(Some(ReclaimRow {
+                    index,
+                    entry,
+                    entries,
+                }));
+            };
+            if current_index == DeadlineIndex::Floor && current_entry.deadline <= now_secs {
+                return Ok(Some(ReclaimRow {
+                    index,
+                    entry,
+                    entries,
+                }));
+            }
+            delete_deadline(storage, op_id, stage, txn_id, index, entry).await?;
+            apply_batch_write(
+                storage,
+                op_id,
+                stage,
+                txn_id,
+                vec![(
+                    DHT_META_KEYSPACE.to_string(),
+                    ByteView::from(deadline_key(current_index, current_entry)),
+                    ByteView::from(Vec::new()),
+                )],
+            )
+            .await?;
+        }
+    }
+    Ok(None)
+}
+
+async fn reserve_key_slot(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    txn_id: TxnId,
+    index: DeadlineIndex,
+    now_secs: u64,
+) -> Result<Option<ReclaimRow>, TransactionFailure> {
+    let count = read_key_count(storage, op_id, stage, txn_id).await?;
+    if count < MAX_STORED_KEYS {
+        write_counter(
+            storage,
+            op_id,
+            stage,
+            txn_id,
+            DHT_KEY_COUNT_KEY,
+            count + 1,
+            "count_write",
+        )
+        .await?;
+        return Ok(None);
+    }
+    if count > MAX_STORED_KEYS {
+        return Err(TransactionFailure::Failed(DhtIoError::storage(
+            "DHT key-count metadata exceeds its limit",
+        )));
+    }
+    if index == DeadlineIndex::Floor {
+        return Err(TransactionFailure::Failed(DhtIoError::StorageFull));
+    }
+
+    find_reclaimable(storage, op_id, stage, txn_id, now_secs)
+        .await?
+        .ok_or(TransactionFailure::Failed(DhtIoError::StorageFull))
+        .map(Some)
+}
+
 async fn run_storage_txn(
     storage: &StorageHandle,
     op_id: OpId,
@@ -1756,28 +1915,19 @@ async fn run_storage_txn(
             delete_keys.push(deadline_key(DeadlineIndex::Floor, entry));
         }
     }
-    delete_keys.sort_unstable();
-    delete_keys.dedup();
-
-    let mut deletes = delete_keys
-        .into_iter()
-        .map(|key| (DHT_META_KEYSPACE.to_string(), ByteView::from(key)))
-        .collect::<Vec<_>>();
-    if had_value && entries.is_empty() && !preserve_row {
-        deletes.push((
-            DHT_KEYSPACE.to_string(),
-            ByteView::from(key.as_bytes().as_slice()),
-        ));
-    }
-
     let mut writes = Vec::with_capacity(2);
-    if !entries.is_empty() {
+    let deadline = if entries.is_empty() {
+        None
+    } else {
         let Some((index, entry)) = row_deadline(key, &entries, now_secs) else {
             abort_storage_txn(storage, op_id, stage, txn_id).await;
             return Err(TransactionFailure::Failed(DhtIoError::storage(
                 "DHT row has no retention deadline",
             )));
         };
+        Some((index, entry))
+    };
+    if let Some((index, entry)) = deadline {
         writes.push((
             DHT_META_KEYSPACE.to_string(),
             ByteView::from(deadline_key(index, entry)),
@@ -1799,16 +1949,53 @@ async fn run_storage_txn(
         }
     }
 
-    let count_result = if !had_value && !entries.is_empty() {
-        update_key_count(storage, op_id, stage, txn_id, true).await
-    } else if had_value && entries.is_empty() && !preserve_row {
-        update_key_count(storage, op_id, stage, txn_id, false).await
+    let reclaimed = if let (false, Some((index, _))) = (had_value, deadline) {
+        match reserve_key_slot(storage, op_id, stage, txn_id, index, now_secs).await {
+            Ok(reclaimed) => reclaimed,
+            Err(error) => {
+                abort_storage_txn(storage, op_id, stage, txn_id).await;
+                return Err(error);
+            }
+        }
     } else {
-        Ok(())
+        None
     };
-    if let Err(error) = count_result {
+    if had_value
+        && entries.is_empty()
+        && !preserve_row
+        && let Err(error) = decrement_key_count(storage, op_id, stage, txn_id).await
+    {
         abort_storage_txn(storage, op_id, stage, txn_id).await;
         return Err(error);
+    }
+
+    if let Some(victim) = &reclaimed {
+        delete_keys.push(deadline_key(victim.index, victim.entry));
+        if let Some(entry) = active_deadline(victim.entry.key, &victim.entries) {
+            delete_keys.push(deadline_key(DeadlineIndex::Active, entry));
+        }
+        if let Some(entry) = floor_deadline(victim.entry.key, &victim.entries) {
+            delete_keys.push(deadline_key(DeadlineIndex::Floor, entry));
+        }
+    }
+    delete_keys.sort_unstable();
+    delete_keys.dedup();
+
+    let mut deletes = delete_keys
+        .into_iter()
+        .map(|key| (DHT_META_KEYSPACE.to_string(), ByteView::from(key)))
+        .collect::<Vec<_>>();
+    if had_value && entries.is_empty() && !preserve_row {
+        deletes.push((
+            DHT_KEYSPACE.to_string(),
+            ByteView::from(key.as_bytes().as_slice()),
+        ));
+    }
+    if let Some(victim) = reclaimed {
+        deletes.push((
+            DHT_KEYSPACE.to_string(),
+            ByteView::from(victim.entry.key.as_bytes().as_slice()),
+        ));
     }
 
     if let Err(error) = apply_batch_delete(storage, op_id, stage, txn_id, deletes).await {
@@ -1882,41 +2069,37 @@ fn merge_storage_entries(
     })
 }
 
-async fn update_key_count(
+async fn read_key_count(
     storage: &StorageHandle,
     op_id: OpId,
     stage: StorageStage,
     txn_id: TxnId,
-    increment: bool,
-) -> Result<(), TransactionFailure> {
+) -> Result<u64, TransactionFailure> {
     let read = Effect::Storage(StorageEffect::Read {
         key_space: DHT_META_KEYSPACE.to_string(),
         key: ByteView::from(DHT_KEY_COUNT_KEY),
         txn_id: Some(txn_id),
     });
-    let count =
-        match send_storage_effect_with_timeout(storage, read, op_id, stage, "count_read").await {
-            Ok(Event::Storage(StorageEvent::ReadResult { value, .. })) => decode_counter(value)?,
-            Ok(Event::Storage(StorageEvent::Error { error })) => {
-                return Err(storage_transaction_error(error));
-            }
-            Ok(other) => {
-                return Err(TransactionFailure::Failed(DhtIoError::storage(format!(
-                    "unexpected DHT key-count read event: {other:?}"
-                ))));
-            }
-            Err(error) => return Err(TransactionFailure::Failed(error)),
-        };
-    let next = if increment {
-        if count >= MAX_STORED_KEYS {
-            return Err(TransactionFailure::Failed(DhtIoError::StorageFull));
-        }
-        count + 1
-    } else {
-        count.checked_sub(1).ok_or_else(|| {
-            TransactionFailure::Failed(DhtIoError::storage("DHT key-count metadata is invalid"))
-        })?
-    };
+    match send_storage_effect_with_timeout(storage, read, op_id, stage, "count_read").await {
+        Ok(Event::Storage(StorageEvent::ReadResult { value, .. })) => decode_counter(value),
+        Ok(Event::Storage(StorageEvent::Error { error })) => Err(storage_transaction_error(error)),
+        Ok(other) => Err(TransactionFailure::Failed(DhtIoError::storage(format!(
+            "unexpected DHT key-count read event: {other:?}"
+        )))),
+        Err(error) => Err(TransactionFailure::Failed(error)),
+    }
+}
+
+async fn decrement_key_count(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    txn_id: TxnId,
+) -> Result<(), TransactionFailure> {
+    let count = read_key_count(storage, op_id, stage, txn_id).await?;
+    let next = count.checked_sub(1).ok_or_else(|| {
+        TransactionFailure::Failed(DhtIoError::storage("DHT key-count metadata is invalid"))
+    })?;
     write_counter(
         storage,
         op_id,
@@ -2767,6 +2950,85 @@ mod tests {
         }
     }
 
+    async fn write_count(storage: &StorageHandle, count: u64) {
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: DHT_META_KEYSPACE.to_string(),
+                key: ByteView::from(DHT_KEY_COUNT_KEY),
+                value: ByteView::from(count.to_le_bytes().as_slice()),
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    async fn row_exists(storage: &StorageHandle, key: DhtKeyId) -> bool {
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: DHT_KEYSPACE.to_string(),
+                key: ByteView::from(key.as_bytes().as_slice()),
+                txn_id: None,
+            }))
+            .await;
+        matches!(
+            event,
+            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. })
+        )
+    }
+
+    async fn write_indexed_row(
+        storage: &StorageHandle,
+        index: DeadlineIndex,
+        entry: DeadlineEntry,
+        value: Vec<u8>,
+    ) {
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::BatchWrite {
+                writes: vec![
+                    (
+                        DHT_KEYSPACE.to_string(),
+                        ByteView::from(entry.key.as_bytes().as_slice()),
+                        ByteView::from(value),
+                    ),
+                    (
+                        DHT_META_KEYSPACE.to_string(),
+                        ByteView::from(deadline_key(index, entry)),
+                        ByteView::from(Vec::new()),
+                    ),
+                ],
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+    }
+
+    async fn store_due_floor(
+        storage: &StorageHandle,
+        key: DhtKeyId,
+        seed: u8,
+        expires_at: u64,
+    ) -> DeadlineEntry {
+        let entry = make_entry(seed, key, expires_at);
+        let deadline = DeadlineEntry {
+            deadline: entry.retain_until,
+            key,
+        };
+        write_indexed_row(
+            storage,
+            DeadlineIndex::Floor,
+            deadline,
+            encode_entries(std::slice::from_ref(&entry)).unwrap(),
+        )
+        .await;
+        deadline
+    }
+
     #[tokio::test]
     async fn ready_lanes_rotate() {
         let (cmd_tx, mut cmd_rx) = mpsc::bounded_blocking_async(4);
@@ -2944,6 +3206,250 @@ mod tests {
             event,
             Event::Storage(StorageEvent::ReadResult { value: None, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn capacity_retained_floor() {
+        let (_directory, storage) = open_storage();
+        let now_secs = now_unix_secs();
+        let victim = DhtKeyId::from_data(b"floor-victim");
+        let target = DhtKeyId::from_data(b"floor-replacement");
+        let retained = StorageMutation::Merge {
+            entries: vec![make_entry(1, victim, now_secs.saturating_sub(1))],
+        };
+        mutate_storage_entries(
+            &storage,
+            30,
+            StorageStage::InboundPutMerge,
+            victim,
+            &retained,
+        )
+        .await
+        .expect("store retained floor");
+        write_count(&storage, MAX_STORED_KEYS).await;
+        let mutation = StorageMutation::Merge {
+            entries: vec![make_entry(2, target, now_secs.saturating_add(200))],
+        };
+
+        assert!(matches!(
+            mutate_storage_entries(
+                &storage,
+                32,
+                StorageStage::InboundPutMerge,
+                target,
+                &mutation,
+            )
+            .await,
+            Err(DhtIoError::StorageFull)
+        ));
+
+        assert!(row_exists(&storage, victim).await);
+        assert!(!row_exists(&storage, target).await);
+        assert_eq!(read_count(&storage).await, MAX_STORED_KEYS);
+        assert_eq!(
+            index_entries(&storage, DeadlineIndex::Floor)
+                .await
+                .into_iter()
+                .map(|entry| entry.key)
+                .collect::<Vec<_>>(),
+            vec![victim]
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_expired_row() {
+        let (_directory, storage) = open_storage();
+        let now_secs = now_unix_secs();
+        let victim = DhtKeyId::from_data(b"expired-active");
+        let target = DhtKeyId::from_data(b"expired-replacement");
+        let entry = make_entry(1, victim, now_secs);
+        let deadline = DeadlineEntry {
+            deadline: now_secs,
+            key: victim,
+        };
+        write_indexed_row(
+            &storage,
+            DeadlineIndex::Active,
+            deadline,
+            encode_entries(std::slice::from_ref(&entry)).unwrap(),
+        )
+        .await;
+        write_count(&storage, MAX_STORED_KEYS).await;
+        let mutation = StorageMutation::Merge {
+            entries: vec![make_entry(2, target, now_secs.saturating_add(200))],
+        };
+
+        mutate_storage_entries(
+            &storage,
+            33,
+            StorageStage::InboundPutMerge,
+            target,
+            &mutation,
+        )
+        .await
+        .expect("replace overdue active row");
+
+        assert!(!row_exists(&storage, victim).await);
+        assert!(row_exists(&storage, target).await);
+        assert_eq!(read_count(&storage).await, MAX_STORED_KEYS);
+    }
+
+    #[tokio::test]
+    async fn capacity_unsafe_rows() {
+        // Capacity reclaim skips corrupt, invalid, and live rows before choosing a safe victim.
+        let (_directory, storage) = open_storage();
+        let now_secs = now_unix_secs();
+        let corrupt = DhtKeyId::from_data(b"corrupt-victim");
+        let invalid_key = DhtKeyId::from_data(b"invalid-victim");
+        let victim = DhtKeyId::from_data(b"live-victim");
+        let floor_victim = DhtKeyId::from_data(b"later-floor-victim");
+        let target = DhtKeyId::from_data(b"safe-replacement");
+        let _ = store_due_floor(&storage, floor_victim, 2, now_secs.saturating_sub(1)).await;
+        let expires_at = now_secs.saturating_add(200);
+        let entry = make_entry(1, victim, expires_at);
+        let mut invalid = make_entry(4, invalid_key, expires_at);
+        invalid.revision = 0;
+        write_indexed_row(
+            &storage,
+            DeadlineIndex::Floor,
+            DeadlineEntry {
+                deadline: now_secs.saturating_sub(3),
+                key: corrupt,
+            },
+            b"not-postcard".to_vec(),
+        )
+        .await;
+        write_indexed_row(
+            &storage,
+            DeadlineIndex::Floor,
+            DeadlineEntry {
+                deadline: now_secs.saturating_sub(3),
+                key: invalid_key,
+            },
+            encode_entries(std::slice::from_ref(&invalid)).unwrap(),
+        )
+        .await;
+        write_indexed_row(
+            &storage,
+            DeadlineIndex::Floor,
+            DeadlineEntry {
+                deadline: now_secs.saturating_sub(2),
+                key: victim,
+            },
+            encode_entries(std::slice::from_ref(&entry)).unwrap(),
+        )
+        .await;
+        write_count(&storage, MAX_STORED_KEYS).await;
+        let mutation = StorageMutation::Merge {
+            entries: vec![make_entry(3, target, now_secs.saturating_add(300))],
+        };
+
+        mutate_storage_entries(
+            &storage,
+            35,
+            StorageStage::InboundPutMerge,
+            target,
+            &mutation,
+        )
+        .await
+        .expect("replace expired floor row");
+
+        assert!(row_exists(&storage, corrupt).await);
+        assert!(row_exists(&storage, invalid_key).await);
+        assert!(row_exists(&storage, victim).await);
+        assert!(!row_exists(&storage, floor_victim).await);
+        assert!(row_exists(&storage, target).await);
+        assert_eq!(read_count(&storage).await, MAX_STORED_KEYS);
+        assert!(
+            index_entries(&storage, DeadlineIndex::Floor)
+                .await
+                .is_empty()
+        );
+        let active = index_entries(&storage, DeadlineIndex::Active).await;
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().any(|entry| entry.key == victim));
+        assert!(active.iter().any(|entry| entry.key == target));
+    }
+
+    #[tokio::test]
+    async fn capacity_floor_admission() {
+        let (_directory, storage) = open_storage();
+        let now_secs = now_unix_secs();
+        let victim = DhtKeyId::from_data(b"retained-floor");
+        let target = DhtKeyId::from_data(b"new-floor");
+        let _ = store_due_floor(&storage, victim, 1, now_secs.saturating_sub(2)).await;
+        write_count(&storage, MAX_STORED_KEYS).await;
+        let mutation = StorageMutation::Merge {
+            entries: vec![make_entry(2, target, now_secs.saturating_sub(1))],
+        };
+
+        assert!(matches!(
+            mutate_storage_entries(
+                &storage,
+                38,
+                StorageStage::InboundPutMerge,
+                target,
+                &mutation,
+            )
+            .await,
+            Err(DhtIoError::StorageFull)
+        ));
+        assert!(row_exists(&storage, victim).await);
+        assert!(!row_exists(&storage, target).await);
+        assert_eq!(read_count(&storage).await, MAX_STORED_KEYS);
+    }
+
+    #[tokio::test]
+    async fn capacity_concurrent_reclaims() {
+        let (_directory, storage) = open_storage();
+        let now_secs = now_unix_secs();
+        let first_victim = DhtKeyId::from_data(b"first-floor-victim");
+        let second_victim = DhtKeyId::from_data(b"second-floor-victim");
+        let first_target = DhtKeyId::from_data(b"first-admission");
+        let second_target = DhtKeyId::from_data(b"second-admission");
+        let _ = store_due_floor(&storage, first_victim, 1, now_secs.saturating_sub(2)).await;
+        let _ = store_due_floor(&storage, second_victim, 2, now_secs.saturating_sub(1)).await;
+        write_count(&storage, MAX_STORED_KEYS).await;
+        let first = StorageMutation::Merge {
+            entries: vec![make_entry(3, first_target, now_secs.saturating_add(200))],
+        };
+        let second = StorageMutation::Merge {
+            entries: vec![make_entry(4, second_target, now_secs.saturating_add(300))],
+        };
+
+        let (first_result, second_result) = tokio::join!(
+            mutate_storage_entries(
+                &storage,
+                44,
+                StorageStage::InboundPutMerge,
+                first_target,
+                &first,
+            ),
+            mutate_storage_entries(
+                &storage,
+                45,
+                StorageStage::InboundPutMerge,
+                second_target,
+                &second,
+            ),
+        );
+        first_result.expect("first admission succeeds");
+        second_result.expect("second admission retries");
+
+        assert!(!row_exists(&storage, first_victim).await);
+        assert!(!row_exists(&storage, second_victim).await);
+        assert!(row_exists(&storage, first_target).await);
+        assert!(row_exists(&storage, second_target).await);
+        assert_eq!(read_count(&storage).await, MAX_STORED_KEYS);
+        assert!(
+            index_entries(&storage, DeadlineIndex::Floor)
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            index_entries(&storage, DeadlineIndex::Active).await.len(),
+            2
+        );
     }
 
     #[tokio::test]
