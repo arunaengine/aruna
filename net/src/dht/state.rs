@@ -1712,7 +1712,12 @@ impl DhtStateMachine {
         skip(self, op, out),
         fields(op_id, key = %op.key, value_count = op.values.len())
     )]
-    fn maybe_complete_get(&mut self, op_id: OpId, mut op: GetOp, out: &mut SmallVec<[DhtEffect; 4]>) {
+    fn maybe_complete_get(
+        &mut self,
+        op_id: OpId,
+        mut op: GetOp,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
         if pending_rpc_count(&op.pending, RpcPhase::GetLookup) > 0
             || !op.frontier.lookup_complete(op.key.as_bytes())
         {

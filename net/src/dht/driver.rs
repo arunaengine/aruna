@@ -2810,9 +2810,7 @@ mod tests {
 
     #[test]
     fn response_bounds_reject() {
-        let nodes = (1..=K + 1)
-            .map(|seed| make_node(seed as u8))
-            .collect();
+        let nodes = (1..=K + 1).map(|seed| make_node(seed as u8)).collect();
         assert!(validate_response(&DhtResponse::Nodes { nodes }).is_err());
 
         let key = DhtKeyId::from_data(b"response-entry-limit");
@@ -2873,15 +2871,9 @@ mod tests {
         let mutation = StorageMutation::Merge {
             entries: vec![entry],
         };
-        mutate_storage_entries(
-            &storage,
-            6,
-            StorageStage::InboundPutMerge,
-            key,
-            &mutation,
-        )
-        .await
-        .expect("duplicate succeeds");
+        mutate_storage_entries(&storage, 6, StorageStage::InboundPutMerge, key, &mutation)
+            .await
+            .expect("duplicate succeeds");
         worker.join().expect("storage worker");
     }
 
