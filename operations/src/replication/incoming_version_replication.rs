@@ -6,6 +6,7 @@ use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
 use crate::replication::util::dht_registration_effect;
+use crate::s3::create_bucket::CreateBucketOperation;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
@@ -31,6 +32,7 @@ use ulid::Ulid;
 enum IncomingVersionReplicationState {
     Init,
     ReadDestinationBucket,
+    CreateDestinationBucket,
     CheckPermissions,
     ReadExistingVersion,
     ReadExistingBlob,
@@ -98,6 +100,7 @@ pub struct IncomingVersionReplicationOperation {
     manifest: VersionReplicationManifest,
     txn_id: Option<Ulid>,
     destination_group_id: Option<GroupId>,
+    create_attempted: bool,
     negotiation_result: Option<ReplicationNegotiationResult>,
     existing_blob_location: Option<BackendLocation>,
     received_blob_location: Option<BackendLocation>,
@@ -126,6 +129,7 @@ impl IncomingVersionReplicationOperation {
             manifest,
             txn_id: None,
             destination_group_id: None,
+            create_attempted: false,
             negotiation_result: None,
             existing_blob_location: None,
             received_blob_location: None,
@@ -144,6 +148,7 @@ impl IncomingVersionReplicationOperation {
         match self.state {
             IncomingVersionReplicationState::Init => "Init",
             IncomingVersionReplicationState::ReadDestinationBucket => "ReadDestinationBucket",
+            IncomingVersionReplicationState::CreateDestinationBucket => "CreateDestinationBucket",
             IncomingVersionReplicationState::CheckPermissions => "CheckPermissions",
             IncomingVersionReplicationState::ReadExistingVersion => "ReadExistingVersion",
             IncomingVersionReplicationState::ReadExistingBlob => "ReadExistingBlob",
@@ -305,6 +310,34 @@ impl IncomingVersionReplicationOperation {
             key: self.manifest.bucket.as_bytes().to_vec().into(),
             txn_id: None,
         })]
+    }
+
+    fn destination_bucket_info(&self) -> BucketInfo {
+        BucketInfo {
+            group_id: self.manifest.group_id,
+            created_at: self.manifest.created_at,
+            created_by: self.manifest.created_by,
+            cors_configuration: None,
+        }
+    }
+
+    fn create_destination_bucket(&mut self) -> Effects {
+        self.create_attempted = true;
+        self.state = IncomingVersionReplicationState::CreateDestinationBucket;
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            CreateBucketOperation::new(
+                self.manifest.bucket.clone(),
+                self.destination_bucket_info()
+            ),
+            |result| Event::SubOperation(SubOperationEvent::BucketCreated {
+                result: match result {
+                    Ok(Some(Ok(_))) => Ok(()),
+                    Ok(Some(Err(err))) => Err(err.to_string()),
+                    Ok(None) => Err("bucket creation returned no result".to_string()),
+                    Err(err) => Err(err.to_string()),
+                },
+            }),
+        ))]
     }
 
     fn check_write_permission(&mut self, group_id: Ulid) -> Effects {
@@ -729,9 +762,12 @@ impl Operation for IncomingVersionReplicationOperation {
                 };
 
                 let Some(value) = value else {
-                    return self.reject_negotiation(
-                        IncomingVersionReplicationError::DestinationBucketNotFound,
-                    );
+                    if self.create_attempted {
+                        return self.reject_negotiation(
+                            IncomingVersionReplicationError::DestinationBucketNotFound,
+                        );
+                    }
+                    return self.create_destination_bucket();
                 };
                 let bucket_info = match BucketInfo::from_bytes(value.as_ref()) {
                     Ok(bucket_info) => bucket_info,
@@ -752,6 +788,24 @@ impl Operation for IncomingVersionReplicationOperation {
 
                 self.destination_group_id = Some(bucket_info.group_id);
                 self.check_write_permission(bucket_info.group_id)
+            }
+            IncomingVersionReplicationState::CreateDestinationBucket => {
+                let Event::SubOperation(SubOperationEvent::BucketCreated { result }) = event else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::SubOperation(SubOperationEvent::BucketCreated)",
+                        received: event,
+                    });
+                };
+                if let Err(reason) = result {
+                    debug!(
+                        bucket = %self.manifest.bucket,
+                        stream_id = %self.stream_id,
+                        reason = %reason,
+                        "Destination bucket auto-create did not create; re-reading"
+                    );
+                }
+                self.read_destination_bucket()
             }
             IncomingVersionReplicationState::CheckPermissions => {
                 let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
@@ -1191,7 +1245,7 @@ mod tests {
     use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-        HASH_PATHS_INDEX_KEYSPACE,
+        HASH_PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
@@ -1209,6 +1263,10 @@ mod tests {
 
     fn test_user_id() -> UserId {
         UserId::nil(test_realm_id())
+    }
+
+    fn test_group_id() -> Ulid {
+        Ulid::from_parts(7, 7)
     }
 
     fn make_location() -> BackendLocation {
@@ -1258,6 +1316,7 @@ mod tests {
             bucket: "bucket".to_string(),
             key: "dir/file.txt".to_string(),
             version_id: Ulid::r#gen(),
+            group_id: test_group_id(),
             kind,
             created_at: SystemTime::now(),
             created_by: test_user_id(),
@@ -1806,7 +1865,8 @@ mod tests {
     }
 
     #[test]
-    fn missing_destination_bucket_is_rejected_during_negotiation() {
+    fn unbuildable_bucket_rejects() {
+        // One create attempt, still missing, then reject and close the stream.
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         let stream_id = Ulid::r#gen();
         let mut op = IncomingVersionReplicationOperation::new(
@@ -1816,15 +1876,18 @@ mod tests {
             manifest,
         );
 
-        let effects = op.start();
+        op.start();
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: None,
+        }));
         assert_eq!(
             op.state,
-            IncomingVersionReplicationState::ReadDestinationBucket
+            IncomingVersionReplicationState::CreateDestinationBucket
         );
-        assert!(matches!(
-            effects[0],
-            Effect::Storage(StorageEffect::Read { .. })
-        ));
+        op.step(Event::SubOperation(SubOperationEvent::BucketCreated {
+            result: Err("boom".to_string()),
+        }));
 
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: b"bucket".to_vec().into(),
@@ -2124,5 +2187,61 @@ mod tests {
             effects[0],
             Effect::Blob(BlobEffect::CloseConnection { .. })
         ));
+    }
+
+    fn missing_bucket_op() -> IncomingVersionReplicationOperation {
+        let manifest = make_manifest(ReplicationItemKind::Materialized);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::r#gen(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            manifest,
+        );
+        op.start();
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: None,
+        }));
+        op
+    }
+
+    #[test]
+    fn missing_bucket_autocreates() {
+        let op = missing_bucket_op();
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::CreateDestinationBucket
+        );
+        assert!(op.create_attempted);
+        let info = op.destination_bucket_info();
+        assert_eq!(info.group_id, test_group_id());
+        assert_eq!(info.created_by, test_user_id());
+        assert!(info.cors_configuration.is_none());
+    }
+
+    #[test]
+    fn autocreate_rereads_bucket() {
+        let mut op = missing_bucket_op();
+        let effects = op.step(Event::SubOperation(SubOperationEvent::BucketCreated {
+            result: Ok(()),
+        }));
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::ReadDestinationBucket
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == S3_BUCKET_KEYSPACE
+        ));
+    }
+
+    #[test]
+    fn create_invalid_event() {
+        let mut op = missing_bucket_op();
+        op.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::r#gen(),
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::Error);
     }
 }

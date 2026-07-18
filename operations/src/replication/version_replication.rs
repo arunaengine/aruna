@@ -20,7 +20,7 @@ use aruna_core::structs::{
     ReplicationItemKind, ReplicationNegotiationResult, ReplicationSuboperationResult,
     SourceMetadata, VersionKey, VersionSourceBinding,
 };
-use aruna_core::types::{Effects, Key, NodeId};
+use aruna_core::types::{Effects, GroupId, Key, NodeId};
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use std::time::SystemTime;
@@ -123,6 +123,7 @@ pub struct ReplicateScopeOperation {
     exact_object_exists: bool,
     iteration_prefix: Option<String>,
     next_start_after: Option<Key>,
+    source_group_id: Option<GroupId>,
     pending_versions: Vec<VersionReplicationRequest>,
     result: ReplicateScopeResult,
     output: Option<Result<ReplicateScopeResult, ReplicateScopeError>>,
@@ -136,6 +137,7 @@ impl ReplicateScopeOperation {
             exact_object_exists: false,
             iteration_prefix: None,
             next_start_after: None,
+            source_group_id: None,
             pending_versions: Vec::new(),
             result: ReplicateScopeResult {
                 replicated: 0,
@@ -287,6 +289,7 @@ impl ReplicateScopeOperation {
             bucket: version_key.bucket,
             key: version_key.key,
             version_id: version_key.version_id,
+            source_group_id: self.source_group_id.unwrap_or_default(),
             target_node_id: self.input.target_node_id,
             auth_context: self.input.auth_context.clone(),
             mode: self.input.mode,
@@ -368,6 +371,7 @@ impl Operation for ReplicateScopeOperation {
                     mode = ?self.input.mode,
                     "Loaded source bucket for replication"
                 );
+                self.source_group_id = Some(bucket_info.group_id);
                 self.resolve_target()
             }
             ReplicateScopeState::ResolveObjectTarget => {
@@ -1019,6 +1023,7 @@ impl ReplicateObjectVersionOperation {
             bucket: self.request.bucket.clone(),
             key: self.request.key.clone(),
             version_id: self.request.version_id,
+            group_id: self.request.source_group_id,
             kind,
             created_at,
             created_by,
@@ -1699,6 +1704,7 @@ mod tests {
             bucket: "bucket".to_string(),
             key: "dir/file.txt".to_string(),
             version_id,
+            source_group_id: Ulid::r#gen(),
             target_node_id: iroh::SecretKey::generate().public(),
             auth_context: auth_context(),
             mode,
