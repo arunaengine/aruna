@@ -237,7 +237,7 @@ mod tests {
             CreateRealmOperation::new(CreateRealmConfig {
                 actor: Actor {
                     node_id: state.get_node_id(),
-                    user_id: UserId::local(Ulid::r#gen(), realm_id),
+                    user_id: UserId::local(Ulid::generate(), realm_id),
                     realm_id,
                 },
                 realm_description: "Realm".to_string(),

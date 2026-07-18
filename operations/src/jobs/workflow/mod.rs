@@ -1626,7 +1626,7 @@ mod tests {
         let bucket = JobRecord::workspace_bucket_name(job_id);
 
         let Err(error) =
-            prepare_workspace(&context, &spec, &record, node_id(7), &bucket, Ulid::r#gen()).await
+            prepare_workspace(&context, &spec, &record, node_id(7), &bucket, Ulid::generate()).await
         else {
             panic!("workspace preparation unexpectedly succeeded");
         };

@@ -226,7 +226,7 @@ mod test {
             compute_handle: None,
         };
 
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         for (bucket, bucket_info) in [
             (
                 "alpha".to_string(),
@@ -249,7 +249,7 @@ mod test {
             (
                 "foreign".to_string(),
                 BucketInfo {
-                    group_id: Ulid::r#gen(),
+                    group_id: Ulid::generate(),
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
                     cors_configuration: None,

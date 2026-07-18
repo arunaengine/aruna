@@ -528,7 +528,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         };
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
 
         let created = drive(
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
@@ -705,7 +705,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         };
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
 
         let created = drive(
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
@@ -869,7 +869,7 @@ mod tests {
                 kind: SourceConnectorKind::ArunaNative,
                 public_config: HashMap::new(),
                 source_path: "source-bucket/data.txt".to_string(),
-                version_selector: Some(format!("version:{}", Ulid::r#gen())),
+                version_selector: Some(format!("version:{}", Ulid::generate())),
                 capabilities: Vec::new(),
                 origin_node_id: Some(origin),
             },

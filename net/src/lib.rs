@@ -525,7 +525,7 @@ impl NetHandle {
         let realm_peers = Arc::new(RwLock::new(realm_peer_nodes.clone()));
         let watch_interest = Arc::new(RwLock::new(WatchInterestTable::default()));
         let (notification_wakes, _) = broadcast::channel(NOTIFICATION_WAKE_CAPACITY);
-        let dashboard_epoch = Ulid::r#gen();
+        let dashboard_epoch = Ulid::generate();
         let (dashboard_changes, _) = watch::channel(0);
         let dht_signed_authorized_nodes = Arc::new(RwLock::new(realm_peer_nodes.clone()));
         let peer_connectivity = Arc::new(Mutex::new(PeerConnectivityManagerState::new(
@@ -574,7 +574,7 @@ impl NetHandle {
             .document_sync_storage_path
             .clone()
             .unwrap_or_else(|| {
-                std::env::temp_dir().join(format!("aruna-document-sync-{}", ulid::Ulid::r#gen()))
+                std::env::temp_dir().join(format!("aruna-document-sync-{}", ulid::Ulid::generate()))
             });
         let document_sync = Arc::new(DocumentSyncService::open_with_persist_policy(
             endpoint.clone(),

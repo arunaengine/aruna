@@ -60,7 +60,7 @@ impl EmitNotificationsOperation {
         let mut writes: Vec<(KeySpace, Key, Value)> = Vec::with_capacity(self.input.records.len());
         for record in &self.input.records {
             let outbox_record = NotificationOutboxRecord {
-                outbox_id: Ulid::r#gen(),
+                outbox_id: Ulid::generate(),
                 record: record.clone(),
             };
             match notification_outbox_write_entry(&outbox_record) {
@@ -205,7 +205,7 @@ mod tests {
             make_user(realm, user),
             NotificationClass::Direct,
             NotificationKind::AddedToGroup {
-                group_id: Ulid::r#gen(),
+                group_id: Ulid::generate(),
                 actor_user_id: make_user(realm, 100),
             },
             1_000,
@@ -313,7 +313,7 @@ mod tests {
             records: vec![make_record(1, 2)],
         });
         operation.start();
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert!(matches!(
             effects.as_slice(),
@@ -342,7 +342,7 @@ mod tests {
             records: vec![make_record(1, 2)],
         });
         operation.start();
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: vec![],
@@ -371,7 +371,7 @@ mod tests {
             records: vec![make_record(1, 2)],
         });
         operation.start();
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
 
         let effects = operation.step(Event::Search());
@@ -471,7 +471,7 @@ mod tests {
             records: vec![make_record(1, 2)],
         });
         operation.start();
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: vec![],
@@ -503,7 +503,7 @@ mod tests {
             records: vec![make_record(1, 2)],
         });
         operation.start();
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: vec![],

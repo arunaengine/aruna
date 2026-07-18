@@ -387,7 +387,7 @@ impl WatchSubscription {
     ) -> Self {
         authorization.watch_path_prefix = path_prefix.clone();
         Self {
-            watch_id: Ulid::r#gen(),
+            watch_id: Ulid::generate(),
             owner,
             path_prefix,
             event_mask,
@@ -716,7 +716,7 @@ mod tests {
     fn keys_are_owner_isolated() {
         let a = user(1, 2);
         let b = user(1, 3);
-        let watch_id = Ulid::r#gen();
+        let watch_id = Ulid::generate();
         let ka = watch_subscription_key(a, watch_id);
         let kb = watch_subscription_key(b, watch_id);
         assert_ne!(&ka[..48], &kb[..48]);
@@ -727,7 +727,7 @@ mod tests {
     #[test]
     fn key_roundtrips_through_parser() {
         let owner = user(5, 9);
-        let watch_id = Ulid::r#gen();
+        let watch_id = Ulid::generate();
         let key = watch_subscription_key(owner, watch_id);
         assert_eq!(
             parse_watch_subscription_key(&key).unwrap(),
@@ -901,7 +901,7 @@ mod tests {
         let group_id = Ulid::from_bytes([5u8; 16]);
         let node_id = node(6);
         let uploaded = WatchEvent {
-            event_id: Ulid::r#gen(),
+            event_id: Ulid::generate(),
             realm_id: RealmId([1u8; 32]),
             kind: WatchEventKind::DataUploaded,
             path: data_watch_resource_path(group_id, node_id, "bucket", "object"),

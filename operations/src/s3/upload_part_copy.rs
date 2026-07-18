@@ -243,7 +243,7 @@ mod test {
     ) {
         drive(
             PutObjectOperation::new(PutObjectConfig {
-                user_id: UserId::local(Ulid::r#gen(), realm_id),
+                user_id: UserId::local(Ulid::generate(), realm_id),
                 group_id,
                 realm_id,
                 node_id,
@@ -304,10 +304,10 @@ mod test {
     async fn range_copy_writes_part_bytes_and_record() {
         let (_temp, context) = full_context().await;
         let realm_id = RealmId::from_bytes([1u8; 32]);
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let node_id = context.net_handle.as_ref().unwrap().node_id();
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
-        let upload_id = Ulid::r#gen();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        let upload_id = Ulid::generate();
 
         put_source(
             &context,
@@ -371,8 +371,8 @@ mod test {
     async fn missing_destination_upload_fails_before_source_lookup() {
         let (_temp, context) = full_context().await;
         let realm_id = RealmId::from_bytes([2u8; 32]);
-        let group_id = Ulid::r#gen();
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::generate();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
 
         let error = upload_part_copy(
             &context,
@@ -383,7 +383,7 @@ mod test {
                 source_group_id: group_id,
                 dest_bucket: "dest".to_string(),
                 dest_key: "object.txt".to_string(),
-                upload_id: Ulid::r#gen(),
+                upload_id: Ulid::generate(),
                 part_number: 1,
                 range: None,
                 user_id,
@@ -403,10 +403,10 @@ mod test {
     async fn unsatisfiable_range_errors() {
         let (_temp, context) = full_context().await;
         let realm_id = RealmId::from_bytes([2u8; 32]);
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let node_id = context.net_handle.as_ref().unwrap().node_id();
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
-        let upload_id = Ulid::r#gen();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        let upload_id = Ulid::generate();
 
         put_source(
             &context,

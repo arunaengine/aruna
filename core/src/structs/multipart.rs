@@ -213,7 +213,7 @@ mod test {
     // Prefix keeps the whole version id, spans all part numbers, excludes the summary.
     #[test]
     fn prefix_covers_version() {
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let prefix = MultipartObjectMetadataKey::part_prefix(version_id).unwrap();
 
         // The prefix must be the part key with the fixed part-number suffix stripped.
@@ -240,7 +240,7 @@ mod test {
         assert!(!summary_key.starts_with(&prefix));
 
         // A different version must not be captured by this version's prefix.
-        let other_key = MultipartObjectMetadataKey::part(Ulid::r#gen(), 0)
+        let other_key = MultipartObjectMetadataKey::part(Ulid::generate(), 0)
             .to_bytes()
             .unwrap();
         assert!(!other_key.starts_with(&prefix));

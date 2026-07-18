@@ -1387,7 +1387,7 @@ async fn emit_sync_watch(
     emit_resource_watch_event(
         context,
         WatchEvent {
-            event_id: Ulid::r#gen(),
+            event_id: Ulid::generate(),
             realm_id: relationship.source.realm_id,
             kind,
             path: data_watch_resource_path(

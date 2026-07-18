@@ -360,7 +360,7 @@ mod tests {
             let mut auth =
                 GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
             if let Some(bucket) = public_bucket.filter(|_| group_id == public_group) {
-                let role_id = Ulid::r#gen();
+                let role_id = Ulid::generate();
                 auth.roles.insert(
                     role_id,
                     Role {

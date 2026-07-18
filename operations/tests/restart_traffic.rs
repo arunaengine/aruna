@@ -101,7 +101,7 @@ async fn restart_traffic_body() -> Result<(), BoxError> {
     install_realm_config(&nodes, &realm_id).await?;
 
     // Seed ~500 documents across shards from node 0.
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     let targets0 = vec![(nodes[0].net.node_id(), nodes[0].context.clone())];
     let created = run_writer(realm_id, group_id, SEED_DOCUMENTS, targets0).await?;
     // Wait until the restarting node holds real shard state (a recent sample is
@@ -253,13 +253,13 @@ async fn run_writer(
     for index in 0..count {
         let slot = index % targets.len();
         let (node_id, context) = &targets[slot];
-        let document_id = Ulid::r#gen();
+        let document_id = Ulid::generate();
         let result = drive(
             CreateMetadataDocumentOperation::new_for_generated_document_id(
                 CreateMetadataDocumentConfig {
                     actor: Actor {
                         node_id: *node_id,
-                        user_id: UserId::local(Ulid::r#gen(), realm_id),
+                        user_id: UserId::local(Ulid::generate(), realm_id),
                         realm_id,
                     },
                     group_id,

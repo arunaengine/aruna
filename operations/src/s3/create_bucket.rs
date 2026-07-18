@@ -269,7 +269,7 @@ mod test {
         };
 
         let bucket_info = BucketInfo {
-            group_id: Ulid::r#gen(),
+            group_id: Ulid::generate(),
             created_at: SystemTime::now(),
             created_by: Default::default(),
             cors_configuration: None,
@@ -302,7 +302,7 @@ mod test {
         };
 
         let bucket_info = BucketInfo {
-            group_id: Ulid::r#gen(),
+            group_id: Ulid::generate(),
             created_at: SystemTime::now(),
             created_by: Default::default(),
             cors_configuration: None,

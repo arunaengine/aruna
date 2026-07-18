@@ -238,7 +238,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         };
-        let enrollment_id = Ulid::r#gen();
+        let enrollment_id = Ulid::generate();
         drive(
             CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
                 record: OnboardingSecretRecord {

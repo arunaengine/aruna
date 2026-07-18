@@ -4632,7 +4632,7 @@ async fn apply_watch_subscription_change_to_storage(
             (
                 NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
                 ByteView::from(watch_interest_dirty_key(realm_id)),
-                ByteView::from(Ulid::r#gen().to_bytes().to_vec()),
+                ByteView::from(Ulid::generate().to_bytes().to_vec()),
             ),
         ];
         let deletes = if let Some(bytes) = bytes.as_ref() {
@@ -8548,7 +8548,7 @@ mod tests {
         ];
         let additions = actors.each_ref().map(|actor| {
             test_admin_event(
-                Ulid::r#gen(),
+                Ulid::generate(),
                 AdminDocumentTarget::User {
                     user_id: actor.user_id,
                 },
@@ -8598,7 +8598,7 @@ mod tests {
         }
 
         let mut removal = test_admin_event(
-            Ulid::r#gen(),
+            Ulid::generate(),
             AdminDocumentTarget::User {
                 user_id: user_ids[0],
             },
@@ -10821,7 +10821,7 @@ mod tests {
             base: None,
             current: DocumentSyncRevision {
                 generation: 1,
-                event_id: Ulid::r#gen(),
+                event_id: Ulid::generate(),
                 actor: local_node,
                 updated_at_ms: 1,
             },
@@ -10832,7 +10832,7 @@ mod tests {
         let blocked = service
             .publish_documents(
                 vec![DocumentSyncPublish::Upsert {
-                    event_id: Ulid::r#gen(),
+                    event_id: Ulid::generate(),
                     target: target.clone(),
                     bytes: b"blocked".to_vec(),
                     change,
@@ -10853,7 +10853,7 @@ mod tests {
         let published = service
             .publish_documents(
                 vec![DocumentSyncPublish::Upsert {
-                    event_id: Ulid::r#gen(),
+                    event_id: Ulid::generate(),
                     target: target.clone(),
                     bytes: b"origin".to_vec(),
                     change,
@@ -11233,7 +11233,7 @@ mod tests {
             base: None,
             current: DocumentSyncRevision {
                 generation: 1,
-                event_id: Ulid::r#gen(),
+                event_id: Ulid::generate(),
                 actor: service.local_node_id().expect("local node id"),
                 updated_at_ms: 1,
             },
@@ -11272,14 +11272,14 @@ mod tests {
             .publish_documents(
                 vec![
                     DocumentSyncPublish::Upsert {
-                        event_id: Ulid::r#gen(),
+                        event_id: Ulid::generate(),
                         target: target.clone(),
                         bytes: b"whole-document-admin-upsert".to_vec(),
                         change: change(DocumentSyncChangeKind::Upsert),
                         allow_genesis: true,
                     },
                     DocumentSyncPublish::Delete {
-                        event_id: Ulid::r#gen(),
+                        event_id: Ulid::generate(),
                         target: target.clone(),
                         change: change(DocumentSyncChangeKind::Delete),
                         allow_genesis: true,
@@ -11544,7 +11544,7 @@ mod tests {
             AdminEventValidation::Accepted
         );
 
-        let server_actor = test_actor(66, UserId::local(Ulid::r#gen(), realm_id), realm_id);
+        let server_actor = test_actor(66, UserId::local(Ulid::generate(), realm_id), realm_id);
         let mut server_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         server_config.ensure_node(server_actor.node_id, RealmNodeKind::Server);
         storage_batch_write_to(
@@ -11580,7 +11580,7 @@ mod tests {
                     &server_actor,
                     1,
                     AdminDocumentOperation::RealmRoleAdded {
-                        role_id: Ulid::r#gen(),
+                        role_id: Ulid::generate(),
                     },
                 ),
             ),
@@ -11610,9 +11610,9 @@ mod tests {
     async fn inbound_admin_validation_rejects_target_and_malformed_events() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([67; 32]);
-        let actor = test_actor(67, UserId::local(Ulid::r#gen(), realm_id), realm_id);
+        let actor = test_actor(67, UserId::local(Ulid::generate(), realm_id), realm_id);
         let user_id = actor.user_id;
-        let other_user = UserId::local(Ulid::r#gen(), realm_id);
+        let other_user = UserId::local(Ulid::generate(), realm_id);
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         config.ensure_node(actor.node_id, RealmNodeKind::Server);
         storage_batch_write_to(
@@ -12349,7 +12349,7 @@ mod tests {
             base: None,
             current: DocumentSyncRevision {
                 generation: 1,
-                event_id: Ulid::r#gen(),
+                event_id: Ulid::generate(),
                 actor: local_node,
                 updated_at_ms: 1,
             },
@@ -12379,14 +12379,14 @@ mod tests {
             .publish_documents(
                 vec![
                     DocumentSyncPublish::Upsert {
-                        event_id: Ulid::r#gen(),
+                        event_id: Ulid::generate(),
                         target: forged_target.clone(),
                         bytes: forged_digest.to_bytes().expect("digest serializes"),
                         change: change(),
                         allow_genesis: true,
                     },
                     DocumentSyncPublish::Upsert {
-                        event_id: Ulid::r#gen(),
+                        event_id: Ulid::generate(),
                         target: target.clone(),
                         bytes: owned_bytes.clone(),
                         change: change(),
@@ -12499,7 +12499,7 @@ mod tests {
             base: None,
             current: DocumentSyncRevision {
                 generation: 1,
-                event_id: Ulid::r#gen(),
+                event_id: Ulid::generate(),
                 actor: local_node,
                 updated_at_ms: 1,
             },
@@ -12536,7 +12536,7 @@ mod tests {
             .publish_documents(
                 vec![
                     DocumentSyncPublish::Delete {
-                        event_id: Ulid::r#gen(),
+                        event_id: Ulid::generate(),
                         target: forged_target.clone(),
                         change: change(DocumentSyncChangeKind::Delete),
                         allow_genesis: true,
@@ -12548,7 +12548,7 @@ mod tests {
                         allow_genesis: true,
                     },
                     DocumentSyncPublish::Upsert {
-                        event_id: Ulid::r#gen(),
+                        event_id: Ulid::generate(),
                         target: target.clone(),
                         bytes: digest_bytes.clone(),
                         change: change(DocumentSyncChangeKind::Upsert),
@@ -12655,7 +12655,7 @@ mod tests {
             base: None,
             current: DocumentSyncRevision {
                 generation: 1,
-                event_id: Ulid::r#gen(),
+                event_id: Ulid::generate(),
                 actor: local_node,
                 updated_at_ms: 1,
             },
@@ -12678,13 +12678,13 @@ mod tests {
             .publish_documents(
                 vec![
                     DocumentSyncPublish::Delete {
-                        event_id: Ulid::r#gen(),
+                        event_id: Ulid::generate(),
                         target: target.clone(),
                         change: change(DocumentSyncChangeKind::Delete),
                         allow_genesis: true,
                     },
                     DocumentSyncPublish::Upsert {
-                        event_id: Ulid::r#gen(),
+                        event_id: Ulid::generate(),
                         target: target.clone(),
                         bytes: snapshot_bytes.clone(),
                         change: change(DocumentSyncChangeKind::Upsert),

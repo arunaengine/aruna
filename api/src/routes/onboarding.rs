@@ -218,7 +218,7 @@ pub async fn create_onboarding_secret(
 
     let onboarding_secret = OnboardingSecret {
         seed_url: request.seed_url,
-        enrollment_id: ulid::Ulid::r#gen(),
+        enrollment_id: ulid::Ulid::generate(),
         secret: secret_bytes,
         mode: request.mode,
     };
@@ -666,7 +666,7 @@ mod tests {
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
         let realm_signing_key = SigningKey::generate(&mut csprng);
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let user_id = UserId::local(Ulid::generate(), realm_id);
         let node_id = net_handle.node_id();
 
         drive(
@@ -902,7 +902,7 @@ mod tests {
             path_restrictions: None,
         };
 
-        let finalizing_id = Ulid::r#gen();
+        let finalizing_id = Ulid::generate();
         drive(
             CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
                 record: OnboardingSecretRecord {
@@ -931,7 +931,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stale_id = Ulid::r#gen();
+        let stale_id = Ulid::generate();
         drive(
             CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
                 record: OnboardingSecretRecord {

@@ -423,7 +423,7 @@ mod test {
     use tempfile::tempdir;
 
     fn test_user_id() -> UserId {
-        UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32]))
+        UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]))
     }
 
     #[test]
@@ -433,7 +433,7 @@ mod test {
         let mut op = UploadPartOperation::new(UploadPartInput {
             bucket: "mybucket".to_string(),
             key: "object.txt".to_string(),
-            upload_id: Ulid::r#gen(),
+            upload_id: Ulid::generate(),
             part_number: 1,
             content_length: None,
             body: None,
@@ -462,7 +462,7 @@ mod test {
         let mut op = UploadPartOperation::new(UploadPartInput {
             bucket: "mybucket".to_string(),
             key: "object.txt".to_string(),
-            upload_id: Ulid::r#gen(),
+            upload_id: Ulid::generate(),
             part_number: 1,
             content_length: None,
             body: None,
@@ -503,7 +503,7 @@ mod test {
             UploadPartOperation::new(UploadPartInput {
                 bucket: "mybucket".to_string(),
                 key: "object.txt".to_string(),
-                upload_id: Ulid::r#gen(),
+                upload_id: Ulid::generate(),
                 part_number: 1,
                 content_length: None,
                 body: None,

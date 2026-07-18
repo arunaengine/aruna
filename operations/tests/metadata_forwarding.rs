@@ -76,7 +76,7 @@ async fn user_node_forwards_create() -> Result<(), Box<dyn std::error::Error>> {
     let user_node = nodes.last().expect("user node");
 
     let group_id = seed_group(&realm, &nodes).await?;
-    let document_id = Ulid::r#gen();
+    let document_id = Ulid::generate();
     let created = drive_forwarded_create(&realm, user_node, group_id, document_id).await?;
 
     // The user node holds nothing, so the record it got back was written by a
@@ -122,7 +122,7 @@ async fn forwarded_invalid_terminal() -> Result<(), Box<dyn std::error::Error>> 
     let (nodes, config) = build_realm(&realm, 3, 1).await?;
     let user_node = nodes.last().expect("user node");
     let group_id = seed_group(&realm, &nodes).await?;
-    let document_id = Ulid::r#gen();
+    let document_id = Ulid::generate();
     let record = drive_forwarded_create(&realm, user_node, group_id, document_id).await?;
     let holders = resolve_shard_holders(&config, &record.placement);
     wait_for_record_on_holders(&nodes, &holders, document_id).await?;
@@ -235,7 +235,7 @@ async fn forwarded_create_is_idempotent() -> Result<(), Box<dyn std::error::Erro
     let user_node = nodes.last().expect("user node");
 
     let group_id = seed_group(&realm, &nodes).await?;
-    let document_id = Ulid::r#gen();
+    let document_id = Ulid::generate();
 
     let first = drive_forwarded_create(&realm, user_node, group_id, document_id).await?;
     let holders = resolve_shard_holders(&config, &first.placement);
@@ -271,7 +271,7 @@ async fn create_replay_rejects() -> Result<(), Box<dyn std::error::Error>> {
     let user_node = nodes.last().expect("user node");
     let first_group = seed_group(&realm, &nodes).await?;
     let other_group = seed_group(&realm, &nodes).await?;
-    let document_id = Ulid::r#gen();
+    let document_id = Ulid::generate();
 
     let created = drive_forwarded_create(&realm, user_node, first_group, document_id).await?;
     let holders = resolve_shard_holders(&config, &created.placement);
@@ -314,7 +314,7 @@ fn forged_delete_change(placement: PlacementRef, actor: NodeId) -> DocumentSyncC
         base: None,
         current: DocumentSyncRevision {
             generation: 1,
-            event_id: Ulid::r#gen(),
+            event_id: Ulid::generate(),
             actor,
             updated_at_ms: 1,
         },
@@ -364,8 +364,8 @@ async fn wait_for_record_on_holders(
 async fn nonholder_resolves_document() -> Result<(), Box<dyn std::error::Error>> {
     let realm = Realm::new();
     let (nodes, config) = build_realm(&realm, 5, 0).await?;
-    let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
+    let document_id = Ulid::generate();
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
@@ -482,7 +482,7 @@ impl Realm {
         let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
         Self {
             realm_id,
-            user_id: UserId::local(Ulid::r#gen(), realm_id),
+            user_id: UserId::local(Ulid::generate(), realm_id),
             signing_key,
         }
     }
@@ -494,7 +494,7 @@ impl Realm {
             iss: self.realm_id.to_string(),
             iat: now,
             exp: now + 600,
-            jti: Ulid::r#gen().to_string(),
+            jti: Ulid::generate().to_string(),
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,

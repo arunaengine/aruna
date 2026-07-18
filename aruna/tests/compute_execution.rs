@@ -80,7 +80,7 @@ async fn setup(backend: DockerBackend) -> TestResult<Fixture> {
 
     // A multi-chunk source object (~1 MiB) the workflow snapshots into the
     // workspace, so staging, container upload, and output capture all stream.
-    let source_bucket = format!("src-{}", Ulid::r#gen().to_string().to_lowercase());
+    let source_bucket = format!("src-{}", Ulid::generate().to_string().to_lowercase());
     let client = s3_client(&endpoint, &creds);
     client.create_bucket().bucket(&source_bucket).send().await?;
     client

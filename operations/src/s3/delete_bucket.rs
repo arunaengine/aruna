@@ -524,7 +524,7 @@ mod test {
             CreateBucketOperation::new(
                 bucket.clone(),
                 BucketInfo {
-                    group_id: Ulid::r#gen(),
+                    group_id: Ulid::generate(),
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
                     cors_configuration: None,
@@ -587,7 +587,7 @@ mod test {
             CreateBucketOperation::new(
                 bucket.clone(),
                 BucketInfo {
-                    group_id: Ulid::r#gen(),
+                    group_id: Ulid::generate(),
                     created_at: SystemTime::now(),
                     created_by: aruna_core::UserId::nil(RealmId::from_bytes([0u8; 32])),
                     cors_configuration: None,
@@ -662,7 +662,7 @@ mod test {
             CreateBucketOperation::new(
                 bucket.clone(),
                 BucketInfo {
-                    group_id: Ulid::r#gen(),
+                    group_id: Ulid::generate(),
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
                     cors_configuration: None,
@@ -779,7 +779,7 @@ mod test {
                 key_space: S3_BUCKET_KEYSPACE.to_string(),
                 key: bucket.clone().into(),
                 value: BucketInfo {
-                    group_id: Ulid::r#gen(),
+                    group_id: Ulid::generate(),
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
                     cors_configuration: None,
@@ -791,7 +791,7 @@ mod test {
             })
             .await;
 
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_HEAD_KEYSPACE.to_string(),
@@ -842,7 +842,7 @@ mod test {
                 key_space: S3_BUCKET_KEYSPACE.to_string(),
                 key: bucket.clone().into(),
                 value: BucketInfo {
-                    group_id: Ulid::r#gen(),
+                    group_id: Ulid::generate(),
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
                     cors_configuration: None,
@@ -856,7 +856,7 @@ mod test {
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                key: VersionKey::new(&bucket, "deleted-key", Ulid::r#gen())
+                key: VersionKey::new(&bucket, "deleted-key", Ulid::generate())
                     .to_bytes()
                     .unwrap()
                     .into(),

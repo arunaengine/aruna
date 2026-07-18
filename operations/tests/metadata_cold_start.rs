@@ -47,7 +47,7 @@ fn graph_iri(index: usize) -> String {
 }
 
 fn registry_record(group_id: GroupId, index: usize) -> MetadataRegistryRecord {
-    let document_id = Ulid::r#gen();
+    let document_id = Ulid::generate();
     MetadataRegistryRecord {
         realm_id: REALM,
         group_id,
@@ -151,7 +151,7 @@ async fn first_query_on_cold_node_with_40k_docs() -> Result<(), BoxError> {
 
     {
         let handle = std::sync::Arc::new(open_handle(metadata_dir.path(), &storage)?);
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
 
         let seed_started = Instant::now();
         let mut tasks = Vec::new();

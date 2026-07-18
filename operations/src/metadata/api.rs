@@ -2312,7 +2312,7 @@ mod tests {
         let remote_node_id = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
         let stale_node_id = iroh::SecretKey::from_bytes(&[23u8; 32]).public();
         let realm_id = RealmId([3u8; 32]);
-        let document_id = Ulid::r#gen();
+        let document_id = Ulid::generate();
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
         config.seed_default_placement();
         config.ensure_node(local_node_id, aruna_core::structs::RealmNodeKind::Server);
@@ -2330,7 +2330,7 @@ mod tests {
 
         let record = MetadataRegistryRecord {
             realm_id,
-            group_id: Ulid::r#gen(),
+            group_id: Ulid::generate(),
             document_id,
             document_path: "datasets/query-targets".to_string(),
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),

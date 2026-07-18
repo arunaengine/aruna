@@ -303,10 +303,10 @@ mod test {
             root: "/tmp".to_string(),
             storage_bucket: "parts".to_string(),
             backend_path: "path".to_string(),
-            ulid: Ulid::r#gen(),
+            ulid: Ulid::generate(),
             compressed: false,
             encrypted: false,
-            created_by: UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32])),
+            created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,
             partial: false,
@@ -320,8 +320,8 @@ mod test {
             upload_id,
             bucket: bucket.to_string(),
             key: key.to_string(),
-            group_id: Ulid::r#gen(),
-            created_by: UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32])),
+            group_id: Ulid::generate(),
+            created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
             created_at: SystemTime::UNIX_EPOCH,
             status: MultipartUploadStatus::Open,
             checksum_hint: None,
@@ -365,7 +365,7 @@ mod test {
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
 
-        let upload_id = Ulid::r#gen();
+        let upload_id = Ulid::generate();
         seed_upload(
             &storage_handle,
             &upload_record(upload_id, "bucket", "object"),
@@ -405,7 +405,7 @@ mod test {
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
 
-        let upload_id = Ulid::r#gen();
+        let upload_id = Ulid::generate();
         seed_upload(
             &storage_handle,
             &upload_record(upload_id, "bucket", "object"),
@@ -453,7 +453,7 @@ mod test {
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
 
-        let upload_id = Ulid::r#gen();
+        let upload_id = Ulid::generate();
         seed_upload(
             &storage_handle,
             &upload_record(upload_id, "bucket", "object"),
@@ -512,7 +512,7 @@ mod test {
             ListPartsOperation::new(ListPartsInput {
                 bucket: "bucket".to_string(),
                 key: "object".to_string(),
-                upload_id: Ulid::r#gen(),
+                upload_id: Ulid::generate(),
                 part_number_marker: None,
                 max_parts: ListPartsOperation::DEFAULT_MAX_PARTS,
             }),
@@ -530,7 +530,7 @@ mod test {
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
 
-        let upload_id = Ulid::r#gen();
+        let upload_id = Ulid::generate();
         seed_upload(
             &storage_handle,
             &upload_record(upload_id, "bucket", "object"),
@@ -559,7 +559,7 @@ mod test {
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
 
-        let upload_id = Ulid::r#gen();
+        let upload_id = Ulid::generate();
         let mut record = upload_record(upload_id, "bucket", "object");
         record.status = MultipartUploadStatus::Completing;
         seed_upload(&storage_handle, &record).await;

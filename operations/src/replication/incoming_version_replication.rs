@@ -1838,8 +1838,8 @@ mod tests {
         BackendLocation {
             root: "/tmp".to_string(),
             storage_bucket: "blob-bucket".to_string(),
-            backend_path: format!("bucket/key_{}", Ulid::r#gen()),
-            ulid: Ulid::r#gen(),
+            backend_path: format!("bucket/key_{}", Ulid::generate()),
+            ulid: Ulid::generate(),
             compressed: false,
             encrypted: false,
             created_by: test_user_id(),
@@ -1878,7 +1878,7 @@ mod tests {
         VersionReplicationManifest {
             bucket: "bucket".to_string(),
             key: "dir/file.txt".to_string(),
-            version_id: Ulid::r#gen(),
+            version_id: Ulid::generate(),
             group_id: test_group_id(),
             kind,
             created_at: SystemTime::now(),
@@ -1915,7 +1915,7 @@ mod tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
             },
-            connector_id: Some(Ulid::r#gen()),
+            connector_id: Some(Ulid::generate()),
         }
     }
 
@@ -2018,10 +2018,10 @@ mod tests {
     }
 
     fn start_apply_transaction(op: &mut IncomingVersionReplicationOperation) -> Ulid {
-        let txn_id = Ulid::r#gen();
+        let txn_id = Ulid::generate();
         op.state = IncomingVersionReplicationState::StartTransaction;
         op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
-        op.destination_group_id = Some(Ulid::r#gen());
+        op.destination_group_id = Some(Ulid::generate());
 
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert_eq!(op.state, IncomingVersionReplicationState::ReadObjectLookup);
@@ -2037,13 +2037,13 @@ mod tests {
     fn existing_version_skips() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest.clone(),
         );
 
-        let _effects = advance_to_version_lookup(&mut op, Ulid::r#gen());
+        let _effects = advance_to_version_lookup(&mut op, Ulid::generate());
 
         let version = BlobVersion::materialized(
             manifest.blob.as_ref().unwrap().hash,
@@ -2069,7 +2069,7 @@ mod tests {
     fn existing_delete_skips() {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             test_realm_id(),
             manifest,
@@ -2094,7 +2094,7 @@ mod tests {
     fn reference_requests_metadata() {
         let manifest = make_reference_manifest();
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             test_realm_id(),
             manifest,
@@ -2131,12 +2131,12 @@ mod tests {
         let expected_source = manifest.source.clone().unwrap();
         let expected_metadata = manifest.reference_metadata.clone().unwrap();
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             test_realm_id(),
             manifest,
         );
-        op.txn_id = Some(Ulid::r#gen());
+        op.txn_id = Some(Ulid::generate());
 
         let effects = op.write_blob_version();
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
@@ -2159,11 +2159,11 @@ mod tests {
     fn hop_limit_rejects() {
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         manifest.origin = Some(SyncOrigin {
-            relationship_id: Ulid::r#gen(),
+            relationship_id: Ulid::generate(),
             hop_count: 5,
         });
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             test_realm_id(),
             manifest,
@@ -2183,7 +2183,7 @@ mod tests {
     #[test]
     fn obligation_keeps_origin() {
         let origin = SyncOrigin {
-            relationship_id: Ulid::r#gen(),
+            relationship_id: Ulid::generate(),
             hop_count: 2,
         };
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
@@ -2197,7 +2197,7 @@ mod tests {
             .unwrap(),
         );
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             test_realm_id(),
             manifest,
@@ -2218,7 +2218,7 @@ mod tests {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let group_id = test_group_id();
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             test_realm_id(),
             manifest,
@@ -2253,7 +2253,7 @@ mod tests {
             })]
         ));
 
-        let txn_id = Ulid::r#gen();
+        let txn_id = Ulid::generate();
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert_eq!(op.state, IncomingVersionReplicationState::EnforceQuota);
         assert!(matches!(
@@ -2294,13 +2294,13 @@ mod tests {
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         manifest.current_version_generation = Some(10);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest.clone(),
         );
         let txn_id = start_apply_transaction(&mut op);
-        let existing_pointer = CurrentVersionPointer::new_with_generation(Ulid::r#gen(), 20);
+        let existing_pointer = CurrentVersionPointer::new_with_generation(Ulid::generate(), 20);
 
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
@@ -2322,12 +2322,12 @@ mod tests {
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         manifest.current_version_generation = None;
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
-        let txn_id = Ulid::r#gen();
+        let txn_id = Ulid::generate();
         op.state = IncomingVersionReplicationState::StartTransaction;
         op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
 
@@ -2350,7 +2350,7 @@ mod tests {
     fn unparsable_existing_current_pointer_rejects_apply() {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
@@ -2378,13 +2378,13 @@ mod tests {
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         manifest.current_version_generation = Some(1);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest.clone(),
         );
         start_apply_transaction(&mut op);
-        let existing_pointer = CurrentVersionPointer::new_with_generation(Ulid::r#gen(), 2);
+        let existing_pointer = CurrentVersionPointer::new_with_generation(Ulid::generate(), 2);
 
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
@@ -2406,13 +2406,13 @@ mod tests {
         manifest.source = Some(source.clone());
         manifest.current_version = false;
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
-        op.txn_id = Some(Ulid::r#gen());
-        op.destination_group_id = Some(Ulid::r#gen());
+        op.txn_id = Some(Ulid::generate());
+        op.destination_group_id = Some(Ulid::generate());
         op.existing_blob_location = Some(make_location());
 
         let effects = op.write_version();
@@ -2428,14 +2428,14 @@ mod tests {
     fn write_version_indexes_non_current_materialized_version_by_content_hash() {
         let mut manifest = make_manifest(ReplicationItemKind::Materialized);
         manifest.current_version = false;
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest.clone(),
         );
-        op.txn_id = Some(Ulid::r#gen());
+        op.txn_id = Some(Ulid::generate());
         op.destination_group_id = Some(group_id);
         op.existing_blob_location = Some(make_location());
 
@@ -2507,7 +2507,7 @@ mod tests {
         manifest.version_id = incoming_version_id;
         manifest.current_version_generation = Some(20);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest.clone(),
@@ -2568,13 +2568,13 @@ mod tests {
         let mut manifest = make_manifest(ReplicationItemKind::Materialized);
         manifest.current_version_generation = Some(2);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
         start_apply_transaction(&mut op);
-        let existing_pointer = CurrentVersionPointer::new_with_generation(Ulid::r#gen(), 1);
+        let existing_pointer = CurrentVersionPointer::new_with_generation(Ulid::generate(), 1);
 
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
@@ -2613,7 +2613,7 @@ mod tests {
         manifest.version_id = incoming_version_id;
         manifest.current_version_generation = Some(7);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest.clone(),
@@ -2668,7 +2668,7 @@ mod tests {
         manifest.version_id = incoming_version_id;
         manifest.current_version_generation = Some(7);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
@@ -2697,7 +2697,7 @@ mod tests {
         let local_node_id = iroh::SecretKey::generate().public();
         let local_realm_id = RealmId::from_bytes([7u8; 32]);
         let op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             local_node_id,
             local_realm_id,
             manifest,
@@ -2720,13 +2720,13 @@ mod tests {
     fn existing_blob_with_manifest_mismatch_requests_blob_transfer() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
 
-        let _effects = advance_to_version_lookup(&mut op, Ulid::r#gen());
+        let _effects = advance_to_version_lookup(&mut op, Ulid::generate());
         let effects = advance_blob_lookup(&mut op);
         assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
         assert!(matches!(
@@ -2754,13 +2754,13 @@ mod tests {
     fn missing_blob_requests_location_lookup_in_new_keyspace() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
 
-        let _effects = advance_to_version_lookup(&mut op, Ulid::r#gen());
+        let _effects = advance_to_version_lookup(&mut op, Ulid::generate());
         let effects = advance_blob_lookup(&mut op);
 
         assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
@@ -2774,7 +2774,7 @@ mod tests {
     #[test]
     fn received_blob_manifest_mismatch_is_rejected_and_cleaned_up() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
-        let stream_id = Ulid::r#gen();
+        let stream_id = Ulid::generate();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
             iroh::SecretKey::generate().public(),
@@ -2813,7 +2813,7 @@ mod tests {
     fn unbuildable_bucket_rejects() {
         // One create attempt, still missing, then reject and close the stream.
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
-        let stream_id = Ulid::r#gen();
+        let stream_id = Ulid::generate();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
             iroh::SecretKey::generate().public(),
@@ -2857,7 +2857,7 @@ mod tests {
     #[test]
     fn denied_write_permission_is_rejected_during_negotiation() {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
-        let stream_id = Ulid::r#gen();
+        let stream_id = Ulid::generate();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
             iroh::SecretKey::generate().public(),
@@ -2868,7 +2868,7 @@ mod tests {
         op.start();
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: b"bucket".to_vec().into(),
-            value: Some(make_bucket_info(Ulid::r#gen()).to_bytes().unwrap().into()),
+            value: Some(make_bucket_info(Ulid::generate()).to_bytes().unwrap().into()),
         }));
         assert_eq!(op.state, IncomingVersionReplicationState::CheckPermissions);
         assert!(matches!(effects[0], Effect::SubOperation(_)));
@@ -2896,7 +2896,7 @@ mod tests {
     fn authorization_errors_are_rejected_during_negotiation() {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
@@ -2905,7 +2905,7 @@ mod tests {
         op.start();
         op.step(Event::Storage(StorageEvent::ReadResult {
             key: b"bucket".to_vec().into(),
-            value: Some(make_bucket_info(Ulid::r#gen()).to_bytes().unwrap().into()),
+            value: Some(make_bucket_info(Ulid::generate()).to_bytes().unwrap().into()),
         }));
 
         let effects = op.step(Event::SubOperation(
@@ -2924,13 +2924,13 @@ mod tests {
     fn delete_marker_requests_version_only() {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
 
-        let _effects = advance_to_version_lookup(&mut op, Ulid::r#gen());
+        let _effects = advance_to_version_lookup(&mut op, Ulid::generate());
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: None,
@@ -2949,13 +2949,13 @@ mod tests {
     fn missing_blob_requests_blob_transfer() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
 
-        let _effects = advance_to_version_lookup(&mut op, Ulid::r#gen());
+        let _effects = advance_to_version_lookup(&mut op, Ulid::generate());
         let effects = advance_blob_lookup(&mut op);
         assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
         assert!(matches!(
@@ -2979,8 +2979,8 @@ mod tests {
     #[test]
     fn apply_failures_send_explicit_rejection_before_abort() {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
-        let stream_id = Ulid::r#gen();
-        let txn_id = Ulid::r#gen();
+        let stream_id = Ulid::generate();
+        let txn_id = Ulid::generate();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
             iroh::SecretKey::generate().public(),
@@ -3017,9 +3017,9 @@ mod tests {
     #[test]
     fn received_blobs_are_deleted_after_apply_failure_before_commit() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
-        let stream_id = Ulid::r#gen();
+        let stream_id = Ulid::generate();
         let received = make_location();
-        let txn_id = Ulid::r#gen();
+        let txn_id = Ulid::generate();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
             iroh::SecretKey::generate().public(),
@@ -3068,8 +3068,8 @@ mod tests {
     #[test]
     fn failures_without_received_blob_close_without_delete() {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
-        let stream_id = Ulid::r#gen();
-        let txn_id = Ulid::r#gen();
+        let stream_id = Ulid::generate();
+        let txn_id = Ulid::generate();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
             iroh::SecretKey::generate().public(),
@@ -3106,7 +3106,7 @@ mod tests {
     #[test]
     fn committed_replication_does_not_delete_received_blob_on_late_failure() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
-        let stream_id = Ulid::r#gen();
+        let stream_id = Ulid::generate();
         let received = make_location();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
@@ -3121,7 +3121,7 @@ mod tests {
         op.apply_committed = true;
 
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::r#gen(),
+            txn_id: Ulid::generate(),
         }));
         assert_eq!(op.state, IncomingVersionReplicationState::Error);
         assert_eq!(effects.len(), 1);
@@ -3134,7 +3134,7 @@ mod tests {
     fn missing_bucket_op() -> IncomingVersionReplicationOperation {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             test_realm_id(),
             manifest,
@@ -3182,7 +3182,7 @@ mod tests {
     fn create_invalid_event() {
         let mut op = missing_bucket_op();
         op.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::r#gen(),
+            txn_id: Ulid::generate(),
         }));
         assert_eq!(op.state, IncomingVersionReplicationState::Error);
     }

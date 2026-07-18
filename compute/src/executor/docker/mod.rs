@@ -1605,7 +1605,8 @@ fn inspect_to_status(inspect: ContainerInspectResponse) -> AttemptStatus {
         ContainerStateStatusEnum::RUNNING
         | ContainerStateStatusEnum::PAUSED
         | ContainerStateStatusEnum::RESTARTING
-        | ContainerStateStatusEnum::REMOVING => AttemptPhase::Running,
+        | ContainerStateStatusEnum::REMOVING
+        | ContainerStateStatusEnum::STOPPING => AttemptPhase::Running,
         ContainerStateStatusEnum::CREATED | ContainerStateStatusEnum::EMPTY => {
             AttemptPhase::Submitted
         }

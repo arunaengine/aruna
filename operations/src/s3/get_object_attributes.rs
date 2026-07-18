@@ -491,11 +491,11 @@ mod tests {
             root: "/tmp".to_string(),
             storage_bucket: "mybucket".to_string(),
             backend_path: "hello.txt".to_string(),
-            ulid: Ulid::r#gen(),
+            ulid: Ulid::generate(),
             compressed: false,
             encrypted: false,
             created_at: SystemTime::UNIX_EPOCH,
-            created_by: UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32])),
+            created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
             staging: false,
             partial: false,
             blob_size: 10,
@@ -609,7 +609,7 @@ mod tests {
         let driver_ctx = driver_context(storage_handle.clone());
 
         let location = location();
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         seed_current_version(&storage_handle, &location, version_id).await;
         seed_multipart_metadata(
             &storage_handle,
@@ -654,7 +654,7 @@ mod tests {
         let driver_ctx = driver_context(storage_handle.clone());
 
         let location = location();
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         seed_current_version(&storage_handle, &location, version_id).await;
 
         let result = drive(
@@ -685,7 +685,7 @@ mod tests {
         let driver_ctx = driver_context(storage_handle.clone());
 
         let location = location();
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         write(
             &storage_handle,
             BLOB_VERSIONS_KEYSPACE,
@@ -736,7 +736,7 @@ mod tests {
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
 
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         write(
             &storage_handle,
             BLOB_VERSIONS_KEYSPACE,

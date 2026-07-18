@@ -82,7 +82,7 @@ async fn emit_replication_watch(
     emit_resource_watch_event(
         context,
         WatchEvent {
-            event_id: Ulid::r#gen(),
+            event_id: Ulid::generate(),
             realm_id: manifest.auth_context.realm_id,
             kind: WatchEventKind::DataUploaded,
             path: data_watch_resource_path(group_id, node_id, &manifest.bucket, &manifest.key),
@@ -470,7 +470,7 @@ async fn reemit_evicted_documents(
     let mut written = 0usize;
     for document in documents {
         let record = new_outbox_record_with_id(
-            document.event_id.unwrap_or_else(ulid::Ulid::r#gen),
+            document.event_id.unwrap_or_else(ulid::Ulid::generate),
             node_id,
             document.target,
             Vec::new(),
@@ -727,8 +727,8 @@ mod tests {
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
         };
-        let document_id = ulid::Ulid::r#gen();
-        let event_id = ulid::Ulid::r#gen();
+        let document_id = ulid::Ulid::generate();
+        let event_id = ulid::Ulid::generate();
 
         project_inbound_metadata_create_events(
             &context,

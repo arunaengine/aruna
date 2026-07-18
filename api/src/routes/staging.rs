@@ -1056,7 +1056,7 @@ mod tests {
     #[tokio::test]
     async fn staging_queue_failure_after_snapshot_commit_leaves_obligation_repairable() {
         let test = setup_state().await;
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         write_doc(
             &test.state.get_ctx(),
             S3_BUCKET_REPLICATION_KEYSPACE,
@@ -1269,7 +1269,7 @@ mod tests {
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: "materialized".to_string(),
-            ulid: Ulid::r#gen(),
+            ulid: Ulid::generate(),
             compressed: false,
             encrypted: false,
             created_by,
@@ -1367,7 +1367,7 @@ mod tests {
         key: &str,
         version: BlobVersion,
     ) {
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         write_doc(
             driver_ctx,
             BLOB_HEAD_KEYSPACE,
@@ -1398,8 +1398,8 @@ mod tests {
         let realm_id =
             aruna_core::structs::RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_id = iroh::SecretKey::from_bytes(&[13u8; 32]).public();
-        let user_with_source_read = UserId::local(Ulid::r#gen(), realm_id);
-        let user_without_source_read = UserId::local(Ulid::r#gen(), realm_id);
+        let user_with_source_read = UserId::local(Ulid::generate(), realm_id);
+        let user_without_source_read = UserId::local(Ulid::generate(), realm_id);
         let actor = Actor {
             node_id,
             user_id: user_with_source_read,
@@ -1414,8 +1414,8 @@ mod tests {
             compute_handle: None,
         });
 
-        let bucket_group_id = Ulid::r#gen();
-        let source_group_id = Ulid::r#gen();
+        let bucket_group_id = Ulid::generate();
+        let source_group_id = Ulid::generate();
         let mut bucket_auth = GroupAuthorizationDocument::new_default_group_doc(
             user_with_source_read,
             realm_id,
@@ -1496,7 +1496,7 @@ mod tests {
 
         let bucket = "stage-bucket".to_string();
         let key = "test.txt".to_string();
-        let connector_id = Ulid::r#gen();
+        let connector_id = Ulid::generate();
         let source_path = "folder/file.txt".to_string();
         let bucket_info = BucketInfo {
             group_id: bucket_group_id,

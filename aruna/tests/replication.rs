@@ -1046,7 +1046,7 @@ async fn permission_rechecks_creator() -> TestResult<()> {
         let source_bucket = "permission-recheck-source";
         let target_bucket = "permission-recheck-target";
         let key = "after-removal/object.txt";
-        let creator_id = UserId::local(ulid::Ulid::r#gen(), harness.seed.realm_id);
+        let creator_id = UserId::local(ulid::Ulid::generate(), harness.seed.realm_id);
 
         harness
             .create_bucket_pair(source_bucket, target_bucket)

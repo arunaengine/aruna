@@ -117,7 +117,7 @@ async fn run_writer(
     let mut latencies = Vec::with_capacity(PER_WRITER);
     let mut batch = Vec::new();
     for index in 0..PER_WRITER {
-        let document_id = Ulid::r#gen();
+        let document_id = Ulid::generate();
         let payload = if index % 2 == 0 {
             scaffold_payload(writer, index)
         } else {
@@ -129,7 +129,7 @@ async fn run_writer(
                 CreateMetadataDocumentConfig {
                     actor: Actor {
                         node_id,
-                        user_id: UserId::local(Ulid::r#gen(), realm_id),
+                        user_id: UserId::local(Ulid::generate(), realm_id),
                         realm_id,
                     },
                     group_id,
@@ -162,7 +162,7 @@ async fn run_writer(
 async fn run_phase(label: &str, with_drains: bool) -> Result<(), BoxError> {
     let node = spawn_probe_node(with_drains).await?;
     let realm_id = RealmId([55u8; 32]);
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
 
     let started = Instant::now();
     let mut handles = Vec::with_capacity(WRITERS);

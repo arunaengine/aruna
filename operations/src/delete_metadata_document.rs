@@ -168,7 +168,7 @@ impl DeleteMetadataDocumentOperation {
     ) -> MetadataDocumentLifecycleRecord {
         MetadataDocumentLifecycleRecord::Delete {
             event: MetadataDocumentDeleteRecord {
-                event_id: Ulid::r#gen(),
+                event_id: Ulid::generate(),
                 tombstone,
                 deleted_after_event_id: record.last_event_id,
             },
@@ -229,7 +229,7 @@ impl DeleteMetadataDocumentOperation {
         };
         let bytes = postcard::to_allocvec(lifecycle_record)
             .map_err(|error| DeleteMetadataDocumentError::ConversionError(error.into()))?;
-        let outbox_id = Ulid::r#gen();
+        let outbox_id = Ulid::generate();
         let change = DocumentSyncChange {
             base: None,
             current: DocumentSyncRevision {
@@ -521,7 +521,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                     self.state = DeleteMetadataDocumentState::WriteAudit;
                     match write_audit_effect(
                         &self.audit_record(record),
-                        Ulid::r#gen(),
+                        Ulid::generate(),
                         Some(txn_id),
                     ) {
                         Ok(effect) => smallvec![effect],
@@ -741,16 +741,16 @@ mod tests {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         aruna_core::structs::Actor {
             node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
+            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
             realm_id,
         }
     }
 
     fn record(actor: &aruna_core::structs::Actor) -> MetadataRegistryRecord {
-        let group_id = Ulid::r#gen();
-        let document_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
+        let document_id = Ulid::generate();
         let document_path = "datasets/delete-lifecycle";
-        let last_event_id = Ulid::r#gen();
+        let last_event_id = Ulid::generate();
         MetadataRegistryRecord {
             realm_id: actor.realm_id,
             group_id,
@@ -873,12 +873,12 @@ mod tests {
             .expect("document lifecycle outbox builds");
         let graph_outbox = outbox_from_effects(
             operation
-                .graph_lifecycle_outbox_effect(&record, Ulid::r#gen())
+                .graph_lifecycle_outbox_effect(&record, Ulid::generate())
                 .expect("graph lifecycle outbox builds"),
         );
         let registry_outbox = outbox_from_effects(
             operation
-                .registry_delete_outbox_effect(&record, Ulid::r#gen())
+                .registry_delete_outbox_effect(&record, Ulid::generate())
                 .expect("registry delete outbox builds"),
         );
         let DocumentSyncOutboxEvent::Upsert {
@@ -942,7 +942,7 @@ mod tests {
             })]
         ));
 
-        let txn_id = Ulid::r#gen();
+        let txn_id = Ulid::generate();
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert!(matches!(
             effects.as_slice(),

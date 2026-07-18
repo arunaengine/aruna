@@ -664,7 +664,7 @@ impl DeleteObjectOperation {
     }
 
     fn write_tombstone(&mut self) -> Effects {
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         self.version_id = Some(version_id);
         self.deleted_version_created_at = Some(SystemTime::now());
         self.read_current_lookup(version_id)
@@ -862,7 +862,7 @@ mod test {
     use ulid::Ulid;
 
     fn test_user_id() -> aruna_core::UserId {
-        aruna_core::UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32]))
+        aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]))
     }
 
     fn deleted_version_value(user_id: aruna_core::UserId) -> aruna_core::types::Value {
@@ -889,7 +889,7 @@ mod test {
 
     #[test]
     fn native_counts_overhead() {
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let version = BlobVersion::reference(
             VersionSourceBinding {
                 strategy: StagingStrategy::Reference,
@@ -951,7 +951,7 @@ mod test {
             bucket: "bucket".to_string(),
             key: "key".to_string(),
             version_id: Some(target_version_id),
-            group_id: Ulid::r#gen(),
+            group_id: Ulid::generate(),
             realm_id: RealmId::from_bytes([1u8; 32]),
             node_id: iroh::SecretKey::generate().public(),
             deleted_by: user_id,
@@ -966,7 +966,7 @@ mod test {
         ));
 
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::r#gen(),
+            txn_id: Ulid::generate(),
         }));
         assert!(matches!(
             effects.as_slice(),
@@ -1101,8 +1101,8 @@ mod test {
             DeleteObjectOperation::new(DeleteObjectInput {
                 bucket: "mybucket".to_string(),
                 key: "missing.txt".to_string(),
-                version_id: Some(Ulid::r#gen()),
-                group_id: Ulid::r#gen(),
+                version_id: Some(Ulid::generate()),
+                group_id: Ulid::generate(),
                 realm_id: RealmId::from_bytes([1u8; 32]),
                 node_id: iroh::SecretKey::generate().public(),
                 deleted_by: test_user_id(),
@@ -1150,8 +1150,8 @@ mod test {
             compute_handle: None,
         };
 
-        let user_id = aruna_core::UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32]));
-        let group_id = Ulid::r#gen();
+        let user_id = aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]));
+        let group_id = Ulid::generate();
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let node_id = context.net_handle.as_ref().unwrap().node_id();
         let put_result = drive(
@@ -1257,7 +1257,7 @@ mod test {
                 key: "to-delete.txt".to_string(),
                 version_id: None,
                 range: None,
-                group_id: Ulid::r#gen(),
+                group_id: Ulid::generate(),
                 user_identity: user_id,
             }),
             &context,
@@ -1302,8 +1302,8 @@ mod test {
             compute_handle: None,
         };
 
-        let user_id = aruna_core::UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32]));
-        let group_id = Ulid::r#gen();
+        let user_id = aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]));
+        let group_id = Ulid::generate();
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let node_id = context.net_handle.as_ref().unwrap().node_id();
         let put_result = drive(
@@ -1425,7 +1425,7 @@ mod test {
                 key: "versioned.txt".to_string(),
                 version_id: None,
                 range: None,
-                group_id: Ulid::r#gen(),
+                group_id: Ulid::generate(),
                 user_identity: user_id,
             }),
             &context,
@@ -1474,7 +1474,7 @@ mod test {
                 key: "versioned.txt".to_string(),
                 version_id: None,
                 range: None,
-                group_id: Ulid::r#gen(),
+                group_id: Ulid::generate(),
                 user_identity: user_id,
             }),
             &context,

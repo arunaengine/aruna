@@ -645,11 +645,11 @@ mod test {
             compute_handle: None,
         };
 
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let realm_id = RealmId([7u8; 32]);
-        let created_by = UserId::local(Ulid::r#gen(), realm_id);
-        let live_version_id = Ulid::r#gen();
-        let deleted_version_id = Ulid::r#gen();
+        let created_by = UserId::local(Ulid::generate(), realm_id);
+        let live_version_id = Ulid::generate();
+        let deleted_version_id = Ulid::generate();
         let live_hash = [3u8; 32];
         let created_at = UNIX_EPOCH + Duration::from_secs(5);
 
@@ -693,7 +693,7 @@ mod test {
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: "path".to_string(),
-            ulid: Ulid::r#gen(),
+            ulid: Ulid::generate(),
             compressed: false,
             encrypted: false,
             created_by,
@@ -746,8 +746,8 @@ mod test {
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
 
-        let group_id = Ulid::r#gen();
-        let created_by = UserId::local(Ulid::r#gen(), RealmId([7u8; 32]));
+        let group_id = Ulid::generate();
+        let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(
             &storage_handle,
@@ -803,8 +803,8 @@ mod test {
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
 
-        let group_id = Ulid::r#gen();
-        let created_by = UserId::local(Ulid::r#gen(), RealmId([7u8; 32]));
+        let group_id = Ulid::generate();
+        let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(
             &storage_handle,
@@ -861,11 +861,11 @@ mod test {
             compute_handle: None,
         };
 
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let realm_id = RealmId([7u8; 32]);
-        let created_by = UserId::local(Ulid::r#gen(), realm_id);
+        let created_by = UserId::local(Ulid::generate(), realm_id);
         let created_at = UNIX_EPOCH + Duration::from_secs(5);
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let hash = [3u8; 32];
 
         let _ = storage_handle
@@ -925,8 +925,8 @@ mod test {
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
 
-        let group_id = Ulid::r#gen();
-        let created_by = UserId::local(Ulid::r#gen(), RealmId([7u8; 32]));
+        let group_id = Ulid::generate();
+        let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(
             &storage_handle,
@@ -990,7 +990,7 @@ mod test {
             compute_handle: None,
         };
 
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
 
         let result = drive(
             ListObjectsV2Operation::new(ListObjectsV2Input {
@@ -1027,10 +1027,10 @@ mod test {
             compute_handle: None,
         };
 
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let realm_id = RealmId([7u8; 32]);
-        let created_by = UserId::local(Ulid::r#gen(), realm_id);
-        let version_id = Ulid::r#gen();
+        let created_by = UserId::local(Ulid::generate(), realm_id);
+        let version_id = Ulid::generate();
         let created_at = UNIX_EPOCH + Duration::from_secs(5);
         let last_refresh = UNIX_EPOCH + Duration::from_secs(20);
 
@@ -1142,7 +1142,7 @@ mod test {
     ) {
         let created_at = UNIX_EPOCH + Duration::from_secs(5);
         for (index, key) in keys.iter().enumerate() {
-            let version_id = Ulid::r#gen();
+            let version_id = Ulid::generate();
             let hash = [index as u8 + 1; 32];
             let version = BlobVersion::materialized(hash, created_at, created_by, None);
             let _ = storage_handle
@@ -1175,7 +1175,7 @@ mod test {
                         root: "/tmp".to_string(),
                         storage_bucket: "objects".to_string(),
                         backend_path: format!("path/{key}"),
-                        ulid: Ulid::r#gen(),
+                        ulid: Ulid::generate(),
                         compressed: false,
                         encrypted: false,
                         created_by,
@@ -1203,7 +1203,7 @@ mod test {
         let result = drive(
             ListObjectsV2Operation::new(ListObjectsV2Input {
                 bucket: bucket.to_string(),
-                group_id: Ulid::r#gen(),
+                group_id: Ulid::generate(),
                 continuation_token: None,
                 max_keys: Some(100),
                 prefix: prefix.map(str::to_string),
@@ -1229,7 +1229,7 @@ mod test {
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
-        let created_by = UserId::local(Ulid::r#gen(), RealmId([7u8; 32]));
+        let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(
             &storage_handle,
@@ -1252,7 +1252,7 @@ mod test {
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
-        let created_by = UserId::local(Ulid::r#gen(), RealmId([7u8; 32]));
+        let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(&storage_handle, "bucket", &["rare0", "rare/1"], created_by).await;
 
@@ -1266,7 +1266,7 @@ mod test {
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
-        let created_by = UserId::local(Ulid::r#gen(), RealmId([7u8; 32]));
+        let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(&storage_handle, "bucket", &["b", "aa", "a/1"], created_by).await;
 
@@ -1280,7 +1280,7 @@ mod test {
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
-        let created_by = UserId::local(Ulid::r#gen(), RealmId([7u8; 32]));
+        let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(&storage_handle, "bucket", &["a", "b", "c"], created_by).await;
 
@@ -1300,7 +1300,7 @@ mod test {
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
-        let created_by = UserId::local(Ulid::r#gen(), RealmId([7u8; 32]));
+        let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(&storage_handle, "bucket", &["docs/1", "docs/2"], created_by).await;
 
@@ -1321,7 +1321,7 @@ mod test {
         drive(
             ListObjectsV2Operation::new(ListObjectsV2Input {
                 bucket: bucket.to_string(),
-                group_id: Ulid::r#gen(),
+                group_id: Ulid::generate(),
                 continuation_token,
                 max_keys: Some(max_keys),
                 prefix: None,
@@ -1342,7 +1342,7 @@ mod test {
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
-        let created_by = UserId::local(Ulid::r#gen(), RealmId([7u8; 32]));
+        let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(
             &storage_handle,
@@ -1370,7 +1370,7 @@ mod test {
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
-        let created_by = UserId::local(Ulid::r#gen(), RealmId([7u8; 32]));
+        let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         seed_materialized_keys(
             &storage_handle,
@@ -1416,7 +1416,7 @@ mod test {
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
 
-        let created_by = UserId::local(Ulid::r#gen(), RealmId([7u8; 32]));
+        let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
         let created_at = UNIX_EPOCH + Duration::from_secs(5);
         let last_refresh = UNIX_EPOCH + Duration::from_secs(20);
 
@@ -1450,7 +1450,7 @@ mod test {
         let deleted = BlobVersion::deleted(created_at, created_by);
 
         for (key, version) in [("beta", reference), ("gamma", deleted)] {
-            let version_id = Ulid::r#gen();
+            let version_id = Ulid::generate();
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
                     key_space: BLOB_HEAD_KEYSPACE.to_string(),
@@ -1478,7 +1478,7 @@ mod test {
         let result = drive(
             ListObjectsV2Operation::new(ListObjectsV2Input {
                 bucket: "bucket".to_string(),
-                group_id: Ulid::r#gen(),
+                group_id: Ulid::generate(),
                 continuation_token: None,
                 max_keys: Some(10),
                 prefix: None,
@@ -1510,7 +1510,7 @@ mod test {
     ) -> ListObjectsV2Input {
         ListObjectsV2Input {
             bucket: "bucket".to_string(),
-            group_id: Ulid::r#gen(),
+            group_id: Ulid::generate(),
             continuation_token,
             max_keys: Some(max_keys),
             prefix: None,
@@ -1526,7 +1526,7 @@ mod test {
             Effect::Storage(StorageEffect::StartTransaction { .. })
         ));
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::r#gen(),
+            txn_id: Ulid::generate(),
         }))
     }
 
@@ -1542,7 +1542,7 @@ mod test {
             panic!("expected initial scan round: {:?}", effects[0]);
         };
 
-        let pointer: aruna_core::types::Value = CurrentVersionPointer::new(Ulid::r#gen())
+        let pointer: aruna_core::types::Value = CurrentVersionPointer::new(Ulid::generate())
             .to_bytes()
             .unwrap()
             .into();
@@ -1603,7 +1603,7 @@ mod test {
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
-        let created_by = UserId::local(Ulid::r#gen(), RealmId([7u8; 32]));
+        let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
 
         let group_keys: Vec<String> = (0..30).map(|index| format!("dir/{index:02}")).collect();
         let mut keys: Vec<&str> = vec!["a"];

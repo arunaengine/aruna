@@ -90,7 +90,7 @@ pub async fn materialize_reference(
         Some(input.node_id),
         Some(head_result.connector.connector_id),
     );
-    let version_id = Ulid::r#gen();
+    let version_id = Ulid::generate();
     let now = SystemTime::now();
 
     let txn_id = match context
@@ -707,13 +707,13 @@ mod tests {
     async fn materialize_reference_retains_historical_hash_path_and_writes_blob_version() {
         let test_context = setup_driver_context().await;
         let context = &test_context.driver_context;
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let realm_id = RealmId::from_bytes([9u8; 32]);
         let node_id = iroh::SecretKey::generate().public();
 
         let initial = drive(
             PutObjectOperation::new(PutObjectConfig {
-                user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
+                user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
                 group_id,
                 realm_id,
                 node_id,
@@ -746,7 +746,7 @@ mod tests {
             context,
             MaterializeReferenceInput {
                 group_id,
-                user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
+                user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
                 realm_id,
                 node_id,
                 connector_id: connector.connector_id,
@@ -821,7 +821,7 @@ mod tests {
     async fn materialize_reference_rejects_over_quota_without_writing_head_or_usage() {
         let test_context = setup_driver_context().await;
         let context = &test_context.driver_context;
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let realm_id = RealmId::from_bytes([8u8; 32]);
         let node_id = iroh::SecretKey::generate().public();
         let (server, endpoint) = spawn_reference_server("ref-data").await;
@@ -831,7 +831,7 @@ mod tests {
             context,
             MaterializeReferenceInput {
                 group_id,
-                user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
+                user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
                 realm_id,
                 node_id,
                 connector_id: connector.connector_id,

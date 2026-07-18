@@ -1046,7 +1046,7 @@ mod tests {
         let result = list_connector_entries(
             State(test.state),
             Extension(Some(test.auth)),
-            Path((test.group_id.to_string(), Ulid::r#gen().to_string())),
+            Path((test.group_id.to_string(), Ulid::generate().to_string())),
             Query(ConnectorEntriesQuery {
                 path: "../secret".to_string(),
                 limit: None,
@@ -1064,7 +1064,7 @@ mod tests {
         let result = list_connector_entries(
             State(test.state),
             Extension(Some(test.other_auth)),
-            Path((test.group_id.to_string(), Ulid::r#gen().to_string())),
+            Path((test.group_id.to_string(), Ulid::generate().to_string())),
             Query(ConnectorEntriesQuery {
                 path: String::new(),
                 limit: None,
@@ -1123,8 +1123,8 @@ mod tests {
             storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
         let realm_id = aruna_core::structs::RealmId([3u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
-        let other_user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        let other_user_id = UserId::local(Ulid::generate(), realm_id);
         let actor = Actor {
             node_id,
             user_id,
@@ -1138,7 +1138,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         });
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let group_auth =
             GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
         let group = Group {

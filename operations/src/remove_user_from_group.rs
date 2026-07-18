@@ -831,7 +831,7 @@ pub mod test {
 
     async fn setup_group(context: &DriverContext) -> (Actor, Group, GroupAuthorizationDocument) {
         let realm_id = RealmId([0u8; 32]);
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let user_id = UserId::local(Ulid::generate(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let actor = Actor {
             node_id,
@@ -924,7 +924,7 @@ pub mod test {
 
         let effects = operation
             .emit_write_auth_doc_and_admin_state(
-                TxnId::r#gen(),
+                TxnId::generate(),
                 Some(auth_doc.to_bytes(&actor).unwrap().into()),
                 None,
                 None,
@@ -986,7 +986,7 @@ pub mod test {
         let (context, net_handle, _tmp) = test_context().await;
         let (actor, group, auth_doc) = setup_group(&context).await;
 
-        let member_id = UserId::local(Ulid::r#gen(), actor.realm_id);
+        let member_id = UserId::local(Ulid::generate(), actor.realm_id);
         let add_input = AddUserToGroupInput {
             actor: actor.clone(),
             group_id: group.group_id,
@@ -1060,7 +1060,7 @@ pub mod test {
         let (context, net_handle, _tmp) = test_context().await;
         let (actor, group, auth_doc) = setup_group(&context).await;
 
-        let member_id = UserId::local(Ulid::r#gen(), actor.realm_id);
+        let member_id = UserId::local(Ulid::generate(), actor.realm_id);
         let add_input = AddUserToGroupInput {
             actor: actor.clone(),
             group_id: group.group_id,
@@ -1124,7 +1124,7 @@ pub mod test {
         let (context, net_handle, _tmp) = test_context().await;
         let (actor, group, auth_doc) = setup_group(&context).await;
 
-        let member = UserId::local(Ulid::r#gen(), actor.realm_id);
+        let member = UserId::local(Ulid::generate(), actor.realm_id);
         drive(
             AddUserToGroupOperation::new(AddUserToGroupInput {
                 actor: actor.clone(),
@@ -1196,7 +1196,7 @@ pub mod test {
         operation.step(Event::SubOperation(
             SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
         ));
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
@@ -1233,7 +1233,7 @@ pub mod test {
         let (context, net_handle, _tmp) = test_context().await;
         let (actor, group, _auth_doc) = setup_group(&context).await;
 
-        let stranger = UserId::local(Ulid::r#gen(), actor.realm_id);
+        let stranger = UserId::local(Ulid::generate(), actor.realm_id);
         drive(
             RemoveUserFromGroupOperation::new(RemoveUserFromGroupInput {
                 actor: actor.clone(),
@@ -1256,7 +1256,7 @@ pub mod test {
         let (context, net_handle, _tmp) = test_context().await;
         let (actor, group, auth_doc) = setup_group(&context).await;
 
-        let member = UserId::local(Ulid::r#gen(), actor.realm_id);
+        let member = UserId::local(Ulid::generate(), actor.realm_id);
         let mut both_roles = role_ids_by_name(&auth_doc, "user");
         both_roles.extend(role_ids_by_name(&auth_doc, "admin"));
         drive(

@@ -752,7 +752,7 @@ pub mod test {
                 actor: actor.clone(),
                 realm_id,
                 role: Role {
-                    role_id: Ulid::r#gen(),
+                    role_id: Ulid::generate(),
                     name: name.to_string(),
                     permissions: HashMap::from([(
                         format!("/{realm_id}/data/**"),
@@ -785,7 +785,7 @@ pub mod test {
                 actor: actor.clone(),
                 realm_id,
                 role: Role {
-                    role_id: Ulid::r#gen(),
+                    role_id: Ulid::generate(),
                     name: "public".to_string(),
                     permissions: HashMap::from([(format!("/{realm_id}/data/**"), permission)]),
                     assigned_users: HashSet::from([UserId::nil(realm_id)]),
@@ -814,7 +814,7 @@ pub mod test {
             actor,
             realm_id,
             role: Role {
-                role_id: Ulid::r#gen(),
+                role_id: Ulid::generate(),
                 name: "foreign-nil".to_string(),
                 permissions: HashMap::from([(format!("/{realm_id}/data/**"), Permission::READ)]),
                 assigned_users: HashSet::from([UserId::nil(other_realm_id)]),
@@ -925,7 +925,7 @@ pub mod test {
             effects.first().unwrap(),
             &Effect::Storage(StorageEffect::StartTransaction { read: false })
         );
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert_eq!(
             effects.first().unwrap(),
@@ -1138,7 +1138,7 @@ pub mod test {
         };
 
         let realm_id = aruna_core::structs::RealmId([0u8; 32]);
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let user_id = UserId::local(Ulid::generate(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let realm_config = CreateRealmConfig {
             actor: Actor {
@@ -1171,7 +1171,7 @@ pub mod test {
             },
             realm_id,
             role: Role {
-                role_id: Ulid::r#gen(),
+                role_id: Ulid::generate(),
                 name: "test_role".to_string(),
                 permissions: HashMap::from([(
                     format!("{}/admin/create_group/*", realm_id),

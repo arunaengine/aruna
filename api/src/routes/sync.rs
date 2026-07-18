@@ -264,7 +264,7 @@ pub async fn create_sync(
     }
 
     let relationship = SyncRelationship {
-        id: Ulid::r#gen(),
+        id: Ulid::generate(),
         source,
         target,
         mode,

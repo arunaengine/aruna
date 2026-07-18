@@ -154,7 +154,7 @@ impl UpdateMetadataDocumentOperation {
     }
 
     fn update_event_record(&self, record: &MetadataRegistryRecord) -> MetadataCreateEventRecord {
-        let event_id = Ulid::r#gen();
+        let event_id = Ulid::generate();
         let mut record = record.clone();
         record.last_event_id = event_id;
         let occurred_at_ms = record.updated_at_ms;
@@ -528,14 +528,14 @@ mod tests {
         let realm_id = RealmId::from_bytes([9u8; 32]);
         Actor {
             node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
+            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
             realm_id,
         }
     }
 
     fn record(actor: &Actor) -> MetadataRegistryRecord {
-        let group_id = Ulid::r#gen();
-        let document_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
+        let document_id = Ulid::generate();
         let document_path = "datasets/update-atomicity";
         MetadataRegistryRecord {
             realm_id: actor.realm_id,
@@ -729,7 +729,7 @@ mod tests {
             epoch: 0,
             shard: 11,
         };
-        let txn_id = Ulid::r#gen();
+        let txn_id = Ulid::generate();
         let mut operation = UpdateMetadataDocumentOperation::new(config(
             actor,
             &record,
@@ -756,7 +756,7 @@ mod tests {
     fn replace_rocrate_validates_and_commits_update_intent_before_craqle_mutation() {
         let actor = actor();
         let record = record(&actor);
-        let txn_id = Ulid::r#gen();
+        let txn_id = Ulid::generate();
         let mut operation = UpdateMetadataDocumentOperation::new(config(
             actor,
             &record,
@@ -791,7 +791,7 @@ mod tests {
     fn entity_upsert_appends_durable_update_event_before_materialization() {
         let actor = actor();
         let record = record(&actor);
-        let txn_id = Ulid::r#gen();
+        let txn_id = Ulid::generate();
         let mut operation = UpdateMetadataDocumentOperation::new(config(
             actor,
             &record,
@@ -819,7 +819,7 @@ mod tests {
         let actor = actor();
         let mut record = record(&actor);
         record.holder_node_ids.clear();
-        let txn_id = Ulid::r#gen();
+        let txn_id = Ulid::generate();
         let mut operation = UpdateMetadataDocumentOperation::new(config(
             actor,
             &record,
@@ -906,7 +906,7 @@ mod tests {
     fn commit_failure_does_not_mutate_or_sync_graph() {
         let actor = actor();
         let record = record(&actor);
-        let txn_id = Ulid::r#gen();
+        let txn_id = Ulid::generate();
         let mut operation = UpdateMetadataDocumentOperation::new(config(
             actor,
             &record,

@@ -608,7 +608,7 @@ mod tests {
 
     fn create_event(document_id: Ulid, event_id: Ulid) -> MetadataCreateEventRecord {
         let realm_id = RealmId::from_bytes([8u8; 32]);
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let document_path = "datasets/lifecycle";
         let record = MetadataRegistryRecord {
             realm_id,
@@ -632,7 +632,7 @@ mod tests {
         MetadataCreateEventRecord {
             event_id,
             record,
-            user_id: UserId::local(Ulid::r#gen(), realm_id),
+            user_id: UserId::local(Ulid::generate(), realm_id),
             node_id: node(1),
             payload: MetadataCreateEventPayload::Scaffold {
                 name: "Lifecycle".to_string(),
@@ -646,8 +646,8 @@ mod tests {
 
     #[test]
     fn metadata_document_lifecycle_upsert_wraps_create_event() {
-        let document_id = Ulid::r#gen();
-        let event_id = Ulid::r#gen();
+        let document_id = Ulid::generate();
+        let event_id = Ulid::generate();
         let create = create_event(document_id, event_id);
 
         let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
@@ -667,11 +667,11 @@ mod tests {
 
     #[test]
     fn metadata_document_lifecycle_delete_carries_tombstone_and_fence() {
-        let document_id = Ulid::r#gen();
-        let event_id = Ulid::r#gen();
-        let deleted_after_event_id = Ulid::r#gen();
+        let document_id = Ulid::generate();
+        let event_id = Ulid::generate();
+        let deleted_after_event_id = Ulid::generate();
         let realm_id = RealmId::from_bytes([9u8; 32]);
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
         let tombstone = MetadataGraphLifecycleRecord::deleted(
             graph_iri.clone(),

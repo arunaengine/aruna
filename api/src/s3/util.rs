@@ -497,7 +497,7 @@ mod tests {
 
     #[test]
     fn parses_bucket_copy_source_with_version() {
-        let version = Ulid::r#gen();
+        let version = Ulid::generate();
         let source = CopySource::Bucket {
             bucket: "src-bucket".into(),
             key: "object.txt".into(),

@@ -1607,7 +1607,7 @@ impl Operation for ReplicateObjectVersionOperation {
                             return self.fail(ReplicateObjectVersionError::MissingBlobHash);
                         };
                         self.state = ReplicateObjectVersionState::TransferBlob;
-                        let replication_id = Ulid::r#gen();
+                        let replication_id = Ulid::generate();
                         self.blob_replication_id = Some(replication_id);
                         debug!(
                             bucket = %self.request.bucket,
@@ -1814,7 +1814,7 @@ mod tests {
 
     fn bucket_info() -> BucketInfo {
         BucketInfo {
-            group_id: Ulid::r#gen(),
+            group_id: Ulid::generate(),
             created_at: SystemTime::now(),
             created_by: test_user_id(),
             cors_configuration: None,
@@ -1909,8 +1909,8 @@ mod tests {
         BackendLocation {
             root: "/tmp".to_string(),
             storage_bucket: "blob-bucket".to_string(),
-            backend_path: format!("bucket/key_{}", Ulid::r#gen()),
-            ulid: Ulid::r#gen(),
+            backend_path: format!("bucket/key_{}", Ulid::generate()),
+            ulid: Ulid::generate(),
             compressed: false,
             encrypted: false,
             created_by: test_user_id(),
@@ -1930,7 +1930,7 @@ mod tests {
             bucket: "bucket".to_string(),
             key: "dir/file.txt".to_string(),
             version_id,
-            source_group_id: Ulid::r#gen(),
+            source_group_id: Ulid::generate(),
             target_node_id: iroh::SecretKey::generate().public(),
             auth_context: auth_context(),
             mode,
@@ -1947,7 +1947,7 @@ mod tests {
             source_prefix: None,
             target_prefix: Some("copied/file.txt".to_string()),
             source_node_id: iroh::SecretKey::generate().public(),
-            relationship_id: Ulid::r#gen(),
+            relationship_id: Ulid::generate(),
             reference_intent: true,
             origin: None,
             upstream_sources: Vec::new(),
@@ -1996,12 +1996,12 @@ mod tests {
             panic!("expected iteration after exact object lookup")
         };
 
-        let matching_version = Ulid::r#gen();
+        let matching_version = Ulid::generate();
         let effects = op.step(Event::Storage(StorageEvent::IterResult {
             values: vec![
                 version_entry("dir/file.txt", matching_version),
-                version_entry("dir/file.txt.bak", Ulid::r#gen()),
-                version_entry("dir/sub/file.txt", Ulid::r#gen()),
+                version_entry("dir/file.txt.bak", Ulid::generate()),
+                version_entry("dir/sub/file.txt", Ulid::generate()),
             ],
             next_start_after: None,
         }));
@@ -2033,9 +2033,9 @@ mod tests {
 
         let effects = op.step(Event::Storage(StorageEvent::IterResult {
             values: vec![
-                version_entry("dir/file-a", Ulid::r#gen()),
-                version_entry("dir/file/b", Ulid::r#gen()),
-                version_entry("dir/other", Ulid::r#gen()),
+                version_entry("dir/file-a", Ulid::generate()),
+                version_entry("dir/file/b", Ulid::generate()),
+                version_entry("dir/other", Ulid::generate()),
             ],
             next_start_after: None,
         }));
@@ -2066,7 +2066,7 @@ mod tests {
 
     #[test]
     fn multipart_metadata_paginates_across_multiple_iter_pages() {
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let mut op = ReplicateObjectVersionOperation::new(version_request(version_id));
         let location = materialized_location();
 
@@ -2146,7 +2146,7 @@ mod tests {
 
     #[test]
     fn multipart_metadata_rejects_incomplete_part_set() {
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let mut op = ReplicateObjectVersionOperation::new(version_request(version_id));
         let location = materialized_location();
 
@@ -2195,7 +2195,7 @@ mod tests {
 
     #[test]
     fn manifest_includes_sender_current_pointer_generation() {
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let generation = 42;
         let mut op = ReplicateObjectVersionOperation::new(version_request(version_id));
         op.replication_version = Some(ReplicationVersion::Deleted {
@@ -2215,7 +2215,7 @@ mod tests {
 
     #[test]
     fn manifest_includes_source_binding_for_materialized_version() {
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let source = reference_source_binding();
         let mut op = ReplicateObjectVersionOperation::new(version_request(version_id));
         op.replication_version = Some(ReplicationVersion::Materialized {
@@ -2237,7 +2237,7 @@ mod tests {
 
     #[test]
     fn builds_reference_manifest() {
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let sync = reference_sync();
         let location = materialized_location();
         let source_node_id = sync.source_node_id;
@@ -2286,7 +2286,7 @@ mod tests {
 
     #[test]
     fn manifest_omits_source_binding_for_delete_marker() {
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let mut op = ReplicateObjectVersionOperation::new(version_request(version_id));
         op.replication_version = Some(ReplicationVersion::Deleted {
             created_at: SystemTime::now(),
@@ -2305,7 +2305,7 @@ mod tests {
 
     #[test]
     fn keeps_reference_deletes() {
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let mut op = ReplicateObjectVersionOperation::new(version_request(version_id))
             .with_sync(reference_sync());
         op.replication_version = Some(ReplicationVersion::Deleted {
@@ -2324,7 +2324,7 @@ mod tests {
 
     #[test]
     fn manifest_rejects_unresolved_reference_version() {
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let source = reference_source_binding();
         let cached_metadata = reference_cached_metadata();
         let created_at = SystemTime::now();
@@ -2347,7 +2347,7 @@ mod tests {
 
     #[test]
     fn preserves_reference_source() {
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let cached_metadata = reference_cached_metadata();
         let mut op = ReplicateObjectVersionOperation::new(version_request_with_mode(
             version_id,
@@ -2383,7 +2383,7 @@ mod tests {
 
     #[test]
     fn reference_versions_are_skipped_without_replication_manifest() {
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let mut op = ReplicateObjectVersionOperation::new(version_request(version_id));
 
         op.start();
@@ -2402,7 +2402,7 @@ mod tests {
 
     #[test]
     fn on_demand_reference_replication_materializes_before_manifest() {
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let original_source = Some(reference_source_binding());
         let mut op = ReplicateObjectVersionOperation::new(version_request_with_mode(
             version_id,
@@ -2474,7 +2474,7 @@ mod tests {
 
     #[test]
     fn on_demand_reference_replication_cleans_up_temporary_blob_after_apply() {
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let mut op = ReplicateObjectVersionOperation::new(version_request_with_mode(
             version_id,
             ReplicationMode::OnDemand,
@@ -2517,7 +2517,7 @@ mod tests {
             value: None,
         }));
         op.step(Event::Blob(BlobEvent::ConnectionEstablished {
-            stream_id: Ulid::r#gen(),
+            stream_id: Ulid::generate(),
         }));
         op.step(Event::Blob(BlobEvent::MessageSent {
             stream_id: op.stream_id.expect("stream id available"),

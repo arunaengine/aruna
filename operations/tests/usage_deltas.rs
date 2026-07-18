@@ -86,7 +86,7 @@ async fn setup() -> Harness {
         },
         realm_id,
         node_id,
-        created_by: UserId::local(Ulid::r#gen(), realm_id),
+        created_by: UserId::local(Ulid::generate(), realm_id),
     }
 }
 
@@ -345,7 +345,7 @@ async fn assert_matches_rebuild(ctx: &DriverContext) {
 #[tokio::test]
 async fn create_and_delete_bucket_delta() {
     let h = setup().await;
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
 
     create_bucket(&h, "counted", group_id).await;
     assert_eq!(read_global(&h.driver).await.buckets, 1);
@@ -366,7 +366,7 @@ async fn create_and_delete_bucket_delta() {
 #[tokio::test]
 async fn simple_put_object_delta() {
     let h = setup().await;
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
 
     let data = b"hello world";
@@ -393,7 +393,7 @@ async fn simple_put_object_delta() {
 #[tokio::test]
 async fn overwrite_put_accumulates_logical_bytes_per_version() {
     let h = setup().await;
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
 
     let first = b"first";
@@ -420,7 +420,7 @@ async fn overwrite_put_accumulates_logical_bytes_per_version() {
 #[tokio::test]
 async fn overwrite_put_same_content_double_counts_logical_bytes() {
     let h = setup().await;
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
 
     let data = b"identical";
@@ -441,7 +441,7 @@ async fn overwrite_put_same_content_double_counts_logical_bytes() {
 #[tokio::test]
 async fn delete_marker_drops_object_but_keeps_logical_bytes() {
     let h = setup().await;
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
 
     let data = b"payload";
@@ -469,7 +469,7 @@ async fn delete_marker_drops_object_but_keeps_logical_bytes() {
 #[tokio::test]
 async fn put_over_delete_marker_revives_object() {
     let h = setup().await;
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
 
     let first = b"first-body";
@@ -496,7 +496,7 @@ async fn put_over_delete_marker_revives_object() {
 #[tokio::test]
 async fn permanent_delete_of_live_version_frees_logical_bytes() {
     let h = setup().await;
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
 
     let data = b"payload";
@@ -523,7 +523,7 @@ async fn permanent_delete_of_live_version_frees_logical_bytes() {
 #[tokio::test]
 async fn multipart_staging_counts_nothing_until_completion() {
     let h = setup().await;
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
 
     let part1 = vec![b'h'; 5 * 1024 * 1024];
@@ -572,7 +572,7 @@ async fn multipart_staging_counts_nothing_until_completion() {
 #[tokio::test]
 async fn aborted_multipart_upload_leaves_counters_untouched() {
     let h = setup().await;
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
 
     let upload_id = create_upload(&h, "bucket", "abort.bin", group_id).await;
@@ -682,7 +682,7 @@ async fn inject_remote_group_snapshot(
 #[tokio::test]
 async fn put_object_gate_allows_under_and_at_ceiling_rejects_over() {
     let h = setup().await;
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
     let ceiling = Some(20);
 
@@ -716,7 +716,7 @@ async fn put_object_gate_allows_under_and_at_ceiling_rejects_over() {
 #[tokio::test]
 async fn put_object_gate_unlimited_when_ceiling_is_none() {
     let h = setup().await;
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
 
     // None => unlimited, no gate regardless of size.
@@ -729,7 +729,7 @@ async fn put_object_gate_unlimited_when_ceiling_is_none() {
 #[tokio::test]
 async fn put_object_gate_honors_grace_headroom() {
     let h = setup().await;
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
 
     // quota 100 with 110% grace => ceiling 110. Writes above the quota but under
@@ -759,8 +759,8 @@ async fn put_object_gate_honors_grace_headroom() {
 #[tokio::test]
 async fn put_object_gate_group_override_takes_precedence_over_default() {
     let h = setup().await;
-    let overridden = Ulid::r#gen();
-    let plain = Ulid::r#gen();
+    let overridden = Ulid::generate();
+    let plain = Ulid::generate();
     create_bucket(&h, "over-bucket", overridden).await;
     create_bucket(&h, "plain-bucket", plain).await;
 
@@ -811,7 +811,7 @@ async fn put_object_gate_group_override_takes_precedence_over_default() {
 #[tokio::test]
 async fn put_object_gate_counts_remote_node_snapshots() {
     let h = setup().await;
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
     let ceiling = Some(100);
 
@@ -840,7 +840,7 @@ async fn put_object_gate_counts_remote_node_snapshots() {
 #[tokio::test]
 async fn delete_object_is_never_gated_by_quota() {
     let h = setup().await;
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
 
     // Fill the group exactly to a tight ceiling.
@@ -894,7 +894,7 @@ async fn try_complete_multipart(
 #[tokio::test]
 async fn multipart_completion_is_gated_like_put() {
     let h = setup().await;
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     create_bucket(&h, "bucket", group_id).await;
     let ceiling = Some(30);
 

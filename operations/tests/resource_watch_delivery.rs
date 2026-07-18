@@ -73,9 +73,9 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[0].net.node_id();
     let watcher = user_with_holder(&config, holder, realm_id);
-    let uploader = UserId::local(Ulid::r#gen(), realm_id);
-    let credential_group = Ulid::r#gen();
-    let bucket_group = Ulid::r#gen();
+    let uploader = UserId::local(Ulid::generate(), realm_id);
+    let credential_group = Ulid::generate();
+    let bucket_group = Ulid::generate();
     let data_node_id = nodes[1].net.node_id();
     install_group_authorization(&nodes, realm_id, credential_group, watcher).await?;
     install_group_authorization(&nodes, realm_id, bucket_group, watcher).await?;
@@ -107,7 +107,7 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
     )
     .await?;
 
-    let event_id = Ulid::r#gen();
+    let event_id = Ulid::generate();
     let occurred_at_ms = unix_timestamp_millis();
     let event = upload_event(
         event_id,
@@ -204,8 +204,8 @@ async fn same_node_delivery() -> Result<(), Box<dyn std::error::Error>> {
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[1].net.node_id();
     let watcher = user_with_holder(&config, holder, realm_id);
-    let uploader = UserId::local(Ulid::r#gen(), realm_id);
-    let group_id = Ulid::r#gen();
+    let uploader = UserId::local(Ulid::generate(), realm_id);
+    let group_id = Ulid::generate();
     let data_node_id = nodes[0].net.node_id();
     install_group_authorization(&nodes, realm_id, group_id, watcher).await?;
     let prefix = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/");
@@ -225,7 +225,7 @@ async fn same_node_delivery() -> Result<(), Box<dyn std::error::Error>> {
         vec![holder],
     );
 
-    let event_id = Ulid::r#gen();
+    let event_id = Ulid::generate();
     let occurred_at_ms = unix_timestamp_millis();
     let event = upload_event(
         event_id,
@@ -285,8 +285,8 @@ async fn unmatched_event_writes_nothing() -> Result<(), Box<dyn std::error::Erro
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[0].net.node_id();
     let watcher = user_with_holder(&config, holder, realm_id);
-    let uploader = UserId::local(Ulid::r#gen(), realm_id);
-    let group_id = Ulid::r#gen();
+    let uploader = UserId::local(Ulid::generate(), realm_id);
+    let group_id = Ulid::generate();
     let data_node_id = nodes[1].net.node_id();
     install_group_authorization(&nodes, realm_id, group_id, watcher).await?;
     let prefix = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/");
@@ -306,7 +306,7 @@ async fn unmatched_event_writes_nothing() -> Result<(), Box<dyn std::error::Erro
 
     // Path is outside every watched prefix even though real interest exists.
     let event = upload_event(
-        Ulid::r#gen(),
+        Ulid::generate(),
         realm_id,
         uploader,
         UploadLocation {
@@ -341,7 +341,7 @@ async fn self_event_delivers() -> Result<(), Box<dyn std::error::Error>> {
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[0].net.node_id();
     let watcher = user_with_holder(&config, holder, realm_id);
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     let data_node_id = nodes[1].net.node_id();
     install_group_authorization(&nodes, realm_id, group_id, watcher).await?;
     let prefix = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/");
@@ -359,7 +359,7 @@ async fn self_event_delivers() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let event_id = Ulid::r#gen();
+    let event_id = Ulid::generate();
     let event = upload_event(
         event_id,
         realm_id,
@@ -397,7 +397,7 @@ async fn digest_converges_and_retracts_across_nodes() -> Result<(), Box<dyn std:
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[2].net.node_id();
     let watcher = user_with_holder(&config, holder, realm_id);
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     let prefix = format!("meta/{group_id}/datasets/team");
     let probe = format!("{prefix}/runs/run-42");
     install_group_authorization(&nodes, realm_id, group_id, watcher).await?;
@@ -455,7 +455,7 @@ async fn remote_create_surfaces_cap_conflict_over_the_wire()
     let holder = nodes[0].net.node_id();
     let owner = user_with_holder(&config, holder, realm_id);
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     let data_node_id = nodes[1].net.node_id();
     install_group_authorization(&nodes, realm_id, group_id, owner).await?;
 
@@ -505,7 +505,7 @@ async fn subscription_survives_inbox_holder_rerank() -> Result<(), Box<dyn std::
 
     let (watcher, old_holder, new_holder) =
         user_with_changed_holder(&reduced_config, &full_config, realm_id);
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     let data_node_id = nodes[0].net.node_id();
     let prefix = data_watch_resource_path(group_id, data_node_id, "bucket", "reranked/");
     let probe = format!("{prefix}probe");
@@ -578,13 +578,13 @@ async fn subscription_survives_inbox_holder_rerank() -> Result<(), Box<dyn std::
         vec![subscription.clone()]
     );
 
-    let event_id = Ulid::r#gen();
+    let event_id = Ulid::generate();
     emit_resource_watch_event(
         nodes[1].context.as_ref(),
         upload_event(
             event_id,
             realm_id,
-            UserId::local(Ulid::r#gen(), realm_id),
+            UserId::local(Ulid::generate(), realm_id),
             UploadLocation {
                 group_id,
                 node_id: data_node_id,
@@ -747,7 +747,7 @@ fn user_with_holder(
     realm_id: RealmId,
 ) -> UserId {
     for _ in 0..10_000 {
-        let candidate = UserId::local(Ulid::r#gen(), realm_id);
+        let candidate = UserId::local(Ulid::generate(), realm_id);
         if matches!(resolve_inbox_holder(&candidate, realm_config), Ok(Some(node)) if node == holder)
         {
             return candidate;
@@ -762,7 +762,7 @@ fn user_with_changed_holder(
     realm_id: RealmId,
 ) -> (UserId, NodeId, NodeId) {
     for _ in 0..10_000 {
-        let candidate = UserId::local(Ulid::r#gen(), realm_id);
+        let candidate = UserId::local(Ulid::generate(), realm_id);
         let old_holder = resolve_inbox_holder(&candidate, before).unwrap().unwrap();
         let new_holder = resolve_inbox_holder(&candidate, after).unwrap().unwrap();
         if old_holder != new_holder {

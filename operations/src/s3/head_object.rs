@@ -547,7 +547,7 @@ mod tests {
             root: "/tmp".to_string(),
             storage_bucket: "mybucket".to_string(),
             backend_path: "hello.txt".to_string(),
-            ulid: Ulid::r#gen(),
+            ulid: Ulid::generate(),
             compressed: false,
             encrypted: false,
             created_at: SystemTime::now(),
@@ -593,7 +593,7 @@ mod tests {
         };
 
         let location = location_with_hash();
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle
             .send_storage_effect(StorageEffect::StartTransaction { read: false })
             .await
@@ -700,7 +700,7 @@ mod tests {
         };
 
         let location = location_with_hash();
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let metadata = BlobVersion::materialized(
             location.get_blake3().unwrap().try_into().unwrap(),
             SystemTime::now(),
@@ -760,8 +760,8 @@ mod tests {
 
     #[test]
     fn head_resolves_native() {
-        let version_id = Ulid::r#gen();
-        let relationship_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
+        let relationship_id = Ulid::generate();
         let origin = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
         let cached_metadata = SourceMetadata {
             content_length: 11,
@@ -799,7 +799,7 @@ mod tests {
             Default::default(),
             SystemTime::UNIX_EPOCH,
         );
-        let txn_id = Ulid::r#gen();
+        let txn_id = Ulid::generate();
         let mut operation = HeadObjectOperation::new(HeadObjectInput {
             bucket: "target-bucket".to_string(),
             key: "folder/file.txt".to_string(),
@@ -885,7 +885,7 @@ mod tests {
             compute_handle: None,
         };
 
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let cached_metadata = SourceMetadata {
             content_length: 11,
             content_type: Some("text/plain".to_string()),
@@ -907,7 +907,7 @@ mod tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
             },
-            connector_id: Some(Ulid::r#gen()),
+            connector_id: Some(Ulid::generate()),
         };
 
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle
