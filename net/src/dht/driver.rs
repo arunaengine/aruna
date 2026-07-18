@@ -23,9 +23,9 @@ use tracing::{Instrument, Span, debug_span, field, info_span, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::constants::{
-    DHT_KEY_COUNT_KEY, DHT_META_KEYSPACE, DHT_REVISION_KEY, DRIVER_IO_EVENT_CAPACITY,
-    DRIVER_TICK_INTERVAL, MAX_ENTRIES_PER_KEY, MAX_INBOUND_RPCS, MAX_MESSAGE_SIZE, MAX_STORED_KEYS,
-    RPC_TIMEOUT, STORAGE_MUTATION_RETRIES, STORAGE_TIMEOUT,
+    CMD_CHANNEL_CAPACITY, DHT_KEY_COUNT_KEY, DHT_META_KEYSPACE, DHT_REVISION_KEY,
+    DRIVER_IO_EVENT_CAPACITY, DRIVER_TICK_INTERVAL, MAX_ENTRIES_PER_KEY, MAX_INBOUND_RPCS,
+    MAX_MESSAGE_SIZE, MAX_STORED_KEYS, RPC_TIMEOUT, STORAGE_MUTATION_RETRIES, STORAGE_TIMEOUT,
 };
 use super::kbucket::K;
 use super::protocol::{
@@ -139,6 +139,15 @@ enum DriverEvent {
     Closed,
 }
 
+// Committed blocks amortize revision I/O; unused values become harmless crash gaps.
+const REVISION_BLOCK_SIZE: u64 = 64;
+
+struct RevisionRequest {
+    op_id: OpId,
+    stage: StorageStage,
+    span: Span,
+}
+
 pub struct DhtDriver {
     state: DhtStateMachine,
     endpoint: Endpoint,
@@ -156,6 +165,8 @@ pub struct DhtDriver {
     inbound_contexts: HashMap<InboundId, Option<SendStream>>,
     inbound_spans: HashMap<InboundId, Span>,
     next_inbound_id: InboundId,
+    revision_tx: tokio::sync::mpsc::Sender<RevisionRequest>,
+    revision_task: tokio::task::JoinHandle<()>,
 }
 
 impl std::fmt::Debug for DhtDriver {
@@ -248,6 +259,13 @@ impl DhtDriver {
         shutdown: CancellationToken,
     ) -> Self {
         let (io_tx, io_rx) = mpsc::bounded_async(DRIVER_IO_EVENT_CAPACITY);
+        let (revision_tx, revision_rx) = tokio::sync::mpsc::channel(CMD_CHANNEL_CAPACITY);
+        let revision_task = tokio::spawn(run_revision_allocator(
+            storage.clone(),
+            io_tx.clone(),
+            revision_rx,
+            shutdown.clone(),
+        ));
 
         Self {
             state,
@@ -266,6 +284,8 @@ impl DhtDriver {
             inbound_contexts: HashMap::new(),
             inbound_spans: HashMap::new(),
             next_inbound_id: 1,
+            revision_tx,
+            revision_task,
         }
     }
 
@@ -313,6 +333,8 @@ impl DhtDriver {
             }
         }
 
+        self.revision_task.abort();
+        let _ = (&mut self.revision_task).await;
         self.fail_pending_callers(DhtIoError::Shutdown);
         self.inbound_contexts.clear();
     }
@@ -1103,34 +1125,22 @@ impl DhtDriver {
         );
     }
 
-    fn dispatch_storage_revision(&self, op_id: OpId, stage: StorageStage) {
-        let storage = self.storage.clone();
-        let io_tx = self.io_tx.clone();
-        tokio::spawn(
-            async move {
-                match reserve_revision(&storage, op_id, stage).await {
-                    Ok(revision) => {
-                        let _ = io_tx
-                            .send(DhtIo::StorageRevisionResult {
-                                op_id,
-                                stage,
-                                revision,
-                            })
-                            .await;
-                    }
-                    Err(error) => {
-                        let _ = io_tx
-                            .send(DhtIo::StorageError {
-                                op_id,
-                                stage,
-                                error,
-                            })
-                            .await;
-                    }
-                }
-            }
-            .instrument(Span::current()),
-        );
+    fn dispatch_storage_revision(&mut self, op_id: OpId, stage: StorageStage) {
+        let request = RevisionRequest {
+            op_id,
+            stage,
+            span: Span::current(),
+        };
+        let error = match self.revision_tx.try_send(request) {
+            Ok(()) => return,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => DhtIoError::QueueFull,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => DhtIoError::Shutdown,
+        };
+        self.process_input_for_io(DhtIo::StorageError {
+            op_id,
+            stage,
+            error,
+        });
     }
 
     #[tracing::instrument(
@@ -1476,11 +1486,69 @@ async fn start_storage_txn(
     }
 }
 
-async fn reserve_revision(
+async fn run_revision_allocator(
+    storage: StorageHandle,
+    io_tx: IoSender,
+    mut revision_rx: tokio::sync::mpsc::Receiver<RevisionRequest>,
+    shutdown: CancellationToken,
+) {
+    let mut revisions = None;
+    loop {
+        let request = tokio::select! {
+            _ = shutdown.cancelled() => return,
+            request = revision_rx.recv() => {
+                let Some(request) = request else {
+                    return;
+                };
+                request
+            }
+        };
+        let RevisionRequest { op_id, stage, span } = request;
+        handle_revision_request(&storage, &io_tx, &mut revisions, op_id, stage)
+            .instrument(span)
+            .await;
+    }
+}
+
+async fn handle_revision_request(
+    storage: &StorageHandle,
+    io_tx: &IoSender,
+    revisions: &mut Option<std::ops::RangeInclusive<u64>>,
+    op_id: OpId,
+    stage: StorageStage,
+) {
+    let revision = match revisions.as_mut().and_then(Iterator::next) {
+        Some(revision) => Ok(revision),
+        None => match reserve_revision_block(storage, op_id, stage).await {
+            Ok(block) => {
+                *revisions = Some(block);
+                revisions.as_mut().and_then(Iterator::next).ok_or_else(|| {
+                    DhtIoError::storage("DHT revision allocator returned an empty block")
+                })
+            }
+            Err(error) => Err(error),
+        },
+    };
+    let io = match revision {
+        Ok(revision) => DhtIo::StorageRevisionResult {
+            op_id,
+            stage,
+            revision,
+        },
+        Err(error) => DhtIo::StorageError {
+            op_id,
+            stage,
+            error,
+        },
+    };
+    let _ = io_tx.send(io).await;
+}
+
+async fn reserve_revision_block(
     storage: &StorageHandle,
     op_id: OpId,
     stage: StorageStage,
-) -> Result<u64, DhtIoError> {
+) -> Result<std::ops::RangeInclusive<u64>, DhtIoError> {
     for _ in 0..STORAGE_MUTATION_RETRIES {
         let txn_id = match start_storage_txn(storage, op_id, stage).await {
             Ok(txn_id) => txn_id,
@@ -1488,13 +1556,13 @@ async fn reserve_revision(
             Err(TransactionFailure::Failed(error)) => return Err(error),
         };
         match reserve_revision_txn(storage, op_id, stage, txn_id).await {
-            Ok(revision) => return Ok(revision),
+            Ok(revisions) => return Ok(revisions),
             Err(TransactionFailure::Conflict) => continue,
             Err(TransactionFailure::Failed(error)) => return Err(error),
         }
     }
     Err(DhtIoError::storage(
-        "DHT revision reservation exceeded conflict retry limit",
+        "DHT revision block reservation exceeded conflict retry limit",
     ))
 }
 
@@ -1503,7 +1571,7 @@ async fn reserve_revision_txn(
     op_id: OpId,
     stage: StorageStage,
     txn_id: TxnId,
-) -> Result<u64, TransactionFailure> {
+) -> Result<std::ops::RangeInclusive<u64>, TransactionFailure> {
     let read = Effect::Storage(StorageEffect::Read {
         key_space: DHT_META_KEYSPACE.to_string(),
         key: ByteView::from(DHT_REVISION_KEY),
@@ -1540,19 +1608,20 @@ async fn reserve_revision_txn(
             return Err(TransactionFailure::Failed(error));
         }
     };
-    let Some(revision) = current.checked_add(1) else {
+    let Some(first) = current.checked_add(1) else {
         abort_storage_txn(storage, op_id, stage, txn_id).await;
         return Err(TransactionFailure::Failed(DhtIoError::storage(
             "DHT revision counter exhausted",
         )));
     };
+    let last = current.saturating_add(REVISION_BLOCK_SIZE);
     if let Err(error) = write_counter(
         storage,
         op_id,
         stage,
         txn_id,
         DHT_REVISION_KEY,
-        revision,
+        last,
         "revision_write",
     )
     .await
@@ -1561,7 +1630,7 @@ async fn reserve_revision_txn(
         return Err(error);
     }
     commit_storage_txn(storage, op_id, stage, txn_id).await?;
-    Ok(revision)
+    Ok(first..=last)
 }
 
 async fn mutate_storage_entries(
@@ -2563,6 +2632,24 @@ mod tests {
         (directory, storage)
     }
 
+    fn spawn_revision_worker(
+        storage: &StorageHandle,
+    ) -> (
+        tokio::sync::mpsc::Sender<RevisionRequest>,
+        IoReceiver,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (io_tx, io_rx) = mpsc::bounded_async(DRIVER_IO_EVENT_CAPACITY);
+        let (revision_tx, revision_rx) = tokio::sync::mpsc::channel(CMD_CHANNEL_CAPACITY);
+        let worker = tokio::spawn(run_revision_allocator(
+            storage.clone(),
+            io_tx,
+            revision_rx,
+            CancellationToken::new(),
+        ));
+        (revision_tx, io_rx, worker)
+    }
+
     async fn read_entries(storage: &StorageHandle, key: DhtKeyId) -> Vec<StoredEntry> {
         let event = storage
             .send_effect(Effect::Storage(StorageEffect::Read {
@@ -2645,16 +2732,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revision_is_monotonic() {
+    async fn revision_blocks_batch() {
         let (_directory, storage) = open_storage();
-        let first = reserve_revision(&storage, 10, StorageStage::PutRevision)
-            .await
-            .expect("reserve first revision");
-        let second = reserve_revision(&storage, 11, StorageStage::PutRevision)
-            .await
-            .expect("reserve second revision");
+        let (revision_tx, mut io_rx, worker) = spawn_revision_worker(&storage);
+        let count = REVISION_BLOCK_SIZE + 1;
+        for op_id in 1..=count {
+            revision_tx
+                .send(RevisionRequest {
+                    op_id,
+                    stage: StorageStage::PutRevision,
+                    span: Span::current(),
+                })
+                .await
+                .expect("queue revision");
+        }
 
-        assert_eq!((first, second), (1, 2));
+        for expected in 1..=count {
+            assert!(matches!(
+                io_rx.recv().await,
+                Some(DhtIo::StorageRevisionResult {
+                    op_id,
+                    stage: StorageStage::PutRevision,
+                    revision,
+                }) if op_id == expected && revision == expected
+            ));
+        }
+        drop(revision_tx);
+        worker.await.expect("revision worker");
+
+        assert_eq!(storage.snapshot_metrics().conflicts_total, 0);
+        assert_eq!(storage.snapshot_metrics().requests_total, 8);
+    }
+
+    #[tokio::test]
+    async fn revision_restart_skips() {
+        let (_directory, storage) = open_storage();
+        let (first_tx, mut first_rx, first_worker) = spawn_revision_worker(&storage);
+        first_tx
+            .send(RevisionRequest {
+                op_id: 1,
+                stage: StorageStage::PutRevision,
+                span: Span::current(),
+            })
+            .await
+            .expect("queue first revision");
+        assert!(matches!(
+            first_rx.recv().await,
+            Some(DhtIo::StorageRevisionResult { revision: 1, .. })
+        ));
+        drop(first_tx);
+        first_worker.await.expect("first revision worker");
+
+        let (second_tx, mut second_rx, second_worker) = spawn_revision_worker(&storage);
+        second_tx
+            .send(RevisionRequest {
+                op_id: 2,
+                stage: StorageStage::PutRevision,
+                span: Span::current(),
+            })
+            .await
+            .expect("queue second revision");
+        assert!(matches!(
+            second_rx.recv().await,
+            Some(DhtIo::StorageRevisionResult { revision: 65, .. })
+        ));
+        drop(second_tx);
+        second_worker.await.expect("second revision worker");
+
+        assert_eq!(storage.snapshot_metrics().requests_total, 8);
     }
 
     #[tokio::test]
