@@ -58,7 +58,7 @@ pub enum DhtResponse {
     },
 }
 
-pub const fn request_kind(request: &DhtRequest) -> &'static str {
+pub(super) const fn request_kind(request: &DhtRequest) -> &'static str {
     match request {
         DhtRequest::Ping => "ping",
         DhtRequest::FindNode { .. } => "find_node",
@@ -67,7 +67,7 @@ pub const fn request_kind(request: &DhtRequest) -> &'static str {
     }
 }
 
-pub const fn response_kind(response: &DhtResponse) -> &'static str {
+pub(super) const fn response_kind(response: &DhtResponse) -> &'static str {
     match response {
         DhtResponse::Pong => "pong",
         DhtResponse::Nodes { .. } => "nodes",

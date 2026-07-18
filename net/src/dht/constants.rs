@@ -17,8 +17,8 @@ pub const MAX_STORED_KEYS: u64 = 65_536;
 pub const STORAGE_MUTATION_RETRIES: usize = 8;
 
 pub const DHT_META_KEYSPACE: &str = "dht_meta_v2";
-pub const DHT_ACTIVE_PREFIX: &[u8] = b"active/";
-pub const DHT_FLOOR_PREFIX: &[u8] = b"floor/";
+pub(super) const DHT_ACTIVE_PREFIX: &[u8] = b"active/";
+pub(super) const DHT_FLOOR_PREFIX: &[u8] = b"floor/";
 pub const DHT_KEY_COUNT_KEY: &[u8] = b"key_count";
 pub const DHT_REVISION_KEY: &[u8] = b"revision";
 

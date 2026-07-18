@@ -15,7 +15,7 @@ use super::constants::{
 };
 use super::rpc::verify_record;
 
-pub const CLEANUP_PAGE_SIZE: usize = 256;
+pub(super) const CLEANUP_PAGE_SIZE: usize = 256;
 const CLOCK_SAMPLE_WINDOW_MS: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -124,7 +124,7 @@ pub enum DeadlineIndex {
 }
 
 impl DeadlineIndex {
-    pub fn prefix(self) -> &'static [u8] {
+    pub(super) fn prefix(self) -> &'static [u8] {
         match self {
             Self::Active => DHT_ACTIVE_PREFIX,
             Self::Floor => DHT_FLOOR_PREFIX,
@@ -172,14 +172,14 @@ pub fn retained_entries(entries: Vec<StoredEntry>, now: u64) -> Vec<StoredEntry>
         .collect()
 }
 
-pub fn retention_deadline(expires_at: u64, now: u64) -> u64 {
+pub(super) fn retention_deadline(expires_at: u64, now: u64) -> u64 {
     expires_at
         .min(now)
         .saturating_add(MAX_TTL_SECS)
         .saturating_add(MAX_CLOCK_SKEW_SECS)
 }
 
-pub fn active_deadline(key: DhtKeyId, entries: &[StoredEntry]) -> Option<DeadlineEntry> {
+pub(super) fn active_deadline(key: DhtKeyId, entries: &[StoredEntry]) -> Option<DeadlineEntry> {
     entries
         .iter()
         .map(|entry| entry.expires_at)
@@ -187,7 +187,7 @@ pub fn active_deadline(key: DhtKeyId, entries: &[StoredEntry]) -> Option<Deadlin
         .map(|deadline| DeadlineEntry { deadline, key })
 }
 
-pub fn floor_deadline(key: DhtKeyId, entries: &[StoredEntry]) -> Option<DeadlineEntry> {
+pub(super) fn floor_deadline(key: DhtKeyId, entries: &[StoredEntry]) -> Option<DeadlineEntry> {
     entries
         .iter()
         .map(|entry| entry.retain_until)
@@ -195,7 +195,7 @@ pub fn floor_deadline(key: DhtKeyId, entries: &[StoredEntry]) -> Option<Deadline
         .map(|deadline| DeadlineEntry { deadline, key })
 }
 
-pub fn row_deadline(
+pub(super) fn row_deadline(
     key: DhtKeyId,
     entries: &[StoredEntry],
     now: u64,
@@ -210,7 +210,7 @@ pub fn row_deadline(
     }
 }
 
-pub fn deadline_key(index: DeadlineIndex, entry: DeadlineEntry) -> Vec<u8> {
+pub(super) fn deadline_key(index: DeadlineIndex, entry: DeadlineEntry) -> Vec<u8> {
     let prefix = index.prefix();
     let mut key = Vec::with_capacity(prefix.len() + 8 + entry.key.as_bytes().len());
     key.extend_from_slice(prefix);
@@ -219,7 +219,7 @@ pub fn deadline_key(index: DeadlineIndex, entry: DeadlineEntry) -> Vec<u8> {
     key
 }
 
-pub fn parse_deadline(index: DeadlineIndex, key: &[u8]) -> Option<DeadlineEntry> {
+pub(super) fn parse_deadline(index: DeadlineIndex, key: &[u8]) -> Option<DeadlineEntry> {
     let suffix = key.strip_prefix(index.prefix())?;
     let (deadline, raw_key) = suffix.split_at_checked(8)?;
     let raw_key: [u8; 32] = raw_key.try_into().ok()?;
