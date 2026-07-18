@@ -19,7 +19,8 @@ use super::protocol::{
     INTERNAL_OP_START, InboundId, OpId, RpcPhase, StorageStage,
 };
 use super::rpc::{
-    DhtRequest, DhtResponse, ErrorCode, StoredValue, signed_record_bytes, verify_stored_value,
+    DhtRequest, DhtResponse, ErrorCode, StoredValue, request_kind, response_kind,
+    signed_record_bytes, verify_stored_value,
 };
 use super::storage::{
     CLEANUP_PAGE_SIZE, StoredEntry, entry_is_fresh, live_entries, retained_entries,
@@ -604,7 +605,7 @@ impl DhtStateMachine {
         name = "dht.state.rpc_response",
         level = "debug",
         skip(self, response, out),
-        fields(op_id, phase = ?phase, peer = %peer, response = ?response)
+        fields(op_id, phase = ?phase, peer = %peer, response = response_kind(&response))
     )]
     fn handle_rpc_response(
         &mut self,
@@ -654,7 +655,7 @@ impl DhtStateMachine {
         name = "dht.state.rpc_response_state",
         level = "trace",
         skip(self, response, op_state, out),
-        fields(op_id, phase = ?phase, peer = %peer, response = ?response)
+        fields(op_id, phase = ?phase, peer = %peer, response = response_kind(&response))
     )]
     fn handle_rpc_response_state(
         &mut self,
@@ -1345,7 +1346,7 @@ impl DhtStateMachine {
         name = "dht.state.inbound_request",
         level = "debug",
         skip(self, request, out),
-        fields(inbound_id, request = ?request)
+        fields(inbound_id, request = request_kind(&request))
     )]
     fn handle_inbound_request(
         &mut self,
@@ -1781,7 +1782,7 @@ impl DhtStateMachine {
         name = "dht.state.queue_rpc",
         level = "debug",
         skip(self, op, request, out),
-        fields(op_id, phase = ?phase, peer = %peer, request = ?request)
+        fields(op_id, phase = ?phase, peer = %peer, request = request_kind(&request))
     )]
     fn queue_rpc(
         &self,
@@ -1809,7 +1810,7 @@ impl DhtStateMachine {
         name = "dht.state.queue_rpc_pending",
         level = "debug",
         skip(self, pending, request, trace_context, out),
-        fields(op_id, phase = ?phase, peer = %peer, request = ?request)
+        fields(op_id, phase = ?phase, peer = %peer, request = request_kind(&request))
     )]
     fn queue_rpc_pending(
         &self,

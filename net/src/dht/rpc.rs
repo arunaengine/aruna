@@ -58,6 +58,25 @@ pub enum DhtResponse {
     },
 }
 
+pub const fn request_kind(request: &DhtRequest) -> &'static str {
+    match request {
+        DhtRequest::Ping => "ping",
+        DhtRequest::FindNode { .. } => "find_node",
+        DhtRequest::GetValue { .. } => "get_value",
+        DhtRequest::PutValue { .. } => "put_value",
+    }
+}
+
+pub const fn response_kind(response: &DhtResponse) -> &'static str {
+    match response {
+        DhtResponse::Pong => "pong",
+        DhtResponse::Nodes { .. } => "nodes",
+        DhtResponse::Value { .. } => "value",
+        DhtResponse::Stored => "stored",
+        DhtResponse::Error { .. } => "error",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorCode {
     InvalidRequest,

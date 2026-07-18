@@ -33,7 +33,7 @@ use super::protocol::{
 };
 use super::rpc::{
     DhtRequest, DhtResponse, ErrorCode, decode_request_with_trace_context, decode_response,
-    encode_request_with_trace_context, encode_response,
+    encode_request_with_trace_context, encode_response, request_kind, response_kind,
 };
 use super::state::DhtStateMachine;
 use super::storage::{
@@ -714,7 +714,7 @@ impl DhtDriver {
                 "dht.rpc.receive",
                 "otel.kind" = "server",
                 peer = %peer,
-                request = ?request,
+                request = request_kind(&request),
             );
             if let Some(trace_context) = trace_context.as_ref() {
                 let _ = span.set_parent(extract_trace_context(trace_context));
@@ -725,7 +725,7 @@ impl DhtDriver {
                 trace!(
                     event = "dht.rpc.received",
                     peer = %peer,
-                    request = ?request,
+                    request = request_kind(&request),
                     "Received inbound DHT RPC"
                 );
             }
@@ -846,7 +846,7 @@ impl DhtDriver {
         name = "dht.driver.rpc_request.dispatch",
         level = "debug",
         skip(self, request, trace_context),
-        fields(op_id, phase = ?phase, peer = %peer, request = ?request)
+        fields(op_id, phase = ?phase, peer = %peer, request = request_kind(&request))
     )]
     fn dispatch_rpc_request(
         &self,
@@ -863,7 +863,7 @@ impl DhtDriver {
             op_id,
             phase = ?phase,
             peer = %peer,
-            request = ?request,
+            request = request_kind(&request),
             "Dispatching outbound DHT RPC"
         );
         let connection_pool = self.connection_pool.clone();
@@ -889,7 +889,7 @@ impl DhtDriver {
             op_id,
             phase = ?phase,
             peer = %peer,
-            request = ?request,
+            request = request_kind(&request),
         );
         if current_parent.is_disabled()
             && let Some(trace_context) = trace_context.as_ref()
@@ -956,7 +956,7 @@ impl DhtDriver {
         name = "dht.driver.rpc_response.dispatch",
         level = "debug",
         skip(self, response),
-        fields(inbound_id, response = ?response)
+        fields(inbound_id, response = response_kind(&response))
     )]
     fn dispatch_rpc_response(&mut self, inbound_id: InboundId, response: DhtResponse) {
         let maybe_send = self.inbound_contexts.remove(&inbound_id);
@@ -2063,7 +2063,7 @@ fn encode_request_frame(
     name = "dht.rpc.request.io",
     level = "debug",
     skip(connection_pool, request, trace_context),
-    fields(op_id, phase = ?phase, peer = %peer, request = ?request)
+    fields(op_id, phase = ?phase, peer = %peer, request = request_kind(&request))
 )]
 async fn rpc_request(
     connection_pool: ConnectionPool,
