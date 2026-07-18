@@ -148,11 +148,9 @@ struct GetOp {
     value_indices: HashMap<(NodeId, RealmId), usize>,
     value_versions: HashMap<(NodeId, RealmId), u64>,
     cache_entries: Vec<StoredEntry>,
-    cache_full: bool,
     remote_entries: HashMap<(NodeId, RealmId), StoredEntry>,
+    remote_values: HashSet<(NodeId, RealmId)>,
     frontier: LookupFrontier,
-    local_value_count: usize,
-    remote_value_count: usize,
     peer_error_count: usize,
     peer_errors: Vec<DhtPeerError>,
     successful_responses: usize,
@@ -454,11 +452,9 @@ impl DhtStateMachine {
             value_indices: HashMap::new(),
             value_versions: HashMap::new(),
             cache_entries: Vec::new(),
-            cache_full: false,
             remote_entries: HashMap::new(),
+            remote_values: HashSet::new(),
             frontier: LookupFrontier::default(),
-            local_value_count: 0,
-            remote_value_count: 0,
             peer_error_count: 0,
             peer_errors: Vec::new(),
             successful_responses: 0,
@@ -781,11 +777,12 @@ impl DhtStateMachine {
                     let existing = op.cache_entries.iter().find(|existing| {
                         existing.publisher == entry.publisher && existing.realm_id == entry.realm_id
                     });
-                    if existing.is_none()
-                        && (op.cache_full || op.cache_entries.len() >= MAX_ENTRIES_PER_KEY)
-                    {
-                        op.cache_full = true;
-                        continue;
+                    if existing.is_none() && op.cache_entries.len() >= MAX_ENTRIES_PER_KEY {
+                        out.push(DhtEffect::Output(DhtOutput::Failed {
+                            op_id,
+                            error: DhtIoError::StorageFull,
+                        }));
+                        return;
                     }
                     if existing.is_some_and(|existing| {
                         existing.revision == entry.revision
@@ -802,7 +799,6 @@ impl DhtStateMachine {
                     if existing.is_some_and(|existing| entry.revision <= existing.revision) {
                         continue;
                     }
-                    let existing_revision = existing.map(|existing| existing.revision);
                     let merged = match merge_entry(
                         &op.key,
                         op.cache_entries.clone(),
@@ -811,19 +807,12 @@ impl DhtStateMachine {
                     ) {
                         Ok(merged) => merged,
                         Err(MergeError::Stale) => continue,
-                        Err(MergeError::Capacity)
-                            if existing_revision
-                                .is_some_and(|revision| entry.revision > revision) =>
-                        {
+                        Err(MergeError::Capacity) => {
                             out.push(DhtEffect::Output(DhtOutput::Failed {
                                 op_id,
                                 error: DhtIoError::StorageFull,
                             }));
                             return;
-                        }
-                        Err(MergeError::Capacity) => {
-                            op.cache_full = true;
-                            continue;
                         }
                         Err(MergeError::Encoding | MergeError::Invalid) => {
                             record_get_peer_error(&mut op, peer, "invalid_record");
@@ -831,10 +820,9 @@ impl DhtStateMachine {
                         }
                     };
                     op.cache_entries = merged;
-                    op.cache_full = false;
                     if entry_is_fresh(entry.expires_at, self.now_secs) {
                         if insert_get_value(&mut op, entry) {
-                            op.remote_value_count = op.remote_value_count.saturating_add(1);
+                            op.remote_values.insert(record_key);
                             op.remote_entries.insert(record_key, stored);
                         }
                     } else if insert_get_floor(&mut op, &entry) {
@@ -1163,7 +1151,6 @@ impl DhtStateMachine {
 
                 let entries = retained_entries(entries, self.now_secs);
                 op.cache_entries = entries.clone();
-                op.cache_full = op.cache_entries.len() >= MAX_ENTRIES_PER_KEY;
                 for entry in entries {
                     if !realm_matches_filter(op.realm_filter.as_ref(), &entry.realm_id) {
                         continue;
@@ -1173,9 +1160,7 @@ impl DhtStateMachine {
                         continue;
                     }
                     if entry_is_fresh(value.expires_at, self.now_secs) {
-                        if insert_get_value(&mut op, value) {
-                            op.local_value_count = op.local_value_count.saturating_add(1);
-                        }
+                        insert_get_value(&mut op, value);
                     } else {
                         insert_get_floor(&mut op, &value);
                     }
@@ -1762,12 +1747,10 @@ impl DhtStateMachine {
 
         let completed_reason = if op.values.is_empty() {
             DhtGetCompletedReason::LookupExhausted
-        } else if op.remote_value_count > 0 {
+        } else if !op.remote_values.is_empty() {
             DhtGetCompletedReason::RemoteValue
-        } else if op.local_value_count > 0 {
-            DhtGetCompletedReason::LocalValue
         } else {
-            DhtGetCompletedReason::LookupExhausted
+            DhtGetCompletedReason::LocalValue
         };
         complete_get(op_id, op, completed_reason, out);
     }
@@ -2206,6 +2189,7 @@ fn remove_get_value(op: &mut GetOp, record_key: (NodeId, RealmId)) {
     let Some(index) = op.value_indices.remove(&record_key) else {
         return;
     };
+    op.remote_values.remove(&record_key);
     op.values.swap_remove(index);
     if let Some(moved) = op.values.get(index) {
         op.value_indices
@@ -2231,8 +2215,8 @@ fn get_stats(op: &GetOp, completed_reason: DhtGetCompletedReason) -> DhtGetStats
 
     DhtGetStats {
         completed_reason,
-        local_value_count: op.local_value_count,
-        remote_value_count: op.remote_value_count,
+        local_value_count: op.values.len().saturating_sub(op.remote_values.len()),
+        remote_value_count: op.remote_values.len(),
         queried_peer_count,
         queried_peers,
         queried_peers_truncated: queried_peer_count > LOOKUP_LOG_PEER_LIMIT,
@@ -2858,6 +2842,8 @@ mod tests {
                 ..
             })] if values.is_empty()
                 && stats.completed_reason == DhtGetCompletedReason::LookupExhausted
+                && stats.local_value_count == 0
+                && stats.remote_value_count == 0
         ));
     }
 
@@ -2950,7 +2936,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_capacity_bounds() {
+    fn cache_capacity_fails() {
         let local_secret = make_secret(103);
         let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
         let key = DhtKeyId::from_data(b"cache-capacity-bound");
@@ -2983,10 +2969,10 @@ mod tests {
         }));
         assert!(matches!(
             effects.as_slice(),
-            [DhtEffect::Output(DhtOutput::Completed {
-                result: DhtOutputValue::GetValues { values, .. },
-                ..
-            })] if values.len() == super::super::constants::MAX_ENTRIES_PER_KEY
+            [DhtEffect::Output(DhtOutput::Failed {
+                op_id: 85,
+                error: DhtIoError::StorageFull
+            })]
         ));
     }
 
