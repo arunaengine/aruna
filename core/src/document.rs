@@ -10,7 +10,7 @@ use crate::keyspaces::{
     METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
     NODE_INFO_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
     NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_NODE_STATS_KEYSPACE,
-    USER_KEYSPACE,
+    USER_ACCESS_KEYSPACE, USER_KEYSPACE,
 };
 use crate::metadata::{MetadataCreateEventRecord, MetadataGraphLifecycleRecord};
 use crate::storage_entries::{
@@ -70,6 +70,10 @@ pub enum DocumentSyncTarget {
     NodeInfo {
         realm_id: RealmId,
         node_id: NodeId,
+    },
+    UserAccess {
+        realm_id: RealmId,
+        access_key: String,
     },
 }
 
@@ -336,6 +340,7 @@ impl DocumentSyncTarget {
             Self::WatchInterest { realm_id, .. } => TopicId::realm(*realm_id),
             Self::WatchSubscription { owner, .. } => TopicId::realm(owner.realm_id),
             Self::NodeInfo { realm_id, .. } => TopicId::realm(*realm_id),
+            Self::UserAccess { realm_id, .. } => TopicId::realm(*realm_id),
         }
     }
 
@@ -353,6 +358,7 @@ impl DocumentSyncTarget {
             Self::WatchInterest { .. } => NOTIFICATION_WATCH_INTEREST_KEYSPACE,
             Self::WatchSubscription { .. } => NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
             Self::NodeInfo { .. } => NODE_INFO_KEYSPACE,
+            Self::UserAccess { .. } => USER_ACCESS_KEYSPACE,
         }
     }
 
@@ -395,6 +401,7 @@ impl DocumentSyncTarget {
                 watch_subscription_key(*owner, *watch_id)
             }
             Self::NodeInfo { node_id, .. } => ByteView::from(node_info_storage_key(*node_id)),
+            Self::UserAccess { access_key, .. } => ByteView::from(access_key.as_bytes().to_vec()),
         }
     }
 
@@ -456,6 +463,9 @@ impl DocumentSyncTarget {
             // Realm-shared: every node's info/heartbeat document rides one topic
             // (no node id in the suffix) so all realm nodes receive every peer's.
             Self::NodeInfo { .. } => bytes.extend_from_slice(b"/node-info"),
+            // Realm-shared: every node subscribes so an access key created on any
+            // node replicates to all, making the credential valid realm-wide.
+            Self::UserAccess { .. } => bytes.extend_from_slice(b"/user-access"),
             other => {
                 debug_assert!(
                     false,
@@ -1010,6 +1020,39 @@ mod tests {
             target.storage_key().as_ref(),
             node_info_storage_key(node_id).as_slice()
         );
+    }
+
+    #[test]
+    fn user_access_targets_share_one_realm_topic() {
+        use crate::keyspaces::USER_ACCESS_KEYSPACE;
+
+        let realm_id = test_realm(2);
+        let target = DocumentSyncTarget::UserAccess {
+            realm_id,
+            access_key: "user:key-a".to_string(),
+        };
+        let other = DocumentSyncTarget::UserAccess {
+            realm_id,
+            access_key: "user:key-b".to_string(),
+        };
+
+        let nil = PlacementRef::NIL;
+        assert_eq!(target.topic_id(), TopicId::realm(realm_id));
+        assert_eq!(
+            target.sync_topic_id(realm_id, &nil),
+            other.sync_topic_id(realm_id, &nil)
+        );
+        assert_ne!(
+            target.sync_topic_id(realm_id, &nil),
+            DocumentSyncTarget::NodeInfo {
+                realm_id,
+                node_id: test_node(1),
+            }
+            .sync_topic_id(realm_id, &nil)
+        );
+        assert!(!target.is_admin_document());
+        assert_eq!(target.storage_keyspace(), USER_ACCESS_KEYSPACE);
+        assert_eq!(target.storage_key().as_ref(), b"user:key-a");
     }
 
     #[test]

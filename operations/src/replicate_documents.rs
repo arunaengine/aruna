@@ -201,6 +201,7 @@ impl ReplicateDocumentsOperation {
                 DocumentSyncTarget::NodeUsage { .. }
                     | DocumentSyncTarget::WatchInterest { .. }
                     | DocumentSyncTarget::NodeInfo { .. }
+                    | DocumentSyncTarget::UserAccess { .. }
             )
         {
             return match self.emit_placement_update() {

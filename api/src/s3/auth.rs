@@ -7,6 +7,7 @@ use aruna_core::structs::{
 use aruna_core::{NodeId, UserId};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
 use s3s::access::{S3Access, S3AccessContext};
@@ -76,8 +77,14 @@ impl S3Access for AuthProvider {
         // Fetch user access -> GetUserAccess state machine
         let user_access = self.query_user_access(&access_key_id).await?;
 
-        if user_access.issued_by != *self.node_id.as_bytes() {
-            return Err(s3_error!(InvalidAccessKeyId, "Credential issuer mismatch"));
+        // Realm-valid credentials: accept any key issued by a configured realm
+        // node, so a key created on one node authenticates on every node. Every
+        // other check below validates against realm-replicated state.
+        if !self.issuer_in_realm(&user_access.issued_by).await? {
+            return Err(s3_error!(
+                InvalidAccessKeyId,
+                "Credential issuer not in realm"
+            ));
         }
 
         if user_access.is_revoked() {
@@ -204,6 +211,24 @@ impl AuthProvider {
             )),
             Err(_) => Err(s3_error!(InternalError, "Failed to query user access")),
         }
+    }
+
+    /// Whether `issued_by` is a node configured in this realm. Credentials are
+    /// replicated realm-wide, so the issuer only has to be a realm member rather
+    /// than the serving node.
+    async fn issuer_in_realm(&self, issued_by: &[u8; 32]) -> S3Result<bool> {
+        let config = drive(
+            GetRealmConfigOperation::new(self.realm_id),
+            self.driver_ctx.as_ref(),
+        )
+        .await
+        .map_err(|_| s3_error!(InternalError, "Failed to load realm config"))?;
+        let node_ids = config
+            .node_ids()
+            .map_err(|_| s3_error!(InternalError, "Malformed realm node id"))?;
+        Ok(node_ids
+            .iter()
+            .any(|node_id| node_id.as_bytes() == issued_by))
     }
 
     async fn find_bucket_info(&self, bucket: &str) -> S3Result<Option<BucketInfo>> {
