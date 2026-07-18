@@ -1,9 +1,21 @@
 use aruna_core::compute::{BackendError, ExecutorKind, TombstoneSpec};
-use aruna_core::structs::{AttemptIntent, JobError, JobErrorKind, JobId, JobResultPayload};
+use aruna_core::structs::{
+    AttemptIntent, JobError, JobErrorKind, JobId, JobPayload, JobResultPayload, JobState,
+    WorkspaceMode,
+};
 
 use super::super::executor::{JobContext, JobRunOutcome};
-use super::super::store::{JobMutationError, authorize_cleanup, record_attempt_tombstone};
+use super::super::store::{
+    JobMutationError, authorize_cleanup, read_job_record, record_attempt_tombstone,
+};
 use crate::driver::drive;
+use crate::s3::delete_bucket::{DeleteBucketError, DeleteBucketOperation};
+use crate::s3::delete_object::DeleteObjectError;
+use crate::s3::delete_objects::{DeleteObjectsEntry, DeleteObjectsInput, delete_objects};
+use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::s3::list_object_versions::{
+    ListObjectVersionsInput, ListObjectVersionsItem, ListObjectVersionsOperation,
+};
 use crate::s3::revoke_user_access::{RevokeUserAccessError, RevokeUserAccessOperation};
 
 pub async fn run_terminal_cleanup(
@@ -14,9 +26,114 @@ pub async fn run_terminal_cleanup(
 ) -> JobRunOutcome {
     let backend_error = cleanup_attempt(ctx, for_job, intent).await.err();
     let revoke_error = revoke_credential(ctx, access_key).await.err();
-    match cleanup_error(revoke_error, backend_error) {
+    let workspace_error = cleanup_temporary_workspace(ctx, for_job).await.err();
+    match cleanup_error([revoke_error, backend_error, workspace_error]) {
         Some(error) => JobRunOutcome::Failed(error),
         None => JobRunOutcome::Succeeded(JobResultPayload::Cleanup),
+    }
+}
+
+async fn cleanup_temporary_workspace(ctx: &JobContext, for_job: JobId) -> Result<(), JobError> {
+    let parent = read_job_record(&ctx.driver.storage_handle, for_job, None)
+        .await
+        .map_err(|error| JobError::retryable(format!("workspace parent read failed: {error}")))?;
+    let Some(parent) = parent else { return Ok(()) };
+    if parent.workspace_mode != WorkspaceMode::Temporary || parent.state != JobState::Succeeded {
+        return Ok(());
+    }
+    let JobPayload::Execution(spec) = &parent.payload else {
+        return Ok(());
+    };
+    let bucket = parent
+        .workspace_bucket
+        .as_deref()
+        .ok_or_else(|| JobError::permanent("temporary workspace bucket is missing"))?;
+    let info = match drive(GetBucketInfoOperation::new(bucket.to_string()), &ctx.driver)
+        .await
+        .and_then(|result| result.transpose())
+    {
+        Ok(Some(info)) => info,
+        Ok(None) | Err(GetBucketInfoError::NotFound) => return Ok(()),
+        Err(error) => {
+            return Err(JobError::retryable(format!(
+                "workspace bucket read failed: {error}"
+            )));
+        }
+    };
+    if info.group_id != spec.group_id {
+        return Err(JobError::permanent(
+            "temporary workspace bucket is outside the execution group",
+        ));
+    }
+
+    loop {
+        let listed = drive(
+            ListObjectVersionsOperation::new(ListObjectVersionsInput {
+                bucket: bucket.to_string(),
+                prefix: None,
+                delimiter: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: Some(ListObjectVersionsOperation::DEFAULT_MAX_KEYS),
+            }),
+            &ctx.driver,
+        )
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(|error| JobError::retryable(format!("workspace list failed: {error}")))?
+        .ok_or_else(|| JobError::retryable("workspace list returned no result"))?;
+        if listed.items.is_empty() {
+            break;
+        }
+        let entries = listed
+            .items
+            .into_iter()
+            .map(|item| match item {
+                ListObjectVersionsItem::Version {
+                    key, version_id, ..
+                }
+                | ListObjectVersionsItem::DeleteMarker {
+                    key, version_id, ..
+                } => DeleteObjectsEntry {
+                    key,
+                    version_id: Some(version_id),
+                },
+            })
+            .collect();
+        let outcomes = delete_objects(
+            &ctx.driver,
+            DeleteObjectsInput {
+                bucket: bucket.to_string(),
+                entries,
+                group_id: spec.group_id,
+                realm_id: parent.created_by.realm_id,
+                node_id: parent.owner_node_id,
+                deleted_by: parent.created_by,
+            },
+        )
+        .await;
+        if let Some(error) = outcomes
+            .into_iter()
+            .find_map(|outcome| match outcome.result {
+                Ok(_) | Err(DeleteObjectError::NoSuchVersion) => None,
+                Err(error) => Some(error),
+            })
+        {
+            return Err(JobError::retryable(format!(
+                "workspace object delete failed: {error}"
+            )));
+        }
+    }
+
+    match drive(DeleteBucketOperation::new(bucket.to_string()), &ctx.driver)
+        .await
+        .and_then(|result| result.transpose())
+    {
+        Ok(Some(())) | Err(DeleteBucketError::NotFound) => Ok(()),
+        Ok(None) => Err(JobError::retryable("workspace delete returned no result")),
+        Err(error) => Err(JobError::retryable(format!(
+            "workspace bucket delete failed: {error}"
+        ))),
     }
 }
 
@@ -103,8 +220,8 @@ fn revoke_error(error: RevokeUserAccessError) -> JobError {
     }
 }
 
-fn cleanup_error(first: Option<JobError>, second: Option<JobError>) -> Option<JobError> {
-    let errors: Vec<_> = [first, second].into_iter().flatten().collect();
+fn cleanup_error(errors: [Option<JobError>; 3]) -> Option<JobError> {
+    let errors: Vec<_> = errors.into_iter().flatten().collect();
     if errors.is_empty() {
         return None;
     }
@@ -138,10 +255,11 @@ mod tests {
         ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence, UserSpec,
     };
     use aruna_core::effects::StorageEffect;
-    use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
+    use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, USER_ACCESS_KEYSPACE};
     use aruna_core::structs::{
-        ComputeResources, ExecutionSpec, JobClaim, JobPayload, JobProgress, JobRecord, JobState,
-        RealmId, UserAccess,
+        BlobHeadKey, BlobVersion, BucketInfo, ComputeResources, CurrentVersionPointer,
+        ExecutionSpec, JobClaim, JobPayload, JobProgress, JobRecord, JobState, RealmId, UserAccess,
+        VersionKey,
     };
     use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
@@ -153,6 +271,7 @@ mod tests {
     use crate::driver::DriverContext;
     use crate::jobs::executor::ProgressReporter;
     use crate::jobs::store::{insert_job, record_attempt_intent};
+    use crate::s3::create_bucket::CreateBucketOperation;
     use crate::s3::get_user_access::GetUserAccessOperation;
 
     struct StubBackend {
@@ -333,6 +452,103 @@ mod tests {
             .unwrap()
     }
 
+    async fn seed_workspace(
+        ctx: &JobContext,
+        job_id: JobId,
+        state: JobState,
+        mode: WorkspaceMode,
+        bucket: &str,
+        with_object: bool,
+    ) {
+        let node_id = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let group_id = Ulid::from_bytes([3; 16]);
+        let user_id = UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32]));
+        let mut record = JobRecord::new(
+            job_id,
+            JobPayload::Execution(ExecutionSpec {
+                group_id,
+                name: None,
+                description: None,
+                tags: Default::default(),
+                image: "alpine:3".to_string(),
+                entrypoint: None,
+                command: Vec::new(),
+                workdir: None,
+                env: Default::default(),
+                resources: ComputeResources::default(),
+                executor_constraint: None,
+                inputs: Vec::new(),
+                file_outputs: Vec::new(),
+                workspace_outputs: Vec::new(),
+                output_prefixes: Vec::new(),
+            }),
+            user_id,
+            node_id,
+            1,
+            1,
+            None,
+        );
+        record.state = state;
+        record.workspace_mode = mode;
+        record.workspace_bucket = Some(bucket.to_string());
+        insert_job(&ctx.driver.storage_handle, &record)
+            .await
+            .unwrap();
+        drive(
+            CreateBucketOperation::new(
+                bucket.to_string(),
+                BucketInfo {
+                    group_id,
+                    created_at: SystemTime::now(),
+                    created_by: user_id,
+                    cors_configuration: None,
+                },
+            ),
+            &ctx.driver,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        if with_object {
+            let key = "result.txt";
+            let version_id = Ulid::from_bytes([11; 16]);
+            for (key_space, key, value) in [
+                (
+                    BLOB_HEAD_KEYSPACE,
+                    BlobHeadKey::new(bucket, key).to_bytes().unwrap(),
+                    CurrentVersionPointer::new(version_id).to_bytes().unwrap(),
+                ),
+                (
+                    BLOB_VERSIONS_KEYSPACE,
+                    VersionKey::new(bucket, key, version_id).to_bytes().unwrap(),
+                    BlobVersion::deleted(SystemTime::now(), user_id)
+                        .to_bytes()
+                        .unwrap(),
+                ),
+            ] {
+                let _ = ctx
+                    .driver
+                    .storage_handle
+                    .send_storage_effect(StorageEffect::Write {
+                        key_space: key_space.to_string(),
+                        key: key.into(),
+                        value: value.into(),
+                        txn_id: None,
+                    })
+                    .await;
+            }
+        }
+    }
+
+    async fn bucket_exists(ctx: &JobContext, bucket: &str) -> bool {
+        matches!(
+            drive(GetBucketInfoOperation::new(bucket.to_string()), &ctx.driver).await,
+            Ok(Some(Ok(_)))
+        )
+    }
+
     async fn write_access(storage: &StorageHandle, access: &UserAccess) {
         let _ = storage
             .send_storage_effect(StorageEffect::Write {
@@ -490,5 +706,99 @@ mod tests {
             JobRunOutcome::Succeeded(JobResultPayload::Cleanup)
         ));
         assert_eq!(backend.calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn temporary_retry_stable() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let backend = StubBackend::new(
+            ExecutorKind::Docker,
+            vec![Err(BackendError::Unavailable("down".to_string())), Ok(())],
+        );
+        let ctx = job_context(storage.clone(), std::slice::from_ref(&backend));
+        let job_id = JobId::from_bytes([12; 16]);
+        let bucket = "temporary-workspace";
+        let intent = seed_attempt(&storage, job_id, "docker", ctx.claim_token).await;
+        seed_workspace(
+            &ctx,
+            job_id,
+            JobState::Succeeded,
+            WorkspaceMode::Temporary,
+            bucket,
+            true,
+        )
+        .await;
+        let mut parent = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        parent.attempt_intent = Some(intent.clone());
+        insert_job(&storage, &parent).await.unwrap();
+
+        assert!(matches!(
+            run_terminal_cleanup(&ctx, job_id, Some(&intent), "missing-access").await,
+            JobRunOutcome::Failed(JobError {
+                kind: JobErrorKind::Retryable,
+                ..
+            })
+        ));
+        assert!(!bucket_exists(&ctx, bucket).await);
+        assert!(matches!(
+            run_terminal_cleanup(&ctx, job_id, Some(&intent), "missing-access").await,
+            JobRunOutcome::Succeeded(JobResultPayload::Cleanup)
+        ));
+    }
+
+    #[tokio::test]
+    async fn temporary_failure_keeps() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = job_context(storage, &[]);
+        let job_id = JobId::from_bytes([13; 16]);
+        let bucket = "failed-workspace";
+        seed_workspace(
+            &ctx,
+            job_id,
+            JobState::Failed,
+            WorkspaceMode::Temporary,
+            bucket,
+            false,
+        )
+        .await;
+
+        let outcome = run_terminal_cleanup(&ctx, job_id, None, "missing-access").await;
+
+        assert!(matches!(
+            outcome,
+            JobRunOutcome::Succeeded(JobResultPayload::Cleanup)
+        ));
+        assert!(bucket_exists(&ctx, bucket).await);
+    }
+
+    #[tokio::test]
+    async fn existing_never_deletes() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = job_context(storage, &[]);
+        let job_id = JobId::from_bytes([14; 16]);
+        let bucket = "existing-workspace";
+        seed_workspace(
+            &ctx,
+            job_id,
+            JobState::Succeeded,
+            WorkspaceMode::Existing,
+            bucket,
+            false,
+        )
+        .await;
+
+        let outcome = run_terminal_cleanup(&ctx, job_id, None, "missing-access").await;
+
+        assert!(matches!(
+            outcome,
+            JobRunOutcome::Succeeded(JobResultPayload::Cleanup)
+        ));
+        assert!(bucket_exists(&ctx, bucket).await);
     }
 }

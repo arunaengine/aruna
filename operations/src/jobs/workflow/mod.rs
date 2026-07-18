@@ -63,7 +63,11 @@ pub async fn run_execution_job(
     let JobPayload::Execution(mut spec) = record.payload.clone() else {
         return;
     };
-    spec.resolve_outputs(&JobRecord::workspace_bucket_name(job_id));
+    let bucket = record
+        .workspace_bucket
+        .clone()
+        .unwrap_or_else(|| JobRecord::workspace_bucket_name(job_id));
+    spec.resolve_outputs(&bucket);
 
     // A fresh cancel before any attempt was submitted: no container exists, so
     // terminalize directly (Claimed -> Cancelled).
@@ -117,7 +121,6 @@ pub async fn run_execution_job(
     tokio::pin!(heartbeat);
 
     let prepare_and_submit = async {
-        let bucket = JobRecord::workspace_bucket_name(job_id);
         let inputs =
             match prepare_workspace(&context, &spec, &record, node_id, &bucket, token).await {
                 Ok(prepared) => prepared,
@@ -331,7 +334,7 @@ async fn prepare_workspace(
     token: ulid::Ulid,
 ) -> Result<Vec<TaskInput>, JobError> {
     ensure_group_write(context, spec, record, node_id).await?;
-    ensure_workspace_bucket(context, spec, record, bucket).await?;
+    ensure_workspace_bucket(context, spec, record, node_id, bucket).await?;
     set_workspace_bucket(
         &context.storage_handle,
         record.job_id,

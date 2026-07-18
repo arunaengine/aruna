@@ -547,6 +547,24 @@ pub struct JobClaim {
     pub lease_expires_at_ms: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceMode {
+    Temporary,
+    #[default]
+    Kept,
+    Existing,
+}
+
+impl WorkspaceMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Temporary => "temporary",
+            Self::Kept => "kept",
+            Self::Existing => "existing",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRecord {
     pub job_id: JobId,
@@ -573,6 +591,8 @@ pub struct JobRecord {
     pub attempt_intent: Option<AttemptIntent>,
     /// Durable workspace/run bucket name (`ws-{jobid}`) for execution jobs.
     pub workspace_bucket: Option<String>,
+    #[serde(default)]
+    pub workspace_mode: WorkspaceMode,
 }
 
 impl JobRecord {
@@ -613,6 +633,7 @@ impl JobRecord {
             plan_digest,
             attempt_intent: None,
             workspace_bucket: None,
+            workspace_mode: WorkspaceMode::default(),
         }
     }
 
@@ -626,7 +647,15 @@ impl JobRecord {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
+        match postcard::from_bytes(bytes) {
+            Ok(record) => Ok(record),
+            Err(postcard::Error::DeserializeUnexpectedEnd) => {
+                let mut legacy = bytes.to_vec();
+                legacy.extend(postcard::to_allocvec(&WorkspaceMode::default())?);
+                Ok(postcard::from_bytes(&legacy)?)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -1117,6 +1146,19 @@ mod tests {
         let record = probe_record(JobId::from_bytes([5u8; 16]), 1_700_000_000_000);
         let bytes = record.to_bytes().unwrap();
         assert_eq!(JobRecord::from_bytes(&bytes).unwrap(), record);
+    }
+
+    #[test]
+    fn legacy_record_defaults() {
+        let record = probe_record(JobId::from_bytes([6u8; 16]), 1_700_000_000_000);
+        let mut bytes = record.to_bytes().unwrap();
+        let mode = postcard::to_allocvec(&WorkspaceMode::Kept).unwrap();
+        bytes.truncate(bytes.len() - mode.len());
+
+        let decoded = JobRecord::from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.workspace_mode, WorkspaceMode::Kept);
+        assert_eq!(decoded.workspace_bucket, record.workspace_bucket);
     }
 
     #[test]

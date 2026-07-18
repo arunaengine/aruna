@@ -463,6 +463,8 @@ pub async fn create_task(
         caller.auth.user_id,
         state.get_node_id(),
         idempotency_key,
+        aruna_core::structs::WorkspaceMode::Kept,
+        None,
     )
     .await
     {

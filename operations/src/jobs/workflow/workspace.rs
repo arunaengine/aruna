@@ -8,7 +8,7 @@ use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
     AuthContext, BackendLocation, BucketInfo, ExecutionSpec, InputSelection, InputSource, JobError,
     JobRecord, OutputDestination, OutputObject, OutputSelection, PathRestriction, Permission,
-    UserAccess, blob_bucket_permission_path, blob_group_permission_path,
+    UserAccess, WorkspaceMode, blob_bucket_permission_path, blob_group_permission_path,
     blob_object_permission_path, workspace_credential_id,
 };
 use aruna_core::types::NodeId;
@@ -80,8 +80,45 @@ pub async fn ensure_workspace_bucket(
     context: &DriverContext,
     spec: &ExecutionSpec,
     record: &JobRecord,
+    node_id: NodeId,
     bucket: &str,
 ) -> Result<(), JobError> {
+    if record.workspace_mode == WorkspaceMode::Existing {
+        let info = drive(GetBucketInfoOperation::new(bucket.to_string()), context)
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(|error| bucket_lookup_error("workspace", error))?
+            .ok_or_else(|| JobError::permanent("existing workspace bucket not found"))?;
+        if info.group_id != spec.group_id {
+            return Err(JobError::permanent(
+                "existing workspace bucket is outside the execution group",
+            ));
+        }
+        let allowed = drive(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: AuthContext {
+                    user_id: record.created_by,
+                    realm_id: record.created_by.realm_id,
+                    path_restrictions: None,
+                },
+                path: blob_bucket_permission_path(
+                    record.created_by.realm_id,
+                    spec.group_id,
+                    node_id,
+                    bucket,
+                ),
+                required_permission: Permission::WRITE,
+            }),
+            context,
+        )
+        .await
+        .map_err(|error| authorization_error("workspace", error))?;
+        return if allowed {
+            Ok(())
+        } else {
+            Err(JobError::permanent("workspace write access denied"))
+        };
+    }
     let bucket_info = BucketInfo {
         group_id: spec.group_id,
         created_at: SystemTime::now(),
