@@ -13,12 +13,12 @@ use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
     NODE_USAGE_DIRTY_GLOBAL_KEY, NODE_USAGE_DIRTY_PREFIX, NODE_USAGE_GLOBAL_PREFIX,
     NODE_USAGE_GROUP_PREFIX, NODE_USAGE_SUMMARY_GLOBAL_KEY, NODE_USAGE_SUMMARY_GROUP_PREFIX,
-    NodeUsageSnapshot, RealmConfigDocument, RealmId, USAGE_GLOBAL_KEY, USAGE_GLOBAL_SHARD_COUNT,
-    UsageCounterError, UsageCounters, UsageDelta, VersionKey, node_usage_dirty_group_id,
-    node_usage_dirty_group_key, node_usage_global_key, node_usage_group_key,
-    node_usage_group_key_group_id, node_usage_group_prefix, node_usage_key_node_id,
-    node_usage_summary_group_key, usage_global_key_for_group, usage_global_shard_index,
-    usage_global_shard_key, usage_global_shard_keys, usage_group_key,
+    NodeUsageSnapshot, RealmConfigDocument, RealmId, SourceConnectorKind, USAGE_GLOBAL_KEY,
+    USAGE_GLOBAL_SHARD_COUNT, UsageCounterError, UsageCounters, UsageDelta, VersionKey,
+    node_usage_dirty_group_id, node_usage_dirty_group_key, node_usage_global_key,
+    node_usage_group_key, node_usage_group_key_group_id, node_usage_group_prefix,
+    node_usage_key_node_id, node_usage_summary_group_key, usage_global_key_for_group,
+    usage_global_shard_index, usage_global_shard_key, usage_global_shard_keys, usage_group_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -692,6 +692,11 @@ impl RebuildUsageStatsOperation {
                     let Some(size) = (match version.state {
                         BlobVersionState::Materialized { blob_hash, .. } => {
                             self.blob_sizes.get(blob_hash.as_slice()).copied()
+                        }
+                        BlobVersionState::Reference { source, .. }
+                            if source.descriptor.kind == SourceConnectorKind::ArunaNative =>
+                        {
+                            Some(value.len() as u64)
                         }
                         BlobVersionState::Reference {
                             cached_metadata, ..
@@ -2130,6 +2135,59 @@ mod tests {
         assert_eq!(beta.buckets, 1);
         assert_eq!(beta.objects, 1);
         assert_eq!(beta.logical_bytes, 80);
+    }
+
+    #[test]
+    fn rebuild_counts_overhead() {
+        let group_id = Ulid::r#gen();
+        let version_id = Ulid::r#gen();
+        let version = BlobVersion::reference(
+            VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                descriptor: PortableSourceDescriptor {
+                    kind: SourceConnectorKind::ArunaNative,
+                    public_config: HashMap::from([(
+                        "relationship_id".to_string(),
+                        Ulid::r#gen().to_string(),
+                    )]),
+                    source_path: "origin/object.bin".to_string(),
+                    version_selector: Some(format!("version:{version_id}")),
+                    capabilities: Vec::new(),
+                    origin_node_id: Some(iroh::SecretKey::from_bytes(&[4u8; 32]).public()),
+                },
+                connector_id: None,
+            },
+            SourceMetadata {
+                content_length: 1_000_000,
+                content_type: None,
+                etag: None,
+                last_modified: None,
+                source_version: None,
+            },
+            SystemTime::UNIX_EPOCH,
+            Default::default(),
+            SystemTime::UNIX_EPOCH,
+        );
+        let value = ByteView::from(version.to_bytes().unwrap());
+        let key = ByteView::from(
+            VersionKey::new("target", "object.bin", version_id)
+                .to_bytes()
+                .unwrap(),
+        );
+        let mut operation = RebuildUsageStatsOperation::new();
+        operation.state = RebuildUsageStatsState::ScanVersions;
+        operation
+            .bucket_groups
+            .insert("target".to_string(), group_id);
+
+        operation.consume_values(&[(key, value.clone())]).unwrap();
+
+        assert_eq!(operation.global.logical_bytes, value.len() as u64);
+        assert_eq!(
+            operation.groups.get(&group_id).unwrap().logical_bytes,
+            value.len() as u64
+        );
+        assert!(operation.global.logical_bytes < 1_000_000);
     }
 
     #[tokio::test]

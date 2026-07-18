@@ -16,7 +16,8 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState,
-    CurrentVersionPointer, MultipartObjectMetadataKey, RealmId, UsageDelta, VersionKey,
+    CurrentVersionPointer, MultipartObjectMetadataKey, RealmId, SourceConnectorKind, UsageDelta,
+    VersionKey,
 };
 use aruna_core::types::{Effects, GroupId, Key, NodeId, UserId};
 use smallvec::smallvec;
@@ -63,9 +64,14 @@ struct VersionSummary {
 }
 
 impl VersionSummary {
-    fn from_blob_version(version_id: Ulid, version: &BlobVersion) -> Self {
+    fn from_blob_version(version_id: Ulid, version: &BlobVersion, encoded_len: usize) -> Self {
         let (materialized_hash, logical_size) = match &version.state {
             BlobVersionState::Materialized { blob_hash, .. } => (Some(*blob_hash), None),
+            BlobVersionState::Reference { source, .. }
+                if source.descriptor.kind == SourceConnectorKind::ArunaNative =>
+            {
+                (None, Some(encoded_len as u64))
+            }
             BlobVersionState::Reference {
                 cached_metadata, ..
             } => (None, Some(cached_metadata.content_length)),
@@ -272,7 +278,7 @@ impl DeleteObjectOperation {
             Ok(version) => version,
             Err(err) => return self.emit_error(err.into()),
         };
-        let summary = VersionSummary::from_blob_version(version_id, &version);
+        let summary = VersionSummary::from_blob_version(version_id, &version, value.len());
         let materialized_hash = summary.materialized_hash;
         self.target_size = summary.logical_size;
         self.target_version = Some(summary);
@@ -337,6 +343,7 @@ impl DeleteObjectOperation {
                 Some(VersionSummary::from_blob_version(
                     version_key.version_id,
                     &version,
+                    value.len(),
                 ))
             })
             .max_by_key(|summary| summary.version_id);
@@ -843,7 +850,8 @@ mod test {
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
         Backend, BackendConfig, BlobHeadKey, BlobVersion, CurrentVersionPointer, HashPathIndexKey,
-        RealmId, VersionKey,
+        PortableSourceDescriptor, RealmId, SourceConnectorKind, SourceMetadata, StagingStrategy,
+        VersionKey, VersionSourceBinding,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -877,6 +885,41 @@ mod test {
                 .into(),
             deleted_version_value(user_id),
         )
+    }
+
+    #[test]
+    fn native_counts_overhead() {
+        let version_id = Ulid::r#gen();
+        let version = BlobVersion::reference(
+            VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                descriptor: PortableSourceDescriptor {
+                    kind: SourceConnectorKind::ArunaNative,
+                    public_config: HashMap::new(),
+                    source_path: "source/object.bin".to_string(),
+                    version_selector: Some(format!("version:{version_id}")),
+                    capabilities: Vec::new(),
+                    origin_node_id: Some(iroh::SecretKey::from_bytes(&[4u8; 32]).public()),
+                },
+                connector_id: None,
+            },
+            SourceMetadata {
+                content_length: 1_000_000,
+                content_type: None,
+                etag: None,
+                last_modified: None,
+                source_version: None,
+            },
+            SystemTime::UNIX_EPOCH,
+            Default::default(),
+            SystemTime::UNIX_EPOCH,
+        );
+        let encoded = version.to_bytes().unwrap();
+
+        let summary = VersionSummary::from_blob_version(version_id, &version, encoded.len());
+
+        assert_eq!(summary.logical_size, Some(encoded.len() as u64));
+        assert!(summary.logical_size.unwrap() < 1_000_000);
     }
 
     async fn read_value(
