@@ -421,8 +421,14 @@ fn validate_relationship(
         .source
         .key_prefix()
         .is_none_or(|prefix| request.key.starts_with(prefix));
+    // Detached stubs are deleted relationships that must keep serving the
+    // reference records the target retained; every other non-enabled state
+    // still refuses access.
     if relationship.mode != SyncMode::Reference
-        || relationship.state != SyncState::Enabled
+        || !matches!(
+            relationship.state,
+            SyncState::Enabled | SyncState::Detached
+        )
         || relationship.source.realm_id != *net_handle.realm_id()
         || relationship.source.node_id != net_handle.node_id()
         || relationship.target.node_id != peer
@@ -518,6 +524,12 @@ fn head_metadata(
 }
 
 async fn mark_access_denied(context: &DriverContext, mut relationship: SyncRelationship) {
+    if relationship.state == SyncState::Detached {
+        // A detached stub has no owner-visible entry left to surface the
+        // failure in, and flipping it to Failed would stop serving retained
+        // data permanently; the per-request denial is the only surface.
+        return;
+    }
     relationship.state = SyncState::Failed {
         reason: "access_denied".to_string(),
     };

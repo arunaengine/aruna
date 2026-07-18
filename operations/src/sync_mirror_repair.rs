@@ -8,7 +8,8 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{SYNC_MIRROR_REPAIR_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE};
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::{
-    AuthContext, Permission, SyncRelationship, blob_bucket_permission_path, sync_relationship_key,
+    AuthContext, Permission, SyncRelationship, SyncState, blob_bucket_permission_path,
+    sync_relationship_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, KeySpace, TxnId, Value};
@@ -27,7 +28,7 @@ use crate::queue_backoff::queue_retry_after_ms;
 use crate::s3::get_bucket_info::GetBucketInfoOperation;
 use crate::sync_relationship::{
     DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, StoreSyncRelationshipOperation,
-    SyncRelationshipDirection, SyncRelationshipError,
+    SyncRelationshipDirection, SyncRelationshipError, remove_outgoing_relationship,
 };
 
 const REPAIR_PAGE_SIZE: usize = 128;
@@ -155,6 +156,13 @@ pub async fn store_sync_status(
             commit_repair_transaction(&context.storage_handle, txn_id).await?;
             return Ok(false);
         };
+        if existing.state == SyncState::Detached {
+            // The relationship was deleted and only survives as a serving
+            // stub; status updates must not overwrite it or re-stage a
+            // reconcile that would resurrect the target mirror.
+            commit_repair_transaction(&context.storage_handle, txn_id).await?;
+            return Ok(false);
+        }
         if !same_relationship(&existing, relationship) {
             return Err(SyncMirrorRepairError::Mirror(
                 "sync relationship identity changed during status update".to_string(),
@@ -482,6 +490,11 @@ async fn process_repair_record(
         )
         .await
         {
+            // Detached stubs only serve retained reference reads; never
+            // resurrect the target mirror for them.
+            Ok(relationship) if relationship.state == SyncState::Detached => {
+                delete_sync_mirror(context, local_node, &record.relationship).await
+            }
             Ok(relationship) => ensure_sync_mirror(context, local_node, &relationship).await,
             Err(SyncRelationshipError::NotFound) => {
                 delete_sync_mirror(context, local_node, &record.relationship).await
@@ -501,14 +514,7 @@ async fn delete_local_relationships(
     relationship: &SyncRelationship,
 ) -> Result<(), SyncMirrorRepairError> {
     if relationship.source.node_id == local_node {
-        drive(
-            DeleteSyncRelationshipOperation::new(
-                relationship.clone(),
-                SyncRelationshipDirection::Outgoing,
-            ),
-            context,
-        )
-        .await?;
+        remove_outgoing_relationship(context, relationship.clone()).await?;
     }
     if relationship.target.node_id == local_node {
         drive(

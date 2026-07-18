@@ -28,7 +28,7 @@ use aruna_operations::sync_mirror_repair::{
 use aruna_operations::sync_relationship::{
     DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, ListSyncRelationshipsOperation,
     StoreSyncRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
-    create_sync_relationship,
+    create_sync_relationship, remove_outgoing_relationship,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -257,7 +257,10 @@ pub async fn create_sync(
     )
     .await?;
     if existing.iter().any(|relationship| {
-        relationship.source == source && relationship.target == target && relationship.mode == mode
+        relationship.state != SyncState::Detached
+            && relationship.source == source
+            && relationship.target == target
+            && relationship.mode == mode
     }) {
         return Err(ServerError::Conflict(
             "sync relationship already exists".to_string(),
@@ -514,7 +517,19 @@ pub async fn delete_sync(
     stage_mirror_delete(&context, &relationship)
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
-    delete_relationship(&state, relationship.clone(), direction).await?;
+    match direction {
+        // Reference relationships leave a detached serving stub behind so
+        // that data retained by the target stays readable; other modes are
+        // removed outright.
+        SyncRelationshipDirection::Outgoing => {
+            remove_outgoing_relationship(&context, relationship.clone())
+                .await
+                .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        }
+        SyncRelationshipDirection::Incoming => {
+            delete_relationship(&state, relationship.clone(), direction).await?;
+        }
+    }
     kick_mirror_repair(&context).await;
     if remove_mirror(&state, &relationship).await {
         clear_repair(&state, &relationship, SyncMirrorRepairIntent::Delete).await;
@@ -767,6 +782,15 @@ async fn list_relationships(
     .map_err(|error| ServerError::InternalError(error.to_string()))
 }
 
+/// Detached stubs only keep retained reference data readable; the management
+/// API treats them exactly like removed relationships.
+fn visible(relationship: SyncRelationship) -> ServerResult<SyncRelationship> {
+    if relationship.state == SyncState::Detached {
+        return Err(ServerError::NotFound);
+    }
+    Ok(relationship)
+}
+
 async fn get_relationship(
     state: &ServerState,
     id: Ulid,
@@ -781,6 +805,7 @@ async fn get_relationship(
         SyncRelationshipError::NotFound => ServerError::NotFound,
         other => ServerError::InternalError(other.to_string()),
     })
+    .and_then(visible)
 }
 
 async fn load_relationship(
@@ -793,7 +818,9 @@ async fn load_relationship(
     )
     .await
     {
-        Ok(relationship) => Ok((relationship, SyncRelationshipDirection::Outgoing)),
+        Ok(relationship) => {
+            Ok((visible(relationship)?, SyncRelationshipDirection::Outgoing))
+        }
         Err(SyncRelationshipError::NotFound) => {
             get_relationship(state, id, SyncRelationshipDirection::Incoming)
                 .await
@@ -857,6 +884,7 @@ fn filter_relationships(
 ) -> Vec<SyncRelationshipResponse> {
     relationships
         .into_iter()
+        .filter(|relationship| relationship.state != SyncState::Detached)
         .filter(|relationship| relationship.created_by == user_id)
         .filter(|relationship| {
             prefix.is_none_or(|prefix| {
@@ -892,6 +920,7 @@ fn map_relationship(relationship: &SyncRelationship) -> SyncRelationshipResponse
         SyncState::Enabled => ("enabled", None),
         SyncState::Paused => ("paused", None),
         SyncState::Failed { reason } => ("failed", Some(reason.clone())),
+        SyncState::Detached => ("detached", None),
     };
     SyncRelationshipResponse {
         id: relationship.id.to_string(),
@@ -1086,6 +1115,63 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, ServerError::BadRequestReason(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_reference_detaches_serving_stub() {
+        let (_storage_dir, state, auth, mut relationship) = test_state().await;
+        relationship.mode = SyncMode::Reference;
+        drive(
+            StoreSyncRelationshipOperation::new(
+                relationship.clone(),
+                SyncRelationshipDirection::Outgoing,
+            ),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            delete_sync(
+                State(state.clone()),
+                Extension(Some(auth.clone())),
+                Path(relationship.id.to_string()),
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+
+        // The outgoing record survives as a detached serving stub ...
+        let stored = drive(
+            GetSyncRelationshipOperation::new(
+                relationship.id,
+                SyncRelationshipDirection::Outgoing,
+            ),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored.state, SyncState::Detached);
+
+        // ... but the management API treats the relationship as removed.
+        assert!(matches!(
+            get_sync(
+                State(state.clone()),
+                Extension(Some(auth.clone())),
+                Path(relationship.id.to_string()),
+            )
+            .await,
+            Err(ServerError::NotFound)
+        ));
+        let Json(listed) = list_sync(
+            State(state),
+            Extension(Some(auth)),
+            Query(SyncListParams::default()),
+        )
+        .await
+        .unwrap();
+        assert!(listed.outgoing.is_empty());
     }
 
     #[tokio::test]

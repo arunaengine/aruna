@@ -3,7 +3,9 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{SyncRelationship, sync_relationship_key, sync_relationship_prefix};
+use aruna_core::structs::{
+    SyncMode, SyncRelationship, SyncState, sync_relationship_key, sync_relationship_prefix,
+};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
@@ -106,6 +108,37 @@ pub async fn create_sync_relationship(
     Err(StorageError::TransactionConflict.into())
 }
 
+/// Removes an outgoing relationship on behalf of a delete flow.
+///
+/// Reference relationships are detached instead of deleted: the target keeps
+/// `BlobVersion::Reference` records bound to this relationship id, and the
+/// native reference path authorizes every read through the outgoing record,
+/// so a serving-only stub must survive for the retained data to stay
+/// readable. All other modes are removed outright.
+pub async fn remove_outgoing_relationship(
+    context: &crate::driver::DriverContext,
+    relationship: SyncRelationship,
+) -> Result<(), SyncRelationshipError> {
+    if relationship.mode == SyncMode::Reference {
+        let stub = SyncRelationship {
+            state: SyncState::Detached,
+            ..relationship
+        };
+        crate::driver::drive(
+            StoreSyncRelationshipOperation::new(stub, SyncRelationshipDirection::Outgoing),
+            context,
+        )
+        .await
+        .map(|_| ())
+    } else {
+        crate::driver::drive(
+            DeleteSyncRelationshipOperation::new(relationship, SyncRelationshipDirection::Outgoing),
+            context,
+        )
+        .await
+    }
+}
+
 async fn create_relationship_once(
     storage: &StorageHandle,
     relationship: &SyncRelationship,
@@ -132,7 +165,13 @@ async fn create_relationship_once(
             }) => {
                 if parse_values(SyncRelationshipDirection::Outgoing, values)?
                     .iter()
-                    .any(|existing| same_create_identity(existing, relationship))
+                    .any(|existing| {
+                        // Detached stubs only keep retained reference data
+                        // readable; they must not block re-creating the same
+                        // relationship.
+                        existing.state != SyncState::Detached
+                            && same_create_identity(existing, relationship)
+                    })
                 {
                     return Err(SyncRelationshipError::Duplicate);
                 }

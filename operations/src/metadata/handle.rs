@@ -68,7 +68,7 @@ use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, SearchBucke
 use crate::sync_mirror_repair::RECONCILE_GRACE;
 use crate::sync_relationship::{
     DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, StoreSyncRelationshipOperation,
-    SyncRelationshipDirection, SyncRelationshipError,
+    SyncRelationshipDirection, SyncRelationshipError, remove_outgoing_relationship,
 };
 
 const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1341,12 +1341,21 @@ impl MetadataHandle {
             if !sync_identity_matches(&stored, &relationship) {
                 return MetadataTransportMessage::Reject("invalid_relationship".to_string());
             }
-            return match drive(
-                DeleteSyncRelationshipOperation::new(stored, direction),
-                context.as_ref(),
-            )
-            .await
-            {
+            // Outgoing reference relationships are detached instead of
+            // deleted so the peer's retained reference records stay readable.
+            let removed = match direction {
+                SyncRelationshipDirection::Outgoing => {
+                    remove_outgoing_relationship(context.as_ref(), stored).await
+                }
+                SyncRelationshipDirection::Incoming => {
+                    drive(
+                        DeleteSyncRelationshipOperation::new(stored, direction),
+                        context.as_ref(),
+                    )
+                    .await
+                }
+            };
+            return match removed {
                 Ok(()) => MetadataTransportMessage::SyncMirrorDeleted,
                 Err(_) => MetadataTransportMessage::Reject("mirror_internal".to_string()),
             };
