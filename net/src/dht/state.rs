@@ -23,8 +23,8 @@ use super::rpc::{
     signed_record_bytes, verify_stored_value,
 };
 use super::storage::{
-    CLEANUP_PAGE_SIZE, MergeError, StoredEntry, entry_is_fresh, merge_entry, retained_entries,
-    retention_deadline,
+    DeadlineEntry, DeadlineIndex, MergeError, StoredEntry, entry_is_fresh, merge_entry,
+    retained_entries, retention_deadline,
 };
 
 const MIN_TTL_SECS: u64 = 1;
@@ -51,8 +51,8 @@ pub struct DhtStateMachine {
     routing_table: RoutingTable,
     next_internal_op_id: OpId,
     ops: HashMap<OpId, OpState>,
-    cleanup_cursor: Option<Vec<u8>>,
-    cleanup_inflight: bool,
+    cleanup_active: bool,
+    cleanup_floor: bool,
     eviction_buckets: HashSet<usize>,
     peer_epoch: u64,
     current_tick: u64,
@@ -65,8 +65,8 @@ impl std::fmt::Debug for DhtStateMachine {
             .field("local_id", &self.local_id)
             .field("routing_table_size", &self.routing_table.len())
             .field("ops", &self.ops.len())
-            .field("cleanup_cursor", &self.cleanup_cursor)
-            .field("cleanup_inflight", &self.cleanup_inflight)
+            .field("cleanup_active", &self.cleanup_active)
+            .field("cleanup_floor", &self.cleanup_floor)
             .field("current_tick", &self.current_tick)
             .field("now_secs", &self.now_secs)
             .finish()
@@ -285,8 +285,8 @@ impl DhtStateMachine {
             routing_table: RoutingTable::new(local_id),
             next_internal_op_id: INTERNAL_OP_START,
             ops: HashMap::new(),
-            cleanup_cursor: None,
-            cleanup_inflight: false,
+            cleanup_active: false,
+            cleanup_floor: false,
             eviction_buckets: HashSet::new(),
             peer_epoch: 0,
             current_tick: 0,
@@ -567,15 +567,12 @@ impl DhtStateMachine {
             DhtIo::StorageWriteResult { op_id, stage } => {
                 self.handle_storage_write(op_id, stage, out)
             }
-            DhtIo::StorageDeleteResult { op_id, stage } => {
-                self.handle_storage_delete(op_id, stage, out)
-            }
             DhtIo::StorageIterResult {
                 op_id,
                 stage,
-                values,
-                next_start_after,
-            } => self.handle_storage_iter(op_id, stage, values, next_start_after, out),
+                index,
+                entries,
+            } => self.handle_storage_iter(op_id, stage, index, entries, out),
             DhtIo::StorageError {
                 op_id,
                 stage,
@@ -1236,6 +1233,17 @@ impl DhtStateMachine {
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
         if op_id == CLEANUP_OP_ID {
+            match stage {
+                StorageStage::CleanupActivePrune => {
+                    self.cleanup_active = false;
+                    self.schedule_active(out);
+                }
+                StorageStage::CleanupFloorPrune => {
+                    self.cleanup_floor = false;
+                    self.schedule_floor(out);
+                }
+                _ => {}
+            }
             return;
         }
 
@@ -1305,66 +1313,62 @@ impl DhtStateMachine {
     }
 
     #[tracing::instrument(
-        name = "dht.state.storage_delete",
-        level = "debug",
-        skip(self, _out),
-        fields(op_id, stage = ?stage)
-    )]
-    fn handle_storage_delete(
-        &mut self,
-        op_id: OpId,
-        stage: StorageStage,
-        _out: &mut SmallVec<[DhtEffect; 4]>,
-    ) {
-        if op_id == CLEANUP_OP_ID {
-            return;
-        }
-
-        let Some(mut op_state) = self.ops.remove(&op_id) else {
-            return;
-        };
-        let _ = take_pending_storage(op_state.pending_mut(), stage);
-        self.ops.insert(op_id, op_state);
-    }
-
-    #[tracing::instrument(
         name = "dht.state.storage_iter",
         level = "debug",
-        skip(self, values, next_start_after, out),
-        fields(op_id, stage = ?stage, page_len = values.len(), has_next = next_start_after.is_some())
+        skip(self, entries, out),
+        fields(op_id, stage = ?stage, index = ?index, page_len = entries.len())
     )]
     fn handle_storage_iter(
         &mut self,
         op_id: OpId,
         stage: StorageStage,
-        values: Vec<(Vec<u8>, Vec<StoredEntry>)>,
-        next_start_after: Option<Vec<u8>>,
+        index: DeadlineIndex,
+        entries: Vec<DeadlineEntry>,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
-        if op_id != CLEANUP_OP_ID || stage != StorageStage::CleanupIter {
+        if op_id != CLEANUP_OP_ID {
             return;
         }
 
-        for (raw_key, entries) in values {
-            let Ok(key_bytes): Result<[u8; 32], _> = raw_key.as_slice().try_into() else {
-                continue;
-            };
-            let key = DhtKeyId::from_bytes(key_bytes);
-
-            let original_len = entries.len();
-            let retained = retained_entries(entries, self.now_secs);
-            if retained.len() < original_len {
-                out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::StoragePrune {
-                    op_id: CLEANUP_OP_ID,
-                    stage: StorageStage::CleanupPrune,
-                    key,
-                    now_secs: self.now_secs,
-                })));
+        let prune_stage = match (stage, index) {
+            (StorageStage::CleanupActiveIter, DeadlineIndex::Active) => {
+                StorageStage::CleanupActivePrune
             }
+            (StorageStage::CleanupFloorIter, DeadlineIndex::Floor) => {
+                StorageStage::CleanupFloorPrune
+            }
+            (StorageStage::CleanupActiveIter, _) => {
+                self.cleanup_active = false;
+                return;
+            }
+            (StorageStage::CleanupFloorIter, _) => {
+                self.cleanup_floor = false;
+                return;
+            }
+            _ => return,
+        };
+        let Some(entry) = entries.into_iter().next() else {
+            match index {
+                DeadlineIndex::Active => self.cleanup_active = false,
+                DeadlineIndex::Floor => self.cleanup_floor = false,
+            }
+            return;
+        };
+        if entry.deadline > self.now_secs {
+            match index {
+                DeadlineIndex::Active => self.cleanup_active = false,
+                DeadlineIndex::Floor => self.cleanup_floor = false,
+            }
+            return;
         }
 
-        self.cleanup_cursor = next_start_after;
-        self.cleanup_inflight = false;
+        out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::StoragePrune {
+            op_id: CLEANUP_OP_ID,
+            stage: prune_stage,
+            index,
+            entry,
+            now_secs: self.now_secs,
+        })));
     }
 
     #[tracing::instrument(
@@ -1381,8 +1385,14 @@ impl DhtStateMachine {
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
         if op_id == CLEANUP_OP_ID {
-            if stage == StorageStage::CleanupIter {
-                self.cleanup_inflight = false;
+            match stage {
+                StorageStage::CleanupActiveIter | StorageStage::CleanupActivePrune => {
+                    self.cleanup_active = false;
+                }
+                StorageStage::CleanupFloorIter | StorageStage::CleanupFloorPrune => {
+                    self.cleanup_floor = false;
+                }
+                _ => {}
             }
             return;
         }
@@ -1843,17 +1853,35 @@ impl DhtStateMachine {
 
     #[tracing::instrument(name = "dht.state.schedule_cleanup", level = "trace", skip(self, out))]
     fn schedule_cleanup(&mut self, out: &mut SmallVec<[DhtEffect; 4]>) {
-        if self.cleanup_inflight {
+        self.schedule_active(out);
+        self.schedule_floor(out);
+    }
+
+    fn schedule_active(&mut self, out: &mut SmallVec<[DhtEffect; 4]>) {
+        if self.cleanup_active {
             return;
         }
 
-        self.cleanup_inflight = true;
+        self.cleanup_active = true;
         out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::StorageIter {
             op_id: CLEANUP_OP_ID,
-            stage: StorageStage::CleanupIter,
-            start_after: self.cleanup_cursor.clone(),
-            limit: CLEANUP_PAGE_SIZE,
-            now_secs: self.now_secs,
+            stage: StorageStage::CleanupActiveIter,
+            index: DeadlineIndex::Active,
+            limit: 1,
+        })));
+    }
+
+    fn schedule_floor(&mut self, out: &mut SmallVec<[DhtEffect; 4]>) {
+        if self.cleanup_floor {
+            return;
+        }
+
+        self.cleanup_floor = true;
+        out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::StorageIter {
+            op_id: CLEANUP_OP_ID,
+            stage: StorageStage::CleanupFloorIter,
+            index: DeadlineIndex::Floor,
+            limit: 1,
         })));
     }
 
@@ -2328,7 +2356,6 @@ fn dht_io_kind(io: &DhtIo) -> &'static str {
         DhtIo::StorageReadResult { .. } => "storage_read_result",
         DhtIo::StorageRevisionResult { .. } => "storage_revision_result",
         DhtIo::StorageWriteResult { .. } => "storage_write_result",
-        DhtIo::StorageDeleteResult { .. } => "storage_delete_result",
         DhtIo::StorageIterResult { .. } => "storage_iter_result",
         DhtIo::StorageError { .. } => "storage_error",
         DhtIo::PeerSeen { .. } => "peer_seen",
@@ -2342,7 +2369,6 @@ fn dht_io_op_id(io: &DhtIo) -> Option<OpId> {
         | DhtIo::StorageReadResult { op_id, .. }
         | DhtIo::StorageRevisionResult { op_id, .. }
         | DhtIo::StorageWriteResult { op_id, .. }
-        | DhtIo::StorageDeleteResult { op_id, .. }
         | DhtIo::StorageIterResult { op_id, .. }
         | DhtIo::StorageError { op_id, .. } => Some(*op_id),
         DhtIo::InboundRequest { .. }
@@ -2362,7 +2388,6 @@ fn dht_io_inbound_id(io: &DhtIo) -> Option<InboundId> {
         | DhtIo::StorageReadResult { .. }
         | DhtIo::StorageRevisionResult { .. }
         | DhtIo::StorageWriteResult { .. }
-        | DhtIo::StorageDeleteResult { .. }
         | DhtIo::StorageIterResult { .. }
         | DhtIo::StorageError { .. }
         | DhtIo::PeerSeen { .. } => None,
@@ -5001,6 +5026,74 @@ mod tests {
         }));
 
         assert!(state.routing_table.all_peers().is_empty());
+    }
+
+    #[test]
+    fn cleanup_runs_parallel() {
+        let local_secret = make_secret(98);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 100);
+
+        let effects = state.step(DhtInput::Tick {
+            now_tick: 1,
+            now_secs: 100,
+        });
+
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, DhtEffect::IoRequest(request) if matches!(&**request, DhtIoRequest::StorageIter { .. })))
+                .count(),
+            2
+        );
+        assert!(state.cleanup_active);
+        assert!(state.cleanup_floor);
+    }
+
+    #[test]
+    fn cleanup_drains_heads() {
+        let local_secret = make_secret(99);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 100);
+        let _ = state.step(DhtInput::Tick {
+            now_tick: 1,
+            now_secs: 100,
+        });
+        let entry = DeadlineEntry {
+            deadline: 100,
+            key: DhtKeyId::from_data(b"due-head"),
+        };
+
+        let effects = state.step(DhtInput::Io(DhtIo::StorageIterResult {
+            op_id: CLEANUP_OP_ID,
+            stage: StorageStage::CleanupActiveIter,
+            index: DeadlineIndex::Active,
+            entries: vec![entry],
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [DhtEffect::IoRequest(request)]
+                if matches!(&**request, DhtIoRequest::StoragePrune {
+                    stage: StorageStage::CleanupActivePrune,
+                    entry: request_entry,
+                    ..
+                } if *request_entry == entry)
+        ));
+
+        let effects = state.step(DhtInput::Io(DhtIo::StorageWriteResult {
+            op_id: CLEANUP_OP_ID,
+            stage: StorageStage::CleanupActivePrune,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [DhtEffect::IoRequest(request)]
+                if matches!(&**request, DhtIoRequest::StorageIter {
+                    stage: StorageStage::CleanupActiveIter,
+                    ..
+                })
+        ));
+        assert!(state.cleanup_active);
+        assert!(state.cleanup_floor);
     }
 
     #[test]

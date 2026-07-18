@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use aruna_core::DistributedTraceContext;
 use aruna_core::alpn::Alpn;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -39,8 +39,9 @@ use super::rpc::{
 };
 use super::state::DhtStateMachine;
 use super::storage::{
-    CLEANUP_PAGE_SIZE, MergeError, StoredEntry, decode_entries, encode_entries, merge_entry,
-    now_unix_secs, retained_entries, validate_entries,
+    CLEANUP_PAGE_SIZE, DeadlineEntry, DeadlineIndex, MergeError, StoredEntry, active_deadline,
+    deadline_key, decode_entries, encode_entries, floor_deadline, merge_entry, now_unix_secs,
+    parse_deadline, retained_entries, row_deadline, validate_entries,
 };
 use crate::connection_pool::{ConnectionPool, PoolConnectError};
 use crate::telemetry::{
@@ -615,7 +616,6 @@ impl DhtDriver {
             | DhtIo::StorageReadResult { op_id, .. }
             | DhtIo::StorageRevisionResult { op_id, .. }
             | DhtIo::StorageWriteResult { op_id, .. }
-            | DhtIo::StorageDeleteResult { op_id, .. }
             | DhtIo::StorageIterResult { op_id, .. }
             | DhtIo::StorageError { op_id, .. } => self.op_spans.get(op_id).cloned(),
             DhtIo::InboundRequest { inbound_id, .. }
@@ -630,9 +630,7 @@ impl DhtDriver {
             DhtIoRequest::RpcRequest { op_id, .. }
             | DhtIoRequest::StorageRead { op_id, .. }
             | DhtIoRequest::StorageRevision { op_id, .. }
-            | DhtIoRequest::StorageWrite { op_id, .. }
             | DhtIoRequest::StorageMerge { op_id, .. }
-            | DhtIoRequest::StorageDelete { op_id, .. }
             | DhtIoRequest::StorageIter { op_id, .. }
             | DhtIoRequest::StoragePrune { op_id, .. } => {
                 if *op_id == CLEANUP_OP_ID {
@@ -842,34 +840,25 @@ impl DhtDriver {
             DhtIoRequest::StorageRevision { op_id, stage } => {
                 self.dispatch_storage_revision(op_id, stage)
             }
-            DhtIoRequest::StorageWrite {
-                op_id,
-                stage,
-                key,
-                entries,
-            } => self.dispatch_storage_write(op_id, stage, key, entries),
             DhtIoRequest::StorageMerge {
                 op_id,
                 stage,
                 key,
                 entries,
             } => self.dispatch_storage_merge(op_id, stage, key, entries),
-            DhtIoRequest::StorageDelete { op_id, stage, key } => {
-                self.dispatch_storage_delete(op_id, stage, key)
-            }
             DhtIoRequest::StorageIter {
                 op_id,
                 stage,
-                start_after,
+                index,
                 limit,
-                now_secs,
-            } => self.dispatch_storage_iter(op_id, stage, start_after, limit, now_secs),
+            } => self.dispatch_storage_iter(op_id, stage, index, limit),
             DhtIoRequest::StoragePrune {
                 op_id,
                 stage,
-                key,
+                index,
+                entry,
                 now_secs,
-            } => self.dispatch_storage_prune(op_id, stage, key, now_secs),
+            } => self.dispatch_storage_prune(op_id, stage, index, entry, now_secs),
         }
     }
 
@@ -1145,85 +1134,6 @@ impl DhtDriver {
     }
 
     #[tracing::instrument(
-        name = "dht.driver.storage_write.dispatch",
-        level = "debug",
-        skip(self, entries),
-        fields(op_id, stage = ?stage, key = %key, entry_count = entries.len())
-    )]
-    fn dispatch_storage_write(
-        &self,
-        op_id: OpId,
-        stage: StorageStage,
-        key: DhtKeyId,
-        entries: Vec<StoredEntry>,
-    ) {
-        let storage = self.storage.clone();
-        let io_tx = self.io_tx.clone();
-        tokio::spawn(
-            async move {
-                let bytes = match encode_entries(&entries) {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        let _ = io_tx
-                            .send(DhtIo::StorageError {
-                                op_id,
-                                stage,
-                                error: DhtIoError::storage(error),
-                            })
-                            .await;
-                        return;
-                    }
-                };
-
-                let effect = Effect::Storage(StorageEffect::Write {
-                    key_space: DHT_KEYSPACE.to_string(),
-                    key: ByteView::from(key.as_bytes().as_slice()),
-                    value: ByteView::from(bytes),
-                    txn_id: None,
-                });
-
-                match send_storage_effect_with_timeout(&storage, effect, op_id, stage, "write")
-                    .await
-                {
-                    Ok(Event::Storage(StorageEvent::WriteResult { .. })) => {
-                        let _ = io_tx.send(DhtIo::StorageWriteResult { op_id, stage }).await;
-                    }
-                    Ok(Event::Storage(StorageEvent::Error { error })) => {
-                        let _ = io_tx
-                            .send(DhtIo::StorageError {
-                                op_id,
-                                stage,
-                                error: DhtIoError::storage(error),
-                            })
-                            .await;
-                    }
-                    Ok(other) => {
-                        let _ = io_tx
-                            .send(DhtIo::StorageError {
-                                op_id,
-                                stage,
-                                error: DhtIoError::storage(format!(
-                                    "unexpected storage write event: {other:?}"
-                                )),
-                            })
-                            .await;
-                    }
-                    Err(error) => {
-                        let _ = io_tx
-                            .send(DhtIo::StorageError {
-                                op_id,
-                                stage,
-                                error,
-                            })
-                            .await;
-                    }
-                }
-            }
-            .instrument(Span::current()),
-        );
-    }
-
-    #[tracing::instrument(
         name = "dht.driver.storage_merge.dispatch",
         level = "debug",
         skip(self, entries),
@@ -1269,21 +1179,26 @@ impl DhtDriver {
         name = "dht.driver.storage_prune.dispatch",
         level = "debug",
         skip(self),
-        fields(op_id, stage = ?stage, key = %key)
+        fields(op_id, stage = ?stage, ?index, key = %entry.key)
     )]
     fn dispatch_storage_prune(
         &self,
         op_id: OpId,
         stage: StorageStage,
-        key: DhtKeyId,
+        index: DeadlineIndex,
+        entry: DeadlineEntry,
         now_secs: u64,
     ) {
         let storage = self.storage.clone();
         let io_tx = self.io_tx.clone();
         tokio::spawn(
             async move {
-                let mutation = StorageMutation::Prune { now_secs };
-                match mutate_storage_entries(&storage, op_id, stage, key, &mutation).await {
+                let mutation = StorageMutation::Prune {
+                    index,
+                    entry,
+                    now_secs,
+                };
+                match mutate_storage_entries(&storage, op_id, stage, entry.key, &mutation).await {
                     Ok(()) => {
                         let _ = io_tx.send(DhtIo::StorageWriteResult { op_id, stage }).await;
                     }
@@ -1303,159 +1218,48 @@ impl DhtDriver {
     }
 
     #[tracing::instrument(
-        name = "dht.driver.storage_delete.dispatch",
-        level = "debug",
-        skip(self),
-        fields(op_id, stage = ?stage, key = %key)
-    )]
-    fn dispatch_storage_delete(&self, op_id: OpId, stage: StorageStage, key: DhtKeyId) {
-        let storage = self.storage.clone();
-        let io_tx = self.io_tx.clone();
-        tokio::spawn(
-            async move {
-                let effect = Effect::Storage(StorageEffect::Delete {
-                    key_space: DHT_KEYSPACE.to_string(),
-                    key: ByteView::from(key.as_bytes().as_slice()),
-                    txn_id: None,
-                });
-
-                match send_storage_effect_with_timeout(&storage, effect, op_id, stage, "delete")
-                    .await
-                {
-                    Ok(Event::Storage(StorageEvent::DeleteResult { .. })) => {
-                        let _ = io_tx
-                            .send(DhtIo::StorageDeleteResult { op_id, stage })
-                            .await;
-                    }
-                    Ok(Event::Storage(StorageEvent::Error { error })) => {
-                        let _ = io_tx
-                            .send(DhtIo::StorageError {
-                                op_id,
-                                stage,
-                                error: DhtIoError::storage(error),
-                            })
-                            .await;
-                    }
-                    Ok(other) => {
-                        let _ = io_tx
-                            .send(DhtIo::StorageError {
-                                op_id,
-                                stage,
-                                error: DhtIoError::storage(format!(
-                                    "unexpected storage delete event: {other:?}"
-                                )),
-                            })
-                            .await;
-                    }
-                    Err(error) => {
-                        let _ = io_tx
-                            .send(DhtIo::StorageError {
-                                op_id,
-                                stage,
-                                error,
-                            })
-                            .await;
-                    }
-                }
-            }
-            .instrument(Span::current()),
-        );
-    }
-
-    #[tracing::instrument(
         name = "dht.driver.storage_iter.dispatch",
         level = "debug",
-        skip(self, start_after),
-        fields(op_id, stage = ?stage, limit, has_cursor = start_after.is_some())
+        skip(self),
+        fields(op_id, stage = ?stage, ?index, limit)
     )]
     fn dispatch_storage_iter(
         &self,
         op_id: OpId,
         stage: StorageStage,
-        start_after: Option<Vec<u8>>,
+        index: DeadlineIndex,
         limit: usize,
-        now_secs: u64,
     ) {
         let storage = self.storage.clone();
         let io_tx = self.io_tx.clone();
         tokio::spawn(
             async move {
-                let effect = Effect::Storage(StorageEffect::Iter {
-                    key_space: DHT_KEYSPACE.to_string(),
-                    prefix: None,
-                    start: start_after.map(ByteView::from).map(IterStart::After),
-                    limit: if limit == 0 { CLEANUP_PAGE_SIZE } else { limit },
-                    txn_id: None,
-                });
-
-                match send_storage_effect_with_timeout(&storage, effect, op_id, stage, "iter").await
-                {
-                    Ok(Event::Storage(StorageEvent::IterResult {
-                        values,
-                        next_start_after,
-                    })) => {
-                        let decoded_values = values
-                            .into_iter()
-                            .filter_map(|(key, value)| {
-                                let raw_key = key.as_ref();
-                                let Ok(key_bytes): Result<[u8; 32], _> = raw_key.try_into() else {
-                                    warn!(key = %hex::encode(raw_key), "Preserving invalid DHT key during cleanup");
-                                    return None;
-                                };
-                                let dht_key = DhtKeyId::from_bytes(key_bytes);
-                                match decode_entries(&value) {
-                                    Ok(entries)
-                                        if validate_entries(&dht_key, &entries, now_secs).is_ok() =>
-                                    {
-                                        Some((raw_key.to_vec(), entries))
-                                    }
-                                    Ok(_) => {
-                                        warn!(key = %hex::encode(raw_key), "Preserving invalid DHT row during cleanup");
-                                        None
-                                    }
-                                    Err(error) => {
-                                        warn!(key = %hex::encode(raw_key), error = %error, "Preserving corrupt DHT row during cleanup");
-                                        None
-                                    }
-                                }
-                            })
-                            .collect();
-
+                match iter_deadlines(&storage, op_id, stage, index, limit, None).await {
+                    Ok(entries) => {
                         let _ = io_tx
                             .send(DhtIo::StorageIterResult {
                                 op_id,
                                 stage,
-                                values: decoded_values,
-                                next_start_after: next_start_after.map(|k| k.as_ref().to_vec()),
+                                index,
+                                entries,
                             })
                             .await;
                     }
-                    Ok(Event::Storage(StorageEvent::Error { error })) => {
-                        let _ = io_tx
-                            .send(DhtIo::StorageError {
-                                op_id,
-                                stage,
-                                error: DhtIoError::storage(error),
-                            })
-                            .await;
-                    }
-                    Ok(other) => {
-                        let _ = io_tx
-                            .send(DhtIo::StorageError {
-                                op_id,
-                                stage,
-                                error: DhtIoError::storage(format!(
-                                    "unexpected storage iter event: {other:?}"
-                                )),
-                            })
-                            .await;
-                    }
-                    Err(error) => {
+                    Err(TransactionFailure::Failed(error)) => {
                         let _ = io_tx
                             .send(DhtIo::StorageError {
                                 op_id,
                                 stage,
                                 error,
+                            })
+                            .await;
+                    }
+                    Err(TransactionFailure::Conflict) => {
+                        let _ = io_tx
+                            .send(DhtIo::StorageError {
+                                op_id,
+                                stage,
+                                error: DhtIoError::storage("DHT deadline iteration conflicted"),
                             })
                             .await;
                     }
@@ -1467,8 +1271,14 @@ impl DhtDriver {
 }
 
 enum StorageMutation {
-    Merge { entries: Vec<StoredEntry> },
-    Prune { now_secs: u64 },
+    Merge {
+        entries: Vec<StoredEntry>,
+    },
+    Prune {
+        index: DeadlineIndex,
+        entry: DeadlineEntry,
+        now_secs: u64,
+    },
 }
 
 enum TransactionFailure {
@@ -1665,6 +1475,80 @@ async fn mutate_storage_entries(
     ))
 }
 
+async fn iter_deadlines(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    index: DeadlineIndex,
+    limit: usize,
+    txn_id: Option<TxnId>,
+) -> Result<Vec<DeadlineEntry>, TransactionFailure> {
+    let limit = if limit == 0 { CLEANUP_PAGE_SIZE } else { limit };
+    loop {
+        let effect = Effect::Storage(StorageEffect::Iter {
+            key_space: DHT_META_KEYSPACE.to_string(),
+            prefix: Some(ByteView::from(index.prefix())),
+            start: None,
+            limit,
+            txn_id,
+        });
+        let values =
+            match send_storage_effect_with_timeout(storage, effect, op_id, stage, "deadline_iter")
+                .await
+            {
+                Ok(Event::Storage(StorageEvent::IterResult { values, .. })) => values,
+                Ok(Event::Storage(StorageEvent::Error { error })) => {
+                    return Err(storage_transaction_error(error));
+                }
+                Ok(other) => {
+                    return Err(TransactionFailure::Failed(DhtIoError::storage(format!(
+                        "unexpected deadline iteration event: {other:?}"
+                    ))));
+                }
+                Err(error) => return Err(TransactionFailure::Failed(error)),
+            };
+        let mut entries = Vec::with_capacity(values.len());
+        let mut invalid = Vec::new();
+        for (key, _) in values {
+            if let Some(entry) = parse_deadline(index, &key) {
+                entries.push(entry);
+            } else {
+                invalid.push((DHT_META_KEYSPACE.to_string(), key));
+            }
+        }
+        if invalid.is_empty() {
+            return Ok(entries);
+        }
+
+        warn!(
+            index = ?index,
+            key_count = invalid.len(),
+            "Removing invalid DHT deadline index keys"
+        );
+        let effect = Effect::Storage(StorageEffect::BatchDelete {
+            deletes: invalid,
+            txn_id,
+        });
+        match send_storage_effect_with_timeout(storage, effect, op_id, stage, "deadline_repair")
+            .await
+        {
+            Ok(Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {}
+            Ok(Event::Storage(StorageEvent::Error { error })) => {
+                return Err(storage_transaction_error(error));
+            }
+            Ok(other) => {
+                return Err(TransactionFailure::Failed(DhtIoError::storage(format!(
+                    "unexpected deadline repair event: {other:?}"
+                ))));
+            }
+            Err(error) => return Err(TransactionFailure::Failed(error)),
+        }
+        if !entries.is_empty() {
+            return Ok(entries);
+        }
+    }
+}
+
 async fn run_storage_txn(
     storage: &StorageHandle,
     op_id: OpId,
@@ -1697,20 +1581,27 @@ async fn run_storage_txn(
     };
 
     let had_value = value.is_some();
-    let entries = match value {
+    let (entries, corrupt_row) = match value {
         Some(value) => match decode_entries(&value) {
-            Ok(entries) => entries,
+            Ok(entries) => (entries, false),
+            Err(error) if matches!(mutation, StorageMutation::Prune { .. }) => {
+                warn!(key = %key, error = %error, "Removing corrupt DHT row during cleanup");
+                (Vec::new(), true)
+            }
             Err(error) => {
                 abort_storage_txn(storage, op_id, stage, txn_id).await;
                 return Err(TransactionFailure::Failed(DhtIoError::storage(error)));
             }
         },
-        None => Vec::new(),
+        None => (Vec::new(), false),
     };
     let original_entries = entries;
+    let now_secs = match mutation {
+        StorageMutation::Merge { .. } => now_unix_secs(),
+        StorageMutation::Prune { now_secs, .. } => *now_secs,
+    };
     let entries = match mutation {
         StorageMutation::Merge { entries } => {
-            let now_secs = now_unix_secs();
             match merge_storage_entries(&key, original_entries.clone(), entries, now_secs) {
                 Ok(entries) => entries,
                 Err(MergeError::Stale) => {
@@ -1737,18 +1628,79 @@ async fn run_storage_txn(
                 }
             }
         }
-        StorageMutation::Prune { now_secs } => {
-            if let Err(error) = validate_entries(&key, &original_entries, *now_secs) {
-                abort_storage_txn(storage, op_id, stage, txn_id).await;
-                return Err(TransactionFailure::Failed(DhtIoError::storage(error)));
+        StorageMutation::Prune { .. } if corrupt_row => Vec::new(),
+        StorageMutation::Prune { .. } => {
+            if let Err(error) = validate_entries(&key, &original_entries, now_secs) {
+                warn!(key = %key, error = %error, "Removing invalid DHT row during cleanup");
+                Vec::new()
+            } else {
+                retained_entries(original_entries.clone(), now_secs)
             }
-            retained_entries(original_entries.clone(), *now_secs)
         }
     };
 
-    if had_value && !entries.is_empty() && entries == original_entries {
+    if matches!(mutation, StorageMutation::Merge { .. })
+        && had_value
+        && !entries.is_empty()
+        && entries == original_entries
+    {
         abort_storage_txn(storage, op_id, stage, txn_id).await;
         return Ok(());
+    }
+
+    let mut delete_keys = Vec::with_capacity(3);
+    if let StorageMutation::Prune { index, entry, .. } = mutation {
+        delete_keys.push(deadline_key(*index, *entry));
+    }
+    if had_value {
+        if let Some(entry) = active_deadline(key, &original_entries) {
+            delete_keys.push(deadline_key(DeadlineIndex::Active, entry));
+        }
+        if let Some(entry) = floor_deadline(key, &original_entries) {
+            delete_keys.push(deadline_key(DeadlineIndex::Floor, entry));
+        }
+    }
+    delete_keys.sort_unstable();
+    delete_keys.dedup();
+
+    let mut deletes = delete_keys
+        .into_iter()
+        .map(|key| (DHT_META_KEYSPACE.to_string(), ByteView::from(key)))
+        .collect::<Vec<_>>();
+    if had_value && entries.is_empty() {
+        deletes.push((
+            DHT_KEYSPACE.to_string(),
+            ByteView::from(key.as_bytes().as_slice()),
+        ));
+    }
+
+    let mut writes = Vec::with_capacity(2);
+    if !entries.is_empty() {
+        let Some((index, entry)) = row_deadline(key, &entries, now_secs) else {
+            abort_storage_txn(storage, op_id, stage, txn_id).await;
+            return Err(TransactionFailure::Failed(DhtIoError::storage(
+                "DHT row has no retention deadline",
+            )));
+        };
+        writes.push((
+            DHT_META_KEYSPACE.to_string(),
+            ByteView::from(deadline_key(index, entry)),
+            ByteView::from(Vec::new()),
+        ));
+        if !had_value || entries != original_entries {
+            let bytes = match encode_entries(&entries) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    abort_storage_txn(storage, op_id, stage, txn_id).await;
+                    return Err(TransactionFailure::Failed(DhtIoError::storage(error)));
+                }
+            };
+            writes.push((
+                DHT_KEYSPACE.to_string(),
+                ByteView::from(key.as_bytes().as_slice()),
+                ByteView::from(bytes),
+            ));
+        }
     }
 
     let count_result = if !had_value && !entries.is_empty() {
@@ -1763,56 +1715,64 @@ async fn run_storage_txn(
         return Err(error);
     }
 
-    let mutation_effect = if entries.is_empty() {
-        StorageEffect::Delete {
-            key_space: DHT_KEYSPACE.to_string(),
-            key: ByteView::from(key.as_bytes().as_slice()),
-            txn_id: Some(txn_id),
-        }
-    } else {
-        let bytes = match encode_entries(&entries) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                abort_storage_txn(storage, op_id, stage, txn_id).await;
-                return Err(TransactionFailure::Failed(DhtIoError::storage(error)));
-            }
-        };
-        StorageEffect::Write {
-            key_space: DHT_KEYSPACE.to_string(),
-            key: ByteView::from(key.as_bytes().as_slice()),
-            value: ByteView::from(bytes),
-            txn_id: Some(txn_id),
-        }
-    };
-
-    match send_storage_effect_with_timeout(
-        storage,
-        Effect::Storage(mutation_effect),
-        op_id,
-        stage,
-        "mutate",
-    )
-    .await
-    {
-        Ok(Event::Storage(StorageEvent::WriteResult { .. }))
-        | Ok(Event::Storage(StorageEvent::DeleteResult { .. })) => {}
-        Ok(Event::Storage(StorageEvent::Error { error })) => {
-            abort_storage_txn(storage, op_id, stage, txn_id).await;
-            return Err(storage_transaction_error(error));
-        }
-        Ok(other) => {
-            abort_storage_txn(storage, op_id, stage, txn_id).await;
-            return Err(TransactionFailure::Failed(DhtIoError::storage(format!(
-                "unexpected transactional mutation event: {other:?}"
-            ))));
-        }
-        Err(error) => {
-            abort_storage_txn(storage, op_id, stage, txn_id).await;
-            return Err(TransactionFailure::Failed(error));
-        }
+    if let Err(error) = apply_batch_delete(storage, op_id, stage, txn_id, deletes).await {
+        abort_storage_txn(storage, op_id, stage, txn_id).await;
+        return Err(error);
+    }
+    if let Err(error) = apply_batch_write(storage, op_id, stage, txn_id, writes).await {
+        abort_storage_txn(storage, op_id, stage, txn_id).await;
+        return Err(error);
     }
 
     commit_storage_txn(storage, op_id, stage, txn_id).await
+}
+
+async fn apply_batch_delete(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    txn_id: TxnId,
+    deletes: Vec<(String, ByteView)>,
+) -> Result<(), TransactionFailure> {
+    if deletes.is_empty() {
+        return Ok(());
+    }
+    let effect = Effect::Storage(StorageEffect::BatchDelete {
+        deletes,
+        txn_id: Some(txn_id),
+    });
+    match send_storage_effect_with_timeout(storage, effect, op_id, stage, "index_delete").await {
+        Ok(Event::Storage(StorageEvent::BatchDeleteResult { .. })) => Ok(()),
+        Ok(Event::Storage(StorageEvent::Error { error })) => Err(storage_transaction_error(error)),
+        Ok(other) => Err(TransactionFailure::Failed(DhtIoError::storage(format!(
+            "unexpected DHT batch-delete event: {other:?}"
+        )))),
+        Err(error) => Err(TransactionFailure::Failed(error)),
+    }
+}
+
+async fn apply_batch_write(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    txn_id: TxnId,
+    writes: Vec<(String, ByteView, ByteView)>,
+) -> Result<(), TransactionFailure> {
+    if writes.is_empty() {
+        return Ok(());
+    }
+    let effect = Effect::Storage(StorageEffect::BatchWrite {
+        writes,
+        txn_id: Some(txn_id),
+    });
+    match send_storage_effect_with_timeout(storage, effect, op_id, stage, "index_write").await {
+        Ok(Event::Storage(StorageEvent::BatchWriteResult { .. })) => Ok(()),
+        Ok(Event::Storage(StorageEvent::Error { error })) => Err(storage_transaction_error(error)),
+        Ok(other) => Err(TransactionFailure::Failed(DhtIoError::storage(format!(
+            "unexpected DHT batch-write event: {other:?}"
+        )))),
+        Err(error) => Err(TransactionFailure::Failed(error)),
+    }
 }
 
 fn merge_storage_entries(
@@ -2047,7 +2007,6 @@ fn dht_io_kind(io: &DhtIo) -> &'static str {
         DhtIo::StorageReadResult { .. } => "storage_read_result",
         DhtIo::StorageRevisionResult { .. } => "storage_revision_result",
         DhtIo::StorageWriteResult { .. } => "storage_write_result",
-        DhtIo::StorageDeleteResult { .. } => "storage_delete_result",
         DhtIo::StorageIterResult { .. } => "storage_iter_result",
         DhtIo::StorageError { .. } => "storage_error",
         DhtIo::PeerSeen { .. } => "peer_seen",
@@ -2061,7 +2020,6 @@ fn dht_io_op_id(io: &DhtIo) -> Option<OpId> {
         | DhtIo::StorageReadResult { op_id, .. }
         | DhtIo::StorageRevisionResult { op_id, .. }
         | DhtIo::StorageWriteResult { op_id, .. }
-        | DhtIo::StorageDeleteResult { op_id, .. }
         | DhtIo::StorageIterResult { op_id, .. }
         | DhtIo::StorageError { op_id, .. } => Some(*op_id),
         DhtIo::InboundRequest { .. }
@@ -2081,7 +2039,6 @@ fn dht_io_inbound_id(io: &DhtIo) -> Option<InboundId> {
         | DhtIo::StorageReadResult { .. }
         | DhtIo::StorageRevisionResult { .. }
         | DhtIo::StorageWriteResult { .. }
-        | DhtIo::StorageDeleteResult { .. }
         | DhtIo::StorageIterResult { .. }
         | DhtIo::StorageError { .. }
         | DhtIo::PeerSeen { .. } => None,
@@ -2095,9 +2052,7 @@ fn dht_io_request_kind(request: &DhtIoRequest) -> &'static str {
         DhtIoRequest::DropInbound { .. } => "drop_inbound",
         DhtIoRequest::StorageRead { .. } => "storage_read",
         DhtIoRequest::StorageRevision { .. } => "storage_revision",
-        DhtIoRequest::StorageWrite { .. } => "storage_write",
         DhtIoRequest::StorageMerge { .. } => "storage_merge",
-        DhtIoRequest::StorageDelete { .. } => "storage_delete",
         DhtIoRequest::StorageIter { .. } => "storage_iter",
         DhtIoRequest::StoragePrune { .. } => "storage_prune",
     }
@@ -2108,9 +2063,7 @@ fn dht_io_request_op_id(request: &DhtIoRequest) -> Option<OpId> {
         DhtIoRequest::RpcRequest { op_id, .. }
         | DhtIoRequest::StorageRead { op_id, .. }
         | DhtIoRequest::StorageRevision { op_id, .. }
-        | DhtIoRequest::StorageWrite { op_id, .. }
         | DhtIoRequest::StorageMerge { op_id, .. }
-        | DhtIoRequest::StorageDelete { op_id, .. }
         | DhtIoRequest::StorageIter { op_id, .. }
         | DhtIoRequest::StoragePrune { op_id, .. } => Some(*op_id),
         DhtIoRequest::RpcResponse { .. } | DhtIoRequest::DropInbound { .. } => None,
@@ -2125,9 +2078,7 @@ fn dht_io_request_inbound_id(request: &DhtIoRequest) -> Option<InboundId> {
         DhtIoRequest::RpcRequest { .. }
         | DhtIoRequest::StorageRead { .. }
         | DhtIoRequest::StorageRevision { .. }
-        | DhtIoRequest::StorageWrite { .. }
         | DhtIoRequest::StorageMerge { .. }
-        | DhtIoRequest::StorageDelete { .. }
         | DhtIoRequest::StorageIter { .. }
         | DhtIoRequest::StoragePrune { .. } => None,
     }
@@ -2144,24 +2095,19 @@ fn internal_operation_kind(request: &DhtIoRequest) -> &'static str {
         },
         DhtIoRequest::StorageRead { stage, .. }
         | DhtIoRequest::StorageRevision { stage, .. }
-        | DhtIoRequest::StorageWrite { stage, .. }
         | DhtIoRequest::StorageMerge { stage, .. }
-        | DhtIoRequest::StorageDelete { stage, .. }
         | DhtIoRequest::StorageIter { stage, .. }
         | DhtIoRequest::StoragePrune { stage, .. } => match stage {
             StorageStage::PutRevision
             | StorageStage::PutLocalRead
-            | StorageStage::PutLocalWrite
             | StorageStage::PutLocalMerge => "put",
             StorageStage::GetLocalRead | StorageStage::GetRemoteMerge => "get",
             StorageStage::InboundGetRead => "inbound_get",
-            StorageStage::InboundPutRead
-            | StorageStage::InboundPutWrite
-            | StorageStage::InboundPutMerge => "inbound_put",
-            StorageStage::CleanupIter
-            | StorageStage::CleanupWrite
-            | StorageStage::CleanupDelete
-            | StorageStage::CleanupPrune => "cleanup",
+            StorageStage::InboundPutRead | StorageStage::InboundPutMerge => "inbound_put",
+            StorageStage::CleanupActiveIter
+            | StorageStage::CleanupFloorIter
+            | StorageStage::CleanupActivePrune
+            | StorageStage::CleanupFloorPrune => "cleanup",
         },
         DhtIoRequest::RpcResponse { .. } | DhtIoRequest::DropInbound { .. } => "inbound",
     }
@@ -2702,6 +2648,29 @@ mod tests {
         decode_entries(&value).expect("decode stored entries")
     }
 
+    async fn index_entries(storage: &StorageHandle, index: DeadlineIndex) -> Vec<DeadlineEntry> {
+        iter_deadlines(storage, 0, StorageStage::CleanupActiveIter, index, 16, None)
+            .await
+            .unwrap_or_else(|_| panic!("read {index:?} deadline index"))
+    }
+
+    async fn read_count(storage: &StorageHandle) -> u64 {
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: DHT_META_KEYSPACE.to_string(),
+                key: ByteView::from(DHT_KEY_COUNT_KEY),
+                txn_id: None,
+            }))
+            .await;
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            panic!("expected DHT key count: {event:?}");
+        };
+        match decode_counter(value) {
+            Ok(count) => count,
+            Err(_) => panic!("decode DHT key count"),
+        }
+    }
+
     #[tokio::test]
     async fn ready_lanes_rotate() {
         let (cmd_tx, mut cmd_rx) = mpsc::bounded_blocking_async(4);
@@ -2882,6 +2851,258 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_indexes_row() {
+        let (_directory, storage) = open_storage();
+        let key = DhtKeyId::from_data(b"indexed-row");
+        let expires_at = now_unix_secs().saturating_add(200);
+        let mutation = StorageMutation::Merge {
+            entries: vec![make_entry(1, key, expires_at)],
+        };
+
+        mutate_storage_entries(&storage, 14, StorageStage::InboundPutMerge, key, &mutation)
+            .await
+            .expect("store indexed row");
+
+        assert_eq!(
+            index_entries(&storage, DeadlineIndex::Active).await,
+            vec![DeadlineEntry {
+                deadline: expires_at,
+                key
+            }]
+        );
+        assert!(
+            index_entries(&storage, DeadlineIndex::Floor)
+                .await
+                .is_empty()
+        );
+        assert_eq!(read_count(&storage).await, 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_moves_floor() {
+        let (_directory, storage) = open_storage();
+        let key = DhtKeyId::from_data(b"floor-transition");
+        let expires_at = now_unix_secs().saturating_add(20);
+        let mutation = StorageMutation::Merge {
+            entries: vec![make_entry(1, key, expires_at)],
+        };
+        mutate_storage_entries(&storage, 15, StorageStage::InboundPutMerge, key, &mutation)
+            .await
+            .expect("store active row");
+        let before = read_entries(&storage, key).await;
+        let active = index_entries(&storage, DeadlineIndex::Active).await[0];
+        let prune = StorageMutation::Prune {
+            index: DeadlineIndex::Active,
+            entry: active,
+            now_secs: expires_at,
+        };
+
+        mutate_storage_entries(&storage, 16, StorageStage::CleanupActivePrune, key, &prune)
+            .await
+            .expect("move row to floor index");
+
+        assert_eq!(read_entries(&storage, key).await, before);
+        assert!(
+            index_entries(&storage, DeadlineIndex::Active)
+                .await
+                .is_empty()
+        );
+        assert_eq!(index_entries(&storage, DeadlineIndex::Floor).await.len(), 1);
+        assert_eq!(read_count(&storage).await, 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_deletes_floor() {
+        let (_directory, storage) = open_storage();
+        let key = DhtKeyId::from_data(b"floor-removal");
+        let expires_at = now_unix_secs().saturating_add(20);
+        let mutation = StorageMutation::Merge {
+            entries: vec![make_entry(1, key, expires_at)],
+        };
+        mutate_storage_entries(&storage, 17, StorageStage::InboundPutMerge, key, &mutation)
+            .await
+            .expect("store active row");
+        let active = index_entries(&storage, DeadlineIndex::Active).await[0];
+        let prune = StorageMutation::Prune {
+            index: DeadlineIndex::Active,
+            entry: active,
+            now_secs: expires_at,
+        };
+        mutate_storage_entries(&storage, 18, StorageStage::CleanupActivePrune, key, &prune)
+            .await
+            .expect("move row to floor index");
+        let floor = index_entries(&storage, DeadlineIndex::Floor).await[0];
+        let prune = StorageMutation::Prune {
+            index: DeadlineIndex::Floor,
+            entry: floor,
+            now_secs: floor.deadline,
+        };
+
+        mutate_storage_entries(&storage, 19, StorageStage::CleanupFloorPrune, key, &prune)
+            .await
+            .expect("delete expired floor");
+
+        assert!(
+            index_entries(&storage, DeadlineIndex::Active)
+                .await
+                .is_empty()
+        );
+        assert!(
+            index_entries(&storage, DeadlineIndex::Floor)
+                .await
+                .is_empty()
+        );
+        assert_eq!(read_count(&storage).await, 0);
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: DHT_KEYSPACE.to_string(),
+                key: ByteView::from(key.as_bytes().as_slice()),
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::ReadResult { value: None, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn cleanup_clears_orphan() {
+        let (_directory, storage) = open_storage();
+        let key = DhtKeyId::from_data(b"orphan-index");
+        let entry = DeadlineEntry { deadline: 10, key };
+        let raw_key = deadline_key(DeadlineIndex::Floor, entry);
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: DHT_META_KEYSPACE.to_string(),
+                key: ByteView::from(raw_key),
+                value: ByteView::from(Vec::new()),
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        let prune = StorageMutation::Prune {
+            index: DeadlineIndex::Floor,
+            entry,
+            now_secs: entry.deadline,
+        };
+
+        mutate_storage_entries(&storage, 20, StorageStage::CleanupFloorPrune, key, &prune)
+            .await
+            .expect("remove orphan index");
+
+        assert!(
+            index_entries(&storage, DeadlineIndex::Floor)
+                .await
+                .is_empty()
+        );
+        assert_eq!(read_count(&storage).await, 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_skips_bad() {
+        let (_directory, storage) = open_storage();
+        let key = DhtKeyId::from_data(b"valid-index");
+        let entry = DeadlineEntry { deadline: 10, key };
+        let mut invalid = DeadlineIndex::Active.prefix().to_vec();
+        invalid.extend_from_slice(b"bad");
+        for raw_key in [invalid.clone(), deadline_key(DeadlineIndex::Active, entry)] {
+            let event = storage
+                .send_effect(Effect::Storage(StorageEffect::Write {
+                    key_space: DHT_META_KEYSPACE.to_string(),
+                    key: ByteView::from(raw_key),
+                    value: ByteView::from(Vec::new()),
+                    txn_id: None,
+                }))
+                .await;
+            assert!(matches!(
+                event,
+                Event::Storage(StorageEvent::WriteResult { .. })
+            ));
+        }
+
+        assert_eq!(
+            index_entries(&storage, DeadlineIndex::Active).await,
+            vec![entry]
+        );
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: DHT_META_KEYSPACE.to_string(),
+                key: ByteView::from(invalid),
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::ReadResult { value: None, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_corrupt() {
+        let (_directory, storage) = open_storage();
+        let key = DhtKeyId::from_data(b"corrupt-cleanup");
+        let entry = DeadlineEntry { deadline: 10, key };
+        let writes = vec![
+            (
+                DHT_KEYSPACE.to_string(),
+                ByteView::from(key.as_bytes().as_slice()),
+                ByteView::from(b"not-postcard".as_slice()),
+            ),
+            (
+                DHT_META_KEYSPACE.to_string(),
+                ByteView::from(deadline_key(DeadlineIndex::Active, entry)),
+                ByteView::from(Vec::new()),
+            ),
+            (
+                DHT_META_KEYSPACE.to_string(),
+                ByteView::from(DHT_KEY_COUNT_KEY),
+                ByteView::from(1u64.to_le_bytes().as_slice()),
+            ),
+        ];
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+        let prune = StorageMutation::Prune {
+            index: DeadlineIndex::Active,
+            entry,
+            now_secs: entry.deadline,
+        };
+
+        mutate_storage_entries(&storage, 21, StorageStage::CleanupActivePrune, key, &prune)
+            .await
+            .expect("remove corrupt row");
+
+        assert!(
+            index_entries(&storage, DeadlineIndex::Active)
+                .await
+                .is_empty()
+        );
+        assert_eq!(read_count(&storage).await, 0);
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: DHT_KEYSPACE.to_string(),
+                key: ByteView::from(key.as_bytes().as_slice()),
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::ReadResult { value: None, .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn batch_merge_persists() {
         let (_directory, storage) = open_storage();
         let key = DhtKeyId::from_data(b"batch-remote-merge");
@@ -2936,14 +3157,20 @@ mod tests {
             .await
             .expect("store old entry");
 
+        let entry = DeadlineEntry {
+            deadline: now_secs.saturating_add(50),
+            key,
+        };
         let prune = StorageMutation::Prune {
+            index: DeadlineIndex::Active,
+            entry,
             now_secs: now_secs.saturating_add(400),
         };
         let merge = StorageMutation::Merge {
             entries: vec![make_entry(2, key, now_secs.saturating_add(500))],
         };
         let (prune_result, merge_result) = tokio::join!(
-            mutate_storage_entries(&storage, 3, StorageStage::CleanupPrune, key, &prune),
+            mutate_storage_entries(&storage, 3, StorageStage::CleanupActivePrune, key, &prune,),
             mutate_storage_entries(&storage, 4, StorageStage::InboundPutMerge, key, &merge),
         );
         prune_result.expect("cleanup retries and succeeds");

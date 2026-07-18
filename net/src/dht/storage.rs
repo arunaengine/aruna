@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::constants::{
-    MAX_CLOCK_SKEW_SECS, MAX_ENTRIES_PER_KEY, MAX_STORED_VALUE_SIZE, MAX_TTL_SECS, MAX_VALUE_SIZE,
+    DHT_ACTIVE_PREFIX, DHT_FLOOR_PREFIX, MAX_CLOCK_SKEW_SECS, MAX_ENTRIES_PER_KEY,
+    MAX_STORED_VALUE_SIZE, MAX_TTL_SECS, MAX_VALUE_SIZE,
 };
 use super::rpc::verify_record;
 
@@ -22,6 +23,27 @@ pub struct StoredEntry {
     pub revision: u64,
     pub signature: iroh::Signature,
     pub retain_until: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadlineIndex {
+    Active,
+    Floor,
+}
+
+impl DeadlineIndex {
+    pub fn prefix(self) -> &'static [u8] {
+        match self {
+            Self::Active => DHT_ACTIVE_PREFIX,
+            Self::Floor => DHT_FLOOR_PREFIX,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadlineEntry {
+    pub deadline: u64,
+    pub key: DhtKeyId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -63,6 +85,56 @@ pub fn retention_deadline(expires_at: u64, now: u64) -> u64 {
         .min(now)
         .saturating_add(MAX_TTL_SECS)
         .saturating_add(MAX_CLOCK_SKEW_SECS)
+}
+
+pub fn active_deadline(key: DhtKeyId, entries: &[StoredEntry]) -> Option<DeadlineEntry> {
+    entries
+        .iter()
+        .map(|entry| entry.expires_at)
+        .max()
+        .map(|deadline| DeadlineEntry { deadline, key })
+}
+
+pub fn floor_deadline(key: DhtKeyId, entries: &[StoredEntry]) -> Option<DeadlineEntry> {
+    entries
+        .iter()
+        .map(|entry| entry.retain_until)
+        .max()
+        .map(|deadline| DeadlineEntry { deadline, key })
+}
+
+pub fn row_deadline(
+    key: DhtKeyId,
+    entries: &[StoredEntry],
+    now: u64,
+) -> Option<(DeadlineIndex, DeadlineEntry)> {
+    if entries
+        .iter()
+        .any(|entry| entry_is_fresh(entry.expires_at, now))
+    {
+        active_deadline(key, entries).map(|entry| (DeadlineIndex::Active, entry))
+    } else {
+        floor_deadline(key, entries).map(|entry| (DeadlineIndex::Floor, entry))
+    }
+}
+
+pub fn deadline_key(index: DeadlineIndex, entry: DeadlineEntry) -> Vec<u8> {
+    let prefix = index.prefix();
+    let mut key = Vec::with_capacity(prefix.len() + 8 + entry.key.as_bytes().len());
+    key.extend_from_slice(prefix);
+    key.extend_from_slice(&entry.deadline.to_be_bytes());
+    key.extend_from_slice(entry.key.as_bytes());
+    key
+}
+
+pub fn parse_deadline(index: DeadlineIndex, key: &[u8]) -> Option<DeadlineEntry> {
+    let suffix = key.strip_prefix(index.prefix())?;
+    let (deadline, raw_key) = suffix.split_at_checked(8)?;
+    let raw_key: [u8; 32] = raw_key.try_into().ok()?;
+    Some(DeadlineEntry {
+        deadline: u64::from_be_bytes(deadline.try_into().ok()?),
+        key: DhtKeyId::from_bytes(raw_key),
+    })
 }
 
 pub fn merge_entry(
@@ -310,6 +382,39 @@ mod tests {
         assert_eq!(
             merge_entry(&key, entries, make_entry(u16::MAX, key, 1, 200), 100),
             Err(MergeError::Capacity)
+        );
+    }
+
+    #[test]
+    fn deadline_orders_keys() {
+        let key = DhtKeyId::from_data(b"deadline-order");
+        let early = deadline_key(DeadlineIndex::Active, DeadlineEntry { deadline: 9, key });
+        let late = deadline_key(DeadlineIndex::Active, DeadlineEntry { deadline: 10, key });
+
+        assert!(early < late);
+        assert_eq!(
+            parse_deadline(DeadlineIndex::Active, &late),
+            Some(DeadlineEntry { deadline: 10, key })
+        );
+        assert_eq!(parse_deadline(DeadlineIndex::Floor, &late), None);
+    }
+
+    #[test]
+    fn deadline_tracks_rows() {
+        let key = DhtKeyId::from_data(b"deadline-row");
+        let mut first = make_entry(1, key, 1, 150);
+        first.retain_until = 300;
+        let mut second = make_entry(2, key, 1, 200);
+        second.retain_until = 350;
+        let entries = vec![first, second];
+
+        assert_eq!(
+            row_deadline(key, &entries, 100),
+            Some((DeadlineIndex::Active, DeadlineEntry { deadline: 200, key }))
+        );
+        assert_eq!(
+            row_deadline(key, &entries, 200),
+            Some((DeadlineIndex::Floor, DeadlineEntry { deadline: 350, key }))
         );
     }
 }

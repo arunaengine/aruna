@@ -7,7 +7,7 @@ use aruna_core::structs::RealmId;
 use thiserror::Error;
 
 use super::rpc::{DhtRequest, DhtResponse};
-use super::storage::StoredEntry;
+use super::storage::{DeadlineEntry, DeadlineIndex, StoredEntry};
 
 pub type OpId = u64;
 pub type InboundId = u64;
@@ -134,18 +134,16 @@ pub enum RpcPhase {
 pub enum StorageStage {
     PutRevision,
     PutLocalRead,
-    PutLocalWrite,
     PutLocalMerge,
     GetLocalRead,
     GetRemoteMerge,
     InboundGetRead,
     InboundPutRead,
-    InboundPutWrite,
     InboundPutMerge,
-    CleanupIter,
-    CleanupWrite,
-    CleanupDelete,
-    CleanupPrune,
+    CleanupActiveIter,
+    CleanupFloorIter,
+    CleanupActivePrune,
+    CleanupFloorPrune,
 }
 
 #[derive(Debug, Clone)]
@@ -176,34 +174,23 @@ pub enum DhtIoRequest {
         op_id: OpId,
         stage: StorageStage,
     },
-    StorageWrite {
-        op_id: OpId,
-        stage: StorageStage,
-        key: DhtKeyId,
-        entries: Vec<StoredEntry>,
-    },
     StorageMerge {
         op_id: OpId,
         stage: StorageStage,
         key: DhtKeyId,
         entries: Vec<StoredEntry>,
     },
-    StorageDelete {
-        op_id: OpId,
-        stage: StorageStage,
-        key: DhtKeyId,
-    },
     StorageIter {
         op_id: OpId,
         stage: StorageStage,
-        start_after: Option<Vec<u8>>,
+        index: DeadlineIndex,
         limit: usize,
-        now_secs: u64,
     },
     StoragePrune {
         op_id: OpId,
         stage: StorageStage,
-        key: DhtKeyId,
+        index: DeadlineIndex,
+        entry: DeadlineEntry,
         now_secs: u64,
     },
 }
@@ -250,15 +237,11 @@ pub enum DhtIo {
         op_id: OpId,
         stage: StorageStage,
     },
-    StorageDeleteResult {
-        op_id: OpId,
-        stage: StorageStage,
-    },
     StorageIterResult {
         op_id: OpId,
         stage: StorageStage,
-        values: Vec<(Vec<u8>, Vec<StoredEntry>)>,
-        next_start_after: Option<Vec<u8>>,
+        index: DeadlineIndex,
+        entries: Vec<DeadlineEntry>,
     },
     StorageError {
         op_id: OpId,
