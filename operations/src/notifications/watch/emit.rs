@@ -1,4 +1,4 @@
-use aruna_core::structs::WatchEvent;
+use aruna_core::structs::{WatchEvent, watch_path_matches};
 use aruna_core::types::UserId;
 use tracing::warn;
 
@@ -107,7 +107,7 @@ async fn include_local_holder_from_subscriptions(
     if subscriptions.iter().any(|subscription| {
         subscription.created_at_ms <= event.occurred_at_ms
             && subscription.event_mask.contains(event.kind)
-            && event.path.starts_with(subscription.path_prefix.as_str())
+            && watch_path_matches(event.kind, &event.path, &subscription.path_prefix)
     }) {
         holders.push(local_node_id);
     }

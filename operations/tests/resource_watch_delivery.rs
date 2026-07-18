@@ -74,14 +74,27 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
     let holder = nodes[0].net.node_id();
     let watcher = user_with_holder(&config, holder, realm_id);
     let uploader = UserId::local(Ulid::r#gen(), realm_id);
-    let group_id = Ulid::r#gen();
+    let credential_group = Ulid::r#gen();
+    let bucket_group = Ulid::r#gen();
     let data_node_id = nodes[1].net.node_id();
-    install_group_authorization(&nodes, realm_id, group_id, watcher).await?;
-    let prefix = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/");
-    let probe = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/probe");
+    install_group_authorization(&nodes, realm_id, credential_group, watcher).await?;
+    install_group_authorization(&nodes, realm_id, bucket_group, watcher).await?;
+    let prefix = data_watch_resource_path(credential_group, data_node_id, "bucket", "reports/");
+    let probe = data_watch_resource_path(bucket_group, data_node_id, "bucket", "reports/probe");
 
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
-    let subscription = create_watch_via(&nodes[0], watcher, &prefix, mask).await?;
+    // This models a persisted watch created by an already-expired bearer token.
+    let mut legacy_binding = WatchAuthorizationBinding::default();
+    legacy_binding.expires_at_secs = 1;
+    let subscription = create_watch_for_user(
+        nodes[0].context.as_ref(),
+        nodes[0].net.node_id(),
+        watcher,
+        prefix.clone(),
+        mask,
+        legacy_binding,
+    )
+    .await?;
 
     // Node B must observe the holder's interest before the upload matches.
     wait_for_holder(
@@ -101,7 +114,7 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
         realm_id,
         uploader,
         UploadLocation {
-            group_id,
+            group_id: bucket_group,
             node_id: data_node_id,
             bucket: "bucket",
             key: "reports/q3/summary.csv",
@@ -151,13 +164,13 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
             assert_eq!(
                 path,
                 &data_watch_resource_path(
-                    group_id,
+                    bucket_group,
                     data_node_id,
                     "bucket",
                     "reports/q3/summary.csv"
                 )
             );
-            assert_eq!(*event_group_id, group_id);
+            assert_eq!(*event_group_id, bucket_group);
             assert_eq!(*event_node_id, data_node_id);
             assert_eq!(bucket, "bucket");
             assert_eq!(key, "reports/q3/summary.csv");
@@ -320,10 +333,9 @@ async fn unmatched_event_writes_nothing() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-// A matching event whose actor is the watcher itself is forwarded directly, but
-// the holder's expansion suppresses self-notify, so the watcher's inbox stays empty.
+// A matching event must notify its actor when the actor owns the watch.
 #[tokio::test]
-async fn self_authored_event_notifies_no_one() -> Result<(), Box<dyn std::error::Error>> {
+async fn self_event_delivers() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([92u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let config = realm_config_for(&nodes, realm_id);
@@ -336,7 +348,7 @@ async fn self_authored_event_notifies_no_one() -> Result<(), Box<dyn std::error:
     let probe = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/probe");
 
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
-    create_watch_via(&nodes[0], watcher, &prefix, mask).await?;
+    let subscription = create_watch_via(&nodes[0], watcher, &prefix, mask).await?;
     wait_for_holder(
         &nodes[1],
         realm_id,
@@ -347,10 +359,9 @@ async fn self_authored_event_notifies_no_one() -> Result<(), Box<dyn std::error:
     )
     .await?;
 
-    // Actor == watcher and the path matches, so the origin forwards the event,
-    // proving the empty inbox is self-notify suppression rather than a missed match.
+    let event_id = Ulid::r#gen();
     let event = upload_event(
-        Ulid::r#gen(),
+        event_id,
         realm_id,
         watcher,
         UploadLocation {
@@ -363,15 +374,14 @@ async fn self_authored_event_notifies_no_one() -> Result<(), Box<dyn std::error:
     );
     emit_resource_watch_event(nodes[1].context.as_ref(), event).await;
 
-    sleep(NEGATIVE_WAIT).await;
-    for node in &nodes {
-        assert_eq!(
-            inbox_len(node).await,
-            0,
-            "a self-authored event must not notify the watcher"
-        );
-    }
-    assert!(list_via(&nodes[2], watcher).await.is_empty());
+    let expected_id = watch_notification_id(event_id, subscription.watch_id);
+    wait_for(POLL_TIMEOUT, || async {
+        list_via(&nodes[2], watcher)
+            .await
+            .iter()
+            .any(|record| record.notification_id == expected_id)
+    })
+    .await?;
 
     shutdown_nodes(nodes).await;
     Ok(())

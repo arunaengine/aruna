@@ -1,7 +1,7 @@
 use aruna_core::structs::{
     GroupAuthorizationDocument, NotificationClass, NotificationKind, NotificationRecord,
     RealmAuthorizationDocument, ResourceEvent, WatchEvent, WatchSubscription,
-    watch_notification_id,
+    watch_notification_id, watch_path_matches,
 };
 use aruna_core::types::UserId;
 
@@ -111,13 +111,9 @@ pub fn route_resource_event(
     records
 }
 
-/// Expands one origin watch event into recipient-addressed records against the
-/// holder's local watch subscriptions. A subscription matches when the event
-/// path starts with its prefix, its mask selects the event kind, it existed when
-/// the event occurred, and its owner is not the actor (no self-notify). Each
-/// record's id is deterministic in `(event_id, watch_id)` and its timestamp is
-/// the event's, so re-expanding a redelivered event mints identical records for
-/// the holder's idempotent upsert.
+/// Expands an event for every matching subscription, including the actor's.
+/// Record ids are deterministic in `(event_id, watch_id)`, so redelivery is
+/// idempotent.
 pub fn route_watch_event(
     event: &WatchEvent,
     subscriptions: &[WatchSubscription],
@@ -127,10 +123,7 @@ pub fn route_watch_event(
         if subscription.created_at_ms > event.occurred_at_ms {
             continue;
         }
-        if subscription.owner == event.actor {
-            continue;
-        }
-        if !event.path.starts_with(&subscription.path_prefix) {
+        if !watch_path_matches(event.kind, &event.path, &subscription.path_prefix) {
             continue;
         }
         if !subscription.event_mask.contains(event.kind) {
@@ -374,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_event_matches_prefix_mask_and_skips_self() {
+    fn self_event_delivered() {
         let owner = user(1);
         let actor = user(2);
         let data_node = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
@@ -397,7 +390,7 @@ mod tests {
                 &data_path(data_node, "bucket", ""),
                 WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
             ),
-            // Self-notify: owner is the actor.
+            // A matching owner receives their own upload event.
             watch_subscription(
                 actor,
                 &data_path(data_node, "bucket", ""),
@@ -409,8 +402,9 @@ mod tests {
             &upload_event(actor, &data_path(data_node, "bucket", "object")),
             &subs,
         );
-        assert_eq!(records.len(), 1);
+        assert_eq!(records.len(), 2);
         assert_eq!(records[0].recipient, owner);
+        assert_eq!(records[1].recipient, actor);
         assert_eq!(records[0].class, NotificationClass::Transient);
         assert_eq!(records[0].created_at_ms, 5_000);
         assert_eq!(

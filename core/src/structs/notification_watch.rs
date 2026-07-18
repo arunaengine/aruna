@@ -53,6 +53,26 @@ pub fn parse_data_watch_resource_path(path: &str) -> Option<DataWatchResourcePat
     })
 }
 
+/// Matches canonical prefixes, treating a data path's group as an alias when
+/// its node and bucket identify the same node-local bucket.
+pub fn watch_path_matches(kind: WatchEventKind, path: &str, prefix: &str) -> bool {
+    if path.starts_with(prefix) {
+        return true;
+    }
+    if kind != WatchEventKind::DataUploaded {
+        return false;
+    }
+    let (Some(path), Some(prefix)) = (
+        parse_data_watch_resource_path(path),
+        parse_data_watch_resource_path(prefix),
+    ) else {
+        return false;
+    };
+    path.node_id == prefix.node_id
+        && path.bucket == prefix.bucket
+        && path.key_prefix.starts_with(prefix.key_prefix)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WatchEventKind {
     MetadataCreated,
@@ -234,6 +254,8 @@ pub fn watch_notification_id(event_id: Ulid, watch_id: Ulid) -> Ulid {
 /// proxied exactly like a notification inbox record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchAuthorizationBinding {
+    /// Legacy creating-token fields retained for stored postcard compatibility.
+    /// Delivery authorization is based only on the owner's current permissions.
     pub token_hash: String,
     pub expires_at_secs: u64,
     pub path_restrictions: Option<Vec<PathRestriction>>,
@@ -560,7 +582,8 @@ impl WatchInterestTable {
         kind: WatchEventKind,
     ) -> Vec<NodeId> {
         let entry_matches = |entry: &WatchInterestEntry| {
-            entry.event_mask.contains(kind) && path.starts_with(entry.path_prefix.as_str())
+            entry.event_mask.contains(kind)
+                && watch_path_matches(kind, path, entry.path_prefix.as_str())
         };
         let mut matched: Vec<NodeId> = self.realms.get(&realm_id).map_or_else(Vec::new, |nodes| {
             nodes
@@ -816,6 +839,31 @@ mod tests {
                 key_prefix: "reports/q3",
             })
         );
+    }
+
+    #[test]
+    fn matches_bucket_owner() {
+        let credential_group = Ulid::from_bytes([4u8; 16]);
+        let bucket_group = Ulid::from_bytes([5u8; 16]);
+        let node_id = node(6);
+        let prefix = data_watch_resource_path(credential_group, node_id, "bucket", "reports/");
+        let event = data_watch_resource_path(bucket_group, node_id, "bucket", "reports/result.csv");
+
+        assert!(watch_path_matches(
+            WatchEventKind::DataUploaded,
+            &event,
+            &prefix,
+        ));
+        assert!(!watch_path_matches(
+            WatchEventKind::MetadataCreated,
+            &event,
+            &prefix,
+        ));
+        assert!(!watch_path_matches(
+            WatchEventKind::DataUploaded,
+            &data_watch_resource_path(bucket_group, node(7), "bucket", "reports/result.csv"),
+            &prefix,
+        ));
     }
 
     #[test]

@@ -1349,7 +1349,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_list_hides_watch_record_after_token_revocation() {
+    async fn revoked_token_ignored() {
         let realm_id = RealmId::from_bytes([82u8; 32]);
         let a = spawn(realm_id, [82u8; 32]).await;
         let b = spawn(realm_id, [83u8; 32]).await;
@@ -1388,18 +1388,16 @@ mod tests {
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
 
-        assert_eq!(
-            list_remote(&a.net, b.net.node_id(), recipient, None, 10)
-                .await
-                .expect("list after token revocation")
-                .0,
-            vec![direct]
-        );
+        let listed = list_remote(&a.net, b.net.node_id(), recipient, None, 10)
+            .await
+            .expect("list after token revocation")
+            .0;
+        assert_eq!(listed, vec![watch.clone(), direct]);
         assert_eq!(
             unread_count_remote(&a.net, b.net.node_id(), recipient)
                 .await
                 .expect("unread count after token revocation"),
-            (1, false)
+            (2, false)
         );
         assert_eq!(
             mark_read_remote(
@@ -1410,8 +1408,8 @@ mod tests {
                 None,
             )
             .await
-            .expect("mark revoked watch record"),
-            0
+            .expect("mark watch record"),
+            1
         );
         assert!(
             read_inbox(&b)
@@ -1420,12 +1418,12 @@ mod tests {
                 .find(|record| record.notification_id == watch.notification_id)
                 .expect("stored watch record")
                 .read_at_ms
-                .is_none()
+                .is_some()
         );
     }
 
     #[tokio::test]
-    async fn rpc_list_requires_original_watch_prefix() {
+    async fn legacy_restriction_ignored() {
         let (a, b, recipient) = delivery_pair(80).await;
         install_watch_authorization(&b, recipient.realm_id, recipient, &[]).await;
         let mut watch = watch_record(recipient, 2);
@@ -1445,12 +1443,12 @@ mod tests {
         }]);
         seed_inbox(&b, &[watch.clone()]).await;
 
-        assert!(
+        assert_eq!(
             list_remote(&a.net, b.net.node_id(), recipient, None, 10)
                 .await
-                .expect("list with unreadable watch prefix")
-                .0
-                .is_empty()
+                .expect("list with a legacy token restriction")
+                .0,
+            vec![watch]
         );
     }
 

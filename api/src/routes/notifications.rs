@@ -5,15 +5,14 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::auth::bearer_token_hash;
 use aruna_core::metrics::WatchAuthorizationMetricReason;
 use aruna_core::structs::{
     AuthContext, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NotificationClass, NotificationKind,
     NotificationRecord, WatchAuthorizationBinding, WatchEventKind, WatchEventMask,
-    WatchSubscription,
+    WatchSubscription, data_watch_resource_path, parse_data_watch_resource_path,
 };
 use aruna_operations::dashboard::subscribe_dashboard_changes;
-use aruna_operations::driver::DriverContext;
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::dispatch::{
     InboxWakeReceiver, NotificationDispatchError, WatchDispatchError, create_watch_for_user,
     delete_watch_for_user, list_notifications_for_user, list_watches_for_user, mark_read_for_user,
@@ -23,8 +22,9 @@ use aruna_operations::notifications::dispatch::{
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::mark_read::MARK_READ_MAX_IDS;
 use aruna_operations::notifications::watch::authorization::{
-    WatchAuthorization, evaluate_watch_authorization, watch_permission_path,
+    WatchAuthorization, evaluate_watch_creation, watch_permission_path,
 };
+use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -177,11 +177,9 @@ pub struct WatchListResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateWatchRequest {
-    /// Canonical watched resource prefix. Data events use
-    /// `s3/{group_id}/{node_id}/{bucket}/{key-prefix}` and metadata events use
-    /// `meta/{group_id}/{normalized_document_path-prefix}`. The slash after the
-    /// bucket or metadata group is required; no leading slash is allowed. Event
-    /// kinds cannot be combined because they use distinct namespaces.
+    /// Canonical data (`s3/{group}/{node}/{bucket}/{key}`) or metadata prefix.
+    /// A local data bucket's owning group replaces the supplied group.
+    /// Prefixes require the bucket/group slash and one event namespace.
     pub path_prefix: String,
     pub events: Vec<String>,
 }
@@ -336,28 +334,24 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
     response
 }
 
-/// Creation shares the exact authorization result delivery and enumeration use,
-/// so a watch cannot be created on anything they would later refuse. A prefix
-/// with no canonical resource identity is a malformed request; everything else a
-/// caller may not read answers Forbidden, whether or not it exists.
+/// Creation checks the request's current restrictions on the canonical path.
+/// Invalid identities are malformed; unreadable resources answer Forbidden.
 async fn authorize_watch(
     state: &ServerState,
     auth: &AuthContext,
     path_prefix: &str,
     event_mask: WatchEventMask,
-    authorization: &WatchAuthorizationBinding,
 ) -> ServerResult<()> {
     if watch_permission_path(state.get_realm_id(), path_prefix, event_mask).is_none() {
         record_watch_creation_denial(state, WatchAuthorizationMetricReason::InvalidResource);
         return Err(ServerError::BadRequest);
     }
-    match evaluate_watch_authorization(
+    match evaluate_watch_creation(
         &state.get_ctx(),
         state.get_realm_id(),
-        auth.user_id,
+        auth,
         path_prefix,
         event_mask,
-        authorization,
     )
     .await
     {
@@ -380,6 +374,46 @@ async fn authorize_watch(
             );
             Err(ServerError::InternalError(error))
         }
+    }
+}
+
+async fn canonicalize_watch_path(
+    state: &ServerState,
+    path_prefix: String,
+    event_mask: WatchEventMask,
+) -> ServerResult<String> {
+    if event_mask.bits() != WatchEventMask::DATA_UPLOADED {
+        return Ok(path_prefix);
+    }
+    let Some((node_id, bucket, key_prefix)) =
+        parse_data_watch_resource_path(&path_prefix).map(|resource| {
+            (
+                resource.node_id,
+                resource.bucket.to_string(),
+                resource.key_prefix.to_string(),
+            )
+        })
+    else {
+        return Ok(path_prefix);
+    };
+    if node_id != state.get_node_id() {
+        return Ok(path_prefix);
+    }
+    match drive(
+        GetBucketInfoOperation::new(bucket.clone()),
+        &state.get_ctx(),
+    )
+    .await
+    .and_then(|output| output.transpose())
+    {
+        Ok(Some(info)) => Ok(data_watch_resource_path(
+            info.group_id,
+            node_id,
+            &bucket,
+            &key_prefix,
+        )),
+        Ok(None) | Err(GetBucketInfoError::NotFound) => Ok(path_prefix),
+        Err(error) => Err(ServerError::InternalError(error.to_string())),
     }
 }
 
@@ -871,7 +905,7 @@ pub async fn list_watches(
     post,
     path = "/notifications/watches",
     tag = "notifications",
-    description = "Create an authorized watch subscription using a canonical resource prefix. Data events use `s3/{group_id}/{node_id}/{bucket}/{key-prefix}` and require READ on that exact node's blob bucket permission path. Metadata events use `meta/{group_id}/{normalized_document_path-prefix}` and require READ on the group's metadata permission path. The slash after the bucket or metadata group is required, no leading slash is allowed, and metadata/data event kinds cannot be combined because their canonical namespaces differ.",
+    description = "Create an authorized watch subscription using a canonical resource prefix. Data events use `s3/{group_id}/{node_id}/{bucket}/{key-prefix}` and require READ on that exact node's blob bucket permission path. For a bucket on this node, the supplied group is canonicalized to the bucket-owning group and the response exposes that canonical prefix. Metadata events use `meta/{group_id}/{normalized_document_path-prefix}` and require READ on the group's metadata permission path. The slash after the bucket or metadata group is required, no leading slash is allowed, and metadata/data event kinds cannot be combined because their canonical namespaces differ.",
     request_body = CreateWatchRequest,
     responses(
         (status = 201, description = "Watch subscription created", body = WatchResponse),
@@ -887,11 +921,10 @@ pub async fn list_watches(
 pub async fn create_watch(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(_bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<CreateWatchRequest>,
 ) -> ServerResult<(StatusCode, Json<WatchResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
-    let bearer_token = bearer_token.ok_or(ServerError::Unauthorized)?;
     if request.path_prefix.is_empty()
         || request.path_prefix.starts_with('/')
         || request.path_prefix.len() > NOTIFICATION_WATCH_MAX_PREFIX_LEN
@@ -908,28 +941,18 @@ pub async fn create_watch(
         };
         event_mask.insert(kind);
     }
+    let path_prefix = canonicalize_watch_path(&state, request.path_prefix, event_mask).await?;
+    authorize_watch(&state, &auth, &path_prefix, event_mask).await?;
     let authorization = WatchAuthorizationBinding {
-        token_hash: bearer_token_hash(bearer_token.as_str()),
-        expires_at_secs: bearer_token.expires_at_secs(),
-        path_restrictions: auth.path_restrictions.clone(),
-        watch_path_prefix: request.path_prefix.clone(),
+        watch_path_prefix: path_prefix.clone(),
+        ..Default::default()
     };
-    // A remote holder receives only the durable subscription, not this request's
-    // AuthContext. Authorize the immutable canonical identity before dispatch.
-    authorize_watch(
-        &state,
-        &auth,
-        &request.path_prefix,
-        event_mask,
-        &authorization,
-    )
-    .await?;
 
     let subscription = create_watch_for_user(
         &state.get_ctx(),
         state.get_node_id(),
         auth.user_id,
-        request.path_prefix,
+        path_prefix,
         event_mask,
         authorization,
     )
@@ -986,18 +1009,21 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
     use aruna_core::metrics::NodeMetrics;
     use aruna_core::structs::{
-        Actor, GroupAuthorizationDocument, NodeCapabilities, PathRestriction, Permission,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
-        data_watch_resource_path,
+        Actor, BucketInfo, GroupAuthorizationDocument, NodeCapabilities, PathRestriction,
+        Permission, RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
+        WatchEvent, WatchEventDetail, data_watch_resource_path,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::DriverContext;
     use aruna_operations::notifications::inbox::upsert_inbox_records;
+    use aruna_operations::notifications::routing::route_watch_event;
+    use aruna_operations::notifications::watch::subscriptions::list_watch_subscriptions;
     use aruna_storage::storage::FjallStorage;
     use byteview::ByteView;
+    use std::time::SystemTime;
     use tempfile::TempDir;
     use tokio::time::timeout;
 
@@ -1159,6 +1185,22 @@ mod tests {
             AUTH_KEYSPACE,
             ByteView::from(group_id.to_bytes().to_vec()),
             ByteView::from(group_auth.to_bytes(&actor).expect("group auth serializes")),
+        )
+        .await;
+    }
+
+    async fn install_bucket(state: &ServerState, bucket: &str, group_id: Ulid, created_by: UserId) {
+        let info = BucketInfo {
+            group_id,
+            created_at: SystemTime::now(),
+            created_by,
+            cors_configuration: None,
+        };
+        write_fixture(
+            state,
+            S3_BUCKET_KEYSPACE,
+            ByteView::from(bucket.as_bytes().to_vec()),
+            ByteView::from(info.to_bytes().expect("bucket serializes")),
         )
         .await;
     }
@@ -1895,6 +1937,63 @@ mod tests {
         .expect("bucket reader may create a watch");
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(created.path_prefix, path_prefix);
+    }
+
+    #[tokio::test]
+    async fn cross_group_watch() {
+        let realm_id = realm_id(17);
+        let holder = node(17);
+        let (_dir, state) = build_state(realm_id, holder).await;
+        install_local_holder_config(&state, realm_id, holder).await;
+        let watcher = UserId::new(Ulid::r#gen(), realm_id);
+        let uploader = UserId::new(Ulid::r#gen(), realm_id);
+        let credential_group = Ulid::r#gen();
+        let bucket_group = Ulid::r#gen();
+        let bucket_node = holder;
+        install_group_authorization(&state, realm_id, bucket_group, watcher, &[uploader]).await;
+        install_bucket(&state, "reports", bucket_group, watcher).await;
+
+        let (_, created) = create_watch(
+            State(state.clone()),
+            Extension(Some(auth_for(watcher, realm_id))),
+            bearer(),
+            Json(CreateWatchRequest {
+                path_prefix: data_watch_resource_path(
+                    credential_group,
+                    bucket_node,
+                    "reports",
+                    "quarterly/",
+                ),
+                events: vec!["data_uploaded".to_string()],
+            }),
+        )
+        .await
+        .expect("bucket reader may register through a foreign credential group");
+
+        let canonical =
+            data_watch_resource_path(bucket_group, bucket_node, "reports", "quarterly/");
+        assert_eq!(created.path_prefix, canonical);
+        let subscriptions = list_watch_subscriptions(&state.get_ctx().storage_handle, watcher)
+            .await
+            .expect("watch lists");
+        let event_path =
+            data_watch_resource_path(bucket_group, bucket_node, "reports", "quarterly/result.csv");
+        let event = WatchEvent {
+            event_id: Ulid::r#gen(),
+            realm_id,
+            kind: WatchEventKind::DataUploaded,
+            path: event_path,
+            actor: uploader,
+            occurred_at_ms: created.created_at_ms + 1,
+            detail: WatchEventDetail::DataUploaded {
+                group_id: bucket_group,
+                node_id: bucket_node,
+                bucket: "reports".to_string(),
+                key: "quarterly/result.csv".to_string(),
+                size_bytes: 1,
+            },
+        };
+        assert_eq!(route_watch_event(&event, &subscriptions).len(), 1);
     }
 
     // A group that does not exist and a group the caller may not read answer
