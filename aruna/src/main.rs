@@ -46,6 +46,10 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 fn main() {
+    // Both ring and aws-lc-rs are in the graph; rustls needs one picked before any TLS init.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install rustls ring crypto provider");
     if let Some(code) = aruna_compute::dispatch_helper() {
         std::process::exit(code);
     }
