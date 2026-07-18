@@ -1103,7 +1103,7 @@ impl DhtStateMachine {
 
                 op.frontier.add_candidates(
                     self.routing_table
-                        .closest(op.key.as_bytes(), K)
+                        .closest(op.key.as_bytes(), LOOKUP_MAX_QUERIES)
                         .into_iter()
                         .map(|peer| peer.node_id),
                     self.local_id,
@@ -1192,7 +1192,7 @@ impl DhtStateMachine {
 
                 op.frontier.add_candidates(
                     self.routing_table
-                        .closest(op.key.as_bytes(), K)
+                        .closest(op.key.as_bytes(), LOOKUP_MAX_QUERIES)
                         .into_iter()
                         .map(|peer| peer.node_id),
                     self.local_id,
@@ -2916,6 +2916,43 @@ mod tests {
         state.queue_put_stores(78, &mut op, &mut fallback);
         assert_eq!(fallback.len(), 1);
         assert_eq!(op.store_attempt_count, K + 1);
+    }
+
+    #[test]
+    fn lookups_seed_fallbacks() {
+        let local_secret = make_secret(98);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
+        for seed in 1..=K + 1 {
+            let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer {
+                node_id: make_node(seed as u8),
+            }));
+        }
+        assert_eq!(state.routing_table.all_peers().len(), K + 1);
+
+        let get_key = DhtKeyId::from_data(b"get-known-fallbacks");
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id: 79,
+            key: get_key,
+            realm_filter: None,
+            trace_context: None,
+        }));
+        let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 79,
+            stage: StorageStage::GetLocalRead,
+            entries: Vec::new(),
+        }));
+        let OpState::Get(get) = state.ops.get(&79).expect("get operation") else {
+            panic!("expected get operation");
+        };
+        assert_eq!(get.frontier.discovered.len(), K + 1);
+
+        let put_key = DhtKeyId::from_data(b"put-known-fallbacks");
+        let _ = start_put(&mut state, 80, put_key);
+        let OpState::Put(put) = state.ops.get(&80).expect("put operation") else {
+            panic!("expected put operation");
+        };
+        assert_eq!(put.frontier.discovered.len(), K + 1);
     }
 
     #[test]
