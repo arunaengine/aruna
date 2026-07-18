@@ -433,12 +433,14 @@ async fn replication_delete_marker_reaches_joined_node() -> TestResult<()> {
 }
 
 #[tokio::test]
-async fn replication_does_not_auto_create_destination_bucket() -> TestResult<()> {
+async fn creates_destination_bucket() -> TestResult<()> {
+    // Incoming replication now auto-creates a missing destination bucket, so a
+    // target-side pre-create is no longer required for delivery.
     let harness = ReplicationHarness::new("replication-missing-destination-group").await?;
 
     let result = async {
         let bucket = "replication-missing-destination";
-        let key = "objects/never-replicated.txt";
+        let key = "objects/auto-created.txt";
         let body = b"missing destination bucket".to_vec();
 
         harness.create_buckets(bucket, false).await?;
@@ -451,20 +453,19 @@ async fn replication_does_not_auto_create_destination_bucket() -> TestResult<()>
             .put_object()
             .bucket(bucket)
             .key(key)
-            .body(ByteStream::from(body))
+            .body(ByteStream::from(body.clone()))
             .send()
             .await?;
 
-        harness
-            .assert_object_never_appears(bucket, key, 15, Duration::from_millis(200))
-            .await?;
+        harness.wait_for_object(bucket, key).await?;
+        harness.assert_object_matches(bucket, key, &body).await?;
 
         let joiner_buckets = harness.joiner_client.list_buckets().send().await?;
         assert!(
             joiner_buckets
                 .buckets()
                 .iter()
-                .all(|entry| entry.name().unwrap_or_default() != bucket)
+                .any(|entry| entry.name().unwrap_or_default() == bucket)
         );
         Ok(())
     }
