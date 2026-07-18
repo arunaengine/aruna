@@ -84,8 +84,10 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
 
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
     // This models a persisted watch created by an already-expired bearer token.
-    let mut legacy_binding = WatchAuthorizationBinding::default();
-    legacy_binding.expires_at_secs = 1;
+    let legacy_binding = WatchAuthorizationBinding {
+        expires_at_secs: 1,
+        ..Default::default()
+    };
     let subscription = create_watch_for_user(
         nodes[0].context.as_ref(),
         nodes[0].net.node_id(),

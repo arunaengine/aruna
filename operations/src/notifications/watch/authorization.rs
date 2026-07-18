@@ -657,8 +657,10 @@ mod tests {
             compute_handle: None,
         };
         let prefix = data_watch_resource_path(group_id, node_id, "bucket", "");
-        let mut expired_binding = WatchAuthorizationBinding::default();
-        expired_binding.expires_at_secs = 1;
+        let expired_binding = WatchAuthorizationBinding {
+            expires_at_secs: 1,
+            ..Default::default()
+        };
 
         assert_eq!(
             is_watch_authorized(
