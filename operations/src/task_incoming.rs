@@ -74,6 +74,9 @@ use crate::s3::refresh_reference_metadata::{
     REFERENCE_METADATA_REFRESH_RETRY_AFTER, process_reference_metadata_refresh_batch,
     restore_reference_metadata_refresh_timer,
 };
+use crate::sync_mirror_repair::{
+    MIRROR_REPAIR_RETRY_AFTER, process_mirror_repairs, restore_mirror_timer,
+};
 use crate::sync_placement::{
     DOCUMENT_SYNC_DEFER_RETRY_AFTER, SHARD_TOPIC_PULL_RETRY_AFTER, SHARD_TOPIC_PULL_RETRY_MAX,
     SYNC_PLACEMENT_RETRY_AFTER,
@@ -1279,6 +1282,31 @@ impl OperationsTaskHandler {
         }
     }
 
+    async fn drain_mirror_repair(&self) {
+        let Some(net_handle) = self.context.net_handle.as_ref() else {
+            self.reschedule_timer(TaskKey::DrainSyncMirrorRepair, MIRROR_REPAIR_RETRY_AFTER)
+                .await;
+            return;
+        };
+        match process_mirror_repairs(&self.context, net_handle.node_id()).await {
+            Ok(result) if result.has_more_due => {
+                self.reschedule_timer(TaskKey::DrainSyncMirrorRepair, Duration::ZERO)
+                    .await;
+            }
+            Ok(result) => {
+                if let Some(after) = result.next_due_after {
+                    self.reschedule_timer(TaskKey::DrainSyncMirrorRepair, after)
+                        .await;
+                }
+            }
+            Err(error) => {
+                warn!(%error, "Failed to drain sync mirror repair queue");
+                self.reschedule_timer(TaskKey::DrainSyncMirrorRepair, MIRROR_REPAIR_RETRY_AFTER)
+                    .await;
+            }
+        }
+    }
+
     async fn drain_reference_metadata_refresh_queue(&self) {
         match process_reference_metadata_refresh_batch(&self.context).await {
             Ok(result) if result.has_more_due => {
@@ -1710,6 +1738,7 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
         restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
         restore_job_queue_timer(&context.storage_handle, &task_handle).await;
         restore_job_prune_timer(&context.storage_handle, &task_handle).await;
+        restore_mirror_timer(&context.storage_handle, &task_handle).await;
     }
 }
 
@@ -1762,6 +1791,7 @@ pub async fn initialize_task_incoming(
         restore_job_queue_timer(&context.storage_handle, &task_handle).await;
     }
     restore_job_prune_timer(&context.storage_handle, &task_handle).await;
+    restore_mirror_timer(&context.storage_handle, &task_handle).await;
 }
 
 /// Runs one document sync outbox drain pass synchronously against `context`.
@@ -1848,6 +1878,9 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::PruneJobs => {
                 self.prune_jobs().await;
+            }
+            TaskKey::DrainSyncMirrorRepair => {
+                self.drain_mirror_repair().await;
             }
         }
     }

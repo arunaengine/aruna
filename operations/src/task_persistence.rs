@@ -47,6 +47,7 @@ fn timer_is_restored_from_durable_queue(effect: &TaskEffect) -> bool {
             | TaskKey::PublishNodeInfo
             | TaskKey::DrainJobQueue
             | TaskKey::PruneJobs
+            | TaskKey::DrainSyncMirrorRepair
     )
 }
 

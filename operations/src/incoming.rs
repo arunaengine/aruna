@@ -13,11 +13,14 @@ use crate::metadata::projector::{
     project_metadata_create_events_from_log, schedule_pending_metadata_projection_drain,
 };
 use crate::metadata::prune_queue::process_metadata_graph_tombstones;
+use crate::notifications::watch::emit::emit_resource_watch_event;
 use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
 use crate::process_placements::process_shard_placements;
 use crate::queue_backoff::queue_retry_after_ms;
-use crate::replication::incoming_version_replication::IncomingVersionReplicationOperation;
-use crate::replication::protocol::VersionReplicationMessage;
+use crate::replication::incoming_version_replication::{
+    IncomingVersionReplicationOperation, IncomingVersionReplicationResult,
+};
+use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
 use crate::usage_stats::refresh_realm_usage_summary_for_targets;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{
@@ -27,6 +30,9 @@ use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
+use aruna_core::structs::{
+    ReplicationItemKind, WatchEvent, WatchEventDetail, WatchEventKind, data_watch_resource_path,
+};
 use aruna_core::task::TaskEvent;
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_net::InboundEventHandler;
@@ -34,6 +40,7 @@ use aruna_net::streams::BiStream;
 use async_trait::async_trait;
 use tokio::time::sleep;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
+use ulid::Ulid;
 
 const METADATA_DOCUMENT_SYNC_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const METADATA_DOCUMENT_SYNC_MAINTENANCE_JITTER_SECS: u64 = 15;
@@ -53,6 +60,44 @@ impl OperationsInboundHandler {
             document_sync_reconcile,
         }
     }
+}
+
+async fn emit_replication_watch(
+    context: &DriverContext,
+    node_id: aruna_core::NodeId,
+    manifest: &VersionReplicationManifest,
+    result: &IncomingVersionReplicationResult,
+) {
+    let Some(group_id) = result.group_id else {
+        return;
+    };
+    if !result.applied || manifest.kind != ReplicationItemKind::Materialized {
+        return;
+    }
+    let size_bytes = manifest.blob.as_ref().map_or(0, |blob| blob.size);
+    let occurred_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    emit_resource_watch_event(
+        context,
+        WatchEvent {
+            event_id: Ulid::r#gen(),
+            realm_id: manifest.auth_context.realm_id,
+            kind: WatchEventKind::DataUploaded,
+            path: data_watch_resource_path(group_id, node_id, &manifest.bucket, &manifest.key),
+            actor: manifest.auth_context.user_id,
+            occurred_at_ms,
+            detail: WatchEventDetail::DataUploaded {
+                group_id,
+                node_id,
+                bucket: manifest.bucket.clone(),
+                key: manifest.key.clone(),
+                size_bytes,
+            },
+        },
+    )
+    .await;
 }
 
 // Coalesces concurrent inbound reconcile triggers: one run in flight, all
@@ -281,14 +326,26 @@ impl InboundEventHandler for OperationsInboundHandler {
                                             kind = ?manifest.kind,
                                             "Received inbound version replication manifest"
                                         );
+                                        let watch_manifest = manifest.clone();
                                         let op = IncomingVersionReplicationOperation::new(
                                             stream_id,
                                             net_handle.node_id(),
                                             *net_handle.realm_id(),
                                             manifest,
                                         );
-                                        if let Err(err) = drive(op, self.context.as_ref()).await {
-                                            error!(error = ?err, "Failed to process inbound version replication stream");
+                                        match drive(op, self.context.as_ref()).await {
+                                            Ok(Ok(result)) => {
+                                                emit_replication_watch(
+                                                    self.context.as_ref(),
+                                                    net_handle.node_id(),
+                                                    &watch_manifest,
+                                                    &result,
+                                                )
+                                                .await;
+                                            }
+                                            Ok(Err(err)) | Err(err) => {
+                                                error!(error = ?err, "Failed to process inbound version replication stream");
+                                            }
                                         }
                                     }
                                     _ => {
