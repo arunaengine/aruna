@@ -4,13 +4,15 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{SyncRelationship, sync_relationship_key, sync_relationship_prefix};
-use aruna_core::types::{Effects, Key, Value};
+use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
 const RELATIONSHIP_PAGE_SIZE: usize = 128;
+const CREATE_RELATIONSHIP_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncRelationshipDirection {
@@ -42,6 +44,8 @@ pub enum SyncRelationshipError {
     Conversion(#[from] ConversionError),
     #[error("sync relationship not found")]
     NotFound,
+    #[error("sync relationship already exists")]
+    Duplicate,
     #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
     UnexpectedEvent {
         state: &'static str,
@@ -50,6 +54,146 @@ pub enum SyncRelationshipError {
     },
     #[error("sync relationship operation did not finish")]
     NotFinished,
+}
+
+pub async fn create_sync_relationship(
+    storage: &StorageHandle,
+    relationship: SyncRelationship,
+) -> Result<SyncRelationship, SyncRelationshipError> {
+    let bucket = relationship.source.bucket().ok_or_else(|| {
+        ConversionError::FromStrError("sync relationship endpoint is not an S3 ARN".to_string())
+    })?;
+    let prefix = ByteView::from(sync_relationship_prefix(bucket));
+    let key = storage_key(SyncRelationshipDirection::Outgoing, &relationship)?;
+    let value = ByteView::from(relationship.to_bytes()?);
+
+    for attempt in 0..CREATE_RELATIONSHIP_ATTEMPTS {
+        let txn_id = match start_create_txn(storage).await {
+            Err(SyncRelationshipError::Storage(StorageError::TransactionConflict))
+                if attempt + 1 < CREATE_RELATIONSHIP_ATTEMPTS =>
+            {
+                continue;
+            }
+            result => result?,
+        };
+        if let Err(error) =
+            create_relationship_once(storage, &relationship, &prefix, &key, &value, txn_id).await
+        {
+            abort_create_txn(storage, txn_id).await;
+            return Err(error);
+        }
+
+        match storage
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => return Ok(relationship),
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            }) if attempt + 1 < CREATE_RELATIONSHIP_ATTEMPTS => {}
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+            received => {
+                abort_create_txn(storage, txn_id).await;
+                return Err(SyncRelationshipError::UnexpectedEvent {
+                    state: "CommittingCreate",
+                    expected: "storage transaction committed",
+                    received,
+                });
+            }
+        }
+    }
+
+    Err(StorageError::TransactionConflict.into())
+}
+
+async fn create_relationship_once(
+    storage: &StorageHandle,
+    relationship: &SyncRelationship,
+    prefix: &Key,
+    key: &Key,
+    value: &Value,
+    txn_id: TxnId,
+) -> Result<(), SyncRelationshipError> {
+    let mut start = None;
+    loop {
+        match storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
+                prefix: Some(prefix.clone()),
+                start: start.map(IterStart::After),
+                limit: RELATIONSHIP_PAGE_SIZE,
+                txn_id: Some(txn_id),
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => {
+                if parse_values(SyncRelationshipDirection::Outgoing, values)?
+                    .iter()
+                    .any(|existing| same_create_identity(existing, relationship))
+                {
+                    return Err(SyncRelationshipError::Duplicate);
+                }
+                let Some(next_start_after) = next_start_after else {
+                    break;
+                };
+                start = Some(next_start_after);
+            }
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+            received => {
+                return Err(SyncRelationshipError::UnexpectedEvent {
+                    state: "ScanningCreate",
+                    expected: "storage iteration result",
+                    received,
+                });
+            }
+        }
+    }
+
+    match storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
+            key: key.clone(),
+            value: value.clone(),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        received => Err(SyncRelationshipError::UnexpectedEvent {
+            state: "WritingCreate",
+            expected: "storage write result",
+            received,
+        }),
+    }
+}
+
+async fn start_create_txn(storage: &StorageHandle) -> Result<TxnId, SyncRelationshipError> {
+    match storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        received => Err(SyncRelationshipError::UnexpectedEvent {
+            state: "StartingCreate",
+            expected: "storage transaction started",
+            received,
+        }),
+    }
+}
+
+async fn abort_create_txn(storage: &StorageHandle, txn_id: TxnId) {
+    let _ = storage
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        .await;
+}
+
+fn same_create_identity(left: &SyncRelationship, right: &SyncRelationship) -> bool {
+    left.source == right.source && left.target == right.target && left.mode == right.mode
 }
 
 fn storage_key(
@@ -665,5 +809,39 @@ mod tests {
             .await,
             Err(SyncRelationshipError::NotFound)
         );
+    }
+
+    #[tokio::test]
+    async fn create_is_atomic() {
+        // Every duplicate race must commit one row and reject the losing transaction.
+        let (_tempdir, context) = test_context();
+
+        for attempt in 0..16u8 {
+            let source = format!("source-{attempt}");
+            let target = format!("target-{attempt}");
+            let first = relationship(attempt * 2 + 1, &source, &target);
+            let second = relationship(attempt * 2 + 2, &source, &target);
+
+            let (first_result, second_result) = tokio::join!(
+                create_sync_relationship(&context.storage_handle, first),
+                create_sync_relationship(&context.storage_handle, second),
+            );
+            assert!(matches!(
+                (&first_result, &second_result),
+                (Ok(_), Err(SyncRelationshipError::Duplicate))
+                    | (Err(SyncRelationshipError::Duplicate), Ok(_))
+            ));
+
+            let stored = drive(
+                ListSyncRelationshipsOperation::new(
+                    SyncRelationshipDirection::Outgoing,
+                    Some(source),
+                ),
+                &context,
+            )
+            .await
+            .unwrap();
+            assert_eq!(stored.len(), 1);
+        }
     }
 }

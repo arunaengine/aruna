@@ -28,6 +28,7 @@ use aruna_operations::sync_mirror_repair::{
 use aruna_operations::sync_relationship::{
     DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, ListSyncRelationshipsOperation,
     StoreSyncRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
+    create_sync_relationship,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -294,12 +295,9 @@ pub async fn create_sync(
         return Err(error);
     }
 
-    if let Err(error) = store_relationship(
-        &state,
-        relationship.clone(),
-        SyncRelationshipDirection::Outgoing,
-    )
-    .await
+    if let Err(error) = create_sync_relationship(&context.storage_handle, relationship.clone())
+        .await
+        .map_err(map_create_error)
     {
         if let Err(stage_error) = stage_mirror_delete(&context, &relationship).await {
             warn!(%stage_error, relationship_id = %relationship.id, "Failed to stage sync mirror rollback");
@@ -682,6 +680,15 @@ fn map_mirror_error(error: MetadataError) -> ServerError {
         "not_found" => ServerError::NotFound,
         "invalid_relationship" => ServerError::BadRequest,
         _ => ServerError::BadGateway,
+    }
+}
+
+fn map_create_error(error: SyncRelationshipError) -> ServerError {
+    match error {
+        SyncRelationshipError::Duplicate => {
+            ServerError::Conflict("sync relationship already exists".to_string())
+        }
+        other => ServerError::InternalError(other.to_string()),
     }
 }
 
