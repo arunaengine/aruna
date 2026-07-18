@@ -309,22 +309,22 @@ pub async fn create_sync(
         return Err(error);
     }
 
-    if matches!(relationship.mode, SyncMode::Once | SyncMode::Reference) {
-        if let Err(error) = queue_relationship(&state, &auth, &relationship).await {
-            if stage_mirror_delete(&context, &relationship).await.is_ok() {
-                let _ = delete_relationship(
-                    &state,
-                    relationship.clone(),
-                    SyncRelationshipDirection::Outgoing,
-                )
-                .await;
-                kick_mirror_repair(&context).await;
-                if remove_mirror(&state, &relationship).await {
-                    clear_repair(&state, &relationship, SyncMirrorRepairIntent::Delete).await;
-                }
+    if matches!(relationship.mode, SyncMode::Once | SyncMode::Reference)
+        && let Err(error) = queue_relationship(&state, &auth, &relationship).await
+    {
+        if stage_mirror_delete(&context, &relationship).await.is_ok() {
+            let _ = delete_relationship(
+                &state,
+                relationship.clone(),
+                SyncRelationshipDirection::Outgoing,
+            )
+            .await;
+            kick_mirror_repair(&context).await;
+            if remove_mirror(&state, &relationship).await {
+                clear_repair(&state, &relationship, SyncMirrorRepairIntent::Delete).await;
             }
-            return Err(error);
         }
+        return Err(error);
     }
 
     clear_repair(&state, &relationship, SyncMirrorRepairIntent::Reconcile).await;
