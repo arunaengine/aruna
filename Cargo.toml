@@ -176,3 +176,6 @@ zeroize = "1.9.0"
 
 [profile.release]
 panic = "abort"
+
+[patch."https://github.com/arunaengine/craqle"]
+craqle = { path = "../craqle" }
