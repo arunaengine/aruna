@@ -2774,7 +2774,7 @@ mod tests {
     #[tokio::test]
     async fn revision_blocks_batch() {
         let (_directory, storage) = open_storage();
-        let (revision_tx, mut io_rx, worker) = spawn_revision_worker(&storage);
+        let (revision_tx, io_rx, worker) = spawn_revision_worker(&storage);
         let count = REVISION_BLOCK_SIZE + 1;
         for op_id in 1..=count {
             revision_tx
@@ -2807,7 +2807,7 @@ mod tests {
     #[tokio::test]
     async fn revision_restart_skips() {
         let (_directory, storage) = open_storage();
-        let (first_tx, mut first_rx, first_worker) = spawn_revision_worker(&storage);
+        let (first_tx, first_rx, first_worker) = spawn_revision_worker(&storage);
         first_tx
             .send(RevisionRequest {
                 op_id: 1,
@@ -2823,7 +2823,7 @@ mod tests {
         drop(first_tx);
         first_worker.await.expect("first revision worker");
 
-        let (second_tx, mut second_rx, second_worker) = spawn_revision_worker(&storage);
+        let (second_tx, second_rx, second_worker) = spawn_revision_worker(&storage);
         second_tx
             .send(RevisionRequest {
                 op_id: 2,
