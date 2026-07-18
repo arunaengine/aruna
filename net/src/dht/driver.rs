@@ -2615,7 +2615,7 @@ mod tests {
         let key = DhtKeyId::from_data(b"unchanged-replay");
         let entry = make_entry(1, key, now_unix_secs().saturating_add(200));
         let encoded = encode_entries(std::slice::from_ref(&entry)).expect("encode entry");
-        let txn_id = TxnId::new();
+        let txn_id = TxnId::r#gen();
         let worker = std::thread::spawn(move || {
             let (effect, response, ..) = receiver.recv().expect("transaction start");
             assert!(matches!(
@@ -2790,7 +2790,7 @@ mod tests {
         for expected in 1..=count {
             assert!(matches!(
                 io_rx.recv().await,
-                Some(DhtIo::StorageRevisionResult {
+                Ok(DhtIo::StorageRevisionResult {
                     op_id,
                     stage: StorageStage::PutRevision,
                     revision,
@@ -2818,7 +2818,7 @@ mod tests {
             .expect("queue first revision");
         assert!(matches!(
             first_rx.recv().await,
-            Some(DhtIo::StorageRevisionResult { revision: 1, .. })
+            Ok(DhtIo::StorageRevisionResult { revision: 1, .. })
         ));
         drop(first_tx);
         first_worker.await.expect("first revision worker");
@@ -2834,7 +2834,7 @@ mod tests {
             .expect("queue second revision");
         assert!(matches!(
             second_rx.recv().await,
-            Some(DhtIo::StorageRevisionResult { revision: 65, .. })
+            Ok(DhtIo::StorageRevisionResult { revision: 65, .. })
         ));
         drop(second_tx);
         second_worker.await.expect("second revision worker");

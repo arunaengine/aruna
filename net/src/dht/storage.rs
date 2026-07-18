@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn floor_window_expires() {
         let key = DhtKeyId::from_data(b"floor-window-expiry");
-        let expires_at = 100;
+        let expires_at: u64 = 100;
         let now = expires_at
             .saturating_add(MAX_TTL_SECS)
             .saturating_add(MAX_CLOCK_SKEW_SECS);
