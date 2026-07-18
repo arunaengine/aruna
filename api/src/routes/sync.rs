@@ -8,7 +8,7 @@ use aruna_core::keyspaces::BLOB_REPLICATION_JOB_KEYSPACE;
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::{
     ArunaArn, AuthContext, BucketInfo, Permission, SyncMode, SyncRelationship, SyncState,
-    SyncStatusSnapshot, blob_bucket_permission_path,
+    SyncStatusSnapshot, blob_bucket_permission_path, ensure_confined_relative_path,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::driver::drive;
@@ -36,6 +36,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::path::Path as StdPath;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -533,10 +534,18 @@ fn validate_endpoint(bucket: &str, prefix: Option<&str>) -> ServerResult<()> {
             "workspace buckets cannot be synchronized".to_string(),
         ));
     }
-    if prefix.is_some_and(str::is_empty) {
-        return Err(ServerError::BadRequestReason(
-            "prefix must be non-empty when provided".to_string(),
-        ));
+    if let Some(prefix) = prefix {
+        if prefix.is_empty() {
+            return Err(ServerError::BadRequestReason(
+                "prefix must be non-empty when provided".to_string(),
+            ));
+        }
+        // Replicated keys inherit the prefix via the sync key mapping, so the
+        // same confinement rules as object keys must hold here; otherwise
+        // replication produces keys that normal S3 operations reject.
+        ensure_confined_relative_path(StdPath::new(prefix)).map_err(|error| {
+            ServerError::BadRequestReason(format!("invalid prefix: {error}"))
+        })?;
     }
     Ok(())
 }
@@ -990,6 +999,15 @@ mod tests {
         assert!(validate_endpoint("bucket", Some("")).is_err());
         assert!(validate_endpoint("bucket/name", None).is_err());
         assert!(validate_endpoint("bucket", Some("selected/")).is_ok());
+    }
+
+    #[test]
+    fn rejects_unsafe_prefixes() {
+        assert!(validate_endpoint("bucket", Some("../escape")).is_err());
+        assert!(validate_endpoint("bucket", Some("nested/../escape")).is_err());
+        assert!(validate_endpoint("bucket", Some("/absolute")).is_err());
+        assert!(validate_endpoint("bucket", Some("with\u{7}control")).is_err());
+        assert!(validate_endpoint("bucket", Some("nested/prefix/")).is_ok());
     }
 
     #[test]
