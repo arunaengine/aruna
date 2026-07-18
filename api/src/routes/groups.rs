@@ -1073,7 +1073,9 @@ pub struct DataPathsResponse {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct DataPathsQuery {
-    /// Data permission path to browse under; empty lists the group's buckets.
+    /// Data permission path to browse under; empty lists the group's buckets, a
+    /// bucket path lists its contents, any other bare segment filters bucket
+    /// names by that prefix.
     #[serde(default)]
     pub prefix: Option<String>,
     #[serde(default)]
@@ -1090,7 +1092,7 @@ pub struct DataPathsQuery {
     tag = "groups",
     params(
         ("id" = String, Path, description = "Group id"),
-        ("prefix" = Option<String>, Query, description = "Data permission path to browse under; empty or the group data path lists buckets"),
+        ("prefix" = Option<String>, Query, description = "Data permission path to browse under; empty or the group data path lists buckets; a bucket path lists that bucket's contents; any other bare segment filters bucket names by that prefix"),
         ("delimiter" = Option<String>, Query, description = "Folder delimiter, typically '/'"),
         ("continuation_token" = Option<String>, Query, description = "Opaque token from a previous page"),
         ("limit" = Option<u32>, Query, description = "Maximum entries per page (1-1000)")
@@ -1133,21 +1135,37 @@ pub async fn list_data_paths(
         None => String::new(),
     };
 
-    let response = match remainder.split_once('/') {
+    // A bare segment that names an existing bucket browses into that bucket's
+    // root so a returned bucket path round-trips; any other bare segment stays a
+    // bucket-name filter.
+    let bucket_target = match remainder.split_once('/') {
+        Some((bucket, key_prefix)) => Some((bucket.to_string(), key_prefix.to_string())),
+        None => {
+            if !remainder.is_empty()
+                && get_bucket_group(&state, &remainder).await? == Some(group_id)
+            {
+                Some((remainder.clone(), String::new()))
+            } else {
+                None
+            }
+        }
+    };
+
+    let response = match bucket_target {
         Some((bucket, key_prefix)) => {
             // Listing inside a bucket requires READ on the bucket, or the prefix
             // being browsed, so path-restricted tokens see only what they may read.
             let listing_path = if key_prefix.is_empty() {
-                blob_bucket_permission_path(realm_id, group_id, node_id, bucket)
+                blob_bucket_permission_path(realm_id, group_id, node_id, &bucket)
             } else {
-                blob_object_permission_path(realm_id, group_id, node_id, bucket, key_prefix)
+                blob_object_permission_path(realm_id, group_id, node_id, &bucket, &key_prefix)
             };
             require_data_read(&state, &auth, listing_path).await?;
             list_bucket_objects(
                 &state,
                 group_id,
-                bucket,
-                key_prefix,
+                &bucket,
+                &key_prefix,
                 query.delimiter.as_deref(),
                 query.continuation_token.as_deref(),
                 limit,
@@ -1800,6 +1818,60 @@ mod tests {
             ]
         );
         assert!(body.continuation_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn round_trips_bucket() {
+        // A returned bucket folder path must list the bucket's children verbatim.
+        let (state, _tempdir) = setup_state().await;
+        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let group_id = seed_group(&state, owner).await;
+        seed_bucket(&state, "data", group_id).await;
+        for (index, key) in ["a.txt", "dir/1"].iter().enumerate() {
+            seed_object(&state, "data", key, owner, index as u8 + 1).await;
+        }
+        let realm_id = state.get_realm_id();
+        let node_id = state.get_node_id();
+
+        let (_status, Json(listing)) = list_data_paths(
+            State(state.clone()),
+            Extension(Some(member_auth(owner))),
+            Path(group_id.to_string()),
+            Query(DataPathsQuery::default()),
+        )
+        .await
+        .unwrap();
+        let bucket_path = listing.entries[0].permission_path.clone();
+        assert_eq!(
+            bucket_path,
+            blob_bucket_permission_path(realm_id, group_id, node_id, "data")
+        );
+
+        let (_status, Json(body)) = list_data_paths(
+            State(state.clone()),
+            Extension(Some(member_auth(owner))),
+            Path(group_id.to_string()),
+            Query(browse(Some(bucket_path.clone()))),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            body.entries
+                .iter()
+                .all(|entry| entry.permission_path != bucket_path)
+        );
+        let paths: Vec<_> = body
+            .entries
+            .iter()
+            .map(|entry| entry.permission_path.clone())
+            .collect();
+        assert!(paths.contains(&blob_object_permission_path(
+            realm_id, group_id, node_id, "data", "a.txt"
+        )));
+        assert!(paths.contains(&blob_object_permission_path(
+            realm_id, group_id, node_id, "data", "dir/"
+        )));
     }
 
     #[tokio::test]
