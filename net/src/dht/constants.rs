@@ -22,6 +22,7 @@ pub const DHT_REVISION_KEY: &[u8] = b"revision";
 
 pub const DRIVER_TICK_INTERVAL: Duration = Duration::from_secs(30);
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(10);
+pub const INBOUND_STORAGE_BUDGET: Duration = Duration::from_secs(8);
 pub const STORAGE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const RPC_TIMEOUT_TICKS: u64 = 4;
 

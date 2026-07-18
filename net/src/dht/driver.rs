@@ -24,8 +24,9 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::constants::{
     CMD_CHANNEL_CAPACITY, DHT_KEY_COUNT_KEY, DHT_META_KEYSPACE, DHT_REVISION_KEY,
-    DRIVER_IO_EVENT_CAPACITY, DRIVER_TICK_INTERVAL, MAX_ENTRIES_PER_KEY, MAX_INBOUND_RPCS,
-    MAX_MESSAGE_SIZE, MAX_STORED_KEYS, RPC_TIMEOUT, STORAGE_MUTATION_RETRIES, STORAGE_TIMEOUT,
+    DRIVER_IO_EVENT_CAPACITY, DRIVER_TICK_INTERVAL, INBOUND_STORAGE_BUDGET, MAX_ENTRIES_PER_KEY,
+    MAX_INBOUND_RPCS, MAX_MESSAGE_SIZE, MAX_STORED_KEYS, RPC_TIMEOUT, STORAGE_MUTATION_RETRIES,
+    STORAGE_TIMEOUT,
 };
 use super::kbucket::K;
 use super::protocol::{
@@ -1047,7 +1048,11 @@ impl DhtDriver {
                     txn_id: None,
                 });
 
-                match send_storage_effect_with_timeout(&storage, effect, op_id, stage, "read").await
+                match run_storage_io(
+                    stage,
+                    send_storage_effect_with_timeout(&storage, effect, op_id, stage, "read"),
+                )
+                .await
                 {
                     Ok(Event::Storage(StorageEvent::ReadResult { value, .. })) => {
                         let mut entries = match value {
@@ -1240,7 +1245,12 @@ impl DhtDriver {
         tokio::spawn(
             async move {
                 let mutation = StorageMutation::Merge { entry };
-                match mutate_storage_entries(&storage, op_id, stage, key, &mutation).await {
+                match run_storage_io(
+                    stage,
+                    mutate_storage_entries(&storage, op_id, stage, key, &mutation),
+                )
+                .await
+                {
                     Ok(()) => {
                         let _ = io_tx.send(DhtIo::StorageWriteResult { op_id, stage }).await;
                     }
@@ -1954,6 +1964,22 @@ async fn send_storage_effect_with_timeout(
             );
             Err(DhtIoError::Timeout)
         }
+    }
+}
+
+async fn run_storage_io<T, F>(stage: StorageStage, future: F) -> Result<T, DhtIoError>
+where
+    F: std::future::Future<Output = Result<T, DhtIoError>>,
+{
+    if matches!(
+        stage,
+        StorageStage::InboundGetRead | StorageStage::InboundPutMerge
+    ) {
+        tokio::time::timeout(INBOUND_STORAGE_BUDGET, future)
+            .await
+            .map_err(DhtIoError::from)?
+    } else {
+        future.await
     }
 }
 
@@ -2729,6 +2755,11 @@ mod tests {
             encode_request_frame(&request, None),
             Err(DhtIoError::InvalidRequest(message)) if message == "request too large"
         ));
+    }
+
+    #[test]
+    fn inbound_budget_precedes() {
+        assert!(INBOUND_STORAGE_BUDGET < RPC_TIMEOUT);
     }
 
     #[tokio::test]
