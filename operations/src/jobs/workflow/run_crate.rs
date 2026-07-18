@@ -199,6 +199,7 @@ fn build_run_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id:
     let root = format!("https://w3id.org/aruna/{document_id}");
     let action_id = format!("#run-{}", record.job_id);
     let agent_id = format!("#agent-{}", record.created_by);
+    let software_id = format!("#software-{}", record.job_id);
     let workspace = record
         .workspace_bucket
         .clone()
@@ -255,7 +256,7 @@ fn build_run_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id:
         "@type": "CreateAction",
         "name": format!("execution of {}", spec.image),
         "agent": {"@id": agent_id.clone()},
-        "instrument": {"@id": spec.image.clone()},
+        "instrument": {"@id": software_id.clone()},
         "object": object_ids,
         "result": result_ids,
         "actionStatus": {"@id": action_status},
@@ -273,11 +274,14 @@ fn build_run_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id:
         }
     }
 
+    // A digest-pinned image reference is not a valid IRI, so the node keeps a
+    // minted @id and carries the raw reference as `identifier`.
     let (image_name, image_version) = split_image(&spec.image);
     let mut software = json!({
-        "@id": spec.image.clone(),
+        "@id": software_id,
         "@type": "SoftwareApplication",
-        "name": image_name
+        "name": image_name,
+        "identifier": spec.image.clone()
     });
     if let (Some(map), Some(version)) = (software.as_object_mut(), image_version) {
         map.insert("softwareVersion".to_string(), json!(version));
@@ -448,10 +452,11 @@ mod tests {
         let action = by_id(&format!("#run-{}", record.job_id));
         assert_eq!(action["@type"], "CreateAction");
         let instrument = action["instrument"]["@id"].as_str().unwrap();
-        assert_eq!(instrument, "busybox:1.36");
+        assert_eq!(instrument, format!("#software-{}", record.job_id));
         let software = by_id(instrument);
         assert_eq!(software["@type"], "SoftwareApplication");
         assert_eq!(software["name"], "busybox");
+        assert_eq!(software["identifier"], "busybox:1.36");
         assert_eq!(software["softwareVersion"], "1.36");
         assert_eq!(action["object"][0]["@id"], "s3://src/in.txt");
         assert_eq!(action["result"][0]["@id"], "s3://src/out.txt");
@@ -466,6 +471,29 @@ mod tests {
         assert_eq!(agent["@type"], "Person");
         assert_eq!(by_id("s3://src/in.txt")["@type"], "File");
         assert_eq!(by_id("s3://src/out.txt")["contentSize"], "7");
+    }
+
+    #[test]
+    fn digest_image_id() {
+        // A digest-pinned image keeps a valid @id and carries the raw reference.
+        let (mut record, mut spec) = execution_record();
+        let image =
+            "ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        spec.image = image.to_string();
+        record.payload = JobPayload::Execution(spec.clone());
+        let value = parse(&record, &spec);
+        let graph = value["@graph"].as_array().unwrap();
+        let by_id = |id: &str| graph.iter().find(|e| e["@id"] == id).expect("entity");
+        let action = by_id(&format!("#run-{}", record.job_id));
+        let instrument = action["instrument"]["@id"].as_str().unwrap();
+        assert_eq!(instrument, format!("#software-{}", record.job_id));
+        let software = by_id(instrument);
+        assert_eq!(software["identifier"], image);
+        assert_eq!(software["name"], "ubuntu");
+        assert_eq!(
+            software["softwareVersion"],
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
     }
 
     #[test]
