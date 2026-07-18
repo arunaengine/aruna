@@ -1668,11 +1668,11 @@ async fn run_storage_txn(
     };
 
     let had_value = value.is_some();
-    let (entries, corrupt_row) = match value {
+    let (entries, mut preserve_row) = match value {
         Some(value) => match decode_entries(&value) {
             Ok(entries) => (entries, false),
             Err(error) if matches!(mutation, StorageMutation::Prune { .. }) => {
-                warn!(key = %key, error = %error, "Removing corrupt DHT row during cleanup");
+                warn!(key = %key, error = %error, "Preserving corrupt DHT row during cleanup");
                 (Vec::new(), true)
             }
             Err(error) => {
@@ -1724,10 +1724,10 @@ async fn run_storage_txn(
                 }
             }
         }
-        StorageMutation::Prune { .. } if corrupt_row => Vec::new(),
         StorageMutation::Prune { .. } => {
             if let Err(error) = validate_entries(&key, &original_entries, now_secs) {
-                warn!(key = %key, error = %error, "Removing invalid DHT row during cleanup");
+                warn!(key = %key, error = %error, "Preserving invalid DHT row during cleanup");
+                preserve_row = true;
                 Vec::new()
             } else {
                 retained_entries(original_entries.clone(), now_secs)
@@ -1763,7 +1763,7 @@ async fn run_storage_txn(
         .into_iter()
         .map(|key| (DHT_META_KEYSPACE.to_string(), ByteView::from(key)))
         .collect::<Vec<_>>();
-    if had_value && entries.is_empty() {
+    if had_value && entries.is_empty() && !preserve_row {
         deletes.push((
             DHT_KEYSPACE.to_string(),
             ByteView::from(key.as_bytes().as_slice()),
@@ -1801,7 +1801,7 @@ async fn run_storage_txn(
 
     let count_result = if !had_value && !entries.is_empty() {
         update_key_count(storage, op_id, stage, txn_id, true).await
-    } else if had_value && entries.is_empty() {
+    } else if had_value && entries.is_empty() && !preserve_row {
         update_key_count(storage, op_id, stage, txn_id, false).await
     } else {
         Ok(())
@@ -3138,64 +3138,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_removes_corrupt() {
-        let (_directory, storage) = open_storage();
-        let key = DhtKeyId::from_data(b"corrupt-cleanup");
-        let entry = DeadlineEntry { deadline: 10, key };
-        let writes = vec![
+    async fn cleanup_preserves_corrupt() {
+        let decode_key = DhtKeyId::from_data(b"corrupt-cleanup");
+        let invalid_key = DhtKeyId::from_data(b"invalid-cleanup");
+        let mut invalid = make_entry(1, invalid_key, 10);
+        invalid.revision = 0;
+        let cases = [
+            (decode_key, b"not-postcard".to_vec()),
             (
-                DHT_KEYSPACE.to_string(),
-                ByteView::from(key.as_bytes().as_slice()),
-                ByteView::from(b"not-postcard".as_slice()),
-            ),
-            (
-                DHT_META_KEYSPACE.to_string(),
-                ByteView::from(deadline_key(DeadlineIndex::Active, entry)),
-                ByteView::from(Vec::new()),
-            ),
-            (
-                DHT_META_KEYSPACE.to_string(),
-                ByteView::from(DHT_KEY_COUNT_KEY),
-                ByteView::from(1u64.to_le_bytes().as_slice()),
+                invalid_key,
+                encode_entries(std::slice::from_ref(&invalid)).expect("encode invalid row"),
             ),
         ];
-        let event = storage
-            .send_effect(Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id: None,
-            }))
-            .await;
-        assert!(matches!(
-            event,
-            Event::Storage(StorageEvent::BatchWriteResult { .. })
-        ));
-        let prune = StorageMutation::Prune {
-            index: DeadlineIndex::Active,
-            entry,
-            now_secs: entry.deadline,
-        };
+        for (key, value) in cases {
+            let (_directory, storage) = open_storage();
+            let entry = DeadlineEntry { deadline: 10, key };
+            let writes = vec![
+                (
+                    DHT_KEYSPACE.to_string(),
+                    ByteView::from(key.as_bytes().as_slice()),
+                    ByteView::from(value.as_slice()),
+                ),
+                (
+                    DHT_META_KEYSPACE.to_string(),
+                    ByteView::from(deadline_key(DeadlineIndex::Active, entry)),
+                    ByteView::from(Vec::new()),
+                ),
+                (
+                    DHT_META_KEYSPACE.to_string(),
+                    ByteView::from(DHT_KEY_COUNT_KEY),
+                    ByteView::from(1u64.to_le_bytes().as_slice()),
+                ),
+            ];
+            let event = storage
+                .send_effect(Effect::Storage(StorageEffect::BatchWrite {
+                    writes,
+                    txn_id: None,
+                }))
+                .await;
+            assert!(matches!(
+                event,
+                Event::Storage(StorageEvent::BatchWriteResult { .. })
+            ));
+            let prune = StorageMutation::Prune {
+                index: DeadlineIndex::Active,
+                entry,
+                now_secs: entry.deadline,
+            };
 
-        mutate_storage_entries(&storage, 21, StorageStage::CleanupActivePrune, key, &prune)
-            .await
-            .expect("remove corrupt row");
-
-        assert!(
-            index_entries(&storage, DeadlineIndex::Active)
+            mutate_storage_entries(&storage, 21, StorageStage::CleanupActivePrune, key, &prune)
                 .await
-                .is_empty()
-        );
-        assert_eq!(read_count(&storage).await, 0);
-        let event = storage
-            .send_effect(Effect::Storage(StorageEffect::Read {
-                key_space: DHT_KEYSPACE.to_string(),
-                key: ByteView::from(key.as_bytes().as_slice()),
-                txn_id: None,
-            }))
-            .await;
-        assert!(matches!(
-            event,
-            Event::Storage(StorageEvent::ReadResult { value: None, .. })
-        ));
+                .expect("quarantine corrupt row");
+
+            assert!(
+                index_entries(&storage, DeadlineIndex::Active)
+                    .await
+                    .is_empty()
+            );
+            assert_eq!(read_count(&storage).await, 1);
+            let event = storage
+                .send_effect(Effect::Storage(StorageEffect::Read {
+                    key_space: DHT_KEYSPACE.to_string(),
+                    key: ByteView::from(key.as_bytes().as_slice()),
+                    txn_id: None,
+                }))
+                .await;
+            let Event::Storage(StorageEvent::ReadResult {
+                value: Some(stored),
+                ..
+            }) = event
+            else {
+                panic!("expected preserved DHT row: {event:?}");
+            };
+            assert_eq!(stored.as_ref(), value);
+        }
     }
 
     #[tokio::test]
