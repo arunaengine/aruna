@@ -199,7 +199,6 @@ pub struct SyncListParams {
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Bucket not found", body = ErrorResponse),
         (status = 409, description = "Duplicate relationship", body = ErrorResponse),
-        (status = 501, description = "Reference mode is not implemented", body = ErrorResponse),
         (status = 502, description = "Target unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -212,9 +211,6 @@ pub async fn create_sync(
 ) -> ServerResult<(StatusCode, Json<SyncRelationshipResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
-    if request.mode == ApiSyncMode::Reference {
-        return Err(ServerError::Unimplemented);
-    }
     validate_endpoint(&request.source.bucket, request.source.prefix.as_deref())?;
     validate_endpoint(&request.target.bucket, request.target.prefix.as_deref())?;
 
@@ -309,7 +305,7 @@ pub async fn create_sync(
         return Err(error);
     }
 
-    if relationship.mode == SyncMode::Once {
+    if matches!(relationship.mode, SyncMode::Once | SyncMode::Reference) {
         if let Err(error) = queue_relationship(&state, &auth, &relationship).await {
             if stage_mirror_delete(&context, &relationship).await.is_ok() {
                 let _ = delete_relationship(
@@ -451,7 +447,6 @@ pub async fn get_sync(
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Relationship not found", body = ErrorResponse),
-        (status = 501, description = "Reference mode is not implemented", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -465,9 +460,6 @@ pub async fn run_sync(
     let mut relationship =
         get_relationship(&state, id, SyncRelationshipDirection::Outgoing).await?;
     ensure_creator(&auth, &relationship)?;
-    if relationship.mode == SyncMode::Reference {
-        return Err(ServerError::Unimplemented);
-    }
     ensure_source_read(&state, &auth, &relationship).await?;
     if matches!(relationship.state, SyncState::Failed { .. }) {
         relationship.state = SyncState::Enabled;
@@ -713,7 +705,7 @@ async fn queue_relationship(
                 target,
                 target_node_id: relationship.target.node_id,
                 auth_context: auth.clone(),
-                replicate_delete_markers: relationship.mode == SyncMode::Continuous
+                replicate_delete_markers: relationship.mode != SyncMode::Once
                     && relationship.replicate_deletes,
                 mode: ReplicationMode::OnDemand,
             },

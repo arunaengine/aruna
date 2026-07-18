@@ -978,8 +978,10 @@ fn relationship_job(
     inbound_origin: Option<&SyncOrigin>,
     upstream_sources: &[ArunaArn],
 ) -> Option<BlobReplicationJobRecord> {
-    if relationship.mode != SyncMode::Continuous
-        || relationship.state != SyncState::Enabled
+    if !matches!(
+        relationship.mode,
+        SyncMode::Continuous | SyncMode::Reference
+    ) || relationship.state != SyncState::Enabled
         || relationship.source.node_id != local_node_id
         || relationship.source.bucket() != Some(bucket)
         || relationship
@@ -2973,6 +2975,27 @@ mod tests {
         );
 
         assert!(job.is_none());
+    }
+
+    #[test]
+    fn reference_job_queues() {
+        let mut reference = relationship(11, 2, Some("photos/"), true);
+        reference.mode = SyncMode::Reference;
+
+        let job = relationship_job(
+            node(1),
+            "bucket",
+            "photos/image.jpg",
+            Ulid::from(12u128),
+            true,
+            reference,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(job.relationship_id, Some(Ulid::from(11u128)));
+        assert_eq!(job.source_delete_marker, Some(true));
     }
 
     #[test]
