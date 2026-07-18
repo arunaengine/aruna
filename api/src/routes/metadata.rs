@@ -4949,6 +4949,16 @@ mod tests {
                 .into(),
         )
         .await;
+        drive(
+            AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+                realm_id,
+                node_id,
+                schedule_refresh: false,
+            }),
+            driver_ctx.as_ref(),
+        )
+        .await
+        .unwrap();
         let group_id = Ulid::generate();
         let group_auth =
             GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
