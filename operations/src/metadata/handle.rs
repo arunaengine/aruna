@@ -3971,6 +3971,7 @@ async fn fill_visibility_caches(
         .collect::<Vec<_>>();
     records.retain(|record| !deleted_graphs.contains(&record.graph_iri));
     let records = Arc::new(records);
+    warn_unprojected_graphs(inner.clone(), records.as_ref()).await;
     let store_accepted = inner.visibility_cache.store_visibility_fill(
         records.clone(),
         lifecycle_entries,
@@ -4042,6 +4043,80 @@ async fn list_registry_records_for_local_read(
     record_elapsed_ms(span, "registry_ms", registry_started);
     span.record("registry_records", records.len() as u64);
     Ok(records)
+}
+
+async fn warn_unprojected_graphs(inner: Arc<MetadataInner>, records: &[MetadataRegistryRecord]) {
+    let projected = records
+        .iter()
+        .map(|record| record.graph_iri.clone())
+        .collect::<BTreeSet<_>>();
+    let node = inner.node.clone();
+    let policies = match tokio::task::spawn_blocking(move || {
+        node.graphs()?
+            .into_iter()
+            .map(|graph| {
+                let policy = node.graph_policy(&graph)?;
+                Ok((graph.as_str().to_string(), policy))
+            })
+            .collect::<Result<BTreeMap<_, _>, CraqleError>>()
+    })
+    .await
+    {
+        Ok(Ok(policies)) => policies,
+        Ok(Err(error)) => {
+            warn!(
+                event = "metadata.authorization.graph_scan_failed",
+                error = %error,
+                "Could not audit metadata graphs against the authorization projection"
+            );
+            return;
+        }
+        Err(error) => {
+            warn!(
+                event = "metadata.authorization.graph_scan_failed",
+                error = %error,
+                "Could not audit metadata graphs against the authorization projection"
+            );
+            return;
+        }
+    };
+    let graphs = policies.keys().cloned().collect::<BTreeSet<_>>();
+    let missing = graphs.difference(&projected).cloned().collect::<Vec<_>>();
+    if !missing.is_empty() {
+        warn!(
+            event = "metadata.authorization.projection_missing",
+            count = missing.len() as u64,
+            sample_graph_iris = ?missing.iter().take(8).collect::<Vec<_>>(),
+            "excluding metadata graphs missing from the authorization projection"
+        );
+    }
+    let unmaterialized = projected.difference(&graphs).cloned().collect::<Vec<_>>();
+    if !unmaterialized.is_empty() {
+        warn!(
+            event = "metadata.authorization.graph_missing",
+            count = unmaterialized.len() as u64,
+            sample_graph_iris = ?unmaterialized.iter().take(8).collect::<Vec<_>>(),
+            "metadata authorization projection references graphs missing from Craqle"
+        );
+    }
+    let stale = records
+        .iter()
+        .filter(|record| {
+            policies.get(&record.graph_iri).is_some_and(|policy| {
+                policy.public != record.public
+                    || policy.permission_paths != [record.permission_path.clone()]
+            })
+        })
+        .map(|record| record.graph_iri.as_str())
+        .collect::<Vec<_>>();
+    if !stale.is_empty() {
+        warn!(
+            event = "metadata.authorization.projection_stale",
+            count = stale.len() as u64,
+            sample_graph_iris = ?stale.iter().take(8).collect::<Vec<_>>(),
+            "metadata authorization projection disagrees with Craqle graph policy"
+        );
+    }
 }
 
 #[tracing::instrument(

@@ -2093,6 +2093,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn portal_searches_description() {
+        let test = setup_state().await;
+        let (_, Json(created)) = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Extension(None),
+            Json(CreateMetadataRequest::RoCrate(
+                CreateMetadataRoCrateRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/portal-array-context".to_string(),
+                    public: true,
+                    rocrate: json!({
+                        "@context": [
+                            "https://w3id.org/ro/crate/1.2/context",
+                            {
+                                "portalTerm": "https://example.org/portalTerm"
+                            }
+                        ],
+                        "@graph": [
+                            {
+                                "@id": "ro-crate-metadata.json",
+                                "@type": "CreativeWork",
+                                "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                                "about": { "@id": "urn:dataset:portal-search" }
+                            },
+                            {
+                                "@id": "urn:dataset:portal-search",
+                                "@type": "Dataset",
+                                "name": "Portal Search Dataset",
+                                "description": "A plain multi word constellation dataset description",
+                                "datePublished": "2026-07-18",
+                                "license": { "@id": "https://creativecommons.org/licenses/by/4.0/" },
+                                "portalTerm": "portal-shape"
+                            }
+                        ]
+                    }),
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let (_, Json(search)) = search_metadata(
+                    State(test.state.clone()),
+                    Extension(None),
+                    Extension(None),
+                    Query(MetadataSearchParams {
+                        q: "constellation".to_string(),
+                        conforms_to: None,
+                        group_id: None,
+                        limit: Some(10),
+                        cursor: None,
+                        mode: Some(MetadataQueryMode::Local),
+                    }),
+                )
+                .await
+                .unwrap();
+                if search
+                    .hits
+                    .iter()
+                    .any(|hit| hit.document_id == created.summary.document_id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("woken search worker indexes the portal crate");
+    }
+
+    #[tokio::test]
     async fn metadata_routes_support_rocrate_create_and_entity_upserts() {
         let test = setup_state().await;
 
