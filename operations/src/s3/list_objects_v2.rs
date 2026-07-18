@@ -1,3 +1,4 @@
+use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -5,7 +6,7 @@ use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VE
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
-    SourceMetadata, VersionKey,
+    SourceConnectorKind, SourceMetadata, VersionKey,
 };
 use aruna_core::types::{Effects, GroupId, Key, Value};
 use aruna_core::util::prefix_upper_bound;
@@ -76,6 +77,11 @@ pub struct ListObjectsV2Object {
     pub head: BlobHeadKey,
     pub location: Option<BackendLocation>,
     pub source_metadata: Option<SourceMetadata>,
+    pub referenced: bool,
+    pub kind: Option<SourceConnectorKind>,
+    pub source_path: Option<String>,
+    pub connector_id: Option<Ulid>,
+    pub origin_node_id: Option<NodeId>,
     pub last_refresh: Option<std::time::SystemTime>,
     pub version_created_at: Option<std::time::SystemTime>,
 }
@@ -440,15 +446,21 @@ impl ListObjectsV2Operation {
             match version.state {
                 BlobVersionState::Deleted => {}
                 BlobVersionState::Reference {
+                    source,
                     cached_metadata,
                     last_refresh,
-                    ..
                 } => {
+                    let descriptor = source.descriptor;
                     self.resolved
                         .push(ResolvedEntry::Object(ListObjectsV2Object {
                             head,
                             location: None,
                             source_metadata: Some(cached_metadata),
+                            referenced: true,
+                            kind: Some(descriptor.kind),
+                            source_path: Some(descriptor.source_path),
+                            connector_id: source.connector_id,
+                            origin_node_id: descriptor.origin_node_id,
                             last_refresh: Some(last_refresh),
                             version_created_at: None,
                         }));
@@ -522,6 +534,11 @@ impl ListObjectsV2Operation {
                         head,
                         location: Some(location),
                         source_metadata: None,
+                        referenced: false,
+                        kind: None,
+                        source_path: None,
+                        connector_id: None,
+                        origin_node_id: None,
                         last_refresh: None,
                         version_created_at: Some(version_created_at),
                     });
@@ -1094,6 +1111,14 @@ mod test {
         assert_eq!(result.objects[0].head.key, "ref-object");
         assert_eq!(result.objects[0].location, None);
         assert_eq!(result.objects[0].source_metadata, Some(source_metadata));
+        assert!(result.objects[0].referenced);
+        assert_eq!(result.objects[0].kind, Some(SourceConnectorKind::Http));
+        assert_eq!(
+            result.objects[0].source_path.as_deref(),
+            Some("source/path")
+        );
+        assert_eq!(result.objects[0].connector_id, None);
+        assert_eq!(result.objects[0].origin_node_id, None);
         assert_eq!(result.objects[0].last_refresh, Some(last_refresh));
         assert!(result.continuation_token.is_none());
     }
