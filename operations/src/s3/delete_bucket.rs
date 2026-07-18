@@ -6,13 +6,19 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
-    S3_MULTIPART_UPLOAD_KEYSPACE,
+    S3_MULTIPART_UPLOAD_KEYSPACE, SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{BlobHeadKey, BucketInfo, MultipartUpload, UsageDelta, VersionKey};
-use aruna_core::types::{Effects, GroupId, TxnId};
+use aruna_core::structs::{
+    BlobHeadKey, BucketInfo, MultipartUpload, SyncRelationship, UsageDelta, VersionKey,
+    sync_relationship_key, sync_relationship_prefix,
+};
+use aruna_core::task::{TaskEffect, TaskKey};
+use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
+
+use crate::sync_mirror_repair::mirror_delete_entry;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DeleteBucketState {
@@ -22,6 +28,9 @@ pub enum DeleteBucketState {
     CheckCurrentObjects,
     CheckVersions,
     CheckMultipartUploads,
+    ScanOutRelationships,
+    ScanInRelationships,
+    WriteRepairs,
     DeleteBucket,
     UpdateUsage,
     CommitTransaction,
@@ -60,6 +69,8 @@ pub struct DeleteBucketOperation {
     txn_id: Option<TxnId>,
     group_id: Option<GroupId>,
     usage_update: Option<UsageCounterUpdate>,
+    relationship_deletes: Vec<(String, Key)>,
+    relationships: Vec<SyncRelationship>,
     output: Option<Result<(), DeleteBucketError>>,
 }
 
@@ -73,6 +84,8 @@ impl DeleteBucketOperation {
             txn_id: None,
             group_id: None,
             usage_update: None,
+            relationship_deletes: Vec::new(),
+            relationships: Vec::new(),
             output: None,
         }
     }
@@ -209,20 +222,128 @@ impl DeleteBucketOperation {
             }
         }
 
-        self.state = DeleteBucketState::DeleteBucket;
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes: vec![
-                (
-                    S3_BUCKET_KEYSPACE.to_string(),
-                    self.bucket.as_bytes().to_vec().into(),
-                ),
-                (
-                    S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
-                    self.bucket.as_bytes().to_vec().into(),
-                ),
-            ],
+        self.scan_relationships(false, None)
+    }
+
+    fn scan_relationships(&mut self, incoming: bool, start: Option<Key>) -> Effects {
+        self.state = if incoming {
+            DeleteBucketState::ScanInRelationships
+        } else {
+            DeleteBucketState::ScanOutRelationships
+        };
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: if incoming {
+                SYNC_RELATIONSHIP_IN_KEYSPACE.to_string()
+            } else {
+                SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string()
+            },
+            prefix: Some(sync_relationship_prefix(&self.bucket).into()),
+            start: start.map(aruna_core::effects::IterStart::After),
+            limit: Self::SCAN_LIMIT,
             txn_id: self.txn_id,
         })]
+    }
+
+    fn handle_relationship_scan(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
+            return self.emit_error(DeleteBucketError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::IterResult)",
+                received: event,
+            });
+        };
+        let incoming = self.state == DeleteBucketState::ScanInRelationships;
+        let key_space = if incoming {
+            SYNC_RELATIONSHIP_IN_KEYSPACE
+        } else {
+            SYNC_RELATIONSHIP_OUT_KEYSPACE
+        };
+        for (key, value) in values {
+            let relationship = match SyncRelationship::from_bytes(&value) {
+                Ok(relationship)
+                    if key.as_ref()
+                        == sync_relationship_key(&self.bucket, relationship.id).as_slice() =>
+                {
+                    relationship
+                }
+                Ok(_) => {
+                    return self.emit_error(
+                        ConversionError::FromStrError(
+                            "sync relationship key does not match payload".to_string(),
+                        )
+                        .into(),
+                    );
+                }
+                Err(error) => return self.emit_error(error.into()),
+            };
+            self.relationship_deletes.push((key_space.to_string(), key));
+            if !self
+                .relationships
+                .iter()
+                .any(|existing| existing.id == relationship.id)
+            {
+                self.relationships.push(relationship);
+            }
+        }
+        if let Some(start) = next_start_after {
+            return self.scan_relationships(incoming, Some(start));
+        }
+        if !incoming {
+            return self.scan_relationships(true, None);
+        }
+
+        if !self.relationships.is_empty() {
+            let writes = match self
+                .relationships
+                .iter()
+                .map(mirror_delete_entry)
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(writes) => writes,
+                Err(error) => return self.emit_error(error.into()),
+            };
+            self.state = DeleteBucketState::WriteRepairs;
+            return smallvec![Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: self.txn_id,
+            })];
+        }
+
+        self.delete_bucket_records()
+    }
+
+    fn delete_bucket_records(&mut self) -> Effects {
+        self.state = DeleteBucketState::DeleteBucket;
+        let mut deletes = vec![
+            (
+                S3_BUCKET_KEYSPACE.to_string(),
+                self.bucket.as_bytes().to_vec().into(),
+            ),
+            (
+                S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
+                self.bucket.as_bytes().to_vec().into(),
+            ),
+        ];
+        deletes.append(&mut self.relationship_deletes);
+        smallvec![Effect::Storage(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn handle_repairs_written(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
+            return self.emit_error(DeleteBucketError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::BatchWriteResult)",
+                received: event,
+            });
+        };
+        self.delete_bucket_records()
     }
 
     fn handle_bucket_deleted(&mut self, event: Event) -> Effects {
@@ -283,7 +404,14 @@ impl DeleteBucketOperation {
         self.txn_id = None;
         self.state = DeleteBucketState::Finish;
         self.output = Some(Ok(()));
-        smallvec![schedule_usage_snapshot_publish_effect()]
+        let mut effects = smallvec![schedule_usage_snapshot_publish_effect()];
+        if !self.relationships.is_empty() {
+            effects.push(Effect::Task(TaskEffect::ShortenTimer {
+                key: TaskKey::DrainSyncMirrorRepair,
+                after: std::time::Duration::ZERO,
+            }));
+        }
+        effects
     }
 }
 
@@ -305,6 +433,10 @@ impl Operation for DeleteBucketOperation {
             DeleteBucketState::CheckMultipartUploads => {
                 self.handle_multipart_uploads_checked(event)
             }
+            DeleteBucketState::ScanOutRelationships | DeleteBucketState::ScanInRelationships => {
+                self.handle_relationship_scan(event)
+            }
+            DeleteBucketState::WriteRepairs => self.handle_repairs_written(event),
             DeleteBucketState::DeleteBucket => self.handle_bucket_deleted(event),
             DeleteBucketState::UpdateUsage => self.handle_usage_update(event),
             DeleteBucketState::CommitTransaction => self.handle_transaction_committed(event),
@@ -346,10 +478,12 @@ mod test {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
+        SYNC_MIRROR_REPAIR_KEYSPACE, SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
     };
     use aruna_core::structs::{
-        BlobVersion, BucketReplicationConfig, BucketReplicationTarget, CurrentVersionPointer,
-        RealmId,
+        ArunaArn, BlobVersion, BucketReplicationConfig, BucketReplicationTarget,
+        CurrentVersionPointer, RealmId, SyncMode, SyncState, SyncStatusSnapshot,
+        sync_relationship_key,
     };
     use aruna_storage::storage;
     use std::time::SystemTime;
@@ -508,6 +642,121 @@ mod test {
             panic!("missing replication config read result");
         };
         assert!(value.is_none());
+    }
+
+    #[tokio::test]
+    async fn deletes_sync_records() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let bucket = "ws-temporary".to_string();
+        drive(
+            CreateBucketOperation::new(
+                bucket.clone(),
+                BucketInfo {
+                    group_id: Ulid::r#gen(),
+                    created_at: SystemTime::now(),
+                    created_by: Default::default(),
+                    cors_configuration: None,
+                },
+            ),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let realm_id = RealmId::from_bytes([7; 32]);
+        let local_node = iroh::SecretKey::from_bytes(&[8; 32]).public();
+        let remote_node = iroh::SecretKey::from_bytes(&[9; 32]).public();
+        let creator = aruna_core::UserId::nil(realm_id);
+        let relationships = [
+            SyncRelationship {
+                id: Ulid::from(1u128),
+                source: ArunaArn::s3_bucket(realm_id, local_node, &bucket).unwrap(),
+                target: ArunaArn::s3_bucket(realm_id, remote_node, "target").unwrap(),
+                mode: SyncMode::Continuous,
+                replicate_deletes: true,
+                created_by: creator,
+                created_at: SystemTime::UNIX_EPOCH,
+                state: SyncState::Enabled,
+                status: SyncStatusSnapshot::default(),
+            },
+            SyncRelationship {
+                id: Ulid::from(2u128),
+                source: ArunaArn::s3_bucket(realm_id, remote_node, "source").unwrap(),
+                target: ArunaArn::s3_bucket(realm_id, local_node, &bucket).unwrap(),
+                mode: SyncMode::Continuous,
+                replicate_deletes: true,
+                created_by: creator,
+                created_at: SystemTime::UNIX_EPOCH,
+                state: SyncState::Enabled,
+                status: SyncStatusSnapshot::default(),
+            },
+        ];
+        let keys = [
+            (
+                SYNC_RELATIONSHIP_OUT_KEYSPACE,
+                sync_relationship_key(&bucket, relationships[0].id),
+                relationships[0].to_bytes().unwrap(),
+            ),
+            (
+                SYNC_RELATIONSHIP_IN_KEYSPACE,
+                sync_relationship_key(&bucket, relationships[1].id),
+                relationships[1].to_bytes().unwrap(),
+            ),
+        ];
+        for (key_space, key, value) in &keys {
+            storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: (*key_space).to_string(),
+                    key: key.clone().into(),
+                    value: value.clone().into(),
+                    txn_id: None,
+                })
+                .await;
+        }
+
+        drive(DeleteBucketOperation::new(bucket), &driver_ctx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        for (key_space, key, _) in keys {
+            let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: key_space.to_string(),
+                    key: key.into(),
+                    txn_id: None,
+                })
+                .await
+            else {
+                panic!("missing sync relationship read result");
+            };
+            assert!(value.is_none());
+        }
+        for relationship in relationships {
+            let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: SYNC_MIRROR_REPAIR_KEYSPACE.to_string(),
+                    key: relationship.id.to_bytes().to_vec().into(),
+                    txn_id: None,
+                })
+                .await
+            else {
+                panic!("missing sync mirror repair read result");
+            };
+            assert!(value.is_some());
+        }
     }
 
     #[tokio::test]
