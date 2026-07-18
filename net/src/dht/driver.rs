@@ -291,6 +291,7 @@ impl DhtDriver {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_clock(
         state: DhtStateMachine,
         clock: DhtClock,
