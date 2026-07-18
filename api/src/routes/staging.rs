@@ -3,16 +3,22 @@ use crate::auth::{
     require_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::connectors::ApiSourceConnectorKind;
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
-use aruna_core::structs::{AuthContext, BucketInfo, Permission, SourceEntry, SourceEntryKind};
+use aruna_core::structs::{
+    AuthContext, BucketInfo, Permission, SourceEntry, SourceEntryKind, blob_bucket_permission_path,
+};
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
 };
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::list_objects_v2::{
+    ListObjectsV2ContinuationToken, ListObjectsV2Input, ListObjectsV2Operation,
+};
 use aruna_operations::s3::put_object::PutObjectError;
 use aruna_operations::staging::head_source::HeadStagingSourceError;
 use aruna_operations::staging::list_source::{
@@ -25,10 +31,12 @@ use aruna_operations::staging::reference::{
 use aruna_operations::staging::snapshot::{
     MaterializeSnapshotError, MaterializeSnapshotInput, stage_snapshot_blob,
 };
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path};
 use std::str::FromStr;
@@ -39,7 +47,7 @@ use utoipa::{OpenApi, ToSchema};
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "staging", description = "Blob staging")),
-    paths(stage_blob, stage_batch)
+    paths(stage_blob, stage_batch, list_references)
 )]
 pub struct StagingApiDoc;
 
@@ -47,6 +55,44 @@ pub fn router() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/staging/", post(stage_blob))
         .route("/staging/batch", post(stage_batch))
+        .route("/staging/references", get(list_references))
+}
+
+const DEFAULT_REFERENCE_LIMIT: usize = 500;
+const MAX_REFERENCE_LIMIT: usize = 1000;
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ReferenceListQuery {
+    pub bucket: String,
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ReferenceListEntry {
+    pub key: String,
+    pub size: u64,
+    pub referenced: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ApiSourceConnectorKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_node_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ReferenceListResponse {
+    /// Includes materialized and referenced objects so clients can aggregate totals.
+    pub entries: Vec<ReferenceListEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -286,6 +332,105 @@ pub async fn stage_batch(
     Ok((StatusCode::OK, Json(StageBatchResponse { results })))
 }
 
+#[utoipa::path(
+    get,
+    path = "/staging/references",
+    tag = "staging",
+    params(
+        ("bucket" = String, Query, description = "Bucket to list"),
+        ("prefix" = Option<String>, Query, description = "Optional object-key prefix"),
+        ("limit" = Option<usize>, Query, description = "Page size (default 500, max 1000)"),
+        ("cursor" = Option<String>, Query, description = "Opaque cursor from the previous page")
+    ),
+    responses(
+        (status = 200, description = "All objects with reference binding details", body = ReferenceListResponse),
+        (status = 400, description = "Invalid cursor", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Bucket not found", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_references(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(query): Query<ReferenceListQuery>,
+) -> ServerResult<(StatusCode, Json<ReferenceListResponse>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let bucket_info = load_bucket_info(&state, &query.bucket).await?;
+    ensure_permission(
+        &state,
+        &auth,
+        blob_bucket_permission_path(
+            state.get_realm_id(),
+            bucket_info.group_id,
+            state.get_node_id(),
+            &query.bucket,
+        ),
+        Permission::READ,
+    )
+    .await?;
+
+    let continuation_token = decode_reference_cursor(query.cursor.as_deref())?;
+    let limit = query
+        .limit
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_REFERENCE_LIMIT)
+        .min(MAX_REFERENCE_LIMIT);
+    let result = drive(
+        ListObjectsV2Operation::new(ListObjectsV2Input {
+            bucket: query.bucket,
+            group_id: bucket_info.group_id,
+            continuation_token,
+            max_keys: Some(limit),
+            prefix: query.prefix.filter(|prefix| !prefix.is_empty()),
+            delimiter: None,
+            start_after: None,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .and_then(|output| output.transpose())
+    .map_err(|error| ServerError::InternalError(error.to_string()))?
+    .ok_or_else(|| ServerError::InternalError("object listing produced no result".to_string()))?;
+
+    let entries = result
+        .objects
+        .into_iter()
+        .map(|object| ReferenceListEntry {
+            size: object
+                .location
+                .as_ref()
+                .map(|location| location.blob_size)
+                .or_else(|| {
+                    object
+                        .source_metadata
+                        .as_ref()
+                        .map(|metadata| metadata.content_length)
+                })
+                .unwrap_or_default(),
+            key: object.head.key,
+            referenced: object.referenced,
+            kind: object.kind.map(Into::into),
+            source_path: object.source_path,
+            connector_id: object.connector_id.map(|id| id.to_string()),
+            origin_node_id: object.origin_node_id.map(|id| id.to_string()),
+        })
+        .collect();
+    let next_cursor = result
+        .continuation_token
+        .map(encode_reference_cursor)
+        .transpose()?;
+
+    Ok((
+        StatusCode::OK,
+        Json(ReferenceListResponse {
+            entries,
+            next_cursor,
+        }),
+    ))
+}
+
 async fn stage_item(
     state: Arc<ServerState>,
     auth: AuthContext,
@@ -345,6 +490,26 @@ fn ensure_batch_capacity(current: usize, additional: usize, limit: usize) -> Ser
         )));
     }
     Ok(())
+}
+
+fn decode_reference_cursor(
+    cursor: Option<&str>,
+) -> ServerResult<Option<ListObjectsV2ContinuationToken>> {
+    cursor
+        .map(|cursor| {
+            let bytes = URL_SAFE_NO_PAD
+                .decode(cursor)
+                .map_err(|_| ServerError::BadRequest)?;
+            ListObjectsV2ContinuationToken::from_bytes(&bytes).map_err(|_| ServerError::BadRequest)
+        })
+        .transpose()
+}
+
+fn encode_reference_cursor(token: ListObjectsV2ContinuationToken) -> ServerResult<String> {
+    token
+        .to_bytes()
+        .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+        .map_err(|error| ServerError::InternalError(error.to_string()))
 }
 
 fn normalize_prefix(prefix: &str) -> ServerResult<String> {
@@ -708,19 +873,24 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, GROUP_KEYSPACE,
-        S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
+        AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+        BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE,
+        S3_BUCKET_REPLICATION_KEYSPACE,
     };
     use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, NodeCapabilities, PathRestriction,
-        RealmAuthorizationDocument, RealmConfigDocument,
+        Actor, BackendLocation, BlobHeadKey, BlobVersion, CurrentVersionPointer, Group,
+        GroupAuthorizationDocument, NodeCapabilities, PathRestriction, PortableSourceDescriptor,
+        RealmAuthorizationDocument, RealmConfigDocument, SourceConnectorKind, SourceMetadata,
+        StagingStrategy, VersionKey, VersionSourceBinding,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::replication::queue::{
         LiveReplicationObligationRecord, live_replication_obligation_key,
     };
     use aruna_storage::storage;
+    use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::UNIX_EPOCH;
     use tempfile::TempDir;
     use ulid::Ulid;
 
@@ -732,6 +902,7 @@ mod tests {
         source_path: String,
         bucket: String,
         key: String,
+        auth_with_bucket_read: AuthContext,
         auth_with_source_read: AuthContext,
         auth_without_source_read: AuthContext,
     }
@@ -774,6 +945,112 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(ServerError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn references_list_bindings() {
+        let test = setup_state().await;
+        let origin = seed_reference_objects(&test).await;
+
+        let (status, Json(mut first)) = list_references(
+            State(test.state.clone()),
+            Extension(Some(test.auth_with_bucket_read.clone())),
+            Query(ReferenceListQuery {
+                bucket: test.bucket.clone(),
+                prefix: Some("data/".to_string()),
+                limit: Some(2),
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(first.entries.len(), 2);
+
+        let (_, Json(second)) = list_references(
+            State(test.state.clone()),
+            Extension(Some(test.auth_with_bucket_read.clone())),
+            Query(ReferenceListQuery {
+                bucket: test.bucket.clone(),
+                prefix: Some("data/".to_string()),
+                limit: Some(2),
+                cursor: first.next_cursor.take(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(second.next_cursor.is_none());
+        first.entries.extend(second.entries);
+        assert_eq!(first.entries.len(), 3);
+        assert!(
+            first
+                .entries
+                .iter()
+                .all(|entry| entry.key.starts_with("data/"))
+        );
+
+        let materialized = first
+            .entries
+            .iter()
+            .find(|entry| entry.key == "data/a-materialized")
+            .unwrap();
+        assert_eq!(materialized.size, 42);
+        assert!(!materialized.referenced);
+        assert_eq!(materialized.kind, None);
+        assert_eq!(materialized.source_path, None);
+        assert_eq!(materialized.connector_id, None);
+        assert_eq!(materialized.origin_node_id, None);
+
+        let external = first
+            .entries
+            .iter()
+            .find(|entry| entry.key == "data/b-external")
+            .unwrap();
+        assert_eq!(external.size, 64);
+        assert!(external.referenced);
+        assert_eq!(external.kind, Some(ApiSourceConnectorKind::Http));
+        assert_eq!(external.source_path.as_deref(), Some("remote/file.txt"));
+        let connector_id = test.connector_id.to_string();
+        assert_eq!(
+            external.connector_id.as_deref(),
+            Some(connector_id.as_str())
+        );
+        assert_eq!(external.origin_node_id, None);
+
+        let native = first
+            .entries
+            .iter()
+            .find(|entry| entry.key == "data/c-native")
+            .unwrap();
+        assert_eq!(native.size, 128);
+        assert!(native.referenced);
+        assert_eq!(native.kind, Some(ApiSourceConnectorKind::ArunaNative));
+        assert_eq!(native.source_path.as_deref(), Some("source-bucket/native"));
+        assert_eq!(native.connector_id, None);
+        let origin_node_id = origin.to_string();
+        assert_eq!(
+            native.origin_node_id.as_deref(),
+            Some(origin_node_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn references_deny_read() {
+        let test = setup_state().await;
+
+        let result = list_references(
+            State(test.state),
+            Extension(Some(test.auth_without_source_read)),
+            Query(ReferenceListQuery {
+                bucket: test.bucket,
+                prefix: None,
+                limit: None,
+                cursor: None,
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServerError::Forbidden)));
     }
 
     #[tokio::test]
@@ -981,7 +1258,136 @@ mod tests {
 
         assert!(openapi.paths.paths.contains_key("/staging/"));
         assert!(openapi.paths.paths.contains_key("/staging/batch"));
+        assert!(openapi.paths.paths.contains_key("/staging/references"));
         assert!(!openapi.paths.paths.contains_key("/blobs/staging"));
+    }
+
+    async fn seed_reference_objects(test: &TestState) -> NodeId {
+        let created_by = test.auth_with_bucket_read.user_id;
+        let materialized_hash = [21u8; 32];
+        let location = BackendLocation {
+            root: "/tmp".to_string(),
+            storage_bucket: "objects".to_string(),
+            backend_path: "materialized".to_string(),
+            ulid: Ulid::r#gen(),
+            compressed: false,
+            encrypted: false,
+            created_by,
+            created_at: UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 42,
+            hashes: HashMap::new(),
+        };
+        write_doc(
+            &test.state.get_ctx(),
+            BLOB_LOCATIONS_KEYSPACE,
+            materialized_hash.to_vec().into(),
+            location.to_bytes().unwrap().into(),
+        )
+        .await;
+        for key in ["data/a-materialized", "other/d-materialized"] {
+            write_blob_version(
+                &test.state.get_ctx(),
+                &test.bucket,
+                key,
+                BlobVersion::materialized(materialized_hash, UNIX_EPOCH, created_by, None),
+            )
+            .await;
+        }
+
+        write_blob_version(
+            &test.state.get_ctx(),
+            &test.bucket,
+            "data/b-external",
+            BlobVersion::reference(
+                VersionSourceBinding {
+                    strategy: StagingStrategy::Reference,
+                    descriptor: PortableSourceDescriptor {
+                        kind: SourceConnectorKind::Http,
+                        public_config: HashMap::new(),
+                        source_path: "remote/file.txt".to_string(),
+                        version_selector: None,
+                        capabilities: Vec::new(),
+                        origin_node_id: None,
+                    },
+                    connector_id: Some(test.connector_id),
+                },
+                SourceMetadata {
+                    content_length: 64,
+                    content_type: None,
+                    etag: None,
+                    last_modified: None,
+                    source_version: None,
+                },
+                UNIX_EPOCH,
+                created_by,
+                UNIX_EPOCH,
+            ),
+        )
+        .await;
+
+        let origin = iroh::SecretKey::from_bytes(&[19u8; 32]).public();
+        write_blob_version(
+            &test.state.get_ctx(),
+            &test.bucket,
+            "data/c-native",
+            BlobVersion::reference(
+                VersionSourceBinding {
+                    strategy: StagingStrategy::Reference,
+                    descriptor: PortableSourceDescriptor {
+                        kind: SourceConnectorKind::ArunaNative,
+                        public_config: HashMap::new(),
+                        source_path: "source-bucket/native".to_string(),
+                        version_selector: None,
+                        capabilities: Vec::new(),
+                        origin_node_id: Some(origin),
+                    },
+                    connector_id: None,
+                },
+                SourceMetadata {
+                    content_length: 128,
+                    content_type: None,
+                    etag: None,
+                    last_modified: None,
+                    source_version: None,
+                },
+                UNIX_EPOCH,
+                created_by,
+                UNIX_EPOCH,
+            ),
+        )
+        .await;
+        origin
+    }
+
+    async fn write_blob_version(
+        driver_ctx: &Arc<DriverContext>,
+        bucket: &str,
+        key: &str,
+        version: BlobVersion,
+    ) {
+        let version_id = Ulid::r#gen();
+        write_doc(
+            driver_ctx,
+            BLOB_HEAD_KEYSPACE,
+            BlobHeadKey::new(bucket, key).to_bytes().unwrap().into(),
+            CurrentVersionPointer::new(version_id)
+                .to_bytes()
+                .unwrap()
+                .into(),
+        )
+        .await;
+        write_doc(
+            driver_ctx,
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new(bucket, key, version_id)
+                .to_bytes()
+                .unwrap()
+                .into(),
+            version.to_bytes().unwrap().into(),
+        )
+        .await;
     }
 
     async fn setup_state() -> TestState {
@@ -1125,6 +1531,7 @@ mod tests {
             &bucket,
             &key,
         );
+        let bucket_path = blob_bucket_permission_path(realm_id, bucket_group_id, node_id, &bucket);
         let source_path_restriction = source_connector_permission_path(
             state.as_ref(),
             bucket_group_id,
@@ -1140,6 +1547,14 @@ mod tests {
             source_path,
             bucket,
             key,
+            auth_with_bucket_read: AuthContext {
+                user_id: user_with_source_read,
+                realm_id,
+                path_restrictions: Some(vec![PathRestriction {
+                    pattern: bucket_path,
+                    permission: Permission::READ,
+                }]),
+            },
             auth_with_source_read: AuthContext {
                 user_id: user_with_source_read,
                 realm_id,
