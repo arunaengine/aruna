@@ -400,6 +400,14 @@ impl InboundEventHandler for OperationsInboundHandler {
                         error!(error = ?err, "Failed to process inbound metadata stream");
                     }
                 }
+                Alpn::NativeReference => {
+                    Box::pin(crate::native_reference::handle_native_stream(
+                        self.context.as_ref(),
+                        stream,
+                        node_id,
+                    ))
+                    .await;
+                }
                 Alpn::Notification => {
                     crate::notifications::incoming::handle_notification_stream(
                         self.context.as_ref(),

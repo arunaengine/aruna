@@ -77,7 +77,13 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
             }
         }
         Effect::StagingSource(staging_source_effect) => {
-            if let Some(blob_handle) = &context.blob_handle {
+            if crate::native_reference::is_native_effect(&staging_source_effect) {
+                Box::pin(crate::native_reference::send_native_effect(
+                    staging_source_effect,
+                    context,
+                ))
+                .await
+            } else if let Some(blob_handle) = &context.blob_handle {
                 blob_handle
                     .send_staging_source_effect(staging_source_effect)
                     .await

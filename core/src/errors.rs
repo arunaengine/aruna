@@ -78,6 +78,8 @@ pub enum StagingSourceError {
     HandleMissing,
     #[error("Staging source not found")]
     NotFound,
+    #[error("Access denied")]
+    AccessDenied,
     #[error("Unsupported staging source kind `{0}`")]
     UnsupportedKind(String),
     #[error("Operator creation failed: {0}")]

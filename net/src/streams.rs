@@ -2,7 +2,10 @@ use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio_util::sync::CancellationToken;
@@ -25,6 +28,30 @@ pub struct BiStream(
     pub RecvStream,
     #[allow(dead_code)] pub(crate) Option<ConnectionLease>,
 );
+
+impl BiStream {
+    pub fn into_recv(self) -> impl AsyncRead + Send + Sync + Unpin + 'static {
+        LeasedRecvStream {
+            recv: self.1,
+            _lease: self.2,
+        }
+    }
+}
+
+struct LeasedRecvStream {
+    recv: RecvStream,
+    _lease: Option<ConnectionLease>,
+}
+
+impl AsyncRead for LeasedRecvStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().recv).poll_read(cx, buf)
+    }
+}
 
 pub struct StreamsService {
     connection_pool: ConnectionPool,
@@ -243,6 +270,7 @@ pub async fn run_accept_loop(
                             alpn @ (Alpn::Bao
                             | Alpn::DocumentSync
                             | Alpn::Metadata
+                            | Alpn::NativeReference
                             | Alpn::Notification
                             | Alpn::Shard),
                         ) => {
