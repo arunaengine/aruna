@@ -2,7 +2,7 @@ use aruna_core::NodeId;
 use aruna_core::metrics::WatchAuthorizationMetricReason;
 use aruna_core::structs::{
     NotificationClass, NotificationKind, NotificationRecord, WatchAuthorizationBinding,
-    WatchEventMask, WatchSubscription,
+    WatchEventMask, WatchInterestEntry, WatchSubscription,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
@@ -365,7 +365,7 @@ pub async fn create_watch_for_user(
     authorization: WatchAuthorizationBinding,
 ) -> Result<WatchSubscription, WatchDispatchError> {
     let holder = resolve_holder(context, owner).await?;
-    if holder == local_node_id {
+    let subscription = if holder == local_node_id {
         let subscription = create_replicated_watch_subscription(
             context,
             local_node_id,
@@ -384,7 +384,7 @@ pub async fn create_watch_for_user(
             other => WatchDispatchError::Internal(other.to_string()),
         })?;
         schedule_watch_interest_publish(context).await;
-        Ok(subscription)
+        subscription
     } else {
         let net_handle = context
             .net_handle
@@ -411,8 +411,23 @@ pub async fn create_watch_for_user(
             } else {
                 WatchDispatchError::Remote(reason)
             }
-        })
+        })?
+    };
+    // Bridge the interest-digest propagation window: the node that handled the
+    // create knows the holder now, so an event it emits before the holder's
+    // digest replicates back still routes to the holder.
+    if let Some(net_handle) = context.net_handle.as_ref() {
+        net_handle.register_local_watch_interest(
+            subscription.watch_id,
+            owner.realm_id,
+            holder,
+            WatchInterestEntry {
+                path_prefix: subscription.path_prefix.clone(),
+                event_mask: subscription.event_mask,
+            },
+        );
     }
+    Ok(subscription)
 }
 
 pub async fn delete_watch_for_user(
@@ -433,7 +448,6 @@ pub async fn delete_watch_for_user(
         .await
         .map_err(|error| WatchDispatchError::Internal(error.to_string()))?;
         schedule_watch_interest_publish(context).await;
-        Ok(())
     } else {
         let net_handle = context
             .net_handle
@@ -441,8 +455,12 @@ pub async fn delete_watch_for_user(
             .ok_or(WatchDispatchError::Unavailable)?;
         delete_watch_remote(net_handle, holder, owner, watch_id)
             .await
-            .map_err(WatchDispatchError::Remote)
+            .map_err(WatchDispatchError::Remote)?;
     }
+    if let Some(net_handle) = context.net_handle.as_ref() {
+        net_handle.retract_local_watch_interest(watch_id);
+    }
+    Ok(())
 }
 
 pub async fn list_watches_for_user(

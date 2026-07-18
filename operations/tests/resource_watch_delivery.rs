@@ -180,6 +180,89 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
     Ok(())
 }
 
+// The fix's Definition of Done: a watch created through node A whose owner's
+// inbox holder is node B fires for an upload handled by node A itself, before
+// B's interest digest replicates back. Node A learns the holder at create time,
+// forwards the origin event, and the record is readable back through A.
+#[tokio::test]
+async fn same_node_delivery() -> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([96u8; 32]);
+    let nodes = build_realm_nodes(&realm_id, 2).await?;
+    let config = realm_config_for(&nodes, realm_id);
+    let holder = nodes[1].net.node_id();
+    let watcher = user_with_holder(&config, holder, realm_id);
+    let uploader = UserId::local(Ulid::r#gen(), realm_id);
+    let group_id = Ulid::r#gen();
+    let data_node_id = nodes[0].net.node_id();
+    install_group_authorization(&nodes, realm_id, group_id, watcher).await?;
+    let prefix = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/");
+    let probe = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/probe");
+
+    let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+    let subscription = create_watch_via(&nodes[0], watcher, &prefix, mask).await?;
+
+    // The create returns before the holder's debounced digest can publish, so
+    // this match can only come from the create-time local registration.
+    assert_eq!(
+        nodes[0].net.watch_interest_snapshot().matching_nodes(
+            realm_id,
+            &probe,
+            WatchEventKind::DataUploaded,
+        ),
+        vec![holder],
+    );
+
+    let event_id = Ulid::r#gen();
+    let occurred_at_ms = unix_timestamp_millis();
+    let event = upload_event(
+        event_id,
+        realm_id,
+        uploader,
+        UploadLocation {
+            group_id,
+            node_id: data_node_id,
+            bucket: "bucket",
+            key: "reports/q3/summary.csv",
+        },
+        occurred_at_ms,
+    );
+    emit_resource_watch_event(nodes[0].context.as_ref(), event).await;
+
+    let expected_id = watch_notification_id(event_id, subscription.watch_id);
+    wait_for(POLL_TIMEOUT, || async {
+        list_via(&nodes[0], watcher)
+            .await
+            .iter()
+            .any(|record| record.notification_id == expected_id)
+    })
+    .await?;
+    assert_eq!(
+        inbox_len(&nodes[1]).await,
+        1,
+        "the holder stores the record"
+    );
+
+    let listed = list_via(&nodes[0], watcher).await;
+    let record = listed
+        .iter()
+        .find(|record| record.notification_id == expected_id)
+        .expect("watch record readable through the creating node");
+    assert_eq!(record.recipient, watcher);
+    assert_eq!(record.created_at_ms, occurred_at_ms);
+
+    // Deleting through the creating node retracts its local registration.
+    delete_watch_via(&nodes[0], watcher, subscription.watch_id).await?;
+    wait_for(POLL_TIMEOUT, || async {
+        list_watches_for_user(nodes[0].context.as_ref(), nodes[0].net.node_id(), watcher)
+            .await
+            .is_ok_and(|rows| rows.is_empty())
+    })
+    .await?;
+
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
 // An event whose path matches no watched prefix is not forwarded, and no inbox
 // record materializes anywhere.
 #[tokio::test]
