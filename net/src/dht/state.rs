@@ -548,10 +548,7 @@ impl DhtStateMachine {
                 peer,
                 request,
                 trace_context: _,
-            } => {
-                self.insert_peer(peer, out);
-                self.handle_inbound_request(inbound_id, request, out);
-            }
+            } => self.handle_inbound_request(inbound_id, peer, request, out),
             DhtIo::InboundReadError { .. } => {}
             DhtIo::InboundDropped { .. } => {}
             DhtIo::StorageReadResult {
@@ -1386,9 +1383,13 @@ impl DhtStateMachine {
     fn handle_inbound_request(
         &mut self,
         inbound_id: InboundId,
+        peer: NodeId,
         request: DhtRequest,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
+        if !matches!(&request, DhtRequest::PutValue { .. }) {
+            self.insert_peer(peer, out);
+        }
         match request {
             DhtRequest::Ping => {
                 out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
@@ -1486,6 +1487,8 @@ impl DhtStateMachine {
                     })));
                     return;
                 }
+
+                self.insert_peer(peer, out);
 
                 let new_entry = StoredEntry {
                     publisher,
@@ -4317,7 +4320,7 @@ mod tests {
     }
 
     #[test]
-    fn inbound_put_invalid_signature_returns_invalid_signature_error() {
+    fn invalid_put_rejected() {
         let local_secret = iroh::SecretKey::from_bytes(&[51u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 0);
@@ -4365,6 +4368,7 @@ mod tests {
                 _ => false,
             }
         }));
+        assert!(state.routing_table.all_peers().is_empty());
     }
 
     #[test]
@@ -4412,6 +4416,7 @@ mod tests {
                 _ => false,
             }
         }));
+        assert_eq!(state.routing_table.all_peers().len(), 1);
     }
 
     #[test]
