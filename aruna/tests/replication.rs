@@ -12,10 +12,12 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_REPLICATION_JOB_KEYSPACE, BLOB_VERSIONS_KEYSPACE, USAGE_STATS_KEYSPACE,
+    BLOB_REPLICATION_JOB_KEYSPACE, BLOB_VERSIONS_KEYSPACE, SYNC_RELATIONSHIP_IN_KEYSPACE,
+    SYNC_RELATIONSHIP_OUT_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::structs::{
-    BlobVersion, BlobVersionState, SourceConnectorKind, StagingStrategy, UsageCounters, VersionKey,
+    BlobVersion, BlobVersionState, SourceConnectorKind, StagingStrategy, SyncRelationship,
+    SyncState, UsageCounters, VersionKey, sync_relationship_key,
 };
 use aruna_operations::driver::DriverContext;
 use aws_sdk_s3::Client as S3Client;
@@ -913,6 +915,74 @@ async fn reference_syncs_lazily() -> TestResult<()> {
         .await?
         .ok_or_else(|| std::io::Error::other("missing target delete marker"))?;
         assert!(BlobVersion::from_bytes(&delete_version)?.is_deleted());
+
+        // Deleting the relationship must keep already synchronized reference
+        // objects on the target readable via a detached serving stub.
+        let retained_key = "archive/retained-object.bin";
+        let retained_body = vec![0xa5u8; 256 * 1024];
+        harness
+            .seed_client
+            .put_object()
+            .bucket(source_bucket)
+            .key(retained_key)
+            .body(ByteStream::from(retained_body.clone()))
+            .send()
+            .await?;
+        harness.wait_for_object(target_bucket, retained_key).await?;
+
+        let delete_response = reqwest::Client::new()
+            .delete(format!(
+                "{}/api/v1/data/sync-relationships/{}",
+                harness.seed.base_url, relationship.id
+            ))
+            .bearer_auth(&harness.seed_token)
+            .send()
+            .await?;
+        assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
+
+        let relationship_id = relationship.id.parse::<Ulid>()?;
+        let stub = read_value(
+            harness.seed.context.as_ref(),
+            SYNC_RELATIONSHIP_OUT_KEYSPACE,
+            sync_relationship_key(source_bucket, relationship_id),
+        )
+        .await?
+        .ok_or_else(|| std::io::Error::other("missing detached serving stub"))?;
+        assert_eq!(
+            SyncRelationship::from_bytes(&stub)?.state,
+            SyncState::Detached
+        );
+        wait_until(
+            "incoming mirror removal",
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+            || {
+                let context = harness.joiner.context.clone();
+                async move {
+                    read_value(
+                        context.as_ref(),
+                        SYNC_RELATIONSHIP_IN_KEYSPACE,
+                        sync_relationship_key(target_bucket, relationship_id),
+                    )
+                    .await
+                    .is_ok_and(|value| value.is_none())
+                }
+            },
+        )
+        .await?;
+        let status_after_delete = reqwest::Client::new()
+            .get(format!(
+                "{}/api/v1/data/sync-relationships/{}",
+                harness.seed.base_url, relationship.id
+            ))
+            .bearer_auth(&harness.seed_token)
+            .send()
+            .await?;
+        assert_eq!(status_after_delete.status(), StatusCode::NOT_FOUND);
+
+        harness
+            .assert_object_matches(target_bucket, retained_key, &retained_body)
+            .await?;
         Ok(())
     }
     .await;
