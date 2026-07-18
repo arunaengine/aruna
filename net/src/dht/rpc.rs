@@ -46,7 +46,7 @@ pub enum DhtResponse {
         nodes: Vec<NodeId>,
     },
     Value {
-        /// The stored values (may be multiple from different publishers)
+        /// Retained signed values, including expired anti-rollback floors.
         entries: Vec<StoredValue>,
         /// Closer nodes if we don't have the value (or in addition to it)
         closer_nodes: Vec<NodeId>,

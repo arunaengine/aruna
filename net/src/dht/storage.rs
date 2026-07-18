@@ -58,14 +58,20 @@ pub fn retained_entries(entries: Vec<StoredEntry>, now: u64) -> Vec<StoredEntry>
         .collect()
 }
 
+pub fn retention_deadline(expires_at: u64, now: u64) -> u64 {
+    expires_at
+        .min(now)
+        .saturating_add(MAX_TTL_SECS)
+        .saturating_add(MAX_CLOCK_SKEW_SECS)
+}
+
 pub fn merge_entry(
     key: &DhtKeyId,
     entries: Vec<StoredEntry>,
-    new_entry: StoredEntry,
+    mut new_entry: StoredEntry,
     now: u64,
 ) -> Result<Vec<StoredEntry>, MergeError> {
     validate_entries(key, &entries, now)?;
-    validate_entries(key, std::slice::from_ref(&new_entry), now)?;
     if new_entry.expires_at
         > now
             .saturating_add(MAX_TTL_SECS)
@@ -73,15 +79,12 @@ pub fn merge_entry(
     {
         return Err(MergeError::Invalid);
     }
-    if !entry_is_fresh(new_entry.expires_at, now) {
+    new_entry.retain_until = retention_deadline(new_entry.expires_at, now);
+    if new_entry.retain_until <= now {
         return Err(MergeError::Stale);
     }
+    validate_entries(key, std::slice::from_ref(&new_entry), now)?;
 
-    let mut new_entry = new_entry;
-    new_entry.retain_until = new_entry.retain_until.max(
-        now.saturating_add(MAX_TTL_SECS)
-            .saturating_add(MAX_CLOCK_SKEW_SECS),
-    );
     let mut filtered = retained_entries(entries, now);
 
     if let Some(position) = filtered.iter().position(|entry| {
@@ -232,6 +235,35 @@ mod tests {
 
         assert_eq!(
             merge_entry(&key, entries, older, 801),
+            Err(MergeError::Stale)
+        );
+    }
+
+    #[test]
+    fn expired_floor_merges() {
+        let key = DhtKeyId::from_data(b"expired-floor-merge");
+        let floor = make_entry(1, key, 2, 90);
+        let entries = merge_entry(&key, Vec::new(), floor, 100).expect("merge retained floor");
+        assert_eq!(entries[0].retain_until, retention_deadline(90, 100));
+
+        let replay = make_entry(1, key, 1, 200);
+        assert_eq!(
+            merge_entry(&key, entries, replay, 100),
+            Err(MergeError::Stale)
+        );
+    }
+
+    #[test]
+    fn floor_window_expires() {
+        let key = DhtKeyId::from_data(b"floor-window-expiry");
+        let expires_at = 100;
+        let now = expires_at
+            .saturating_add(MAX_TTL_SECS)
+            .saturating_add(MAX_CLOCK_SKEW_SECS);
+        let floor = make_entry(1, key, 2, expires_at);
+
+        assert_eq!(
+            merge_entry(&key, Vec::new(), floor, now),
             Err(MergeError::Stale)
         );
     }

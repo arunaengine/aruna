@@ -852,8 +852,8 @@ impl DhtDriver {
                 op_id,
                 stage,
                 key,
-                entry,
-            } => self.dispatch_storage_merge(op_id, stage, key, entry),
+                entries,
+            } => self.dispatch_storage_merge(op_id, stage, key, entries),
             DhtIoRequest::StorageDelete { op_id, stage, key } => {
                 self.dispatch_storage_delete(op_id, stage, key)
             }
@@ -1055,7 +1055,7 @@ impl DhtDriver {
                 .await
                 {
                     Ok(Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                        let mut entries = match value {
+                        let entries = match value {
                             Some(data) => match decode_entries(&data) {
                                 Ok(entries) => entries,
                                 Err(error) => {
@@ -1083,10 +1083,6 @@ impl DhtDriver {
                                 .await;
                             return;
                         }
-                        if let Some(realm_filter) = realm_filter {
-                            entries.retain(|entry| entry.realm_id == realm_filter);
-                        }
-
                         let _ = io_tx
                             .send(DhtIo::StorageReadResult {
                                 op_id,
@@ -1230,21 +1226,21 @@ impl DhtDriver {
     #[tracing::instrument(
         name = "dht.driver.storage_merge.dispatch",
         level = "debug",
-        skip(self, entry),
-        fields(op_id, stage = ?stage, key = %key)
+        skip(self, entries),
+        fields(op_id, stage = ?stage, key = %key, entry_count = entries.len())
     )]
     fn dispatch_storage_merge(
         &self,
         op_id: OpId,
         stage: StorageStage,
         key: DhtKeyId,
-        entry: StoredEntry,
+        entries: Vec<StoredEntry>,
     ) {
         let storage = self.storage.clone();
         let io_tx = self.io_tx.clone();
         tokio::spawn(
             async move {
-                let mutation = StorageMutation::Merge { entry };
+                let mutation = StorageMutation::Merge { entries };
                 match run_storage_io(
                     stage,
                     mutate_storage_entries(&storage, op_id, stage, key, &mutation),
@@ -1471,7 +1467,7 @@ impl DhtDriver {
 }
 
 enum StorageMutation {
-    Merge { entry: StoredEntry },
+    Merge { entries: Vec<StoredEntry> },
     Prune { now_secs: u64 },
 }
 
@@ -1713,9 +1709,9 @@ async fn run_storage_txn(
     };
     let original_entries = entries;
     let entries = match mutation {
-        StorageMutation::Merge { entry } => {
+        StorageMutation::Merge { entries } => {
             let now_secs = now_unix_secs();
-            match merge_entry(&key, original_entries.clone(), entry.clone(), now_secs) {
+            match merge_storage_entries(&key, original_entries.clone(), entries, now_secs) {
                 Ok(entries) => entries,
                 Err(MergeError::Stale) => {
                     abort_storage_txn(storage, op_id, stage, txn_id).await;
@@ -1817,6 +1813,17 @@ async fn run_storage_txn(
     }
 
     commit_storage_txn(storage, op_id, stage, txn_id).await
+}
+
+fn merge_storage_entries(
+    key: &DhtKeyId,
+    original: Vec<StoredEntry>,
+    entries: &[StoredEntry],
+    now_secs: u64,
+) -> Result<Vec<StoredEntry>, MergeError> {
+    entries.iter().try_fold(original, |current, entry| {
+        merge_entry(key, current, entry.clone(), now_secs)
+    })
 }
 
 async fn update_key_count(
@@ -2146,7 +2153,7 @@ fn internal_operation_kind(request: &DhtIoRequest) -> &'static str {
             | StorageStage::PutLocalRead
             | StorageStage::PutLocalWrite
             | StorageStage::PutLocalMerge => "put",
-            StorageStage::GetLocalRead => "get",
+            StorageStage::GetLocalRead | StorageStage::GetRemoteMerge => "get",
             StorageStage::InboundGetRead => "inbound_get",
             StorageStage::InboundPutRead
             | StorageStage::InboundPutWrite
@@ -2638,7 +2645,9 @@ mod tests {
             response.send(StorageEvent::TransactionAborted { txn_id });
         });
 
-        let mutation = StorageMutation::Merge { entry };
+        let mutation = StorageMutation::Merge {
+            entries: vec![entry],
+        };
         mutate_storage_entries(
             &storage,
             6,
@@ -2851,7 +2860,7 @@ mod tests {
 
         let key = DhtKeyId::from_data(b"full-keyspace");
         let mutation = StorageMutation::Merge {
-            entry: make_entry(1, key, now_unix_secs().saturating_add(200)),
+            entries: vec![make_entry(1, key, now_unix_secs().saturating_add(200))],
         };
         assert!(matches!(
             mutate_storage_entries(&storage, 12, StorageStage::InboundPutMerge, key, &mutation,)
@@ -2873,15 +2882,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_merge_persists() {
+        let (_directory, storage) = open_storage();
+        let key = DhtKeyId::from_data(b"batch-remote-merge");
+        let expires_at = now_unix_secs().saturating_add(200);
+        let mutation = StorageMutation::Merge {
+            entries: vec![
+                make_entry(1, key, expires_at),
+                make_entry(2, key, expires_at),
+            ],
+        };
+
+        mutate_storage_entries(&storage, 13, StorageStage::GetRemoteMerge, key, &mutation)
+            .await
+            .expect("batch merge succeeds");
+
+        let entries = read_entries(&storage, key).await;
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[tokio::test]
     async fn concurrent_merges_preserve() {
         let (_directory, storage) = open_storage();
         let key = DhtKeyId::from_data(b"concurrent-merges");
         let expires_at = now_unix_secs().saturating_add(200);
         let first = StorageMutation::Merge {
-            entry: make_entry(1, key, expires_at),
+            entries: vec![make_entry(1, key, expires_at)],
         };
         let second = StorageMutation::Merge {
-            entry: make_entry(2, key, expires_at),
+            entries: vec![make_entry(2, key, expires_at)],
         };
 
         let (first_result, second_result) = tokio::join!(
@@ -2901,7 +2930,7 @@ mod tests {
         let key = DhtKeyId::from_data(b"cleanup-race");
         let now_secs = now_unix_secs();
         let old = StorageMutation::Merge {
-            entry: make_entry(1, key, now_secs.saturating_add(50)),
+            entries: vec![make_entry(1, key, now_secs.saturating_add(50))],
         };
         mutate_storage_entries(&storage, 3, StorageStage::InboundPutMerge, key, &old)
             .await
@@ -2911,7 +2940,7 @@ mod tests {
             now_secs: now_secs.saturating_add(400),
         };
         let merge = StorageMutation::Merge {
-            entry: make_entry(2, key, now_secs.saturating_add(500)),
+            entries: vec![make_entry(2, key, now_secs.saturating_add(500))],
         };
         let (prune_result, merge_result) = tokio::join!(
             mutate_storage_entries(&storage, 3, StorageStage::CleanupPrune, key, &prune),
@@ -2945,7 +2974,7 @@ mod tests {
         ));
 
         let mutation = StorageMutation::Merge {
-            entry: make_entry(1, key, now_unix_secs().saturating_add(200)),
+            entries: vec![make_entry(1, key, now_unix_secs().saturating_add(200))],
         };
         assert!(
             mutate_storage_entries(&storage, 5, StorageStage::InboundPutMerge, key, &mutation,)
@@ -2971,7 +3000,7 @@ mod tests {
         let (_directory, storage) = open_storage();
         let key = DhtKeyId::from_data(b"stale-merge");
         let mutation = StorageMutation::Merge {
-            entry: make_entry(1, key, now_unix_secs()),
+            entries: vec![make_entry(1, key, 0)],
         };
 
         assert!(matches!(

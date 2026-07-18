@@ -137,6 +137,7 @@ pub enum StorageStage {
     PutLocalWrite,
     PutLocalMerge,
     GetLocalRead,
+    GetRemoteMerge,
     InboundGetRead,
     InboundPutRead,
     InboundPutWrite,
@@ -185,7 +186,7 @@ pub enum DhtIoRequest {
         op_id: OpId,
         stage: StorageStage,
         key: DhtKeyId,
-        entry: StoredEntry,
+        entries: Vec<StoredEntry>,
     },
     StorageDelete {
         op_id: OpId,
