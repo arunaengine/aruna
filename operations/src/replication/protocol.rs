@@ -4,7 +4,7 @@ use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::{
     ArunaArn, AuthContext, BackendLocation, MultipartChecksumType, MultipartObjectPart,
-    MultipartObjectSummary, ReplicationItemKind, ReplicationNegotiationResult,
+    MultipartObjectSummary, ReplicationItemKind, ReplicationNegotiationResult, SourceMetadata,
     VersionSourceBinding,
 };
 use serde::{Deserialize, Deserializer, Serialize};
@@ -32,6 +32,7 @@ pub struct VersionReplicationManifest {
     pub origin: Option<SyncOrigin>,
     pub upstream_sources: Vec<ArunaArn>,
     pub writer_auth_context: Option<AuthContext>,
+    pub reference_metadata: Option<SourceMetadata>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -140,9 +141,16 @@ impl VersionReplicationMessage {
         match postcard::from_bytes(payload) {
             Ok(message) => Ok(message),
             Err(postcard::Error::DeserializeUnexpectedEnd) => {
+                let reference_none = postcard::to_allocvec(&Option::<SourceMetadata>::None)?;
+                let mut current = payload.to_vec();
+                current.extend_from_slice(&reference_none);
+                if let Ok(message) = postcard::from_bytes(&current) {
+                    return Ok(message);
+                }
                 let writer_none = postcard::to_allocvec(&Option::<AuthContext>::None)?;
                 let mut current = payload.to_vec();
                 current.extend_from_slice(&writer_none);
+                current.extend_from_slice(&reference_none);
                 if let Ok(message) = postcard::from_bytes(&current) {
                     return Ok(message);
                 }
@@ -150,6 +158,7 @@ impl VersionReplicationMessage {
                 let mut origin_only = payload.to_vec();
                 origin_only.extend_from_slice(&empty_sources);
                 origin_only.extend_from_slice(&writer_none);
+                origin_only.extend_from_slice(&reference_none);
                 if let Ok(message) = postcard::from_bytes(&origin_only) {
                     return Ok(message);
                 }
@@ -157,6 +166,7 @@ impl VersionReplicationMessage {
                 previous.extend(postcard::to_allocvec(&Option::<SyncOrigin>::None)?);
                 previous.extend_from_slice(&empty_sources);
                 previous.extend_from_slice(&writer_none);
+                previous.extend_from_slice(&reference_none);
                 if let Ok(message) = postcard::from_bytes(&previous) {
                     return Ok(message);
                 }
@@ -165,6 +175,7 @@ impl VersionReplicationMessage {
                 legacy.extend(postcard::to_allocvec(&Option::<SyncOrigin>::None)?);
                 legacy.extend_from_slice(&empty_sources);
                 legacy.extend_from_slice(&writer_none);
+                legacy.extend_from_slice(&reference_none);
                 Ok(postcard::from_bytes(&legacy)?)
             }
             Err(error) => Err(error.into()),
@@ -274,6 +285,7 @@ mod tests {
             origin: None,
             upstream_sources: Vec::new(),
             writer_auth_context: None,
+            reference_metadata: None,
         }
     }
 
@@ -292,6 +304,13 @@ mod tests {
             )
             .unwrap(),
         );
+        manifest.reference_metadata = Some(aruna_core::structs::SourceMetadata {
+            content_length: 42,
+            content_type: Some("text/plain".to_string()),
+            etag: Some("etag-1".to_string()),
+            last_modified: Some(SystemTime::UNIX_EPOCH),
+            source_version: None,
+        });
         let message = VersionReplicationMessage::VersionManifest(manifest);
         let bytes = message.to_bytes().unwrap();
 
@@ -338,6 +357,7 @@ mod tests {
         let mut bytes = VersionReplicationMessage::VersionManifest(intermediate.clone())
             .to_bytes()
             .unwrap();
+        assert_eq!(bytes.pop(), Some(0));
         assert_eq!(bytes.pop(), Some(0));
         assert_eq!(bytes.pop(), Some(0));
         assert_eq!(

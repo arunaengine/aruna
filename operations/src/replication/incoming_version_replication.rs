@@ -95,8 +95,10 @@ pub enum IncomingVersionReplicationError {
     WriterPermissionDenied,
     #[error("Replication hop limit exceeded")]
     HopLimitExceeded,
-    #[error("reference_unsupported")]
-    ReferenceUnsupported,
+    #[error("Reference replication manifest is missing source metadata")]
+    MissingReferenceMetadata,
+    #[error("Reference replication manifest is missing source binding")]
+    MissingReferenceSource,
     #[error(transparent)]
     QuotaGateError(#[from] QuotaGateError),
     #[error(transparent)]
@@ -333,12 +335,54 @@ impl IncomingVersionReplicationOperation {
     }
 
     fn current_materialized_hash_from_manifest(&self) -> Option<[u8; 32]> {
-        if !self.manifest.current_version || self.manifest.kind != ReplicationItemKind::Materialized
+        if !self.manifest.current_version
+            || self.manifest.kind != ReplicationItemKind::Materialized
+            || self.manifest.reference_intent
         {
             return None;
         }
 
         self.manifest.blob.as_ref().map(|blob| blob.hash)
+    }
+
+    fn is_reference_item(&self) -> bool {
+        self.manifest.reference_intent && self.manifest.kind == ReplicationItemKind::Materialized
+    }
+
+    fn reference_version(&self) -> Result<BlobVersion, IncomingVersionReplicationError> {
+        let source = self
+            .manifest
+            .source
+            .clone()
+            .ok_or(IncomingVersionReplicationError::MissingReferenceSource)?;
+        let metadata = self
+            .manifest
+            .reference_metadata
+            .clone()
+            .ok_or(IncomingVersionReplicationError::MissingReferenceMetadata)?;
+        Ok(BlobVersion::reference(
+            source,
+            metadata,
+            self.manifest.created_at,
+            self.manifest.created_by,
+            self.manifest.created_at,
+        ))
+    }
+
+    fn incoming_logical_bytes(&self) -> Result<u64, IncomingVersionReplicationError> {
+        if self.is_reference_item() {
+            return self
+                .reference_version()?
+                .to_bytes()
+                .map(|bytes| bytes.len() as u64)
+                .map_err(Into::into);
+        }
+
+        self.manifest
+            .blob
+            .as_ref()
+            .map(|blob| blob.size)
+            .ok_or(IncomingVersionReplicationError::MissingBlobInfo)
     }
 
     fn prepare_head_transition(&mut self) -> Effects {
@@ -470,13 +514,14 @@ impl IncomingVersionReplicationOperation {
         let Some(group_id) = self.destination_group_id else {
             return self.fail(IncomingVersionReplicationError::DestinationBucketNotFound);
         };
-        let Some(blob) = self.manifest.blob.as_ref() else {
-            return self.fail(IncomingVersionReplicationError::MissingBlobInfo);
+        let logical_bytes = match self.incoming_logical_bytes() {
+            Ok(logical_bytes) => logical_bytes,
+            Err(error) => return self.fail(error),
         };
         self.quota_ceiling = Some(ceiling);
         self.quota_gate = Some(QuotaGate::new_for_realm(
             ceiling,
-            blob.size,
+            logical_bytes,
             group_id,
             self.local_node_id,
             self.local_realm_id,
@@ -575,6 +620,9 @@ impl IncomingVersionReplicationOperation {
     }
 
     fn write_hash_lookup_or_continue(&mut self) -> Effects {
+        if self.is_reference_item() {
+            return self.write_object_lookup_or_continue();
+        }
         if let Some(location) = self.received_blob_location.as_ref()
             && let Err(err) = self.validate_materialized_location(location)
         {
@@ -712,25 +760,33 @@ impl IncomingVersionReplicationOperation {
         );
         let (version, materialized_hash) = match self.manifest.kind {
             ReplicationItemKind::Materialized => {
-                let Ok(location) = self.effective_materialized_location() else {
-                    return self.fail(IncomingVersionReplicationError::MissingBlobLocation);
-                };
-                let Some(blake3_hash) = location.get_blake3() else {
-                    return self.fail(IncomingVersionReplicationError::MissingBlobLocation);
-                };
-                let hash: [u8; 32] = match blake3_hash.try_into() {
-                    Ok(hash) => hash,
-                    Err(err) => return self.fail(ConversionError::from(err).into()),
-                };
-                (
-                    BlobVersion::materialized(
-                        hash,
-                        self.manifest.created_at,
-                        self.manifest.created_by,
-                        self.manifest.source.clone(),
-                    ),
-                    Some(hash),
-                )
+                if self.is_reference_item() {
+                    let version = match self.reference_version() {
+                        Ok(version) => version,
+                        Err(error) => return self.fail(error),
+                    };
+                    (version, None)
+                } else {
+                    let Ok(location) = self.effective_materialized_location() else {
+                        return self.fail(IncomingVersionReplicationError::MissingBlobLocation);
+                    };
+                    let Some(blake3_hash) = location.get_blake3() else {
+                        return self.fail(IncomingVersionReplicationError::MissingBlobLocation);
+                    };
+                    let hash: [u8; 32] = match blake3_hash.try_into() {
+                        Ok(hash) => hash,
+                        Err(err) => return self.fail(ConversionError::from(err).into()),
+                    };
+                    (
+                        BlobVersion::materialized(
+                            hash,
+                            self.manifest.created_at,
+                            self.manifest.created_by,
+                            self.manifest.source.clone(),
+                        ),
+                        Some(hash),
+                    )
+                }
             }
             ReplicationItemKind::DeleteMarker => (
                 BlobVersion::deleted(self.manifest.created_at, self.manifest.created_by),
@@ -827,13 +883,7 @@ impl IncomingVersionReplicationOperation {
 
     fn usage_delta(&self) -> Result<UsageDelta, IncomingVersionReplicationError> {
         let logical_bytes = match self.manifest.kind {
-            ReplicationItemKind::Materialized => i128::from(
-                self.manifest
-                    .blob
-                    .as_ref()
-                    .ok_or(IncomingVersionReplicationError::MissingBlobInfo)?
-                    .size,
-            ),
+            ReplicationItemKind::Materialized => i128::from(self.incoming_logical_bytes()?),
             ReplicationItemKind::DeleteMarker => 0,
         };
         Ok(UsageDelta {
@@ -857,6 +907,34 @@ impl IncomingVersionReplicationOperation {
                 return self.commit_transaction();
             }
             self.usage_update = Some(update);
+            return self.start_usage_update();
+        }
+        if self.is_reference_item() {
+            let logical_bytes = match self.incoming_logical_bytes() {
+                Ok(logical_bytes) => logical_bytes,
+                Err(error) => return self.fail(error),
+            };
+            self.usage_update = Some(UsageCounterUpdate::for_group(group_id, group_delta));
+            let Some(txn_id) = self.txn_id else {
+                return self.fail(IncomingVersionReplicationError::StorageError(
+                    StorageError::TransactionNotFound,
+                ));
+            };
+            if let Some(ceiling) = self.quota_ceiling
+                && logical_bytes > 0
+            {
+                let mut gate = QuotaGate::new_for_realm(
+                    ceiling,
+                    logical_bytes,
+                    group_id,
+                    self.local_node_id,
+                    self.local_realm_id,
+                );
+                self.state = IncomingVersionReplicationState::CheckCommitQuota;
+                let effects = gate.start(txn_id);
+                self.quota_gate = Some(gate);
+                return effects;
+            }
             return self.start_usage_update();
         }
         let Some(blob) = self.manifest.blob.as_ref() else {
@@ -924,6 +1002,9 @@ impl IncomingVersionReplicationOperation {
     }
 
     fn register_blob_in_dht_or_continue(&mut self) -> Effects {
+        if self.is_reference_item() {
+            return self.send_apply_complete();
+        }
         let Ok(location) = self.effective_materialized_location() else {
             return self.send_apply_complete();
         };
@@ -1012,8 +1093,10 @@ impl Operation for IncomingVersionReplicationOperation {
     type Error = IncomingVersionReplicationError;
 
     fn start(&mut self) -> Effects {
-        if self.manifest.reference_intent {
-            return self.reject_negotiation(IncomingVersionReplicationError::ReferenceUnsupported);
+        if self.is_reference_item()
+            && let Err(error) = self.reference_version()
+        {
+            return self.reject_negotiation(error);
         }
         if self
             .manifest
@@ -1195,6 +1278,9 @@ impl Operation for IncomingVersionReplicationOperation {
 
                 match ceiling {
                     Some(ceiling) => self.start_quota_check(ceiling),
+                    None if self.is_reference_item() => {
+                        self.send_negotiation(ReplicationNegotiationResult::NeedVersionOnly)
+                    }
                     None => self.read_existing_blob(),
                 }
             }
@@ -1246,6 +1332,8 @@ impl Operation for IncomingVersionReplicationOperation {
                     self.send_negotiation(ReplicationNegotiationResult::Rejected(
                         "quota".to_string(),
                     ))
+                } else if self.is_reference_item() {
+                    self.send_negotiation(ReplicationNegotiationResult::NeedVersionOnly)
                 } else {
                     self.read_existing_blob()
                 }
@@ -1723,9 +1811,10 @@ mod tests {
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BlobVersion, BucketInfo, CurrentVersionPointer,
-        HashPathIndexKey, QuotaConfig, RealmConfigDocument, RealmId, ReplicationItemKind,
-        ReplicationNegotiationResult, SourceConnectorKind, StagingStrategy, VersionSourceBinding,
+        AuthContext, BackendLocation, BlobVersion, BlobVersionState, BucketInfo,
+        CurrentVersionPointer, HashPathIndexKey, QuotaConfig, RealmConfigDocument, RealmId,
+        ReplicationItemKind, ReplicationNegotiationResult, SourceConnectorKind, SourceMetadata,
+        StagingStrategy, VersionSourceBinding,
     };
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -1808,6 +1897,7 @@ mod tests {
             origin: None,
             upstream_sources: Vec::new(),
             writer_auth_context: None,
+            reference_metadata: None,
         }
     }
 
@@ -1827,6 +1917,25 @@ mod tests {
             },
             connector_id: Some(Ulid::r#gen()),
         }
+    }
+
+    fn make_reference_manifest() -> VersionReplicationManifest {
+        let mut manifest = make_manifest(ReplicationItemKind::Materialized);
+        let mut source = make_source_binding();
+        source.descriptor.kind = SourceConnectorKind::ArunaNative;
+        source.descriptor.origin_node_id = Some(iroh::SecretKey::from_bytes(&[8u8; 32]).public());
+        source.connector_id = None;
+        manifest.blob = None;
+        manifest.source = Some(source);
+        manifest.reference_intent = true;
+        manifest.reference_metadata = Some(SourceMetadata {
+            content_length: 1_000_000,
+            content_type: Some("application/octet-stream".to_string()),
+            etag: None,
+            last_modified: Some(manifest.created_at),
+            source_version: None,
+        });
+        manifest
     }
 
     fn message_from_effect(effect: &Effect) -> VersionReplicationMessage {
@@ -1982,9 +2091,8 @@ mod tests {
     }
 
     #[test]
-    fn reference_intent_rejects() {
-        let mut manifest = make_manifest(ReplicationItemKind::Materialized);
-        manifest.reference_intent = true;
+    fn reference_requests_metadata() {
+        let manifest = make_reference_manifest();
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::r#gen(),
             iroh::SecretKey::generate().public(),
@@ -1992,10 +2100,59 @@ mod tests {
             manifest,
         );
 
-        let effects = op.start();
+        let _effects = advance_to_version_lookup(&mut op, test_group_id());
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::ReadQuotaConfig);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
 
         assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
-        expect_rejected_negotiation(&effects[0], "reference_unsupported");
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionNegotiationResponse(
+                ReplicationNegotiationResult::NeedVersionOnly
+            )
+        ));
+    }
+
+    #[test]
+    fn reference_writes_version() {
+        let manifest = make_reference_manifest();
+        let expected_source = manifest.source.clone().unwrap();
+        let expected_metadata = manifest.reference_metadata.clone().unwrap();
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::r#gen(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            manifest,
+        );
+        op.txn_id = Some(Ulid::r#gen());
+
+        let effects = op.write_blob_version();
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected reference version write")
+        };
+        let version = BlobVersion::from_bytes(value.as_ref()).unwrap();
+
+        assert!(matches!(
+            version.state,
+            BlobVersionState::Reference {
+                source,
+                cached_metadata,
+                ..
+            } if source == expected_source && cached_metadata == expected_metadata
+        ));
+        assert!(op.incoming_logical_bytes().unwrap() < 1_000_000);
     }
 
     #[test]

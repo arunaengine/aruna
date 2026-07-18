@@ -1,3 +1,4 @@
+use crate::connectors::resolver::ARUNA_NATIVE_RELATIONSHIP_ID;
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
 };
@@ -17,8 +18,9 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     ArunaArn, AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
     CurrentVersionPointer, MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
-    ReplicationItemKind, ReplicationNegotiationResult, ReplicationSuboperationResult,
-    SourceMetadata, SyncMode, SyncRelationship, VersionKey, VersionSourceBinding,
+    PortableSourceDescriptor, ReplicationItemKind, ReplicationNegotiationResult,
+    ReplicationSuboperationResult, SourceConnectorKind, SourceMetadata, StagingStrategy, SyncMode,
+    SyncRelationship, VersionKey, VersionSourceBinding,
 };
 use aruna_core::types::{Effects, GroupId, Key, NodeId};
 use serde::{Deserialize, Serialize};
@@ -64,6 +66,8 @@ struct SyncTransferContext {
     target_bucket: String,
     source_prefix: Option<String>,
     target_prefix: Option<String>,
+    source_node_id: NodeId,
+    relationship_id: Ulid,
     reference_intent: bool,
     origin: Option<SyncOrigin>,
     upstream_sources: Vec<ArunaArn>,
@@ -182,6 +186,8 @@ impl ReplicateScopeOperation {
             target_bucket: relationship.target.bucket().unwrap_or_default().to_string(),
             source_prefix: relationship.source.key_prefix().map(ToOwned::to_owned),
             target_prefix: relationship.target.key_prefix().map(ToOwned::to_owned),
+            source_node_id: relationship.source.node_id,
+            relationship_id: relationship.id,
             reference_intent: relationship.mode == SyncMode::Reference,
             origin: Some(origin.unwrap_or(SyncOrigin {
                 relationship_id: relationship.id,
@@ -895,6 +901,11 @@ impl ReplicateObjectVersionOperation {
     }
 
     fn resolve_reference_or_skip(&mut self, version: ReplicationVersion) -> Effects {
+        if self.sync.as_ref().is_some_and(|sync| sync.reference_intent) {
+            self.replication_version = Some(version);
+            return self.read_current_lookup();
+        }
+
         if self.request.mode != ReplicationMode::OnDemand {
             return self.skip_version();
         }
@@ -1079,31 +1090,55 @@ impl ReplicateObjectVersionOperation {
             .as_ref()
             .filter(|pointer| pointer.version_id == self.request.version_id);
         let current_version = current_version_pointer.is_some();
-        let (kind, created_at, created_by, blob, source) = match version {
+        let reference_intent = self.sync.as_ref().is_some_and(|sync| sync.reference_intent);
+        let (kind, created_at, created_by, blob, source, reference_metadata) = match version {
             ReplicationVersion::Materialized {
                 created_at,
                 created_by,
                 location,
                 source,
             } => {
-                let hash = location
-                    .get_blake3()
-                    .ok_or(ReplicateObjectVersionError::MissingBlobHash)?
-                    .try_into()
-                    .map_err(|_| ReplicateObjectVersionError::MissingBlobHash)?;
-                (
-                    ReplicationItemKind::Materialized,
-                    created_at,
-                    created_by,
-                    Some(MaterializedBlobInfo {
-                        hash,
-                        size: location.blob_size,
-                        compressed: location.compressed,
-                        encrypted: location.encrypted,
-                        location,
-                    }),
-                    source,
-                )
+                if reference_intent {
+                    let sync = self
+                        .sync
+                        .as_ref()
+                        .ok_or(ReplicateObjectVersionError::UnresolvedReferenceVersion)?;
+                    let metadata = SourceMetadata {
+                        content_length: location.blob_size,
+                        content_type: None,
+                        etag: None,
+                        last_modified: Some(location.created_at),
+                        source_version: None,
+                    };
+                    (
+                        ReplicationItemKind::Materialized,
+                        created_at,
+                        created_by,
+                        None,
+                        Some(self.reference_binding(sync)),
+                        Some(metadata),
+                    )
+                } else {
+                    let hash = location
+                        .get_blake3()
+                        .ok_or(ReplicateObjectVersionError::MissingBlobHash)?
+                        .try_into()
+                        .map_err(|_| ReplicateObjectVersionError::MissingBlobHash)?;
+                    (
+                        ReplicationItemKind::Materialized,
+                        created_at,
+                        created_by,
+                        Some(MaterializedBlobInfo {
+                            hash,
+                            size: location.blob_size,
+                            compressed: location.compressed,
+                            encrypted: location.encrypted,
+                            location,
+                        }),
+                        source,
+                        None,
+                    )
+                }
             }
             ReplicationVersion::Deleted {
                 created_at,
@@ -1114,9 +1149,29 @@ impl ReplicateObjectVersionOperation {
                 created_by,
                 None,
                 None,
+                None,
             ),
-            ReplicationVersion::Reference { .. } => {
-                return Err(ReplicateObjectVersionError::UnresolvedReferenceVersion);
+            ReplicationVersion::Reference {
+                created_at,
+                created_by,
+                cached_metadata,
+                ..
+            } => {
+                if !reference_intent {
+                    return Err(ReplicateObjectVersionError::UnresolvedReferenceVersion);
+                }
+                let sync = self
+                    .sync
+                    .as_ref()
+                    .ok_or(ReplicateObjectVersionError::UnresolvedReferenceVersion)?;
+                (
+                    ReplicationItemKind::Materialized,
+                    created_at,
+                    created_by,
+                    None,
+                    Some(self.reference_binding(sync)),
+                    Some(cached_metadata),
+                )
             }
         };
 
@@ -1159,6 +1214,7 @@ impl ReplicateObjectVersionOperation {
                 .sync
                 .as_ref()
                 .and_then(|sync| sync.writer_auth_context.clone()),
+            reference_metadata,
         });
         if let Some(manifest) = self.manifest.as_ref() {
             debug!(
@@ -1176,6 +1232,24 @@ impl ReplicateObjectVersionOperation {
             );
         }
         Ok(())
+    }
+
+    fn reference_binding(&self, sync: &SyncTransferContext) -> VersionSourceBinding {
+        VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::ArunaNative,
+                public_config: std::collections::HashMap::from([(
+                    ARUNA_NATIVE_RELATIONSHIP_ID.to_string(),
+                    sync.relationship_id.to_string(),
+                )]),
+                source_path: format!("{}/{}", self.request.bucket, self.request.key),
+                version_selector: Some(format!("version:{}", self.request.version_id)),
+                capabilities: Vec::new(),
+                origin_node_id: Some(sync.source_node_id),
+            },
+            connector_id: None,
+        }
     }
 
     fn send_manifest(&mut self) -> Effects {
@@ -1688,7 +1762,7 @@ impl Operation for ReplicateObjectVersionOperation {
 mod tests {
     use super::{
         ReplicateObjectVersionError, ReplicateObjectVersionOperation, ReplicateScopeInput,
-        ReplicateScopeOperation, ReplicateScopeTarget, ReplicationVersion,
+        ReplicateScopeOperation, ReplicateScopeTarget, ReplicationVersion, SyncTransferContext,
     };
     use crate::replication::protocol::{
         ReplicationMode, VersionReplicationMessage, VersionReplicationRequest,
@@ -1704,9 +1778,9 @@ mod tests {
     use aruna_core::structs::{
         AuthContext, BackendLocation, BlobVersion, BucketInfo, CurrentVersionPointer,
         MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
-        MultipartObjectSummary, PortableSourceDescriptor, RealmId, ReplicationNegotiationResult,
-        ReplicationSuboperationResult, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata,
-        StagingStrategy, VersionKey, VersionSourceBinding,
+        MultipartObjectSummary, PortableSourceDescriptor, RealmId, ReplicationItemKind,
+        ReplicationNegotiationResult, ReplicationSuboperationResult, ResolvedSourceAccess,
+        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
     };
     use bytes::Bytes;
     use futures_util::stream;
@@ -1865,6 +1939,20 @@ mod tests {
 
     fn version_request(version_id: Ulid) -> VersionReplicationRequest {
         version_request_with_mode(version_id, ReplicationMode::Live)
+    }
+
+    fn reference_sync() -> SyncTransferContext {
+        SyncTransferContext {
+            target_bucket: "target-bucket".to_string(),
+            source_prefix: None,
+            target_prefix: Some("copied/file.txt".to_string()),
+            source_node_id: iroh::SecretKey::generate().public(),
+            relationship_id: Ulid::r#gen(),
+            reference_intent: true,
+            origin: None,
+            upstream_sources: Vec::new(),
+            writer_auth_context: None,
+        }
     }
 
     fn multipart_part_entry(
@@ -2148,6 +2236,55 @@ mod tests {
     }
 
     #[test]
+    fn builds_reference_manifest() {
+        let version_id = Ulid::r#gen();
+        let sync = reference_sync();
+        let location = materialized_location();
+        let source_node_id = sync.source_node_id;
+        let relationship_id = sync.relationship_id;
+        let mut op =
+            ReplicateObjectVersionOperation::new(version_request(version_id)).with_sync(sync);
+        op.replication_version = Some(ReplicationVersion::Materialized {
+            created_at: SystemTime::now(),
+            created_by: test_user_id(),
+            location: location.clone(),
+            source: None,
+        });
+
+        op.build_manifest(None).unwrap();
+
+        let manifest = op.manifest.expect("manifest built");
+        assert!(manifest.reference_intent);
+        assert!(manifest.blob.is_none());
+        assert_eq!(manifest.bucket, "target-bucket");
+        assert_eq!(manifest.key, "copied/file.txt");
+        assert_eq!(
+            manifest.reference_metadata,
+            Some(SourceMetadata {
+                content_length: location.blob_size,
+                content_type: None,
+                etag: None,
+                last_modified: Some(location.created_at),
+                source_version: None,
+            })
+        );
+        let source = manifest.source.expect("reference binding");
+        assert_eq!(source.strategy, StagingStrategy::Reference);
+        assert_eq!(source.connector_id, None);
+        assert_eq!(source.descriptor.kind, SourceConnectorKind::ArunaNative);
+        assert_eq!(source.descriptor.origin_node_id, Some(source_node_id));
+        assert_eq!(source.descriptor.source_path, "bucket/dir/file.txt");
+        assert_eq!(
+            source.descriptor.version_selector.as_deref(),
+            Some(format!("version:{version_id}").as_str())
+        );
+        assert_eq!(
+            source.descriptor.public_config.get("relationship_id"),
+            Some(&relationship_id.to_string())
+        );
+    }
+
+    #[test]
     fn manifest_omits_source_binding_for_delete_marker() {
         let version_id = Ulid::r#gen();
         let mut op = ReplicateObjectVersionOperation::new(version_request(version_id));
@@ -2164,6 +2301,25 @@ mod tests {
             aruna_core::structs::ReplicationItemKind::DeleteMarker
         );
         assert_eq!(manifest.source, None);
+    }
+
+    #[test]
+    fn keeps_reference_deletes() {
+        let version_id = Ulid::r#gen();
+        let mut op = ReplicateObjectVersionOperation::new(version_request(version_id))
+            .with_sync(reference_sync());
+        op.replication_version = Some(ReplicationVersion::Deleted {
+            created_at: SystemTime::now(),
+            created_by: test_user_id(),
+        });
+
+        op.build_manifest(None).unwrap();
+
+        let manifest = op.manifest.expect("manifest built");
+        assert_eq!(manifest.kind, ReplicationItemKind::DeleteMarker);
+        assert!(manifest.blob.is_none());
+        assert!(manifest.source.is_none());
+        assert!(manifest.reference_metadata.is_none());
     }
 
     #[test]
@@ -2186,6 +2342,42 @@ mod tests {
         assert_eq!(
             op.build_manifest(None),
             Err(ReplicateObjectVersionError::UnresolvedReferenceVersion)
+        );
+    }
+
+    #[test]
+    fn preserves_reference_source() {
+        let version_id = Ulid::r#gen();
+        let cached_metadata = reference_cached_metadata();
+        let mut op = ReplicateObjectVersionOperation::new(version_request_with_mode(
+            version_id,
+            ReplicationMode::OnDemand,
+        ))
+        .with_sync(reference_sync());
+
+        op.start();
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![1u8].into(),
+            value: Some(reference_blob_version().to_bytes().unwrap().into()),
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == BLOB_HEAD_KEYSPACE
+        ));
+        assert!(matches!(
+            op.replication_version,
+            Some(ReplicationVersion::Reference { .. })
+        ));
+
+        op.build_manifest(None).unwrap();
+        let manifest = op.manifest.expect("manifest built");
+        assert!(manifest.blob.is_none());
+        assert_eq!(manifest.reference_metadata, Some(cached_metadata));
+        assert_eq!(
+            manifest.source.expect("reference binding").descriptor.kind,
+            SourceConnectorKind::ArunaNative
         );
     }
 
