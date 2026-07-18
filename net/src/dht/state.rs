@@ -854,6 +854,8 @@ impl DhtStateMachine {
 
         if matches!(response, DhtResponse::Pong) {
             self.insert_peer(peer, out);
+        } else {
+            let _ = self.routing_table.remove_seen(&op.peer, op.peer_seen);
         }
 
         if pending_rpc_count(&op.pending, RpcPhase::MaintenancePing) > 0 {
@@ -4348,6 +4350,46 @@ mod tests {
                 .iter()
                 .any(|entry| entry.node_id == peer)
         );
+    }
+
+    #[test]
+    fn invalid_ping_evicts() {
+        let local_secret = make_secret(96);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 0);
+        let peer = make_node(97);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer }));
+
+        let effects = state.step(DhtInput::Tick {
+            now_tick: 1,
+            now_secs: 0,
+        });
+        let op_id = effects
+            .iter()
+            .find_map(|effect| match effect {
+                DhtEffect::IoRequest(request) => match &**request {
+                    DhtIoRequest::RpcRequest {
+                        op_id,
+                        phase: RpcPhase::MaintenancePing,
+                        ..
+                    } => Some(*op_id),
+                    _ => None,
+                },
+                DhtEffect::Output(_) => None,
+            })
+            .expect("maintenance ping");
+
+        let _ = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id,
+            phase: RpcPhase::MaintenancePing,
+            peer,
+            response: DhtResponse::Error {
+                code: ErrorCode::InvalidRequest,
+                message: "invalid ping".to_string(),
+            },
+        }));
+
+        assert!(state.routing_table.all_peers().is_empty());
     }
 
     #[test]
