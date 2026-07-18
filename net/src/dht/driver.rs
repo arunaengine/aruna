@@ -38,10 +38,11 @@ use super::rpc::{
     encode_request_with_trace_context, encode_response, request_kind, response_kind,
 };
 use super::state::DhtStateMachine;
+use super::storage::now_unix_secs;
 use super::storage::{
-    CLEANUP_PAGE_SIZE, DeadlineEntry, DeadlineIndex, MergeError, StoredEntry, active_deadline,
-    deadline_key, decode_entries, encode_entries, floor_deadline, merge_entry, now_unix_secs,
-    parse_deadline, retained_entries, row_deadline, validate_entries,
+    CLEANUP_PAGE_SIZE, DeadlineEntry, DeadlineIndex, DhtClock, DhtClockError, MergeError,
+    StoredEntry, active_deadline, deadline_key, decode_entries, encode_entries, floor_deadline,
+    merge_entry, parse_deadline, retained_entries, row_deadline, validate_entries,
 };
 use crate::connection_pool::{ConnectionPool, PoolConnectError};
 use crate::telemetry::{
@@ -125,6 +126,22 @@ impl std::fmt::Debug for DriverCmd {
     }
 }
 
+fn reject_driver_cmd(cmd: DriverCmd, error: DhtIoError) {
+    match cmd {
+        DriverCmd::Put { reply, .. }
+        | DriverCmd::Get { reply, .. }
+        | DriverCmd::Bootstrap { reply, .. }
+        | DriverCmd::RoutingTableSize { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
+        DriverCmd::AddPeer { .. } => {}
+    }
+}
+
+fn clock_error(error: DhtClockError) -> DhtIoError {
+    DhtIoError::storage(format!("DHT clock unhealthy: {error}"))
+}
+
 #[derive(Debug, Clone, Copy)]
 enum DriverLane {
     Command,
@@ -152,6 +169,7 @@ struct RevisionRequest {
 
 pub struct DhtDriver {
     state: DhtStateMachine,
+    clock: DhtClock,
     endpoint: Endpoint,
     connection_pool: ConnectionPool,
     storage: StorageHandle,
@@ -260,6 +278,29 @@ impl DhtDriver {
         inbound_rx: InboundReceiver,
         shutdown: CancellationToken,
     ) -> Self {
+        let clock = DhtClock::from_secs(state.clock_secs());
+        Self::with_clock(
+            state,
+            clock,
+            endpoint,
+            storage,
+            connection_pool,
+            cmd_rx,
+            inbound_rx,
+            shutdown,
+        )
+    }
+
+    pub(crate) fn with_clock(
+        state: DhtStateMachine,
+        clock: DhtClock,
+        endpoint: Endpoint,
+        storage: StorageHandle,
+        connection_pool: ConnectionPool,
+        cmd_rx: DriverCmdReceiver,
+        inbound_rx: InboundReceiver,
+        shutdown: CancellationToken,
+    ) -> Self {
         let (io_tx, io_rx) = mpsc::bounded_async(DRIVER_IO_EVENT_CAPACITY);
         let (revision_tx, revision_rx) = tokio::sync::mpsc::channel(CMD_CHANNEL_CAPACITY);
         let revision_task = tokio::spawn(run_revision_allocator(
@@ -271,6 +312,7 @@ impl DhtDriver {
 
         Self {
             state,
+            clock,
             endpoint,
             connection_pool,
             storage,
@@ -298,7 +340,7 @@ impl DhtDriver {
         let _ = ticker.tick().await;
         let mut next_lane = DriverLane::Command;
 
-        loop {
+        let terminal_error = loop {
             let (event, following_lane) = next_driver_event(
                 next_lane,
                 &self.shutdown,
@@ -310,34 +352,51 @@ impl DhtDriver {
             .await;
             next_lane = following_lane;
 
+            if matches!(&event, DriverEvent::Shutdown | DriverEvent::Closed) {
+                break DhtIoError::Shutdown;
+            }
+            let now_secs = match self.clock.now_secs() {
+                Ok(now_secs) => now_secs,
+                Err(error) => {
+                    warn!(error = %error, "Stopping DHT driver because the system clock is unhealthy");
+                    let terminal_error = clock_error(error);
+                    if let DriverEvent::Command(cmd) = event {
+                        reject_driver_cmd(cmd, terminal_error.clone());
+                    }
+                    break terminal_error;
+                }
+            };
             match event {
-                DriverEvent::Shutdown | DriverEvent::Closed => break,
+                DriverEvent::Shutdown | DriverEvent::Closed => break DhtIoError::Shutdown,
                 DriverEvent::Command(cmd) => {
-                    self.process_input(DhtInput::Clock {
-                        now_secs: now_unix_secs(),
-                    });
+                    self.process_input(DhtInput::Clock { now_secs });
                     self.handle_driver_cmd(cmd);
                 }
                 DriverEvent::Inbound(inbound) => self.handle_inbound_stream(inbound),
                 DriverEvent::Io(io) => {
-                    self.process_input(DhtInput::Clock {
-                        now_secs: now_unix_secs(),
-                    });
+                    self.process_input(DhtInput::Clock { now_secs });
                     self.handle_worker_io(io);
                 }
                 DriverEvent::Tick => {
                     self.now_tick = self.now_tick.saturating_add(1);
                     self.process_input(DhtInput::Tick {
                         now_tick: self.now_tick,
-                        now_secs: now_unix_secs(),
+                        now_secs,
                     });
                 }
             }
-        }
+        };
 
         self.revision_task.abort();
         let _ = (&mut self.revision_task).await;
-        self.fail_pending_callers(DhtIoError::Shutdown);
+        self.fail_pending_callers(terminal_error.clone());
+        let buffered = self.cmd_rx.len();
+        for _ in 0..buffered {
+            let Ok(cmd) = self.cmd_rx.try_recv() else {
+                break;
+            };
+            reject_driver_cmd(cmd, terminal_error.clone());
+        }
         self.inbound_contexts.clear();
     }
 
@@ -1148,12 +1207,13 @@ impl DhtDriver {
     ) {
         let storage = self.storage.clone();
         let io_tx = self.io_tx.clone();
+        let clock = self.clock.clone();
         tokio::spawn(
             async move {
                 let mutation = StorageMutation::Merge { entries };
                 match run_storage_io(
                     stage,
-                    mutate_storage_entries(&storage, op_id, stage, key, &mutation),
+                    mutate_storage_checked(&storage, op_id, stage, key, &mutation, &clock),
                 )
                 .await
                 {
@@ -1191,6 +1251,7 @@ impl DhtDriver {
     ) {
         let storage = self.storage.clone();
         let io_tx = self.io_tx.clone();
+        let clock = self.clock.clone();
         tokio::spawn(
             async move {
                 let mutation = StorageMutation::Prune {
@@ -1198,7 +1259,9 @@ impl DhtDriver {
                     entry,
                     now_secs,
                 };
-                match mutate_storage_entries(&storage, op_id, stage, entry.key, &mutation).await {
+                match mutate_storage_checked(&storage, op_id, stage, entry.key, &mutation, &clock)
+                    .await
+                {
                     Ok(()) => {
                         let _ = io_tx.send(DhtIo::StorageWriteResult { op_id, stage }).await;
                     }
@@ -1449,12 +1512,35 @@ async fn reserve_revision_txn(
     Ok(first..=last)
 }
 
+#[cfg(test)]
 async fn mutate_storage_entries(
     storage: &StorageHandle,
     op_id: OpId,
     stage: StorageStage,
     key: DhtKeyId,
     mutation: &StorageMutation,
+) -> Result<(), DhtIoError> {
+    mutate_storage_with(storage, op_id, stage, key, mutation, None).await
+}
+
+async fn mutate_storage_checked(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    key: DhtKeyId,
+    mutation: &StorageMutation,
+    clock: &DhtClock,
+) -> Result<(), DhtIoError> {
+    mutate_storage_with(storage, op_id, stage, key, mutation, Some(clock)).await
+}
+
+async fn mutate_storage_with(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    key: DhtKeyId,
+    mutation: &StorageMutation,
+    clock: Option<&DhtClock>,
 ) -> Result<(), DhtIoError> {
     for _ in 0..STORAGE_MUTATION_RETRIES {
         let txn_id = match start_storage_txn(storage, op_id, stage).await {
@@ -1463,7 +1549,7 @@ async fn mutate_storage_entries(
             Err(TransactionFailure::Failed(error)) => return Err(error),
         };
 
-        match run_storage_txn(storage, op_id, stage, key, txn_id, mutation).await {
+        match run_storage_txn(storage, op_id, stage, key, txn_id, mutation, clock).await {
             Ok(()) => return Ok(()),
             Err(TransactionFailure::Conflict) => continue,
             Err(TransactionFailure::Failed(error)) => return Err(error),
@@ -1556,6 +1642,7 @@ async fn run_storage_txn(
     key: DhtKeyId,
     txn_id: TxnId,
     mutation: &StorageMutation,
+    clock: Option<&DhtClock>,
 ) -> Result<(), TransactionFailure> {
     let read = Effect::Storage(StorageEffect::Read {
         key_space: DHT_KEYSPACE.to_string(),
@@ -1596,12 +1683,21 @@ async fn run_storage_txn(
         None => (Vec::new(), false),
     };
     let original_entries = entries;
-    let now_secs = match mutation {
-        StorageMutation::Merge { .. } => now_unix_secs(),
-        StorageMutation::Prune { now_secs, .. } => *now_secs,
+    let now_secs = match clock {
+        Some(clock) => match clock.now_secs() {
+            Ok(now_secs) => now_secs,
+            Err(error) => {
+                abort_storage_txn(storage, op_id, stage, txn_id).await;
+                return Err(TransactionFailure::Failed(clock_error(error)));
+            }
+        },
+        None => match mutation {
+            StorageMutation::Merge { .. } => now_unix_secs(),
+            StorageMutation::Prune { now_secs, .. } => *now_secs,
+        },
     };
     let entries = match mutation {
-        StorageMutation::Merge { entries } => {
+        StorageMutation::Merge { entries, .. } => {
             match merge_storage_entries(&key, original_entries.clone(), entries, now_secs) {
                 Ok(entries) => entries,
                 Err(MergeError::Stale) => {
@@ -3113,10 +3209,18 @@ mod tests {
                 make_entry(2, key, expires_at),
             ],
         };
+        let clock = DhtClock::new();
 
-        mutate_storage_entries(&storage, 13, StorageStage::GetRemoteMerge, key, &mutation)
-            .await
-            .expect("batch merge succeeds");
+        mutate_storage_checked(
+            &storage,
+            13,
+            StorageStage::GetRemoteMerge,
+            key,
+            &mutation,
+            &clock,
+        )
+        .await
+        .expect("batch merge succeeds");
 
         let entries = read_entries(&storage, key).await;
         assert_eq!(entries.len(), 2);

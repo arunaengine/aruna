@@ -15,7 +15,7 @@ use super::constants::{CMD_CHANNEL_CAPACITY, INBOUND_STREAM_CAPACITY};
 use super::driver::{CallerOutcome, DhtDriver, DriverCmd, DriverCmdSender, InboundSender};
 use super::protocol::{DhtIoError, DhtOutputValue, DhtPutStats};
 use super::state::DhtStateMachine;
-use super::storage::now_unix_secs;
+use super::storage::DhtClock;
 use crate::connection_pool::ConnectionPool;
 use crate::error::{NetError, Result};
 use crate::telemetry::{current_trace_context, duration_ms};
@@ -60,9 +60,11 @@ impl DhtHandle {
         let (inbound_stream_tx, inbound_stream_rx) =
             mpsc::bounded_blocking_async(INBOUND_STREAM_CAPACITY);
 
-        let state = DhtStateMachine::new(local_id, secret_key, now_unix_secs());
-        let driver = DhtDriver::new(
+        let clock = DhtClock::new();
+        let state = DhtStateMachine::new(local_id, secret_key, clock.current_secs());
+        let driver = DhtDriver::with_clock(
             state,
+            clock,
             endpoint,
             storage,
             connection_pool,

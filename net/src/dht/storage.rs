@@ -1,8 +1,11 @@
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::structs::RealmId;
 use aruna_core::util::unix_timestamp_secs;
+use aruna_core::{IdEnvironment, SystemEnvironment};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -13,6 +16,95 @@ use super::constants::{
 use super::rpc::verify_record;
 
 pub const CLEANUP_PAGE_SIZE: usize = 256;
+const CLOCK_SAMPLE_WINDOW_MS: u64 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum DhtClockError {
+    #[error("DHT wall clock diverged from monotonic time by {drift_ms} ms")]
+    Diverged { drift_ms: u64 },
+}
+
+#[derive(Clone, Copy)]
+struct ClockAnchor {
+    wall_ms: u64,
+    monotonic_ms: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct DhtClock<E = SystemEnvironment> {
+    env: E,
+    anchor: ClockAnchor,
+    last_ms: Arc<AtomicU64>,
+}
+
+impl DhtClock<SystemEnvironment> {
+    pub(crate) fn new() -> Self {
+        Self::with_env(SystemEnvironment::new())
+    }
+
+    pub(crate) fn from_secs(now_secs: u64) -> Self {
+        let env = SystemEnvironment::new();
+        let anchor = ClockAnchor {
+            wall_ms: now_secs.saturating_mul(1_000),
+            monotonic_ms: env.monotonic_ms(),
+        };
+        Self {
+            env,
+            anchor,
+            last_ms: Arc::new(AtomicU64::new(anchor.wall_ms)),
+        }
+    }
+}
+
+impl<E: IdEnvironment> DhtClock<E> {
+    fn with_env(env: E) -> Self {
+        let anchor = Self::sample_time(&env);
+        Self {
+            env,
+            anchor,
+            last_ms: Arc::new(AtomicU64::new(anchor.wall_ms)),
+        }
+    }
+
+    fn sample_time(env: &E) -> ClockAnchor {
+        loop {
+            let monotonic_before = env.monotonic_ms();
+            let wall_ms = env.now_ms();
+            let monotonic_after = env.monotonic_ms();
+            let Some(elapsed) = monotonic_after.checked_sub(monotonic_before) else {
+                continue;
+            };
+            if elapsed <= CLOCK_SAMPLE_WINDOW_MS {
+                return ClockAnchor {
+                    wall_ms,
+                    monotonic_ms: monotonic_before.saturating_add(elapsed / 2),
+                };
+            }
+        }
+    }
+
+    pub(crate) fn current_secs(&self) -> u64 {
+        self.last_ms.load(Ordering::Acquire) / 1_000
+    }
+
+    pub(crate) fn now_secs(&self) -> Result<u64, DhtClockError> {
+        let sample = Self::sample_time(&self.env);
+        let Some(elapsed_ms) = sample.monotonic_ms.checked_sub(self.anchor.monotonic_ms) else {
+            return Err(DhtClockError::Diverged { drift_ms: u64::MAX });
+        };
+        let expected_ms = self.anchor.wall_ms.saturating_add(elapsed_ms);
+        let drift_ms = sample.wall_ms.abs_diff(expected_ms);
+        if drift_ms > MAX_CLOCK_SKEW_SECS.saturating_mul(1_000) {
+            return Err(DhtClockError::Diverged { drift_ms });
+        }
+        let previous = self.last_ms.fetch_max(sample.wall_ms, Ordering::AcqRel);
+        Ok(previous.max(sample.wall_ms) / 1_000)
+    }
+}
+
+pub fn now_unix_secs() -> u64 {
+    unix_timestamp_secs()
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredEntry {
@@ -248,13 +340,56 @@ pub fn entry_is_fresh(expires_at: u64, now: u64) -> bool {
     expires_at > now
 }
 
-pub fn now_unix_secs() -> u64 {
-    unix_timestamp_secs()
-}
-
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    #[derive(Clone)]
+    struct FakeEnv {
+        wall_ms: Cell<u64>,
+        monotonic_ms: Cell<u64>,
+        suspend_ms: Cell<u64>,
+    }
+
+    impl FakeEnv {
+        fn new(wall_ms: u64, monotonic_ms: u64) -> Self {
+            Self {
+                wall_ms: Cell::new(wall_ms),
+                monotonic_ms: Cell::new(monotonic_ms),
+                suspend_ms: Cell::new(0),
+            }
+        }
+
+        fn set_time(&self, wall_ms: u64, monotonic_ms: u64) {
+            self.wall_ms.set(wall_ms);
+            self.monotonic_ms.set(monotonic_ms);
+        }
+
+        fn suspend_on_sample(&self, suspend_ms: u64) {
+            self.suspend_ms.set(suspend_ms);
+        }
+    }
+
+    impl IdEnvironment for FakeEnv {
+        fn now_ms(&self) -> u64 {
+            let suspend_ms = self.suspend_ms.replace(0);
+            let wall_ms = self.wall_ms.get();
+            self.wall_ms.set(wall_ms.saturating_add(suspend_ms));
+            self.monotonic_ms
+                .set(self.monotonic_ms.get().saturating_add(suspend_ms));
+            wall_ms
+        }
+
+        fn monotonic_ms(&self) -> u64 {
+            self.monotonic_ms.get()
+        }
+
+        fn random_nonce(&self) -> u64 {
+            0
+        }
+    }
 
     fn make_entry(seed: u16, key: DhtKeyId, revision: u64, expires_at: u64) -> StoredEntry {
         let mut secret = [0u8; 32];
@@ -277,6 +412,55 @@ mod tests {
             signature: secret.sign(&signed),
             retain_until: expires_at,
         }
+    }
+
+    #[test]
+    fn clock_retries_suspend() {
+        let env = FakeEnv::new(100_000, 10_000);
+        env.suspend_on_sample(1_000);
+        let clock = DhtClock::with_env(env);
+
+        assert_eq!(clock.current_secs(), 101);
+    }
+
+    #[test]
+    fn clock_follows_corrections() {
+        let env = FakeEnv::new(100_000, 10_000);
+        let clock = DhtClock::with_env(env);
+        let peer = clock.clone();
+        clock.env.set_time(161_000, 11_000);
+        assert_eq!(clock.now_secs(), Ok(161));
+
+        peer.env.set_time(102_000, 12_000);
+        assert_eq!(peer.now_secs(), Ok(161));
+        clock.env.set_time(162_000, 72_000);
+        assert_eq!(clock.now_secs(), Ok(162));
+    }
+
+    #[test]
+    fn clock_rejects_jumps() {
+        let max_skew_ms = MAX_CLOCK_SKEW_SECS * 1_000;
+        let env = FakeEnv::new(100_000, 10_000);
+        let clock = DhtClock::with_env(env);
+        clock.env.set_time(101_000 + max_skew_ms, 11_000);
+        assert_eq!(clock.now_secs(), Ok(401));
+        clock.env.set_time(102_000 + max_skew_ms + 1, 12_000);
+        assert_eq!(
+            clock.now_secs(),
+            Err(DhtClockError::Diverged {
+                drift_ms: max_skew_ms + 1
+            })
+        );
+
+        let env = FakeEnv::new(100_000 + max_skew_ms + 1, 10_000);
+        let clock = DhtClock::with_env(env);
+        clock.env.set_time(101_000, 11_000);
+        assert_eq!(
+            clock.now_secs(),
+            Err(DhtClockError::Diverged {
+                drift_ms: max_skew_ms + 1
+            })
+        );
     }
 
     #[test]

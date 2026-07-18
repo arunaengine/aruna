@@ -317,6 +317,10 @@ impl DhtStateMachine {
         self.ops.contains_key(&op_id)
     }
 
+    pub(crate) fn clock_secs(&self) -> u64 {
+        self.now_secs
+    }
+
     #[tracing::instrument(
         name = "dht.state.cmd",
         level = "debug",
