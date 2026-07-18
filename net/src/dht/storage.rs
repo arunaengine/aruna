@@ -37,7 +37,7 @@ pub enum MergeError {
 }
 
 pub fn decode_entries(bytes: &[u8]) -> Result<Vec<StoredEntry>, postcard::Error> {
-    postcard::from_bytes(bytes)
+    super::rpc::decode_exact(bytes)
 }
 
 pub fn encode_entries(entries: &[StoredEntry]) -> Result<Vec<u8>, postcard::Error> {

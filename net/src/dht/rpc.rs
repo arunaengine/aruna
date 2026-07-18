@@ -168,7 +168,7 @@ pub fn decode_request(bytes: &[u8]) -> Result<DhtRequest, postcard::Error> {
 pub fn decode_request_with_trace_context(
     bytes: &[u8],
 ) -> Result<(Option<DistributedTraceContext>, DhtRequest), postcard::Error> {
-    postcard::from_bytes::<DhtRequestEnvelope>(bytes)
+    decode_exact::<DhtRequestEnvelope>(bytes)
         .map(|envelope| (envelope.trace_context, envelope.request))
 }
 
@@ -179,7 +179,19 @@ pub fn encode_response(resp: &DhtResponse) -> Result<Vec<u8>, postcard::Error> {
 
 /// Deserialize a response from bytes
 pub fn decode_response(bytes: &[u8]) -> Result<DhtResponse, postcard::Error> {
-    postcard::from_bytes(bytes)
+    decode_exact(bytes)
+}
+
+pub(crate) fn decode_exact<'a, T>(bytes: &'a [u8]) -> Result<T, postcard::Error>
+where
+    T: Deserialize<'a>,
+{
+    let (value, remainder) = postcard::take_from_bytes(bytes)?;
+    if remainder.is_empty() {
+        Ok(value)
+    } else {
+        Err(postcard::Error::DeserializeBadEncoding)
+    }
 }
 
 #[cfg(test)]
@@ -219,6 +231,22 @@ mod tests {
         } else {
             panic!("wrong variant");
         }
+    }
+
+    #[test]
+    fn rejects_request_suffix() {
+        let mut bytes = encode_request(&DhtRequest::Ping).expect("encode request");
+        bytes.push(0);
+
+        assert!(decode_request(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_response_suffix() {
+        let mut bytes = encode_response(&DhtResponse::Pong).expect("encode response");
+        bytes.push(0);
+
+        assert!(decode_response(&bytes).is_err());
     }
 
     #[test]
