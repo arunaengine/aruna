@@ -842,10 +842,12 @@ impl Operation for QueueLiveVersionReplicationOperation {
                             .map(|bucket| (relationship.target.node_id, bucket.to_string()));
                         if let Some(job) = relationship_job(
                             self.input.local_node_id,
-                            &self.input.bucket,
-                            &self.input.key,
-                            self.input.version_id,
-                            self.input.delete_marker,
+                            RelationshipJobTarget {
+                                bucket: &self.input.bucket,
+                                key: &self.input.key,
+                                version_id: self.input.version_id,
+                                delete_marker: self.input.delete_marker,
+                            },
                             relationship,
                             None,
                             &[],
@@ -968,16 +970,27 @@ impl Operation for QueueLiveVersionReplicationOperation {
     }
 }
 
-fn relationship_job(
-    local_node_id: NodeId,
-    bucket: &str,
-    key: &str,
+/// Identifies the object version a replication job is being derived for.
+struct RelationshipJobTarget<'a> {
+    bucket: &'a str,
+    key: &'a str,
     version_id: Ulid,
     delete_marker: bool,
+}
+
+fn relationship_job(
+    local_node_id: NodeId,
+    target: RelationshipJobTarget<'_>,
     relationship: SyncRelationship,
     inbound_origin: Option<&SyncOrigin>,
     upstream_sources: &[ArunaArn],
 ) -> Option<BlobReplicationJobRecord> {
+    let RelationshipJobTarget {
+        bucket,
+        key,
+        version_id,
+        delete_marker,
+    } = target;
     if !matches!(
         relationship.mode,
         SyncMode::Continuous | SyncMode::Reference
@@ -1682,10 +1695,12 @@ async fn write_live_jobs(
             .map(|bucket| (relationship.target.node_id, bucket.to_string()));
         if let Some(job) = relationship_job(
             obligation.local_node_id,
-            &obligation.bucket,
-            &obligation.key,
-            obligation.version_id,
-            obligation.delete_marker,
+            RelationshipJobTarget {
+                bucket: &obligation.bucket,
+                key: &obligation.key,
+                version_id: obligation.version_id,
+                delete_marker: obligation.delete_marker,
+            },
             relationship,
             obligation.origin.as_ref(),
             &upstream_sources,
@@ -2962,10 +2977,12 @@ mod tests {
     fn hop_limit_stops() {
         let job = relationship_job(
             node(1),
-            "bucket",
-            "key",
-            Ulid::from(8u128),
-            false,
+            RelationshipJobTarget {
+                bucket: "bucket",
+                key: "key",
+                version_id: Ulid::from(8u128),
+                delete_marker: false,
+            },
             relationship(10, 2, None, true),
             Some(&SyncOrigin {
                 relationship_id: Ulid::from(9u128),
@@ -2984,10 +3001,12 @@ mod tests {
 
         let job = relationship_job(
             node(1),
-            "bucket",
-            "photos/image.jpg",
-            Ulid::from(12u128),
-            true,
+            RelationshipJobTarget {
+                bucket: "bucket",
+                key: "photos/image.jpg",
+                version_id: Ulid::from(12u128),
+                delete_marker: true,
+            },
             reference,
             None,
             &[],
@@ -3003,10 +3022,12 @@ mod tests {
         let version_id = Ulid::from(20u128);
         let first = relationship_job(
             node(1),
-            "a",
-            "key",
-            version_id,
-            false,
+            RelationshipJobTarget {
+                bucket: "a",
+                key: "key",
+                version_id,
+                delete_marker: false,
+            },
             sync_link(21, 1, "a", 2, "b"),
             None,
             &[],
@@ -3014,10 +3035,12 @@ mod tests {
         .unwrap();
         let second = relationship_job(
             node(2),
-            "b",
-            "key",
-            version_id,
-            false,
+            RelationshipJobTarget {
+                bucket: "b",
+                key: "key",
+                version_id,
+                delete_marker: false,
+            },
             sync_link(22, 2, "b", 3, "c"),
             first.origin.as_ref(),
             &first.upstream_sources,
@@ -3026,10 +3049,12 @@ mod tests {
 
         let cycle = relationship_job(
             node(3),
-            "c",
-            "key",
-            version_id,
-            false,
+            RelationshipJobTarget {
+                bucket: "c",
+                key: "key",
+                version_id,
+                delete_marker: false,
+            },
             sync_link(23, 3, "c", 1, "a"),
             second.origin.as_ref(),
             &second.upstream_sources,
@@ -3049,10 +3074,12 @@ mod tests {
 
         let job = relationship_job(
             node(2),
-            "source",
-            "key",
-            Ulid::from(25u128),
-            false,
+            RelationshipJobTarget {
+                bucket: "source",
+                key: "key",
+                version_id: Ulid::from(25u128),
+                delete_marker: false,
+            },
             relationship,
             Some(&SyncOrigin {
                 relationship_id: Ulid::from(23u128),
