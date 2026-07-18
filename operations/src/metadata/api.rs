@@ -790,15 +790,11 @@ async fn load_metadata_realm_nodes_with_status(
     realm_id: RealmId,
     local_node_id: NodeId,
 ) -> MetadataRealmNodeDiscovery {
-    let config = match drive(GetRealmConfigOperation::new(realm_id), context).await {
-        Ok(config) => config,
-        Err(error) => {
-            warn!(error = %error, "realm config unavailable; using local-only metadata results");
-            return MetadataRealmNodeDiscovery {
-                nodes: vec![local_node_id],
-                failed: true,
-            };
-        }
+    let Some(config) = load_realm_config(context, realm_id).await else {
+        return MetadataRealmNodeDiscovery {
+            nodes: vec![local_node_id],
+            failed: true,
+        };
     };
     let nodes = match drive(GetRealmNodesOperation::new(realm_id), context).await {
         Ok(nodes) => match authorized_realm_nodes(&config, nodes) {
