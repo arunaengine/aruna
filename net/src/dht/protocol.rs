@@ -19,7 +19,8 @@ pub const CLEANUP_OP_ID: OpId = 0;
 pub enum DhtInput {
     Cmd(DhtCmd),
     Io(DhtIo),
-    Tick { now_tick: u64 },
+    Clock { now_secs: u64 },
+    Tick { now_tick: u64, now_secs: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -67,11 +68,20 @@ pub enum DhtOutput {
 #[derive(Debug, Clone)]
 pub enum DhtOutputValue {
     Unit,
+    PutStored {
+        stats: DhtPutStats,
+    },
     GetValues {
         values: Vec<DhtEntry>,
         stats: DhtGetStats,
     },
     RoutingTableSize(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DhtPutStats {
+    pub remote_attempt_count: usize,
+    pub remote_store_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,15 +132,19 @@ pub enum RpcPhase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StorageStage {
+    PutRevision,
     PutLocalRead,
     PutLocalWrite,
+    PutLocalMerge,
     GetLocalRead,
     InboundGetRead,
     InboundPutRead,
     InboundPutWrite,
+    InboundPutMerge,
     CleanupIter,
     CleanupWrite,
     CleanupDelete,
+    CleanupPrune,
 }
 
 #[derive(Debug, Clone)]
@@ -155,12 +169,24 @@ pub enum DhtIoRequest {
         stage: StorageStage,
         key: DhtKeyId,
         realm_filter: Option<RealmId>,
+        now_secs: u64,
+    },
+    StorageRevision {
+        op_id: OpId,
+        stage: StorageStage,
     },
     StorageWrite {
         op_id: OpId,
         stage: StorageStage,
         key: DhtKeyId,
         entries: Vec<StoredEntry>,
+    },
+    StorageMerge {
+        op_id: OpId,
+        stage: StorageStage,
+        key: DhtKeyId,
+        entry: StoredEntry,
+        now_secs: u64,
     },
     StorageDelete {
         op_id: OpId,
@@ -172,10 +198,18 @@ pub enum DhtIoRequest {
         stage: StorageStage,
         start_after: Option<Vec<u8>>,
         limit: usize,
+        now_secs: u64,
+    },
+    StoragePrune {
+        op_id: OpId,
+        stage: StorageStage,
+        key: DhtKeyId,
+        now_secs: u64,
     },
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum DhtIo {
     RpcResponse {
         op_id: OpId,
@@ -206,6 +240,11 @@ pub enum DhtIo {
         op_id: OpId,
         stage: StorageStage,
         entries: Vec<StoredEntry>,
+    },
+    StorageRevisionResult {
+        op_id: OpId,
+        stage: StorageStage,
+        revision: u64,
     },
     StorageWriteResult {
         op_id: OpId,
@@ -245,6 +284,10 @@ pub enum DhtIoError {
     Storage(String),
     #[error("invalid response: {0}")]
     InvalidResponse(String),
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+    #[error("storage full")]
+    StorageFull,
 }
 
 impl DhtIoError {
@@ -258,6 +301,10 @@ impl DhtIoError {
 
     pub fn invalid_response(error: impl std::fmt::Display) -> Self {
         Self::InvalidResponse(error.to_string())
+    }
+
+    pub fn invalid_request(error: impl std::fmt::Display) -> Self {
+        Self::InvalidRequest(error.to_string())
     }
 }
 

@@ -22,9 +22,10 @@ pub enum DhtRequest {
         key: DhtKeyId,
         realm_id: RealmId,
         value: Vec<u8>,
-        ttl_secs: u64,
+        expires_at: u64,
+        revision: u64,
         publisher: NodeId,
-        /// Optional Ed25519 signature over (key || value || ttl_secs)
+        /// Required Ed25519 signature over the complete record envelope.
         signature: Option<iroh::Signature>,
     },
 }
@@ -73,22 +74,56 @@ pub struct StoredValue {
     pub realm_id: RealmId,
     pub value: Vec<u8>,
     pub expires_at: u64,
-    /// Optional Ed25519 signature for publisher verification
-    pub signature: Option<iroh::Signature>,
+    pub revision: u64,
+    pub signature: iroh::Signature,
 }
 
-pub fn signed_put_value_bytes(
+pub fn signed_record_bytes(
     key: &DhtKeyId,
+    publisher: &NodeId,
     realm_id: &RealmId,
     value: &[u8],
-    ttl_secs: u64,
+    expires_at: u64,
+    revision: u64,
 ) -> Vec<u8> {
-    let mut signed_data = Vec::with_capacity(32 + 32 + value.len() + 8);
+    const SIGNING_CONTEXT: &[u8] = b"aruna/dht/2/record";
+
+    let mut signed_data =
+        Vec::with_capacity(SIGNING_CONTEXT.len() + 32 + 32 + 32 + 8 + 8 + 8 + value.len());
+    signed_data.extend_from_slice(SIGNING_CONTEXT);
     signed_data.extend_from_slice(key.as_bytes());
+    signed_data.extend_from_slice(publisher.as_bytes());
     signed_data.extend_from_slice(realm_id.as_bytes());
+    signed_data.extend_from_slice(&expires_at.to_le_bytes());
+    signed_data.extend_from_slice(&revision.to_le_bytes());
+    signed_data.extend_from_slice(&(value.len() as u64).to_le_bytes());
     signed_data.extend_from_slice(value);
-    signed_data.extend_from_slice(&ttl_secs.to_le_bytes());
     signed_data
+}
+
+pub fn verify_stored_value(key: &DhtKeyId, entry: &StoredValue) -> bool {
+    verify_record(
+        key,
+        &entry.publisher,
+        &entry.realm_id,
+        &entry.value,
+        entry.expires_at,
+        entry.revision,
+        &entry.signature,
+    )
+}
+
+pub fn verify_record(
+    key: &DhtKeyId,
+    publisher: &NodeId,
+    realm_id: &RealmId,
+    value: &[u8],
+    expires_at: u64,
+    revision: u64,
+    signature: &iroh::Signature,
+) -> bool {
+    let signed_data = signed_record_bytes(key, publisher, realm_id, value, expires_at, revision);
+    publisher.verify(&signed_data, signature).is_ok()
 }
 
 /// Serialize a request to bytes
@@ -131,6 +166,8 @@ pub fn decode_response(bytes: &[u8]) -> Result<DhtResponse, postcard::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dht::constants::{MAX_MESSAGE_SIZE, MAX_STORED_VALUE_SIZE};
+    use crate::dht::kbucket::K;
 
     fn make_node(bytes: [u8; 32]) -> NodeId {
         NodeId::from_bytes(&bytes).expect("valid test key")
@@ -214,16 +251,19 @@ mod tests {
         let key = DhtKeyId::from_data(b"signed-put");
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let value = b"payload".to_vec();
-        let ttl_secs: u64 = 42;
+        let expires_at: u64 = 42;
+        let revision = 7;
 
-        let signed_data = signed_put_value_bytes(&key, &realm_id, &value, ttl_secs);
+        let signed_data =
+            signed_record_bytes(&key, &publisher, &realm_id, &value, expires_at, revision);
         let signature = publisher_secret.sign(&signed_data);
 
         let req = DhtRequest::PutValue {
             key,
             realm_id,
             value: value.clone(),
-            ttl_secs,
+            expires_at,
+            revision,
             publisher,
             signature: Some(signature),
         };
@@ -235,21 +275,25 @@ mod tests {
                 key: decoded_key,
                 realm_id: decoded_realm_id,
                 value: decoded_value,
-                ttl_secs: decoded_ttl,
+                expires_at: decoded_expiry,
+                revision: decoded_revision,
                 publisher: decoded_publisher,
                 signature: Some(decoded_signature),
             } => {
                 assert_eq!(decoded_key, key);
                 assert_eq!(decoded_realm_id, realm_id);
                 assert_eq!(decoded_value, value);
-                assert_eq!(decoded_ttl, ttl_secs);
+                assert_eq!(decoded_expiry, expires_at);
+                assert_eq!(decoded_revision, revision);
                 assert_eq!(decoded_publisher, publisher);
 
-                let verify_data = signed_put_value_bytes(
+                let verify_data = signed_record_bytes(
                     &decoded_key,
+                    &decoded_publisher,
                     &decoded_realm_id,
                     &decoded_value,
-                    decoded_ttl,
+                    decoded_expiry,
+                    decoded_revision,
                 );
                 assert!(
                     decoded_publisher
@@ -259,5 +303,10 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn wire_limit_enforced() {
+        const { assert!(MAX_STORED_VALUE_SIZE + K * 32 + 1024 <= MAX_MESSAGE_SIZE) };
     }
 }

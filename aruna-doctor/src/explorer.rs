@@ -533,7 +533,9 @@ impl PartialEq for JsonStoredEntry {
             && self.0.realm_id == other.0.realm_id
             && self.0.value == other.0.value
             && self.0.expires_at == other.0.expires_at
+            && self.0.revision == other.0.revision
             && self.0.signature == other.0.signature
+            && self.0.retain_until == other.0.retain_until
     }
 }
 
@@ -542,18 +544,13 @@ impl Serialize for JsonStoredEntry {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("StoredEntry", 6)?;
+        let mut state = serializer.serialize_struct("StoredEntry", 8)?;
         state.serialize_field("publisher", &self.0.publisher.to_string())?;
         state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
         state.serialize_field("expires_at", &self.0.expires_at)?;
-        state.serialize_field(
-            "signature",
-            &self
-                .0
-                .signature
-                .as_ref()
-                .map(std::string::ToString::to_string),
-        )?;
+        state.serialize_field("revision", &self.0.revision)?;
+        state.serialize_field("retain_until", &self.0.retain_until)?;
+        state.serialize_field("signature", &self.0.signature.to_string())?;
         state.serialize_field("value_len", &self.0.value.len())?;
         state.serialize_field("value_hex", &hex::encode(&self.0.value))?;
         state.end()
@@ -1707,16 +1704,28 @@ mod tests {
     }
 
     #[test]
-    fn decodes_dht_entries_and_key() {
+    fn decodes_dht_entry() {
         let key = DhtKeyId::from_bytes([6_u8; 32]);
         let realm_id = RealmId::from_bytes([7_u8; 32]);
-        let publisher = iroh::SecretKey::from_bytes(&[5_u8; 32]).public();
+        let publisher_secret = iroh::SecretKey::from_bytes(&[5_u8; 32]);
+        let publisher = publisher_secret.public();
+        let revision = 1;
+        let signed = aruna_net::dht::rpc::signed_record_bytes(
+            &key,
+            &publisher,
+            &realm_id,
+            &[1, 2, 3, 4],
+            42,
+            revision,
+        );
         let entries = vec![StoredEntry {
             publisher,
             realm_id,
             value: vec![1, 2, 3, 4],
             expires_at: 42,
-            signature: None,
+            revision,
+            signature: publisher_secret.sign(&signed),
+            retain_until: 42,
         }];
         let value = postcard::to_allocvec(&entries).unwrap();
 

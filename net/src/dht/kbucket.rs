@@ -25,8 +25,8 @@ impl PeerInfo {
         }
     }
 
-    pub fn touch(&mut self) {
-        self.last_seen = self.last_seen.saturating_add(1);
+    pub fn seen(node_id: NodeId, last_seen: u64) -> Self {
+        Self { node_id, last_seen }
     }
 }
 
@@ -61,9 +61,12 @@ impl KBucket {
     pub fn insert(&mut self, peer: PeerInfo) -> InsertResult {
         // Check if peer already exists
         if let Some(pos) = self.peers.iter().position(|p| p.node_id == peer.node_id) {
+            if peer.last_seen <= self.peers[pos].last_seen {
+                return InsertResult::Updated;
+            }
             // Move to back (most recently seen) and update
             let mut existing = self.peers.remove(pos).expect("position valid");
-            existing.touch();
+            existing.last_seen = peer.last_seen;
             self.peers.push_back(existing);
             return InsertResult::Updated;
         }
@@ -103,6 +106,14 @@ impl KBucket {
         } else {
             None
         }
+    }
+
+    pub fn remove_seen(&mut self, node_id: &NodeId, last_seen: u64) -> Option<PeerInfo> {
+        let position = self
+            .peers
+            .iter()
+            .position(|peer| &peer.node_id == node_id && peer.last_seen == last_seen)?;
+        self.peers.remove(position)
     }
 }
 
@@ -165,6 +176,11 @@ impl RoutingTable {
     pub fn remove(&mut self, node_id: &NodeId) -> Option<PeerInfo> {
         let idx = self.bucket_index(node_id)?;
         self.buckets[idx].remove(node_id)
+    }
+
+    pub fn remove_seen(&mut self, node_id: &NodeId, last_seen: u64) -> Option<PeerInfo> {
+        let idx = self.bucket_index(node_id)?;
+        self.buckets[idx].remove_seen(node_id, last_seen)
     }
 
     /// Evict the oldest peer from a specific bucket
@@ -239,6 +255,21 @@ mod tests {
         // Update same peer
         assert!(matches!(bucket.insert(peer), InsertResult::Updated));
         assert_eq!(bucket.len(), 1);
+    }
+
+    #[test]
+    fn stale_epoch_ignored() {
+        let mut bucket = KBucket::new();
+        let first = make_node(1);
+        let second = make_node(2);
+        bucket.insert(PeerInfo::seen(first, 10));
+        bucket.insert(PeerInfo::seen(second, 11));
+        bucket.insert(PeerInfo::seen(first, 9));
+
+        let peers = bucket.peers().collect::<Vec<_>>();
+        assert_eq!(peers[0].node_id, first);
+        assert_eq!(peers[0].last_seen, 10);
+        assert_eq!(peers[1].node_id, second);
     }
 
     #[test]

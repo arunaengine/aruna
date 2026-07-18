@@ -13,7 +13,7 @@ use tracing::{info, trace, warn};
 
 use super::constants::{CMD_CHANNEL_CAPACITY, INBOUND_STREAM_CAPACITY};
 use super::driver::{CallerOutcome, DhtDriver, DriverCmd, DriverCmdSender, InboundSender};
-use super::protocol::{DhtIoError, DhtOutputValue};
+use super::protocol::{DhtIoError, DhtOutputValue, DhtPutStats};
 use super::state::DhtStateMachine;
 use super::storage::now_unix_secs;
 use crate::connection_pool::ConnectionPool;
@@ -111,7 +111,7 @@ impl DhtHandle {
         realm_id: RealmId,
         value: Vec<u8>,
         ttl: Duration,
-    ) -> Result<()> {
+    ) -> Result<DhtPutStats> {
         trace!(
             event = "dht.put.started",
             key = %key,
@@ -131,9 +131,9 @@ impl DhtHandle {
             })
             .await?
         {
-            DhtOutputValue::Unit => {
+            DhtOutputValue::PutStored { stats } => {
                 trace!(event = "dht.put.completed", key = %key, "Completed DHT put");
-                Ok(())
+                Ok(stats)
             }
             other => Err(NetError::Dht(format!(
                 "unexpected DHT put output: {other:?}"

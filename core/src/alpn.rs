@@ -20,7 +20,7 @@ pub enum Alpn {
 impl Alpn {
     pub const fn as_bytes(&self) -> &'static [u8] {
         match self {
-            Alpn::Dht => b"aruna/dht/1",
+            Alpn::Dht => b"aruna/dht/2",
             Alpn::Bao => b"aruna/bao/1",
             Alpn::DocumentSync => irokle::net::IROKLE_SYNC_ALPN,
             Alpn::Metadata => b"aruna/metadata/1",
@@ -32,7 +32,7 @@ impl Alpn {
 
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         match bytes {
-            b"aruna/dht/1" => Some(Alpn::Dht),
+            b"aruna/dht/2" => Some(Alpn::Dht),
             b"aruna/bao/1" => Some(Alpn::Bao),
             irokle::net::IROKLE_SYNC_ALPN => Some(Alpn::DocumentSync),
             b"aruna/metadata/1" => Some(Alpn::Metadata),
@@ -47,7 +47,7 @@ impl Alpn {
 impl std::fmt::Display for Alpn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Alpn::Dht => write!(f, "aruna/dht/1"),
+            Alpn::Dht => write!(f, "aruna/dht/2"),
             Alpn::Bao => write!(f, "aruna/bao/1"),
             Alpn::DocumentSync => match std::str::from_utf8(irokle::net::IROKLE_SYNC_ALPN) {
                 Ok(value) => write!(f, "{value}"),
