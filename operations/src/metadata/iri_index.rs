@@ -190,24 +190,35 @@ pub(crate) async fn rebuild_metadata_iri_reference_index(
         written = written.saturating_add(projected.len());
     }
 
-    // Drop rows left under prior cursors for the documents just rebuilt so the
-    // index and the predicate-less backlink scan stay bounded.
-    let stale = superseded_iri_reference_keys(&context.storage_handle, None, &reprojected).await?;
+    // Re-read the registry so cleanup keys deletion on the current cursor: a
+    // materialization that advanced a document mid-rebuild keeps its fresh rows,
+    // while rows for documents gone from the registry are pruned.
+    let registered = metadata_handle
+        .list_cached_registry_records()
+        .await?
+        .iter()
+        .map(|record| (record.document_id, record.last_event_id))
+        .collect::<HashMap<_, _>>();
+    let stale =
+        stale_rebuild_iri_reference_keys(&context.storage_handle, &reprojected, &registered)
+            .await?;
     delete_iri_reference_keys(&context.storage_handle, stale).await?;
 
     Ok(written)
 }
 
-/// Keys of index rows whose document is re-projected under a newer cursor.
-/// Superseded rows are already fenced from results but bloat storage and the
-/// predicate-less scan, so callers delete them alongside the current projection.
-pub(crate) async fn superseded_iri_reference_keys(
+/// Scans the IRI reference index and returns the keyspace-qualified keys for
+/// which `select` accepts the row's document id and cursor.
+async fn select_iri_reference_keys<F>(
     storage: &StorageHandle,
     txn_id: Option<Ulid>,
-    current_cursors: &HashMap<Ulid, Ulid>,
-) -> Result<Vec<(String, ByteView)>, MetadataError> {
+    mut select: F,
+) -> Result<Vec<(String, ByteView)>, MetadataError>
+where
+    F: FnMut(Ulid, Ulid) -> bool,
+{
     let mut start_after = None;
-    let mut stale = Vec::new();
+    let mut selected = Vec::new();
     loop {
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
@@ -234,11 +245,9 @@ pub(crate) async fn superseded_iri_reference_keys(
         };
         for (key, _) in values {
             if let Some((document_id, cursor)) = metadata_iri_reference_key_ids(key.as_ref())
-                && current_cursors
-                    .get(&document_id)
-                    .is_some_and(|current| *current != cursor)
+                && select(document_id, cursor)
             {
-                stale.push((METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(), key));
+                selected.push((METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(), key));
             }
         }
         match next_start_after {
@@ -246,10 +255,54 @@ pub(crate) async fn superseded_iri_reference_keys(
             None => break,
         }
     }
-    Ok(stale)
+    Ok(selected)
 }
 
-async fn delete_iri_reference_keys(
+/// Keys of index rows whose document is re-projected under a newer cursor.
+/// Superseded rows are already fenced from results but bloat storage and the
+/// predicate-less scan, so callers delete them alongside the current projection.
+pub(crate) async fn superseded_iri_reference_keys(
+    storage: &StorageHandle,
+    txn_id: Option<Ulid>,
+    current_cursors: &HashMap<Ulid, Ulid>,
+) -> Result<Vec<(String, ByteView)>, MetadataError> {
+    select_iri_reference_keys(storage, txn_id, |document_id, cursor| {
+        current_cursors
+            .get(&document_id)
+            .is_some_and(|current| *current != cursor)
+    })
+    .await
+}
+
+/// Keys the full rebuild must drop. A row survives only at the cursor the
+/// rebuild just projected or the document's current registry cursor, so a
+/// materialization that raced ahead keeps its rows; rows for documents in
+/// neither map (deleted or reverted) are pruned.
+async fn stale_rebuild_iri_reference_keys(
+    storage: &StorageHandle,
+    reprojected: &HashMap<Ulid, Ulid>,
+    registered: &HashMap<Ulid, Ulid>,
+) -> Result<Vec<(String, ByteView)>, MetadataError> {
+    select_iri_reference_keys(storage, None, |document_id, cursor| {
+        reprojected.get(&document_id) != Some(&cursor)
+            && registered.get(&document_id) != Some(&cursor)
+    })
+    .await
+}
+
+/// Keys for the given documents at every cursor, so a deletion can prune the
+/// rows it would otherwise leak into the predicate-less backlink scan.
+pub(crate) async fn document_iri_reference_keys(
+    storage: &StorageHandle,
+    document_ids: &BTreeSet<Ulid>,
+) -> Result<Vec<(String, ByteView)>, MetadataError> {
+    select_iri_reference_keys(storage, None, |document_id, _| {
+        document_ids.contains(&document_id)
+    })
+    .await
+}
+
+pub(crate) async fn delete_iri_reference_keys(
     storage: &StorageHandle,
     keys: Vec<(String, ByteView)>,
 ) -> Result<(), MetadataError> {
@@ -398,7 +451,30 @@ async fn write_metadata_iri_references(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::storage_entries::metadata_iri_reference_key;
     use aruna_core::structs::{PlacementRef, RealmId};
+    use aruna_storage::FjallStorage;
+
+    fn index_key(document_id: Ulid, cursor: Ulid) -> ByteView {
+        metadata_iri_reference_key("p", "o", document_id, cursor)
+    }
+
+    async fn write_index_row(storage: &StorageHandle, document_id: Ulid, cursor: Ulid) {
+        match storage
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes: vec![(
+                    METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
+                    index_key(document_id, cursor),
+                    ByteView::from(vec![1u8]),
+                )],
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+            other => panic!("unexpected write event: {other:?}"),
+        }
+    }
 
     fn registry_record(document_id: Ulid, cursor: Ulid) -> MetadataRegistryRecord {
         let realm_id = RealmId::from_bytes([7u8; 32]);
@@ -564,5 +640,71 @@ mod tests {
             filtered[0].subject_iris,
             vec!["https://example.test/root".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn keeps_raced_cursor() {
+        // A cursor a concurrent materialization advanced past the reprojected one
+        // survives cleanup; only genuinely older rows are dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let doc = Ulid::from_parts(5, 1);
+        let ancient = Ulid::from_parts(1, 1);
+        let reprojected_cursor = Ulid::from_parts(2, 1);
+        let raced = Ulid::from_parts(3, 1);
+        for cursor in [ancient, reprojected_cursor, raced] {
+            write_index_row(&storage, doc, cursor).await;
+        }
+        let reprojected = HashMap::from([(doc, reprojected_cursor)]);
+        let registered = HashMap::from([(doc, raced)]);
+
+        let stale = stale_rebuild_iri_reference_keys(&storage, &reprojected, &registered)
+            .await
+            .unwrap();
+        let keys: Vec<ByteView> = stale.into_iter().map(|(_, key)| key).collect();
+        assert_eq!(keys, vec![index_key(doc, ancient)]);
+    }
+
+    #[tokio::test]
+    async fn prunes_deleted_docs() {
+        // A document gone from the registry has all its rows marked stale.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let live = Ulid::from_parts(1, 1);
+        let gone = Ulid::from_parts(2, 1);
+        let cursor = Ulid::from_parts(3, 1);
+        write_index_row(&storage, live, cursor).await;
+        write_index_row(&storage, gone, cursor).await;
+        let reprojected = HashMap::from([(live, cursor)]);
+        let registered = HashMap::from([(live, cursor)]);
+
+        let stale = stale_rebuild_iri_reference_keys(&storage, &reprojected, &registered)
+            .await
+            .unwrap();
+        let keys: Vec<ByteView> = stale.into_iter().map(|(_, key)| key).collect();
+        assert_eq!(keys, vec![index_key(gone, cursor)]);
+    }
+
+    #[tokio::test]
+    async fn deletes_document_rows() {
+        // The deletion path collects every cursor's rows for the given documents.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let deleted = Ulid::from_parts(1, 1);
+        let kept = Ulid::from_parts(2, 1);
+        let first = Ulid::from_parts(1, 1);
+        let second = Ulid::from_parts(2, 1);
+        write_index_row(&storage, deleted, first).await;
+        write_index_row(&storage, deleted, second).await;
+        write_index_row(&storage, kept, first).await;
+        let targets = BTreeSet::from([deleted]);
+
+        let keys = document_iri_reference_keys(&storage, &targets)
+            .await
+            .unwrap();
+        let keys: Vec<ByteView> = keys.into_iter().map(|(_, key)| key).collect();
+        assert!(keys.contains(&index_key(deleted, first)));
+        assert!(keys.contains(&index_key(deleted, second)));
+        assert!(!keys.contains(&index_key(kept, first)));
     }
 }
