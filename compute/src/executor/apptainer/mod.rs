@@ -667,7 +667,7 @@ fn validate_spec(context: &FenceContext, spec: &TaskSpec) -> Result<(), BackendE
     StageLayout::from_spec(spec)?;
     check_identity(spec.security.run_as, process_identity())?;
     match (spec.staging_mode, spec.security.network) {
-        (StagingMode::Files, NetworkAccess::Isolated)
+        (StagingMode::Files, NetworkAccess::Isolated | NetworkAccess::Open)
         | (StagingMode::DirectS3, NetworkAccess::Open) => {}
         (StagingMode::DirectS3, _) => {
             return Err(BackendError::InvalidSpec(
@@ -676,7 +676,7 @@ fn validate_spec(context: &FenceContext, spec: &TaskSpec) -> Result<(), BackendE
         }
         (StagingMode::Files, _) => {
             return Err(BackendError::InvalidSpec(
-                "Files staging requires isolated networking".to_string(),
+                "Files staging does not support S3-only networking".to_string(),
             ));
         }
     }

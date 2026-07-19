@@ -1116,7 +1116,10 @@ fn validate_spec(
         ));
     }
     match (spec.staging_mode, spec.security.network) {
-        (StagingMode::Files, aruna_core::compute::NetworkAccess::Isolated) => {}
+        (
+            StagingMode::Files,
+            aruna_core::compute::NetworkAccess::Isolated | aruna_core::compute::NetworkAccess::Open,
+        ) => {}
         (StagingMode::DirectS3, aruna_core::compute::NetworkAccess::S3Only)
             if !config.s3_cidrs.is_empty() => {}
         (StagingMode::DirectS3, _) => {
@@ -1126,7 +1129,7 @@ fn validate_spec(
         }
         (StagingMode::Files, _) => {
             return Err(BackendError::InvalidSpec(
-                "Files staging requires isolated networking".to_string(),
+                "Files staging does not support S3-only networking".to_string(),
             ));
         }
     }

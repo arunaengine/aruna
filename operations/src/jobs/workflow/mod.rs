@@ -11,8 +11,8 @@ use aruna_compute::ExecutorBackend;
 use aruna_compute::executor::logs::NullSink;
 use aruna_core::compute::{
     AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind,
-    FenceContext, LogLimits, LogTails, ReconcileEvidence, ResourceRequest, SecurityContext,
-    StagingMode, TaskInput, TaskSpec, TombstoneSpec, UserSpec,
+    FenceContext, LogLimits, LogTails, NetworkAccess, ReconcileEvidence, ResourceRequest,
+    SecurityContext, StagingMode, TaskInput, TaskSpec, TombstoneSpec, UserSpec,
 };
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
@@ -45,6 +45,7 @@ use workspace::{
 /// Fallback walltime when a spec declares none. Enforcement, reconcile
 /// validation, and credential expiry must all agree on this value.
 pub(crate) const DEFAULT_WALLTIME: Duration = Duration::from_secs(24 * 60 * 60);
+const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
 
 /// Drive a claimed execution job through prepare -> submit -> supervise -> finalize.
 /// External attempts never share the generic in-process supervisor because a lost
@@ -381,6 +382,15 @@ fn build_task_spec(
         workspace: None,
         security: SecurityContext {
             run_as,
+            network: if spec
+                .tags
+                .get(NETWORK_TAG_KEY)
+                .is_some_and(|value| value == "open")
+            {
+                NetworkAccess::Open
+            } else {
+                NetworkAccess::Isolated
+            },
             ..Default::default()
         },
         log_limits: Default::default(),
@@ -2058,5 +2068,22 @@ mod tests {
         );
 
         assert_eq!(spec.security.run_as, run_as);
+    }
+
+    #[test]
+    fn carries_requested_network_access() {
+        let mut execution = execution_spec();
+        execution
+            .tags
+            .insert(NETWORK_TAG_KEY.to_string(), "open".to_string());
+        let spec = build_task_spec(
+            &execution,
+            &AttemptRef::new("job", 1),
+            "alpine@sha256:digest",
+            Vec::new(),
+            NOBODY,
+        );
+
+        assert_eq!(spec.security.network, NetworkAccess::Open);
     }
 }

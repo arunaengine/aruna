@@ -19,9 +19,10 @@ reference.
 
 Docker and Kubernetes tasks run as `65534:65534`, without Linux capabilities or
 privilege escalation, with runtime-default seccomp and no service-account token.
-Network access is isolated for Files staging. Direct-S3 is explicit: Docker and
-Apptainer require open networking, while Kubernetes restricts task egress to the
-configured S3 CIDRs and port. Stage and fetch helpers never receive S3
+Network access is isolated for Files staging unless a task explicitly carries
+the `aruna-engine.org/network=open` execution tag. Direct-S3 is explicit: Docker
+and Apptainer require open networking, while Kubernetes restricts task egress to
+the configured S3 CIDRs and port. Stage and fetch helpers never receive S3
 credentials.
 
 Every external attempt has an immutable attempt epoch and a monotone controller
