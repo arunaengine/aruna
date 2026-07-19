@@ -13,6 +13,15 @@ pub enum SyncMode {
     Continuous,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceHandling {
+    #[default]
+    Materialize,
+    Preserve,
+    Skip,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncState {
@@ -52,6 +61,8 @@ pub struct SyncRelationship {
     pub source: ArunaArn,
     pub target: ArunaArn,
     pub mode: SyncMode,
+    pub reference_handling: ReferenceHandling,
+    pub reference_serving: bool,
     pub replicate_deletes: bool,
     pub created_by: UserId,
     pub created_at: SystemTime,
@@ -60,12 +71,36 @@ pub struct SyncRelationship {
 }
 
 impl SyncRelationship {
+    pub fn serves_references(&self) -> bool {
+        self.reference_serving
+    }
+
+    pub fn set_reference_handling(&mut self, handling: ReferenceHandling) {
+        self.reference_serving |= handling == ReferenceHandling::Preserve;
+        self.reference_handling = handling;
+    }
+
     pub fn validate(&self) -> Result<(), ConversionError> {
         validate_endpoint(&self.source, "source")?;
         validate_endpoint(&self.target, "target")?;
         if self.source == self.target {
             return Err(ConversionError::FromStrError(
                 "sync source and target must differ".to_string(),
+            ));
+        }
+        if self.mode == SyncMode::Reference
+            && self.reference_handling != ReferenceHandling::Preserve
+        {
+            return Err(ConversionError::FromStrError(
+                "reference sync mode requires preserve reference handling".to_string(),
+            ));
+        }
+        if (self.mode == SyncMode::Reference
+            || self.reference_handling == ReferenceHandling::Preserve)
+            && !self.reference_serving
+        {
+            return Err(ConversionError::FromStrError(
+                "preserved references require serving capability".to_string(),
             ));
         }
         Ok(())
@@ -94,6 +129,19 @@ pub fn sync_relationship_key(bucket: &str, id: Ulid) -> Vec<u8> {
     let mut key = sync_relationship_prefix(bucket);
     key.extend_from_slice(&id.to_bytes());
     key
+}
+
+pub fn sync_state_key(
+    relationship_id: Ulid,
+    bucket: &str,
+    key: &str,
+    version_id: Ulid,
+) -> Result<Vec<u8>, ConversionError> {
+    let version_key = crate::structs::VersionKey::new(bucket, key, version_id).to_bytes()?;
+    let mut key = Vec::with_capacity(16 + version_key.len());
+    key.extend_from_slice(&relationship_id.to_bytes());
+    key.extend_from_slice(&version_key);
+    Ok(key)
 }
 
 fn validate_endpoint(arn: &ArunaArn, endpoint: &str) -> Result<(), ConversionError> {
@@ -128,6 +176,8 @@ mod tests {
             .unwrap(),
             target: ArunaArn::s3_bucket(realm_id, test_node(4), "target-bucket").unwrap(),
             mode: SyncMode::Continuous,
+            reference_handling: ReferenceHandling::Materialize,
+            reference_serving: false,
             replicate_deletes: true,
             created_by: UserId::local(Ulid::from_bytes([5u8; 16]), realm_id),
             created_at: SystemTime::UNIX_EPOCH,
@@ -153,6 +203,18 @@ mod tests {
     }
 
     #[test]
+    fn preserve_serves_references() {
+        let mut relationship = relationship();
+        assert!(!relationship.serves_references());
+
+        relationship.set_reference_handling(ReferenceHandling::Preserve);
+        assert!(relationship.serves_references());
+
+        relationship.set_reference_handling(ReferenceHandling::Materialize);
+        assert!(relationship.serves_references());
+    }
+
+    #[test]
     fn rejects_non_s3() {
         let mut relationship = relationship();
         relationship.source = ArunaArn::new(
@@ -172,6 +234,16 @@ mod tests {
         relationship.target = relationship.source.clone();
 
         assert!(relationship.to_bytes().is_err());
+    }
+
+    #[test]
+    fn reference_requires_preserve() {
+        let mut relationship = relationship();
+        relationship.mode = SyncMode::Reference;
+
+        assert!(relationship.to_bytes().is_err());
+        relationship.set_reference_handling(ReferenceHandling::Preserve);
+        assert!(relationship.to_bytes().is_ok());
     }
 
     #[test]

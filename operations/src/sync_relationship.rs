@@ -4,7 +4,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    SyncMode, SyncRelationship, SyncState, sync_relationship_key, sync_relationship_prefix,
+    SyncRelationship, SyncState, sync_relationship_key, sync_relationship_prefix,
 };
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use aruna_storage::StorageHandle;
@@ -111,7 +111,7 @@ pub async fn create_sync_relationship(
 
 /// Removes an outgoing relationship on behalf of a delete flow.
 ///
-/// Reference relationships are detached instead of deleted: the target keeps
+/// Relationships serving references are detached instead of deleted: the target keeps
 /// `BlobVersion::Reference` records bound to this relationship id, and the
 /// native reference path authorizes every read through the outgoing record,
 /// so a serving-only stub must survive for the retained data to stay
@@ -120,7 +120,7 @@ pub async fn remove_outgoing_relationship(
     context: &crate::driver::DriverContext,
     relationship: SyncRelationship,
 ) -> Result<(), SyncRelationshipError> {
-    if relationship.mode == SyncMode::Reference {
+    if relationship.serves_references() {
         let stub = SyncRelationship {
             state: SyncState::Detached,
             ..relationship
@@ -714,6 +714,8 @@ mod tests {
                 .unwrap(),
             target: ArunaArn::s3_object_prefix(realm_id, test_node(3), target, "replica/").unwrap(),
             mode: SyncMode::Continuous,
+            reference_handling: Default::default(),
+            reference_serving: false,
             replicate_deletes: true,
             created_by: UserId::local(Ulid::from_bytes([4u8; 16]), realm_id),
             created_at: SystemTime::UNIX_EPOCH,

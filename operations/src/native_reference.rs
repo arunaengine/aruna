@@ -8,7 +8,7 @@ use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{Event, StagingSourceEvent};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
-    AuthContext, Permission, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata, SyncMode,
+    AuthContext, Permission, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata,
     SyncRelationship, SyncState, blob_object_permission_path,
 };
 use aruna_net::NetHandle;
@@ -424,7 +424,7 @@ fn validate_relationship(
     // Detached stubs are deleted relationships that must keep serving the
     // reference records the target retained; every other non-enabled state
     // still refuses access.
-    if relationship.mode != SyncMode::Reference
+    if !relationship.serves_references()
         || !matches!(relationship.state, SyncState::Enabled | SyncState::Detached)
         || relationship.source.realm_id != *net_handle.realm_id()
         || relationship.source.node_id != net_handle.node_id()
@@ -581,6 +581,9 @@ fn close_stream(stream: &mut BiStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::structs::{ArunaArn, ReferenceHandling, SyncMode, SyncStatusSnapshot};
+    use aruna_net::NetConfig;
+    use aruna_storage::storage::FjallStorage;
 
     #[test]
     fn request_roundtrips() {
@@ -613,5 +616,44 @@ mod tests {
             postcard::from_bytes::<NativeReferenceResponse>(&bytes).unwrap(),
             response
         );
+    }
+
+    #[tokio::test]
+    async fn preserve_allows_native() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let net = NetHandle::new(NetConfig::default(), storage).await.unwrap();
+        let peer = iroh::SecretKey::generate().public();
+        let realm_id = *net.realm_id();
+        let mut relationship = SyncRelationship {
+            id: Ulid::generate(),
+            source: ArunaArn::s3_bucket(realm_id, net.node_id(), "source").unwrap(),
+            target: ArunaArn::s3_bucket(realm_id, peer, "target").unwrap(),
+            mode: SyncMode::Continuous,
+            reference_handling: ReferenceHandling::Materialize,
+            reference_serving: false,
+            replicate_deletes: true,
+            created_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            state: SyncState::Enabled,
+            status: SyncStatusSnapshot::default(),
+        };
+        let request = NativeReferenceRequest {
+            relationship_id: relationship.id,
+            bucket: "source".to_string(),
+            key: "data.txt".to_string(),
+            version_id: Ulid::generate(),
+            head: true,
+            range: None,
+        };
+
+        assert_eq!(
+            validate_relationship(&net, peer, &relationship, &request),
+            Err(NativeReferenceReject::AccessDenied)
+        );
+        relationship.set_reference_handling(ReferenceHandling::Preserve);
+        assert!(validate_relationship(&net, peer, &relationship, &request).is_ok());
+        relationship.set_reference_handling(ReferenceHandling::Materialize);
+        assert!(validate_relationship(&net, peer, &relationship, &request).is_ok());
     }
 }

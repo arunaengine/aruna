@@ -4,8 +4,8 @@ use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::{
-    ArunaArn, AuthContext, BucketInfo, Permission, SyncMode, SyncRelationship, SyncState,
-    SyncStatusSnapshot, blob_bucket_permission_path, ensure_confined_relative_path,
+    ArunaArn, AuthContext, BucketInfo, Permission, ReferenceHandling, SyncMode, SyncRelationship,
+    SyncState, SyncStatusSnapshot, blob_bucket_permission_path, ensure_confined_relative_path,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::driver::drive;
@@ -42,7 +42,7 @@ use utoipa::{OpenApi, ToSchema};
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "sync", description = "S3 bucket synchronization")),
-    paths(create_sync, list_sync, get_sync, run_sync, delete_sync)
+    paths(create_sync, list_sync, get_sync, update_sync, run_sync, delete_sync)
 )]
 pub struct SyncApiDoc;
 
@@ -51,7 +51,7 @@ pub fn router() -> Router<Arc<ServerState>> {
         .route("/data/sync-relationships", post(create_sync).get(list_sync))
         .route(
             "/data/sync-relationships/{id}",
-            get(get_sync).delete(delete_sync),
+            get(get_sync).patch(update_sync).delete(delete_sync),
         )
         .route("/data/sync-relationships/{id}/run", post(run_sync))
 }
@@ -99,11 +99,42 @@ impl From<SyncMode> for ApiSyncMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiReferenceHandling {
+    #[default]
+    Materialize,
+    Preserve,
+    Skip,
+}
+
+impl From<ApiReferenceHandling> for ReferenceHandling {
+    fn from(value: ApiReferenceHandling) -> Self {
+        match value {
+            ApiReferenceHandling::Materialize => Self::Materialize,
+            ApiReferenceHandling::Preserve => Self::Preserve,
+            ApiReferenceHandling::Skip => Self::Skip,
+        }
+    }
+}
+
+impl From<ReferenceHandling> for ApiReferenceHandling {
+    fn from(value: ReferenceHandling) -> Self {
+        match value {
+            ReferenceHandling::Materialize => Self::Materialize,
+            ReferenceHandling::Preserve => Self::Preserve,
+            ReferenceHandling::Skip => Self::Skip,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
 pub struct CreateSyncRequest {
     pub source: SyncSourceRequest,
     pub target: SyncTargetRequest,
     pub mode: ApiSyncMode,
+    #[serde(default)]
+    pub reference_handling: ApiReferenceHandling,
     #[serde(default)]
     pub replicate_deletes: bool,
 }
@@ -131,6 +162,7 @@ pub struct SyncRelationshipResponse {
     pub source: String,
     pub target: String,
     pub mode: ApiSyncMode,
+    pub reference_handling: ApiReferenceHandling,
     pub replicate_deletes: bool,
     pub created_by: String,
     pub created_at: String,
@@ -162,6 +194,11 @@ pub struct SyncDetailResponse {
 pub struct SyncRunResponse {
     pub relationship_id: String,
     pub queued: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+pub struct UpdateSyncRequest {
+    pub reference_handling: ApiReferenceHandling,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, ToSchema, PartialEq, Eq)]
@@ -245,6 +282,11 @@ pub async fn create_sync(
     .await?;
 
     let mode = SyncMode::from(request.mode);
+    let reference_handling = if mode == SyncMode::Reference {
+        ReferenceHandling::Preserve
+    } else {
+        request.reference_handling.into()
+    };
     let existing = list_relationships(
         &state,
         SyncRelationshipDirection::Outgoing,
@@ -267,6 +309,8 @@ pub async fn create_sync(
         source,
         target,
         mode,
+        reference_handling,
+        reference_serving: reference_handling == ReferenceHandling::Preserve,
         replicate_deletes: request.replicate_deletes,
         created_by: auth.user_id,
         created_at: SystemTime::now(),
@@ -433,6 +477,89 @@ pub async fn get_sync(
         last_synced_at,
         last_error,
     }))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/data/sync-relationships/{id}",
+    tag = "sync",
+    params(("id" = String, Path, description = "Relationship ULID")),
+    request_body = UpdateSyncRequest,
+    responses(
+        (status = 200, description = "Sync relationship updated", body = SyncRelationshipResponse),
+        (status = 400, description = "Invalid relationship id", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Relationship not found", body = ErrorResponse),
+        (status = 502, description = "Target unavailable", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn update_sync(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateSyncRequest>,
+) -> ServerResult<Json<SyncRelationshipResponse>> {
+    let auth = require_realm_auth(&state, auth)?;
+    let bearer = bearer.ok_or(ServerError::Unauthorized)?;
+    let id = parse_id(&id)?;
+    let mut relationship =
+        get_relationship(&state, id, SyncRelationshipDirection::Outgoing).await?;
+    ensure_creator(&auth, &relationship)?;
+    ensure_source_read(&state, &auth, &relationship).await?;
+
+    let handling = ReferenceHandling::from(request.reference_handling);
+    if relationship.mode == SyncMode::Reference && handling != ReferenceHandling::Preserve {
+        return Err(ServerError::BadRequestReason(
+            "reference sync mode requires preserve reference handling".to_string(),
+        ));
+    }
+    if relationship.reference_handling == handling {
+        return Ok(Json(map_relationship(&relationship)));
+    }
+    relationship.set_reference_handling(handling);
+    let source_group_id = load_bucket(
+        &state,
+        relationship
+            .source
+            .bucket()
+            .ok_or_else(|| ServerError::BadRequestReason("invalid source ARN".to_string()))?,
+    )
+    .await?
+    .group_id;
+    let context = state.get_ctx();
+    stage_mirror_reconcile(&context, &relationship)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    if let Err(error) = create_mirror(
+        &state,
+        &auth,
+        &bearer,
+        source_group_id,
+        relationship.clone(),
+    )
+    .await
+    {
+        kick_mirror_repair(&context).await;
+        return Err(error);
+    }
+    let updated = match store_relationship(
+        &state,
+        relationship.clone(),
+        SyncRelationshipDirection::Outgoing,
+    )
+    .await
+    {
+        Ok(updated) => updated,
+        Err(error) => {
+            kick_mirror_repair(&context).await;
+            return Err(error);
+        }
+    };
+    clear_repair(&state, &updated, SyncMirrorRepairIntent::Reconcile).await;
+    Ok(Json(map_relationship(&updated)))
 }
 
 #[utoipa::path(
@@ -878,6 +1005,7 @@ fn map_relationship(relationship: &SyncRelationship) -> SyncRelationshipResponse
         source: relationship.source.to_string(),
         target: relationship.target.to_string(),
         mode: relationship.mode.into(),
+        reference_handling: relationship.reference_handling.into(),
         replicate_deletes: relationship.replicate_deletes,
         created_by: relationship.created_by.to_string(),
         created_at: map_time(Some(relationship.created_at)).unwrap_or_default(),
@@ -934,6 +1062,8 @@ mod tests {
             target: ArunaArn::s3_object_prefix(realm_id, test_node(4), "target", "replica/")
                 .unwrap(),
             mode: SyncMode::Continuous,
+            reference_handling: Default::default(),
+            reference_serving: false,
             replicate_deletes: true,
             created_by: UserId::local(Ulid::from_bytes([5u8; 16]), realm_id),
             created_at: SystemTime::UNIX_EPOCH,
@@ -1071,9 +1201,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_reference_detaches_serving_stub() {
+    async fn delete_preserve_detaches() {
         let (_storage_dir, state, auth, mut relationship) = test_state().await;
-        relationship.mode = SyncMode::Reference;
+        relationship.set_reference_handling(ReferenceHandling::Preserve);
+        relationship.set_reference_handling(ReferenceHandling::Materialize);
         drive(
             StoreSyncRelationshipOperation::new(
                 relationship.clone(),

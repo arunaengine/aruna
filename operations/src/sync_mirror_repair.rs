@@ -831,6 +831,8 @@ fn same_relationship(left: &SyncRelationship, right: &SyncRelationship) -> bool 
         && left.source == right.source
         && left.target == right.target
         && left.mode == right.mode
+        && left.reference_handling == right.reference_handling
+        && left.reference_serving == right.reference_serving
         && left.replicate_deletes == right.replicate_deletes
         && left.created_by == right.created_by
         && left.created_at == right.created_at
@@ -888,7 +890,9 @@ async fn delete_repair_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{ArunaArn, RealmId, SyncMode, SyncState, SyncStatusSnapshot};
+    use aruna_core::structs::{
+        ArunaArn, RealmId, ReferenceHandling, SyncMode, SyncState, SyncStatusSnapshot,
+    };
     use aruna_core::types::UserId;
     use aruna_storage::FjallStorage;
     use std::time::SystemTime;
@@ -905,6 +909,8 @@ mod tests {
             source: ArunaArn::s3_bucket(realm_id, node(3), "source").unwrap(),
             target: ArunaArn::s3_bucket(realm_id, node(4), "target").unwrap(),
             mode: SyncMode::Continuous,
+            reference_handling: Default::default(),
+            reference_serving: false,
             replicate_deletes: true,
             created_by: UserId::local(Ulid::from_bytes([5; 16]), realm_id),
             created_at: SystemTime::UNIX_EPOCH,
@@ -922,6 +928,15 @@ mod tests {
             SyncMirrorRepairRecord::from_bytes(&key, &record.to_bytes().unwrap()).unwrap(),
             record
         );
+    }
+
+    #[test]
+    fn serving_changes_identity() {
+        let left = relationship();
+        let mut right = left.clone();
+        right.reference_serving = true;
+
+        assert!(!same_relationship(&left, &right));
     }
 
     #[tokio::test]
@@ -1051,6 +1066,46 @@ mod tests {
                 .unwrap()
                 .map(|record| record.relationship),
             Some(relationship)
+        );
+    }
+
+    #[tokio::test]
+    async fn status_cannot_revert_handling() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let mut current = relationship();
+        let stale = current.clone();
+        current.set_reference_handling(ReferenceHandling::Preserve);
+        drive(
+            StoreSyncRelationshipOperation::new(
+                current.clone(),
+                SyncRelationshipDirection::Outgoing,
+            ),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            store_sync_status(&context, &stale).await,
+            Err(SyncMirrorRepairError::Mirror(_))
+        ));
+        assert_eq!(
+            drive(
+                GetSyncRelationshipOperation::new(current.id, SyncRelationshipDirection::Outgoing,),
+                &context,
+            )
+            .await
+            .unwrap(),
+            current
         );
     }
 

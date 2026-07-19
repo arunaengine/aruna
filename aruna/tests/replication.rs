@@ -4,8 +4,8 @@ use aruna_api::routes::credentials::CreateS3PathRestriction;
 use aruna_api::routes::groups::AddGroupMemberRequest;
 use aruna_api::routes::info::{RealmGroupQuotaOverride, RealmQuotaConfig};
 use aruna_api::routes::sync::{
-    ApiSyncMode, CreateSyncRequest, SyncDetailResponse, SyncRelationshipResponse,
-    SyncSourceRequest, SyncTargetRequest,
+    ApiReferenceHandling, ApiSyncMode, CreateSyncRequest, SyncDetailResponse,
+    SyncRelationshipResponse, SyncSourceRequest, SyncTargetRequest,
 };
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
@@ -501,6 +501,7 @@ async fn continuous_remaps_prefix() -> TestResult<()> {
                         prefix: Some("replica/".to_string()),
                     },
                     mode: ApiSyncMode::Continuous,
+                    reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: true,
                 },
             )
@@ -665,6 +666,7 @@ async fn once_syncs_prefix() -> TestResult<()> {
                         prefix: Some("snapshot/".to_string()),
                     },
                     mode: ApiSyncMode::Once,
+                    reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: false,
                 },
             )
@@ -806,6 +808,7 @@ async fn reference_syncs_lazily() -> TestResult<()> {
                         prefix: None,
                     },
                     mode: ApiSyncMode::Reference,
+                    reference_handling: ApiReferenceHandling::Preserve,
                     replicate_deletes: true,
                 },
             )
@@ -860,8 +863,8 @@ async fn reference_syncs_lazily() -> TestResult<()> {
         let reference_usage = read_usage(harness.joiner.context.as_ref()).await?;
         assert_eq!(reference_usage.stored_blobs, 0);
         assert_eq!(reference_usage.stored_bytes, 0);
-        assert!(reference_usage.logical_bytes > 0);
-        assert!(reference_usage.logical_bytes < body.len() as u64);
+        assert_eq!(reference_usage.logical_bytes, 0);
+        assert_eq!(reference_usage.referenced_bytes, body.len() as u64);
 
         let delete_output = harness
             .seed_client
@@ -1048,6 +1051,7 @@ async fn quota_surfaces_failure() -> TestResult<()> {
                         prefix: None,
                     },
                     mode: ApiSyncMode::Once,
+                    reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: false,
                 },
             )
@@ -1137,6 +1141,7 @@ async fn permission_rechecks_creator() -> TestResult<()> {
                         prefix: None,
                     },
                     mode: ApiSyncMode::Continuous,
+                    reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: true,
                 },
             )
@@ -1247,6 +1252,7 @@ async fn chain_blocks_cycle() -> TestResult<()> {
                         prefix: Some("final/".to_string()),
                     },
                     mode: ApiSyncMode::Continuous,
+                    reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: true,
                 },
             )
@@ -1266,6 +1272,7 @@ async fn chain_blocks_cycle() -> TestResult<()> {
                         prefix: Some("input/".to_string()),
                     },
                     mode: ApiSyncMode::Continuous,
+                    reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: true,
                 },
             )
@@ -1285,6 +1292,7 @@ async fn chain_blocks_cycle() -> TestResult<()> {
                         prefix: Some("relay/".to_string()),
                     },
                     mode: ApiSyncMode::Continuous,
+                    reference_handling: ApiReferenceHandling::Materialize,
                     replicate_deletes: true,
                 },
             )

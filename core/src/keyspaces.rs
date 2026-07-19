@@ -42,6 +42,7 @@ pub const S3_BUCKET_REPLICATION_KEYSPACE: &str = "s3_bucket_replication";
 pub const SYNC_RELATIONSHIP_OUT_KEYSPACE: &str = "sync_relationship_out";
 pub const SYNC_RELATIONSHIP_IN_KEYSPACE: &str = "sync_relationship_in";
 pub const SYNC_MIRROR_REPAIR_KEYSPACE: &str = "sync_mirror_repair";
+pub const SYNC_REFERENCE_STATE_KEYSPACE: &str = "sync_reference_state";
 pub const S3_MULTIPART_OBJECT_METADATA_KEYSPACE: &str = "s3_multipart_object_metadata";
 pub const S3_MULTIPART_UPLOAD_KEYSPACE: &str = "s3_multipart_uploads";
 pub const S3_MULTIPART_UPLOAD_PART_KEYSPACE: &str = "s3_multipart_upload_parts";

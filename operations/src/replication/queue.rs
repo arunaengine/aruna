@@ -2198,8 +2198,8 @@ mod tests {
     use aruna_core::keyspaces::{AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
     use aruna_core::structs::{
         Actor, ArunaArn, BlobVersion, BucketInfo, BucketReplicationTarget,
-        GroupAuthorizationDocument, RealmAuthorizationDocument, RealmId, SyncStatusSnapshot,
-        VersionKey, sync_relationship_key,
+        GroupAuthorizationDocument, RealmAuthorizationDocument, RealmId, ReferenceHandling,
+        SyncStatusSnapshot, VersionKey, sync_relationship_key,
     };
     use aruna_storage::FjallStorage;
     use std::time::SystemTime;
@@ -2405,6 +2405,8 @@ mod tests {
             source,
             target: ArunaArn::s3_bucket(realm(), node(target), "bucket").unwrap(),
             mode: SyncMode::Continuous,
+            reference_handling: Default::default(),
+            reference_serving: false,
             replicate_deletes,
             created_by: user(),
             created_at: SystemTime::UNIX_EPOCH,
@@ -2425,6 +2427,8 @@ mod tests {
             source: ArunaArn::s3_bucket(realm(), node(source_node), source_bucket).unwrap(),
             target: ArunaArn::s3_bucket(realm(), node(target_node), target_bucket).unwrap(),
             mode: SyncMode::Continuous,
+            reference_handling: Default::default(),
+            reference_serving: false,
             replicate_deletes: true,
             created_by: user(),
             created_at: SystemTime::UNIX_EPOCH,
@@ -3048,6 +3052,7 @@ mod tests {
     fn reference_job_queues() {
         let mut reference = relationship(11, 2, Some("photos/"), true);
         reference.mode = SyncMode::Reference;
+        reference.set_reference_handling(ReferenceHandling::Preserve);
 
         let job = relationship_job(
             node(1),
@@ -3152,6 +3157,8 @@ mod tests {
             source: ArunaArn::s3_bucket(realm(), node(2), "upstream").unwrap(),
             target: ArunaArn::s3_bucket(realm(), node(1), "bucket").unwrap(),
             mode: SyncMode::Continuous,
+            reference_handling: Default::default(),
+            reference_serving: false,
             replicate_deletes: true,
             created_by: user(),
             created_at: SystemTime::UNIX_EPOCH,
