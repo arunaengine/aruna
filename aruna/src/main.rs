@@ -398,7 +398,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         cors: cors.clone(),
         portal_csp: PortalCspConfig::new(config.portal_csp_extra_origins.clone()),
     };
-    let server = Server::new(state.clone(), server_config);
+    let server = Server::new(state.clone(), server_config)
+        .with_api_public_url(config.api_public_url.clone());
 
     // S3 Server
     let s3_server = S3Server::new(

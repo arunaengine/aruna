@@ -229,8 +229,20 @@ impl ServerState {
     }
 
     pub async fn register_rest_interface(&self, bind_address: SocketAddr) {
+        self.register_rest_interface_with_public_url(bind_address, None)
+            .await;
+    }
+
+    pub async fn register_rest_interface_with_public_url(
+        &self,
+        bind_address: SocketAddr,
+        public_url: Option<&str>,
+    ) {
         let mut interface_state = self.interface_state.write().await;
-        interface_state.rest = Some(RestInterfaceRuntime::from_bind_address(bind_address));
+        interface_state.rest = Some(RestInterfaceRuntime::from_bind_address(
+            bind_address,
+            public_url,
+        ));
     }
 
     pub async fn register_s3_interface(&self, bind_address: SocketAddr, advertised_host: &str) {
@@ -567,8 +579,9 @@ pub fn swagger_ui() -> SwaggerUi {
 }
 
 impl RestInterfaceRuntime {
-    pub fn from_bind_address(bind_address: SocketAddr) -> Self {
-        let base_url = client_base_url_from_bind_address(bind_address);
+    pub fn from_bind_address(bind_address: SocketAddr, public_url: Option<&str>) -> Self {
+        let base_url =
+            client_base_url_from_advertised_host(public_url.unwrap_or_default(), bind_address);
         Self {
             bind_address,
             api_base_url: format!("{base_url}/api/v1"),
@@ -628,7 +641,22 @@ fn client_host_from_ip(ip: std::net::IpAddr) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{client_base_url_from_advertised_host, client_base_url_from_bind_address};
+    use super::{
+        RestInterfaceRuntime, client_base_url_from_advertised_host,
+        client_base_url_from_bind_address,
+    };
+
+    #[test]
+    fn rest_runtime_uses_public_url() {
+        let runtime = RestInterfaceRuntime::from_bind_address(
+            "0.0.0.0:3000".parse().unwrap(),
+            Some("https://api.node-1.v3.aruna-engine.org/"),
+        );
+        assert_eq!(
+            runtime.api_base_url,
+            "https://api.node-1.v3.aruna-engine.org/api/v1"
+        );
+    }
 
     #[test]
     fn client_base_url_rewrites_unspecified_ipv6() {

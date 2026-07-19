@@ -17,6 +17,7 @@ pub const DEFAULT_MAX_HTTP_BODY_SIZE: usize = 1024 * 1024;
 pub struct Server {
     state: Arc<ServerState>,
     config: ServerConfig,
+    api_public_url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -29,7 +30,16 @@ pub struct ServerConfig {
 
 impl Server {
     pub fn new(state: Arc<ServerState>, config: ServerConfig) -> Self {
-        Self { state, config }
+        Self {
+            state,
+            config,
+            api_public_url: None,
+        }
+    }
+
+    pub fn with_api_public_url(mut self, api_public_url: Option<String>) -> Self {
+        self.api_public_url = api_public_url;
+        self
     }
     pub fn build_router(&self) -> Router {
         // Build the main API router
@@ -59,7 +69,9 @@ impl Server {
 
     pub async fn run_with_listener(self, listener: TcpListener) -> Result<(), ServerSetupError> {
         let bound_addr = listener.local_addr()?;
-        self.state.register_rest_interface(bound_addr).await;
+        self.state
+            .register_rest_interface_with_public_url(bound_addr, self.api_public_url.as_deref())
+            .await;
         let router = self.build_router();
 
         axum::serve(
