@@ -787,7 +787,7 @@ fn map_list_error(error: ListStagingSourceError) -> ServerError {
         ListStagingSourceError::Staging(aruna_core::errors::StagingSourceError::NotFound) => {
             ServerError::NotFound
         }
-        ListStagingSourceError::Staging(_) => ServerError::BadGateway,
+        ListStagingSourceError::Staging(error) => ServerError::BadGatewayReason(error.to_string()),
         _ => ServerError::InternalError(error.to_string()),
     }
 }
@@ -1080,6 +1080,18 @@ mod tests {
         assert_eq!(normalize_browse_path("prefix").unwrap(), "prefix/");
         assert_eq!(normalize_browse_path("prefix/").unwrap(), "prefix/");
         assert_eq!(normalize_browse_path("").unwrap(), "");
+    }
+
+    #[test]
+    fn list_preserves_reason() {
+        let error = map_list_error(ListStagingSourceError::Staging(
+            aruna_core::errors::StagingSourceError::ListError("not an index".to_string()),
+        ));
+
+        assert!(matches!(
+            error,
+            ServerError::BadGatewayReason(message) if message == "List error: not an index"
+        ));
     }
 
     #[test]

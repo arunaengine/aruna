@@ -475,7 +475,7 @@ fn stage_result(item: StageBatchItem, result: ServerResult<()>) -> StageBatchRes
 fn batch_error_message(error: &ServerError) -> String {
     match error {
         ServerError::InternalError(_) => "Internal server error".to_string(),
-        ServerError::BadGateway => "Bad gateway".to_string(),
+        ServerError::BadGateway | ServerError::BadGatewayReason(_) => "Bad gateway".to_string(),
         _ => error.to_string(),
     }
 }
