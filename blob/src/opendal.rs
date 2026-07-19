@@ -143,6 +143,14 @@ pub(crate) async fn list_staging_source(
     recursive: bool,
     files_only: bool,
 ) -> Result<(Vec<aruna_core::structs::SourceEntry>, bool), StagingSourceError> {
+    let ResolvedSourceAccess::OpenDal {
+        kind, config, path, ..
+    } = access;
+    if *kind == SourceConnectorKind::Http {
+        // opendal's Http service cannot list; walk autoindex pages instead.
+        return crate::autoindex::list_http_autoindex(config, path, limit, recursive, files_only)
+            .await;
+    }
     let (operator, path, ..) = build_staging_source_operator(access)?;
     list_operator(&operator, path, limit, recursive, files_only).await
 }

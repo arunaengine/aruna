@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::time::Instant;
 
 use aruna_core::effects::{Effect, StorageEffect};
