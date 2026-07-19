@@ -59,9 +59,10 @@ pub enum SyncRelationshipError {
 }
 
 pub async fn create_sync_relationship(
-    storage: &StorageHandle,
+    context: &crate::driver::DriverContext,
     relationship: SyncRelationship,
 ) -> Result<SyncRelationship, SyncRelationshipError> {
+    let storage = &context.storage_handle;
     let bucket = relationship.source.bucket().ok_or_else(|| {
         ConversionError::FromStrError("sync relationship endpoint is not an S3 ARN".to_string())
     })?;
@@ -862,8 +863,8 @@ mod tests {
             let second = relationship(attempt * 2 + 2, &source, &target);
 
             let (first_result, second_result) = tokio::join!(
-                create_sync_relationship(&context.storage_handle, first),
-                create_sync_relationship(&context.storage_handle, second),
+                create_sync_relationship(&context, first),
+                create_sync_relationship(&context, second),
             );
             assert!(matches!(
                 (&first_result, &second_result),

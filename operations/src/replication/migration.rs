@@ -178,23 +178,16 @@ pub async fn migrate_legacy_sync(
                         error = %rollback_error,
                         "Failed to roll back migrated sync mirror"
                     );
-                } else if let Err(clear_error) = clear_mirror_repair(
-                    &context.storage_handle,
-                    &relationship,
-                    SyncMirrorRepairIntent::Delete,
-                )
-                .await
+                } else if let Err(clear_error) =
+                    clear_mirror_repair(context, &relationship, SyncMirrorRepairIntent::Delete)
+                        .await
                 {
                     warn!(relationship_id = %relationship.id, error = %clear_error, "Failed to clear migrated sync mirror repair");
                 }
                 return Err(error.into());
             }
-            if let Err(error) = clear_mirror_repair(
-                &context.storage_handle,
-                &relationship,
-                SyncMirrorRepairIntent::Reconcile,
-            )
-            .await
+            if let Err(error) =
+                clear_mirror_repair(context, &relationship, SyncMirrorRepairIntent::Reconcile).await
             {
                 warn!(relationship_id = %relationship.id, %error, "Failed to clear migrated sync mirror repair");
                 kick_mirror_repair(context).await;

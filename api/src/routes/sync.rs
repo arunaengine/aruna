@@ -2,9 +2,6 @@ use crate::auth::{ValidatedArunaBearerTokenCarrier, ensure_permission, require_r
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::BLOB_REPLICATION_JOB_KEYSPACE;
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::{
     ArunaArn, AuthContext, BucketInfo, Permission, SyncMode, SyncRelationship, SyncState,
@@ -14,16 +11,14 @@ use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::MetadataAuthToken;
 use aruna_operations::replication::protocol::ReplicationMode;
-use aruna_operations::replication::queue::{
-    BlobReplicationJobRecord, QueueBlobReplicationOperation,
-};
+use aruna_operations::replication::queue::{QueueBlobReplicationOperation, relationship_job_stats};
 use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeTarget,
 };
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::sync_mirror_repair::{
     SyncMirrorRepairIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
-    stage_mirror_delete, stage_mirror_reconcile, store_sync_status,
+    request_sync_mirror_create, stage_mirror_delete, stage_mirror_reconcile, store_sync_status,
 };
 use aruna_operations::sync_relationship::{
     DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, ListSyncRelationshipsOperation,
@@ -295,7 +290,7 @@ pub async fn create_sync(
         return Err(error);
     }
 
-    if let Err(error) = create_sync_relationship(&context.storage_handle, relationship.clone())
+    if let Err(error) = create_sync_relationship(&context, relationship.clone())
         .await
         .map_err(map_create_error)
     {
@@ -647,20 +642,15 @@ async fn create_mirror(
 
     let auth_token = MetadataAuthToken::bearer(bearer.as_str().to_string())
         .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
-    let metadata_handle = state
-        .get_ctx()
-        .metadata_handle
-        .clone()
-        .ok_or(ServerError::BadGateway)?;
-    metadata_handle
-        .request_sync_create(
-            relationship.target.node_id,
-            Some(auth_token),
-            source_group_id,
-            relationship,
-        )
-        .await
-        .map_err(map_mirror_error)
+    request_sync_mirror_create(
+        &state.get_ctx(),
+        relationship.target.node_id,
+        auth_token,
+        source_group_id,
+        relationship,
+    )
+    .await
+    .map_err(map_mirror_error)
 }
 
 async fn remove_mirror(state: &ServerState, relationship: &SyncRelationship) -> bool {
@@ -679,7 +669,7 @@ async fn clear_repair(
     expected: SyncMirrorRepairIntent,
 ) {
     let context = state.get_ctx();
-    if let Err(error) = clear_mirror_repair(&context.storage_handle, relationship, expected).await {
+    if let Err(error) = clear_mirror_repair(&context, relationship, expected).await {
         warn!(%error, relationship_id = %relationship.id, "Failed to clear sync mirror repair");
         kick_mirror_repair(&context).await;
     }
@@ -828,45 +818,9 @@ async fn load_relationship(
 }
 
 async fn load_job_stats(state: &ServerState, id: Ulid) -> ServerResult<(usize, Option<u64>)> {
-    let mut start = None;
-    let mut pending = 0usize;
-    let mut oldest = None::<u64>;
-    loop {
-        let event = state
-            .get_ctx()
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
-                prefix: None,
-                start: start.map(IterStart::After),
-                limit: 256,
-                txn_id: None,
-            })
-            .await;
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return Err(ServerError::InternalError(
-                "failed to inspect sync replication jobs".to_string(),
-            ));
-        };
-        for (_, value) in values {
-            let record = BlobReplicationJobRecord::from_bytes(value.as_ref())
-                .map_err(|error| ServerError::InternalError(error.to_string()))?;
-            if record.relationship_id == Some(id) {
-                pending += 1;
-                oldest = Some(oldest.map_or(record.enqueued_at_ms, |current| {
-                    current.min(record.enqueued_at_ms)
-                }));
-            }
-        }
-        let Some(next_start_after) = next_start_after else {
-            break;
-        };
-        start = Some(next_start_after);
-    }
+    let (pending, oldest) = relationship_job_stats(&state.get_ctx(), id)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
     Ok((
         pending,
         oldest.map(|oldest| unix_timestamp_millis().saturating_sub(oldest)),
@@ -950,6 +904,8 @@ fn map_time(value: Option<SystemTime>) -> Option<String> {
 mod tests {
     use super::*;
     use aruna_core::UserId;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::SYNC_MIRROR_REPAIR_KEYSPACE;
     use aruna_core::structs::{NodeCapabilities, RealmId};
     use aruna_operations::driver::DriverContext;

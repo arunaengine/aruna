@@ -41,6 +41,7 @@ use crate::sync_mirror_repair::{kick_mirror_repair, store_sync_status};
 
 const REPLICATION_SCAN_PAGE_SIZE: usize = 512;
 const REPLICATION_BATCH_SIZE: usize = 64;
+const RELATIONSHIP_STATS_PAGE_SIZE: usize = 256;
 const LIVE_REPLICATION_OBLIGATION_BATCH_SIZE: usize = 64;
 
 pub const BLOB_REPLICATION_POLL_AFTER: Duration = Duration::from_secs(5);
@@ -1162,6 +1163,55 @@ pub async fn blob_replication_jobs_exist(
         other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
             "{other:?}"
         ))),
+    }
+}
+
+/// Counts queued replication jobs bound to a relationship and reports the
+/// oldest enqueue timestamp among them in unix milliseconds.
+pub async fn relationship_job_stats(
+    context: &DriverContext,
+    relationship_id: Ulid,
+) -> Result<(usize, Option<u64>), BlobReplicationQueueError> {
+    let mut start = None;
+    let mut pending = 0usize;
+    let mut oldest = None::<u64>;
+    loop {
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
+                prefix: None,
+                start: start.map(IterStart::After),
+                limit: RELATIONSHIP_STATS_PAGE_SIZE,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => {
+                for (_, value) in values {
+                    let record = BlobReplicationJobRecord::from_bytes(value.as_ref())?;
+                    if record.relationship_id == Some(relationship_id) {
+                        pending = pending.saturating_add(1);
+                        oldest = Some(oldest.map_or(record.enqueued_at_ms, |current: u64| {
+                            current.min(record.enqueued_at_ms)
+                        }));
+                    }
+                }
+                let Some(next_start_after) = next_start_after else {
+                    return Ok((pending, oldest));
+                };
+                start = Some(next_start_after);
+            }
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+            other => {
+                return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
+                    "{other:?}"
+                )));
+            }
+        }
     }
 }
 

@@ -20,6 +20,7 @@ use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
+use ulid::Ulid;
 
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
@@ -213,17 +214,35 @@ pub async fn store_sync_status(
 }
 
 pub async fn clear_mirror_repair(
-    storage: &StorageHandle,
+    context: &DriverContext,
     relationship: &SyncRelationship,
     expected: SyncMirrorRepairIntent,
 ) -> Result<(), SyncMirrorRepairError> {
     clear_repair_intent(
-        storage,
+        &context.storage_handle,
         relationship.id.to_bytes().to_vec(),
         relationship,
         expected,
     )
     .await
+}
+
+/// Forwards a user-authorized sync mirror creation request to the target
+/// node so routes never orchestrate metadata effects directly.
+pub async fn request_sync_mirror_create(
+    context: &DriverContext,
+    target_node: NodeId,
+    auth_token: MetadataAuthToken,
+    source_group_id: Ulid,
+    relationship: SyncRelationship,
+) -> Result<(), MetadataError> {
+    let metadata_handle = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(MetadataError::HandleMissing)?;
+    metadata_handle
+        .request_sync_create(target_node, Some(auth_token), source_group_id, relationship)
+        .await
 }
 
 pub async fn kick_mirror_repair(context: &DriverContext) {
@@ -1080,7 +1099,15 @@ mod tests {
         .await
         .unwrap();
 
-        clear_mirror_repair(&storage, &stale, SyncMirrorRepairIntent::Reconcile)
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        clear_mirror_repair(&context, &stale, SyncMirrorRepairIntent::Reconcile)
             .await
             .unwrap();
 
@@ -1108,7 +1135,15 @@ mod tests {
         .await
         .unwrap();
 
-        clear_mirror_repair(&storage, &stale, SyncMirrorRepairIntent::Delete)
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        clear_mirror_repair(&context, &stale, SyncMirrorRepairIntent::Delete)
             .await
             .unwrap();
 
