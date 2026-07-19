@@ -295,6 +295,15 @@ mod tests {
                 code: 200,
             })
             .inc();
+        // prometheus-client omits families without samples from the text
+        // encoding, so the histogram needs one observation to show up.
+        metrics
+            .http_request_duration
+            .get_or_create(&RouteLabels {
+                interface: "rest",
+                op: "/metrics".to_string(),
+            })
+            .observe(0.05);
 
         let body = metrics.render().await;
         assert!(
