@@ -22,8 +22,8 @@ use aruna_core::metadata::{
 };
 use aruna_core::storage_entries::metadata_graph_lifecycle_key;
 use aruna_core::structs::{
-    AuthContext, MetadataRegistryRecord, Permission, RealmConfigDocument, RealmId, RealmNodeKind,
-    SyncRelationship, blob_bucket_permission_path,
+    AuthContext, BucketInfo, MetadataRegistryRecord, Permission, RealmConfigDocument, RealmId,
+    RealmNodeKind, SyncRelationship, blob_bucket_permission_path,
 };
 use aruna_core::telemetry::{duration_ms, record_duration_ms, record_elapsed_ms};
 use aruna_core::types::{GroupId, UserId};
@@ -63,6 +63,7 @@ use crate::auth::{
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::list_groups::ListGroupOperation;
+use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, SearchBucketsOperation};
 use crate::sync_mirror_repair::RECONCILE_GRACE;
@@ -119,6 +120,30 @@ fn valid_sync_request(
         && relationship.target.realm_id == realm_id
         && relationship.created_by == user_id
         && (delete || (!source_bucket.starts_with("ws-") && !target_bucket.starts_with("ws-")))
+}
+
+async fn create_sync_bucket(
+    context: &DriverContext,
+    bucket: &str,
+    group_id: GroupId,
+    relationship: &SyncRelationship,
+) -> Result<(), CreateBucketError> {
+    drive(
+        CreateBucketOperation::new(
+            bucket.to_string(),
+            BucketInfo {
+                group_id,
+                created_at: relationship.created_at,
+                created_by: relationship.created_by,
+                cors_configuration: None,
+            },
+        ),
+        context,
+    )
+    .await?
+    .transpose()?
+    .ok_or(CreateBucketError::CreateBucketFailed)?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1361,18 +1386,18 @@ impl MetadataHandle {
             };
         }
 
-        let group_id = match drive(
+        let (group_id, create_bucket) = match drive(
             GetBucketInfoOperation::new(local_bucket.to_string()),
             context.as_ref(),
         )
         .await
         {
-            Ok(Some(Ok(bucket_info))) => bucket_info.group_id,
+            Ok(Some(Ok(bucket_info))) => (bucket_info.group_id, false),
             Ok(Some(Err(GetBucketInfoError::NotFound))) | Ok(None) => {
                 let Some(source_group_id) = source_group_id else {
                     return MetadataTransportMessage::Reject("invalid_relationship".to_string());
                 };
-                source_group_id
+                (source_group_id, true)
             }
             Ok(Some(Err(_))) => {
                 return MetadataTransportMessage::Reject("mirror_internal".to_string());
@@ -1399,6 +1424,13 @@ impl MetadataHandle {
         };
         if !permitted {
             return MetadataTransportMessage::Reject("access_denied".to_string());
+        }
+        if create_bucket
+            && create_sync_bucket(context.as_ref(), local_bucket, group_id, &relationship)
+                .await
+                .is_err()
+        {
+            return MetadataTransportMessage::Reject("mirror_internal".to_string());
         }
 
         match drive(
@@ -5665,6 +5697,46 @@ mod tests {
             UserId::local(Ulid::generate(), realm_id),
             true,
         ));
+    }
+
+    #[tokio::test]
+    async fn sync_creates_bucket() {
+        let tempdir = tempdir().unwrap();
+        let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let (_, realm_id, user_id) = realm_fixture();
+        let group_id = Ulid::generate();
+        let relationship = SyncRelationship {
+            id: Ulid::generate(),
+            source: ArunaArn::s3_bucket(realm_id, node_id_from_seed(1), "source").unwrap(),
+            target: ArunaArn::s3_bucket(realm_id, node_id_from_seed(2), "foobar").unwrap(),
+            mode: SyncMode::Once,
+            replicate_deletes: false,
+            created_by: user_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            state: SyncState::Enabled,
+            status: SyncStatusSnapshot::default(),
+        };
+
+        create_sync_bucket(&context, "foobar", group_id, &relationship)
+            .await
+            .unwrap();
+        let bucket = drive(GetBucketInfoOperation::new("foobar".to_string()), &context)
+            .await
+            .unwrap()
+            .transpose()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(bucket.group_id, group_id);
+        assert_eq!(bucket.created_by, user_id);
     }
 
     #[tokio::test(start_paused = true)]
