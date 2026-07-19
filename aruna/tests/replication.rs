@@ -2,7 +2,7 @@ mod shared;
 
 use aruna_api::routes::credentials::CreateS3PathRestriction;
 use aruna_api::routes::groups::AddGroupMemberRequest;
-use aruna_api::routes::info::{RealmGroupQuotaOverride, RealmQuotaConfig};
+use aruna_api::routes::info::{RealmGroupQuotaOverride, RealmInfoResponse, RealmQuotaConfig};
 use aruna_api::routes::sync::{
     ApiReferenceHandling, ApiSyncMode, CreateSyncRequest, SyncDetailResponse,
     SyncRelationshipResponse, SyncSourceRequest, SyncTargetRequest,
@@ -1016,25 +1016,46 @@ async fn quota_surfaces_failure() -> TestResult<()> {
             .send()
             .await?;
 
+        let quota = RealmQuotaConfig {
+            default_group_quota_bytes: None,
+            grace_factor_percent: 100,
+            warn_threshold_percent: 85,
+            group_overrides: vec![RealmGroupQuotaOverride {
+                group_id: harness.group_id.clone(),
+                quota_bytes: Some(1),
+                grace_factor_percent: Some(100),
+            }],
+            max_groups_per_user: Some(3),
+            user_group_cap_overrides: Vec::new(),
+            max_devices_per_user: None,
+        };
         let quota_response = reqwest::Client::new()
             .put(format!("{}/api/v1/info/realm/quota", harness.seed.base_url))
             .bearer_auth(&harness.seed_token)
-            .json(&RealmQuotaConfig {
-                default_group_quota_bytes: None,
-                grace_factor_percent: 100,
-                warn_threshold_percent: 85,
-                group_overrides: vec![RealmGroupQuotaOverride {
-                    group_id: harness.group_id.clone(),
-                    quota_bytes: Some(1),
-                    grace_factor_percent: Some(100),
-                }],
-                max_groups_per_user: Some(3),
-                user_group_cap_overrides: Vec::new(),
-                max_devices_per_user: None,
-            })
+            .json(&quota)
             .send()
             .await?;
         assert_eq!(quota_response.status(), StatusCode::OK);
+        wait_until(
+            "quota configuration convergence",
+            Duration::from_secs(60),
+            Duration::from_millis(200),
+            || async {
+                let Ok(response) = reqwest::Client::new()
+                    .get(format!("{}/api/v1/info/realm", harness.joiner.base_url))
+                    .bearer_auth(&harness.seed_token)
+                    .send()
+                    .await
+                else {
+                    return false;
+                };
+                response
+                    .json::<RealmInfoResponse>()
+                    .await
+                    .is_ok_and(|info| info.quota.as_ref() == Some(&quota))
+            },
+        )
+        .await?;
 
         let relationship = harness
             .post_sync(
@@ -1059,7 +1080,7 @@ async fn quota_surfaces_failure() -> TestResult<()> {
 
         wait_until(
             "quota failure relationship status",
-            Duration::from_secs(20),
+            Duration::from_secs(60),
             Duration::from_millis(200),
             || {
                 let harness = &harness;
