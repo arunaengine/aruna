@@ -13,12 +13,12 @@ use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
     NODE_USAGE_DIRTY_GLOBAL_KEY, NODE_USAGE_DIRTY_PREFIX, NODE_USAGE_GLOBAL_PREFIX,
     NODE_USAGE_GROUP_PREFIX, NODE_USAGE_SUMMARY_GLOBAL_KEY, NODE_USAGE_SUMMARY_GROUP_PREFIX,
-    NodeUsageSnapshot, RealmConfigDocument, RealmId, SourceConnectorKind, USAGE_GLOBAL_KEY,
-    USAGE_GLOBAL_SHARD_COUNT, UsageCounterError, UsageCounters, UsageDelta, VersionKey,
-    node_usage_dirty_group_id, node_usage_dirty_group_key, node_usage_global_key,
-    node_usage_group_key, node_usage_group_key_group_id, node_usage_group_prefix,
-    node_usage_key_node_id, node_usage_summary_group_key, usage_global_key_for_group,
-    usage_global_shard_index, usage_global_shard_key, usage_global_shard_keys, usage_group_key,
+    NodeUsageSnapshot, RealmConfigDocument, RealmId, USAGE_GLOBAL_KEY, USAGE_GLOBAL_SHARD_COUNT,
+    UsageCounterError, UsageCounters, UsageDelta, VersionKey, node_usage_dirty_group_id,
+    node_usage_dirty_group_key, node_usage_global_key, node_usage_group_key,
+    node_usage_group_key_group_id, node_usage_group_prefix, node_usage_key_node_id,
+    node_usage_summary_group_key, usage_global_key_for_group, usage_global_shard_index,
+    usage_global_shard_key, usage_global_shard_keys, usage_group_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -689,24 +689,22 @@ impl RebuildUsageStatsOperation {
                         }
                     }
 
-                    let Some(size) = (match version.state {
-                        BlobVersionState::Materialized { blob_hash, .. } => {
-                            self.blob_sizes.get(blob_hash.as_slice()).copied()
-                        }
-                        BlobVersionState::Reference { source, .. }
-                            if source.descriptor.kind == SourceConnectorKind::ArunaNative =>
-                        {
-                            Some(value.len() as u64)
-                        }
+                    let Some((logical_bytes, referenced_bytes)) = (match version.state {
+                        BlobVersionState::Materialized { blob_hash, .. } => self
+                            .blob_sizes
+                            .get(blob_hash.as_slice())
+                            .copied()
+                            .map(|size| (size, 0)),
                         BlobVersionState::Reference {
                             cached_metadata, ..
-                        } => Some(cached_metadata.content_length),
+                        } => Some((0, cached_metadata.content_length)),
                         BlobVersionState::Deleted => None,
                     }) else {
                         continue;
                     };
                     let delta = UsageCounters {
-                        logical_bytes: size,
+                        logical_bytes,
+                        referenced_bytes,
                         ..Default::default()
                     };
                     self.global.add(&delta)?;
@@ -2120,8 +2118,9 @@ mod tests {
         assert_eq!(global.objects, 3);
         assert_eq!(global.stored_blobs, 2);
         assert_eq!(global.stored_bytes, 140);
-        // 100 + 40 + 30 + 40 + 40: every materialized/reference version counts logically.
-        assert_eq!(global.logical_bytes, 250);
+        // Referenced source size is reported separately from local logical bytes.
+        assert_eq!(global.logical_bytes, 220);
+        assert_eq!(global.referenced_bytes, 30);
 
         let stored_global = read_global_counters(&ctx).await;
         assert_eq!(stored_global, global);
@@ -2129,12 +2128,14 @@ mod tests {
         let alpha = read_counters(&ctx, usage_group_key(group_a)).await;
         assert_eq!(alpha.buckets, 1);
         assert_eq!(alpha.objects, 2);
-        assert_eq!(alpha.logical_bytes, 170);
+        assert_eq!(alpha.logical_bytes, 140);
+        assert_eq!(alpha.referenced_bytes, 30);
 
         let beta = read_counters(&ctx, usage_group_key(group_b)).await;
         assert_eq!(beta.buckets, 1);
         assert_eq!(beta.objects, 1);
         assert_eq!(beta.logical_bytes, 80);
+        assert_eq!(beta.referenced_bytes, 0);
     }
 
     #[test]
@@ -2182,12 +2183,12 @@ mod tests {
 
         operation.consume_values(&[(key, value.clone())]).unwrap();
 
-        assert_eq!(operation.global.logical_bytes, value.len() as u64);
+        assert_eq!(operation.global.logical_bytes, 0);
+        assert_eq!(operation.global.referenced_bytes, 1_000_000);
         assert_eq!(
-            operation.groups.get(&group_id).unwrap().logical_bytes,
-            value.len() as u64
+            operation.groups.get(&group_id).unwrap().referenced_bytes,
+            1_000_000
         );
-        assert!(operation.global.logical_bytes < 1_000_000);
     }
 
     #[tokio::test]

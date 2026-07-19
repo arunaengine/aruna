@@ -160,6 +160,7 @@ async fn rich_node_usage_snapshot_ingest_is_counter_neutral()
         stored_blobs: 3,
         stored_bytes: 4096,
         logical_bytes: 8192,
+        referenced_bytes: 2048,
     };
     write_usage_stat(node_a, usage_global_key_for_group(group_id), rich).await;
     write_usage_stat(node_a, usage_group_key(group_id), rich).await;

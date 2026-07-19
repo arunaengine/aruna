@@ -1125,6 +1125,7 @@ pub struct UsageResponse {
     pub stored_blobs: u64,
     pub stored_bytes: u64,
     pub logical_bytes: u64,
+    pub referenced_bytes: u64,
     pub realm: UsageTotals,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota: Option<GroupQuotaStatus>,
@@ -1178,6 +1179,7 @@ pub struct UsageTotals {
     pub stored_blobs: u64,
     pub stored_bytes: u64,
     pub logical_bytes: u64,
+    pub referenced_bytes: u64,
 }
 
 impl From<UsageCounters> for UsageTotals {
@@ -1188,6 +1190,7 @@ impl From<UsageCounters> for UsageTotals {
             stored_blobs: counters.stored_blobs,
             stored_bytes: counters.stored_bytes,
             logical_bytes: counters.logical_bytes,
+            referenced_bytes: counters.referenced_bytes,
         }
     }
 }
@@ -1200,6 +1203,7 @@ impl UsageResponse {
             stored_blobs: local.stored_blobs,
             stored_bytes: local.stored_bytes,
             logical_bytes: local.logical_bytes,
+            referenced_bytes: local.referenced_bytes,
             realm: realm.into(),
             quota: None,
         }

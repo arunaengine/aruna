@@ -16,8 +16,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState,
-    CurrentVersionPointer, MultipartObjectMetadataKey, RealmId, SourceConnectorKind, UsageDelta,
-    VersionKey,
+    CurrentVersionPointer, MultipartObjectMetadataKey, RealmId, UsageDelta, VersionKey,
 };
 use aruna_core::types::{Effects, GroupId, Key, NodeId, UserId};
 use smallvec::smallvec;
@@ -60,27 +59,24 @@ struct VersionSummary {
     version_id: Ulid,
     materialized_hash: Option<[u8; 32]>,
     logical_size: Option<u64>,
+    referenced: bool,
     deleted: bool,
 }
 
 impl VersionSummary {
-    fn from_blob_version(version_id: Ulid, version: &BlobVersion, encoded_len: usize) -> Self {
-        let (materialized_hash, logical_size) = match &version.state {
-            BlobVersionState::Materialized { blob_hash, .. } => (Some(*blob_hash), None),
-            BlobVersionState::Reference { source, .. }
-                if source.descriptor.kind == SourceConnectorKind::ArunaNative =>
-            {
-                (None, Some(encoded_len as u64))
-            }
+    fn from_blob_version(version_id: Ulid, version: &BlobVersion) -> Self {
+        let (materialized_hash, logical_size, referenced) = match &version.state {
+            BlobVersionState::Materialized { blob_hash, .. } => (Some(*blob_hash), None, false),
             BlobVersionState::Reference {
                 cached_metadata, ..
-            } => (None, Some(cached_metadata.content_length)),
-            BlobVersionState::Deleted => (None, None),
+            } => (None, Some(cached_metadata.content_length), true),
+            BlobVersionState::Deleted => (None, None, false),
         };
         Self {
             version_id,
             materialized_hash,
             logical_size,
+            referenced,
             deleted: version.is_deleted(),
         }
     }
@@ -278,7 +274,7 @@ impl DeleteObjectOperation {
             Ok(version) => version,
             Err(err) => return self.emit_error(err.into()),
         };
-        let summary = VersionSummary::from_blob_version(version_id, &version, value.len());
+        let summary = VersionSummary::from_blob_version(version_id, &version);
         let materialized_hash = summary.materialized_hash;
         self.target_size = summary.logical_size;
         self.target_version = Some(summary);
@@ -343,7 +339,6 @@ impl DeleteObjectOperation {
                 Some(VersionSummary::from_blob_version(
                     version_key.version_id,
                     &version,
-                    value.len(),
                 ))
             })
             .max_by_key(|summary| summary.version_id);
@@ -590,10 +585,11 @@ impl DeleteObjectOperation {
             } else {
                 0
             };
-            let logical_bytes = self.target_size.map_or(0, |size| -i128::from(size));
+            let bytes = self.target_size.map_or(0, |size| -i128::from(size));
             UsageDelta {
                 objects,
-                logical_bytes,
+                logical_bytes: if target.referenced { 0 } else { bytes },
+                referenced_bytes: if target.referenced { bytes } else { 0 },
                 ..Default::default()
             }
         } else {
@@ -888,7 +884,7 @@ mod test {
     }
 
     #[test]
-    fn native_counts_overhead() {
+    fn reference_counts_content() {
         let version_id = Ulid::generate();
         let version = BlobVersion::reference(
             VersionSourceBinding {
@@ -914,12 +910,10 @@ mod test {
             Default::default(),
             SystemTime::UNIX_EPOCH,
         );
-        let encoded = version.to_bytes().unwrap();
+        let summary = VersionSummary::from_blob_version(version_id, &version);
 
-        let summary = VersionSummary::from_blob_version(version_id, &version, encoded.len());
-
-        assert_eq!(summary.logical_size, Some(encoded.len() as u64));
-        assert!(summary.logical_size.unwrap() < 1_000_000);
+        assert_eq!(summary.logical_size, Some(1_000_000));
+        assert!(summary.referenced);
     }
 
     async fn read_value(
