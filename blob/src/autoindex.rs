@@ -37,6 +37,7 @@ struct Anchor {
 pub(crate) async fn list_http_autoindex(
     config: &HashMap<String, String>,
     path: &str,
+    offset: usize,
     limit: usize,
     recursive: bool,
     files_only: bool,
@@ -45,6 +46,7 @@ pub(crate) async fn list_http_autoindex(
     let mut queue = VecDeque::from([path.trim_matches('/').to_string()]);
     let mut entries = Vec::new();
     let mut fetches = 0usize;
+    let mut skipped = 0usize;
 
     while let Some(dir) = queue.pop_front() {
         if fetches == MAX_INDEX_FETCHES {
@@ -75,6 +77,10 @@ pub(crate) async fn list_http_autoindex(
             } else {
                 SourceEntryKind::File
             };
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
             if entries.len() == limit {
                 return Ok((entries, true));
             }
@@ -808,7 +814,7 @@ mod tests {
             ("root".to_string(), "data".to_string()),
         ]);
 
-        let (entries, truncated) = list_http_autoindex(&config, "", 2, false, false)
+        let (entries, truncated) = list_http_autoindex(&config, "", 0, 2, false, false)
             .await
             .unwrap();
 
@@ -819,6 +825,13 @@ mod tests {
         assert_eq!(entries[1].kind, SourceEntryKind::File);
         assert_eq!(entries[1].size, Some(10));
         assert!(truncated);
+
+        let (entries, truncated) = list_http_autoindex(&config, "", 2, 2, false, false)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "b.txt");
+        assert!(!truncated);
 
         server.abort();
         let _ = server.await;
@@ -838,7 +851,7 @@ mod tests {
         .await;
         let config = HashMap::from([("endpoint".to_string(), endpoint)]);
 
-        let (entries, truncated) = list_http_autoindex(&config, "", 10, true, true)
+        let (entries, truncated) = list_http_autoindex(&config, "", 0, 10, true, true)
             .await
             .unwrap();
 
@@ -863,7 +876,7 @@ mod tests {
         .await;
         let config = HashMap::from([("endpoint".to_string(), endpoint)]);
 
-        let error = list_http_autoindex(&config, "", 10, false, false)
+        let error = list_http_autoindex(&config, "", 0, 10, false, false)
             .await
             .unwrap_err();
         assert!(matches!(error, StagingSourceError::ListError(_)));
@@ -877,7 +890,7 @@ mod tests {
         let (server, endpoint) = spawn_index_server(Vec::new()).await;
         let config = HashMap::from([("endpoint".to_string(), endpoint)]);
 
-        let error = list_http_autoindex(&config, "missing", 10, false, false)
+        let error = list_http_autoindex(&config, "missing", 0, 10, false, false)
             .await
             .unwrap_err();
         assert_eq!(error, StagingSourceError::NotFound);

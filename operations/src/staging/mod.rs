@@ -86,8 +86,12 @@ pub(crate) mod test_utils {
         CreateSourceConnectorInput, CreateSourceConnectorOperation,
     };
     use crate::driver::{DriverContext, drive};
+    use crate::s3::create_bucket::CreateBucketOperation;
     use aruna_blob::blob::BlobHandler;
-    use aruna_core::structs::{Backend, BackendConfig, SourceConnector, SourceConnectorKind};
+    use aruna_core::UserId;
+    use aruna_core::structs::{
+        Backend, BackendConfig, BucketInfo, SourceConnector, SourceConnectorKind,
+    };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use std::collections::HashMap;
@@ -157,5 +161,28 @@ pub(crate) mod test_utils {
         .await
         .expect("connector creation must succeed")
         .connector
+    }
+
+    pub(crate) async fn create_test_bucket(
+        context: &DriverContext,
+        group_id: Ulid,
+        created_by: UserId,
+        bucket: &str,
+    ) -> BucketInfo {
+        let info = BucketInfo {
+            group_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by,
+            cors_configuration: None,
+        };
+        drive(
+            CreateBucketOperation::new(bucket.to_string(), info.clone()),
+            context,
+        )
+        .await
+        .expect("bucket creation must succeed")
+        .expect("bucket creation must finish")
+        .expect("bucket creation must return info");
+        info
     }
 }

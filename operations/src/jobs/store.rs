@@ -4,7 +4,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     JOB_ATTEMPT_CONTROL_KEYSPACE, JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE,
-    JOB_RUN_CRATE_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
+    JOB_RUN_CRATE_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE, STAGING_JOB_STATE_KEYSPACE,
 };
 use aruna_core::structs::{
     AttemptControl, AttemptIntent, JobClaim, JobError, JobExecutionClass, JobId, JobPayload,
@@ -139,6 +139,10 @@ pub fn job_prune_delete_entries(record: &JobRecord) -> JobDeletes {
             JOB_SCHEDULE_INDEX_KEYSPACE.to_string(),
             schedule_index_key_for(record),
         ),
+        (
+            STAGING_JOB_STATE_KEYSPACE.to_string(),
+            ByteView::from(record.job_id.to_bytes().to_vec()),
+        ),
     ];
     // Epochs are handed out from 1; every used epoch left a control row.
     for epoch in 1..record.next_attempt_epoch {
@@ -224,6 +228,57 @@ where
     }
     Err(JobMutationError::Storage(
         "job mutation exhausted conflict retries".to_string(),
+    ))
+}
+
+pub async fn put_staging_checkpoint(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    value: Value,
+) -> Result<(), JobMutationError> {
+    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
+        let txn_id = start_write_txn(storage)
+            .await
+            .map_err(JobMutationError::Storage)?;
+        let result = async {
+            let record = read_job_record(storage, job_id, Some(txn_id))
+                .await
+                .map_err(JobMutationError::Storage)?
+                .ok_or(JobMutationError::NotFound)?;
+            guard_token(&record, token)?;
+            batch_write(
+                storage,
+                vec![(
+                    STAGING_JOB_STATE_KEYSPACE.to_string(),
+                    ByteView::from(job_id.to_bytes().to_vec()),
+                    value.clone(),
+                )],
+                Some(txn_id),
+            )
+            .await
+            .map_err(JobMutationError::Storage)
+        }
+        .await;
+        match result {
+            Ok(()) => match commit_txn(storage, txn_id).await {
+                CommitResult::Committed => return Ok(()),
+                CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => continue,
+                CommitResult::Conflict => {
+                    return Err(JobMutationError::Storage(
+                        "checkpoint write exhausted conflict retries".to_string(),
+                    ));
+                }
+                CommitResult::Failed(error) => return Err(JobMutationError::Storage(error)),
+            },
+            Err(error) => {
+                abort_txn(storage, txn_id).await;
+                return Err(error);
+            }
+        }
+    }
+    Err(JobMutationError::Storage(
+        "checkpoint write exhausted conflict retries".to_string(),
     ))
 }
 
@@ -1954,6 +2009,42 @@ mod tests {
             record.state,
             JobState::Claimed,
             "record unchanged after rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_checkpoint_rejected() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([2u8; 16]);
+        insert_job(&storage, &queued_record(job_id)).await.unwrap();
+        let ClaimOutcome::Claimed(record) = claim_job(&storage, job_id, node_id(3), 5_000)
+            .await
+            .unwrap()
+        else {
+            panic!("job must be claimed")
+        };
+        let token = record.claim.unwrap().claim_token;
+        put_staging_checkpoint(&storage, job_id, token, b"newer".to_vec().into())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            put_staging_checkpoint(&storage, job_id, Ulid::generate(), b"stale".to_vec().into(),)
+                .await,
+            Err(JobMutationError::TokenMismatch)
+        ));
+        assert_eq!(
+            read_raw(
+                &storage,
+                STAGING_JOB_STATE_KEYSPACE,
+                ByteView::from(job_id.to_bytes().to_vec()),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+            b"newer"
         );
     }
 

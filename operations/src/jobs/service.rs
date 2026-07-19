@@ -1,7 +1,8 @@
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::structs::{
-    ExecutionSpec, JobId, JobPayload, JobRecord, RunCrateStatus, WorkspaceMode, user_dedup_key,
+    ExecutionSpec, JobId, JobPayload, JobRecord, RunCrateStatus, StagingJobSpec, WorkspaceMode,
+    user_dedup_key,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{NodeId, UserId};
@@ -58,6 +59,27 @@ pub async fn submit_execution_job(
             now_ms: unix_timestamp_millis(),
             workspace_mode,
             workspace_bucket,
+        }),
+        context,
+    )
+    .await
+}
+
+pub async fn submit_staging_job(
+    context: &DriverContext,
+    spec: StagingJobSpec,
+    owner_node_id: NodeId,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    let created_by = spec.auth_context.user_id;
+    drive(
+        SubmitJobOperation::new(SubmitJobSpec {
+            payload: JobPayload::Staging(spec),
+            created_by,
+            owner_node_id,
+            dedup_key: None,
+            now_ms: unix_timestamp_millis(),
+            workspace_mode: WorkspaceMode::default(),
+            workspace_bucket: None,
         }),
         context,
     )

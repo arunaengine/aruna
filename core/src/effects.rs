@@ -98,6 +98,7 @@ pub enum StagingSourceEffect {
     },
     List {
         access: ResolvedSourceAccess,
+        offset: usize,
         limit: usize,
         recursive: bool,
         files_only: bool,

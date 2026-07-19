@@ -2022,6 +2022,7 @@ mod tests {
 
         let ctx = JobContext {
             driver: context(storage.clone()),
+            job_id,
             claim_token: token,
             cancel: CancellationToken::new(),
             shutdown: CancellationToken::new(),

@@ -573,6 +573,7 @@ pub async fn list_connector_entries(
             group_id,
             connector_id,
             source_path,
+            offset: 0,
             limit: limit.min(MAX_ENTRY_LIMIT),
             recursive: false,
             files_only: false,

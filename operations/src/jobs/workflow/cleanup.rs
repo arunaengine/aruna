@@ -385,6 +385,7 @@ mod tests {
                 task_handle: None,
                 compute_handle: Some(Arc::new(registry)),
             }),
+            job_id: JobId::from_bytes([0xCB; 16]),
             claim_token: Ulid::from_bytes([0xCC; 16]),
             cancel: CancellationToken::new(),
             shutdown: CancellationToken::new(),

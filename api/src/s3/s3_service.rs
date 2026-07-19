@@ -3117,6 +3117,8 @@ impl S3 for ArunaS3Service {
                     target: ArunaArn::parse(&target.arn)
                         .map_err(|error| s3_error!(InvalidArgument, "{}", error.to_string()))?,
                     mode: SyncMode::Continuous,
+                    reference_handling: Default::default(),
+                    reference_serving: false,
                     replicate_deletes: target.replicate_delete_markers,
                     created_by: user_access.user_identity,
                     created_at,

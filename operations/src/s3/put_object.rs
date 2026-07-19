@@ -10,13 +10,15 @@ use crate::usage_stats::{
 use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
-use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+use aruna_core::keyspaces::{
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobHeadKey, BlobVersion, CurrentVersionPointer, RealmId,
-    UsageDelta, VersionKey, VersionSourceBinding,
+    AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
+    RealmId, UsageDelta, VersionKey, VersionSourceBinding,
 };
 use aruna_core::types::{Effects, GroupId, NodeId, UserId};
 use bytes::Bytes;
@@ -31,6 +33,7 @@ pub enum PutObjectState {
     WriteBlob,
     CleanupFailedWrite,
     StartTransaction,
+    CheckBucket,
     CheckHashLookup,
     CreateBlobLocation,
     ReadObjectLookup,
@@ -131,6 +134,7 @@ pub struct PutObjectOperation {
     quota_gate: Option<QuotaGate>,
     pending_error: Option<PutObjectError>,
     output: Option<Result<BackendLocation, PutObjectError>>,
+    expected_bucket: Option<BucketInfo>,
 }
 
 impl PutObjectOperation {
@@ -149,7 +153,13 @@ impl PutObjectOperation {
             quota_gate: None,
             pending_error: None,
             output: None,
+            expected_bucket: None,
         }
+    }
+
+    pub fn with_bucket_guard(mut self, bucket: BucketInfo) -> Self {
+        self.expected_bucket = Some(bucket);
+        self
     }
 
     fn handle_init(&mut self) -> Effects {
@@ -215,23 +225,55 @@ impl PutObjectOperation {
     fn handle_transaction_started(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event {
             self.txn_id = Some(txn_id);
-            self.state = PutObjectState::CheckHashLookup;
-
-            if let Some(written_location) = self.get_written_location() {
-                if let Some(blake3_hash) = written_location.get_blake3() {
-                    smallvec![Effect::Storage(StorageEffect::Read {
-                        key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                        key: blake3_hash.to_vec().into(),
-                        txn_id: self.txn_id,
-                    })]
-                } else {
-                    self.emit_error(PutObjectError::MissingHash("blake3".to_string()))
-                }
+            if self.expected_bucket.is_some() {
+                self.state = PutObjectState::CheckBucket;
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: S3_BUCKET_KEYSPACE.to_string(),
+                    key: self.config.request.bucket.as_bytes().into(),
+                    txn_id: self.txn_id,
+                })]
             } else {
-                self.emit_error(PutObjectError::MissingOutput)
+                self.start_hash_lookup()
             }
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
+        }
+    }
+
+    fn handle_bucket_checked(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+        let current = match value
+            .as_ref()
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose()
+        {
+            Ok(current) => current,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        if current.as_ref() != self.expected_bucket.as_ref()
+            || current.is_none_or(|bucket| bucket.group_id != self.config.group_id)
+        {
+            return self.emit_error(StorageError::TransactionConflict.into());
+        }
+        self.start_hash_lookup()
+    }
+
+    fn start_hash_lookup(&mut self) -> Effects {
+        self.state = PutObjectState::CheckHashLookup;
+        if let Some(written_location) = self.get_written_location() {
+            if let Some(blake3_hash) = written_location.get_blake3() {
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+                    key: blake3_hash.to_vec().into(),
+                    txn_id: self.txn_id,
+                })]
+            } else {
+                self.emit_error(PutObjectError::MissingHash("blake3".to_string()))
+            }
+        } else {
+            self.emit_error(PutObjectError::MissingOutput)
         }
     }
 
@@ -763,6 +805,7 @@ impl Operation for PutObjectOperation {
             PutObjectState::WriteBlob => self.handle_write_finished(event),
             PutObjectState::CleanupFailedWrite => self.handle_failed_write_cleanup(event),
             PutObjectState::StartTransaction => self.handle_transaction_started(event),
+            PutObjectState::CheckBucket => self.handle_bucket_checked(event),
             PutObjectState::CheckHashLookup => self.handle_hash_lookup_checked(event),
             PutObjectState::CreateBlobLocation => self.handle_blob_location_created(event),
             PutObjectState::ReadObjectLookup => self.handle_object_lookup_read(event),
@@ -843,14 +886,14 @@ mod test {
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE,
-        HASH_PATHS_INDEX_KEYSPACE,
+        HASH_PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
     use aruna_core::structs::{
-        Backend, BackendConfig, BackendLocation, BlobHeadKey, BlobVersion, CurrentVersionPointer,
-        HashPathIndexKey, RealmId, UsageDelta, VersionKey,
+        Backend, BackendConfig, BackendLocation, BlobHeadKey, BlobVersion, BucketInfo,
+        CurrentVersionPointer, HashPathIndexKey, RealmId, UsageDelta, VersionKey,
     };
     use aruna_net::dht::storage::decode_entries;
     use aruna_net::{NetConfig, NetHandle};
@@ -928,6 +971,49 @@ mod test {
             version_source: None,
             quota_ceiling: Some(1),
         }
+    }
+
+    #[test]
+    fn bucket_guard_rejects_recreate() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = iroh::SecretKey::generate().public();
+        let config = put_config(realm_id, group_id, node_id);
+        let expected = BucketInfo {
+            group_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: config.user_id,
+            cors_configuration: None,
+        };
+        let recreated = BucketInfo {
+            created_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+            ..expected.clone()
+        };
+        let mut op = PutObjectOperation::new(config).with_bucket_guard(expected);
+        op.state = PutObjectState::StartTransaction;
+        op.written_location = Some(test_location(op.config.user_id));
+
+        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::generate(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == S3_BUCKET_KEYSPACE
+        ));
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"mybucket".to_vec().into(),
+            value: Some(recreated.to_bytes().unwrap().into()),
+        }));
+
+        assert!(effects.is_empty());
+        assert!(op.is_complete());
+        assert_eq!(
+            op.finalize(),
+            Err(PutObjectError::StorageError(
+                StorageError::TransactionConflict
+            ))
+        );
     }
 
     #[test]

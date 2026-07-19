@@ -84,12 +84,13 @@ impl BlobHandle {
             StagingSourceEffect::Head { access } => self.handler.head_staging_source(access).await,
             StagingSourceEffect::List {
                 access,
+                offset,
                 limit,
                 recursive,
                 files_only,
             } => {
                 self.handler
-                    .list_staging_source(access, limit, recursive, files_only)
+                    .list_staging_source(access, offset, limit, recursive, files_only)
                     .await
             }
             StagingSourceEffect::Read { access, range } => {

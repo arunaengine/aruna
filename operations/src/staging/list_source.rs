@@ -15,6 +15,7 @@ pub struct ListStagingSourceInput {
     pub group_id: GroupId,
     pub connector_id: Ulid,
     pub source_path: String,
+    pub offset: usize,
     pub limit: usize,
     pub recursive: bool,
     pub files_only: bool,
@@ -24,6 +25,7 @@ pub struct ListStagingSourceInput {
 pub struct ListStagingSourceResult {
     pub entries: Vec<SourceEntry>,
     pub truncated: bool,
+    pub next_offset: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,6 +102,7 @@ impl Operation for ListStagingSourceOperation {
                     self.state = ListStagingSourceState::List;
                     smallvec![Effect::StagingSource(StagingSourceEffect::List {
                         access: resolved.access,
+                        offset: self.input.offset,
                         limit: self.input.limit,
                         recursive: self.input.recursive,
                         files_only: self.input.files_only,
@@ -112,7 +115,12 @@ impl Operation for ListStagingSourceOperation {
                 Event::StagingSource(StagingSourceEvent::ListResult { entries, truncated }),
             ) => {
                 self.state = ListStagingSourceState::Finish;
-                self.output = Some(Ok(ListStagingSourceResult { entries, truncated }));
+                let next_offset = truncated.then_some(self.input.offset + entries.len());
+                self.output = Some(Ok(ListStagingSourceResult {
+                    entries,
+                    truncated,
+                    next_offset,
+                }));
                 smallvec![]
             }
             (
@@ -166,6 +174,7 @@ mod tests {
             group_id: Ulid::from_bytes([1u8; 16]),
             connector_id: Ulid::from_bytes([2u8; 16]),
             source_path: "prefix".to_string(),
+            offset: 0,
             limit: 20,
             recursive: true,
             files_only: true,
@@ -209,6 +218,7 @@ mod tests {
             effects.as_slice(),
             [Effect::StagingSource(StagingSourceEffect::List {
                 limit: 20,
+                offset: 0,
                 recursive: true,
                 files_only: true,
                 ..
@@ -236,6 +246,7 @@ mod tests {
             Ok(ListStagingSourceResult {
                 entries: Vec::new(),
                 truncated: true,
+                next_offset: Some(0),
             })
         );
     }

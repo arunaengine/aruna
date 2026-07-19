@@ -10,21 +10,20 @@ use crate::staging::head_source::{
 };
 use crate::task_persistence::persist_task_effect;
 use crate::usage_stats::{
-    QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError,
-    schedule_usage_snapshot_publish_effect,
+    UsageCounterUpdate, UsageUpdateError, schedule_usage_snapshot_publish_effect,
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
-    SOURCE_CONNECTOR_SECRET_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
+    SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE,
 };
 use aruna_core::structs::{
-    BlobHeadKey, BlobVersion, CurrentVersionPointer, RealmId, SourceConnector,
-    SourceConnectorSecret, SourceMetadata, StagingStrategy, UsageDelta, VersionKey,
-    VersionSourceBinding,
+    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, RealmId,
+    SourceConnector, SourceConnectorSecret, SourceMetadata, StagingStrategy, UsageDelta,
+    VersionKey, VersionSourceBinding,
 };
 use aruna_core::types::{Effects, GroupId, NodeId, TxnId, UserId};
 use std::time::SystemTime;
@@ -41,7 +40,7 @@ pub struct MaterializeReferenceInput {
     pub source_path: String,
     pub bucket: String,
     pub key: String,
-    pub quota_ceiling: Option<u64>,
+    pub expected_bucket: BucketInfo,
 }
 
 #[derive(Debug, PartialEq)]
@@ -62,10 +61,6 @@ pub enum MaterializeReferenceError {
     Conversion(#[from] ConversionError),
     #[error(transparent)]
     Usage(#[from] UsageUpdateError),
-    #[error(transparent)]
-    QuotaGate(#[from] QuotaGateError),
-    #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
-    QuotaExceeded { limit: u64, usage: u64 },
 }
 
 pub async fn materialize_reference(
@@ -103,7 +98,15 @@ pub async fn materialize_reference(
         _ => return Err(StorageError::WriteError.into()),
     };
 
-    let result: Result<(), MaterializeReferenceError> = async {
+    let result: Result<(Ulid, bool), MaterializeReferenceError> = async {
+        guard_expected_bucket(
+            context,
+            txn_id,
+            &input.bucket,
+            input.group_id,
+            &input.expected_bucket,
+        )
+        .await?;
         guard_resolved_connector_unchanged(
             context,
             txn_id,
@@ -114,18 +117,49 @@ pub async fn materialize_reference(
 
         let existing_pointer =
             read_current_pointer(context, txn_id, &input.bucket, &input.key).await?;
-        let was_live = match existing_pointer.as_ref() {
-            Some(pointer) => read_blob_version(
-                context,
-                txn_id,
-                &input.bucket,
-                &input.key,
-                pointer.version_id,
-            )
-            .await?
-            .is_some_and(|version| !version.is_deleted()),
-            None => false,
+        let existing_version = match existing_pointer.as_ref() {
+            Some(pointer) => {
+                read_blob_version(
+                    context,
+                    txn_id,
+                    &input.bucket,
+                    &input.key,
+                    pointer.version_id,
+                )
+                .await?
+            }
+            None => None,
         };
+        if let (
+            Some(pointer),
+            Some(BlobVersion {
+                state:
+                    BlobVersionState::Reference {
+                        source,
+                        cached_metadata,
+                        ..
+                    },
+                ..
+            }),
+        ) = (existing_pointer.as_ref(), existing_version.as_ref())
+            && source == &version_source
+            && source_metadata_matches(cached_metadata, &head_result.metadata)
+        {
+            match context
+                .storage_handle
+                .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+                .await
+            {
+                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                    return Ok((pointer.version_id, false));
+                }
+                Event::Storage(StorageEvent::Error { error }) => {
+                    return Err(MaterializeReferenceError::Storage(error));
+                }
+                _ => return Err(MaterializeReferenceError::Storage(StorageError::WriteError)),
+            }
+        }
+        let was_live = existing_version.is_some_and(|version| !version.is_deleted());
         let next_pointer = CurrentVersionPointer::next_for(existing_pointer.as_ref(), version_id);
 
         for effect in build_head_transition_effects(
@@ -160,27 +194,12 @@ pub async fn materialize_reference(
         )
         .await?;
 
-        let logical_bytes = head_result.metadata.content_length;
-        if let Some(ceiling) = input.quota_ceiling
-            && logical_bytes > 0
-        {
-            enforce_quota(
-                context,
-                txn_id,
-                ceiling,
-                logical_bytes,
-                input.group_id,
-                input.node_id,
-                input.realm_id,
-            )
-            .await?;
-        }
-
+        let referenced_bytes = head_result.metadata.content_length;
         let mut usage_update = UsageCounterUpdate::for_group(
             input.group_id,
             UsageDelta {
                 objects: if was_live { 0 } else { 1 },
-                logical_bytes: i128::from(logical_bytes),
+                referenced_bytes: i128::from(referenced_bytes),
                 ..Default::default()
             },
         );
@@ -193,7 +212,7 @@ pub async fn materialize_reference(
             .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
             .await
         {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok((version_id, true)),
             Event::Storage(StorageEvent::Error { error }) => {
                 Err(MaterializeReferenceError::Storage(error))
             }
@@ -209,8 +228,10 @@ pub async fn materialize_reference(
             .await;
     }
 
-    result?;
-    schedule_usage_snapshot_publish(context).await;
+    let (version_id, changed) = result?;
+    if changed {
+        schedule_usage_snapshot_publish(context).await;
+    }
 
     Ok(MaterializeReferenceResult {
         connector: head_result.connector,
@@ -218,6 +239,13 @@ pub async fn materialize_reference(
         version_source,
         version_id,
     })
+}
+
+fn source_metadata_matches(left: &SourceMetadata, right: &SourceMetadata) -> bool {
+    left.content_length == right.content_length
+        && left.content_type == right.content_type
+        && left.etag == right.etag
+        && left.last_modified == right.last_modified
 }
 
 pub async fn stage_reference_blob(
@@ -272,35 +300,6 @@ async fn send_single_storage_effect(
             .expect("effect length was checked before popping"),
     )
     .await
-}
-
-async fn enforce_quota(
-    context: &DriverContext,
-    txn_id: TxnId,
-    ceiling: u64,
-    logical_bytes: u64,
-    group_id: GroupId,
-    node_id: NodeId,
-    realm_id: RealmId,
-) -> Result<(), MaterializeReferenceError> {
-    let mut gate = QuotaGate::new_for_realm(ceiling, logical_bytes, group_id, node_id, realm_id);
-    let mut effects = gate.start(txn_id);
-    loop {
-        let event = send_single_storage_effect(context, effects).await?;
-        effects = match gate.step(event, txn_id)? {
-            Some(effects) => effects,
-            None => break,
-        };
-    }
-
-    if gate.is_exceeded() {
-        Err(MaterializeReferenceError::QuotaExceeded {
-            limit: gate.ceiling(),
-            usage: gate.projected_usage(),
-        })
-    } else {
-        Ok(())
-    }
 }
 
 async fn run_usage_update(
@@ -436,12 +435,43 @@ async fn guard_resolved_connector_unchanged(
     Ok(())
 }
 
+async fn guard_expected_bucket(
+    context: &DriverContext,
+    txn_id: TxnId,
+    bucket: &str,
+    group_id: GroupId,
+    expected: &BucketInfo,
+) -> Result<(), MaterializeReferenceError> {
+    let current = match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: bucket.as_bytes().into(),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .as_ref()
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose()?,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        _ => return Err(StorageError::ReadError.into()),
+    };
+    if expected.group_id != group_id || current.as_ref() != Some(expected) {
+        return Err(StorageError::TransactionConflict.into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::driver::drive;
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-    use crate::staging::test_utils::{create_http_connector, setup_driver_context};
+    use crate::staging::test_utils::{
+        create_http_connector, create_test_bucket, setup_driver_context,
+    };
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
@@ -704,16 +734,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bucket_guard_rejects_recreate() {
+        let (_tempdir, context) = test_context();
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let group_id = Ulid::generate();
+        let expected = BucketInfo {
+            group_id,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            cors_configuration: None,
+        };
+        let recreated = BucketInfo {
+            created_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+            ..expected.clone()
+        };
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: b"bucket-a".to_vec().into(),
+                value: recreated.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        let txn_id = start_write_transaction(&context).await;
+
+        assert_conflict(
+            guard_expected_bucket(&context, txn_id, "bucket-a", group_id, &expected).await,
+        );
+    }
+
+    #[tokio::test]
     async fn materialize_reference_retains_historical_hash_path_and_writes_blob_version() {
         let test_context = setup_driver_context().await;
         let context = &test_context.driver_context;
         let group_id = Ulid::generate();
         let realm_id = RealmId::from_bytes([9u8; 32]);
         let node_id = iroh::SecretKey::generate().public();
+        let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let expected_bucket = create_test_bucket(context, group_id, user_id, "bucket-a").await;
 
         let initial = drive(
             PutObjectOperation::new(PutObjectConfig {
-                user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+                user_id,
                 group_id,
                 realm_id,
                 node_id,
@@ -746,14 +813,14 @@ mod tests {
             context,
             MaterializeReferenceInput {
                 group_id,
-                user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+                user_id,
                 realm_id,
                 node_id,
                 connector_id: connector.connector_id,
                 source_path: "folder/file.txt".to_string(),
                 bucket: "bucket-a".to_string(),
                 key: "object.txt".to_string(),
-                quota_ceiling: None,
+                expected_bucket,
             },
         )
         .await
@@ -811,19 +878,23 @@ mod tests {
 
         let group_usage = read_usage_counters(context, usage_group_key(group_id)).await;
         assert_eq!(group_usage.objects, 1);
-        assert_eq!(group_usage.logical_bytes, 13);
+        assert_eq!(group_usage.logical_bytes, 5);
+        assert_eq!(group_usage.referenced_bytes, 8);
         let global_usage = read_usage_counters(context, usage_global_key_for_group(group_id)).await;
         assert_eq!(global_usage.objects, 1);
-        assert_eq!(global_usage.logical_bytes, 13);
+        assert_eq!(global_usage.logical_bytes, 5);
+        assert_eq!(global_usage.referenced_bytes, 8);
     }
 
     #[tokio::test]
-    async fn materialize_reference_rejects_over_quota_without_writing_head_or_usage() {
+    async fn reference_bypasses_quota() {
         let test_context = setup_driver_context().await;
         let context = &test_context.driver_context;
         let group_id = Ulid::generate();
         let realm_id = RealmId::from_bytes([8u8; 32]);
         let node_id = iroh::SecretKey::generate().public();
+        let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let expected_bucket = create_test_bucket(context, group_id, user_id, "bucket-a").await;
         let (server, endpoint) = spawn_reference_server("ref-data").await;
         let connector = create_http_connector(context, group_id, &endpoint).await;
 
@@ -831,14 +902,14 @@ mod tests {
             context,
             MaterializeReferenceInput {
                 group_id,
-                user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+                user_id,
                 realm_id,
                 node_id,
                 connector_id: connector.connector_id,
                 source_path: "folder/file.txt".to_string(),
                 bucket: "bucket-a".to_string(),
                 key: "object.txt".to_string(),
-                quota_ceiling: Some(7),
+                expected_bucket,
             },
         )
         .await;
@@ -846,24 +917,55 @@ mod tests {
         server.abort();
         let _ = server.await;
 
+        assert!(result.is_ok());
+        let usage = read_usage_counters(context, usage_group_key(group_id)).await;
+        assert_eq!(usage.logical_bytes, 0);
+        assert_eq!(usage.referenced_bytes, 8);
+    }
+
+    #[tokio::test]
+    async fn reference_reuses_version() {
+        let test_context = setup_driver_context().await;
+        let context = &test_context.driver_context;
+        let group_id = Ulid::generate();
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let node_id = iroh::SecretKey::generate().public();
+        let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let expected_bucket = create_test_bucket(context, group_id, user_id, "bucket-a").await;
+        let (server, endpoint) = spawn_reference_server("ref-data").await;
+        let connector = create_http_connector(context, group_id, &endpoint).await;
+        let input = MaterializeReferenceInput {
+            group_id,
+            user_id,
+            realm_id,
+            node_id,
+            connector_id: connector.connector_id,
+            source_path: "folder/file.txt".to_string(),
+            bucket: "bucket-a".to_string(),
+            key: "object.txt".to_string(),
+            expected_bucket,
+        };
+
+        let first = materialize_reference(context, input.clone()).await.unwrap();
+        let second = materialize_reference(context, input).await.unwrap();
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(second.version_id, first.version_id);
+        let pointer = read_value(
+            context,
+            BLOB_HEAD_KEYSPACE,
+            BlobHeadKey::new("bucket-a", "object.txt")
+                .to_bytes()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            result,
-            Err(MaterializeReferenceError::QuotaExceeded { limit: 7, usage: 8 })
+            CurrentVersionPointer::from_bytes(pointer.as_ref()).unwrap(),
+            CurrentVersionPointer::new_with_generation(first.version_id, 1)
         );
-        assert!(
-            read_value(
-                context,
-                BLOB_HEAD_KEYSPACE,
-                BlobHeadKey::new("bucket-a", "object.txt")
-                    .to_bytes()
-                    .unwrap(),
-            )
-            .await
-            .is_none()
-        );
-        assert_eq!(
-            read_usage_counters(context, usage_group_key(group_id)).await,
-            UsageCounters::default()
-        );
+        let usage = read_usage_counters(context, usage_group_key(group_id)).await;
+        assert_eq!(usage.referenced_bytes, 8);
     }
 }

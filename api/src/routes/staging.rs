@@ -8,10 +8,14 @@ use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
 use aruna_core::structs::{
-    AuthContext, BucketInfo, Permission, SourceEntry, SourceEntryKind, blob_bucket_permission_path,
+    AuthContext, BucketInfo, JobPayload, JobRecord, JobState, Permission, SourceEntry,
+    SourceEntryKind, StagingJobCheckpoint, StagingJobItem, StagingJobPhase, StagingJobPrefix,
+    StagingJobSpec, StagingStrategy, blob_bucket_permission_path,
 };
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::jobs::service::{list_owned_jobs, read_owned_job, submit_staging_job};
+use aruna_operations::jobs::staging::read_staging_checkpoint;
 use aruna_operations::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
 };
@@ -31,14 +35,14 @@ use aruna_operations::staging::reference::{
 use aruna_operations::staging::snapshot::{
     MaterializeSnapshotError, MaterializeSnapshotInput, stage_snapshot_blob,
 };
-use axum::extract::{Query, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
-use std::path::{Component, Path};
+use std::path::{Component, Path as FsPath};
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::warn;
@@ -47,7 +51,14 @@ use utoipa::{OpenApi, ToSchema};
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "staging", description = "Blob staging")),
-    paths(stage_blob, stage_batch, list_references)
+    paths(
+        stage_blob,
+        stage_batch,
+        submit_staging,
+        list_staging_jobs,
+        get_staging_job,
+        list_references
+    )
 )]
 pub struct StagingApiDoc;
 
@@ -55,11 +66,21 @@ pub fn router() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/staging/", post(stage_blob))
         .route("/staging/batch", post(stage_batch))
+        .route("/staging/jobs", get(list_staging_jobs).post(submit_staging))
+        .route("/staging/jobs/{job_id}", get(get_staging_job))
         .route("/staging/references", get(list_references))
 }
 
 const DEFAULT_REFERENCE_LIMIT: usize = 500;
 const MAX_REFERENCE_LIMIT: usize = 1000;
+const DEFAULT_JOB_LIMIT: usize = 50;
+const MAX_JOB_LIMIT: usize = 200;
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct StagingJobListQuery {
+    pub limit: Option<usize>,
+    pub cursor: Option<String>,
+}
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ReferenceListQuery {
@@ -182,6 +203,51 @@ pub struct StageBatchResponse {
     pub results: Vec<StageBatchResult>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct SubmitStagingJobResponse {
+    pub job_id: String,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct StagingJobProgressResponse {
+    pub items_current: u64,
+    pub items_total: Option<u64>,
+    pub bytes_current: u64,
+    pub bytes_total: Option<u64>,
+    pub current_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct StagingJobErrorResponse {
+    pub source_path: String,
+    pub target_key: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct StagingJobResponse {
+    pub job_id: String,
+    pub strategy: ApiStagingStrategy,
+    pub group_id: String,
+    pub connector_id: String,
+    pub bucket: String,
+    pub state: String,
+    pub phase: String,
+    pub submitted_at: String,
+    pub finished_at: Option<String>,
+    pub error: Option<String>,
+    pub progress: StagingJobProgressResponse,
+    pub errors: Vec<StagingJobErrorResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct StagingJobListResponse {
+    pub jobs: Vec<StagingJobResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
 #[utoipa::path(
     post,
     path = "/staging/",
@@ -282,6 +348,7 @@ pub async fn stage_batch(
                 group_id,
                 connector_id,
                 source_path: source_prefix.clone(),
+                offset: 0,
                 limit: remaining,
                 recursive: true,
                 files_only: true,
@@ -330,6 +397,214 @@ pub async fn stage_batch(
     results.extend(expansion_errors);
 
     Ok((StatusCode::OK, Json(StageBatchResponse { results })))
+}
+
+#[utoipa::path(
+    post,
+    path = "/staging/jobs",
+    tag = "staging",
+    request_body = StageBatchRequest,
+    responses(
+        (status = 202, description = "Staging job accepted", body = SubmitStagingJobResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Not found", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn submit_staging(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(request): Json<StageBatchRequest>,
+) -> ServerResult<(StatusCode, Json<SubmitStagingJobResponse>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let group_id = parse_group_id(&request.group_id)?;
+    let connector_id = parse_source_connector_id(&request.connector_id)?;
+    if request.strategy == ApiStagingStrategy::Sync {
+        return Err(ServerError::Unimplemented);
+    }
+    let node_id = request
+        .node_id
+        .as_deref()
+        .map(NodeId::from_str)
+        .transpose()
+        .map_err(|_| ServerError::BadRequest)?
+        .unwrap_or_else(|| state.get_node_id());
+    if node_id != state.get_node_id() {
+        return Err(ServerError::BadRequestReason(
+            "staging node must be the local node".to_string(),
+        ));
+    }
+    let bucket_info = load_bucket_info(&state, &request.bucket).await?;
+    if bucket_info.group_id != group_id {
+        return Err(ServerError::NotFound);
+    }
+
+    let mut items = Vec::new();
+    for item in request.items.unwrap_or_default() {
+        validate_relative_source_path(&item.source_path)?;
+        if item.target_key.trim().is_empty() {
+            return Err(ServerError::BadRequest);
+        }
+        ensure_source_permission(&state, &auth, group_id, connector_id, &item.source_path).await?;
+        ensure_permission(
+            &state,
+            &auth,
+            bucket_blob_permission_path(&state, group_id, &request.bucket, &item.target_key),
+            Permission::WRITE,
+        )
+        .await?;
+        items.push(StagingJobItem {
+            source_path: item.source_path,
+            target_key: item.target_key,
+        });
+    }
+
+    let mut prefixes = Vec::new();
+    for prefix in request.prefixes.unwrap_or_default() {
+        let source_prefix = normalize_prefix(&prefix.source_prefix)?;
+        ensure_prefix_permission(
+            &state,
+            &auth,
+            group_id,
+            connector_id,
+            source_prefix.trim_end_matches('/'),
+        )
+        .await?;
+        ensure_permission(
+            &state,
+            &auth,
+            bucket_blob_permission_path(
+                &state,
+                group_id,
+                &request.bucket,
+                prefix.target_prefix.trim_matches('/'),
+            ),
+            Permission::WRITE,
+        )
+        .await?;
+        prefixes.push(StagingJobPrefix {
+            source_prefix: source_prefix.trim_end_matches('/').to_string(),
+            target_prefix: prefix.target_prefix.trim_matches('/').to_string(),
+        });
+    }
+    if items.is_empty() && prefixes.is_empty() {
+        return Err(ServerError::BadRequestReason(
+            "at least one staging item or prefix is required".to_string(),
+        ));
+    }
+
+    let result = submit_staging_job(
+        &state.get_ctx(),
+        StagingJobSpec {
+            auth_context: auth,
+            group_id,
+            node_id,
+            connector_id,
+            bucket: request.bucket,
+            strategy: match request.strategy {
+                ApiStagingStrategy::Snapshot => StagingStrategy::Snapshot,
+                ApiStagingStrategy::Reference => StagingStrategy::Reference,
+                ApiStagingStrategy::Sync => unreachable!(),
+            },
+            items,
+            prefixes,
+        },
+        node_id,
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SubmitStagingJobResponse {
+            job_id: result.job_id.to_string(),
+            created: result.created,
+        }),
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/staging/jobs",
+    tag = "staging",
+    params(
+        ("limit" = Option<usize>, Query, description = "Max jobs to return (default 50, max 200)"),
+        ("cursor" = Option<String>, Query, description = "Opaque pagination cursor from a previous page")
+    ),
+    responses(
+        (status = 200, description = "Staging jobs", body = StagingJobListResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_staging_jobs(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(query): Query<StagingJobListQuery>,
+) -> ServerResult<(StatusCode, Json<StagingJobListResponse>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let cursor = decode_job_cursor(query.cursor.as_deref())?;
+    let limit = query
+        .limit
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_JOB_LIMIT)
+        .min(MAX_JOB_LIMIT);
+    let (records, next_cursor) =
+        list_owned_jobs(&state.get_ctx(), auth.user_id, cursor, limit, |record| {
+            matches!(record.payload, JobPayload::Staging(_)) && staging_job_visible(record, &auth)
+        })
+        .await
+        .map_err(ServerError::InternalError)?;
+    let mut jobs = Vec::with_capacity(records.len());
+    for record in records {
+        let checkpoint = read_staging_checkpoint(&state.get_ctx(), record.job_id)
+            .await
+            .map_err(ServerError::InternalError)?;
+        jobs.push(staging_job_response(&record, checkpoint.as_ref())?);
+    }
+    Ok((
+        StatusCode::OK,
+        Json(StagingJobListResponse {
+            jobs,
+            next_cursor: encode_job_cursor(next_cursor),
+        }),
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/staging/jobs/{job_id}",
+    tag = "staging",
+    params(("job_id" = String, Path, description = "Staging job identifier")),
+    responses(
+        (status = 200, description = "Staging job", body = StagingJobResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Not found", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_staging_job(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    AxumPath(job_id): AxumPath<String>,
+) -> ServerResult<(StatusCode, Json<StagingJobResponse>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let job_id =
+        aruna_core::structs::JobId::from_str(&job_id).map_err(|_| ServerError::BadRequest)?;
+    let record = read_owned_job(&state.get_ctx(), auth.user_id, job_id)
+        .await
+        .map_err(ServerError::InternalError)?
+        .filter(|record| staging_job_visible(record, &auth))
+        .ok_or(ServerError::NotFound)?;
+    let checkpoint = read_staging_checkpoint(&state.get_ctx(), job_id)
+        .await
+        .map_err(ServerError::InternalError)?;
+    Ok((
+        StatusCode::OK,
+        Json(staging_job_response(&record, checkpoint.as_ref())?),
+    ))
 }
 
 #[utoipa::path(
@@ -492,6 +767,121 @@ fn ensure_batch_capacity(current: usize, additional: usize, limit: usize) -> Ser
     Ok(())
 }
 
+fn staging_job_visible(record: &JobRecord, auth: &AuthContext) -> bool {
+    let JobPayload::Staging(spec) = &record.payload else {
+        return false;
+    };
+    auth.path_restrictions.is_none() || spec.auth_context == *auth
+}
+
+fn staging_job_response(
+    record: &JobRecord,
+    checkpoint: Option<&StagingJobCheckpoint>,
+) -> ServerResult<StagingJobResponse> {
+    let JobPayload::Staging(spec) = &record.payload else {
+        return Err(ServerError::NotFound);
+    };
+    let phase = match record.state {
+        JobState::Succeeded => StagingJobPhase::Completed,
+        JobState::Failed | JobState::Cancelled => StagingJobPhase::Failed,
+        _ => checkpoint
+            .map(|checkpoint| checkpoint.phase)
+            .unwrap_or(StagingJobPhase::Queued),
+    };
+    let progress = checkpoint
+        .map(|checkpoint| StagingJobProgressResponse {
+            items_current: checkpoint.items_current,
+            items_total: checkpoint.items_total,
+            bytes_current: checkpoint.bytes_current,
+            bytes_total: checkpoint.bytes_total,
+            current_path: checkpoint.current_path.clone(),
+        })
+        .unwrap_or_else(|| StagingJobProgressResponse {
+            items_current: record.progress.current,
+            items_total: record.progress.total,
+            bytes_current: 0,
+            bytes_total: None,
+            current_path: None,
+        });
+    Ok(StagingJobResponse {
+        job_id: record.job_id.to_string(),
+        strategy: match spec.strategy {
+            StagingStrategy::Reference => ApiStagingStrategy::Reference,
+            StagingStrategy::Snapshot => ApiStagingStrategy::Snapshot,
+            StagingStrategy::Sync => ApiStagingStrategy::Sync,
+        },
+        group_id: spec.group_id.to_string(),
+        connector_id: spec.connector_id.to_string(),
+        bucket: spec.bucket.clone(),
+        state: match record.state {
+            JobState::Queued | JobState::Claimed => "queued",
+            JobState::Succeeded => "done",
+            JobState::Failed | JobState::Cancelled => "failed",
+            _ => "running",
+        }
+        .to_string(),
+        phase: staging_phase_name(phase).to_string(),
+        submitted_at: format_job_time(record.created_at_ms),
+        finished_at: record.finished_at_ms.map(format_job_time),
+        error: record
+            .last_error
+            .as_ref()
+            .map(|error| error.message.clone()),
+        progress,
+        errors: checkpoint
+            .map(|checkpoint| {
+                checkpoint
+                    .errors
+                    .iter()
+                    .map(|error| StagingJobErrorResponse {
+                        source_path: error.source_path.clone(),
+                        target_key: error.target_key.clone(),
+                        error: error.error.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+fn staging_phase_name(phase: StagingJobPhase) -> &'static str {
+    match phase {
+        StagingJobPhase::Queued => "queued",
+        StagingJobPhase::Discovering => "discovering",
+        StagingJobPhase::Inspecting => "inspecting",
+        StagingJobPhase::Registering => "registering",
+        StagingJobPhase::Downloading => "downloading",
+        StagingJobPhase::Writing => "writing",
+        StagingJobPhase::Completed => "completed",
+        StagingJobPhase::Failed => "failed",
+    }
+}
+
+fn format_job_time(timestamp_ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(timestamp_ms as i64)
+        .map(|timestamp| timestamp.to_rfc3339())
+        .unwrap_or_default()
+}
+
+fn decode_job_cursor(cursor: Option<&str>) -> ServerResult<Option<Vec<u8>>> {
+    match cursor {
+        Some(cursor) => {
+            let bytes = URL_SAFE_NO_PAD
+                .decode(cursor)
+                .map_err(|_| ServerError::BadRequest)?;
+            if bytes.len() != 24 {
+                return Err(ServerError::BadRequest);
+            }
+            Ok(Some(bytes))
+        }
+        None => Ok(None),
+    }
+}
+
+fn encode_job_cursor(cursor: Option<Vec<u8>>) -> Option<String> {
+    cursor.map(|cursor| URL_SAFE_NO_PAD.encode(cursor))
+}
+
 fn decode_reference_cursor(
     cursor: Option<&str>,
 ) -> ServerResult<Option<ListObjectsV2ContinuationToken>> {
@@ -513,7 +903,11 @@ fn encode_reference_cursor(token: ListObjectsV2ContinuationToken) -> ServerResul
 }
 
 fn normalize_prefix(prefix: &str) -> ServerResult<String> {
-    if prefix.trim().is_empty() {
+    let mut prefix = prefix.trim();
+    while let Some(stripped) = prefix.strip_prefix("./") {
+        prefix = stripped;
+    }
+    if prefix.is_empty() || prefix == "." {
         return Ok(String::new());
     }
     validate_relative_source_path(prefix)?;
@@ -585,6 +979,8 @@ async fn snapshot_blob(
             bucket: request.bucket.clone(),
             key: request.key.clone(),
             quota_ceiling,
+            retry_key: None,
+            expected_bucket: bucket_info,
         },
     )
     .await
@@ -636,8 +1032,6 @@ async fn reference_blob(
     .await?;
     ensure_source_permission(&state, &auth, group_id, connector_id, &request.source_path).await?;
 
-    let quota_ceiling = resolve_group_quota_ceiling(&state, group_id).await?;
-
     let result = stage_reference_blob(
         &state.get_ctx(),
         MaterializeReferenceInput {
@@ -649,11 +1043,21 @@ async fn reference_blob(
             source_path: request.source_path,
             bucket: request.bucket.clone(),
             key: request.key.clone(),
-            quota_ceiling,
+            expected_bucket: bucket_info,
         },
     )
     .await
     .map_err(map_reference_error)?;
+
+    queue_live_version_replication(
+        &state,
+        auth,
+        request.bucket.clone(),
+        request.key.clone(),
+        result.version_id,
+        false,
+    )
+    .await;
 
     Ok((
         StatusCode::CREATED,
@@ -718,6 +1122,22 @@ async fn ensure_source_permission(
     .await
 }
 
+async fn ensure_prefix_permission(
+    state: &ServerState,
+    auth: &AuthContext,
+    group_id: ulid::Ulid,
+    connector_id: ulid::Ulid,
+    source_prefix: &str,
+) -> ServerResult<()> {
+    ensure_permission(
+        state,
+        auth,
+        source_connector_permission_path(state, group_id, connector_id, source_prefix),
+        Permission::READ,
+    )
+    .await
+}
+
 fn source_connector_permission_path(
     state: &ServerState,
     group_id: ulid::Ulid,
@@ -738,7 +1158,13 @@ fn validate_relative_source_path(source_path: &str) -> ServerResult<()> {
     }
 
     let mut has_normal_component = false;
-    for component in Path::new(trimmed).components() {
+    if trimmed
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return Err(ServerError::BadRequest);
+    }
+    for component in FsPath::new(trimmed).components() {
         match component {
             Component::Normal(_) => has_normal_component = true,
             Component::CurDir
@@ -762,21 +1188,21 @@ fn map_snapshot_error(error: MaterializeSnapshotError) -> ServerError {
             ServerError::Forbidden
         }
         MaterializeSnapshotError::Write(error) => ServerError::InternalError(error.to_string()),
+        MaterializeSnapshotError::Storage(error) => ServerError::InternalError(error.to_string()),
+        MaterializeSnapshotError::Conversion(error) => {
+            ServerError::InternalError(error.to_string())
+        }
     }
 }
 
 fn map_reference_error(error: MaterializeReferenceError) -> ServerError {
     match error {
         MaterializeReferenceError::Head(error) => map_head_staging_error(error),
-        MaterializeReferenceError::QuotaExceeded { .. } => ServerError::Forbidden,
         MaterializeReferenceError::Storage(error) => ServerError::InternalError(error.to_string()),
         MaterializeReferenceError::Conversion(error) => {
             ServerError::InternalError(error.to_string())
         }
         MaterializeReferenceError::Usage(error) => ServerError::InternalError(error.to_string()),
-        MaterializeReferenceError::QuotaGate(error) => {
-            ServerError::InternalError(error.to_string())
-        }
     }
 }
 
@@ -905,6 +1331,15 @@ mod tests {
         auth_with_bucket_read: AuthContext,
         auth_with_source_read: AuthContext,
         auth_without_source_read: AuthContext,
+    }
+
+    #[test]
+    fn job_cursor_roundtrip() {
+        let cursor = vec![7u8; 24];
+        let encoded = encode_job_cursor(Some(cursor.clone())).unwrap();
+
+        assert_eq!(decode_job_cursor(Some(&encoded)).unwrap(), Some(cursor));
+        assert!(decode_job_cursor(Some("invalid")).is_err());
     }
 
     #[tokio::test]
@@ -1116,16 +1551,6 @@ mod tests {
     }
 
     #[test]
-    fn reference_quota_exceeded_maps_to_forbidden() {
-        let error = map_reference_error(MaterializeReferenceError::QuotaExceeded {
-            limit: 100,
-            usage: 200,
-        });
-
-        assert!(matches!(error, ServerError::Forbidden));
-    }
-
-    #[test]
     fn batch_keeps_failures() {
         let success = stage_result(
             StageBatchItem {
@@ -1168,6 +1593,15 @@ mod tests {
                 target_key: "imported/nested/file.txt".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn prefix_normalizes_root() {
+        assert_eq!(normalize_prefix(".").unwrap(), "");
+        assert_eq!(normalize_prefix("./").unwrap(), "");
+        assert_eq!(normalize_prefix("./refseq/").unwrap(), "refseq/");
+        assert!(normalize_prefix("refseq/./nested").is_err());
+        assert!(normalize_prefix("../refseq").is_err());
     }
 
     #[test]

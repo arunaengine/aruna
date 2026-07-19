@@ -611,6 +611,7 @@ async fn run_job(
     let progress = ProgressReporter::from_progress(&record.progress);
     let ctx = JobContext {
         driver: context.clone(),
+        job_id,
         claim_token: token,
         cancel: cancel.clone(),
         shutdown,

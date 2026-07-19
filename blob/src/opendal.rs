@@ -139,6 +139,7 @@ pub(crate) async fn read_staging_source(
 
 pub(crate) async fn list_staging_source(
     access: &ResolvedSourceAccess,
+    offset: usize,
     limit: usize,
     recursive: bool,
     files_only: bool,
@@ -148,16 +149,19 @@ pub(crate) async fn list_staging_source(
     } = access;
     if *kind == SourceConnectorKind::Http {
         // opendal's Http service cannot list; walk autoindex pages instead.
-        return crate::autoindex::list_http_autoindex(config, path, limit, recursive, files_only)
-            .await;
+        return crate::autoindex::list_http_autoindex(
+            config, path, offset, limit, recursive, files_only,
+        )
+        .await;
     }
     let (operator, path, ..) = build_staging_source_operator(access)?;
-    list_operator(&operator, path, limit, recursive, files_only).await
+    list_operator(&operator, path, offset, limit, recursive, files_only).await
 }
 
 async fn list_operator(
     operator: &Operator,
     path: &str,
+    offset: usize,
     limit: usize,
     recursive: bool,
     files_only: bool,
@@ -168,6 +172,7 @@ async fn list_operator(
         .await
         .map_err(|error| StagingSourceError::ListError(error.to_string()))?;
     let mut entries = Vec::with_capacity(limit);
+    let mut skipped = 0usize;
 
     while let Some(entry) = lister
         .try_next()
@@ -184,6 +189,10 @@ async fn list_operator(
             EntryMode::DIR if !files_only => aruna_core::structs::SourceEntryKind::Directory,
             EntryMode::DIR | EntryMode::Unknown => continue,
         };
+        if skipped < offset {
+            skipped += 1;
+            continue;
+        }
         if entries.len() == limit {
             return Ok((entries, true));
         }
@@ -344,13 +353,19 @@ mod tests {
         )]))
         .unwrap();
 
-        let (entries, truncated) = list_operator(&operator, "prefix/", 1, false, false)
+        let (entries, truncated) = list_operator(&operator, "prefix/", 0, 1, false, false)
             .await
             .unwrap();
 
         assert_eq!(entries.len(), 1);
         assert!(entries[0].path.starts_with("prefix/"));
         assert!(truncated);
+
+        let (entries, truncated) = list_operator(&operator, "prefix/", 1, 1, false, false)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!truncated);
     }
 
     #[tokio::test]
@@ -368,7 +383,7 @@ mod tests {
         )]))
         .unwrap();
 
-        let (entries, truncated) = list_operator(&operator, "prefix/", 10, true, true)
+        let (entries, truncated) = list_operator(&operator, "prefix/", 0, 10, true, true)
             .await
             .unwrap();
 
@@ -395,7 +410,7 @@ mod tests {
         )]))
         .unwrap();
 
-        let (entries, truncated) = list_operator(&operator, "prefix/", 1, true, true)
+        let (entries, truncated) = list_operator(&operator, "prefix/", 0, 1, true, true)
             .await
             .unwrap();
 
