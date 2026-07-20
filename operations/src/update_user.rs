@@ -621,7 +621,7 @@ fn local_user_document_sync_change(
         base: previous_change.map(|change| change.current),
         current: DocumentSyncRevision {
             generation: updated_at_ms.max(minimum_generation),
-            event_id: Ulid::r#gen(),
+            event_id: Ulid::generate(),
             actor: actor.node_id,
             updated_at_ms,
         },
@@ -859,7 +859,7 @@ mod tests {
             }))
         ));
 
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         let target = AdminDocumentTarget::User { user_id };
         let document = DocumentSyncTarget::User { user_id };
@@ -996,7 +996,7 @@ mod tests {
         };
 
         operation.start();
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
 
         let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
@@ -1060,7 +1060,7 @@ mod tests {
         let mut operation = UpdateUserOperation::new(input(realm_id, user_id, user_id));
 
         operation.start();
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
 
         let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {

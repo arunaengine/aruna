@@ -1,7 +1,8 @@
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::structs::{
-    ExecutionSpec, JobId, JobPayload, JobRecord, RunCrateStatus, user_dedup_key,
+    ExecutionSpec, JobId, JobPayload, JobRecord, RunCrateStatus, StagingJobSpec, WorkspaceMode,
+    user_dedup_key,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{NodeId, UserId};
@@ -28,7 +29,26 @@ pub async fn submit_execution_job(
     created_by: UserId,
     owner_node_id: NodeId,
     idempotency_key: Option<String>,
+    workspace_mode: WorkspaceMode,
+    workspace_bucket: Option<String>,
 ) -> Result<SubmitJobResult, SubmitJobError> {
+    match workspace_mode {
+        WorkspaceMode::Existing
+            if workspace_bucket
+                .as_deref()
+                .is_none_or(|bucket| bucket.trim().is_empty()) =>
+        {
+            return Err(SubmitJobError::InvalidWorkspace(
+                "existing mode requires a bucket".to_string(),
+            ));
+        }
+        WorkspaceMode::Temporary | WorkspaceMode::Kept if workspace_bucket.is_some() => {
+            return Err(SubmitJobError::InvalidWorkspace(
+                "bucket is only valid for existing mode".to_string(),
+            ));
+        }
+        _ => {}
+    }
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
     drive(
         SubmitJobOperation::new(SubmitJobSpec {
@@ -37,6 +57,29 @@ pub async fn submit_execution_job(
             owner_node_id,
             dedup_key,
             now_ms: unix_timestamp_millis(),
+            workspace_mode,
+            workspace_bucket,
+        }),
+        context,
+    )
+    .await
+}
+
+pub async fn submit_staging_job(
+    context: &DriverContext,
+    spec: StagingJobSpec,
+    owner_node_id: NodeId,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    let created_by = spec.auth_context.user_id;
+    drive(
+        SubmitJobOperation::new(SubmitJobSpec {
+            payload: JobPayload::Staging(spec),
+            created_by,
+            owner_node_id,
+            dedup_key: None,
+            now_ms: unix_timestamp_millis(),
+            workspace_mode: WorkspaceMode::default(),
+            workspace_bucket: None,
         }),
         context,
     )

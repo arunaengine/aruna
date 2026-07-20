@@ -59,22 +59,24 @@ struct VersionSummary {
     version_id: Ulid,
     materialized_hash: Option<[u8; 32]>,
     logical_size: Option<u64>,
+    referenced: bool,
     deleted: bool,
 }
 
 impl VersionSummary {
     fn from_blob_version(version_id: Ulid, version: &BlobVersion) -> Self {
-        let (materialized_hash, logical_size) = match &version.state {
-            BlobVersionState::Materialized { blob_hash, .. } => (Some(*blob_hash), None),
+        let (materialized_hash, logical_size, referenced) = match &version.state {
+            BlobVersionState::Materialized { blob_hash, .. } => (Some(*blob_hash), None, false),
             BlobVersionState::Reference {
                 cached_metadata, ..
-            } => (None, Some(cached_metadata.content_length)),
-            BlobVersionState::Deleted => (None, None),
+            } => (None, Some(cached_metadata.content_length), true),
+            BlobVersionState::Deleted => (None, None, false),
         };
         Self {
             version_id,
             materialized_hash,
             logical_size,
+            referenced,
             deleted: version.is_deleted(),
         }
     }
@@ -583,10 +585,11 @@ impl DeleteObjectOperation {
             } else {
                 0
             };
-            let logical_bytes = self.target_size.map_or(0, |size| -i128::from(size));
+            let bytes = self.target_size.map_or(0, |size| -i128::from(size));
             UsageDelta {
                 objects,
-                logical_bytes,
+                logical_bytes: if target.referenced { 0 } else { bytes },
+                referenced_bytes: if target.referenced { bytes } else { 0 },
                 ..Default::default()
             }
         } else {
@@ -657,7 +660,7 @@ impl DeleteObjectOperation {
     }
 
     fn write_tombstone(&mut self) -> Effects {
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         self.version_id = Some(version_id);
         self.deleted_version_created_at = Some(SystemTime::now());
         self.read_current_lookup(version_id)
@@ -843,7 +846,8 @@ mod test {
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
         Backend, BackendConfig, BlobHeadKey, BlobVersion, CurrentVersionPointer, HashPathIndexKey,
-        RealmId, VersionKey,
+        PortableSourceDescriptor, RealmId, SourceConnectorKind, SourceMetadata, StagingStrategy,
+        VersionKey, VersionSourceBinding,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -854,7 +858,7 @@ mod test {
     use ulid::Ulid;
 
     fn test_user_id() -> aruna_core::UserId {
-        aruna_core::UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32]))
+        aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]))
     }
 
     fn deleted_version_value(user_id: aruna_core::UserId) -> aruna_core::types::Value {
@@ -877,6 +881,39 @@ mod test {
                 .into(),
             deleted_version_value(user_id),
         )
+    }
+
+    #[test]
+    fn reference_counts_content() {
+        let version_id = Ulid::generate();
+        let version = BlobVersion::reference(
+            VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                descriptor: PortableSourceDescriptor {
+                    kind: SourceConnectorKind::ArunaNative,
+                    public_config: HashMap::new(),
+                    source_path: "source/object.bin".to_string(),
+                    version_selector: Some(format!("version:{version_id}")),
+                    capabilities: Vec::new(),
+                    origin_node_id: Some(iroh::SecretKey::from_bytes(&[4u8; 32]).public()),
+                },
+                connector_id: None,
+            },
+            SourceMetadata {
+                content_length: 1_000_000,
+                content_type: None,
+                etag: None,
+                last_modified: None,
+                source_version: None,
+            },
+            SystemTime::UNIX_EPOCH,
+            Default::default(),
+            SystemTime::UNIX_EPOCH,
+        );
+        let summary = VersionSummary::from_blob_version(version_id, &version);
+
+        assert_eq!(summary.logical_size, Some(1_000_000));
+        assert!(summary.referenced);
     }
 
     async fn read_value(
@@ -908,7 +945,7 @@ mod test {
             bucket: "bucket".to_string(),
             key: "key".to_string(),
             version_id: Some(target_version_id),
-            group_id: Ulid::r#gen(),
+            group_id: Ulid::generate(),
             realm_id: RealmId::from_bytes([1u8; 32]),
             node_id: iroh::SecretKey::generate().public(),
             deleted_by: user_id,
@@ -923,7 +960,7 @@ mod test {
         ));
 
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::r#gen(),
+            txn_id: Ulid::generate(),
         }));
         assert!(matches!(
             effects.as_slice(),
@@ -1058,8 +1095,8 @@ mod test {
             DeleteObjectOperation::new(DeleteObjectInput {
                 bucket: "mybucket".to_string(),
                 key: "missing.txt".to_string(),
-                version_id: Some(Ulid::r#gen()),
-                group_id: Ulid::r#gen(),
+                version_id: Some(Ulid::generate()),
+                group_id: Ulid::generate(),
                 realm_id: RealmId::from_bytes([1u8; 32]),
                 node_id: iroh::SecretKey::generate().public(),
                 deleted_by: test_user_id(),
@@ -1107,8 +1144,8 @@ mod test {
             compute_handle: None,
         };
 
-        let user_id = aruna_core::UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32]));
-        let group_id = Ulid::r#gen();
+        let user_id = aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]));
+        let group_id = Ulid::generate();
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let node_id = context.net_handle.as_ref().unwrap().node_id();
         let put_result = drive(
@@ -1214,7 +1251,7 @@ mod test {
                 key: "to-delete.txt".to_string(),
                 version_id: None,
                 range: None,
-                group_id: Ulid::r#gen(),
+                group_id: Ulid::generate(),
                 user_identity: user_id,
             }),
             &context,
@@ -1259,8 +1296,8 @@ mod test {
             compute_handle: None,
         };
 
-        let user_id = aruna_core::UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32]));
-        let group_id = Ulid::r#gen();
+        let user_id = aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]));
+        let group_id = Ulid::generate();
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let node_id = context.net_handle.as_ref().unwrap().node_id();
         let put_result = drive(
@@ -1382,7 +1419,7 @@ mod test {
                 key: "versioned.txt".to_string(),
                 version_id: None,
                 range: None,
-                group_id: Ulid::r#gen(),
+                group_id: Ulid::generate(),
                 user_identity: user_id,
             }),
             &context,
@@ -1431,7 +1468,7 @@ mod test {
                 key: "versioned.txt".to_string(),
                 version_id: None,
                 range: None,
-                group_id: Ulid::r#gen(),
+                group_id: Ulid::generate(),
                 user_identity: user_id,
             }),
             &context,

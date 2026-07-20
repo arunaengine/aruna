@@ -567,7 +567,7 @@ pub async fn create_metadata_document(
                     realm_id: state.get_realm_id(),
                 },
                 group_id,
-                document_id: Ulid::r#gen(),
+                document_id: Ulid::generate(),
                 document_path: path,
                 public,
                 payload,
@@ -585,7 +585,7 @@ pub async fn create_metadata_document(
     emit_resource_watch_event(
         ctx.as_ref(),
         WatchEvent {
-            event_id: Ulid::r#gen(),
+            event_id: Ulid::generate(),
             realm_id: state.get_realm_id(),
             kind: WatchEventKind::MetadataCreated,
             path: format!("meta/{}/{}", result.group_id, result.document_path),
@@ -2093,6 +2093,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn portal_searches_description() {
+        let test = setup_state().await;
+        let (_, Json(created)) = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Extension(None),
+            Json(CreateMetadataRequest::RoCrate(
+                CreateMetadataRoCrateRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/portal-array-context".to_string(),
+                    public: true,
+                    rocrate: json!({
+                        "@context": [
+                            "https://w3id.org/ro/crate/1.2/context",
+                            {
+                                "portalTerm": "https://example.org/portalTerm"
+                            }
+                        ],
+                        "@graph": [
+                            {
+                                "@id": "ro-crate-metadata.json",
+                                "@type": "CreativeWork",
+                                "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                                "about": { "@id": "urn:dataset:portal-search" }
+                            },
+                            {
+                                "@id": "urn:dataset:portal-search",
+                                "@type": "Dataset",
+                                "name": "Portal Search Dataset",
+                                "description": "A plain multi word constellation dataset description",
+                                "datePublished": "2026-07-18",
+                                "license": { "@id": "https://creativecommons.org/licenses/by/4.0/" },
+                                "portalTerm": "portal-shape"
+                            }
+                        ]
+                    }),
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let (_, Json(search)) = search_metadata(
+                    State(test.state.clone()),
+                    Extension(None),
+                    Extension(None),
+                    Query(MetadataSearchParams {
+                        q: "constellation".to_string(),
+                        conforms_to: None,
+                        group_id: None,
+                        limit: Some(10),
+                        cursor: None,
+                        mode: Some(MetadataQueryMode::Local),
+                    }),
+                )
+                .await
+                .unwrap();
+                if search
+                    .hits
+                    .iter()
+                    .any(|hit| hit.document_id == created.summary.document_id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("woken search worker indexes the portal crate");
+    }
+
+    #[tokio::test]
     async fn metadata_routes_support_rocrate_create_and_entity_upserts() {
         let test = setup_state().await;
 
@@ -2291,7 +2366,7 @@ mod tests {
         );
         let lifecycle = MetadataDocumentLifecycleRecord::Delete {
             event: MetadataDocumentDeleteRecord {
-                event_id: Ulid::r#gen(),
+                event_id: Ulid::generate(),
                 tombstone: tombstone.clone(),
                 deleted_after_event_id: record.last_event_id,
             },
@@ -2410,7 +2485,7 @@ mod tests {
             State(test.state),
             Extension(None),
             Extension(None),
-            Path(Ulid::r#gen().to_string()),
+            Path(Ulid::generate().to_string()),
             Json(SparqlQueryRequest {
                 query: "ASK WHERE { ?s ?p ?o }".to_string(),
                 mode: None,
@@ -2525,7 +2600,7 @@ mod tests {
     async fn load_metadata_record_by_document_returns_internal_error_on_storage_failure() {
         let state = setup_state_with_closed_storage().await;
 
-        let result = load_metadata_record_by_document(state.as_ref(), Ulid::r#gen()).await;
+        let result = load_metadata_record_by_document(state.as_ref(), Ulid::generate()).await;
 
         assert!(matches!(
             result,
@@ -2536,7 +2611,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_permission_returns_forbidden_for_nonexistent_group() {
         let test = setup_state().await;
-        let missing_group = Ulid::r#gen();
+        let missing_group = Ulid::generate();
         let path = format!("/{}/g/{missing_group}/meta/**", test.state.get_realm_id());
 
         let result = ensure_permission(
@@ -3165,8 +3240,8 @@ mod tests {
     async fn setup_search_pagination_cluster(node_count: usize) -> SearchPaginationCluster {
         let realm_signing_key = test_realm_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-        let user_id = aruna_core::UserId::local(Ulid::r#gen(), realm_id);
-        let group_id = Ulid::r#gen();
+        let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let group_id = Ulid::generate();
 
         let mut nodes = Vec::new();
         for _ in 0..node_count {
@@ -3372,7 +3447,7 @@ mod tests {
     async fn group_filter_fanout() {
         // Group filter must hold across every fanned-out node.
         let cluster = setup_search_pagination_cluster(3).await;
-        let other_group = Ulid::r#gen();
+        let other_group = Ulid::generate();
         for node in &cluster.nodes {
             install_metadata_auth_documents(
                 node,
@@ -3837,7 +3912,7 @@ mod tests {
     async fn group_filter_scopes() {
         // Filtered search returns only the named group's hits; unfiltered spans groups.
         let test = setup_state_with_net().await;
-        let other_group = Ulid::r#gen();
+        let other_group = Ulid::generate();
         install_group_auth(&test, other_group).await;
         create_test_metadata_document(
             test.state.clone(),
@@ -4004,8 +4079,8 @@ mod tests {
     async fn setup_distributed_metadata_access_state() -> DistributedMetadataAccessState {
         let realm_signing_key = test_realm_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-        let user_id = aruna_core::UserId::local(Ulid::r#gen(), realm_id);
-        let group_id = Ulid::r#gen();
+        let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let group_id = Ulid::generate();
         let coordinator = spawn_distributed_metadata_node(realm_id).await;
         let remote = spawn_distributed_metadata_node(realm_id).await;
         let nodes = [&coordinator, &remote];
@@ -4404,8 +4479,8 @@ mod tests {
         // A private backlink from a group the caller cannot read is dropped.
         let test = setup_state().await;
         let realm_id = test.state.get_realm_id();
-        let foreign_user = aruna_core::UserId::local(Ulid::r#gen(), realm_id);
-        let foreign_group = Ulid::r#gen();
+        let foreign_user = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let foreign_group = Ulid::generate();
         seed_group_owned_by(&test, foreign_group, foreign_user).await;
         let foreign_auth = AuthContext {
             user_id: foreign_user,
@@ -4731,7 +4806,7 @@ mod tests {
             iss: realm_id.to_string(),
             iat: now,
             exp: now + 600,
-            jti: Ulid::r#gen().to_string(),
+            jti: Ulid::generate().to_string(),
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,
@@ -4755,7 +4830,7 @@ mod tests {
             storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
         let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
         let realm_id = test_realm_id(3);
-        let user_id = aruna_core::UserId::local(Ulid::r#gen(), realm_id);
+        let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
         let actor = Actor {
             node_id,
             user_id,
@@ -4779,7 +4854,7 @@ mod tests {
             task_handle: Some(task_handle),
             compute_handle: None,
         });
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let group_auth =
             GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
         let group = Group {
@@ -4860,7 +4935,7 @@ mod tests {
         .await
         .unwrap();
         let node_id = net.node_id();
-        let user_id = aruna_core::UserId::local(Ulid::r#gen(), realm_id);
+        let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
         let actor = Actor {
             node_id,
             user_id,
@@ -4901,7 +4976,7 @@ mod tests {
                 .into(),
         )
         .await;
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let group_auth =
             GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
         let group = Group {

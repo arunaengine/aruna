@@ -270,7 +270,7 @@ mod tests {
             })]
         ));
 
-        let txn_id = Ulid::r#gen();
+        let txn_id = Ulid::generate();
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert_eq!(op.state, ResolveBlobPermissionPathsState::ReadHashAliases);
         assert!(matches!(
@@ -292,7 +292,7 @@ mod tests {
 
         op.start();
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::r#gen(),
+            txn_id: Ulid::generate(),
         }));
         assert_eq!(op.state, ResolveBlobPermissionPathsState::ReadHashAliases);
         assert!(matches!(
@@ -347,7 +347,7 @@ mod tests {
         ));
 
         let effects = op.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: Ulid::r#gen(),
+            txn_id: Ulid::generate(),
         }));
         assert!(effects.is_empty());
         assert_eq!(op.state, ResolveBlobPermissionPathsState::Finish);

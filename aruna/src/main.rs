@@ -35,6 +35,7 @@ use aruna_operations::jobs::drain::restore_job_queue_timer;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_metadata_warmup};
+use aruna_operations::replication::migration::migrate_legacy_sync;
 use aruna_operations::startup::restore_shard_subscriptions;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::StorageHandle;
@@ -45,6 +46,10 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 fn main() {
+    // Both ring and aws-lc-rs are in the graph; rustls needs one picked before any TLS init.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install rustls ring crypto provider");
     if let Some(code) = aruna_compute::dispatch_helper() {
         std::process::exit(code);
     }
@@ -311,6 +316,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    match migrate_legacy_sync(driver_ctx.as_ref(), config.node_id, config.realm_id).await {
+        Ok(summary) if summary.failed > 0 => warn!(
+            migrated = summary.migrated,
+            skipped = summary.skipped,
+            failed = summary.failed,
+            "Legacy S3 replication migration incomplete; startup will retry"
+        ),
+        Ok(summary) if !summary.already_complete => info!(
+            migrated = summary.migrated,
+            skipped = summary.skipped,
+            "Migrated legacy S3 replication configs"
+        ),
+        Ok(_) => {}
+        Err(error) => warn!(%error, "Failed to migrate legacy S3 replication configs"),
+    }
+
     // Republish a full set of node usage snapshots after startup-mode core
     // document announcement has had a chance to queue the shared node-usage topic
     // genesis. Best-effort: failures are retried by the debounced publisher.
@@ -377,7 +398,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         cors: cors.clone(),
         portal_csp: PortalCspConfig::new(config.portal_csp_extra_origins.clone()),
     };
-    let server = Server::new(state.clone(), server_config);
+    let server = Server::new(state.clone(), server_config)
+        .with_api_public_url(config.api_public_url.clone());
 
     // S3 Server
     let s3_server = S3Server::new(

@@ -649,7 +649,7 @@ impl CompleteMultipartUploadOperation {
     }
 
     fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Effects {
-        let version_id = *self.version_id.get_or_insert_with(Ulid::r#gen);
+        let version_id = *self.version_id.get_or_insert_with(Ulid::generate);
         let pointer = CurrentVersionPointer::next_for(existing, version_id);
         let alias_context = match self.alias_context() {
             Ok(context) => context,
@@ -1390,7 +1390,7 @@ mod tests {
         CompleteMultipartUploadInput {
             bucket: "bucket".to_string(),
             key: "object".to_string(),
-            upload_id: Ulid::r#gen(),
+            upload_id: Ulid::generate(),
             realm_id,
             node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
             completed_parts: vec![],
@@ -1399,7 +1399,7 @@ mod tests {
             checksum_type: MultipartChecksumType::FullObject,
             checksum_type_explicit: false,
             object_size: Some(10),
-            created_by: UserId::local(Ulid::r#gen(), realm_id),
+            created_by: UserId::local(Ulid::generate(), realm_id),
             quota_ceiling: Some(30),
         }
     }
@@ -1409,7 +1409,7 @@ mod tests {
             upload_id: input.upload_id,
             bucket: input.bucket.clone(),
             key: input.key.clone(),
-            group_id: Ulid::r#gen(),
+            group_id: Ulid::generate(),
             created_by: input.created_by,
             created_at: SystemTime::now(),
             status: MultipartUploadStatus::Completing,
@@ -1424,10 +1424,10 @@ mod tests {
                 root: "/tmp".to_string(),
                 storage_bucket: "multipart".to_string(),
                 backend_path: format!("part-{part_number}"),
-                ulid: Ulid::r#gen(),
+                ulid: Ulid::generate(),
                 compressed: false,
                 encrypted: false,
-                created_by: UserId::local(Ulid::r#gen(), RealmId::from_bytes([4u8; 32])),
+                created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([4u8; 32])),
                 created_at: SystemTime::now(),
                 staging: false,
                 partial: true,
@@ -1468,7 +1468,7 @@ mod tests {
             checksum_type: MultipartChecksumType::Composite,
         });
         let mut op = CompleteMultipartUploadOperation::new(input);
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         op.txn_id = Some(txn_id);
         op.state = CompleteMultipartUploadState::ReadUploadForMark;
 
@@ -1623,17 +1623,17 @@ mod tests {
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: "object".to_string(),
-            ulid: Ulid::r#gen(),
+            ulid: Ulid::generate(),
             compressed: false,
             encrypted: false,
-            created_by: UserId::local(Ulid::r#gen(), RealmId::from_bytes([4u8; 32])),
+            created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([4u8; 32])),
             created_at: SystemTime::now(),
             staging: false,
             partial: false,
             blob_size: 10,
             hashes: HashMap::new(),
         });
-        op.version_id = Some(Ulid::r#gen());
+        op.version_id = Some(Ulid::generate());
         op.upload_parts = vec![requested.clone(), omitted.clone()];
         op.resolved_parts = vec![requested.clone()];
 
@@ -1658,7 +1658,7 @@ mod tests {
         let input = finalize_input();
         let record = open_upload_record(&input);
         let mut op = CompleteMultipartUploadOperation::new(input);
-        let finalize_txn = TxnId::r#gen();
+        let finalize_txn = TxnId::generate();
         op.txn_id = Some(finalize_txn);
         op.upload_record = Some(record);
         op.state = CompleteMultipartUploadState::EnforceQuota;
@@ -1708,7 +1708,7 @@ mod tests {
     fn quota_rejection_abort_failure_preserves_original_error() {
         let input = finalize_input();
         let mut op = CompleteMultipartUploadOperation::new(input);
-        let finalize_txn = TxnId::r#gen();
+        let finalize_txn = TxnId::generate();
         op.txn_id = Some(finalize_txn);
         op.state = CompleteMultipartUploadState::EnforceQuota;
 

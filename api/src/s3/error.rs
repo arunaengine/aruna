@@ -301,6 +301,9 @@ impl IntoS3Error for GetObjectError {
                 StagingSourceError::NotFound => {
                     s3_error!(NoSuchKey, "The referenced source object does not exist.")
                 }
+                StagingSourceError::AccessDenied => {
+                    s3_error!(AccessDenied, "Access to the referenced source was denied.")
+                }
                 err => s3_error!(ServiceUnavailable, "{}", err),
             },
             err => internal_error(err),
@@ -327,6 +330,25 @@ impl IntoS3Error for HeadObjectError {
             HeadObjectError::NoSuchVersion => no_such_version_error(),
             HeadObjectError::DeleteMarker => delete_marker_error(),
             HeadObjectError::NoSuchKey => no_such_key_error(),
+            HeadObjectError::ResolveReferenceError(error) => match error {
+                SourceConnectorResolutionError::ResolveFailed
+                | SourceConnectorResolutionError::NotFound => {
+                    s3_error!(
+                        ServiceUnavailable,
+                        "Reference source is currently unavailable"
+                    )
+                }
+                err => internal_error(err),
+            },
+            HeadObjectError::StagingSourceError(error) => match error {
+                StagingSourceError::NotFound => {
+                    s3_error!(NoSuchKey, "The referenced source object does not exist.")
+                }
+                StagingSourceError::AccessDenied => {
+                    s3_error!(AccessDenied, "Access to the referenced source was denied.")
+                }
+                err => s3_error!(ServiceUnavailable, "{}", err),
+            },
             err => internal_error(err),
         }
     }
@@ -503,5 +525,13 @@ mod tests {
             entity_too_small.status_code(),
             Some(http::StatusCode::BAD_REQUEST)
         );
+    }
+
+    #[test]
+    fn maps_head_denial() {
+        let error =
+            HeadObjectError::StagingSourceError(StagingSourceError::AccessDenied).into_s3_error();
+
+        assert_eq!(*error.code(), S3ErrorCode::AccessDenied);
     }
 }

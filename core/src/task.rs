@@ -22,6 +22,7 @@ pub enum TaskKey {
     PublishWatchInterest,
     DrainJobQueue,
     PruneJobs,
+    DrainSyncMirrorRepair,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

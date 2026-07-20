@@ -5,7 +5,7 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::{
     MetadataRegistryRecord, NotificationClass, NotificationKind, NotificationRecord,
     RealmConfigDocument, RealmId, WatchEvent, WatchEventDetail, WatchEventKind,
-    data_watch_resource_path,
+    data_watch_resource_path, parse_data_watch_resource_path,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
@@ -366,6 +366,33 @@ fn validate_inbound_watch_event(
                 return Err("watch event data path does not match detail".to_string());
             }
         }
+        (
+            WatchEventKind::SyncCompleted,
+            WatchEventDetail::SyncCompleted {
+                group_id,
+                node_id,
+                bucket,
+                relationship_id,
+                ..
+            },
+        )
+        | (
+            WatchEventKind::SyncFailed,
+            WatchEventDetail::SyncFailed {
+                group_id,
+                node_id,
+                bucket,
+                relationship_id,
+                ..
+            },
+        ) => {
+            validate_sync_detail(event, *group_id, *node_id, bucket, *relationship_id)?;
+            if let WatchEventDetail::SyncFailed { error, .. } = &event.detail
+                && error.is_empty()
+            {
+                return Err("watch event has empty sync error".to_string());
+            }
+        }
         _ => return Err("watch event kind does not match detail".to_string()),
     }
 
@@ -376,7 +403,10 @@ fn validate_inbound_record(record: &NotificationRecord, now_ms: u64) -> Result<(
     if record.watch_authorization.is_some()
         || matches!(
             record.kind,
-            NotificationKind::MetadataCreated { .. } | NotificationKind::DataUploaded { .. }
+            NotificationKind::MetadataCreated { .. }
+                | NotificationKind::DataUploaded { .. }
+                | NotificationKind::SyncCompleted { .. }
+                | NotificationKind::SyncFailed { .. }
         )
     {
         return Err("resource watch records must use watch event delivery".to_string());
@@ -473,6 +503,67 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
             }
             validate_kind_user("actor_user_id", actor_user_id, recipient_realm)?;
         }
+        NotificationKind::SyncCompleted {
+            path,
+            group_id,
+            node_id,
+            bucket,
+            relationship_id,
+            actor_user_id,
+            ..
+        }
+        | NotificationKind::SyncFailed {
+            path,
+            group_id,
+            node_id,
+            bucket,
+            relationship_id,
+            actor_user_id,
+            ..
+        } => {
+            validate_sync_path(path, *group_id, *node_id, bucket, *relationship_id)?;
+            if let NotificationKind::SyncFailed { error, .. } = kind
+                && error.is_empty()
+            {
+                return Err("notification record has empty sync error".to_string());
+            }
+            validate_kind_user("actor_user_id", actor_user_id, recipient_realm)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_sync_detail(
+    event: &WatchEvent,
+    group_id: ulid::Ulid,
+    node_id: NodeId,
+    bucket: &str,
+    relationship_id: ulid::Ulid,
+) -> Result<(), String> {
+    validate_sync_path(&event.path, group_id, node_id, bucket, relationship_id)
+        .map_err(|error| error.replace("notification record", "watch event"))
+}
+
+fn validate_sync_path(
+    path: &str,
+    group_id: ulid::Ulid,
+    node_id: NodeId,
+    bucket: &str,
+    relationship_id: ulid::Ulid,
+) -> Result<(), String> {
+    if group_id.is_nil() {
+        return Err("notification record has empty group_id".to_string());
+    }
+    if bucket.is_empty() {
+        return Err("notification record has empty bucket".to_string());
+    }
+    if relationship_id.is_nil() {
+        return Err("notification record has empty relationship_id".to_string());
+    }
+    let resource = parse_data_watch_resource_path(path)
+        .ok_or_else(|| "notification record sync path is not canonical".to_string())?;
+    if resource.group_id != group_id || resource.node_id != node_id || resource.bucket != bucket {
+        return Err("notification record sync path does not match detail".to_string());
     }
     Ok(())
 }
@@ -960,7 +1051,7 @@ mod tests {
         )
         .await;
 
-        let recipient = UserId::new(Ulid::r#gen(), realm_id);
+        let recipient = UserId::new(Ulid::generate(), realm_id);
         let error = deliver_remote(&c.net, b.net.node_id(), vec![record(recipient, 1)])
             .await
             .expect_err("unknown peer must be rejected");
@@ -989,8 +1080,8 @@ mod tests {
         .await;
 
         let records = vec![
-            record(UserId::new(Ulid::r#gen(), realm_id), 1),
-            record(UserId::new(Ulid::r#gen(), other_realm), 2),
+            record(UserId::new(Ulid::generate(), realm_id), 1),
+            record(UserId::new(Ulid::generate(), other_realm), 2),
         ];
         let error = deliver_remote(&a.net, b.net.node_id(), records)
             .await
@@ -1180,7 +1271,7 @@ mod tests {
         )
         .await;
 
-        let recipient = UserId::new(Ulid::r#gen(), realm_id);
+        let recipient = UserId::new(Ulid::generate(), realm_id);
         let deliver_error = deliver_remote(&c.net, b.net.node_id(), vec![record(recipient, 1)])
             .await
             .expect_err("user-kind peer must be rejected");
@@ -1303,7 +1394,8 @@ mod tests {
             .expect("first authorized page");
         assert_eq!(first_page, vec![watch_three]);
         let retry_cursor = retry_cursor.expect("cursor after first authorized page");
-        install_watch_authorization(&b, realm_id, UserId::new(Ulid::r#gen(), realm_id), &[]).await;
+        install_watch_authorization(&b, realm_id, UserId::new(Ulid::generate(), realm_id), &[])
+            .await;
 
         let (listed, next_cursor) = list_remote(&a.net, b.net.node_id(), recipient, None, 1)
             .await
@@ -1349,7 +1441,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_list_hides_watch_record_after_token_revocation() {
+    async fn revoked_token_ignored() {
         let realm_id = RealmId::from_bytes([82u8; 32]);
         let a = spawn(realm_id, [82u8; 32]).await;
         let b = spawn(realm_id, [83u8; 32]).await;
@@ -1388,18 +1480,16 @@ mod tests {
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
 
-        assert_eq!(
-            list_remote(&a.net, b.net.node_id(), recipient, None, 10)
-                .await
-                .expect("list after token revocation")
-                .0,
-            vec![direct]
-        );
+        let listed = list_remote(&a.net, b.net.node_id(), recipient, None, 10)
+            .await
+            .expect("list after token revocation")
+            .0;
+        assert_eq!(listed, vec![watch.clone(), direct]);
         assert_eq!(
             unread_count_remote(&a.net, b.net.node_id(), recipient)
                 .await
                 .expect("unread count after token revocation"),
-            (1, false)
+            (2, false)
         );
         assert_eq!(
             mark_read_remote(
@@ -1410,8 +1500,8 @@ mod tests {
                 None,
             )
             .await
-            .expect("mark revoked watch record"),
-            0
+            .expect("mark watch record"),
+            1
         );
         assert!(
             read_inbox(&b)
@@ -1420,12 +1510,12 @@ mod tests {
                 .find(|record| record.notification_id == watch.notification_id)
                 .expect("stored watch record")
                 .read_at_ms
-                .is_none()
+                .is_some()
         );
     }
 
     #[tokio::test]
-    async fn rpc_list_requires_original_watch_prefix() {
+    async fn legacy_restriction_ignored() {
         let (a, b, recipient) = delivery_pair(80).await;
         install_watch_authorization(&b, recipient.realm_id, recipient, &[]).await;
         let mut watch = watch_record(recipient, 2);
@@ -1445,12 +1535,12 @@ mod tests {
         }]);
         seed_inbox(&b, &[watch.clone()]).await;
 
-        assert!(
+        assert_eq!(
             list_remote(&a.net, b.net.node_id(), recipient, None, 10)
                 .await
-                .expect("list with unreadable watch prefix")
-                .0
-                .is_empty()
+                .expect("list with a legacy token restriction")
+                .0,
+            vec![watch]
         );
     }
 
@@ -1512,7 +1602,7 @@ mod tests {
     #[tokio::test]
     async fn rpc_mark_read_rejects_too_many_ids() {
         let (a, b, recipient) = delivery_pair(75).await;
-        let ids = (0..=MARK_READ_MAX_IDS).map(|_| Ulid::r#gen()).collect();
+        let ids = (0..=MARK_READ_MAX_IDS).map(|_| Ulid::generate()).collect();
 
         let error = mark_read_remote(&a.net, b.net.node_id(), recipient, ids, None)
             .await
@@ -1540,7 +1630,7 @@ mod tests {
         )
         .await;
 
-        let recipient = UserId::new(Ulid::r#gen(), realm_id);
+        let recipient = UserId::new(Ulid::generate(), realm_id);
         let error = list_remote(&c.net, b.net.node_id(), recipient, None, 10)
             .await
             .expect_err("unknown peer must be rejected on the read path");
@@ -1614,7 +1704,7 @@ mod tests {
         )
         .await;
 
-        let recipient = UserId::new(Ulid::r#gen(), realm_id);
+        let recipient = UserId::new(Ulid::generate(), realm_id);
         let sample = record(recipient, 1);
         let per_record = postcard::to_allocvec(&NotificationTransportMessage::DeliverBatch {
             records: vec![sample.clone(), sample.clone()],
@@ -1730,7 +1820,7 @@ mod tests {
             "unexpected reject reason: {list_error}"
         );
 
-        let delete_error = delete_watch_remote(&a.net, b.net.node_id(), owner, Ulid::r#gen())
+        let delete_error = delete_watch_remote(&a.net, b.net.node_id(), owner, Ulid::generate())
             .await
             .expect_err("delete on non-holder must be rejected");
         assert!(
@@ -1766,7 +1856,8 @@ mod tests {
 
         let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
         // The watched group exists and is readable, just not by `owner`.
-        install_watch_authorization(&b, realm_id, UserId::new(Ulid::r#gen(), realm_id), &[]).await;
+        install_watch_authorization(&b, realm_id, UserId::new(Ulid::generate(), realm_id), &[])
+            .await;
 
         let error = create_watch_remote(
             &a.net,
@@ -1829,7 +1920,8 @@ mod tests {
         );
 
         // Re-owning the group drops the original owner's READ.
-        install_watch_authorization(&b, realm_id, UserId::new(Ulid::r#gen(), realm_id), &[]).await;
+        install_watch_authorization(&b, realm_id, UserId::new(Ulid::generate(), realm_id), &[])
+            .await;
 
         let listed = list_watches_remote(&a.net, b.net.node_id(), owner)
             .await
@@ -1881,11 +1973,11 @@ mod tests {
     #[test]
     fn inbound_metadata_watch_path_accepts_normalized_nested_document_path() {
         let realm_id = RealmId::from_bytes([79u8; 32]);
-        let actor = UserId::new(Ulid::r#gen(), realm_id);
-        let group_id = Ulid::r#gen();
-        let document_id = Ulid::r#gen();
+        let actor = UserId::new(Ulid::generate(), realm_id);
+        let group_id = Ulid::generate();
+        let document_id = Ulid::generate();
         let mut event = WatchEvent {
-            event_id: Ulid::r#gen(),
+            event_id: Ulid::generate(),
             realm_id,
             kind: WatchEventKind::MetadataCreated,
             path: format!("meta/{group_id}/datasets/project/runs/run-42"),
@@ -1905,7 +1997,7 @@ mod tests {
             Err("watch event metadata path is not canonical".to_string())
         );
 
-        event.path = format!("meta/{}/datasets/project", Ulid::r#gen());
+        event.path = format!("meta/{}/datasets/project", Ulid::generate());
         assert_eq!(
             validate_inbound_watch_event(&event, realm_id, 1_000),
             Err("watch event metadata path does not match detail".to_string())
@@ -1915,7 +2007,7 @@ mod tests {
     #[test]
     fn inbound_data_watch_path_requires_matching_group_and_node_identity() {
         let realm_id = RealmId::from_bytes([78u8; 32]);
-        let actor = UserId::new(Ulid::r#gen(), realm_id);
+        let actor = UserId::new(Ulid::generate(), realm_id);
         let mut event = upload_event(realm_id, actor, "bucket/object");
 
         assert!(
@@ -1932,6 +2024,38 @@ mod tests {
             validate_inbound_watch_event(&event, realm_id, event.occurred_at_ms),
             Err("watch event data path does not match detail".to_string())
         );
+    }
+
+    #[test]
+    fn validates_sync_watch() {
+        let realm_id = RealmId::from_bytes([77u8; 32]);
+        let actor = UserId::new(Ulid::generate(), realm_id);
+        let group_id = data_group_id();
+        let node_id = data_node_id();
+        let mut event = WatchEvent {
+            event_id: Ulid::generate(),
+            realm_id,
+            kind: WatchEventKind::SyncCompleted,
+            path: data_watch_resource_path(group_id, node_id, "bucket", "prefix/"),
+            actor,
+            occurred_at_ms: 1_000,
+            detail: WatchEventDetail::SyncCompleted {
+                group_id,
+                node_id,
+                bucket: "bucket".to_string(),
+                relationship_id: Ulid::generate(),
+                versions_synced: 2,
+            },
+        };
+
+        assert!(validate_inbound_watch_event(&event, realm_id, 1_000).is_ok());
+        if let WatchEventDetail::SyncCompleted {
+            relationship_id, ..
+        } = &mut event.detail
+        {
+            *relationship_id = Ulid::nil();
+        }
+        assert!(validate_inbound_watch_event(&event, realm_id, 1_000).is_err());
     }
 
     #[tokio::test]
@@ -1951,7 +2075,7 @@ mod tests {
         .await;
 
         let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
-        let actor = UserId::new(Ulid::r#gen(), realm_id);
+        let actor = UserId::new(Ulid::generate(), realm_id);
         install_watch_authorization(&b, realm_id, owner, &[]).await;
         create_watch_subscription(
             &b.context.storage_handle,
@@ -2046,7 +2170,7 @@ mod tests {
         )
         .await;
 
-        let actor = UserId::new(Ulid::r#gen(), realm_id);
+        let actor = UserId::new(Ulid::generate(), realm_id);
         let written = deliver_watch_events_remote(
             &a.net,
             b.net.node_id(),
@@ -2100,7 +2224,7 @@ mod tests {
         .await
         .expect("holder subscription");
 
-        let actor = UserId::new(Ulid::r#gen(), realm_id);
+        let actor = UserId::new(Ulid::generate(), realm_id);
         let mut event = upload_event(realm_id, actor, "bucket/object");
         event.kind = WatchEventKind::MetadataCreated;
         let error = deliver_watch_events_remote(&a.net, b.net.node_id(), vec![event])
@@ -2129,7 +2253,7 @@ mod tests {
         )
         .await;
 
-        let owner = UserId::new(Ulid::r#gen(), realm_id);
+        let owner = UserId::new(Ulid::generate(), realm_id);
         create_watch_subscription(
             &b.context.storage_handle,
             owner,
@@ -2140,7 +2264,7 @@ mod tests {
         .await
         .expect("holder subscription");
 
-        let actor = UserId::new(Ulid::r#gen(), realm_id);
+        let actor = UserId::new(Ulid::generate(), realm_id);
         let error = deliver_watch_events_remote(
             &c.net,
             b.net.node_id(),
@@ -2184,7 +2308,7 @@ mod tests {
             "unexpected response: {empty:?}"
         );
 
-        let actor = UserId::new(Ulid::r#gen(), realm_id);
+        let actor = UserId::new(Ulid::generate(), realm_id);
         let mixed = deliver_watch_events_remote(
             &a.net,
             b.net.node_id(),
@@ -2217,7 +2341,7 @@ mod tests {
         )
         .await;
 
-        let owner = UserId::new(Ulid::r#gen(), realm_id);
+        let owner = UserId::new(Ulid::generate(), realm_id);
         let error = create_watch_remote(
             &c.net,
             b.net.node_id(),

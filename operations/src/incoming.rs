@@ -13,11 +13,14 @@ use crate::metadata::projector::{
     project_metadata_create_events_from_log, schedule_pending_metadata_projection_drain,
 };
 use crate::metadata::prune_queue::process_metadata_graph_tombstones;
+use crate::notifications::watch::emit::emit_resource_watch_event;
 use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
 use crate::process_placements::process_shard_placements;
 use crate::queue_backoff::queue_retry_after_ms;
-use crate::replication::incoming_version_replication::IncomingVersionReplicationOperation;
-use crate::replication::protocol::VersionReplicationMessage;
+use crate::replication::incoming_version_replication::{
+    IncomingVersionReplicationOperation, IncomingVersionReplicationResult,
+};
+use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
 use crate::usage_stats::refresh_realm_usage_summary_for_targets;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{
@@ -27,13 +30,17 @@ use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
-use aruna_core::task::TaskEvent;
+use aruna_core::structs::{
+    ReplicationItemKind, WatchEvent, WatchEventDetail, WatchEventKind, data_watch_resource_path,
+};
+use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
 use async_trait::async_trait;
 use tokio::time::sleep;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
+use ulid::Ulid;
 
 const METADATA_DOCUMENT_SYNC_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const METADATA_DOCUMENT_SYNC_MAINTENANCE_JITTER_SECS: u64 = 15;
@@ -53,6 +60,44 @@ impl OperationsInboundHandler {
             document_sync_reconcile,
         }
     }
+}
+
+async fn emit_replication_watch(
+    context: &DriverContext,
+    node_id: aruna_core::NodeId,
+    manifest: &VersionReplicationManifest,
+    result: &IncomingVersionReplicationResult,
+) {
+    let Some(group_id) = result.group_id else {
+        return;
+    };
+    if !result.applied || manifest.kind != ReplicationItemKind::Materialized {
+        return;
+    }
+    let size_bytes = manifest.blob.as_ref().map_or(0, |blob| blob.size);
+    let occurred_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    emit_resource_watch_event(
+        context,
+        WatchEvent {
+            event_id: Ulid::generate(),
+            realm_id: manifest.auth_context.realm_id,
+            kind: WatchEventKind::DataUploaded,
+            path: data_watch_resource_path(group_id, node_id, &manifest.bucket, &manifest.key),
+            actor: manifest.auth_context.user_id,
+            occurred_at_ms,
+            detail: WatchEventDetail::DataUploaded {
+                group_id,
+                node_id,
+                bucket: manifest.bucket.clone(),
+                key: manifest.key.clone(),
+                size_bytes,
+            },
+        },
+    )
+    .await;
 }
 
 // Coalesces concurrent inbound reconcile triggers: one run in flight, all
@@ -281,14 +326,26 @@ impl InboundEventHandler for OperationsInboundHandler {
                                             kind = ?manifest.kind,
                                             "Received inbound version replication manifest"
                                         );
+                                        let watch_manifest = manifest.clone();
                                         let op = IncomingVersionReplicationOperation::new(
                                             stream_id,
                                             net_handle.node_id(),
                                             *net_handle.realm_id(),
                                             manifest,
                                         );
-                                        if let Err(err) = drive(op, self.context.as_ref()).await {
-                                            error!(error = ?err, "Failed to process inbound version replication stream");
+                                        match drive(op, self.context.as_ref()).await {
+                                            Ok(Ok(result)) => {
+                                                emit_replication_watch(
+                                                    self.context.as_ref(),
+                                                    net_handle.node_id(),
+                                                    &watch_manifest,
+                                                    &result,
+                                                )
+                                                .await;
+                                            }
+                                            Ok(Err(err)) | Err(err) => {
+                                                error!(error = ?err, "Failed to process inbound version replication stream");
+                                            }
                                         }
                                     }
                                     _ => {
@@ -316,7 +373,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                 }
                 Alpn::DocumentSync => {
                     let Some(net_handle) = self.context.net_handle.clone() else {
-                        warn!(node_id = %node_id, "Dropping inbound document sync stream without net handle");
+                        warn!(peer = %node_id, "Dropping inbound document sync stream without net handle");
                         return;
                     };
                     match net_handle.handle_document_sync_stream(stream, node_id).await {
@@ -333,7 +390,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                 }
                 Alpn::Metadata => {
                     let Some(metadata_handle) = self.context.metadata_handle.clone() else {
-                        warn!(node_id = %node_id, "Dropping inbound metadata stream without metadata handle");
+                        warn!(peer = %node_id, "Dropping inbound metadata stream without metadata handle");
                         return;
                     };
                     if let Err(err) = metadata_handle
@@ -342,6 +399,14 @@ impl InboundEventHandler for OperationsInboundHandler {
                     {
                         error!(error = ?err, "Failed to process inbound metadata stream");
                     }
+                }
+                Alpn::NativeReference => {
+                    Box::pin(crate::native_reference::handle_native_stream(
+                        self.context.as_ref(),
+                        stream,
+                        node_id,
+                    ))
+                    .await;
                 }
                 Alpn::Notification => {
                     crate::notifications::incoming::handle_notification_stream(
@@ -361,7 +426,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                 }
                 Alpn::Dht => {
                     warn!(
-                        node_id = %node_id,
+                        peer = %node_id,
                         "Ignoring inbound stream for non-stream ALPN"
                     );
                 }
@@ -398,14 +463,14 @@ async fn reemit_evicted_documents(
     documents: Vec<DocumentSyncEvictedDocument>,
 ) {
     let Some(net_handle) = context.net_handle.as_ref() else {
-        warn!("Cannot re-emit evicted documents without net handle");
+        warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, "Cannot re-emit evicted documents without net handle");
         return;
     };
     let node_id = net_handle.node_id();
     let mut written = 0usize;
     for document in documents {
         let record = new_outbox_record_with_id(
-            document.event_id.unwrap_or_else(ulid::Ulid::r#gen),
+            document.event_id.unwrap_or_else(ulid::Ulid::generate),
             node_id,
             document.target,
             Vec::new(),
@@ -416,17 +481,17 @@ async fn reemit_evicted_documents(
         let effect = match write_outbox_effect(&record) {
             Ok(effect) => effect,
             Err(error) => {
-                warn!(error = %error, "Failed to encode re-emitted eviction outbox record");
+                warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, error = %error, "Failed to encode re-emitted eviction outbox record");
                 continue;
             }
         };
         match context.storage_handle.send_effect(effect).await {
             Event::Storage(StorageEvent::WriteResult { .. }) => written += 1,
             Event::Storage(StorageEvent::Error { error }) => {
-                warn!(error = %error, "Failed to write re-emitted eviction outbox record");
+                warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, error = %error, "Failed to write re-emitted eviction outbox record");
             }
             other => {
-                warn!(event = ?other, "Unexpected event writing re-emitted eviction outbox record");
+                warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, event = ?other, "Unexpected event writing re-emitted eviction outbox record");
             }
         }
     }
@@ -434,14 +499,14 @@ async fn reemit_evicted_documents(
         return;
     }
     let Some(task_handle) = context.task_handle.as_ref() else {
-        warn!("Cannot schedule outbox drain for re-emitted evictions without task handle");
+        warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, "Cannot schedule outbox drain for re-emitted evictions without task handle");
         return;
     };
     if let Event::Task(TaskEvent::Error { message, .. }) = task_handle
         .send_effect(schedule_outbox_drain_effect())
         .await
     {
-        warn!(message = %message, "Failed to schedule outbox drain after re-emitting evictions");
+        warn!(task_id = ?TaskKey::DrainDocumentSyncOutbox, message = %message, "Failed to schedule outbox drain after re-emitting evictions");
     }
     info!(
         count = written,
@@ -496,7 +561,7 @@ async fn schedule_projection_retry(context: &DriverContext) {
     if let Err(error) =
         schedule_pending_metadata_projection_drain(context, METADATA_PROJECTION_RETRY_AFTER).await
     {
-        warn!(error = ?error, "Failed to schedule metadata projection retry");
+        warn!(task_id = ?TaskKey::DrainMetadataProjectionQueue, error = ?error, "Failed to schedule metadata projection retry");
     }
 }
 
@@ -662,8 +727,8 @@ mod tests {
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
         };
-        let document_id = ulid::Ulid::r#gen();
-        let event_id = ulid::Ulid::r#gen();
+        let document_id = ulid::Ulid::generate();
+        let event_id = ulid::Ulid::generate();
 
         project_inbound_metadata_create_events(
             &context,

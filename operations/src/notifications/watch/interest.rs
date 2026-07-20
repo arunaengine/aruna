@@ -95,7 +95,7 @@ pub fn schedule_watch_interest_publish_effect() -> Effect {
 /// marker whose stored generation still matches the one it observed, so a CRUD
 /// that re-dirties a realm mid-publish keeps its retry signal.
 pub fn watch_interest_dirty_marker_write(realm_id: RealmId) -> (KeySpace, Key, Value) {
-    let generation = ByteView::from(Ulid::r#gen().to_bytes().to_vec());
+    let generation = ByteView::from(Ulid::generate().to_bytes().to_vec());
     (
         NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
         ByteView::from(watch_interest_dirty_key(realm_id)),
@@ -918,7 +918,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let owner = user(1, 2);
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
 
         create_watch_subscription(
             &ctx.storage_handle,
@@ -940,7 +940,7 @@ mod tests {
         let node_id = node(5);
         let owner = user(1, 2);
         install_realm_config(&ctx, owner.realm_id, &[node_id]).await;
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         install_authorization(&ctx, owner.realm_id, node_id, group_id, owner, &[]).await;
 
         create_watch_subscription(
@@ -1004,7 +1004,7 @@ mod tests {
         let realm_id = RealmId([7u8; 32]);
         let node_id = node(5);
         let owner = user(7, 2);
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         install_realm_config(&ctx, realm_id, &[node_id]).await;
         install_authorization(&ctx, realm_id, node_id, group_id, owner, &[]).await;
         create_watch_subscription(
@@ -1057,7 +1057,7 @@ mod tests {
         let realm_id = RealmId([8u8; 32]);
         let node_id = node(6);
         let owner = user(8, 2);
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         install_realm_config(&ctx, realm_id, &[node_id]).await;
         create_watch_subscription(
             &ctx.storage_handle,
@@ -1102,7 +1102,7 @@ mod tests {
         let node_id = node(5);
         let owner = user(1, 2);
         install_realm_config(&ctx, owner.realm_id, &[node_id]).await;
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         install_authorization(&ctx, owner.realm_id, node_id, group_id, owner, &[]).await;
 
         let created = create_watch_subscription(
@@ -1146,7 +1146,7 @@ mod tests {
         let config = install_realm_config(&ctx, realm_id, &[local_node_id, remote_node_id]).await;
         let local_owner = user_for_holder(realm_id, &config, local_node_id);
         let stale_owner = user_for_holder(realm_id, &config, remote_node_id);
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         install_authorization(
             &ctx,
             realm_id,
@@ -1288,7 +1288,7 @@ mod tests {
         let (_dir, ctx, net) = ctx_with_net(realm_id, [72u8; 32]).await;
         let node_id = net.node_id();
         install_realm_config(&ctx, realm_id, &[node_id]).await;
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let auth_owner = user(6, 3);
         let watch_owner = user(6, 2);
         let prefix = metadata_prefix(group_id, "a");

@@ -95,7 +95,7 @@ impl UsageCounterUpdate {
     /// marker whose stored generation still matches the one it observed, so a
     /// write that re-dirties a marker mid-publish keeps its retry signal.
     fn dirty_marker_writes(&self) -> Vec<(String, Key, Value)> {
-        let generation = ByteView::from(ulid::Ulid::r#gen().to_bytes().to_vec());
+        let generation = ByteView::from(ulid::Ulid::generate().to_bytes().to_vec());
         vec![
             (
                 USAGE_NODE_STATS_KEYSPACE.to_string(),
@@ -689,19 +689,22 @@ impl RebuildUsageStatsOperation {
                         }
                     }
 
-                    let Some(size) = (match version.state {
-                        BlobVersionState::Materialized { blob_hash, .. } => {
-                            self.blob_sizes.get(blob_hash.as_slice()).copied()
-                        }
+                    let Some((logical_bytes, referenced_bytes)) = (match version.state {
+                        BlobVersionState::Materialized { blob_hash, .. } => self
+                            .blob_sizes
+                            .get(blob_hash.as_slice())
+                            .copied()
+                            .map(|size| (size, 0)),
                         BlobVersionState::Reference {
                             cached_metadata, ..
-                        } => Some(cached_metadata.content_length),
+                        } => Some((0, cached_metadata.content_length)),
                         BlobVersionState::Deleted => None,
                     }) else {
                         continue;
                     };
                     let delta = UsageCounters {
-                        logical_bytes: size,
+                        logical_bytes,
+                        referenced_bytes,
                         ..Default::default()
                     };
                     self.global.add(&delta)?;
@@ -1307,7 +1310,7 @@ async fn write_usage_snapshot_retry_markers(
         .iter()
         .map(|(key, _)| key.as_ref().to_vec())
         .collect();
-    let generation = Value::from(ulid::Ulid::r#gen().to_bytes().to_vec());
+    let generation = Value::from(ulid::Ulid::generate().to_bytes().to_vec());
     let mut writes: Vec<(String, Key, Value)> =
         Vec::with_capacity(published.groups.len() + usize::from(published.global));
     if published.global && !observed_keys.contains(NODE_USAGE_DIRTY_GLOBAL_KEY) {
@@ -1740,7 +1743,7 @@ mod tests {
             root: "/tmp".to_string(),
             storage_bucket: "bucket".to_string(),
             backend_path: "path".to_string(),
-            ulid: Ulid::r#gen(),
+            ulid: Ulid::generate(),
             compressed: false,
             encrypted: false,
             created_at: SystemTime::now(),
@@ -1800,8 +1803,8 @@ mod tests {
 
     #[test]
     fn counter_update_applies_deltas_with_synthetic_events() {
-        let group_id = Ulid::r#gen();
-        let txn_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
+        let txn_id = Ulid::generate();
         let mut update = UsageCounterUpdate::for_group(
             group_id,
             UsageDelta {
@@ -1864,7 +1867,7 @@ mod tests {
     async fn create_bucket_maintains_usage_counters() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
 
         drive(
             CreateBucketOperation::new(
@@ -1893,7 +1896,7 @@ mod tests {
     async fn load_usage_counters_reads_group_and_global_counters() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let group = UsageCounters {
             buckets: 1,
             objects: 2,
@@ -1958,8 +1961,8 @@ mod tests {
     async fn rebuild_counts_live_objects_logical_and_stored_bytes() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
-        let group_a = Ulid::r#gen();
-        let group_b = Ulid::r#gen();
+        let group_a = Ulid::generate();
+        let group_b = Ulid::generate();
 
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = ctx
             .storage_handle
@@ -2009,7 +2012,7 @@ mod tests {
         // alpha/ref.txt: one reference version, live.
         // beta/shared.bin: two materialized versions of the shared blob.
         let write_version = async |bucket: &str, key: &str, version: BlobVersion| {
-            let version_id = Ulid::r#gen();
+            let version_id = Ulid::generate();
             ctx.storage_handle
                 .send_storage_effect(StorageEffect::Write {
                     key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
@@ -2079,7 +2082,7 @@ mod tests {
                         capabilities: Vec::new(),
                         origin_node_id: None,
                     },
-                    connector_id: Some(Ulid::r#gen()),
+                    connector_id: Some(Ulid::generate()),
                 },
                 SourceMetadata {
                     content_length: 30,
@@ -2115,8 +2118,9 @@ mod tests {
         assert_eq!(global.objects, 3);
         assert_eq!(global.stored_blobs, 2);
         assert_eq!(global.stored_bytes, 140);
-        // 100 + 40 + 30 + 40 + 40: every materialized/reference version counts logically.
-        assert_eq!(global.logical_bytes, 250);
+        // Referenced source size is reported separately from local logical bytes.
+        assert_eq!(global.logical_bytes, 220);
+        assert_eq!(global.referenced_bytes, 30);
 
         let stored_global = read_global_counters(&ctx).await;
         assert_eq!(stored_global, global);
@@ -2124,19 +2128,74 @@ mod tests {
         let alpha = read_counters(&ctx, usage_group_key(group_a)).await;
         assert_eq!(alpha.buckets, 1);
         assert_eq!(alpha.objects, 2);
-        assert_eq!(alpha.logical_bytes, 170);
+        assert_eq!(alpha.logical_bytes, 140);
+        assert_eq!(alpha.referenced_bytes, 30);
 
         let beta = read_counters(&ctx, usage_group_key(group_b)).await;
         assert_eq!(beta.buckets, 1);
         assert_eq!(beta.objects, 1);
         assert_eq!(beta.logical_bytes, 80);
+        assert_eq!(beta.referenced_bytes, 0);
+    }
+
+    #[test]
+    fn rebuild_counts_overhead() {
+        let group_id = Ulid::generate();
+        let version_id = Ulid::generate();
+        let version = BlobVersion::reference(
+            VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                descriptor: PortableSourceDescriptor {
+                    kind: SourceConnectorKind::ArunaNative,
+                    public_config: HashMap::from([(
+                        "relationship_id".to_string(),
+                        Ulid::generate().to_string(),
+                    )]),
+                    source_path: "origin/object.bin".to_string(),
+                    version_selector: Some(format!("version:{version_id}")),
+                    capabilities: Vec::new(),
+                    origin_node_id: Some(iroh::SecretKey::from_bytes(&[4u8; 32]).public()),
+                },
+                connector_id: None,
+            },
+            SourceMetadata {
+                content_length: 1_000_000,
+                content_type: None,
+                etag: None,
+                last_modified: None,
+                source_version: None,
+            },
+            SystemTime::UNIX_EPOCH,
+            Default::default(),
+            SystemTime::UNIX_EPOCH,
+        );
+        let value = ByteView::from(version.to_bytes().unwrap());
+        let key = ByteView::from(
+            VersionKey::new("target", "object.bin", version_id)
+                .to_bytes()
+                .unwrap(),
+        );
+        let mut operation = RebuildUsageStatsOperation::new();
+        operation.state = RebuildUsageStatsState::ScanVersions;
+        operation
+            .bucket_groups
+            .insert("target".to_string(), group_id);
+
+        operation.consume_values(&[(key, value.clone())]).unwrap();
+
+        assert_eq!(operation.global.logical_bytes, 0);
+        assert_eq!(operation.global.referenced_bytes, 1_000_000);
+        assert_eq!(
+            operation.groups.get(&group_id).unwrap().referenced_bytes,
+            1_000_000
+        );
     }
 
     #[tokio::test]
     async fn rebuild_removes_stale_usage_counter_keys() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
-        let stale_group = Ulid::r#gen();
+        let stale_group = Ulid::generate();
         let stale_key = usage_group_key(stale_group);
 
         ctx.storage_handle
@@ -2227,7 +2286,7 @@ mod tests {
     async fn usage_update_writes_dirty_markers_in_transaction() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
 
         drive(
             CreateBucketOperation::new(
@@ -2264,7 +2323,7 @@ mod tests {
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let node_id = node(1);
         let realm_id = RealmId::from_bytes([9u8; 32]);
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
 
         let counters = UsageCounters {
             buckets: 1,
@@ -2318,7 +2377,7 @@ mod tests {
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let local = node(1);
         let remote = node(2);
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
 
         let local_counters = UsageCounters {
             logical_bytes: 10,
@@ -2456,7 +2515,7 @@ mod tests {
     async fn clear_consumed_markers_keeps_regenerated_markers() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
-        let generation_one = Ulid::r#gen().to_bytes().to_vec();
+        let generation_one = Ulid::generate().to_bytes().to_vec();
 
         write_node_stat(
             &ctx,
@@ -2471,7 +2530,7 @@ mod tests {
 
         // A concurrent counter update re-dirties the marker with a new generation
         // after it was observed but before it is cleared.
-        let generation_two = Ulid::r#gen().to_bytes().to_vec();
+        let generation_two = Ulid::generate().to_bytes().to_vec();
         write_node_stat(
             &ctx,
             NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec(),
@@ -2511,8 +2570,8 @@ mod tests {
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let node_id = node(1);
         let realm_id = RealmId::from_bytes([9u8; 32]);
-        let group_id = Ulid::r#gen();
-        let generation = Ulid::r#gen().to_bytes().to_vec();
+        let group_id = Ulid::generate();
+        let generation = Ulid::generate().to_bytes().to_vec();
 
         let counters = UsageCounters {
             buckets: 1,
@@ -2569,7 +2628,7 @@ mod tests {
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let node_id = node(1);
         let realm_id = RealmId::from_bytes([9u8; 32]);
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
 
         let counters = UsageCounters {
             buckets: 1,
@@ -2638,8 +2697,8 @@ mod tests {
         let node_id = node(1);
         let remote = node(2);
         let realm_id = RealmId::from_bytes([9u8; 32]);
-        let group_id = Ulid::r#gen();
-        let generation = Ulid::r#gen().to_bytes().to_vec();
+        let group_id = Ulid::generate();
+        let generation = Ulid::generate().to_bytes().to_vec();
 
         let counters = UsageCounters {
             buckets: 1,
@@ -2691,7 +2750,7 @@ mod tests {
         let node_id = node(1);
         let remote = node(2);
         let realm_id = RealmId::from_bytes([9u8; 32]);
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
 
         let counters = UsageCounters {
             buckets: 1,
@@ -2750,8 +2809,8 @@ mod tests {
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let node_id = node(1);
         let realm_id = RealmId::from_bytes([9u8; 32]);
-        let live_group = Ulid::r#gen();
-        let stale_group = Ulid::r#gen();
+        let live_group = Ulid::generate();
+        let stale_group = Ulid::generate();
 
         // A live group still has a counter key.
         let counters = UsageCounters {
@@ -2810,7 +2869,7 @@ mod tests {
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let local = node(1);
         let remote = node(2);
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
 
         let local_counters = UsageCounters {
             logical_bytes: 10,

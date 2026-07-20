@@ -971,7 +971,7 @@ pub async fn create_group_role(
         assigned_users.insert(UserId::nil(realm_id));
     }
 
-    let role_id = Ulid::r#gen();
+    let role_id = Ulid::generate();
     let (_, auth_doc) = drive(
         AddGroupRoleOperation::new(AddGroupRoleConfig {
             auth_context: auth.clone(),
@@ -1430,7 +1430,7 @@ mod tests {
 
     async fn seed_group(state: &ServerState, owner: UserId) -> Ulid {
         let realm_id = state.get_realm_id();
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let auth_doc = GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
         let group = Group {
             display_name: "Test".to_string(),
@@ -1541,7 +1541,7 @@ mod tests {
     fn foreign_auth() -> AuthContext {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         AuthContext {
-            user_id: UserId::local(Ulid::r#gen(), realm_id),
+            user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
         }
@@ -1552,7 +1552,7 @@ mod tests {
     #[tokio::test]
     async fn group_directory_requires_realm() {
         let (state, _tempdir) = setup_state().await;
-        let group_id = Ulid::r#gen().to_string();
+        let group_id = Ulid::generate().to_string();
 
         assert!(matches!(
             list_groups(
@@ -1614,7 +1614,7 @@ mod tests {
     #[tokio::test]
     async fn joins_member_names() {
         let (state, _tempdir) = setup_state().await;
-        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let owner = UserId::local(Ulid::generate(), state.get_realm_id());
         let group_id = seed_group(&state, owner).await;
         store_user(&state, owner, "Owner").await;
 
@@ -1639,7 +1639,7 @@ mod tests {
     async fn unresolved_member_none() {
         // A member without a stored user record still lists, with name None.
         let (state, _tempdir) = setup_state().await;
-        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let owner = UserId::local(Ulid::generate(), state.get_realm_id());
         let group_id = seed_group(&state, owner).await;
 
         let (status, Json(body)) = list_group_members(
@@ -1676,7 +1676,7 @@ mod tests {
     }
 
     async fn seed_object(state: &ServerState, bucket: &str, key: &str, owner: UserId, tag: u8) {
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let created_at = UNIX_EPOCH + Duration::from_secs(5);
         let hash = [tag; 32];
         store_bytes(
@@ -1703,7 +1703,7 @@ mod tests {
                 root: "/tmp".to_string(),
                 storage_bucket: "objects".to_string(),
                 backend_path: format!("path/{key}"),
-                ulid: Ulid::r#gen(),
+                ulid: Ulid::generate(),
                 compressed: false,
                 encrypted: false,
                 created_by: owner,
@@ -1731,11 +1731,11 @@ mod tests {
     #[tokio::test]
     async fn folds_group_buckets() {
         let (state, _tempdir) = setup_state().await;
-        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let owner = UserId::local(Ulid::generate(), state.get_realm_id());
         let group_id = seed_group(&state, owner).await;
         seed_bucket(&state, "alpha", group_id).await;
         seed_bucket(&state, "beta", group_id).await;
-        seed_bucket(&state, "foreign", Ulid::r#gen()).await;
+        seed_bucket(&state, "foreign", Ulid::generate()).await;
 
         let (status, Json(body)) = list_data_paths(
             State(state.clone()),
@@ -1770,7 +1770,7 @@ mod tests {
     #[tokio::test]
     async fn bucket_folds_objects() {
         let (state, _tempdir) = setup_state().await;
-        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let owner = UserId::local(Ulid::generate(), state.get_realm_id());
         let group_id = seed_group(&state, owner).await;
         seed_bucket(&state, "data", group_id).await;
         for (index, key) in ["a.txt", "dir/1", "dir/2", "z.txt"].iter().enumerate() {
@@ -1824,7 +1824,7 @@ mod tests {
     async fn round_trips_bucket() {
         // A returned bucket folder path must list the bucket's children verbatim.
         let (state, _tempdir) = setup_state().await;
-        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let owner = UserId::local(Ulid::generate(), state.get_realm_id());
         let group_id = seed_group(&state, owner).await;
         seed_bucket(&state, "data", group_id).await;
         for (index, key) in ["a.txt", "dir/1"].iter().enumerate() {
@@ -1877,7 +1877,7 @@ mod tests {
     #[tokio::test]
     async fn paginates_object_pages() {
         let (state, _tempdir) = setup_state().await;
-        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let owner = UserId::local(Ulid::generate(), state.get_realm_id());
         let group_id = seed_group(&state, owner).await;
         seed_bucket(&state, "data", group_id).await;
         for (index, key) in ["a", "b", "c", "d"].iter().enumerate() {
@@ -1925,7 +1925,7 @@ mod tests {
     #[tokio::test]
     async fn path_matches_helper() {
         let (state, _tempdir) = setup_state().await;
-        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let owner = UserId::local(Ulid::generate(), state.get_realm_id());
         let group_id = seed_group(&state, owner).await;
         seed_bucket(&state, "data", group_id).await;
         seed_object(&state, "data", "reports/q1.csv", owner, 9).await;
@@ -1957,9 +1957,9 @@ mod tests {
     async fn hides_foreign_bucket() {
         // A crafted path naming another group's bucket must not leak its keys.
         let (state, _tempdir) = setup_state().await;
-        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let owner = UserId::local(Ulid::generate(), state.get_realm_id());
         let group_id = seed_group(&state, owner).await;
-        seed_bucket(&state, "secret", Ulid::r#gen()).await;
+        seed_bucket(&state, "secret", Ulid::generate()).await;
         seed_object(&state, "secret", "k", owner, 1).await;
         let realm_id = state.get_realm_id();
         let node_id = state.get_node_id();
@@ -1980,9 +1980,9 @@ mod tests {
     #[tokio::test]
     async fn non_member_forbidden() {
         let (state, _tempdir) = setup_state().await;
-        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let owner = UserId::local(Ulid::generate(), state.get_realm_id());
         let group_id = seed_group(&state, owner).await;
-        let outsider = member_auth(UserId::local(Ulid::r#gen(), state.get_realm_id()));
+        let outsider = member_auth(UserId::local(Ulid::generate(), state.get_realm_id()));
 
         let result = list_data_paths(
             State(state),
@@ -1999,13 +1999,13 @@ mod tests {
         // Membership alone is not enough: a role granting no READ is forbidden.
         let (state, _tempdir) = setup_state().await;
         let realm_id = state.get_realm_id();
-        let owner = UserId::local(Ulid::r#gen(), realm_id);
+        let owner = UserId::local(Ulid::generate(), realm_id);
         let group_id = seed_group(&state, owner).await;
-        let limited = UserId::local(Ulid::r#gen(), realm_id);
+        let limited = UserId::local(Ulid::generate(), realm_id);
 
         let mut auth_doc =
             GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
-        let role_id = Ulid::r#gen();
+        let role_id = Ulid::generate();
         auth_doc.roles.insert(
             role_id,
             Role {
@@ -2044,7 +2044,7 @@ mod tests {
         let result = list_data_paths(
             State(state),
             Extension(None),
-            Path(Ulid::r#gen().to_string()),
+            Path(Ulid::generate().to_string()),
             Query(DataPathsQuery::default()),
         )
         .await;

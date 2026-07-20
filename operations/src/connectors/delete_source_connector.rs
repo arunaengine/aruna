@@ -389,7 +389,7 @@ mod tests {
     async fn create_connector(context: &DriverContext) -> SourceConnector {
         drive(
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
-                group_id: ulid::Ulid::r#gen(),
+                group_id: ulid::Ulid::generate(),
                 created_by: Default::default(),
                 name: "ftp-source".to_string(),
                 kind: SourceConnectorKind::Ftp,
@@ -415,7 +415,7 @@ mod tests {
     async fn create_public_connector(context: &DriverContext) -> SourceConnector {
         drive(
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
-                group_id: ulid::Ulid::r#gen(),
+                group_id: ulid::Ulid::generate(),
                 created_by: Default::default(),
                 name: "http-source".to_string(),
                 kind: SourceConnectorKind::Http,
@@ -433,7 +433,7 @@ mod tests {
     }
 
     async fn write_reference_version(context: &DriverContext, source: VersionSourceBinding) {
-        let version_id = ulid::Ulid::r#gen();
+        let version_id = ulid::Ulid::generate();
         let key = VersionKey::new("bucket", "key", version_id)
             .to_bytes()
             .unwrap();
@@ -474,7 +474,7 @@ mod tests {
     fn reference_blob_version(connector_id: Ulid) -> BlobVersion {
         let connector = SourceConnector::new(
             connector_id,
-            Ulid::r#gen(),
+            Ulid::generate(),
             "ftp-source".to_string(),
             SourceConnectorKind::Ftp,
             HashMap::new(),

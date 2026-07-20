@@ -6,6 +6,7 @@ pub mod prune;
 pub mod reconcile;
 pub mod runtime;
 pub mod service;
+pub mod staging;
 pub mod store;
 pub mod submit;
 pub mod workflow;

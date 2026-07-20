@@ -20,8 +20,9 @@ use aruna_core::NodeId;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
-    AuthContext, BlobHeadKey, BucketInfo, Permission, RealmId, UserAccess, WatchEvent,
-    WatchEventDetail, WatchEventKind, blob_bucket_permission_path, blob_object_permission_path,
+    ArunaArn, AuthContext, BlobHeadKey, BucketInfo, Permission, RealmId, SyncMode,
+    SyncRelationship, SyncState, SyncStatusSnapshot, UserAccess, WatchEvent, WatchEventDetail,
+    WatchEventKind, blob_bucket_permission_path, blob_object_permission_path,
     data_watch_resource_path,
 };
 use aruna_core::types::UserId;
@@ -29,6 +30,7 @@ use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::metadata::MetadataAuthToken;
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
 use aruna_operations::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
@@ -78,7 +80,7 @@ use aruna_operations::s3::list_objects_v2::{
 use aruna_operations::s3::list_parts::{ListPartsInput as LPI, ListPartsOperation};
 use aruna_operations::s3::listing::common_prefix_of;
 use aruna_operations::s3::put_bucket_replication::{
-    DeleteBucketReplicationOperation, GetBucketReplicationOperation, PutBucketReplicationOperation,
+    DeleteBucketReplicationOperation, GetBucketReplicationOperation,
 };
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation, PutObjectResult};
 use aruna_operations::s3::refresh_reference_metadata::{
@@ -87,6 +89,14 @@ use aruna_operations::s3::refresh_reference_metadata::{
 use aruna_operations::s3::upload_part::{UploadPartInput as UPI, UploadPartOperation};
 use aruna_operations::s3::upload_part_copy::{
     UploadPartCopyInput as UploadPartCopyData, upload_part_copy,
+};
+use aruna_operations::sync_mirror_repair::{
+    SyncMirrorRepairIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
+    request_sync_mirror_create, stage_mirror_delete, stage_mirror_reconcile,
+};
+use aruna_operations::sync_relationship::{
+    DeleteSyncRelationshipOperation, ListSyncRelationshipsOperation,
+    StoreSyncRelationshipOperation, SyncRelationshipDirection,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -272,6 +282,12 @@ impl ArunaS3Service {
         bucket: &str,
         configuration: &ReplicationConfiguration,
     ) -> S3Result<Vec<aruna_core::structs::BucketReplicationTarget>> {
+        if bucket.starts_with("ws-") {
+            return Err(s3_error!(
+                InvalidArgument,
+                "Workspace buckets cannot be replication sources"
+            ));
+        }
         let mut targets = Vec::new();
 
         for rule in &configuration.rules {
@@ -292,10 +308,25 @@ impl ArunaS3Service {
                     "Replication target must be in same realm"
                 ));
             }
-            if arn.path != bucket {
+            let target_bucket = arn.bucket().ok_or_else(|| {
+                s3_error!(InvalidArgument, "Replication target ARN must use s3 type")
+            })?;
+            if arn.key_prefix().is_some() {
                 return Err(s3_error!(
                     InvalidArgument,
-                    "Replication target bucket must equal source bucket"
+                    "Replication target ARN must name a bucket, not a prefix"
+                ));
+            }
+            if target_bucket.starts_with("ws-") {
+                return Err(s3_error!(
+                    InvalidArgument,
+                    "Workspace buckets cannot be replication targets"
+                ));
+            }
+            if arn.node_id == self.node_id && target_bucket == bucket {
+                return Err(s3_error!(
+                    InvalidArgument,
+                    "Replication source and target must differ"
                 ));
             }
             let replicate_delete_markers = rule
@@ -306,7 +337,7 @@ impl ArunaS3Service {
             targets.push(aruna_core::structs::BucketReplicationTarget {
                 node_id: arn.node_id,
                 realm_id: arn.realm_id,
-                bucket: bucket.to_string(),
+                bucket: target_bucket.to_string(),
                 arn: arn.to_string(),
                 replicate_delete_markers,
             });
@@ -371,6 +402,169 @@ impl ArunaS3Service {
         }
     }
 
+    fn relationships_config(
+        &self,
+        relationships: &[SyncRelationship],
+    ) -> aruna_core::structs::BucketReplicationConfig {
+        aruna_core::structs::BucketReplicationConfig {
+            targets: relationships
+                .iter()
+                .map(
+                    |relationship| aruna_core::structs::BucketReplicationTarget {
+                        node_id: relationship.target.node_id,
+                        realm_id: relationship.target.realm_id,
+                        bucket: relationship
+                            .target
+                            .bucket()
+                            .expect("XML-visible sync targets are bucket ARNs")
+                            .to_string(),
+                        arn: relationship.target.to_string(),
+                        replicate_delete_markers: relationship.replicate_deletes,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    async fn list_xml_relationships(&self, bucket: &str) -> S3Result<Vec<SyncRelationship>> {
+        let relationships = drive(
+            ListSyncRelationshipsOperation::new(
+                SyncRelationshipDirection::Outgoing,
+                Some(bucket.to_string()),
+            ),
+            &self.state,
+        )
+        .await
+        .map_err(|error| s3_error!(InternalError, "{}", error.to_string()))?;
+
+        Ok(relationships
+            .into_iter()
+            .filter(|relationship| {
+                relationship.mode == SyncMode::Continuous
+                    && relationship.source.realm_id == self.realm_id
+                    && relationship.source.node_id == self.node_id
+                    && relationship.source.bucket() == Some(bucket)
+                    && relationship.source.key_prefix().is_none()
+                    && relationship.target.realm_id == self.realm_id
+                    && relationship.target.key_prefix().is_none()
+            })
+            .collect())
+    }
+
+    async fn store_sync_relationship(
+        &self,
+        relationship: SyncRelationship,
+        direction: SyncRelationshipDirection,
+    ) -> S3Result<()> {
+        drive(
+            StoreSyncRelationshipOperation::new(relationship, direction),
+            &self.state,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| s3_error!(InternalError, "{}", error.to_string()))
+    }
+
+    async fn delete_sync_relationship(
+        &self,
+        relationship: SyncRelationship,
+        direction: SyncRelationshipDirection,
+    ) -> S3Result<()> {
+        drive(
+            DeleteSyncRelationshipOperation::new(relationship, direction),
+            &self.state,
+        )
+        .await
+        .map_err(|error| s3_error!(InternalError, "{}", error.to_string()))
+    }
+
+    async fn create_sync_mirror(
+        &self,
+        user_access: &UserAccess,
+        relationship: &SyncRelationship,
+    ) -> S3Result<()> {
+        if relationship.target.node_id == self.node_id {
+            let target_bucket = relationship
+                .target
+                .bucket()
+                .ok_or_else(|| s3_error!(InvalidArgument, "Invalid replication target ARN"))?;
+            let bucket_info = drive(
+                GetBucketInfoOperation::new(target_bucket.to_string()),
+                &self.state,
+            )
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to load replication target"))?;
+            let permitted = drive(
+                CheckPermissionsOperation::new(CheckPermissionsConfig {
+                    auth_context: AuthContext {
+                        user_id: user_access.user_identity,
+                        realm_id: user_access.user_identity.realm_id,
+                        path_restrictions: user_access.path_restrictions.clone(),
+                    },
+                    path: blob_bucket_permission_path(
+                        self.realm_id,
+                        bucket_info.group_id,
+                        self.node_id,
+                        target_bucket,
+                    ),
+                    required_permission: Permission::WRITE,
+                }),
+                &self.state,
+            )
+            .await
+            .map_err(|error| s3_error!(InternalError, "{}", error.to_string()))?;
+            if !permitted {
+                return Err(s3_error!(AccessDenied, "Permission denied"));
+            }
+            return self
+                .store_sync_relationship(relationship.clone(), SyncRelationshipDirection::Incoming)
+                .await;
+        }
+
+        let auth_token = MetadataAuthToken::internal(user_access.user_identity, self.realm_id);
+        request_sync_mirror_create(
+            &self.state,
+            relationship.target.node_id,
+            auth_token,
+            user_access.group_id,
+            relationship.clone(),
+        )
+        .await
+        .map_err(|error| match error {
+            aruna_core::metadata::MetadataError::HandleMissing => {
+                s3_error!(InternalError, "Replication target is unreachable")
+            }
+            aruna_core::metadata::MetadataError::Backend(message) if message == "access_denied" => {
+                s3_error!(AccessDenied, "Permission denied")
+            }
+            aruna_core::metadata::MetadataError::Backend(message) if message == "not_found" => {
+                s3_error!(NoSuchBucket, "Replication target bucket does not exist")
+            }
+            error => s3_error!(InternalError, "Replication target error: {}", error),
+        })
+    }
+
+    async fn remove_sync_mirror(&self, relationship: &SyncRelationship) -> bool {
+        if let Err(error) = delete_sync_mirror(&self.state, self.node_id, relationship).await {
+            warn!(relationship_id = %relationship.id, %error, "Failed to remove remote sync mirror");
+            return false;
+        }
+        true
+    }
+
+    async fn clear_mirror_repair(
+        &self,
+        relationship: &SyncRelationship,
+        expected: SyncMirrorRepairIntent,
+    ) {
+        if let Err(error) = clear_mirror_repair(&self.state, relationship, expected).await {
+            warn!(%error, relationship_id = %relationship.id, "Failed to clear sync mirror repair");
+            kick_mirror_repair(&self.state).await;
+        }
+    }
+
     async fn queue_live_version_replication(
         &self,
         auth_context: AuthContext,
@@ -424,7 +618,7 @@ impl ArunaS3Service {
     ) {
         let path = data_watch_resource_path(group_id, self.node_id, &bucket, &key);
         let event = WatchEvent {
-            event_id: ulid::Ulid::r#gen(),
+            event_id: ulid::Ulid::generate(),
             realm_id: self.realm_id,
             kind: WatchEventKind::DataUploaded,
             path,
@@ -2903,21 +3097,110 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<PutBucketReplicationInput>,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
-        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
-        let targets = self
-            .parse_replication_targets(&req.input.bucket, &req.input.replication_configuration)?;
+        let bucket = req.input.bucket;
+        let targets =
+            self.parse_replication_targets(&bucket, &req.input.replication_configuration)?;
+        let old_relationships = self.list_xml_relationships(&bucket).await?;
+        let source = ArunaArn::s3_bucket(self.realm_id, self.node_id, bucket.clone())
+            .map_err(|error| s3_error!(InvalidArgument, "{}", error.to_string()))?;
+        let created_at = SystemTime::now();
+        let relationships = targets
+            .iter()
+            .map(|target| {
+                Ok(SyncRelationship {
+                    id: ulid::Ulid::generate(),
+                    source: source.clone(),
+                    target: ArunaArn::parse(&target.arn)
+                        .map_err(|error| s3_error!(InvalidArgument, "{}", error.to_string()))?,
+                    mode: SyncMode::Continuous,
+                    reference_handling: Default::default(),
+                    reference_serving: false,
+                    replicate_deletes: target.replicate_delete_markers,
+                    created_by: user_access.user_identity,
+                    created_at,
+                    state: SyncState::Enabled,
+                    status: SyncStatusSnapshot::default(),
+                })
+            })
+            .collect::<S3Result<Vec<_>>>()?;
 
-        drive(
-            PutBucketReplicationOperation::new(req.input.bucket, targets),
-            &self.state,
-        )
-        .await
-        .and_then(|result| result.transpose())
-        .map_err(IntoS3Error::into_s3_error)?
-        .ok_or_else(|| s3_error!(InternalError, "Failed to store bucket replication config"))?;
+        let mut stored = Vec::new();
+        for relationship in &relationships {
+            stage_mirror_reconcile(&self.state, relationship)
+                .await
+                .map_err(|error| s3_error!(InternalError, "{}", error))?;
+            if let Err(error) = self.create_sync_mirror(&user_access, relationship).await {
+                kick_mirror_repair(&self.state).await;
+                for created in &stored {
+                    if stage_mirror_delete(&self.state, created).await.is_ok() {
+                        let _ = self
+                            .delete_sync_relationship(
+                                created.clone(),
+                                SyncRelationshipDirection::Outgoing,
+                            )
+                            .await;
+                        kick_mirror_repair(&self.state).await;
+                        if self.remove_sync_mirror(created).await {
+                            self.clear_mirror_repair(created, SyncMirrorRepairIntent::Delete)
+                                .await;
+                        }
+                    }
+                }
+                return Err(error);
+            }
+            if let Err(error) = self
+                .store_sync_relationship(relationship.clone(), SyncRelationshipDirection::Outgoing)
+                .await
+            {
+                let mut rollback = stored.clone();
+                rollback.push(relationship.clone());
+                for created in &rollback {
+                    if stage_mirror_delete(&self.state, created).await.is_ok() {
+                        let _ = self
+                            .delete_sync_relationship(
+                                created.clone(),
+                                SyncRelationshipDirection::Outgoing,
+                            )
+                            .await;
+                        kick_mirror_repair(&self.state).await;
+                        if self.remove_sync_mirror(created).await {
+                            self.clear_mirror_repair(created, SyncMirrorRepairIntent::Delete)
+                                .await;
+                        }
+                    }
+                }
+                return Err(error);
+            }
+            self.clear_mirror_repair(relationship, SyncMirrorRepairIntent::Reconcile)
+                .await;
+            stored.push(relationship.clone());
+        }
+
+        for relationship in old_relationships {
+            stage_mirror_delete(&self.state, &relationship)
+                .await
+                .map_err(|error| s3_error!(InternalError, "{}", error))?;
+            self.delete_sync_relationship(
+                relationship.clone(),
+                SyncRelationshipDirection::Outgoing,
+            )
+            .await?;
+            kick_mirror_repair(&self.state).await;
+            if self.remove_sync_mirror(&relationship).await {
+                self.clear_mirror_repair(&relationship, SyncMirrorRepairIntent::Delete)
+                    .await;
+            }
+        }
+
+        drive(DeleteBucketReplicationOperation::new(bucket), &self.state)
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to clear legacy replication config"))?;
 
         Ok(S3Response::new(PutBucketReplicationOutput::default()))
     }
@@ -2932,14 +3215,19 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
 
-        let config = drive(
-            GetBucketReplicationOperation::new(req.input.bucket),
-            &self.state,
-        )
-        .await
-        .and_then(|result| result.transpose())
-        .map_err(IntoS3Error::into_s3_error)?
-        .ok_or_else(|| s3_error!(InternalError, "Failed to load bucket replication config"))?;
+        let relationships = self.list_xml_relationships(&req.input.bucket).await?;
+        let config = if relationships.is_empty() {
+            drive(
+                GetBucketReplicationOperation::new(req.input.bucket),
+                &self.state,
+            )
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to load bucket replication config"))?
+        } else {
+            self.relationships_config(&relationships)
+        };
 
         Ok(S3Response::new(GetBucketReplicationOutput {
             replication_configuration: Some(self.build_replication_configuration(&config)),
@@ -2955,6 +3243,23 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        let relationships = self.list_xml_relationships(&req.input.bucket).await?;
+
+        for relationship in relationships {
+            stage_mirror_delete(&self.state, &relationship)
+                .await
+                .map_err(|error| s3_error!(InternalError, "{}", error))?;
+            self.delete_sync_relationship(
+                relationship.clone(),
+                SyncRelationshipDirection::Outgoing,
+            )
+            .await?;
+            kick_mirror_repair(&self.state).await;
+            if self.remove_sync_mirror(&relationship).await {
+                self.clear_mirror_repair(&relationship, SyncMirrorRepairIntent::Delete)
+                    .await;
+            }
+        }
 
         drive(
             DeleteBucketReplicationOperation::new(req.input.bucket),
@@ -3014,6 +3319,89 @@ mod tests {
         created_by: UserId,
     }
 
+    fn parser_service(realm_id: RealmId, node_id: NodeId) -> (TempDir, ArunaS3Service) {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let state = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        (
+            storage_dir,
+            ArunaS3Service {
+                state,
+                realm_id,
+                node_id,
+            },
+        )
+    }
+
+    fn replication_config(bucket: String) -> ReplicationConfiguration {
+        ReplicationConfiguration {
+            role: "arn:aruna:replication-role".to_string(),
+            rules: vec![ReplicationRule {
+                delete_marker_replication: None,
+                destination: Destination {
+                    access_control_translation: None,
+                    account: None,
+                    bucket,
+                    encryption_configuration: None,
+                    metrics: None,
+                    replication_time: None,
+                    storage_class: None,
+                },
+                existing_object_replication: None,
+                filter: None,
+                id: None,
+                prefix: None,
+                priority: None,
+                source_selection_criteria: None,
+                status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+            }],
+        }
+    }
+
+    #[test]
+    fn accepts_different_bucket() {
+        let realm_id = RealmId([71u8; 32]);
+        let source_node = iroh::SecretKey::from_bytes(&[72u8; 32]).public();
+        let target_node = iroh::SecretKey::from_bytes(&[73u8; 32]).public();
+        let (_storage_dir, service) = parser_service(realm_id, source_node);
+        let target = ArunaArn::s3_bucket(realm_id, target_node, "target-bucket").unwrap();
+
+        let parsed = service
+            .parse_replication_targets("source-bucket", &replication_config(target.to_string()))
+            .unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].bucket, "target-bucket");
+        assert_eq!(parsed[0].arn, target.to_string());
+    }
+
+    #[test]
+    fn rejects_prefix_target() {
+        let realm_id = RealmId([74u8; 32]);
+        let source_node = iroh::SecretKey::from_bytes(&[75u8; 32]).public();
+        let target_node = iroh::SecretKey::from_bytes(&[76u8; 32]).public();
+        let (_storage_dir, service) = parser_service(realm_id, source_node);
+        let target =
+            ArunaArn::s3_object_prefix(realm_id, target_node, "target-bucket", "prefix").unwrap();
+
+        assert!(
+            service
+                .parse_replication_targets(
+                    "source-bucket",
+                    &replication_config(target.to_string()),
+                )
+                .is_err()
+        );
+    }
+
     #[test]
     fn upload_id_marker_is_ignored_without_key_marker() {
         assert_eq!(
@@ -3025,7 +3413,7 @@ mod tests {
             None
         );
 
-        let marker = Ulid::r#gen();
+        let marker = Ulid::generate();
         assert_eq!(
             parse_upload_id_marker(Some("key"), Some(&marker.to_string())).unwrap(),
             Some(marker)
@@ -3051,8 +3439,8 @@ mod tests {
         let service = ArunaS3Service::new(context, realm_id, node_id).await;
         let bucket = "bucket".to_string();
         let key = "object".to_string();
-        let version_id = Ulid::r#gen();
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let version_id = Ulid::generate();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
         let auth = AuthContext {
             user_id,
             realm_id,
@@ -3094,7 +3482,7 @@ mod tests {
             .put_object_response(
                 &checksum_request,
                 auth,
-                Ulid::r#gen(),
+                Ulid::generate(),
                 bucket.clone(),
                 key,
                 PutObjectResult {
@@ -3238,9 +3626,9 @@ mod tests {
         let holder = net.node_id();
 
         let service = ArunaS3Service::new(context.clone(), realm_id, net.node_id()).await;
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
-        let watcher = UserId::local(Ulid::r#gen(), realm_id);
-        let group_id = Ulid::r#gen();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        let watcher = UserId::local(Ulid::generate(), realm_id);
+        let group_id = Ulid::generate();
         let watch_prefix = data_watch_resource_path(group_id, net.node_id(), "bucket", "");
         net.replace_watch_interest(data_uploaded_interest(
             realm_id,
@@ -3279,7 +3667,7 @@ mod tests {
                 "object".to_string(),
                 PutObjectResult {
                     location: response_location(user_id),
-                    version_id: Ulid::r#gen(),
+                    version_id: Ulid::generate(),
                 },
             )
             .await
@@ -3326,12 +3714,12 @@ mod tests {
         net.replace_watch_interest(data_uploaded_interest(
             realm_id,
             holder,
-            data_watch_resource_path(Ulid::r#gen(), net.node_id(), "bucket", ""),
+            data_watch_resource_path(Ulid::generate(), net.node_id(), "bucket", ""),
         ));
 
         let service = ArunaS3Service::new(context.clone(), realm_id, net.node_id()).await;
         let anonymous = UserId::nil(realm_id);
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let auth = AuthContext {
             user_id: anonymous,
             realm_id,
@@ -3354,7 +3742,7 @@ mod tests {
                 "object".to_string(),
                 PutObjectResult {
                     location: response_location(anonymous),
-                    version_id: Ulid::r#gen(),
+                    version_id: Ulid::generate(),
                 },
             )
             .await
@@ -3384,7 +3772,7 @@ mod tests {
         let refresh = ReferenceMetadataRefresh {
             bucket: "bucket".to_string(),
             key: "reference".to_string(),
-            version_id: Ulid::r#gen(),
+            version_id: Ulid::generate(),
             metadata: source_metadata(2, "etag"),
             refreshed_at: UNIX_EPOCH.checked_sub(Duration::from_secs(1)).unwrap(),
         };
@@ -3486,8 +3874,8 @@ mod tests {
             context,
             bucket: "bucket".to_string(),
             key: "key".to_string(),
-            version_id: Ulid::r#gen(),
-            created_by: UserId::local(Ulid::r#gen(), realm_id),
+            version_id: Ulid::generate(),
+            created_by: UserId::local(Ulid::generate(), realm_id),
         }
     }
 
@@ -3499,7 +3887,7 @@ mod tests {
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: "bucket/object".to_string(),
-            ulid: Ulid::r#gen(),
+            ulid: Ulid::generate(),
             compressed: false,
             encrypted: false,
             created_by,
@@ -3707,7 +4095,7 @@ mod tests {
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: format!("path/{key}"),
-            ulid: Ulid::r#gen(),
+            ulid: Ulid::generate(),
             compressed: false,
             encrypted: false,
             created_by,
@@ -3773,7 +4161,7 @@ mod tests {
     fn test_user_access(group_id: Ulid, realm_id: RealmId) -> UserAccess {
         UserAccess {
             access_key: "test-key".to_string(),
-            user_identity: UserId::local(Ulid::r#gen(), realm_id),
+            user_identity: UserId::local(Ulid::generate(), realm_id),
             group_id,
             secret: "secret".to_string(),
             expiry: SystemTime::now() + Duration::from_secs(3600),
@@ -3809,11 +4197,11 @@ mod tests {
         });
         let realm_id = RealmId([36u8; 32]);
         let node_id = NodeId::from_bytes(&[0u8; 32]).unwrap();
-        let credential_group_id = Ulid::r#gen();
+        let credential_group_id = Ulid::generate();
         let source_group_id = if same_group {
             credential_group_id
         } else {
-            Ulid::r#gen()
+            Ulid::generate()
         };
         let user_access = test_user_access(credential_group_id, realm_id);
         let actor = Actor {
@@ -3940,7 +4328,7 @@ mod tests {
                 .bucket("destination".to_string())
                 .key("copied".to_string())
                 .copy_source(s3s::dto::CopySource::parse("source/object").unwrap())
-                .upload_id(Ulid::r#gen().to_string())
+                .upload_id(Ulid::generate().to_string())
                 .part_number(1)
                 .build()
                 .unwrap();
@@ -3969,7 +4357,7 @@ mod tests {
         created_at: SystemTime,
     ) {
         for key in keys {
-            let version_id = Ulid::r#gen();
+            let version_id = Ulid::generate();
             let hash = [key.len() as u8; 32];
             write_head(storage_handle, bucket, key, version_id).await;
             write_materialized_version(
@@ -4017,8 +4405,8 @@ mod tests {
             compute_handle: None,
         });
         let realm_id = RealmId([2u8; 32]);
-        let group_id = Ulid::r#gen();
-        let created_by = UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::generate();
+        let created_by = UserId::local(Ulid::generate(), realm_id);
         let created_at = UNIX_EPOCH;
 
         let service = ArunaS3Service::new(
@@ -4096,8 +4484,8 @@ mod tests {
             compute_handle: None,
         });
         let realm_id = RealmId([3u8; 32]);
-        let group_id = Ulid::r#gen();
-        let created_by = UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::generate();
+        let created_by = UserId::local(Ulid::generate(), realm_id);
         let created_at = UNIX_EPOCH;
 
         let service = ArunaS3Service::new(
@@ -4250,8 +4638,8 @@ mod tests {
             compute_handle: None,
         });
         let realm_id = RealmId([33u8; 32]);
-        let group_id = Ulid::r#gen();
-        let created_by = UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::generate();
+        let created_by = UserId::local(Ulid::generate(), realm_id);
 
         let service =
             ArunaS3Service::new(context, realm_id, NodeId::from_bytes(&[0u8; 32]).unwrap()).await;
@@ -4317,8 +4705,8 @@ mod tests {
             compute_handle: None,
         });
         let realm_id = RealmId([34u8; 32]);
-        let group_id = Ulid::r#gen();
-        let created_by = UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::generate();
+        let created_by = UserId::local(Ulid::generate(), realm_id);
 
         let service = ArunaS3Service::new(
             context.clone(),
@@ -4439,8 +4827,8 @@ mod tests {
             compute_handle: None,
         });
         let realm_id = RealmId([4u8; 32]);
-        let group_id = Ulid::r#gen();
-        let created_by = UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::generate();
+        let created_by = UserId::local(Ulid::generate(), realm_id);
         let created_at = UNIX_EPOCH + Duration::from_secs(1);
 
         let service = ArunaS3Service::new(
@@ -4455,7 +4843,7 @@ mod tests {
         // through it.
         for i in 0..305 {
             let key = format!("dir/key_{:04}", i);
-            let version_id = Ulid::r#gen();
+            let version_id = Ulid::generate();
             let hash = [i as u8; 32];
             write_head(&storage_handle, "bucket", &key, version_id).await;
             write_materialized_version(
@@ -4525,8 +4913,8 @@ mod tests {
             compute_handle: None,
         });
         let realm_id = RealmId([5u8; 32]);
-        let group_id = Ulid::r#gen();
-        let created_by = UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::generate();
+        let created_by = UserId::local(Ulid::generate(), realm_id);
         let created_at = UNIX_EPOCH + Duration::from_secs(5);
         let last_refresh = UNIX_EPOCH + Duration::from_secs(20);
 
@@ -4545,7 +4933,7 @@ mod tests {
             source_version: None,
         };
 
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         write_reference_version_with_metadata(
             &storage_handle,
             "bucket",
@@ -4623,8 +5011,8 @@ mod tests {
             compute_handle: None,
         });
         let realm_id = RealmId([6u8; 32]);
-        let group_id = Ulid::r#gen();
-        let created_by = UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::generate();
+        let created_by = UserId::local(Ulid::generate(), realm_id);
         let created_at = UNIX_EPOCH + Duration::from_secs(5);
 
         let service = ArunaS3Service::new(
@@ -4689,8 +5077,8 @@ mod tests {
             compute_handle: None,
         });
         let realm_id = RealmId([7u8; 32]);
-        let group_id = Ulid::r#gen();
-        let created_by = UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::generate();
+        let created_by = UserId::local(Ulid::generate(), realm_id);
         let created_at = UNIX_EPOCH;
 
         let service = ArunaS3Service::new(
@@ -4803,8 +5191,8 @@ mod tests {
             compute_handle: None,
         });
         let realm_id = RealmId([35u8; 32]);
-        let group_id = Ulid::r#gen();
-        let created_by = UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::generate();
+        let created_by = UserId::local(Ulid::generate(), realm_id);
 
         let service =
             ArunaS3Service::new(context, realm_id, NodeId::from_bytes(&[0u8; 32]).unwrap()).await;
@@ -4865,8 +5253,8 @@ mod tests {
             compute_handle: None,
         });
         let realm_id = RealmId([36u8; 32]);
-        let group_id = Ulid::r#gen();
-        let created_by = UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::generate();
+        let created_by = UserId::local(Ulid::generate(), realm_id);
 
         let service =
             ArunaS3Service::new(context, realm_id, NodeId::from_bytes(&[0u8; 32]).unwrap()).await;
@@ -4941,8 +5329,8 @@ mod tests {
             compute_handle: None,
         });
         let realm_id = RealmId([37u8; 32]);
-        let group_id = Ulid::r#gen();
-        let created_by = UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::generate();
+        let created_by = UserId::local(Ulid::generate(), realm_id);
 
         let service =
             ArunaS3Service::new(context, realm_id, NodeId::from_bytes(&[0u8; 32]).unwrap()).await;

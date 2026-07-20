@@ -693,13 +693,7 @@ impl ExecutorBackend for KubernetesBackend {
         image: &str,
         _cancel: &CancellationToken,
     ) -> Result<String, BackendError> {
-        if digest_pinned(image) {
-            Ok(image.to_string())
-        } else {
-            Err(BackendError::InvalidSpec(
-                "Kubernetes images must be supplied by digest".to_string(),
-            ))
-        }
+        Ok(image.to_string())
     }
 
     async fn fence(&self, context: &FenceContext) -> Result<(), BackendError> {
@@ -1115,11 +1109,6 @@ fn validate_spec(
         ));
     }
     validate_name(&context.attempt.external_name())?;
-    if !digest_pinned(&spec.image) {
-        return Err(BackendError::InvalidSpec(
-            "task image must be digest-pinned".to_string(),
-        ));
-    }
     StageLayout::from_spec(spec)?;
     if spec.security.run_as != NOBODY {
         return Err(BackendError::InvalidSpec(
@@ -1127,7 +1116,10 @@ fn validate_spec(
         ));
     }
     match (spec.staging_mode, spec.security.network) {
-        (StagingMode::Files, aruna_core::compute::NetworkAccess::Isolated) => {}
+        (
+            StagingMode::Files,
+            aruna_core::compute::NetworkAccess::Isolated | aruna_core::compute::NetworkAccess::Open,
+        ) => {}
         (StagingMode::DirectS3, aruna_core::compute::NetworkAccess::S3Only)
             if !config.s3_cidrs.is_empty() => {}
         (StagingMode::DirectS3, _) => {
@@ -1137,7 +1129,7 @@ fn validate_spec(
         }
         (StagingMode::Files, _) => {
             return Err(BackendError::InvalidSpec(
-                "Files staging requires isolated networking".to_string(),
+                "Files staging does not support S3-only networking".to_string(),
             ));
         }
     }
@@ -1873,6 +1865,27 @@ mod tests {
             s3_port: 443,
         };
         assert!(validate_config(&config).is_err());
+    }
+
+    #[tokio::test]
+    async fn accepts_task_images() {
+        let backend = KubernetesBackend {
+            client: fake_client(|_, _| (404, status_json(404))),
+            config: test_config(),
+        };
+        let cancel = CancellationToken::new();
+
+        for image in [
+            "registry.example/task:latest",
+            "registry.example/task@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        ] {
+            let resolved = backend.resolve_image(image, &cancel).await.unwrap();
+            let context = context();
+            let spec = TaskSpec::new(context.attempt.clone(), resolved.clone());
+
+            assert_eq!(resolved, image);
+            assert!(validate_spec(&context, &spec, &backend.config).is_ok());
+        }
     }
 
     #[test]

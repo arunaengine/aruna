@@ -92,6 +92,7 @@ impl ReadStagingSourceOperation {
                 group_id: self.input.group_id,
                 connector_id: self.input.connector_id,
                 source_path: self.input.source_path.clone(),
+                allow_root: false,
             }
         )]
     }
@@ -373,7 +374,7 @@ mod tests {
     #[tokio::test]
     async fn read_operation_resolves_connector_and_hits_runtime() {
         let test_context = setup_driver_context().await;
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let connector =
             create_http_connector(&test_context.driver_context, group_id, "http://127.0.0.1:1")
                 .await;

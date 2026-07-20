@@ -249,7 +249,7 @@ mod tests {
         let access = UserAccess {
             access_key: "user:key".to_string(),
             user_identity: UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32])),
-            group_id: Ulid::r#gen(),
+            group_id: Ulid::generate(),
             secret: "secret".to_string(),
             expiry: SystemTime::now() + Duration::from_secs(60),
             path_restrictions: None,
@@ -259,7 +259,7 @@ mod tests {
         let mut op = RevokeUserAccessOperation::new(access.access_key.clone());
         op.start();
         op.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::r#gen(),
+            txn_id: Ulid::generate(),
         }));
         op.step(Event::Storage(StorageEvent::ReadResult {
             key: access.access_key.as_bytes().to_vec().into(),
@@ -270,7 +270,7 @@ mod tests {
         }));
 
         let effects = op.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: Ulid::r#gen(),
+            txn_id: Ulid::generate(),
         }));
         assert_eq!(op.state, RevokeUserAccessState::ReplicateAccess);
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
@@ -300,7 +300,7 @@ mod tests {
         let user_access = UserAccess {
             access_key: access_key.clone(),
             user_identity: Default::default(),
-            group_id: Ulid::r#gen(),
+            group_id: Ulid::generate(),
             secret: "secret".to_string(),
             expiry: SystemTime::now() + Duration::from_secs(3600),
             path_restrictions: None,

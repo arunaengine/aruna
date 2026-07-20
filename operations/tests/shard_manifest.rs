@@ -42,14 +42,14 @@ async fn document_manifest_row_lands_on_origin_and_receiver_with_matching_digest
 -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([120u8; 32]);
     let (nodes, config) = build_realm_nodes(&realm_id, 2).await?;
-    let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
+    let document_id = Ulid::generate();
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
-                user_id: UserId::local(Ulid::r#gen(), realm_id),
+                user_id: UserId::local(Ulid::generate(), realm_id),
                 realm_id,
             },
             group_id,

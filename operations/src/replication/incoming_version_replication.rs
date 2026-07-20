@@ -5,27 +5,36 @@ use crate::blob::blob_keyspace_helper::{
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
+use crate::replication::queue::{
+    LiveReplicationObligationRecord, live_obligation_effect, schedule_blob_replication_drain_effect,
+};
 use crate::replication::util::dht_registration_effect;
 use crate::s3::create_bucket::CreateBucketOperation;
+use crate::usage_stats::{
+    QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError,
+    schedule_usage_snapshot_publish_effect,
+};
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
-    S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+    S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
-    MultipartObjectMetadataKey, Permission, RealmId, ReplicationItemKind,
-    ReplicationNegotiationResult, VersionKey, blob_bucket_permission_path,
-    blob_object_permission_path,
+    AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
+    CurrentVersionPointer, MultipartObjectMetadataKey, Permission, RealmConfigDocument, RealmId,
+    ReplicationItemKind, ReplicationNegotiationResult, UsageDelta, VersionKey,
+    blob_bucket_permission_path, blob_object_permission_path,
 };
+use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, NodeId};
 use smallvec::smallvec;
 use std::collections::VecDeque;
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 use ulid::Ulid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,17 +43,32 @@ enum IncomingVersionReplicationState {
     ReadDestinationBucket,
     CreateDestinationBucket,
     CheckPermissions,
+    CheckWriterPermissions,
     ReadExistingVersion,
+    ReadReplacedBlob,
+    ReadQuotaConfig,
+    StartQuotaCheck,
+    EnforceQuota,
+    FinishQuotaCheck,
     ReadExistingBlob,
     SendNegotiation,
     ReceiveBlob,
     StartTransaction,
+    VerifyReplaced,
+    ReadReplacedMetadata,
+    DeleteReplacedMetadata,
     WriteBlobLocation,
     ReadObjectLookup,
+    ReadCurrentVersion,
     ApplyHeadTransition,
     WriteBlobVersion,
     WriteMultipartMetadata,
+    WriteLiveObligation,
+    CheckCommitQuota,
+    UpdateUsage,
     CommitTransaction,
+    ScheduleUsage,
+    ScheduleLiveDrain,
     SendApplyRejected,
     AbortTransaction,
     CleanupReceivedBlob,
@@ -71,8 +95,24 @@ pub enum IncomingVersionReplicationError {
     DestinationBucketNotFound,
     #[error("Replication requires WRITE permission on the destination path")]
     WritePermissionDenied,
+    #[error("writer_access_denied")]
+    WriterPermissionDenied,
+    #[error("Replication hop limit exceeded")]
+    HopLimitExceeded,
+    #[error("Reference replication manifest is missing source metadata")]
+    MissingReferenceMetadata,
+    #[error("Reference replication manifest is missing source binding")]
+    MissingReferenceSource,
+    #[error(transparent)]
+    QuotaGateError(#[from] QuotaGateError),
+    #[error(transparent)]
+    UsageUpdateError(#[from] UsageUpdateError),
+    #[error("quota")]
+    QuotaExceeded,
     #[error("Current version manifest is missing current pointer generation")]
     MissingCurrentVersionGeneration,
+    #[error("Destination current version not found")]
+    CurrentVersionNotFound,
     #[error("Materialized replication manifest is missing blob info")]
     MissingBlobInfo,
     #[error("Materialized replication manifest is missing local blob location")]
@@ -83,12 +123,20 @@ pub enum IncomingVersionReplicationError {
     BlobSizeMismatch,
     #[error("Replicated blob storage flags do not match manifest")]
     BlobStorageFlagsMismatch,
+    #[error("Replaced multipart metadata exceeds the supported part limit")]
+    MultipartMetadataOverflow,
     #[error("Unexpected event in state {state}: expected {expected}, got {received:?}")]
     InvalidStateEvent {
         state: &'static str,
         expected: &'static str,
         received: Event,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncomingVersionReplicationResult {
+    pub applied: bool,
+    pub group_id: Option<GroupId>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -102,16 +150,23 @@ pub struct IncomingVersionReplicationOperation {
     destination_group_id: Option<GroupId>,
     create_attempted: bool,
     negotiation_result: Option<ReplicationNegotiationResult>,
+    quota_ceiling: Option<u64>,
+    quota_gate: Option<QuotaGate>,
+    usage_update: Option<UsageCounterUpdate>,
     existing_blob_location: Option<BackendLocation>,
+    replaced_version: Option<BlobVersion>,
     received_blob_location: Option<BackendLocation>,
     existing_current_pointer: Option<CurrentVersionPointer>,
+    object_delta: i128,
+    replaced_logical_bytes: u64,
+    replaced_reference_bytes: u64,
     pending_new_pointer: Option<CurrentVersionPointer>,
     pending_new_current_hash: Option<[u8; 32]>,
     pending_head_transition_effects: VecDeque<Effect>,
     pending_version_effects: VecDeque<Effect>,
     cleanup_blob_location: Option<BackendLocation>,
     apply_committed: bool,
-    output: Option<Result<(), IncomingVersionReplicationError>>,
+    output: Option<Result<IncomingVersionReplicationResult, IncomingVersionReplicationError>>,
 }
 
 impl IncomingVersionReplicationOperation {
@@ -131,9 +186,16 @@ impl IncomingVersionReplicationOperation {
             destination_group_id: None,
             create_attempted: false,
             negotiation_result: None,
+            quota_ceiling: None,
+            quota_gate: None,
+            usage_update: None,
             existing_blob_location: None,
+            replaced_version: None,
             received_blob_location: None,
             existing_current_pointer: None,
+            object_delta: 0,
+            replaced_logical_bytes: 0,
+            replaced_reference_bytes: 0,
             pending_new_pointer: None,
             pending_new_current_hash: None,
             pending_head_transition_effects: VecDeque::new(),
@@ -150,17 +212,32 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::ReadDestinationBucket => "ReadDestinationBucket",
             IncomingVersionReplicationState::CreateDestinationBucket => "CreateDestinationBucket",
             IncomingVersionReplicationState::CheckPermissions => "CheckPermissions",
+            IncomingVersionReplicationState::CheckWriterPermissions => "CheckWriterPermissions",
             IncomingVersionReplicationState::ReadExistingVersion => "ReadExistingVersion",
+            IncomingVersionReplicationState::ReadReplacedBlob => "ReadReplacedBlob",
+            IncomingVersionReplicationState::ReadQuotaConfig => "ReadQuotaConfig",
+            IncomingVersionReplicationState::StartQuotaCheck => "StartQuotaCheck",
+            IncomingVersionReplicationState::EnforceQuota => "EnforceQuota",
+            IncomingVersionReplicationState::FinishQuotaCheck => "FinishQuotaCheck",
             IncomingVersionReplicationState::ReadExistingBlob => "ReadExistingBlob",
             IncomingVersionReplicationState::SendNegotiation => "SendNegotiation",
             IncomingVersionReplicationState::ReceiveBlob => "ReceiveBlob",
             IncomingVersionReplicationState::StartTransaction => "StartTransaction",
+            IncomingVersionReplicationState::VerifyReplaced => "VerifyReplaced",
+            IncomingVersionReplicationState::ReadReplacedMetadata => "ReadReplacedMetadata",
+            IncomingVersionReplicationState::DeleteReplacedMetadata => "DeleteReplacedMetadata",
             IncomingVersionReplicationState::WriteBlobLocation => "WriteBlobLocation",
             IncomingVersionReplicationState::ReadObjectLookup => "ReadObjectLookup",
+            IncomingVersionReplicationState::ReadCurrentVersion => "ReadCurrentVersion",
             IncomingVersionReplicationState::ApplyHeadTransition => "ApplyHeadTransition",
             IncomingVersionReplicationState::WriteBlobVersion => "WriteBlobVersion",
             IncomingVersionReplicationState::WriteMultipartMetadata => "WriteMultipartMetadata",
+            IncomingVersionReplicationState::WriteLiveObligation => "WriteLiveObligation",
+            IncomingVersionReplicationState::CheckCommitQuota => "CheckCommitQuota",
+            IncomingVersionReplicationState::UpdateUsage => "UpdateUsage",
             IncomingVersionReplicationState::CommitTransaction => "CommitTransaction",
+            IncomingVersionReplicationState::ScheduleUsage => "ScheduleUsage",
+            IncomingVersionReplicationState::ScheduleLiveDrain => "ScheduleLiveDrain",
             IncomingVersionReplicationState::SendApplyRejected => "SendApplyRejected",
             IncomingVersionReplicationState::AbortTransaction => "AbortTransaction",
             IncomingVersionReplicationState::CleanupReceivedBlob => "CleanupReceivedBlob",
@@ -182,8 +259,15 @@ impl IncomingVersionReplicationOperation {
             "Rejecting incoming version replication negotiation"
         );
         let reason = err.to_string();
-        self.output = Some(Ok(()));
+        self.output = Some(Ok(self.result(false)));
         self.send_negotiation(ReplicationNegotiationResult::Rejected(reason))
+    }
+
+    fn result(&self, applied: bool) -> IncomingVersionReplicationResult {
+        IncomingVersionReplicationResult {
+            applied,
+            group_id: self.destination_group_id,
+        }
     }
 
     fn fail(&mut self, err: IncomingVersionReplicationError) -> Effects {
@@ -267,12 +351,55 @@ impl IncomingVersionReplicationOperation {
     }
 
     fn current_materialized_hash_from_manifest(&self) -> Option<[u8; 32]> {
-        if !self.manifest.current_version || self.manifest.kind != ReplicationItemKind::Materialized
+        if !self.manifest.current_version
+            || self.manifest.kind != ReplicationItemKind::Materialized
+            || self.manifest.reference_intent
         {
             return None;
         }
 
         self.manifest.blob.as_ref().map(|blob| blob.hash)
+    }
+
+    fn is_reference_item(&self) -> bool {
+        self.manifest.reference_intent && self.manifest.kind == ReplicationItemKind::Materialized
+    }
+
+    fn reference_version(&self) -> Result<BlobVersion, IncomingVersionReplicationError> {
+        let source = self
+            .manifest
+            .source
+            .clone()
+            .ok_or(IncomingVersionReplicationError::MissingReferenceSource)?;
+        let metadata = self
+            .manifest
+            .reference_metadata
+            .clone()
+            .ok_or(IncomingVersionReplicationError::MissingReferenceMetadata)?;
+        Ok(BlobVersion::reference(
+            source,
+            metadata,
+            self.manifest.created_at,
+            self.manifest.created_by,
+            self.manifest.created_at,
+        ))
+    }
+
+    fn incoming_logical_bytes(&self) -> Result<u64, IncomingVersionReplicationError> {
+        if self.is_reference_item() {
+            return self
+                .manifest
+                .reference_metadata
+                .as_ref()
+                .map(|metadata| metadata.content_length)
+                .ok_or(IncomingVersionReplicationError::MissingReferenceMetadata);
+        }
+
+        self.manifest
+            .blob
+            .as_ref()
+            .map(|blob| blob.size)
+            .ok_or(IncomingVersionReplicationError::MissingBlobInfo)
     }
 
     fn prepare_head_transition(&mut self) -> Effects {
@@ -354,6 +481,23 @@ impl IncomingVersionReplicationOperation {
         ))]
     }
 
+    fn check_writer_permission(&mut self, group_id: Ulid) -> Effects {
+        let Some(auth_context) = self.manifest.writer_auth_context.clone() else {
+            return self.read_existing_version();
+        };
+        self.state = IncomingVersionReplicationState::CheckWriterPermissions;
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context,
+                path: self.target_authorization_path(group_id),
+                required_permission: Permission::WRITE,
+            }),
+            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
+                allowed: result
+            }),
+        ))]
+    }
+
     fn read_existing_version(&mut self) -> Effects {
         self.state = IncomingVersionReplicationState::ReadExistingVersion;
         let key = match self.version_key_bytes() {
@@ -365,6 +509,64 @@ impl IncomingVersionReplicationOperation {
             key: key.into(),
             txn_id: None,
         })]
+    }
+
+    fn read_replaced_blob(&mut self, blob_hash: [u8; 32]) -> Effects {
+        self.state = IncomingVersionReplicationState::ReadReplacedBlob;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+            key: blob_hash.to_vec().into(),
+            txn_id: None,
+        })]
+    }
+
+    fn read_quota_config(&mut self) -> Effects {
+        self.state = IncomingVersionReplicationState::ReadQuotaConfig;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: DocumentSyncTarget::RealmConfig {
+                realm_id: self.local_realm_id,
+            }
+            .storage_keyspace()
+            .to_string(),
+            key: DocumentSyncTarget::RealmConfig {
+                realm_id: self.local_realm_id,
+            }
+            .storage_key(),
+            txn_id: None,
+        })]
+    }
+
+    fn start_quota_check(&mut self, ceiling: u64) -> Effects {
+        let Some(group_id) = self.destination_group_id else {
+            return self.fail(IncomingVersionReplicationError::DestinationBucketNotFound);
+        };
+        let logical_bytes = match self.incoming_logical_bytes() {
+            Ok(logical_bytes) => logical_bytes,
+            Err(error) => return self.fail(error),
+        }
+        .saturating_sub(self.replaced_logical_bytes);
+        self.quota_ceiling = Some(ceiling);
+        self.quota_gate = Some(QuotaGate::new_for_realm(
+            ceiling,
+            logical_bytes,
+            group_id,
+            self.local_node_id,
+            self.local_realm_id,
+        ));
+        self.state = IncomingVersionReplicationState::StartQuotaCheck;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: true,
+        })]
+    }
+
+    fn finish_quota_check(&mut self) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(IncomingVersionReplicationError::StorageError(
+                StorageError::TransactionNotFound,
+            ));
+        };
+        self.state = IncomingVersionReplicationState::FinishQuotaCheck;
+        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
     }
 
     fn read_existing_blob(&mut self) -> Effects {
@@ -409,6 +611,81 @@ impl IncomingVersionReplicationOperation {
         })]
     }
 
+    fn read_replaced_metadata(&mut self) -> Effects {
+        if self.replaced_version.is_none() {
+            return self.write_hash_lookup_or_continue();
+        }
+        let prefix = match MultipartObjectMetadataKey::part_prefix(self.manifest.version_id) {
+            Ok(prefix) => prefix.into(),
+            Err(error) => return self.fail(error.into()),
+        };
+        self.state = IncomingVersionReplicationState::ReadReplacedMetadata;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
+            prefix: Some(prefix),
+            start: None,
+            limit: 10_000,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn verify_replaced(&mut self) -> Effects {
+        let key = match self.version_key_bytes() {
+            Ok(key) => key,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.state = IncomingVersionReplicationState::VerifyReplaced;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            key: key.into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn delete_replaced_metadata(
+        &mut self,
+        values: Vec<(aruna_core::types::Key, aruna_core::types::Value)>,
+    ) -> Effects {
+        let mut deletes = Vec::with_capacity(values.len() + 2);
+        let summary_key =
+            match MultipartObjectMetadataKey::summary(self.manifest.version_id).to_bytes() {
+                Ok(key) => key.into(),
+                Err(error) => return self.fail(error.into()),
+            };
+        deletes.push((
+            S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
+            summary_key,
+        ));
+        deletes.extend(
+            values
+                .into_iter()
+                .map(|(key, _)| (S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(), key)),
+        );
+        if let Some(hash) = self
+            .replaced_version
+            .as_ref()
+            .and_then(BlobVersion::blob_hash)
+        {
+            let context = match self.alias_context() {
+                Ok(context) => context,
+                Err(error) => return self.fail(error),
+            };
+            let key = match context
+                .hash_path_index_key(*hash, self.manifest.version_id)
+                .to_bytes()
+            {
+                Ok(key) => key.into(),
+                Err(error) => return self.fail(error.into()),
+            };
+            deletes.push((HASH_PATHS_INDEX_KEYSPACE.to_string(), key));
+        }
+        self.state = IncomingVersionReplicationState::DeleteReplacedMetadata;
+        smallvec![Effect::Storage(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: self.txn_id,
+        })]
+    }
+
     fn effective_materialized_location(
         &self,
     ) -> Result<BackendLocation, IncomingVersionReplicationError> {
@@ -445,6 +722,9 @@ impl IncomingVersionReplicationOperation {
     }
 
     fn write_hash_lookup_or_continue(&mut self) -> Effects {
+        if self.is_reference_item() {
+            return self.write_object_lookup_or_continue();
+        }
         if let Some(location) = self.received_blob_location.as_ref()
             && let Err(err) = self.validate_materialized_location(location)
         {
@@ -502,6 +782,27 @@ impl IncomingVersionReplicationOperation {
         })]
     }
 
+    fn read_current(&mut self, version_id: Ulid) -> Effects {
+        self.state = IncomingVersionReplicationState::ReadCurrentVersion;
+        let key = match VersionKey::new(&self.manifest.bucket, &self.manifest.key, version_id)
+            .to_bytes()
+        {
+            Ok(key) => key,
+            Err(err) => return self.fail(err.into()),
+        };
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            key: key.into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn apply_liveness(&mut self, previous_live: bool) -> Effects {
+        let next_live = self.manifest.kind == ReplicationItemKind::Materialized;
+        self.object_delta = i128::from(u8::from(next_live)) - i128::from(u8::from(previous_live));
+        self.prepare_head_transition()
+    }
+
     fn write_object_lookup_after_compare(&mut self, existing: Option<&[u8]>) -> Effects {
         let Some(incoming_generation) = self.manifest.current_version_generation else {
             return self.write_version();
@@ -542,7 +843,10 @@ impl IncomingVersionReplicationOperation {
         ));
         self.pending_new_current_hash = self.current_materialized_hash_from_manifest();
 
-        self.prepare_head_transition()
+        match existing_pointer {
+            Some(pointer) => self.read_current(pointer.version_id),
+            None => self.apply_liveness(false),
+        }
     }
 
     fn write_version(&mut self) -> Effects {
@@ -558,25 +862,33 @@ impl IncomingVersionReplicationOperation {
         );
         let (version, materialized_hash) = match self.manifest.kind {
             ReplicationItemKind::Materialized => {
-                let Ok(location) = self.effective_materialized_location() else {
-                    return self.fail(IncomingVersionReplicationError::MissingBlobLocation);
-                };
-                let Some(blake3_hash) = location.get_blake3() else {
-                    return self.fail(IncomingVersionReplicationError::MissingBlobLocation);
-                };
-                let hash: [u8; 32] = match blake3_hash.try_into() {
-                    Ok(hash) => hash,
-                    Err(err) => return self.fail(ConversionError::from(err).into()),
-                };
-                (
-                    BlobVersion::materialized(
-                        hash,
-                        self.manifest.created_at,
-                        self.manifest.created_by,
-                        self.manifest.source.clone(),
-                    ),
-                    Some(hash),
-                )
+                if self.is_reference_item() {
+                    let version = match self.reference_version() {
+                        Ok(version) => version,
+                        Err(error) => return self.fail(error),
+                    };
+                    (version, None)
+                } else {
+                    let Ok(location) = self.effective_materialized_location() else {
+                        return self.fail(IncomingVersionReplicationError::MissingBlobLocation);
+                    };
+                    let Some(blake3_hash) = location.get_blake3() else {
+                        return self.fail(IncomingVersionReplicationError::MissingBlobLocation);
+                    };
+                    let hash: [u8; 32] = match blake3_hash.try_into() {
+                        Ok(hash) => hash,
+                        Err(err) => return self.fail(ConversionError::from(err).into()),
+                    };
+                    (
+                        BlobVersion::materialized(
+                            hash,
+                            self.manifest.created_at,
+                            self.manifest.created_by,
+                            self.manifest.source.clone(),
+                        ),
+                        Some(hash),
+                    )
+                }
             }
             ReplicationItemKind::DeleteMarker => (
                 BlobVersion::deleted(self.manifest.created_at, self.manifest.created_by),
@@ -604,7 +916,7 @@ impl IncomingVersionReplicationOperation {
 
     fn write_multipart_metadata_or_continue(&mut self) -> Effects {
         let Some(multipart) = self.manifest.multipart.as_ref() else {
-            return self.commit_transaction();
+            return self.write_live_obligation();
         };
 
         self.state = IncomingVersionReplicationState::WriteMultipartMetadata;
@@ -650,6 +962,117 @@ impl IncomingVersionReplicationOperation {
         })]
     }
 
+    fn write_live_obligation(&mut self) -> Effects {
+        self.state = IncomingVersionReplicationState::WriteLiveObligation;
+        let record = LiveReplicationObligationRecord::new(
+            self.local_node_id,
+            self.manifest
+                .writer_auth_context
+                .clone()
+                .unwrap_or_else(|| self.manifest.auth_context.clone()),
+            self.manifest.bucket.clone(),
+            self.manifest.key.clone(),
+            self.manifest.version_id,
+            self.manifest.kind == ReplicationItemKind::DeleteMarker,
+        )
+        .with_origin(self.manifest.origin.clone())
+        .with_sources(self.manifest.upstream_sources.clone());
+        match live_obligation_effect(record, self.txn_id) {
+            Ok(effect) => smallvec![effect],
+            Err(error) => self.fail(error.into()),
+        }
+    }
+
+    fn usage_delta(&self) -> Result<UsageDelta, IncomingVersionReplicationError> {
+        let bytes = match self.manifest.kind {
+            ReplicationItemKind::Materialized => i128::from(self.incoming_logical_bytes()?),
+            ReplicationItemKind::DeleteMarker => 0,
+        };
+        Ok(UsageDelta {
+            objects: self.object_delta,
+            logical_bytes: if self.is_reference_item() { 0 } else { bytes }
+                - i128::from(self.replaced_logical_bytes),
+            referenced_bytes: if self.is_reference_item() { bytes } else { 0 }
+                - i128::from(self.replaced_reference_bytes),
+            ..Default::default()
+        })
+    }
+
+    fn start_commit_quota(&mut self) -> Effects {
+        let Some(group_id) = self.destination_group_id else {
+            return self.fail(IncomingVersionReplicationError::DestinationBucketNotFound);
+        };
+        let group_delta = match self.usage_delta() {
+            Ok(delta) => delta,
+            Err(error) => return self.fail(error),
+        };
+        if self.manifest.kind == ReplicationItemKind::DeleteMarker {
+            let update = UsageCounterUpdate::for_group(group_id, group_delta);
+            if update.is_noop() {
+                return self.commit_transaction();
+            }
+            self.usage_update = Some(update);
+            return self.start_usage_update();
+        }
+        if self.is_reference_item() {
+            self.usage_update = Some(UsageCounterUpdate::for_group(group_id, group_delta));
+            return self.start_usage_update();
+        }
+        let Some(blob) = self.manifest.blob.as_ref() else {
+            return self.fail(IncomingVersionReplicationError::MissingBlobInfo);
+        };
+        let size = i128::from(blob.size);
+        let new_blob = self.received_blob_location.is_some();
+        let global_delta = UsageDelta {
+            stored_blobs: i128::from(new_blob),
+            stored_bytes: if new_blob { size } else { 0 },
+            ..group_delta
+        };
+        self.usage_update = Some(UsageCounterUpdate::with_global(
+            group_id,
+            group_delta,
+            global_delta,
+        ));
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(IncomingVersionReplicationError::StorageError(
+                StorageError::TransactionNotFound,
+            ));
+        };
+        let quota_bytes = blob.size.saturating_sub(self.replaced_logical_bytes);
+        if let Some(ceiling) = self.quota_ceiling
+            && quota_bytes > 0
+        {
+            let mut gate = QuotaGate::new_for_realm(
+                ceiling,
+                quota_bytes,
+                group_id,
+                self.local_node_id,
+                self.local_realm_id,
+            );
+            self.state = IncomingVersionReplicationState::CheckCommitQuota;
+            let effects = gate.start(txn_id);
+            self.quota_gate = Some(gate);
+            effects
+        } else {
+            self.start_usage_update()
+        }
+    }
+
+    fn start_usage_update(&mut self) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(IncomingVersionReplicationError::StorageError(
+                StorageError::TransactionNotFound,
+            ));
+        };
+        self.state = IncomingVersionReplicationState::UpdateUsage;
+        match self.usage_update.as_mut() {
+            Some(update) => update.start(txn_id),
+            None => self.fail(IncomingVersionReplicationError::ReplicationError(
+                ReplicationError::ReplicationFailed,
+            )),
+        }
+    }
+
     fn commit_transaction(&mut self) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.fail(IncomingVersionReplicationError::StorageError(
@@ -661,6 +1084,9 @@ impl IncomingVersionReplicationOperation {
     }
 
     fn register_blob_in_dht_or_continue(&mut self) -> Effects {
+        if self.is_reference_item() {
+            return self.send_apply_complete();
+        }
         let Ok(location) = self.effective_materialized_location() else {
             return self.send_apply_complete();
         };
@@ -675,6 +1101,13 @@ impl IncomingVersionReplicationOperation {
                 Err(_) => return self.send_apply_complete(),
             };
         smallvec![effect]
+    }
+
+    fn finish_live_drain(&mut self) -> Effects {
+        match self.manifest.kind {
+            ReplicationItemKind::Materialized => self.register_blob_in_dht_or_continue(),
+            ReplicationItemKind::DeleteMarker => self.send_apply_complete(),
+        }
     }
 
     fn send_apply_complete(&mut self) -> Effects {
@@ -738,11 +1171,32 @@ impl IncomingVersionReplicationOperation {
 }
 
 impl Operation for IncomingVersionReplicationOperation {
-    type Output = Result<(), IncomingVersionReplicationError>;
+    type Output = Result<IncomingVersionReplicationResult, IncomingVersionReplicationError>;
     type Error = IncomingVersionReplicationError;
 
     fn start(&mut self) -> Effects {
+        if self.is_reference_item()
+            && let Err(error) = self.reference_version()
+        {
+            return self.reject_negotiation(error);
+        }
+        if self
+            .manifest
+            .origin
+            .as_ref()
+            .is_some_and(|origin| origin.hop_count > 4)
+        {
+            return self.reject_negotiation(IncomingVersionReplicationError::HopLimitExceeded);
+        }
         if self.manifest.auth_context.realm_id != self.local_realm_id {
+            return self.reject_negotiation(IncomingVersionReplicationError::RealmMismatch);
+        }
+        if self
+            .manifest
+            .writer_auth_context
+            .as_ref()
+            .is_some_and(|auth| auth.realm_id != self.local_realm_id)
+        {
             return self.reject_negotiation(IncomingVersionReplicationError::RealmMismatch);
         }
 
@@ -826,10 +1280,30 @@ impl Operation for IncomingVersionReplicationOperation {
                             stream_id = %self.stream_id,
                             "Incoming replication write permission granted"
                         );
-                        self.read_existing_version()
+                        self.check_writer_permission(
+                            self.destination_group_id.unwrap_or(self.manifest.group_id),
+                        )
                     }
                     Ok(false) => self
                         .reject_negotiation(IncomingVersionReplicationError::WritePermissionDenied),
+                    Err(err) => self.reject_negotiation(err.into()),
+                }
+            }
+            IncomingVersionReplicationState::CheckWriterPermissions => {
+                let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
+                else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::SubOperation(SubOperationEvent::AuthorizationResult)",
+                        received: event,
+                    });
+                };
+
+                match allowed {
+                    Ok(true) => self.read_existing_version(),
+                    Ok(false) => self.reject_negotiation(
+                        IncomingVersionReplicationError::WriterPermissionDenied,
+                    ),
                     Err(err) => self.reject_negotiation(err.into()),
                 }
             }
@@ -852,11 +1326,166 @@ impl Operation for IncomingVersionReplicationOperation {
                     "Loaded existing destination version metadata"
                 );
 
+                if let Some(value) = value {
+                    let existing = match BlobVersion::from_bytes(value.as_ref()) {
+                        Ok(existing) => existing,
+                        Err(error) => return self.fail(error.into()),
+                    };
+                    self.replaced_version = Some(existing.clone());
+                    match &existing.state {
+                        BlobVersionState::Reference {
+                            cached_metadata, ..
+                        } => {
+                            self.replaced_reference_bytes = cached_metadata.content_length;
+                            if self.is_reference_item() {
+                                let incoming = match self.reference_version() {
+                                    Ok(incoming) => incoming,
+                                    Err(error) => return self.fail(error),
+                                };
+                                if existing == incoming {
+                                    return self.send_negotiation(
+                                        ReplicationNegotiationResult::AlreadyReplicatedVersion,
+                                    );
+                                }
+                                return self.send_negotiation(
+                                    ReplicationNegotiationResult::NeedVersionOnly,
+                                );
+                            }
+                        }
+                        BlobVersionState::Materialized { blob_hash, .. } => {
+                            if !self.is_reference_item()
+                                && self
+                                    .manifest
+                                    .blob
+                                    .as_ref()
+                                    .is_some_and(|blob| blob.hash == *blob_hash)
+                            {
+                                return self.send_negotiation(
+                                    ReplicationNegotiationResult::AlreadyReplicatedVersion,
+                                );
+                            }
+                            return self.read_replaced_blob(*blob_hash);
+                        }
+                        BlobVersionState::Deleted
+                            if self.manifest.kind == ReplicationItemKind::DeleteMarker =>
+                        {
+                            return self.send_negotiation(
+                                ReplicationNegotiationResult::AlreadyReplicatedVersion,
+                            );
+                        }
+                        BlobVersionState::Deleted => {}
+                    }
+                }
+
                 match self.manifest.kind {
                     ReplicationItemKind::DeleteMarker => {
                         self.send_negotiation(ReplicationNegotiationResult::NeedVersionOnly)
                     }
-                    ReplicationItemKind::Materialized => self.read_existing_blob(),
+                    ReplicationItemKind::Materialized => self.read_quota_config(),
+                }
+            }
+            IncomingVersionReplicationState::ReadReplacedBlob => {
+                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::ReadResult)",
+                        received: event,
+                    });
+                };
+                self.replaced_logical_bytes = match value
+                    .as_ref()
+                    .map(|value| BackendLocation::from_bytes(value.as_ref()))
+                    .transpose()
+                {
+                    Ok(location) => location.map_or(0, |location| location.blob_size),
+                    Err(error) => return self.fail(error.into()),
+                };
+                if self.is_reference_item() {
+                    self.send_negotiation(ReplicationNegotiationResult::NeedVersionOnly)
+                } else {
+                    self.read_quota_config()
+                }
+            }
+            IncomingVersionReplicationState::ReadQuotaConfig => {
+                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::ReadResult)",
+                        received: event,
+                    });
+                };
+                let Some(group_id) = self.destination_group_id else {
+                    return self.fail(IncomingVersionReplicationError::DestinationBucketNotFound);
+                };
+                let ceiling = match value
+                    .map(|value| RealmConfigDocument::from_bytes(value.as_ref()))
+                    .transpose()
+                {
+                    Ok(Some(config)) => config.quota.effective_group_ceiling(&group_id),
+                    Ok(None) => None,
+                    Err(err) => return self.fail(err.into()),
+                };
+
+                match ceiling {
+                    _ if self.is_reference_item() => {
+                        self.send_negotiation(ReplicationNegotiationResult::NeedVersionOnly)
+                    }
+                    Some(ceiling) => self.start_quota_check(ceiling),
+                    None => self.read_existing_blob(),
+                }
+            }
+            IncomingVersionReplicationState::StartQuotaCheck => {
+                let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::TransactionStarted)",
+                        received: event,
+                    });
+                };
+                self.txn_id = Some(txn_id);
+                let Some(gate) = self.quota_gate.as_mut() else {
+                    return self.fail(IncomingVersionReplicationError::ReplicationError(
+                        ReplicationError::ReplicationFailed,
+                    ));
+                };
+                self.state = IncomingVersionReplicationState::EnforceQuota;
+                gate.start(txn_id)
+            }
+            IncomingVersionReplicationState::EnforceQuota => {
+                let Some(txn_id) = self.txn_id else {
+                    return self.fail(IncomingVersionReplicationError::StorageError(
+                        StorageError::TransactionNotFound,
+                    ));
+                };
+                let Some(gate) = self.quota_gate.as_mut() else {
+                    return self.fail(IncomingVersionReplicationError::ReplicationError(
+                        ReplicationError::ReplicationFailed,
+                    ));
+                };
+                match gate.step(event, txn_id) {
+                    Ok(Some(effects)) => effects,
+                    Ok(None) => self.finish_quota_check(),
+                    Err(err) => self.fail(err.into()),
+                }
+            }
+            IncomingVersionReplicationState::FinishQuotaCheck => {
+                let Event::Storage(StorageEvent::TransactionAborted { .. }) = event else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::TransactionAborted)",
+                        received: event,
+                    });
+                };
+                self.txn_id = None;
+                if self.quota_gate.as_ref().is_some_and(QuotaGate::is_exceeded) {
+                    self.output = Some(Ok(self.result(false)));
+                    self.send_negotiation(ReplicationNegotiationResult::Rejected(
+                        "quota".to_string(),
+                    ))
+                } else if self.is_reference_item() {
+                    self.send_negotiation(ReplicationNegotiationResult::NeedVersionOnly)
+                } else {
+                    self.read_existing_blob()
                 }
             }
             IncomingVersionReplicationState::ReadExistingBlob => {
@@ -998,6 +1627,57 @@ impl Operation for IncomingVersionReplicationOperation {
                     txn_id = %txn_id,
                     "Started incoming replication transaction"
                 );
+                self.verify_replaced()
+            }
+            IncomingVersionReplicationState::VerifyReplaced => {
+                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::ReadResult)",
+                        received: event,
+                    });
+                };
+                let current = match value
+                    .as_ref()
+                    .map(|value| BlobVersion::from_bytes(value.as_ref()))
+                    .transpose()
+                {
+                    Ok(current) => current,
+                    Err(error) => return self.fail(error.into()),
+                };
+                if current != self.replaced_version {
+                    return self.fail(IncomingVersionReplicationError::StorageError(
+                        StorageError::TransactionConflict,
+                    ));
+                }
+                self.read_replaced_metadata()
+            }
+            IncomingVersionReplicationState::ReadReplacedMetadata => {
+                let Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) = event
+                else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::IterResult)",
+                        received: event,
+                    });
+                };
+                if next_start_after.is_some() {
+                    return self.fail(IncomingVersionReplicationError::MultipartMetadataOverflow);
+                }
+                self.delete_replaced_metadata(values)
+            }
+            IncomingVersionReplicationState::DeleteReplacedMetadata => {
+                let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
+                        received: event,
+                    });
+                };
+                self.replaced_version = None;
                 self.write_hash_lookup_or_continue()
             }
             IncomingVersionReplicationState::WriteBlobLocation => {
@@ -1043,6 +1723,23 @@ impl Operation for IncomingVersionReplicationOperation {
                 );
                 self.write_object_lookup_after_compare(value.as_deref())
             }
+            IncomingVersionReplicationState::ReadCurrentVersion => {
+                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::ReadResult)",
+                        received: event,
+                    });
+                };
+                let Some(value) = value else {
+                    return self.fail(IncomingVersionReplicationError::CurrentVersionNotFound);
+                };
+                let version = match BlobVersion::from_bytes(value.as_ref()) {
+                    Ok(version) => version,
+                    Err(error) => return self.fail(error.into()),
+                };
+                self.apply_liveness(!version.is_deleted())
+            }
             IncomingVersionReplicationState::ApplyHeadTransition => match event {
                 Event::Storage(StorageEvent::WriteResult { .. })
                 | Event::Storage(StorageEvent::DeleteResult { .. }) => {
@@ -1083,7 +1780,54 @@ impl Operation for IncomingVersionReplicationOperation {
                     multipart_parts = self.manifest.multipart.as_ref().map(|m| m.parts.len()).unwrap_or(0),
                     "Wrote multipart replication metadata"
                 );
-                self.commit_transaction()
+                self.write_live_obligation()
+            }
+            IncomingVersionReplicationState::WriteLiveObligation => {
+                let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::WriteResult)",
+                        received: event,
+                    });
+                };
+                self.start_commit_quota()
+            }
+            IncomingVersionReplicationState::CheckCommitQuota => {
+                let Some(txn_id) = self.txn_id else {
+                    return self.fail(IncomingVersionReplicationError::StorageError(
+                        StorageError::TransactionNotFound,
+                    ));
+                };
+                let Some(gate) = self.quota_gate.as_mut() else {
+                    return self.fail(IncomingVersionReplicationError::ReplicationError(
+                        ReplicationError::ReplicationFailed,
+                    ));
+                };
+                match gate.step(event, txn_id) {
+                    Ok(Some(effects)) => effects,
+                    Ok(None) if gate.is_exceeded() => {
+                        self.fail(IncomingVersionReplicationError::QuotaExceeded)
+                    }
+                    Ok(None) => self.start_usage_update(),
+                    Err(error) => self.fail(error.into()),
+                }
+            }
+            IncomingVersionReplicationState::UpdateUsage => {
+                let Some(txn_id) = self.txn_id else {
+                    return self.fail(IncomingVersionReplicationError::StorageError(
+                        StorageError::TransactionNotFound,
+                    ));
+                };
+                let Some(update) = self.usage_update.as_mut() else {
+                    return self.fail(IncomingVersionReplicationError::ReplicationError(
+                        ReplicationError::ReplicationFailed,
+                    ));
+                };
+                match update.step(event, txn_id) {
+                    Ok(Some(effects)) => effects,
+                    Ok(None) => self.commit_transaction(),
+                    Err(error) => self.fail(error.into()),
+                }
             }
             IncomingVersionReplicationState::CommitTransaction => {
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
@@ -1104,11 +1848,29 @@ impl Operation for IncomingVersionReplicationOperation {
                     kind = ?self.manifest.kind,
                     "Committed incoming replication transaction"
                 );
-                match self.manifest.kind {
-                    ReplicationItemKind::Materialized => self.register_blob_in_dht_or_continue(),
-                    ReplicationItemKind::DeleteMarker => self.send_apply_complete(),
-                }
+                self.state = IncomingVersionReplicationState::ScheduleUsage;
+                smallvec![schedule_usage_snapshot_publish_effect()]
             }
+            IncomingVersionReplicationState::ScheduleUsage => match event {
+                Event::Task(TaskEvent::TimerScheduled { .. })
+                | Event::Task(TaskEvent::Error { .. }) => {
+                    self.state = IncomingVersionReplicationState::ScheduleLiveDrain;
+                    smallvec![schedule_blob_replication_drain_effect()]
+                }
+                other => {
+                    warn!(event = ?other, "Incoming replication committed but usage scheduling returned an unexpected event");
+                    self.state = IncomingVersionReplicationState::ScheduleLiveDrain;
+                    smallvec![schedule_blob_replication_drain_effect()]
+                }
+            },
+            IncomingVersionReplicationState::ScheduleLiveDrain => match event {
+                Event::Task(TaskEvent::TimerScheduled { .. })
+                | Event::Task(TaskEvent::Error { .. }) => self.finish_live_drain(),
+                other => {
+                    warn!(event = ?other, "Incoming replication committed but drain scheduling returned an unexpected event");
+                    self.finish_live_drain()
+                }
+            },
             IncomingVersionReplicationState::SendApplyRejected => {
                 let Event::Blob(BlobEvent::MessageSent { .. }) = event else {
                     return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
@@ -1180,7 +1942,7 @@ impl Operation for IncomingVersionReplicationOperation {
                     self.state = IncomingVersionReplicationState::Finish;
                 }
                 if self.output.is_none() {
-                    self.output = Some(Ok(()));
+                    self.output = Some(Ok(self.result(self.apply_committed)));
                 }
                 debug!(
                     bucket = %self.manifest.bucket,
@@ -1205,12 +1967,12 @@ impl Operation for IncomingVersionReplicationOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == IncomingVersionReplicationState::Error
-            && let Some(Err(err)) = self.output
-        {
-            return Err(err);
+        let default = self.result(self.apply_committed);
+        let output = self.output.unwrap_or(Ok(default));
+        match (self.state, output) {
+            (IncomingVersionReplicationState::Error, Err(error)) => Err(error),
+            (_, output) => Ok(output),
         }
-        Ok(self.output.unwrap_or(Ok(())))
     }
 
     fn abort(&mut self) -> Effects {
@@ -1237,21 +1999,24 @@ mod tests {
         IncomingVersionReplicationState,
     };
     use crate::replication::protocol::{
-        MaterializedBlobInfo, VersionReplicationManifest, VersionReplicationMessage,
+        MaterializedBlobInfo, SyncOrigin, VersionReplicationManifest, VersionReplicationMessage,
     };
+    use crate::replication::queue::LiveReplicationObligationRecord;
     use aruna_core::UserId;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-    use aruna_core::errors::AuthorizationError;
+    use aruna_core::errors::{AuthorizationError, StorageError};
     use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
-        BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-        HASH_PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE,
+        BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+        BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE,
+        S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BlobVersion, BucketInfo, CurrentVersionPointer,
-        HashPathIndexKey, RealmId, ReplicationItemKind, ReplicationNegotiationResult,
-        SourceConnectorKind, StagingStrategy, VersionSourceBinding,
+        AuthContext, BackendLocation, BlobVersion, BlobVersionState, BucketInfo,
+        CurrentVersionPointer, HashPathIndexKey, MultipartObjectMetadataKey, QuotaConfig,
+        RealmConfigDocument, RealmId, ReplicationItemKind, ReplicationNegotiationResult,
+        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionSourceBinding,
     };
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -1275,8 +2040,8 @@ mod tests {
         BackendLocation {
             root: "/tmp".to_string(),
             storage_bucket: "blob-bucket".to_string(),
-            backend_path: format!("bucket/key_{}", Ulid::r#gen()),
-            ulid: Ulid::r#gen(),
+            backend_path: format!("bucket/key_{}", Ulid::generate()),
+            ulid: Ulid::generate(),
             compressed: false,
             encrypted: false,
             created_by: test_user_id(),
@@ -1315,7 +2080,7 @@ mod tests {
         VersionReplicationManifest {
             bucket: "bucket".to_string(),
             key: "dir/file.txt".to_string(),
-            version_id: Ulid::r#gen(),
+            version_id: Ulid::generate(),
             group_id: test_group_id(),
             kind,
             created_at: SystemTime::now(),
@@ -1330,6 +2095,11 @@ mod tests {
             blob,
             source: None,
             multipart: None,
+            reference_intent: false,
+            origin: None,
+            upstream_sources: Vec::new(),
+            writer_auth_context: None,
+            reference_metadata: None,
         }
     }
 
@@ -1347,8 +2117,27 @@ mod tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
             },
-            connector_id: Some(Ulid::r#gen()),
+            connector_id: Some(Ulid::generate()),
         }
+    }
+
+    fn make_reference_manifest() -> VersionReplicationManifest {
+        let mut manifest = make_manifest(ReplicationItemKind::Materialized);
+        let mut source = make_source_binding();
+        source.descriptor.kind = SourceConnectorKind::ArunaNative;
+        source.descriptor.origin_node_id = Some(iroh::SecretKey::from_bytes(&[8u8; 32]).public());
+        source.connector_id = None;
+        manifest.blob = None;
+        manifest.source = Some(source);
+        manifest.reference_intent = true;
+        manifest.reference_metadata = Some(SourceMetadata {
+            content_length: 1_000_000,
+            content_type: Some("application/octet-stream".to_string()),
+            etag: None,
+            last_modified: Some(manifest.created_at),
+            source_version: None,
+        });
+        manifest
     }
 
     fn message_from_effect(effect: &Effect) -> VersionReplicationMessage {
@@ -1404,13 +2193,53 @@ mod tests {
         effects.remove(0)
     }
 
+    fn advance_blob_lookup(
+        op: &mut IncomingVersionReplicationOperation,
+    ) -> aruna_core::types::Effects {
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::ReadQuotaConfig);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == BLOB_LOCATIONS_KEYSPACE
+        ));
+        effects
+    }
+
     fn start_apply_transaction(op: &mut IncomingVersionReplicationOperation) -> Ulid {
-        let txn_id = Ulid::r#gen();
+        let txn_id = Ulid::generate();
         op.state = IncomingVersionReplicationState::StartTransaction;
         op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
-        op.destination_group_id = Some(Ulid::r#gen());
+        op.destination_group_id = Some(Ulid::generate());
 
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert_eq!(op.state, IncomingVersionReplicationState::VerifyReplaced);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, txn_id: read_txn_id, .. })]
+                if key_space == BLOB_VERSIONS_KEYSPACE && *read_txn_id == Some(txn_id)
+        ));
+        let value = op
+            .replaced_version
+            .as_ref()
+            .map(|version| version.to_bytes().unwrap().into());
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value,
+        }));
         assert_eq!(op.state, IncomingVersionReplicationState::ReadObjectLookup);
         assert!(matches!(
             effects.as_slice(),
@@ -1421,16 +2250,16 @@ mod tests {
     }
 
     #[test]
-    fn existing_version_does_not_short_circuit_apply() {
+    fn existing_version_skips() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest.clone(),
         );
 
-        let _effects = advance_to_version_lookup(&mut op, Ulid::r#gen());
+        let _effects = advance_to_version_lookup(&mut op, Ulid::generate());
 
         let version = BlobVersion::materialized(
             manifest.blob.as_ref().unwrap().hash,
@@ -1442,13 +2271,391 @@ mod tests {
             key: vec![0u8; 4].into(),
             value: Some(version.to_bytes().unwrap().into()),
         }));
-        assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
         assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionNegotiationResponse(
+                ReplicationNegotiationResult::AlreadyReplicatedVersion
+            )
+        ));
+    }
+
+    #[test]
+    fn existing_delete_skips() {
+        let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            manifest.clone(),
+        );
+
+        let _effects = advance_to_version_lookup(&mut op, test_group_id());
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(
+                BlobVersion::deleted(manifest.created_at, manifest.created_by)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            ),
+        }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionNegotiationResponse(
+                ReplicationNegotiationResult::AlreadyReplicatedVersion
+            )
+        ));
+    }
+
+    #[test]
+    fn reference_requests_metadata() {
+        let manifest = make_reference_manifest();
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            manifest,
+        );
+
+        let _effects = advance_to_version_lookup(&mut op, test_group_id());
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::ReadQuotaConfig);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionNegotiationResponse(
+                ReplicationNegotiationResult::NeedVersionOnly
+            )
+        ));
+    }
+
+    #[test]
+    fn reference_writes_version() {
+        let manifest = make_reference_manifest();
+        let expected_source = manifest.source.clone().unwrap();
+        let expected_metadata = manifest.reference_metadata.clone().unwrap();
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            manifest,
+        );
+        op.txn_id = Some(Ulid::generate());
+
+        let effects = op.write_blob_version();
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected reference version write")
+        };
+        let version = BlobVersion::from_bytes(value.as_ref()).unwrap();
+
+        assert!(matches!(
+            version.state,
+            BlobVersionState::Reference {
+                source,
+                cached_metadata,
+                ..
+            } if source == expected_source && cached_metadata == expected_metadata
+        ));
+        let usage = op.usage_delta().unwrap();
+        assert_eq!(usage.logical_bytes, 0);
+        assert_eq!(usage.referenced_bytes, 1_000_000);
+    }
+
+    #[test]
+    fn replacement_cleans_metadata() {
+        let manifest = make_manifest(ReplicationItemKind::Materialized);
+        let version_id = manifest.version_id;
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            manifest,
+        );
+        let txn_id = Ulid::generate();
+        op.txn_id = Some(txn_id);
+        op.destination_group_id = Some(test_group_id());
+        op.replaced_version = Some(BlobVersion::materialized(
+            [9u8; 32],
+            SystemTime::now(),
+            test_user_id(),
+            None,
+        ));
+
+        let effects = op.read_replaced_metadata();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { key_space, txn_id: effect_txn, .. })]
+                if key_space == S3_MULTIPART_OBJECT_METADATA_KEYSPACE
+                    && *effect_txn == Some(txn_id)
+        ));
+
+        let part_key = MultipartObjectMetadataKey::part(version_id, 3)
+            .to_bytes()
+            .unwrap();
+        let mut effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![(part_key.clone().into(), vec![1u8].into())],
+            next_start_after: None,
+        }));
+        let Effect::Storage(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: effect_txn,
+        }) = effects.remove(0)
+        else {
+            panic!("expected replacement metadata batch delete")
+        };
+        assert_eq!(effect_txn, Some(txn_id));
+        let summary_key = MultipartObjectMetadataKey::summary(version_id)
+            .to_bytes()
+            .unwrap();
+        assert!(deletes.iter().any(|(key_space, key)| {
+            key_space == S3_MULTIPART_OBJECT_METADATA_KEYSPACE && key.as_ref() == summary_key
+        }));
+        assert!(deletes.iter().any(|(key_space, key)| {
+            key_space == S3_MULTIPART_OBJECT_METADATA_KEYSPACE && key.as_ref() == part_key
+        }));
+        assert!(deletes.iter().any(|(key_space, key)| {
+            key_space == HASH_PATHS_INDEX_KEYSPACE
+                && HashPathIndexKey::from_bytes(key.as_ref())
+                    .is_ok_and(|index| index.blake3_hash == [9u8; 32])
+        }));
+
+        let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: deletes,
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::ReadObjectLookup);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Read { key_space, .. })]
-                if key_space == BLOB_LOCATIONS_KEYSPACE
+                if key_space == BLOB_HEAD_KEYSPACE
         ));
+    }
+
+    #[test]
+    fn replaced_version_fenced() {
+        let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest.clone(),
+        );
+        let prior = BlobVersion::deleted(manifest.created_at, manifest.created_by);
+        op.replaced_version = Some(prior);
+        op.state = IncomingVersionReplicationState::StartTransaction;
+        op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
+        op.destination_group_id = Some(Ulid::generate());
+
+        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::generate(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == BLOB_VERSIONS_KEYSPACE
+        ));
+        let current =
+            BlobVersion::materialized([9u8; 32], manifest.created_at, manifest.created_by, None);
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(current.to_bytes().unwrap().into()),
+        }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
+        assert!(matches!(
+            op.output,
+            Some(Err(IncomingVersionReplicationError::StorageError(
+                StorageError::TransactionConflict
+            )))
+        ));
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionApplyRejected(_)
+        ));
+    }
+
+    #[test]
+    fn changed_reference_updates() {
+        let manifest = make_reference_manifest();
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            manifest.clone(),
+        );
+        let _effects = advance_to_version_lookup(&mut op, test_group_id());
+        let mut metadata = manifest.reference_metadata.clone().unwrap();
+        metadata.etag = Some("old-etag".to_string());
+        let existing = BlobVersion::reference(
+            manifest.source.clone().unwrap(),
+            metadata,
+            manifest.created_at,
+            manifest.created_by,
+            manifest.created_at,
+        );
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(existing.to_bytes().unwrap().into()),
+        }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionNegotiationResponse(
+                ReplicationNegotiationResult::NeedVersionOnly
+            )
+        ));
+    }
+
+    #[test]
+    fn hop_limit_rejects() {
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.origin = Some(SyncOrigin {
+            relationship_id: Ulid::generate(),
+            hop_count: 5,
+        });
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            manifest,
+        );
+
+        let effects = op.start();
+
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        expect_rejected_negotiation(
+            &effects[0],
+            IncomingVersionReplicationError::HopLimitExceeded
+                .to_string()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn obligation_keeps_origin() {
+        let origin = SyncOrigin {
+            relationship_id: Ulid::generate(),
+            hop_count: 2,
+        };
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.origin = Some(origin.clone());
+        manifest.upstream_sources.push(
+            aruna_core::structs::ArunaArn::s3_bucket(
+                test_realm_id(),
+                iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
+                "source",
+            )
+            .unwrap(),
+        );
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            manifest,
+        );
+
+        let effects = op.write_live_obligation();
+
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected live replication obligation write")
+        };
+        let obligation = LiveReplicationObligationRecord::from_bytes(value).unwrap();
+        assert_eq!(obligation.origin, Some(origin));
+        assert_eq!(obligation.upstream_sources, op.manifest.upstream_sources);
+    }
+
+    #[test]
+    fn quota_excess_rejects() {
+        let manifest = make_manifest(ReplicationItemKind::Materialized);
+        let group_id = test_group_id();
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            manifest,
+        );
+        let _effects = advance_to_version_lookup(&mut op, group_id);
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::ReadQuotaConfig);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+
+        let mut config = RealmConfigDocument::default_for_realm(test_realm_id(), Vec::new());
+        config.quota = QuotaConfig {
+            default_group_quota_bytes: Some(1),
+            grace_factor_percent: 100,
+            ..QuotaConfig::default()
+        };
+        let config_bytes = postcard::to_allocvec(&config).unwrap();
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(config_bytes.clone().into()),
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::StartQuotaCheck);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction {
+                read: true
+            })]
+        ));
+
+        let txn_id = Ulid::generate();
+        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert_eq!(op.state, IncomingVersionReplicationState::EnforceQuota);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { txn_id: read_txn_id, .. })]
+                if *read_txn_id == Some(txn_id)
+        ));
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(config_bytes.into()),
+        }));
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+        let effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::FinishQuotaCheck);
+        assert_eq!(
+            effects[0],
+            Effect::Storage(StorageEffect::AbortTransaction { txn_id })
+        );
+
+        let effects = op.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        match message_from_effect(&effects[0]) {
+            VersionReplicationMessage::VersionNegotiationResponse(
+                ReplicationNegotiationResult::Rejected(reason),
+            ) => assert_eq!(reason, "quota"),
+            other => panic!("expected quota rejection, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1456,13 +2663,13 @@ mod tests {
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         manifest.current_version_generation = Some(10);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest.clone(),
         );
         let txn_id = start_apply_transaction(&mut op);
-        let existing_pointer = CurrentVersionPointer::new_with_generation(Ulid::r#gen(), 20);
+        let existing_pointer = CurrentVersionPointer::new_with_generation(Ulid::generate(), 20);
 
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
@@ -1475,6 +2682,8 @@ mod tests {
             [Effect::Storage(StorageEffect::Write { key_space, txn_id: write_txn_id, .. })]
                 if key_space == BLOB_VERSIONS_KEYSPACE && *write_txn_id == Some(txn_id)
         ));
+        assert_eq!(op.object_delta, 0);
+        assert_eq!(op.usage_delta().unwrap().objects, 0);
     }
 
     #[test]
@@ -1482,16 +2691,25 @@ mod tests {
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         manifest.current_version_generation = None;
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
-        let txn_id = Ulid::r#gen();
+        let txn_id = Ulid::generate();
         op.state = IncomingVersionReplicationState::StartTransaction;
         op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
 
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == BLOB_VERSIONS_KEYSPACE
+        ));
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
 
         assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
         assert!(matches!(
@@ -1510,7 +2728,7 @@ mod tests {
     fn unparsable_existing_current_pointer_rejects_apply() {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
@@ -1538,13 +2756,13 @@ mod tests {
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         manifest.current_version_generation = Some(1);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest.clone(),
         );
         start_apply_transaction(&mut op);
-        let existing_pointer = CurrentVersionPointer::new_with_generation(Ulid::r#gen(), 2);
+        let existing_pointer = CurrentVersionPointer::new_with_generation(Ulid::generate(), 2);
 
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
@@ -1566,13 +2784,13 @@ mod tests {
         manifest.source = Some(source.clone());
         manifest.current_version = false;
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
-        op.txn_id = Some(Ulid::r#gen());
-        op.destination_group_id = Some(Ulid::r#gen());
+        op.txn_id = Some(Ulid::generate());
+        op.destination_group_id = Some(Ulid::generate());
         op.existing_blob_location = Some(make_location());
 
         let effects = op.write_version();
@@ -1588,14 +2806,14 @@ mod tests {
     fn write_version_indexes_non_current_materialized_version_by_content_hash() {
         let mut manifest = make_manifest(ReplicationItemKind::Materialized);
         manifest.current_version = false;
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest.clone(),
         );
-        op.txn_id = Some(Ulid::r#gen());
+        op.txn_id = Some(Ulid::generate());
         op.destination_group_id = Some(group_id);
         op.existing_blob_location = Some(make_location());
 
@@ -1623,6 +2841,35 @@ mod tests {
         let effects = op.step(Event::Storage(StorageEvent::WriteResult {
             key: vec![0u8; 4].into(),
         }));
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::WriteLiveObligation
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Write { key_space, .. })]
+                if key_space == BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: vec![0u8; 4].into(),
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::UpdateUsage);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchRead { .. })]
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(vec![0].into(), None), (vec![1].into(), None)],
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchWrite { .. })]
+        ));
+        let effects = op.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
         assert_eq!(op.state, IncomingVersionReplicationState::CommitTransaction);
         assert!(matches!(
             effects.as_slice(),
@@ -1638,7 +2885,7 @@ mod tests {
         manifest.version_id = incoming_version_id;
         manifest.current_version_generation = Some(20);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest.clone(),
@@ -1649,6 +2896,25 @@ mod tests {
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: Some(existing_pointer.to_bytes().unwrap().into()),
+        }));
+
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::ReadCurrentVersion
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == BLOB_VERSIONS_KEYSPACE
+        ));
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(
+                BlobVersion::materialized([2u8; 32], SystemTime::now(), test_user_id(), None)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            ),
         }));
 
         let [
@@ -1671,6 +2937,50 @@ mod tests {
                 manifest.current_version_generation.unwrap()
             )
         );
+        assert_eq!(op.object_delta, -1);
+        assert_eq!(op.usage_delta().unwrap().objects, -1);
+    }
+
+    #[test]
+    fn materialized_restores_object() {
+        let mut manifest = make_manifest(ReplicationItemKind::Materialized);
+        manifest.current_version_generation = Some(2);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest,
+        );
+        start_apply_transaction(&mut op);
+        let existing_pointer = CurrentVersionPointer::new_with_generation(Ulid::generate(), 1);
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(existing_pointer.to_bytes().unwrap().into()),
+        }));
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::ReadCurrentVersion
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == BLOB_VERSIONS_KEYSPACE
+        ));
+
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(
+                BlobVersion::deleted(SystemTime::now(), test_user_id())
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            ),
+        }));
+
+        let delta = op.usage_delta().unwrap();
+        assert_eq!(delta.objects, 1);
+        assert_eq!(delta.logical_bytes, 42);
     }
 
     #[test]
@@ -1681,7 +2991,7 @@ mod tests {
         manifest.version_id = incoming_version_id;
         manifest.current_version_generation = Some(7);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest.clone(),
@@ -1692,6 +3002,25 @@ mod tests {
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: Some(existing_pointer.to_bytes().unwrap().into()),
+        }));
+
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::ReadCurrentVersion
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == BLOB_VERSIONS_KEYSPACE
+        ));
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(
+                BlobVersion::materialized([2u8; 32], SystemTime::now(), test_user_id(), None)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            ),
         }));
 
         let [
@@ -1717,7 +3046,7 @@ mod tests {
         manifest.version_id = incoming_version_id;
         manifest.current_version_generation = Some(7);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
@@ -1746,7 +3075,7 @@ mod tests {
         let local_node_id = iroh::SecretKey::generate().public();
         let local_realm_id = RealmId::from_bytes([7u8; 32]);
         let op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             local_node_id,
             local_realm_id,
             manifest,
@@ -1769,17 +3098,14 @@ mod tests {
     fn existing_blob_with_manifest_mismatch_requests_blob_transfer() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
 
-        let _effects = advance_to_version_lookup(&mut op, Ulid::r#gen());
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![0u8; 4].into(),
-            value: None,
-        }));
+        let _effects = advance_to_version_lookup(&mut op, Ulid::generate());
+        let effects = advance_blob_lookup(&mut op);
         assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
         assert!(matches!(
             effects.as_slice(),
@@ -1806,17 +3132,14 @@ mod tests {
     fn missing_blob_requests_location_lookup_in_new_keyspace() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
 
-        let _effects = advance_to_version_lookup(&mut op, Ulid::r#gen());
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![0u8; 4].into(),
-            value: None,
-        }));
+        let _effects = advance_to_version_lookup(&mut op, Ulid::generate());
+        let effects = advance_blob_lookup(&mut op);
 
         assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
         assert!(matches!(
@@ -1829,7 +3152,7 @@ mod tests {
     #[test]
     fn received_blob_manifest_mismatch_is_rejected_and_cleaned_up() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
-        let stream_id = Ulid::r#gen();
+        let stream_id = Ulid::generate();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
             iroh::SecretKey::generate().public(),
@@ -1868,7 +3191,7 @@ mod tests {
     fn unbuildable_bucket_rejects() {
         // One create attempt, still missing, then reject and close the stream.
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
-        let stream_id = Ulid::r#gen();
+        let stream_id = Ulid::generate();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
             iroh::SecretKey::generate().public(),
@@ -1912,7 +3235,7 @@ mod tests {
     #[test]
     fn denied_write_permission_is_rejected_during_negotiation() {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
-        let stream_id = Ulid::r#gen();
+        let stream_id = Ulid::generate();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
             iroh::SecretKey::generate().public(),
@@ -1923,7 +3246,12 @@ mod tests {
         op.start();
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: b"bucket".to_vec().into(),
-            value: Some(make_bucket_info(Ulid::r#gen()).to_bytes().unwrap().into()),
+            value: Some(
+                make_bucket_info(Ulid::generate())
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            ),
         }));
         assert_eq!(op.state, IncomingVersionReplicationState::CheckPermissions);
         assert!(matches!(effects[0], Effect::SubOperation(_)));
@@ -1951,7 +3279,7 @@ mod tests {
     fn authorization_errors_are_rejected_during_negotiation() {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
@@ -1960,7 +3288,12 @@ mod tests {
         op.start();
         op.step(Event::Storage(StorageEvent::ReadResult {
             key: b"bucket".to_vec().into(),
-            value: Some(make_bucket_info(Ulid::r#gen()).to_bytes().unwrap().into()),
+            value: Some(
+                make_bucket_info(Ulid::generate())
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            ),
         }));
 
         let effects = op.step(Event::SubOperation(
@@ -1979,13 +3312,13 @@ mod tests {
     fn delete_marker_requests_version_only() {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
 
-        let _effects = advance_to_version_lookup(&mut op, Ulid::r#gen());
+        let _effects = advance_to_version_lookup(&mut op, Ulid::generate());
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: None,
@@ -2004,17 +3337,14 @@ mod tests {
     fn missing_blob_requests_blob_transfer() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
 
-        let _effects = advance_to_version_lookup(&mut op, Ulid::r#gen());
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![0u8; 4].into(),
-            value: None,
-        }));
+        let _effects = advance_to_version_lookup(&mut op, Ulid::generate());
+        let effects = advance_blob_lookup(&mut op);
         assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
         assert!(matches!(
             effects[0],
@@ -2037,8 +3367,8 @@ mod tests {
     #[test]
     fn apply_failures_send_explicit_rejection_before_abort() {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
-        let stream_id = Ulid::r#gen();
-        let txn_id = Ulid::r#gen();
+        let stream_id = Ulid::generate();
+        let txn_id = Ulid::generate();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
             iroh::SecretKey::generate().public(),
@@ -2075,9 +3405,9 @@ mod tests {
     #[test]
     fn received_blobs_are_deleted_after_apply_failure_before_commit() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
-        let stream_id = Ulid::r#gen();
+        let stream_id = Ulid::generate();
         let received = make_location();
-        let txn_id = Ulid::r#gen();
+        let txn_id = Ulid::generate();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
             iroh::SecretKey::generate().public(),
@@ -2126,8 +3456,8 @@ mod tests {
     #[test]
     fn failures_without_received_blob_close_without_delete() {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
-        let stream_id = Ulid::r#gen();
-        let txn_id = Ulid::r#gen();
+        let stream_id = Ulid::generate();
+        let txn_id = Ulid::generate();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
             iroh::SecretKey::generate().public(),
@@ -2164,7 +3494,7 @@ mod tests {
     #[test]
     fn committed_replication_does_not_delete_received_blob_on_late_failure() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
-        let stream_id = Ulid::r#gen();
+        let stream_id = Ulid::generate();
         let received = make_location();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
@@ -2179,7 +3509,7 @@ mod tests {
         op.apply_committed = true;
 
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::r#gen(),
+            txn_id: Ulid::generate(),
         }));
         assert_eq!(op.state, IncomingVersionReplicationState::Error);
         assert_eq!(effects.len(), 1);
@@ -2192,7 +3522,7 @@ mod tests {
     fn missing_bucket_op() -> IncomingVersionReplicationOperation {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut op = IncomingVersionReplicationOperation::new(
-            Ulid::r#gen(),
+            Ulid::generate(),
             iroh::SecretKey::generate().public(),
             test_realm_id(),
             manifest,
@@ -2240,7 +3570,7 @@ mod tests {
     fn create_invalid_event() {
         let mut op = missing_bucket_op();
         op.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::r#gen(),
+            txn_id: Ulid::generate(),
         }));
         assert_eq!(op.state, IncomingVersionReplicationState::Error);
     }

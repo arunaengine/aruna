@@ -1,6 +1,11 @@
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use crate::connectors::{
+    ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
+};
+use aruna_core::effects::{Effect, StagingSourceEffect, StorageEffect};
+use aruna_core::errors::{
+    ConversionError, SourceConnectorResolutionError, StagingSourceError, StorageError,
+};
+use aruna_core::events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
@@ -8,8 +13,8 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
-    MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectSummary, SourceMetadata,
-    VersionKey,
+    MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectSummary, SourceConnectorKind,
+    SourceMetadata, VersionKey, VersionSourceBinding,
 };
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -27,6 +32,8 @@ pub enum HeadObjectState {
     GetCurrentVersion,
     ReadMultipartSummary,
     CommitTransaction,
+    ResolveReferenceAccess,
+    HeadReferenceSource,
     Finish,
     Error,
 }
@@ -56,6 +63,10 @@ pub enum HeadObjectError {
     NoSuchVersion,
     #[error("The specified version is a delete marker.")]
     DeleteMarker,
+    #[error(transparent)]
+    ResolveReferenceError(#[from] SourceConnectorResolutionError),
+    #[error(transparent)]
+    StagingSourceError(#[from] StagingSourceError),
     #[error("HeadObject failed")]
     HeadObjectFailed,
 }
@@ -93,6 +104,7 @@ pub struct HeadObjectOperation {
     checksum_type: MultipartChecksumType,
     composite_hashes: HashMap<String, Vec<u8>>,
     part_count: Option<usize>,
+    reference_source: Option<VersionSourceBinding>,
     output: Option<Result<HeadObjectResult, HeadObjectError>>,
 }
 
@@ -110,6 +122,7 @@ impl HeadObjectOperation {
             checksum_type: MultipartChecksumType::FullObject,
             composite_hashes: HashMap::new(),
             part_count: None,
+            reference_source: None,
             output: None,
         }
     }
@@ -255,17 +268,30 @@ impl HeadObjectOperation {
                 HeadObjectError::NoSuchKey
             }),
             BlobVersionState::Reference {
+                source,
                 cached_metadata,
                 last_refresh,
-                ..
             } => {
                 self.location = None;
                 self.source_metadata = Some(cached_metadata);
                 self.last_refresh = Some(last_refresh);
                 self.version_created_at = None;
-                self.finish_lookup()
+                if source.descriptor.kind == SourceConnectorKind::ArunaNative {
+                    self.commit_reference(source)
+                } else {
+                    self.finish_lookup()
+                }
             }
         }
+    }
+
+    fn commit_reference(&mut self, source: VersionSourceBinding) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(HeadObjectError::NoTransactionFound);
+        };
+        self.reference_source = Some(source);
+        self.state = HeadObjectState::CommitTransaction;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
     fn read_blob_location(&mut self, blob_hash: [u8; 32]) -> Effects {
@@ -373,6 +399,13 @@ impl HeadObjectOperation {
 
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event {
+            self.txn_id = None;
+            if let Some(source) = self.reference_source.take() {
+                self.state = HeadObjectState::ResolveReferenceAccess;
+                return smallvec![resolve_version_source_binding_suboperation(
+                    ResolveVersionSourceBindingInput { source },
+                )];
+            }
             self.state = HeadObjectState::Finish;
             smallvec![]
         } else {
@@ -381,6 +414,55 @@ impl HeadObjectOperation {
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
                 received: event,
             })
+        }
+    }
+
+    fn handle_reference_access(&mut self, event: Event) -> Effects {
+        match event {
+            Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved {
+                result: Ok(access),
+            }) => {
+                self.state = HeadObjectState::HeadReferenceSource;
+                smallvec![Effect::StagingSource(StagingSourceEffect::Head { access })]
+            }
+            Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved {
+                result: Err(error),
+            }) => self.emit_error(error.into()),
+            other => self.emit_error(HeadObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)",
+                received: other,
+            }),
+        }
+    }
+
+    fn handle_reference_head(&mut self, event: Event) -> Effects {
+        match event {
+            Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) => {
+                self.source_metadata = Some(metadata);
+                self.last_refresh = Some(SystemTime::now());
+                self.state = HeadObjectState::Finish;
+                self.output = Some(Ok(HeadObjectResult {
+                    location: None,
+                    source_metadata: self.source_metadata.clone(),
+                    last_refresh: self.last_refresh,
+                    version_created_at: None,
+                    version_id: self.resolved_version_id.or(self.input.version_id),
+                    resolved_version_id: self.resolved_version_id,
+                    checksum_type: self.checksum_type,
+                    composite_hashes: self.composite_hashes.clone(),
+                    part_count: self.part_count,
+                }));
+                smallvec![]
+            }
+            Event::StagingSource(StagingSourceEvent::Error { error }) => {
+                self.emit_error(error.into())
+            }
+            other => self.emit_error(HeadObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::StagingSource(StagingSourceEvent::HeadResult)",
+                received: other,
+            }),
         }
     }
 }
@@ -406,6 +488,8 @@ impl Operation for HeadObjectOperation {
             HeadObjectState::GetCurrentVersion => self.handle_received_current_version(event),
             HeadObjectState::ReadMultipartSummary => self.handle_multipart_summary_read(event),
             HeadObjectState::CommitTransaction => self.handle_transaction_committed(event),
+            HeadObjectState::ResolveReferenceAccess => self.handle_reference_access(event),
+            HeadObjectState::HeadReferenceSource => self.handle_reference_head(event),
             HeadObjectState::Finish | HeadObjectState::Error => smallvec![],
         }
     }
@@ -447,7 +531,8 @@ mod tests {
     use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5};
     use aruna_core::structs::{
         Backend, BlobHeadKey, BlobVersion, CurrentVersionPointer, PortableSourceDescriptor,
-        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
+        ResolvedSourceAccess, SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey,
+        VersionSourceBinding,
     };
     use aruna_net::{NetConfig, NetHandle};
     use std::collections::HashMap;
@@ -462,7 +547,7 @@ mod tests {
             root: "/tmp".to_string(),
             storage_bucket: "mybucket".to_string(),
             backend_path: "hello.txt".to_string(),
-            ulid: Ulid::r#gen(),
+            ulid: Ulid::generate(),
             compressed: false,
             encrypted: false,
             created_at: SystemTime::now(),
@@ -508,7 +593,7 @@ mod tests {
         };
 
         let location = location_with_hash();
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle
             .send_storage_effect(StorageEffect::StartTransaction { read: false })
             .await
@@ -615,7 +700,7 @@ mod tests {
         };
 
         let location = location_with_hash();
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let metadata = BlobVersion::materialized(
             location.get_blake3().unwrap().try_into().unwrap(),
             SystemTime::now(),
@@ -673,6 +758,100 @@ mod tests {
         assert_eq!(result.checksum_type, MultipartChecksumType::FullObject);
     }
 
+    #[test]
+    fn head_resolves_native() {
+        let version_id = Ulid::generate();
+        let relationship_id = Ulid::generate();
+        let origin = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+        let cached_metadata = SourceMetadata {
+            content_length: 11,
+            content_type: Some("text/plain".to_string()),
+            etag: Some("cached".to_string()),
+            last_modified: Some(SystemTime::UNIX_EPOCH),
+            source_version: None,
+        };
+        let refreshed_metadata = SourceMetadata {
+            content_length: 17,
+            content_type: Some("application/octet-stream".to_string()),
+            etag: Some("current".to_string()),
+            last_modified: Some(SystemTime::UNIX_EPOCH),
+            source_version: Some(version_id.to_string()),
+        };
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::ArunaNative,
+                public_config: HashMap::from([(
+                    "relationship_id".to_string(),
+                    relationship_id.to_string(),
+                )]),
+                source_path: "source-bucket/folder/file.txt".to_string(),
+                version_selector: Some(format!("version:{version_id}")),
+                capabilities: Vec::new(),
+                origin_node_id: Some(origin),
+            },
+            connector_id: None,
+        };
+        let version = BlobVersion::reference(
+            source,
+            cached_metadata,
+            SystemTime::UNIX_EPOCH,
+            Default::default(),
+            SystemTime::UNIX_EPOCH,
+        );
+        let txn_id = Ulid::generate();
+        let mut operation = HeadObjectOperation::new(HeadObjectInput {
+            bucket: "target-bucket".to_string(),
+            key: "folder/file.txt".to_string(),
+            version_id: Some(version_id),
+        });
+
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(version.to_bytes().unwrap().into()),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: committed })]
+                if *committed == txn_id
+        ));
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let access = ResolvedSourceAccess::OpenDal {
+            kind: SourceConnectorKind::ArunaNative,
+            config: HashMap::new(),
+            path: "source-bucket/folder/file.txt".to_string(),
+            version: Some(version_id.to_string()),
+        };
+        let effects = operation.step(Event::SubOperation(
+            SubOperationEvent::VersionSourceAccessResolved {
+                result: Ok(access.clone()),
+            },
+        ));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::StagingSource(StagingSourceEffect::Head { access: resolved })]
+                if resolved == &access
+        ));
+
+        assert!(
+            operation
+                .step(Event::StagingSource(StagingSourceEvent::HeadResult {
+                    metadata: refreshed_metadata.clone(),
+                }))
+                .is_empty()
+        );
+        let result = operation.finalize().unwrap().unwrap().unwrap();
+        assert_eq!(result.source_metadata, Some(refreshed_metadata));
+        assert!(result.last_refresh.is_some());
+        assert_eq!(result.version_id, Some(version_id));
+    }
+
     #[tokio::test]
     async fn head_object_returns_cached_reference_metadata() {
         let temp_handle = tempdir().unwrap();
@@ -706,7 +885,7 @@ mod tests {
             compute_handle: None,
         };
 
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let cached_metadata = SourceMetadata {
             content_length: 11,
             content_type: Some("text/plain".to_string()),
@@ -728,7 +907,7 @@ mod tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
             },
-            connector_id: Some(Ulid::r#gen()),
+            connector_id: Some(Ulid::generate()),
         };
 
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle

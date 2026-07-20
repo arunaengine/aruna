@@ -115,7 +115,7 @@ impl Topology {
 
         let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
         let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let user_id = UserId::local(Ulid::generate(), realm_id);
 
         let mut nodes = Vec::with_capacity(management + users);
         for index in 0..(management + users) {
@@ -193,7 +193,7 @@ impl Topology {
             iss: self.realm_id.to_string(),
             iat: now,
             exp: now + 600,
-            jti: Ulid::r#gen().to_string(),
+            jti: Ulid::generate().to_string(),
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,

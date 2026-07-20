@@ -9,17 +9,20 @@ An explicitly selected executor must pass its startup health checks. Set
 health failure. Invalid configuration is still rejected.
 
 Task images are resolved before the attempt intent is committed and the
-digest-pinned reference is retained for recovery. Kubernetes requires the task
-image to be supplied by digest. The Kubernetes helper image also has no default
-and must be configured as an immutable digest reference.
+digest-pinned reference is retained for exact-bits recovery. Kubernetes also
+accepts tagged task images without a registry lookup and always pulls them;
+retries may therefore run newer bits if the tag moves. The Kubernetes helper
+image still has no default and must be configured as an immutable digest
+reference.
 
 ## Shared security and recovery
 
 Docker and Kubernetes tasks run as `65534:65534`, without Linux capabilities or
 privilege escalation, with runtime-default seccomp and no service-account token.
-Network access is isolated for Files staging. Direct-S3 is explicit: Docker and
-Apptainer require open networking, while Kubernetes restricts task egress to the
-configured S3 CIDRs and port. Stage and fetch helpers never receive S3
+Network access is isolated for Files staging unless a task explicitly carries
+the `aruna-engine.org/network=open` execution tag. Direct-S3 is explicit: Docker
+and Apptainer require open networking, while Kubernetes restricts task egress to
+the configured S3 CIDRs and port. Stage and fetch helpers never receive S3
 credentials.
 
 Every external attempt has an immutable attempt epoch and a monotone controller

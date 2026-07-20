@@ -23,6 +23,7 @@ iroh-io = { workspace = true }
 md5 = { workspace = true }
 opendal = { workspace = true }
 postcard = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }

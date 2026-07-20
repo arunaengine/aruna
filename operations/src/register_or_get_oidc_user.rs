@@ -470,7 +470,7 @@ fn apply_admin_reducer_operation(
 ) -> Result<AdminDocumentEvent, AdminDocumentReducerError> {
     let observed = state.clock.clone();
     let event = AdminDocumentEvent {
-        event_id: Ulid::r#gen(),
+        event_id: Ulid::generate(),
         target: state.target.clone(),
         origin_node_id: actor.node_id,
         origin_seq: observed.sequence_for(&actor.node_id) + 1,
@@ -492,7 +492,7 @@ fn initial_user_document_sync_change(actor: &Actor, placement: PlacementRef) -> 
         base: None,
         current: DocumentSyncRevision {
             generation: updated_at_ms,
-            event_id: Ulid::r#gen(),
+            event_id: Ulid::generate(),
             actor: actor.node_id,
             updated_at_ms,
         },
@@ -534,7 +534,7 @@ mod tests {
             user_id: UserId::nil(realm_id),
             realm_id,
         };
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let user_id = UserId::local(Ulid::generate(), realm_id);
         let mut operation = RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
             actor: actor.clone(),
             issuer: "https://issuer.example".to_string(),
@@ -556,7 +556,7 @@ mod tests {
             Effect::Storage(StorageEffect::StartTransaction { read: false })
         ));
 
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert!(matches!(
             effects.first().unwrap(),
@@ -725,7 +725,7 @@ mod tests {
             user_id: UserId::nil(realm_id),
             realm_id,
         };
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let user_id = UserId::local(Ulid::generate(), realm_id);
         let mut operation = RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
             actor: actor.clone(),
             issuer: "https://issuer.example".to_string(),
@@ -736,7 +736,7 @@ mod tests {
         let document_target = DocumentSyncTarget::User { user_id };
 
         operation.start();
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
@@ -789,7 +789,7 @@ mod tests {
     #[tokio::test]
     async fn existing_user_is_returned_without_new_announcement() {
         let realm_id = aruna_core::structs::RealmId([5u8; 32]);
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let user_id = UserId::local(Ulid::generate(), realm_id);
         let existing_user = User {
             user_id,
             name: "bob".to_string(),
@@ -806,11 +806,11 @@ mod tests {
             issuer: "https://issuer.example".to_string(),
             subject_id: "subject-2".to_string(),
             name: "ignored".to_string(),
-            user_id: UserId::local(Ulid::r#gen(), realm_id),
+            user_id: UserId::local(Ulid::generate(), realm_id),
         });
 
         operation.start();
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: vec![

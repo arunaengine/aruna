@@ -389,7 +389,7 @@ mod tests {
             compute_handle: None,
         };
 
-        let enrollment_id = Ulid::r#gen();
+        let enrollment_id = Ulid::generate();
         let record = OnboardingSecretRecord {
             enrollment_id,
             secret_hash: "abc".to_string(),

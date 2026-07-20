@@ -157,7 +157,10 @@ async fn notification_is_visible(
 ) -> Result<bool, String> {
     if !matches!(
         record.kind,
-        NotificationKind::MetadataCreated { .. } | NotificationKind::DataUploaded { .. }
+        NotificationKind::MetadataCreated { .. }
+            | NotificationKind::DataUploaded { .. }
+            | NotificationKind::SyncCompleted { .. }
+            | NotificationKind::SyncFailed { .. }
     ) {
         return Ok(record.watch_authorization.is_none());
     }

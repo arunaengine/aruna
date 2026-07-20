@@ -5,7 +5,9 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{JobId, JobPayload, JobRecord, job_record_key, parse_job_dedup_value};
+use aruna_core::structs::{
+    JobId, JobPayload, JobRecord, WorkspaceMode, job_record_key, parse_job_dedup_value,
+};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, NodeId, TxnId, UserId};
 use smallvec::smallvec;
@@ -29,6 +31,8 @@ pub struct SubmitJobSpec {
     pub owner_node_id: NodeId,
     pub dedup_key: Option<Vec<u8>>,
     pub now_ms: u64,
+    pub workspace_mode: WorkspaceMode,
+    pub workspace_bucket: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +50,8 @@ pub enum SubmitJobError {
     Conversion(#[from] ConversionError),
     #[error("idempotency key already bound to job {existing_job_id} with a different plan")]
     JobPlanConflict { existing_job_id: JobId },
+    #[error("invalid workspace: {0}")]
+    InvalidWorkspace(String),
     #[error("unexpected event while submitting job: {0}")]
     UnexpectedEvent(String),
 }
@@ -91,7 +97,7 @@ pub struct SubmitJobOperation {
 
 impl SubmitJobOperation {
     pub fn new(spec: SubmitJobSpec) -> Self {
-        let record = JobRecord::new(
+        let mut record = JobRecord::new(
             JobId::new(),
             spec.payload,
             spec.created_by,
@@ -100,6 +106,20 @@ impl SubmitJobOperation {
             spec.now_ms,
             spec.dedup_key,
         );
+        if matches!(&record.payload, JobPayload::Execution(_)) {
+            record.workspace_mode = spec.workspace_mode;
+            record.workspace_bucket = match spec.workspace_mode {
+                WorkspaceMode::Existing => spec.workspace_bucket,
+                WorkspaceMode::Temporary | WorkspaceMode::Kept => {
+                    Some(JobRecord::workspace_bucket_name(record.job_id))
+                }
+            };
+            record.plan_digest = Some(workspace_plan_digest(
+                &record.payload,
+                record.workspace_mode,
+                record.workspace_bucket.as_deref(),
+            ));
+        }
         Self {
             record,
             state: SubmitState::Init,
@@ -197,6 +217,27 @@ impl SubmitJobOperation {
         }));
         smallvec![]
     }
+}
+
+fn workspace_plan_digest(
+    payload: &JobPayload,
+    mode: WorkspaceMode,
+    bucket: Option<&str>,
+) -> [u8; 32] {
+    let digest = payload.plan_digest();
+    if mode == WorkspaceMode::Kept {
+        return digest;
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aruna/job-workspace/v1");
+    hasher.update(&digest);
+    hasher.update(mode.name().as_bytes());
+    if mode == WorkspaceMode::Existing
+        && let Some(bucket) = bucket
+    {
+        hasher.update(bucket.as_bytes());
+    }
+    *hasher.finalize().as_bytes()
 }
 
 impl Operation for SubmitJobOperation {
@@ -327,7 +368,9 @@ mod tests {
     use aruna_core::keyspaces::{
         JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
     };
-    use aruna_core::structs::{JobState, RealmId, encode_job_dedup_value};
+    use aruna_core::structs::{
+        ComputeResources, ExecutionSpec, JobState, RealmId, encode_job_dedup_value,
+    };
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
     use byteview::ByteView;
@@ -364,7 +407,29 @@ mod tests {
             owner_node_id: node_id(7),
             dedup_key,
             now_ms: 1_000,
+            workspace_mode: WorkspaceMode::Kept,
+            workspace_bucket: None,
         }
+    }
+
+    fn execution_payload() -> JobPayload {
+        JobPayload::Execution(ExecutionSpec {
+            group_id: Ulid::from_bytes([3; 16]),
+            name: None,
+            description: None,
+            tags: Default::default(),
+            image: "alpine:3".to_string(),
+            entrypoint: None,
+            command: Vec::new(),
+            workdir: None,
+            env: Default::default(),
+            resources: ComputeResources::default(),
+            executor_constraint: None,
+            inputs: Vec::new(),
+            file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+        })
     }
 
     async fn count_keyspace(storage: &StorageHandle, key_space: &str) -> usize {
@@ -373,6 +438,55 @@ mod tests {
             .expect("scan")
             .0
             .len()
+    }
+
+    #[tokio::test]
+    async fn existing_bucket_persisted() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = context(storage.clone());
+        let submission = SubmitJobSpec {
+            payload: execution_payload(),
+            workspace_mode: WorkspaceMode::Existing,
+            workspace_bucket: Some("shared-workspace".to_string()),
+            ..spec(None)
+        };
+
+        let result = drive(SubmitJobOperation::new(submission), &ctx)
+            .await
+            .unwrap();
+        let record = read_job_record(&storage, result.job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(record.workspace_mode, WorkspaceMode::Existing);
+        assert_eq!(record.workspace_bucket.as_deref(), Some("shared-workspace"));
+    }
+
+    #[tokio::test]
+    async fn temporary_dedup_stable() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = context(storage);
+        let submission = SubmitJobSpec {
+            payload: execution_payload(),
+            dedup_key: Some(b"temporary".to_vec()),
+            workspace_mode: WorkspaceMode::Temporary,
+            workspace_bucket: None,
+            ..spec(None)
+        };
+
+        let first = drive(SubmitJobOperation::new(submission.clone()), &ctx)
+            .await
+            .unwrap();
+        let second = drive(SubmitJobOperation::new(submission), &ctx)
+            .await
+            .unwrap();
+
+        assert!(first.created);
+        assert!(!second.created);
+        assert_eq!(second.job_id, first.job_id);
     }
 
     async fn write_raw(storage: &StorageHandle, key_space: &str, key: ByteView, value: ByteView) {

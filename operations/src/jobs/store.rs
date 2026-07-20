@@ -4,7 +4,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     JOB_ATTEMPT_CONTROL_KEYSPACE, JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE,
-    JOB_RUN_CRATE_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
+    JOB_RUN_CRATE_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE, STAGING_JOB_STATE_KEYSPACE,
 };
 use aruna_core::structs::{
     AttemptControl, AttemptIntent, JobClaim, JobError, JobExecutionClass, JobId, JobPayload,
@@ -139,6 +139,10 @@ pub fn job_prune_delete_entries(record: &JobRecord) -> JobDeletes {
             JOB_SCHEDULE_INDEX_KEYSPACE.to_string(),
             schedule_index_key_for(record),
         ),
+        (
+            STAGING_JOB_STATE_KEYSPACE.to_string(),
+            ByteView::from(record.job_id.to_bytes().to_vec()),
+        ),
     ];
     // Epochs are handed out from 1; every used epoch left a control row.
     for epoch in 1..record.next_attempt_epoch {
@@ -224,6 +228,57 @@ where
     }
     Err(JobMutationError::Storage(
         "job mutation exhausted conflict retries".to_string(),
+    ))
+}
+
+pub async fn put_staging_checkpoint(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    value: Value,
+) -> Result<(), JobMutationError> {
+    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
+        let txn_id = start_write_txn(storage)
+            .await
+            .map_err(JobMutationError::Storage)?;
+        let result = async {
+            let record = read_job_record(storage, job_id, Some(txn_id))
+                .await
+                .map_err(JobMutationError::Storage)?
+                .ok_or(JobMutationError::NotFound)?;
+            guard_token(&record, token)?;
+            batch_write(
+                storage,
+                vec![(
+                    STAGING_JOB_STATE_KEYSPACE.to_string(),
+                    ByteView::from(job_id.to_bytes().to_vec()),
+                    value.clone(),
+                )],
+                Some(txn_id),
+            )
+            .await
+            .map_err(JobMutationError::Storage)
+        }
+        .await;
+        match result {
+            Ok(()) => match commit_txn(storage, txn_id).await {
+                CommitResult::Committed => return Ok(()),
+                CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => continue,
+                CommitResult::Conflict => {
+                    return Err(JobMutationError::Storage(
+                        "checkpoint write exhausted conflict retries".to_string(),
+                    ));
+                }
+                CommitResult::Failed(error) => return Err(JobMutationError::Storage(error)),
+            },
+            Err(error) => {
+                abort_txn(storage, txn_id).await;
+                return Err(error);
+            }
+        }
+    }
+    Err(JobMutationError::Storage(
+        "checkpoint write exhausted conflict retries".to_string(),
     ))
 }
 
@@ -468,7 +523,7 @@ pub async fn claim_job(
         record.state = JobState::Claimed;
         record.claim = Some(JobClaim {
             holder_node_id,
-            claim_token: Ulid::r#gen(),
+            claim_token: Ulid::generate(),
             lease_expires_at_ms: now_ms.saturating_add(JOB_LEASE_MS),
         });
         claimed_now = true;
@@ -789,7 +844,7 @@ pub async fn handoff_external_attempt(
             return Ok(JobMutation::Skip);
         }
         if let Some(claim) = record.claim.as_mut() {
-            claim.claim_token = Ulid::r#gen();
+            claim.claim_token = Ulid::generate();
             claim.lease_expires_at_ms = now_ms;
         }
         bump_generation(control)?;
@@ -1299,7 +1354,7 @@ pub async fn adopt_external_attempt(
             return Ok(JobMutation::Skip);
         }
         record.updated_at_ms = now_ms;
-        let claim_token = Ulid::r#gen();
+        let claim_token = Ulid::generate();
         record.claim = Some(JobClaim {
             holder_node_id,
             claim_token,
@@ -1758,7 +1813,7 @@ mod tests {
         let mut record = queued_record(job_id);
         record.execution_class = JobExecutionClass::ExternalAttempt;
         record.state = JobState::Running;
-        let live_token = Ulid::r#gen();
+        let live_token = Ulid::generate();
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: live_token,
@@ -1838,7 +1893,7 @@ mod tests {
         let mut record = queued_record(job_id);
         record.execution_class = JobExecutionClass::ExternalAttempt;
         record.state = JobState::Preparing;
-        let token = Ulid::r#gen();
+        let token = Ulid::generate();
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: token,
@@ -1937,7 +1992,7 @@ mod tests {
         let err = complete_job(
             &storage,
             job_id,
-            Ulid::r#gen(),
+            Ulid::generate(),
             JobResultPayload::Probe { completed_steps: 1 },
             JobProgress::new("steps"),
             6_000,
@@ -1954,6 +2009,42 @@ mod tests {
             record.state,
             JobState::Claimed,
             "record unchanged after rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_checkpoint_rejected() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([2u8; 16]);
+        insert_job(&storage, &queued_record(job_id)).await.unwrap();
+        let ClaimOutcome::Claimed(record) = claim_job(&storage, job_id, node_id(3), 5_000)
+            .await
+            .unwrap()
+        else {
+            panic!("job must be claimed")
+        };
+        let token = record.claim.unwrap().claim_token;
+        put_staging_checkpoint(&storage, job_id, token, b"newer".to_vec().into())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            put_staging_checkpoint(&storage, job_id, Ulid::generate(), b"stale".to_vec().into(),)
+                .await,
+            Err(JobMutationError::TokenMismatch)
+        ));
+        assert_eq!(
+            read_raw(
+                &storage,
+                STAGING_JOB_STATE_KEYSPACE,
+                ByteView::from(job_id.to_bytes().to_vec()),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+            b"newer"
         );
     }
 
@@ -2020,7 +2111,7 @@ mod tests {
         record.state = JobState::Running;
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
-            claim_token: Ulid::r#gen(),
+            claim_token: Ulid::generate(),
             lease_expires_at_ms: 5_000,
         });
         insert_job(&storage, &record).await.unwrap();
@@ -2056,7 +2147,7 @@ mod tests {
         record.state = JobState::Running;
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
-            claim_token: Ulid::r#gen(),
+            claim_token: Ulid::generate(),
             lease_expires_at_ms: 5_000,
         });
         insert_job(&storage, &record).await.unwrap();
@@ -2077,7 +2168,7 @@ mod tests {
         // Lease hand-back preserves attempts but resets execution progress.
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([0xA1; 16]);
-        let token = Ulid::r#gen();
+        let token = Ulid::generate();
         let mut record = running_record(job_id, token, 60_000);
         record.attempts = 2;
         record.progress.current = 4;
@@ -2103,11 +2194,11 @@ mod tests {
     async fn release_guards_token() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([0xB2; 16]);
-        insert_job(&storage, &running_record(job_id, Ulid::r#gen(), 60_000))
+        insert_job(&storage, &running_record(job_id, Ulid::generate(), 60_000))
             .await
             .unwrap();
 
-        let error = release_job(&storage, job_id, Ulid::r#gen(), 6_000)
+        let error = release_job(&storage, job_id, Ulid::generate(), 6_000)
             .await
             .expect_err("a foreign token must not release the lease");
         assert!(matches!(error, JobMutationError::TokenMismatch));
@@ -2162,7 +2253,7 @@ mod tests {
         let mut record = queued_record(job_id);
         record.dedup_key = Some(b"dedup".to_vec());
         record.state = JobState::Running;
-        let token = Ulid::r#gen();
+        let token = Ulid::generate();
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: token,
@@ -2288,7 +2379,7 @@ mod tests {
     async fn revived_lease_kept() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([2u8; 16]);
-        insert_job(&storage, &running_record(job_id, Ulid::r#gen(), 10_000))
+        insert_job(&storage, &running_record(job_id, Ulid::generate(), 10_000))
             .await
             .unwrap();
 
@@ -2601,7 +2692,7 @@ mod tests {
         let (_dir, storage) = temp_storage();
         let job_a = JobId::from_bytes([1u8; 16]);
         let job_b = JobId::from_bytes([2u8; 16]);
-        let token = Ulid::r#gen();
+        let token = Ulid::generate();
         let mut record = running_record(job_a, token, 10_000);
         record.dedup_key = Some(b"k".to_vec());
         insert_job(&storage, &record).await.unwrap();
@@ -2644,7 +2735,7 @@ mod tests {
     async fn external_never_requeued() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([0xE0; 16]);
-        let mut record = execution_record(job_id, Ulid::r#gen(), JobState::Running);
+        let mut record = execution_record(job_id, Ulid::generate(), JobState::Running);
         record.claim.as_mut().unwrap().lease_expires_at_ms = 1;
         record.attempt_intent = Some(AttemptIntent {
             attempt_no: 1,
@@ -2672,7 +2763,7 @@ mod tests {
     async fn preintent_requeues() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([0xE3; 16]);
-        let mut record = execution_record(job_id, Ulid::r#gen(), JobState::Ready);
+        let mut record = execution_record(job_id, Ulid::generate(), JobState::Ready);
         record.claim.as_mut().unwrap().lease_expires_at_ms = 1;
         insert_job(&storage, &record).await.unwrap();
 
@@ -2693,7 +2784,7 @@ mod tests {
     async fn attempt_intent_persists() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([0xA0; 16]);
-        let token = Ulid::r#gen();
+        let token = Ulid::generate();
         insert_job(&storage, &running_record(job_id, token, 10_000))
             .await
             .unwrap();
@@ -2723,7 +2814,7 @@ mod tests {
     async fn cancel_blocks_intent() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([0xA1; 16]);
-        let token = Ulid::r#gen();
+        let token = Ulid::generate();
         let mut record = running_record(job_id, token, 10_000);
         record.execution_class = JobExecutionClass::ExternalAttempt;
         record.state = JobState::Ready;
@@ -2750,7 +2841,7 @@ mod tests {
     async fn cancel_blocks_running() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([0xA2; 16]);
-        let token = Ulid::r#gen();
+        let token = Ulid::generate();
         insert_job(&storage, &execution_record(job_id, token, JobState::Ready))
             .await
             .unwrap();
@@ -2783,7 +2874,7 @@ mod tests {
     async fn cancel_blocks_completion() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([0xA3; 16]);
-        let token = Ulid::r#gen();
+        let token = Ulid::generate();
         insert_job(
             &storage,
             &execution_record(job_id, token, JobState::Running),
@@ -2821,7 +2912,7 @@ mod tests {
     async fn success_wins_cancel() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([0xA4; 16]);
-        let token = Ulid::r#gen();
+        let token = Ulid::generate();
         insert_job(
             &storage,
             &execution_record(job_id, token, JobState::Running),
@@ -2866,7 +2957,7 @@ mod tests {
     async fn external_live_skipped() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([0xE2; 16]);
-        let mut record = running_record(job_id, Ulid::r#gen(), 10_000);
+        let mut record = running_record(job_id, Ulid::generate(), 10_000);
         record.execution_class = JobExecutionClass::ExternalAttempt;
         insert_job(&storage, &record).await.unwrap();
 

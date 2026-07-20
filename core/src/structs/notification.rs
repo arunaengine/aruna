@@ -61,6 +61,24 @@ pub enum NotificationKind {
         size_bytes: u64,
         actor_user_id: UserId,
     },
+    SyncCompleted {
+        path: String,
+        group_id: GroupId,
+        node_id: NodeId,
+        bucket: String,
+        relationship_id: Ulid,
+        versions_synced: u64,
+        actor_user_id: UserId,
+    },
+    SyncFailed {
+        path: String,
+        group_id: GroupId,
+        node_id: NodeId,
+        bucket: String,
+        relationship_id: Ulid,
+        error: String,
+        actor_user_id: UserId,
+    },
 }
 
 impl NotificationKind {
@@ -72,9 +90,10 @@ impl NotificationKind {
             | NotificationKind::RemovedFromGroup { .. }
             | NotificationKind::GroupMemberAdded { .. } => "group.membership",
             NotificationKind::NodeOnboarded { .. } => "node.onboarding",
-            NotificationKind::MetadataCreated { .. } | NotificationKind::DataUploaded { .. } => {
-                "resource.watch"
-            }
+            NotificationKind::MetadataCreated { .. }
+            | NotificationKind::DataUploaded { .. }
+            | NotificationKind::SyncCompleted { .. }
+            | NotificationKind::SyncFailed { .. } => "resource.watch",
         }
     }
 
@@ -87,6 +106,8 @@ impl NotificationKind {
             NotificationKind::NodeOnboarded { .. } => "node_onboarded",
             NotificationKind::MetadataCreated { .. } => "metadata_created",
             NotificationKind::DataUploaded { .. } => "data_uploaded",
+            NotificationKind::SyncCompleted { .. } => "sync_completed",
+            NotificationKind::SyncFailed { .. } => "sync_failed",
         }
     }
 }
@@ -138,7 +159,7 @@ impl NotificationRecord {
         created_at_ms: u64,
     ) -> Self {
         Self {
-            notification_id: Ulid::r#gen(),
+            notification_id: Ulid::generate(),
             recipient,
             class,
             kind,
@@ -288,7 +309,7 @@ mod tests {
 
     fn added(actor: u8) -> NotificationKind {
         NotificationKind::AddedToGroup {
-            group_id: Ulid::r#gen(),
+            group_id: Ulid::generate(),
             actor_user_id: user(1, actor),
         }
     }
@@ -296,7 +317,7 @@ mod tests {
     #[test]
     fn notification_record_decodes_legacy_schema() {
         let recipient = user(1, 2);
-        let notification_id = Ulid::r#gen();
+        let notification_id = Ulid::generate();
         let legacy = (
             notification_id,
             recipient,
@@ -313,7 +334,7 @@ mod tests {
         assert_eq!(decoded.watch_authorization, None);
         assert!(NotificationRecord::from_bytes(&[legacy_bytes, vec![2]].concat()).is_err());
 
-        let outbox_id = Ulid::r#gen();
+        let outbox_id = Ulid::generate();
         let outbox = (outbox_id, legacy);
         let decoded =
             NotificationOutboxRecord::from_bytes(&postcard::to_allocvec(&outbox).unwrap())
@@ -325,20 +346,20 @@ mod tests {
     #[test]
     fn notification_record_roundtrips_through_postcard() {
         let recipient = user(1, 2);
-        let metadata_group_id = Ulid::r#gen();
-        let data_group_id = Ulid::r#gen();
+        let metadata_group_id = Ulid::generate();
+        let data_group_id = Ulid::generate();
         let data_node_id = make_node_id(8);
         for kind in [
             NotificationKind::AddedToGroup {
-                group_id: Ulid::r#gen(),
+                group_id: Ulid::generate(),
                 actor_user_id: user(1, 3),
             },
             NotificationKind::RemovedFromGroup {
-                group_id: Ulid::r#gen(),
+                group_id: Ulid::generate(),
                 actor_user_id: user(1, 3),
             },
             NotificationKind::GroupMemberAdded {
-                group_id: Ulid::r#gen(),
+                group_id: Ulid::generate(),
                 member_user_id: user(1, 4),
                 actor_user_id: user(1, 3),
             },
@@ -349,7 +370,7 @@ mod tests {
             NotificationKind::MetadataCreated {
                 path: format!("meta/{metadata_group_id}/datasets/project/run-42"),
                 group_id: metadata_group_id,
-                document_id: Ulid::r#gen(),
+                document_id: Ulid::generate(),
                 actor_user_id: user(1, 5),
             },
             NotificationKind::DataUploaded {
@@ -366,6 +387,34 @@ mod tests {
                 size_bytes: 4096,
                 actor_user_id: user(1, 6),
             },
+            NotificationKind::SyncCompleted {
+                path: crate::structs::data_watch_resource_path(
+                    data_group_id,
+                    data_node_id,
+                    "bucket",
+                    "prefix/",
+                ),
+                group_id: data_group_id,
+                node_id: data_node_id,
+                bucket: "bucket".to_string(),
+                relationship_id: Ulid::generate(),
+                versions_synced: 3,
+                actor_user_id: user(1, 6),
+            },
+            NotificationKind::SyncFailed {
+                path: crate::structs::data_watch_resource_path(
+                    data_group_id,
+                    data_node_id,
+                    "bucket",
+                    "prefix/",
+                ),
+                group_id: data_group_id,
+                node_id: data_node_id,
+                bucket: "bucket".to_string(),
+                relationship_id: Ulid::generate(),
+                error: "quota".to_string(),
+                actor_user_id: user(1, 6),
+            },
         ] {
             let record = NotificationRecord::new(recipient, NotificationClass::Direct, kind, 1234);
             let bytes = record.to_bytes().unwrap();
@@ -376,7 +425,7 @@ mod tests {
     #[test]
     fn inbox_keys_order_newest_first_within_recipient() {
         let r = user(1, 2);
-        let id = Ulid::r#gen();
+        let id = Ulid::generate();
         assert!(notification_inbox_key(r, 2000, id) < notification_inbox_key(r, 1000, id));
 
         let id_a = Ulid::from_bytes([0u8; 16]);
@@ -391,7 +440,7 @@ mod tests {
     fn inbox_key_is_recipient_prefixed() {
         let a = user(1, 2);
         let b = user(1, 3);
-        let id = Ulid::r#gen();
+        let id = Ulid::generate();
         let ka = notification_inbox_key(a, 1000, id);
         let kb = notification_inbox_key(b, 1000, id);
         assert_ne!(&ka[..48], &kb[..48]);
@@ -403,7 +452,7 @@ mod tests {
     fn inbox_key_roundtrips_through_parser() {
         let r = user(5, 9);
         let ts = 1_700_000_000_000u64;
-        let id = Ulid::r#gen();
+        let id = Ulid::generate();
         let key = notification_inbox_key(r, ts, id);
         assert_eq!(parse_notification_inbox_key(&key).unwrap(), (r, ts, id));
         assert!(matches!(
@@ -445,7 +494,7 @@ mod tests {
     fn cursor_is_key_suffix() {
         let r = user(1, 2);
         let ts = 42u64;
-        let id = Ulid::r#gen();
+        let id = Ulid::generate();
         let cursor = notification_inbox_cursor(ts, id);
         assert_eq!(cursor.len(), 24);
         assert_eq!(
@@ -505,15 +554,15 @@ mod tests {
     #[test]
     fn kind_categories_are_stable() {
         let added = NotificationKind::AddedToGroup {
-            group_id: Ulid::r#gen(),
+            group_id: Ulid::generate(),
             actor_user_id: user(1, 3),
         };
         let removed = NotificationKind::RemovedFromGroup {
-            group_id: Ulid::r#gen(),
+            group_id: Ulid::generate(),
             actor_user_id: user(1, 3),
         };
         let member = NotificationKind::GroupMemberAdded {
-            group_id: Ulid::r#gen(),
+            group_id: Ulid::generate(),
             member_user_id: user(1, 4),
             actor_user_id: user(1, 3),
         };
@@ -521,14 +570,14 @@ mod tests {
             realm_id: RealmId([1; 32]),
             node_id: make_node_id(1),
         };
-        let metadata_group_id = Ulid::r#gen();
+        let metadata_group_id = Ulid::generate();
         let metadata_created = NotificationKind::MetadataCreated {
             path: format!("meta/{metadata_group_id}/datasets/project/run-42"),
             group_id: metadata_group_id,
-            document_id: Ulid::r#gen(),
+            document_id: Ulid::generate(),
             actor_user_id: user(1, 5),
         };
-        let data_group_id = Ulid::r#gen();
+        let data_group_id = Ulid::generate();
         let data_node_id = make_node_id(2);
         let data_uploaded = NotificationKind::DataUploaded {
             path: crate::structs::data_watch_resource_path(
@@ -544,17 +593,49 @@ mod tests {
             size_bytes: 1,
             actor_user_id: user(1, 6),
         };
+        let sync_completed = NotificationKind::SyncCompleted {
+            path: crate::structs::data_watch_resource_path(
+                data_group_id,
+                data_node_id,
+                "bucket",
+                "",
+            ),
+            group_id: data_group_id,
+            node_id: data_node_id,
+            bucket: "bucket".to_string(),
+            relationship_id: Ulid::generate(),
+            versions_synced: 2,
+            actor_user_id: user(1, 6),
+        };
+        let sync_failed = NotificationKind::SyncFailed {
+            path: crate::structs::data_watch_resource_path(
+                data_group_id,
+                data_node_id,
+                "bucket",
+                "",
+            ),
+            group_id: data_group_id,
+            node_id: data_node_id,
+            bucket: "bucket".to_string(),
+            relationship_id: Ulid::generate(),
+            error: "quota".to_string(),
+            actor_user_id: user(1, 6),
+        };
         assert_eq!(added.category(), "group.membership");
         assert_eq!(removed.category(), "group.membership");
         assert_eq!(member.category(), "group.membership");
         assert_eq!(onboarded.category(), "node.onboarding");
         assert_eq!(metadata_created.category(), "resource.watch");
         assert_eq!(data_uploaded.category(), "resource.watch");
+        assert_eq!(sync_completed.category(), "resource.watch");
+        assert_eq!(sync_failed.category(), "resource.watch");
         assert_eq!(added.name(), "added_to_group");
         assert_eq!(removed.name(), "removed_from_group");
         assert_eq!(member.name(), "group_member_added");
         assert_eq!(onboarded.name(), "node_onboarded");
         assert_eq!(metadata_created.name(), "metadata_created");
         assert_eq!(data_uploaded.name(), "data_uploaded");
+        assert_eq!(sync_completed.name(), "sync_completed");
+        assert_eq!(sync_failed.name(), "sync_failed");
     }
 }

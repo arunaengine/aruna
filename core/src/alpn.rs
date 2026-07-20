@@ -9,6 +9,8 @@ pub enum Alpn {
     DocumentSync,
     /// Metadata bootstrap protocol
     Metadata,
+    /// Lazy Aruna-native reference reads
+    NativeReference,
     /// Notification delivery protocol
     Notification,
     /// Shard holder-manifest exchange protocol
@@ -22,6 +24,7 @@ impl Alpn {
             Alpn::Bao => b"aruna/bao/1",
             Alpn::DocumentSync => irokle::net::IROKLE_SYNC_ALPN,
             Alpn::Metadata => b"aruna/metadata/1",
+            Alpn::NativeReference => b"aruna/native/1",
             Alpn::Notification => b"aruna/notification/1",
             Alpn::Shard => b"aruna/shard/1",
         }
@@ -33,6 +36,7 @@ impl Alpn {
             b"aruna/bao/1" => Some(Alpn::Bao),
             irokle::net::IROKLE_SYNC_ALPN => Some(Alpn::DocumentSync),
             b"aruna/metadata/1" => Some(Alpn::Metadata),
+            b"aruna/native/1" => Some(Alpn::NativeReference),
             b"aruna/notification/1" => Some(Alpn::Notification),
             b"aruna/shard/1" => Some(Alpn::Shard),
             _ => None,
@@ -50,6 +54,7 @@ impl std::fmt::Display for Alpn {
                 Err(_) => write!(f, "<invalid-document-sync-alpn>"),
             },
             Alpn::Metadata => write!(f, "aruna/metadata/1"),
+            Alpn::NativeReference => write!(f, "aruna/native/1"),
             Alpn::Notification => write!(f, "aruna/notification/1"),
             Alpn::Shard => write!(f, "aruna/shard/1"),
         }
@@ -71,6 +76,10 @@ mod tests {
         assert_eq!(
             Alpn::from_bytes(Alpn::Metadata.as_bytes()),
             Some(Alpn::Metadata)
+        );
+        assert_eq!(
+            Alpn::from_bytes(Alpn::NativeReference.as_bytes()),
+            Some(Alpn::NativeReference)
         );
         assert_eq!(
             Alpn::from_bytes(Alpn::Notification.as_bytes()),

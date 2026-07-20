@@ -418,7 +418,7 @@ mod tests {
         let bucket_count = 8u16;
         let mut flagged = 0;
         for _ in 0..512 {
-            let generic = Ulid::r#gen();
+            let generic = Ulid::generate();
             let fields = layout::unpack(generic.0);
             match MetaResourceId::parse(&generic.to_string()) {
                 Err(ParseError::ReservedHandle) => assert_eq!(fields.handle, 0),

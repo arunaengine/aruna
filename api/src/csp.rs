@@ -17,6 +17,8 @@ use url::{Host, Url};
 /// from the matching static origin.
 const FONT_STYLE_ORIGIN: &str = "https://fonts.googleapis.com";
 const FONT_FILE_ORIGIN: &str = "https://fonts.gstatic.com";
+const PYPI_ORIGIN: &str = "https://pypi.org";
+const NPM_ORIGIN: &str = "https://registry.npmjs.org";
 
 /// Anti-clickjacking policy every response carries when it has no stricter one.
 const BASELINE_CSP: &str = "frame-ancestors 'none'";
@@ -252,11 +254,14 @@ pub(crate) async fn baseline_security_headers(request: Request, next: Next) -> R
     response
 }
 
-/// `script-src` carries `'wasm-unsafe-eval'` because the portal hashes profile
-/// artifacts with hash-wasm, which compiles a WebAssembly module; it permits no
-/// JavaScript eval. Inline scripts and styles are not allowed.
+/// `script-src` carries `'wasm-unsafe-eval'` because hash-wasm compiles WebAssembly;
+/// it permits no JavaScript eval or inline scripts. Inline styles support CodeMirror's
+/// generated theme stylesheet.
 fn content_security_policy(origins: &ResolvedOrigins) -> String {
-    let connect_src = directive("connect-src 'self'", &origins.connect);
+    let connect_src = directive(
+        &format!("connect-src 'self' {NPM_ORIGIN} {PYPI_ORIGIN}"),
+        &origins.connect,
+    );
     let img_src = directive("img-src 'self' data: blob:", &origins.img);
 
     [
@@ -269,7 +274,7 @@ fn content_security_policy(origins: &ResolvedOrigins) -> String {
         "frame-ancestors 'none'",
         "form-action 'self'",
         "script-src 'self' 'wasm-unsafe-eval'",
-        &format!("style-src 'self' {FONT_STYLE_ORIGIN}"),
+        &format!("style-src 'self' 'unsafe-inline' {FONT_STYLE_ORIGIN}"),
         &img_src,
         &format!("font-src 'self' data: {FONT_FILE_ORIGIN}"),
         &connect_src,
@@ -317,7 +322,9 @@ fn is_loopback_host(host: Option<Host<&str>>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResolvedOrigins, content_security_policy, normalize_origin};
+    use super::{
+        NPM_ORIGIN, PYPI_ORIGIN, ResolvedOrigins, content_security_policy, normalize_origin,
+    };
 
     fn origins(connect: &[&str], img: &[&str]) -> ResolvedOrigins {
         ResolvedOrigins {
@@ -366,15 +373,17 @@ mod tests {
 
         assert!(policy.contains("default-src 'self'"));
         assert!(policy.contains("script-src 'self' 'wasm-unsafe-eval'"));
-        assert!(policy.contains("style-src 'self' https://fonts.googleapis.com"));
+        assert!(policy.contains("style-src 'self' 'unsafe-inline' https://fonts.googleapis.com"));
         assert!(policy.contains("font-src 'self' data: https://fonts.gstatic.com"));
         assert!(policy.contains("img-src 'self' data: blob:"));
         assert!(policy.contains("connect-src 'self'"));
+        assert!(policy.contains(NPM_ORIGIN));
+        assert!(policy.contains(PYPI_ORIGIN));
         assert!(policy.contains("frame-ancestors 'none'"));
         assert!(policy.contains("object-src 'none'"));
         assert!(policy.contains("base-uri 'self'"));
         assert!(policy.contains("form-action 'self'"));
-        assert!(!policy.contains("unsafe-inline"));
+        assert!(!policy.contains("script-src 'self' 'unsafe-inline'"));
         assert!(!policy.contains("'unsafe-eval'"));
     }
 
@@ -385,7 +394,9 @@ mod tests {
             &[],
         ));
 
-        assert!(policy.ends_with("connect-src 'self' http://127.0.0.1:9000 https://issuer.test"));
+        assert!(policy.ends_with(&format!(
+            "connect-src 'self' {NPM_ORIGIN} {PYPI_ORIGIN} http://127.0.0.1:9000 https://issuer.test"
+        )));
     }
 
     #[test]

@@ -92,7 +92,7 @@ impl CreateSourceConnectorOperation {
         }
 
         let now = SystemTime::now();
-        let connector_id = ulid::Ulid::r#gen();
+        let connector_id = ulid::Ulid::generate();
         let connector = SourceConnector::new(
             connector_id,
             self.input.group_id,
@@ -223,7 +223,7 @@ mod tests {
 
         let result = drive(
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
-                group_id: ulid::Ulid::r#gen(),
+                group_id: ulid::Ulid::generate(),
                 created_by: Default::default(),
                 name: "refdata".to_string(),
                 kind: SourceConnectorKind::S3,

@@ -10,7 +10,8 @@ use aruna_core::UserId;
 use aruna_core::structs::AuthContext;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::{
-    MetadataSearchExecution, MetadataSearchRequest, search_metadata as run_search_metadata,
+    BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
+    search_buckets_distributed, search_metadata as run_search_metadata,
 };
 use aruna_operations::search_groups::{SearchGroupsInput, SearchGroupsOperation};
 use aruna_operations::search_users::{SearchUsersInput, SearchUsersOperation};
@@ -25,26 +26,30 @@ use utoipa::{OpenApi, ToSchema};
 
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const MAX_SEARCH_LIMIT: usize = 100;
+const MAX_BUCKET_LIMIT: usize = 50;
 const SEARCH_TYPE_DOCUMENTS: &str = "documents";
+const SEARCH_TYPE_BUCKETS: &str = "buckets";
 const SEARCH_TYPE_GROUPS: &str = "groups";
 const SEARCH_TYPE_USERS: &str = "users";
 
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "search", description = "Unified realm search")),
-    paths(unified_search)
+    paths(unified_search, bucket_search)
 )]
 pub struct SearchApiDoc;
 
 pub fn router() -> Router<Arc<ServerState>> {
-    Router::new().route("/search", get(unified_search))
+    Router::new()
+        .route("/search", get(unified_search))
+        .route("/search/buckets", get(bucket_search))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct SearchParams {
     #[serde(default)]
     pub q: String,
-    /// Comma-separated subset of documents,groups,users. Defaults to all three.
+    /// Comma-separated subset of documents,buckets,groups,users. Defaults to all four.
     #[serde(default)]
     pub types: Option<String>,
     /// Per-section page size (default 10, clamped to 1..=100).
@@ -70,9 +75,37 @@ pub struct SearchResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub documents: Option<DocumentsSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub buckets: Option<BucketsSection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub groups: Option<GroupsSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub users: Option<UsersSection>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct BucketSearchParams {
+    #[serde(default)]
+    pub q: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BucketsSection {
+    pub hits: Vec<BucketHit>,
+    pub nodes_queried: usize,
+    pub nodes_failed: usize,
+    pub failed_nodes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BucketHit {
+    pub arn: String,
+    pub bucket: String,
+    pub node_id: String,
+    pub group_id: String,
+    pub group_name: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -116,6 +149,7 @@ pub struct UserHit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SearchTypes {
     documents: bool,
+    buckets: bool,
     groups: bool,
     users: bool,
 }
@@ -124,13 +158,14 @@ impl SearchTypes {
     fn all() -> Self {
         Self {
             documents: true,
+            buckets: true,
             groups: true,
             users: true,
         }
     }
 
     fn count(&self) -> usize {
-        self.documents as usize + self.groups as usize + self.users as usize
+        self.documents as usize + self.buckets as usize + self.groups as usize + self.users as usize
     }
 }
 
@@ -140,6 +175,7 @@ fn parse_search_types(types: Option<&str>) -> ServerResult<SearchTypes> {
     };
     let mut selected = SearchTypes {
         documents: false,
+        buckets: false,
         groups: false,
         users: false,
     };
@@ -150,6 +186,7 @@ fn parse_search_types(types: Option<&str>) -> ServerResult<SearchTypes> {
         }
         match value {
             SEARCH_TYPE_DOCUMENTS => selected.documents = true,
+            SEARCH_TYPE_BUCKETS => selected.buckets = true,
             SEARCH_TYPE_GROUPS => selected.groups = true,
             SEARCH_TYPE_USERS => selected.users = true,
             _ => return Err(ServerError::BadRequest),
@@ -165,11 +202,58 @@ fn parse_search_types(types: Option<&str>) -> ServerResult<SearchTypes> {
 
 #[utoipa::path(
     get,
+    path = "/search/buckets",
+    tag = "search",
+    params(
+        ("q" = String, Query, description = "Case-insensitive bucket-name substring"),
+        ("limit" = Option<usize>, Query, description = "Result limit (default 10, clamped to 1..=50)")
+    ),
+    responses(
+        (status = 200, description = "Authorized federated bucket matches", body = BucketsSection),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn bucket_search(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Query(params): Query<BucketSearchParams>,
+) -> ServerResult<(StatusCode, Json<BucketsSection>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let query = params.q.trim();
+    if query.chars().count() < MIN_SEARCH_QUERY_CHARS {
+        return Err(ServerError::BadRequest);
+    }
+    let result = search_buckets_distributed(
+        state.get_ctx().as_ref(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        BucketSearchRequest {
+            auth,
+            bearer_token: bearer_token.map(|carrier| carrier.as_str().to_string()),
+            query: query.to_string(),
+            limit: params
+                .limit
+                .unwrap_or(DEFAULT_SEARCH_LIMIT)
+                .clamp(1, MAX_BUCKET_LIMIT),
+            target_nodes: None,
+        },
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
+    Ok((StatusCode::OK, Json(map_bucket_section(result))))
+}
+
+#[utoipa::path(
+    get,
     path = "/search",
     tag = "search",
     params(
         ("q" = String, Query, description = "Search query; trimmed, minimum 2 characters"),
-        ("types" = Option<String>, Query, description = "Comma-separated subset of documents,groups,users. Defaults to all three; an unknown type returns 400"),
+        ("types" = Option<String>, Query, description = "Comma-separated subset of documents,buckets,groups,users. Defaults to all four; an unknown type returns 400"),
         ("limit" = Option<usize>, Query, description = "Per-section page size (default 10, clamped to 1..=100)"),
         ("cursor" = Option<String>, Query, description = "Opaque continuation token. Only accepted when exactly one type is requested"),
         ("group_id" = Option<String>, Query, description = "Documents-only: restrict metadata hits to a single group id"),
@@ -202,6 +286,8 @@ pub async fn unified_search(
             parse_group_id(cursor)?;
         } else if types.users {
             UserId::from_string(cursor).map_err(|_| ServerError::BadRequest)?;
+        } else if types.buckets {
+            return Err(ServerError::BadRequest);
         }
     }
     let q = params.q.trim().to_string();
@@ -215,19 +301,20 @@ pub async fn unified_search(
     let group_id = params.group_id.as_deref().map(parse_group_id).transpose()?;
     let bearer = bearer_token.map(|carrier| carrier.as_str().to_string());
 
-    let (documents, groups, users) = tokio::join!(
+    let (documents, buckets, groups, users) = tokio::join!(
         run_documents(
             &state,
             &auth,
             types.documents,
             &q,
-            bearer,
+            bearer.clone(),
             params.conforms_to.clone(),
             group_id,
             limit,
             params.cursor.clone(),
             params.mode.clone(),
         ),
+        run_buckets(&state, &auth, types.buckets, &q, bearer, limit),
         run_groups(&state, types.groups, &q, limit, params.cursor.clone()),
         run_users(&state, types.users, &q, limit, params.cursor.clone()),
     );
@@ -236,10 +323,68 @@ pub async fn unified_search(
         StatusCode::OK,
         Json(SearchResponse {
             documents: documents?,
+            buckets: buckets?,
             groups: groups?,
             users: users?,
         }),
     ))
+}
+
+async fn run_buckets(
+    state: &ServerState,
+    auth: &AuthContext,
+    requested: bool,
+    query: &str,
+    bearer_token: Option<String>,
+    limit: usize,
+) -> ServerResult<Option<BucketsSection>> {
+    if !requested {
+        return Ok(None);
+    }
+    let result = search_buckets_distributed(
+        state.get_ctx().as_ref(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        BucketSearchRequest {
+            auth: auth.clone(),
+            bearer_token,
+            query: query.to_string(),
+            limit: limit.min(MAX_BUCKET_LIMIT),
+            target_nodes: None,
+        },
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
+    Ok(Some(map_bucket_section(result)))
+}
+
+fn map_bucket_section(result: BucketSearchExecution) -> BucketsSection {
+    let mut failed_nodes = result
+        .fanout_stats
+        .failed_partitions
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if result.fanout_stats.discovery_failed {
+        failed_nodes.push("partition-discovery".to_string());
+    }
+    BucketsSection {
+        hits: result
+            .hits
+            .into_iter()
+            .map(|hit| BucketHit {
+                arn: hit.arn,
+                bucket: hit.bucket,
+                node_id: hit.node_id.to_string(),
+                group_id: hit.group_id.to_string(),
+                group_name: hit.group_name,
+                created_at: chrono::DateTime::<chrono::Utc>::from(hit.created_at).to_rfc3339(),
+            })
+            .collect(),
+        nodes_queried: result.fanout_stats.nodes_queried,
+        nodes_failed: result.fanout_stats.nodes_failed,
+        failed_nodes,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -370,10 +515,10 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, USER_KEYSPACE};
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE, USER_KEYSPACE};
     use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
-        RealmId, User,
+        Actor, BucketInfo, Group, GroupAuthorizationDocument, NodeCapabilities,
+        RealmAuthorizationDocument, RealmId, User,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::metadata::MetadataHandle;
@@ -385,6 +530,7 @@ mod tests {
     use aruna_tasks::TaskHandle;
     use byteview::ByteView;
     use ed25519_dalek::SigningKey;
+    use std::time::SystemTime;
     use tempfile::TempDir;
     use ulid::Ulid;
 
@@ -523,6 +669,20 @@ mod tests {
         let groups = [Ulid::from_bytes([1u8; 16]), Ulid::from_bytes([2u8; 16])];
         seed_group(&state, &actor, groups[0], "alpha-team").await;
         seed_group(&state, &actor, groups[1], "alpha-squad").await;
+        write_bytes(
+            &state,
+            S3_BUCKET_KEYSPACE,
+            b"alpha-bucket".to_vec(),
+            BucketInfo {
+                group_id: groups[0],
+                created_at: SystemTime::UNIX_EPOCH,
+                created_by: user_id,
+                cors_configuration: None,
+            }
+            .to_bytes()
+            .unwrap(),
+        )
+        .await;
 
         let users = [
             UserId::local(Ulid::from_bytes([1u8; 16]), realm),
@@ -621,8 +781,42 @@ mod tests {
         .await
         .unwrap();
         assert!(resp.documents.is_none());
+        assert!(resp.buckets.is_none());
         assert!(resp.groups.is_some());
         assert!(resp.users.is_some());
+    }
+
+    #[tokio::test]
+    async fn searches_buckets() {
+        let fx = setup().await;
+        let (_, Json(dedicated)) = bucket_search(
+            State(fx.state.clone()),
+            Extension(Some(fx.auth.clone())),
+            Extension(None),
+            Query(BucketSearchParams {
+                q: "bucket".to_string(),
+                limit: Some(10),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dedicated.hits.len(), 1);
+        assert_eq!(dedicated.hits[0].bucket, "alpha-bucket");
+        assert!(dedicated.hits[0].arn.ends_with(":s3/alpha-bucket"));
+
+        let unified = search(
+            &fx,
+            SearchParams {
+                types: Some("buckets".to_string()),
+                ..params("bucket")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(unified.documents.is_none());
+        assert_eq!(unified.buckets.unwrap().hits.len(), 1);
+        assert!(unified.groups.is_none());
+        assert!(unified.users.is_none());
     }
 
     #[tokio::test]
@@ -680,6 +874,16 @@ mod tests {
                 "{section} cursor should be rejected"
             );
         }
+        let result = search(
+            &fx,
+            SearchParams {
+                types: Some("buckets".to_string()),
+                cursor: Some("unsupported".to_string()),
+                ..params("alpha")
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::BadRequest)));
     }
 
     #[tokio::test]
@@ -850,6 +1054,8 @@ mod tests {
         assert!(documents.hits.is_empty());
         assert!(documents.next_cursor.is_none());
         assert!(!documents.truncated);
+        let buckets = resp.buckets.unwrap();
+        assert!(buckets.hits.is_empty());
         let groups = resp.groups.unwrap();
         assert!(groups.hits.is_empty());
         assert!(groups.next_cursor.is_none());

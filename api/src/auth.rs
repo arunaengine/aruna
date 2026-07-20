@@ -819,7 +819,7 @@ mod test {
         let realm_signing_key = SigningKey::generate(&mut csprng);
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_id = iroh::SecretKey::generate().public();
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let user_id = UserId::local(Ulid::generate(), realm_id);
         drive(
             CreateRealmOperation::new(CreateRealmConfig {
                 actor: Actor {
@@ -1224,7 +1224,7 @@ mod test {
     #[tokio::test]
     pub async fn test_token_capabilities() {
         let mut tempdir = temp_dir();
-        tempdir.push(Ulid::r#gen().to_string());
+        tempdir.push(Ulid::generate().to_string());
         let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
@@ -1264,7 +1264,7 @@ mod test {
 
         let time = chrono::Utc::now().timestamp() as u64;
         let expiry = None;
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let user_id = UserId::local(Ulid::generate(), realm_id);
 
         drive(
             RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
@@ -1399,7 +1399,7 @@ mod test {
     #[tokio::test]
     pub async fn test_unknown_token_user_is_rejected() {
         let mut tempdir = temp_dir();
-        tempdir.push(Ulid::r#gen().to_string());
+        tempdir.push(Ulid::generate().to_string());
         let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
@@ -1479,7 +1479,7 @@ mod test {
         .await;
 
         let time = chrono::Utc::now().timestamp() as u64;
-        let unknown_user = UserId::local(Ulid::r#gen(), realm_id);
+        let unknown_user = UserId::local(Ulid::generate(), realm_id);
         let token = drive(
             CreateTokenOperation::new(CreateTokenConfig {
                 time,
@@ -1515,7 +1515,7 @@ mod test {
     #[tokio::test]
     pub async fn test_token_validation() {
         let mut tempdir = temp_dir();
-        tempdir.push(Ulid::r#gen().to_string());
+        tempdir.push(Ulid::generate().to_string());
         let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
@@ -1560,7 +1560,7 @@ mod test {
                 .unwrap()
                 .timestamp() as u64,
         );
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let user_id = UserId::local(Ulid::generate(), realm_id);
 
         drive(
             RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
@@ -1769,11 +1769,11 @@ mod test {
         let issuer_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(issuer_key.verifying_key().to_bytes());
         let claims = TokenClaims {
-            sub: format!("{}@{}", Ulid::r#gen(), issuer_b64),
+            sub: format!("{}@{}", Ulid::generate(), issuer_b64),
             iss: issuer_b64,
             iat: now,
             exp: now + 600,
-            jti: Ulid::r#gen().to_string(),
+            jti: Ulid::generate().to_string(),
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,
@@ -1792,7 +1792,7 @@ mod test {
     #[tokio::test]
     async fn rejected_token_flood_keeps_issuer_cache_bounded() {
         let mut tempdir = temp_dir();
-        tempdir.push(Ulid::r#gen().to_string());
+        tempdir.push(Ulid::generate().to_string());
         let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
@@ -1851,7 +1851,7 @@ mod test {
     #[tokio::test]
     async fn valid_delegated_token_caches_single_issuer_key() {
         let mut tempdir = temp_dir();
-        tempdir.push(Ulid::r#gen().to_string());
+        tempdir.push(Ulid::generate().to_string());
         let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
@@ -1906,7 +1906,7 @@ mod test {
             CreateTokenOperation::new(CreateTokenConfig {
                 time: chrono::Utc::now().timestamp().max(0) as u64,
                 expiry: None,
-                user_id: UserId::local(Ulid::r#gen(), realm_id),
+                user_id: UserId::local(Ulid::generate(), realm_id),
                 realm_id,
                 node_capabilities: capabilities,
             })

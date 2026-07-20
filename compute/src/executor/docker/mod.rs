@@ -595,7 +595,7 @@ fn validate_spec(config: &DockerConfig, spec: &TaskSpec) -> Result<(), BackendEr
         ));
     }
     match (spec.staging_mode, security.network) {
-        (StagingMode::Files, NetworkAccess::Isolated)
+        (StagingMode::Files, NetworkAccess::Isolated | NetworkAccess::Open)
         | (StagingMode::DirectS3, NetworkAccess::Open) => {}
         (StagingMode::DirectS3, NetworkAccess::S3Only) => {
             return Err(BackendError::InvalidSpec(
@@ -1605,7 +1605,8 @@ fn inspect_to_status(inspect: ContainerInspectResponse) -> AttemptStatus {
         ContainerStateStatusEnum::RUNNING
         | ContainerStateStatusEnum::PAUSED
         | ContainerStateStatusEnum::RESTARTING
-        | ContainerStateStatusEnum::REMOVING => AttemptPhase::Running,
+        | ContainerStateStatusEnum::REMOVING
+        | ContainerStateStatusEnum::STOPPING => AttemptPhase::Running,
         ContainerStateStatusEnum::CREATED | ContainerStateStatusEnum::EMPTY => {
             AttemptPhase::Submitted
         }
@@ -1915,7 +1916,7 @@ mod tests {
 
         spec.security.run_as.uid = 65_534;
         spec.security.network = NetworkAccess::Open;
-        assert!(validate_spec(&config, &spec).is_err());
+        assert!(validate_spec(&config, &spec).is_ok());
 
         spec.security.network = NetworkAccess::Isolated;
         spec.security.read_only_rootfs = true;

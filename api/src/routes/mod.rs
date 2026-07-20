@@ -17,6 +17,7 @@ pub mod notifications;
 pub mod onboarding;
 pub mod search;
 pub mod staging;
+pub mod sync;
 pub mod tes;
 pub mod users;
 
@@ -27,6 +28,7 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
         .merge(blobs::router())
         .merge(drs::router())
         .merge(staging::router())
+        .merge(sync::router())
         .merge(connectors::router())
         .merge(credentials::router())
         .merge(groups::router())

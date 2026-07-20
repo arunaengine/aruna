@@ -721,11 +721,11 @@ mod test {
     }
 
     fn created_by() -> UserId {
-        UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32]))
+        UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]))
     }
 
     fn ordered_ulids(count: usize) -> Vec<Ulid> {
-        let mut ulids: Vec<Ulid> = (0..count).map(|_| Ulid::r#gen()).collect();
+        let mut ulids: Vec<Ulid> = (0..count).map(|_| Ulid::generate()).collect();
         ulids.sort();
         ulids
     }
@@ -737,7 +737,7 @@ mod test {
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: "path".to_string(),
-            ulid: Ulid::r#gen(),
+            ulid: Ulid::generate(),
             compressed: false,
             encrypted: false,
             created_by: created_by(),
@@ -971,7 +971,7 @@ mod test {
         seed_materialized(&storage_handle, "a", a_versions[0], [10u8; 32]).await;
         seed_materialized(&storage_handle, "a", a_versions[1], [11u8; 32]).await;
         seed_head(&storage_handle, "a", a_versions[1]).await;
-        let b_version = Ulid::r#gen();
+        let b_version = Ulid::generate();
         seed_materialized(&storage_handle, "b", b_version, [12u8; 32]).await;
         seed_head(&storage_handle, "b", b_version).await;
 
@@ -1031,7 +1031,7 @@ mod test {
         let driver_ctx = driver_context(storage_handle.clone());
 
         for (index, key) in ["a.txt", "dir/1", "dir/2", "z.txt"].iter().enumerate() {
-            let version_id = Ulid::r#gen();
+            let version_id = Ulid::generate();
             seed_materialized(&storage_handle, key, version_id, [index as u8 + 20; 32]).await;
             seed_head(&storage_handle, key, version_id).await;
         }
@@ -1072,7 +1072,7 @@ mod test {
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
 
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let source_metadata = SourceMetadata {
             content_length: 42,
             content_type: Some("text/plain".to_string()),
@@ -1139,7 +1139,7 @@ mod test {
         let driver_ctx = driver_context(storage_handle.clone());
 
         for (index, key) in ["b", "aa", "a/1"].iter().enumerate() {
-            let version_id = Ulid::r#gen();
+            let version_id = Ulid::generate();
             seed_materialized(&storage_handle, key, version_id, [index as u8 + 40; 32]).await;
             seed_head(&storage_handle, key, version_id).await;
         }
@@ -1176,7 +1176,7 @@ mod test {
         for (group, count) in [("a/", 4usize), ("b/", 3), ("c/", 1)] {
             for index in 0..count {
                 let key = format!("{group}{index}");
-                let version_id = Ulid::r#gen();
+                let version_id = Ulid::generate();
                 seed_materialized(&storage_handle, &key, version_id, [index as u8 + 60; 32]).await;
                 seed_head(&storage_handle, &key, version_id).await;
             }

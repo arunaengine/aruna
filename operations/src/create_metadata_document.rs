@@ -293,7 +293,7 @@ impl CreateMetadataDocumentOperation {
     }
 
     fn create_event_record(&self, record: &MetadataRegistryRecord) -> MetadataCreateEventRecord {
-        let event_id = Ulid::r#gen();
+        let event_id = Ulid::generate();
         let mut record = record.clone();
         record.last_event_id = event_id;
         let occurred_at_ms = record.created_at_ms;
@@ -681,7 +681,7 @@ mod tests {
     fn actor(realm_id: RealmId, key_byte: u8) -> Actor {
         Actor {
             node_id: iroh::SecretKey::from_bytes(&[key_byte; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
+            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
             realm_id,
         }
     }
@@ -759,7 +759,7 @@ mod tests {
         let realm_config = realm_config(&actor);
         let mut operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
             actor.clone(),
-            GroupId::r#gen(),
+            GroupId::generate(),
             document_id,
         ));
 
@@ -983,8 +983,8 @@ mod tests {
     fn generated_document_id_validates_then_appends_without_existing_read() {
         let realm_id = RealmId([11u8; 32]);
         let actor = actor(realm_id, 6);
-        let group_id = GroupId::r#gen();
-        let document_id = Ulid::r#gen();
+        let group_id = GroupId::generate();
+        let document_id = Ulid::generate();
         let mut operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
             actor.clone(),
             group_id,
@@ -1007,10 +1007,10 @@ mod tests {
         let realm_id = RealmId([21u8; 32]);
         let actor = actor(realm_id, 4);
         let realm_config = realm_config(&actor);
-        let document_id = Ulid::r#gen();
+        let document_id = Ulid::generate();
         let mut operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
             actor.clone(),
-            GroupId::r#gen(),
+            GroupId::generate(),
             document_id,
         ));
 
@@ -1032,8 +1032,8 @@ mod tests {
     fn create_checks_existing_after_validation_and_uses_local_holder() {
         let realm_id = RealmId([8u8; 32]);
         let actor = actor(realm_id, 1);
-        let group_id = GroupId::r#gen();
-        let document_id = Ulid::r#gen();
+        let group_id = GroupId::generate();
+        let document_id = Ulid::generate();
         let mut operation =
             CreateMetadataDocumentOperation::new(config(actor.clone(), group_id, document_id));
 
@@ -1076,8 +1076,8 @@ mod tests {
     fn create_returns_after_event_append_without_persistent_effects() {
         let realm_id = RealmId([12u8; 32]);
         let actor = actor(realm_id, 7);
-        let group_id = GroupId::r#gen();
-        let document_id = Ulid::r#gen();
+        let group_id = GroupId::generate();
+        let document_id = Ulid::generate();
         let mut operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
             actor.clone(),
             group_id,
@@ -1110,8 +1110,8 @@ mod tests {
     fn validation_failure_does_not_append_event() {
         let realm_id = RealmId([13u8; 32]);
         let actor = actor(realm_id, 8);
-        let group_id = GroupId::r#gen();
-        let document_id = Ulid::r#gen();
+        let group_id = GroupId::generate();
+        let document_id = Ulid::generate();
         let mut operation =
             CreateMetadataDocumentOperation::new(config(actor, group_id, document_id));
 
@@ -1136,8 +1136,8 @@ mod tests {
     fn create_event_append_failure_fails_without_projection_cleanup() {
         let realm_id = RealmId([10u8; 32]);
         let actor = actor(realm_id, 5);
-        let group_id = GroupId::r#gen();
-        let document_id = Ulid::r#gen();
+        let group_id = GroupId::generate();
+        let document_id = Ulid::generate();
         let mut operation =
             CreateMetadataDocumentOperation::new(config(actor.clone(), group_id, document_id));
 

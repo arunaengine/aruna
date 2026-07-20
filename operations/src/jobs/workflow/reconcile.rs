@@ -44,7 +44,6 @@ impl ExternalReconciler for ComputeReconciler {
         let JobPayload::Execution(mut spec) = record.payload.clone() else {
             return;
         };
-        spec.resolve_outputs(&JobRecord::workspace_bucket_name(job_id));
 
         // Take over with a fresh claim token, but only if the old holder is really gone.
         let (adopted, control) = match adopt_external_attempt(
@@ -105,6 +104,7 @@ impl ExternalReconciler for ComputeReconciler {
             .workspace_bucket
             .clone()
             .unwrap_or_else(|| JobRecord::workspace_bucket_name(job_id));
+        spec.resolve_outputs(&bucket);
         let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), intent.attempt_no);
         let fence = FenceContext {
             attempt: attempt.clone(),

@@ -1,5 +1,5 @@
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
-use aruna_core::structs::{MetadataRegistryRecord, RealmId};
+use aruna_core::structs::{MetadataRegistryRecord, RealmId, SyncRelationship};
 use aruna_core::types::{GroupId, UserId};
 use aruna_net::streams::BiStream;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -8,6 +8,7 @@ use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
 use crate::create_metadata_document::CreateMetadataDocumentPayload;
+use crate::s3::search_buckets::BucketSearchHit;
 use crate::update_metadata_document::UpdateMetadataDocumentMutation;
 
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
@@ -138,6 +139,25 @@ pub enum MetadataTransportMessage {
         object_iri: String,
         group_id: Option<GroupId>,
     },
+    SearchBuckets {
+        auth_token: Option<MetadataAuthToken>,
+        query: String,
+        limit: usize,
+    },
+    BucketSearchResults {
+        hits: Vec<BucketSearchHit>,
+    },
+    CreateSyncMirror {
+        auth_token: Option<MetadataAuthToken>,
+        source_group_id: GroupId,
+        relationship: Box<SyncRelationship>,
+    },
+    DeleteSyncMirror {
+        auth_token: Option<MetadataAuthToken>,
+        relationship: Box<SyncRelationship>,
+    },
+    SyncMirrorCreated,
+    SyncMirrorDeleted,
 }
 
 pub async fn write_message(
@@ -223,6 +243,11 @@ mod tests {
             object_iri: "https://example.com/profile".to_string(),
             group_id: None,
         });
+        assert_has_auth_token_field(MetadataTransportMessage::SearchBuckets {
+            auth_token: Some(MetadataAuthToken::bearer("bucket-token").unwrap()),
+            query: "dataset".to_string(),
+            limit: 10,
+        });
     }
 
     #[test]
@@ -289,6 +314,15 @@ mod tests {
             })
             .unwrap(),
             vec![10, 0]
+        );
+        assert_eq!(
+            postcard::to_allocvec(&MetadataTransportMessage::SearchBuckets {
+                auth_token: None,
+                query: String::new(),
+                limit: 0,
+            })
+            .unwrap(),
+            vec![12, 0, 0, 0]
         );
     }
 

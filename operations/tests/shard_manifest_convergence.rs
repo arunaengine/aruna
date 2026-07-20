@@ -54,7 +54,7 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
 -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([125u8; 32]);
     let (nodes, config) = build_realm_nodes(&realm_id, 2).await?;
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     let holders = [nodes[0].net.node_id(), nodes[1].net.node_id()];
 
     // The bucket is chosen from the canonical path (6.3.6), so documents sharing
@@ -62,7 +62,7 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
     // and choose from the same subject, so their choice is the shared shard this
     // test needs.
     let placement = shared_path_bucket(&config, &holders, realm_id, group_id);
-    let document_ids: Vec<Ulid> = (0..6).map(|_| Ulid::r#gen()).collect();
+    let document_ids: Vec<Ulid> = (0..6).map(|_| Ulid::generate()).collect();
 
     // Interleave the creates across the two holders.
     for (index, document_id) in document_ids.iter().enumerate() {
@@ -98,7 +98,7 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
         DeleteMetadataDocumentOperation::new(
             Actor {
                 node_id: nodes[0].net.node_id(),
-                user_id: UserId::local(Ulid::r#gen(), realm_id),
+                user_id: UserId::local(Ulid::generate(), realm_id),
                 realm_id,
             },
             group_id,
@@ -201,7 +201,7 @@ async fn create_document(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
             actor: Actor {
                 node_id: node.net.node_id(),
-                user_id: UserId::local(Ulid::r#gen(), realm_id),
+                user_id: UserId::local(Ulid::generate(), realm_id),
                 realm_id,
             },
             group_id,

@@ -73,15 +73,30 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[0].net.node_id();
     let watcher = user_with_holder(&config, holder, realm_id);
-    let uploader = UserId::local(Ulid::r#gen(), realm_id);
-    let group_id = Ulid::r#gen();
+    let uploader = UserId::local(Ulid::generate(), realm_id);
+    let credential_group = Ulid::generate();
+    let bucket_group = Ulid::generate();
     let data_node_id = nodes[1].net.node_id();
-    install_group_authorization(&nodes, realm_id, group_id, watcher).await?;
-    let prefix = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/");
-    let probe = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/probe");
+    install_group_authorization(&nodes, realm_id, credential_group, watcher).await?;
+    install_group_authorization(&nodes, realm_id, bucket_group, watcher).await?;
+    let prefix = data_watch_resource_path(credential_group, data_node_id, "bucket", "reports/");
+    let probe = data_watch_resource_path(bucket_group, data_node_id, "bucket", "reports/probe");
 
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
-    let subscription = create_watch_via(&nodes[0], watcher, &prefix, mask).await?;
+    // This models a persisted watch created by an already-expired bearer token.
+    let legacy_binding = WatchAuthorizationBinding {
+        expires_at_secs: 1,
+        ..Default::default()
+    };
+    let subscription = create_watch_for_user(
+        nodes[0].context.as_ref(),
+        nodes[0].net.node_id(),
+        watcher,
+        prefix.clone(),
+        mask,
+        legacy_binding,
+    )
+    .await?;
 
     // Node B must observe the holder's interest before the upload matches.
     wait_for_holder(
@@ -94,14 +109,14 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
     )
     .await?;
 
-    let event_id = Ulid::r#gen();
+    let event_id = Ulid::generate();
     let occurred_at_ms = unix_timestamp_millis();
     let event = upload_event(
         event_id,
         realm_id,
         uploader,
         UploadLocation {
-            group_id,
+            group_id: bucket_group,
             node_id: data_node_id,
             bucket: "bucket",
             key: "reports/q3/summary.csv",
@@ -151,13 +166,13 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
             assert_eq!(
                 path,
                 &data_watch_resource_path(
-                    group_id,
+                    bucket_group,
                     data_node_id,
                     "bucket",
                     "reports/q3/summary.csv"
                 )
             );
-            assert_eq!(*event_group_id, group_id);
+            assert_eq!(*event_group_id, bucket_group);
             assert_eq!(*event_node_id, data_node_id);
             assert_eq!(bucket, "bucket");
             assert_eq!(key, "reports/q3/summary.csv");
@@ -191,8 +206,8 @@ async fn same_node_delivery() -> Result<(), Box<dyn std::error::Error>> {
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[1].net.node_id();
     let watcher = user_with_holder(&config, holder, realm_id);
-    let uploader = UserId::local(Ulid::r#gen(), realm_id);
-    let group_id = Ulid::r#gen();
+    let uploader = UserId::local(Ulid::generate(), realm_id);
+    let group_id = Ulid::generate();
     let data_node_id = nodes[0].net.node_id();
     install_group_authorization(&nodes, realm_id, group_id, watcher).await?;
     let prefix = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/");
@@ -212,7 +227,7 @@ async fn same_node_delivery() -> Result<(), Box<dyn std::error::Error>> {
         vec![holder],
     );
 
-    let event_id = Ulid::r#gen();
+    let event_id = Ulid::generate();
     let occurred_at_ms = unix_timestamp_millis();
     let event = upload_event(
         event_id,
@@ -272,8 +287,8 @@ async fn unmatched_event_writes_nothing() -> Result<(), Box<dyn std::error::Erro
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[0].net.node_id();
     let watcher = user_with_holder(&config, holder, realm_id);
-    let uploader = UserId::local(Ulid::r#gen(), realm_id);
-    let group_id = Ulid::r#gen();
+    let uploader = UserId::local(Ulid::generate(), realm_id);
+    let group_id = Ulid::generate();
     let data_node_id = nodes[1].net.node_id();
     install_group_authorization(&nodes, realm_id, group_id, watcher).await?;
     let prefix = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/");
@@ -293,7 +308,7 @@ async fn unmatched_event_writes_nothing() -> Result<(), Box<dyn std::error::Erro
 
     // Path is outside every watched prefix even though real interest exists.
     let event = upload_event(
-        Ulid::r#gen(),
+        Ulid::generate(),
         realm_id,
         uploader,
         UploadLocation {
@@ -320,23 +335,22 @@ async fn unmatched_event_writes_nothing() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-// A matching event whose actor is the watcher itself is forwarded directly, but
-// the holder's expansion suppresses self-notify, so the watcher's inbox stays empty.
+// A matching event must notify its actor when the actor owns the watch.
 #[tokio::test]
-async fn self_authored_event_notifies_no_one() -> Result<(), Box<dyn std::error::Error>> {
+async fn self_event_delivers() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([92u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[0].net.node_id();
     let watcher = user_with_holder(&config, holder, realm_id);
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     let data_node_id = nodes[1].net.node_id();
     install_group_authorization(&nodes, realm_id, group_id, watcher).await?;
     let prefix = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/");
     let probe = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/probe");
 
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
-    create_watch_via(&nodes[0], watcher, &prefix, mask).await?;
+    let subscription = create_watch_via(&nodes[0], watcher, &prefix, mask).await?;
     wait_for_holder(
         &nodes[1],
         realm_id,
@@ -347,10 +361,9 @@ async fn self_authored_event_notifies_no_one() -> Result<(), Box<dyn std::error:
     )
     .await?;
 
-    // Actor == watcher and the path matches, so the origin forwards the event,
-    // proving the empty inbox is self-notify suppression rather than a missed match.
+    let event_id = Ulid::generate();
     let event = upload_event(
-        Ulid::r#gen(),
+        event_id,
         realm_id,
         watcher,
         UploadLocation {
@@ -363,15 +376,14 @@ async fn self_authored_event_notifies_no_one() -> Result<(), Box<dyn std::error:
     );
     emit_resource_watch_event(nodes[1].context.as_ref(), event).await;
 
-    sleep(NEGATIVE_WAIT).await;
-    for node in &nodes {
-        assert_eq!(
-            inbox_len(node).await,
-            0,
-            "a self-authored event must not notify the watcher"
-        );
-    }
-    assert!(list_via(&nodes[2], watcher).await.is_empty());
+    let expected_id = watch_notification_id(event_id, subscription.watch_id);
+    wait_for(POLL_TIMEOUT, || async {
+        list_via(&nodes[2], watcher)
+            .await
+            .iter()
+            .any(|record| record.notification_id == expected_id)
+    })
+    .await?;
 
     shutdown_nodes(nodes).await;
     Ok(())
@@ -387,7 +399,7 @@ async fn digest_converges_and_retracts_across_nodes() -> Result<(), Box<dyn std:
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[2].net.node_id();
     let watcher = user_with_holder(&config, holder, realm_id);
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     let prefix = format!("meta/{group_id}/datasets/team");
     let probe = format!("{prefix}/runs/run-42");
     install_group_authorization(&nodes, realm_id, group_id, watcher).await?;
@@ -445,7 +457,7 @@ async fn remote_create_surfaces_cap_conflict_over_the_wire()
     let holder = nodes[0].net.node_id();
     let owner = user_with_holder(&config, holder, realm_id);
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     let data_node_id = nodes[1].net.node_id();
     install_group_authorization(&nodes, realm_id, group_id, owner).await?;
 
@@ -495,7 +507,7 @@ async fn subscription_survives_inbox_holder_rerank() -> Result<(), Box<dyn std::
 
     let (watcher, old_holder, new_holder) =
         user_with_changed_holder(&reduced_config, &full_config, realm_id);
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
     let data_node_id = nodes[0].net.node_id();
     let prefix = data_watch_resource_path(group_id, data_node_id, "bucket", "reranked/");
     let probe = format!("{prefix}probe");
@@ -568,13 +580,13 @@ async fn subscription_survives_inbox_holder_rerank() -> Result<(), Box<dyn std::
         vec![subscription.clone()]
     );
 
-    let event_id = Ulid::r#gen();
+    let event_id = Ulid::generate();
     emit_resource_watch_event(
         nodes[1].context.as_ref(),
         upload_event(
             event_id,
             realm_id,
-            UserId::local(Ulid::r#gen(), realm_id),
+            UserId::local(Ulid::generate(), realm_id),
             UploadLocation {
                 group_id,
                 node_id: data_node_id,
@@ -737,7 +749,7 @@ fn user_with_holder(
     realm_id: RealmId,
 ) -> UserId {
     for _ in 0..10_000 {
-        let candidate = UserId::local(Ulid::r#gen(), realm_id);
+        let candidate = UserId::local(Ulid::generate(), realm_id);
         if matches!(resolve_inbox_holder(&candidate, realm_config), Ok(Some(node)) if node == holder)
         {
             return candidate;
@@ -752,7 +764,7 @@ fn user_with_changed_holder(
     realm_id: RealmId,
 ) -> (UserId, NodeId, NodeId) {
     for _ in 0..10_000 {
-        let candidate = UserId::local(Ulid::r#gen(), realm_id);
+        let candidate = UserId::local(Ulid::generate(), realm_id);
         let old_holder = resolve_inbox_holder(&candidate, before).unwrap().unwrap();
         let new_holder = resolve_inbox_holder(&candidate, after).unwrap().unwrap();
         if old_holder != new_holder {

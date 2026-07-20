@@ -129,8 +129,8 @@ pub fn usage_group_key(group_id: GroupId) -> Vec<u8> {
 
 /// Maintained usage aggregates. `stored_*` fields track physical,
 /// content-addressed blobs and are only meaningful on the global counter;
-/// `logical_bytes` sums materialized and reference version sizes and is the
-/// per-group quota basis.
+/// `logical_bytes` sums materialized version sizes and is the per-group quota
+/// basis; `referenced_bytes` reports external reference footprint separately.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UsageCounters {
     pub buckets: u64,
@@ -138,6 +138,7 @@ pub struct UsageCounters {
     pub stored_blobs: u64,
     pub stored_bytes: u64,
     pub logical_bytes: u64,
+    pub referenced_bytes: u64,
 }
 
 impl UsageCounters {
@@ -155,12 +156,18 @@ impl UsageCounters {
         let stored_blobs = apply_delta("stored_blobs", self.stored_blobs, delta.stored_blobs)?;
         let stored_bytes = apply_delta("stored_bytes", self.stored_bytes, delta.stored_bytes)?;
         let logical_bytes = apply_delta("logical_bytes", self.logical_bytes, delta.logical_bytes)?;
+        let referenced_bytes = apply_delta(
+            "referenced_bytes",
+            self.referenced_bytes,
+            delta.referenced_bytes,
+        )?;
 
         self.buckets = buckets;
         self.objects = objects;
         self.stored_blobs = stored_blobs;
         self.stored_bytes = stored_bytes;
         self.logical_bytes = logical_bytes;
+        self.referenced_bytes = referenced_bytes;
         Ok(())
     }
 
@@ -170,12 +177,18 @@ impl UsageCounters {
         let stored_blobs = add_counter("stored_blobs", self.stored_blobs, other.stored_blobs)?;
         let stored_bytes = add_counter("stored_bytes", self.stored_bytes, other.stored_bytes)?;
         let logical_bytes = add_counter("logical_bytes", self.logical_bytes, other.logical_bytes)?;
+        let referenced_bytes = add_counter(
+            "referenced_bytes",
+            self.referenced_bytes,
+            other.referenced_bytes,
+        )?;
 
         self.buckets = buckets;
         self.objects = objects;
         self.stored_blobs = stored_blobs;
         self.stored_bytes = stored_bytes;
         self.logical_bytes = logical_bytes;
+        self.referenced_bytes = referenced_bytes;
         Ok(())
     }
 }
@@ -187,6 +200,7 @@ pub struct UsageDelta {
     pub stored_blobs: i128,
     pub stored_bytes: i128,
     pub logical_bytes: i128,
+    pub referenced_bytes: i128,
 }
 
 impl UsageDelta {
@@ -281,6 +295,7 @@ mod tests {
                 stored_blobs: 3,
                 stored_bytes: 4,
                 logical_bytes: 5,
+                referenced_bytes: 6,
             })
             .unwrap();
 
@@ -289,6 +304,7 @@ mod tests {
         assert_eq!(counters.stored_blobs, 3);
         assert_eq!(counters.stored_bytes, 4);
         assert_eq!(counters.logical_bytes, 5);
+        assert_eq!(counters.referenced_bytes, 6);
     }
 
     #[test]
@@ -314,6 +330,7 @@ mod tests {
             stored_blobs: 3,
             stored_bytes: 4,
             logical_bytes: 5,
+            referenced_bytes: 6,
         };
         let bytes = counters.to_bytes().unwrap();
         assert_eq!(UsageCounters::from_bytes(&bytes).unwrap(), counters);

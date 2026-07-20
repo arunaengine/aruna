@@ -39,6 +39,10 @@ pub const HASH_PATHS_INDEX_KEYSPACE: &str = "hash_paths_index";
 pub const USER_ACCESS_KEYSPACE: &str = "user_access";
 pub const S3_BUCKET_KEYSPACE: &str = "s3_buckets";
 pub const S3_BUCKET_REPLICATION_KEYSPACE: &str = "s3_bucket_replication";
+pub const SYNC_RELATIONSHIP_OUT_KEYSPACE: &str = "sync_relationship_out";
+pub const SYNC_RELATIONSHIP_IN_KEYSPACE: &str = "sync_relationship_in";
+pub const SYNC_MIRROR_REPAIR_KEYSPACE: &str = "sync_mirror_repair";
+pub const SYNC_REFERENCE_STATE_KEYSPACE: &str = "sync_reference_state";
 pub const S3_MULTIPART_OBJECT_METADATA_KEYSPACE: &str = "s3_multipart_object_metadata";
 pub const S3_MULTIPART_UPLOAD_KEYSPACE: &str = "s3_multipart_uploads";
 pub const S3_MULTIPART_UPLOAD_PART_KEYSPACE: &str = "s3_multipart_upload_parts";
@@ -64,6 +68,7 @@ pub const JOB_OWNER_INDEX_KEYSPACE: &str = "job_owner_index";
 pub const JOB_DEDUP_INDEX_KEYSPACE: &str = "job_dedup_index";
 pub const JOB_RUN_CRATE_KEYSPACE: &str = "job_run_crate";
 pub const JOB_ATTEMPT_CONTROL_KEYSPACE: &str = "job_attempt_control";
+pub const STAGING_JOB_STATE_KEYSPACE: &str = "staging_job_state";
 
 pub const BUCKET_STATS_DB: &str = "bucket_stats";
 

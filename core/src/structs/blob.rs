@@ -653,8 +653,8 @@ mod tests {
         let now = SystemTime::now();
         let base = UserAccess {
             access_key: "access".into(),
-            user_identity: UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32])),
-            group_id: Ulid::r#gen(),
+            user_identity: UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
+            group_id: Ulid::generate(),
             secret: "secret".into(),
             expiry: now + Duration::from_secs(60),
             path_restrictions: None,
@@ -867,7 +867,7 @@ mod tests {
             root: "/data".to_string(),
             storage_bucket: "bucket".to_string(),
             backend_path: "object.bin".to_string(),
-            ulid: Ulid::r#gen(),
+            ulid: Ulid::generate(),
             compressed: false,
             encrypted: false,
             created_by: UserId::default(),

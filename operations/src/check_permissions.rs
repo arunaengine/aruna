@@ -451,7 +451,7 @@ mod test {
         let realm_signing_key: SigningKey = SigningKey::generate(&mut csprng);
         let pubkey = realm_signing_key.verifying_key().to_bytes();
         let realm_id = RealmId::from_bytes(pubkey);
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let path = format!("/{}/g/{}", realm_id, group_id.to_string());
         let (parsed_realm_id, parsed_group_id) =
             CheckPermissionsOperation::parse_path(&path).unwrap();
@@ -466,18 +466,18 @@ mod test {
         assert_eq!(realm_id, parsed_realm_id);
         assert!(parsed_group_id.is_none());
 
-        let path = format!("/abcd/g/{}", Ulid::r#gen().to_string());
+        let path = format!("/abcd/g/{}", Ulid::generate().to_string());
         assert!(CheckPermissionsOperation::parse_path(&path).is_err());
     }
 
     #[test]
     fn path_restrictions_enforce_whitelist_and_required_permission() {
         let realm_id = RealmId([0u8; 32]);
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let pattern = format!("/{realm_id}/g/{group_id}/meta/**");
         let mut operation = CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: AuthContext {
-                user_id: UserId::local(Ulid::r#gen(), realm_id),
+                user_id: UserId::local(Ulid::generate(), realm_id),
                 realm_id,
                 path_restrictions: Some(vec![PathRestriction {
                     pattern: pattern.clone(),
@@ -509,9 +509,9 @@ mod test {
     fn collect_roles_only_treats_same_realm_nil_as_public() {
         let realm_id = RealmId([1u8; 32]);
         let other_realm_id = RealmId([2u8; 32]);
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let role = Role {
-            role_id: Ulid::r#gen(),
+            role_id: Ulid::generate(),
             name: "foreign-nil".to_string(),
             permissions: HashMap::from([(
                 format!("/{realm_id}/g/{group_id}/data/**"),
@@ -536,12 +536,12 @@ mod test {
     #[test]
     fn public_grants_are_read_only_when_evaluating_permissions() {
         let realm_id = RealmId([2u8; 32]);
-        let group_id = Ulid::r#gen();
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::generate();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
         let path = format!("/{realm_id}/g/{group_id}/data/object");
 
         let public_write = Role {
-            role_id: Ulid::r#gen(),
+            role_id: Ulid::generate(),
             name: "public-write".to_string(),
             permissions: HashMap::from([(path.clone(), Permission::WRITE)]),
             assigned_users: HashSet::from([UserId::nil(realm_id)]),
@@ -562,7 +562,7 @@ mod test {
         );
 
         let public_direct_write = Role {
-            role_id: Ulid::r#gen(),
+            role_id: Ulid::generate(),
             name: "public-direct-write".to_string(),
             permissions: HashMap::from([(path.clone(), Permission::WRITE)]),
             assigned_users: HashSet::from([UserId::nil(realm_id), user_id]),
@@ -578,19 +578,19 @@ mod test {
         );
 
         let public_deny = Role {
-            role_id: Ulid::r#gen(),
+            role_id: Ulid::generate(),
             name: "public-deny".to_string(),
             permissions: HashMap::from([(path.clone(), Permission::DENY)]),
             assigned_users: HashSet::from([UserId::nil(realm_id)]),
         };
         let direct_read = Role {
-            role_id: Ulid::r#gen(),
+            role_id: Ulid::generate(),
             name: "direct-read".to_string(),
             permissions: HashMap::from([(path.clone(), Permission::READ)]),
             assigned_users: HashSet::from([user_id]),
         };
         let public_direct_deny = Role {
-            role_id: Ulid::r#gen(),
+            role_id: Ulid::generate(),
             name: "public-direct-deny".to_string(),
             permissions: HashMap::from([(path.clone(), Permission::DENY)]),
             assigned_users: HashSet::from([UserId::nil(realm_id), user_id]),
@@ -665,7 +665,7 @@ mod test {
         };
 
         let realm_id = RealmId([3u8; 32]);
-        let admin_id = UserId::local(Ulid::r#gen(), realm_id);
+        let admin_id = UserId::local(Ulid::generate(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
         let actor = Actor {
             node_id,
@@ -719,7 +719,7 @@ mod test {
                 actor: actor.clone(),
                 group_id,
                 role: aruna_core::structs::Role {
-                    role_id: Ulid::r#gen(),
+                    role_id: Ulid::generate(),
                     name: "public-read".to_string(),
                     permissions: HashMap::from([(
                         format!("/{realm_id}/g/{group_id}/data/**"),
@@ -767,7 +767,7 @@ mod test {
         // Authenticated strangers inherit public grants — signed access is
         // never weaker than unsigned access.
         let stranger = AuthContext {
-            user_id: UserId::local(Ulid::r#gen(), realm_id),
+            user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
         };
@@ -788,7 +788,7 @@ mod test {
                     actor: actor.clone(),
                     group_id,
                     role: aruna_core::structs::Role {
-                        role_id: Ulid::r#gen(),
+                        role_id: Ulid::generate(),
                         name: name.to_string(),
                         permissions: HashMap::from([(
                             format!("/{realm_id}/g/{group_id}/data/**"),
@@ -834,7 +834,7 @@ mod test {
         };
 
         let realm_id = RealmId([0u8; 32]);
-        let admin_id = UserId::local(Ulid::r#gen(), realm_id);
+        let admin_id = UserId::local(Ulid::generate(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
 
         let realm_config = CreateRealmConfig {
@@ -861,7 +861,7 @@ mod test {
         .await
         .unwrap();
 
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let user_id = UserId::local(Ulid::generate(), realm_id);
 
         let group_config = CreateGroupConfig {
             actor: aruna_core::structs::Actor {
@@ -890,7 +890,7 @@ mod test {
                 "/{}/g/{}/meta/{}",
                 realm_id,
                 group_id.to_string(),
-                Ulid::r#gen().to_string()
+                Ulid::generate().to_string()
             ),
             required_permission: Permission::WRITE,
         };
@@ -903,7 +903,7 @@ mod test {
         //
         let perm_config = CheckPermissionsConfig {
             auth_context: aruna_core::structs::AuthContext {
-                user_id: UserId::local(Ulid::r#gen(), realm_id),
+                user_id: UserId::local(Ulid::generate(), realm_id),
                 realm_id,
                 path_restrictions: None,
             },
@@ -911,7 +911,7 @@ mod test {
                 "/{}/g/{}/data/{}",
                 realm_id,
                 group_id.to_string(),
-                Ulid::r#gen().to_string()
+                Ulid::generate().to_string()
             ),
             required_permission: Permission::WRITE,
         };
@@ -931,8 +931,8 @@ mod test {
             path: format!(
                 "/{}/g/{}/data/{}",
                 realm_id,
-                Ulid::r#gen(),
-                Ulid::r#gen().to_string()
+                Ulid::generate(),
+                Ulid::generate().to_string()
             ),
             required_permission: Permission::WRITE,
         };
@@ -942,7 +942,7 @@ mod test {
         //
         // User is in group and has not sufficient permissions
         //
-        let reader = UserId::local(Ulid::r#gen(), realm_id);
+        let reader = UserId::local(Ulid::generate(), realm_id);
         let add_user_input = AddUserToGroupInput {
             actor: Actor {
                 node_id,
@@ -971,7 +971,7 @@ mod test {
                 "/{}/g/{}/meta/{}",
                 realm_id,
                 group_id.to_string(),
-                Ulid::r#gen().to_string()
+                Ulid::generate().to_string()
             ),
             required_permission: Permission::WRITE,
         };
@@ -988,7 +988,7 @@ mod test {
         //
         // Test DENY roles
         //
-        let denied_user = UserId::local(Ulid::r#gen(), realm_id);
+        let denied_user = UserId::local(Ulid::generate(), realm_id);
         let add_role_input = AddGroupRoleConfig {
             auth_context: aruna_core::structs::AuthContext {
                 user_id,
@@ -1003,7 +1003,7 @@ mod test {
             },
             group_id,
             role: aruna_core::structs::Role {
-                role_id: Ulid::r#gen(),
+                role_id: Ulid::generate(),
                 name: "denied".to_string(),
                 permissions: HashMap::from([(
                     format!("{}/g/{}/**", realm_id, group_id),
@@ -1026,7 +1026,7 @@ mod test {
                 "/{}/g/{}/meta/{}",
                 realm_id,
                 group_id.to_string(),
-                Ulid::r#gen().to_string()
+                Ulid::generate().to_string()
             ),
             required_permission: Permission::READ,
         };
@@ -1042,7 +1042,7 @@ mod test {
                 realm_id,
                 path_restrictions: None,
             },
-            path: format!("/{}/admin/roles/{}", realm_id, Ulid::r#gen().to_string()),
+            path: format!("/{}/admin/roles/{}", realm_id, Ulid::generate().to_string()),
             required_permission: Permission::READ,
         };
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
@@ -1057,7 +1057,7 @@ mod test {
                 realm_id,
                 path_restrictions: None,
             },
-            path: format!("/{}/admin/roles/{}", realm_id, Ulid::r#gen().to_string()),
+            path: format!("/{}/admin/roles/{}", realm_id, Ulid::generate().to_string()),
             required_permission: Permission::WRITE,
         };
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
@@ -1077,7 +1077,7 @@ mod test {
                 }
             })
             .collect();
-        let new_admin = UserId::local(Ulid::r#gen(), realm_id);
+        let new_admin = UserId::local(Ulid::generate(), realm_id);
 
         let add_user_input = AddUserToRealmRolesInput {
             actor: Actor {
@@ -1099,7 +1099,7 @@ mod test {
                 realm_id,
                 path_restrictions: None,
             },
-            path: format!("/{}/admin/roles/{}", realm_id, Ulid::r#gen().to_string()),
+            path: format!("/{}/admin/roles/{}", realm_id, Ulid::generate().to_string()),
             required_permission: Permission::WRITE,
         };
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());

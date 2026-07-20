@@ -233,7 +233,7 @@ mod tests {
             recipient,
             NotificationClass::Direct,
             NotificationKind::AddedToGroup {
-                group_id: Ulid::r#gen(),
+                group_id: Ulid::generate(),
                 actor_user_id: user(recipient.realm_id.0[0], 200),
             },
             created_at_ms,
@@ -418,7 +418,7 @@ mod tests {
         let recipient = user(1, 1);
         let original = record(recipient, 10);
         let mut mismatched = original.clone();
-        mismatched.notification_id = Ulid::r#gen();
+        mismatched.notification_id = Ulid::generate();
         assert!(matches!(
             context
                 .storage_handle

@@ -126,17 +126,17 @@ async fn manifest_request_rejected_from_sync_eligible_non_holder()
 async fn new_holder_verifies_shard_against_co_holder() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([124u8; 32]);
     let (nodes, _config) = build_realm_nodes(&realm_id, 2).await?;
-    let group_id = Ulid::r#gen();
+    let group_id = Ulid::generate();
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
-                user_id: UserId::local(Ulid::r#gen(), realm_id),
+                user_id: UserId::local(Ulid::generate(), realm_id),
                 realm_id,
             },
             group_id,
-            document_id: Ulid::r#gen(),
+            document_id: Ulid::generate(),
             document_path: "datasets/verify-canary".to_string(),
             public: true,
             payload: CreateMetadataDocumentPayload::Scaffold {
@@ -256,7 +256,7 @@ async fn install_config_without_placements(
 ) -> Result<RealmConfigDocument, Box<dyn std::error::Error>> {
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     let strategy = PlacementStrategy {
-        strategy_id: Ulid::r#gen(),
+        strategy_id: Ulid::generate(),
         name: "default".to_string(),
         replica_count: None,
         distinct_locations: false,

@@ -501,7 +501,7 @@ mod tests {
     async fn create_connector(context: &DriverContext) -> SourceConnector {
         drive(
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
-                group_id: ulid::Ulid::r#gen(),
+                group_id: ulid::Ulid::generate(),
                 created_by: Default::default(),
                 name: "ftp-source".to_string(),
                 kind: SourceConnectorKind::Ftp,
@@ -525,7 +525,7 @@ mod tests {
     }
 
     async fn write_reference_version(context: &DriverContext, source: VersionSourceBinding) {
-        let version_id = ulid::Ulid::r#gen();
+        let version_id = ulid::Ulid::generate();
         let key = VersionKey::new("bucket", "key", version_id)
             .to_bytes()
             .unwrap();
@@ -580,7 +580,7 @@ mod tests {
     }
 
     fn reference_blob_version(connector_id: Ulid) -> BlobVersion {
-        let connector = replacement_connector(Ulid::r#gen(), connector_id);
+        let connector = replacement_connector(Ulid::generate(), connector_id);
         let source = build_version_source_binding(
             StagingStrategy::Reference,
             &connector,
@@ -673,7 +673,7 @@ mod tests {
         });
         operation.state = ReplaceSourceConnectorState::ScanReferenceVersions;
         operation.txn_id = Some(txn_id);
-        operation.replacement = Some(replacement_connector(Ulid::r#gen(), connector_id));
+        operation.replacement = Some(replacement_connector(Ulid::generate(), connector_id));
         operation.replacement_secret = Some(connector_secret(connector_id, "bob"));
 
         let effects = operation.step(Event::Storage(StorageEvent::IterResult {
@@ -714,7 +714,7 @@ mod tests {
 
         let created = drive(
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
-                group_id: ulid::Ulid::r#gen(),
+                group_id: ulid::Ulid::generate(),
                 created_by: Default::default(),
                 name: "old".to_string(),
                 kind: SourceConnectorKind::Http,

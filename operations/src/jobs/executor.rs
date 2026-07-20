@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aruna_core::structs::{JobError, JobPayload, JobProgress, JobResultPayload};
+use aruna_core::structs::{JobError, JobId, JobPayload, JobProgress, JobResultPayload};
 use tokio_util::sync::CancellationToken;
 
 use crate::driver::DriverContext;
@@ -34,6 +34,10 @@ impl ProgressReporter {
         *self.inner.total.lock().expect("progress mutex poisoned") = Some(total);
     }
 
+    pub fn set_current(&self, current: u64) {
+        self.inner.current.store(current, Ordering::Relaxed);
+    }
+
     pub fn advance(&self, delta: u64) {
         self.inner.current.fetch_add(delta, Ordering::Relaxed);
     }
@@ -49,6 +53,7 @@ impl ProgressReporter {
 
 pub struct JobContext {
     pub driver: Arc<DriverContext>,
+    pub job_id: JobId,
     pub claim_token: ulid::Ulid,
     /// User-initiated cancel: terminal `Cancelled` plus cleanup.
     pub cancel: CancellationToken,
@@ -102,6 +107,7 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
             )
             .await
         }
+        JobPayload::Staging(spec) => crate::jobs::staging::run_staging_job(ctx, spec).await,
         // Guard: an execution job must run through the external attempt path.
         JobPayload::Execution(_) => JobRunOutcome::Failed(JobError::permanent(
             "execution payload dispatched through the in-process seam",
@@ -119,6 +125,7 @@ pub fn run_cleanup(payload: &JobPayload) {
             }
         }
         JobPayload::Execution(_)
+        | JobPayload::Staging(_)
         | JobPayload::WriteRunCrate { .. }
         | JobPayload::TerminalCleanup { .. } => {}
     }

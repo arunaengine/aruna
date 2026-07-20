@@ -51,6 +51,7 @@ use crate::list_groups::ListGroupOperation;
 use crate::list_metadata_documents::ListMetadataDocumentsOperation;
 use crate::metadata::repository::{LIST_METADATA_PAGE_SIZE, StorageReadError};
 use crate::placement::resolve_shard_holders;
+use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, SearchBucketsOperation};
 
 const DEFAULT_LIST_METADATA_LIMIT: usize = 50;
 const MAX_LIST_METADATA_LIMIT: usize = 1_000;
@@ -194,6 +195,21 @@ pub struct MetadataSearchExecution {
     pub hits: Vec<MetadataSearchHit>,
     pub next_cursor: Option<String>,
     pub truncated: bool,
+    pub fanout_stats: MetadataFanoutStats,
+}
+
+#[derive(Debug, Clone)]
+pub struct BucketSearchRequest {
+    pub auth: AuthContext,
+    pub bearer_token: Option<String>,
+    pub query: String,
+    pub limit: usize,
+    pub target_nodes: Option<Vec<NodeId>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BucketSearchExecution {
+    pub hits: Vec<BucketSearchHit>,
     pub fanout_stats: MetadataFanoutStats,
 }
 
@@ -1410,6 +1426,7 @@ where
 enum MetadataFanoutOperation {
     Query,
     Search,
+    BucketSearch,
 }
 
 impl MetadataFanoutOperation {
@@ -1417,6 +1434,7 @@ impl MetadataFanoutOperation {
         match self {
             Self::Query => "query",
             Self::Search => "search",
+            Self::BucketSearch => "bucket_search",
         }
     }
 
@@ -1444,6 +1462,14 @@ fn metadata_fanout_node_span(
         ),
         MetadataFanoutOperation::Search => debug_span!(
             "metadata.operation.search_node",
+            peer = ?node_id,
+            local,
+            elapsed_ms = field::Empty,
+            hit_count = field::Empty,
+            result = field::Empty,
+        ),
+        MetadataFanoutOperation::BucketSearch => debug_span!(
+            "metadata.operation.bucket_search_node",
             peer = ?node_id,
             local,
             elapsed_ms = field::Empty,
@@ -1573,8 +1599,10 @@ where
             }
             let all_nodes = nodes.clone();
             let mut failed_partitions = Vec::new();
-            if matches!(operation, MetadataFanoutOperation::Query)
-                && nodes.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES
+            if matches!(
+                operation,
+                MetadataFanoutOperation::Query | MetadataFanoutOperation::BucketSearch
+            ) && nodes.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES
             {
                 if let Some(local_index) = nodes
                     .iter()
@@ -1603,8 +1631,11 @@ where
                 .map(|(index, node_id)| (node_id, index))
                 .collect::<HashMap<_, _>>();
             let mut outstanding = nodes.iter().copied().collect::<HashSet<_>>();
-            let deadline = matches!(operation, MetadataFanoutOperation::Query)
-                .then(|| tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE);
+            let deadline = matches!(
+                operation,
+                MetadataFanoutOperation::Query | MetadataFanoutOperation::BucketSearch
+            )
+            .then(|| tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE);
 
             let pending =
                 stream::iter(nodes.into_iter().enumerate().map(|(node_index, node_id)| {
@@ -1680,6 +1711,85 @@ where
                     .collect(),
                 fanout_stats,
             ))
+        }
+    }
+}
+
+pub async fn search_buckets_distributed(
+    context: &DriverContext,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    request: BucketSearchRequest,
+) -> Result<BucketSearchExecution, MetadataApiError> {
+    let limit = request.limit.clamp(1, 50);
+    let handle = context
+        .metadata_handle
+        .clone()
+        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
+    let remote_auth_token = metadata_auth_token_from_bearer(request.bearer_token.as_deref());
+    let local_call: MetadataNodeCall<Vec<BucketSearchHit>> = metadata_node_call(
+        (
+            context.clone(),
+            request.auth,
+            realm_id,
+            request.query.clone(),
+            limit,
+        ),
+        |(context, auth, realm_id, query, limit), node_id| async move {
+            drive(
+                SearchBucketsOperation::new(SearchBucketsInput {
+                    auth,
+                    realm_id,
+                    node_id,
+                    query,
+                    limit,
+                }),
+                &context,
+            )
+            .await
+            .map_err(|error| MetadataError::Backend(error.to_string()))
+        },
+    );
+    let remote_call: MetadataNodeCall<Vec<BucketSearchHit>> = metadata_node_call(
+        (handle, remote_auth_token, request.query, limit),
+        |(handle, auth_token, query, limit), node_id| async move {
+            handle
+                .request_bucket_search(node_id, auth_token, query, limit)
+                .await
+        },
+    );
+    let (parts, fanout_stats) = run_metadata_fanout(
+        context,
+        realm_id,
+        local_node_id,
+        MetadataFanoutScope::new(
+            Some(MetadataApiQueryMode::Distributed),
+            request.target_nodes,
+            true,
+        ),
+        MetadataFanoutOperation::BucketSearch,
+        local_call,
+        remote_call,
+        record_bucket_result,
+        map_metadata_internal_error,
+    )
+    .await?;
+    let mut hits = parts
+        .into_iter()
+        .flat_map(|(_, hits)| hits)
+        .collect::<Vec<_>>();
+    hits.truncate(limit);
+    Ok(BucketSearchExecution { hits, fanout_stats })
+}
+
+fn record_bucket_result(span: &Span, result: &Result<Vec<BucketSearchHit>, MetadataError>) {
+    match result {
+        Ok(hits) => {
+            span.record("result", "ok");
+            span.record("hit_count", hits.len() as u64);
+        }
+        Err(_) => {
+            span.record("result", "error");
         }
     }
 }
@@ -2055,6 +2165,9 @@ mod tests {
 
     use std::collections::BTreeMap;
 
+    use aruna_storage::storage;
+    use tempfile::tempdir;
+
     #[test]
     fn deduplicates_select_rows_from_multiple_nodes() {
         let results = aggregate_query_results(
@@ -2199,7 +2312,7 @@ mod tests {
         let remote_node_id = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
         let stale_node_id = iroh::SecretKey::from_bytes(&[23u8; 32]).public();
         let realm_id = RealmId([3u8; 32]);
-        let document_id = Ulid::r#gen();
+        let document_id = Ulid::generate();
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
         config.seed_default_placement();
         config.ensure_node(local_node_id, aruna_core::structs::RealmNodeKind::Server);
@@ -2217,7 +2330,7 @@ mod tests {
 
         let record = MetadataRegistryRecord {
             realm_id,
-            group_id: Ulid::r#gen(),
+            group_id: Ulid::generate(),
             document_id,
             document_path: "datasets/query-targets".to_string(),
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
@@ -2251,6 +2364,56 @@ mod tests {
             deduplicate_fanout_nodes(vec![first, second, first, third, second]),
             vec![first, second, third]
         );
+    }
+
+    #[tokio::test]
+    async fn bucket_fanout_partial() {
+        let directory = tempdir().unwrap();
+        let context = DriverContext {
+            storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap())
+                .unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let local = iroh::SecretKey::from_bytes(&[41u8; 32]).public();
+        let healthy = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
+        let failed = iroh::SecretKey::from_bytes(&[43u8; 32]).public();
+        let local_call: MetadataNodeCall<usize> =
+            metadata_node_call((), |(), _| async move { Ok(1) });
+        let remote_call: MetadataNodeCall<usize> =
+            metadata_node_call(failed, |failed, node_id| async move {
+                if node_id == failed {
+                    Err(MetadataError::Backend("offline".to_string()))
+                } else {
+                    Ok(2)
+                }
+            });
+
+        let (parts, stats) = run_metadata_fanout(
+            &context,
+            RealmId::from_bytes([9u8; 32]),
+            local,
+            MetadataFanoutScope::new(
+                Some(MetadataApiQueryMode::Distributed),
+                Some(vec![local, healthy, failed]),
+                true,
+            ),
+            MetadataFanoutOperation::BucketSearch,
+            local_call,
+            remote_call,
+            |_, _| {},
+            map_metadata_internal_error,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(parts, vec![(local, 1), (healthy, 2)]);
+        assert_eq!(stats.nodes_queried, 3);
+        assert_eq!(stats.nodes_failed, 1);
+        assert_eq!(stats.failed_partitions, vec![failed]);
     }
 
     #[test]

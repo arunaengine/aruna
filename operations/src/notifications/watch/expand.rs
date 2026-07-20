@@ -1,10 +1,7 @@
-use aruna_core::auth::TOKEN_REVOCATION_LIST_KEY;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    API_STATE_KEYSPACE, AUTH_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
-};
+use aruna_core::keyspaces::{AUTH_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE};
 use aruna_core::metrics::WatchAuthorizationMetricReason;
 use aruna_core::structs::{
     NotificationRecord, RealmId, WatchEvent, WatchEventDetail, WatchSubscription,
@@ -151,7 +148,9 @@ async fn stage_watch_expansion(
     for (_, event, _) in &candidates {
         let group_id = match &event.detail {
             WatchEventDetail::MetadataCreated { group_id, .. }
-            | WatchEventDetail::DataUploaded { group_id, .. } => *group_id,
+            | WatchEventDetail::DataUploaded { group_id, .. }
+            | WatchEventDetail::SyncCompleted { group_id, .. }
+            | WatchEventDetail::SyncFailed { group_id, .. } => *group_id,
         };
         let key: Key = group_id.to_bytes().to_vec().into();
         if !reads
@@ -161,10 +160,6 @@ async fn stage_watch_expansion(
             reads.push((AUTH_KEYSPACE.to_string(), key));
         }
     }
-    reads.push((
-        API_STATE_KEYSPACE.to_string(),
-        TOKEN_REVOCATION_LIST_KEY.into(),
-    ));
     let expected_count = reads.len();
     let guarded = match context
         .storage_handle
@@ -307,15 +302,17 @@ mod tests {
     use aruna_core::keyspaces::{AUTH_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE};
     use aruna_core::structs::{
         Actor, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmNodeKind, WatchEventDetail, WatchEventKind, WatchEventMask,
-        blob_object_permission_path, data_watch_resource_path,
+        RealmConfigDocument, RealmNodeKind, WatchAuthorizationBinding, WatchEventDetail,
+        WatchEventKind, WatchEventMask, blob_object_permission_path, data_watch_resource_path,
     };
     use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    use crate::notifications::watch::subscriptions::create_watch_subscription;
+    use crate::notifications::watch::subscriptions::{
+        create_replicated_watch_subscription, create_watch_subscription,
+    };
 
     fn temp_context() -> (tempfile::TempDir, DriverContext) {
         let dir = tempdir().expect("temp dir");
@@ -433,11 +430,17 @@ mod tests {
         let actor = user(realm, 2);
         let group_id = Ulid::from_bytes([3u8; 16]);
         install_authorization(&context, realm, local_node_id, group_id, owner).await;
-        create_watch_subscription(
-            &context.storage_handle,
+        let expired_binding = WatchAuthorizationBinding {
+            expires_at_secs: 1,
+            ..Default::default()
+        };
+        create_replicated_watch_subscription(
+            &context,
+            local_node_id,
             owner,
             data_watch_resource_path(group_id, local_node_id, "bucket", ""),
             WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            expired_binding,
             1,
         )
         .await
@@ -464,7 +467,7 @@ mod tests {
         let realm = RealmId([1u8; 32]);
         let (local_node_id, config) = local_config(realm);
         let actor = user(realm, 2);
-        let events = vec![upload_event(realm, actor, Ulid::r#gen(), local_node_id)];
+        let events = vec![upload_event(realm, actor, Ulid::generate(), local_node_id)];
         assert_eq!(
             expand_watch_events(&context, realm, &config, local_node_id, &events)
                 .await

@@ -46,7 +46,7 @@ pub struct GroupAuthorizationDocument {
 impl GroupAuthorizationDocument {
     pub fn new_default_group_doc(user_id: UserId, realm_id: RealmId, group_id: GroupId) -> Self {
         let mut roles = HashMap::new();
-        let admin = Ulid::r#gen();
+        let admin = Ulid::generate();
         roles.insert(
             admin,
             Role {
@@ -60,7 +60,7 @@ impl GroupAuthorizationDocument {
             },
         );
 
-        let user = Ulid::r#gen();
+        let user = Ulid::generate();
         roles.insert(
             user,
             Role {
@@ -84,7 +84,7 @@ impl GroupAuthorizationDocument {
             },
         );
 
-        let viewer = Ulid::r#gen();
+        let viewer = Ulid::generate();
         roles.insert(
             viewer,
             Role {
@@ -126,14 +126,14 @@ mod test {
     pub fn test_group_conversion() {
         let group = Group {
             display_name: "A group".to_string(),
-            group_id: Ulid::r#gen(),
+            group_id: Ulid::generate(),
             realm_id: RealmId([0u8; 32]),
-            roles: HashSet::from([Ulid::r#gen(), Ulid::r#gen()]),
-            owner: UserId::local(Ulid::r#gen(), RealmId([0u8; 32])),
+            roles: HashSet::from([Ulid::generate(), Ulid::generate()]),
+            owner: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
-            user_id: UserId::local(Ulid::r#gen(), RealmId([0u8; 32])),
+            user_id: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
             realm_id: RealmId([0u8; 32]),
         };
         let bytes = group.to_bytes(&actor).unwrap();
@@ -145,13 +145,13 @@ mod test {
     #[test]
     pub fn test_group_auth_doc_conversion() {
         let auth_doc = GroupAuthorizationDocument::new_default_group_doc(
-            UserId::local(Ulid::r#gen(), RealmId([0u8; 32])),
+            UserId::local(Ulid::generate(), RealmId([0u8; 32])),
             RealmId([0u8; 32]),
-            Ulid::r#gen(),
+            Ulid::generate(),
         );
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
-            user_id: UserId::local(Ulid::r#gen(), RealmId([0u8; 32])),
+            user_id: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
             realm_id: RealmId([0u8; 32]),
         };
         let bytes = auth_doc.to_bytes(&actor).unwrap();

@@ -872,7 +872,7 @@ mod tests {
 
     fn registry_record(group_id: Ulid, path: &str) -> MetadataRegistryRecord {
         let realm_id = RealmId::from_bytes([7u8; 32]);
-        let document_id = Ulid::r#gen();
+        let document_id = Ulid::generate();
         MetadataRegistryRecord {
             realm_id,
             group_id,

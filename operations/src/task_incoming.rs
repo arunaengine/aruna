@@ -74,6 +74,9 @@ use crate::s3::refresh_reference_metadata::{
     REFERENCE_METADATA_REFRESH_RETRY_AFTER, process_reference_metadata_refresh_batch,
     restore_reference_metadata_refresh_timer,
 };
+use crate::sync_mirror_repair::{
+    MIRROR_REPAIR_RETRY_AFTER, process_mirror_repairs, restore_mirror_timer,
+};
 use crate::sync_placement::{
     DOCUMENT_SYNC_DEFER_RETRY_AFTER, SHARD_TOPIC_PULL_RETRY_AFTER, SHARD_TOPIC_PULL_RETRY_MAX,
     SYNC_PLACEMENT_RETRY_AFTER,
@@ -458,21 +461,21 @@ impl OperationsTaskHandler {
             after,
         };
         if let Err(message) = persist_task_effect(&self.context.storage_handle, &effect).await {
-            warn!(key = ?key, message = %message, "Failed to persist timer re-arm");
+            warn!(task_id = ?key, message = %message, "Failed to persist timer re-arm");
             return false;
         }
         let Some(task_handle) = self.context.task_handle.as_ref() else {
-            warn!(key = ?key, "Cannot re-arm failed timer without task handle");
+            warn!(task_id = ?key, "Cannot re-arm failed timer without task handle");
             return false;
         };
         match task_handle.send_effect(Effect::Task(effect)).await {
             Event::Task(TaskEvent::TimerScheduled { .. }) => true,
             Event::Task(TaskEvent::Error { message, .. }) => {
-                warn!(key = ?key, message = %message, "Failed to re-arm failed timer");
+                warn!(task_id = ?key, message = %message, "Failed to re-arm failed timer");
                 false
             }
             other => {
-                warn!(key = ?key, event = ?other, "Unexpected timer re-arm result");
+                warn!(task_id = ?key, event = ?other, "Unexpected timer re-arm result");
                 false
             }
         }
@@ -481,17 +484,18 @@ impl OperationsTaskHandler {
     // Kicks the placement reconciler immediately (not persisted; it is re-derived
     // from the realm config at startup by `restore_shard_subscriptions`).
     async fn schedule_sync_placements(&self, realm_id: RealmId, node_id: aruna_core::NodeId) {
+        let task_id = TaskKey::SyncPlacements { realm_id, node_id };
         let Some(task_handle) = self.context.task_handle.as_ref() else {
-            warn!("Cannot schedule shard placement sync without task handle");
+            warn!(task_id = ?task_id, "Cannot schedule shard placement sync without task handle");
             return;
         };
         let effect = Effect::Task(TaskEffect::ResetTimer {
-            key: TaskKey::SyncPlacements { realm_id, node_id },
+            key: task_id.clone(),
             after: Duration::ZERO,
         });
         if let Event::Task(TaskEvent::Error { message, .. }) = task_handle.send_effect(effect).await
         {
-            warn!(message = %message, "Failed to schedule shard placement sync after local realm config change");
+            warn!(task_id = ?task_id, message = %message, "Failed to schedule shard placement sync after local realm config change");
         }
     }
 
@@ -500,7 +504,7 @@ impl OperationsTaskHandler {
         let drain_started = Instant::now();
 
         let Some(net_handle) = self.context.net_handle.as_ref() else {
-            warn!(key = ?retry_key, "Cannot drain document sync outbox without net handle");
+            warn!(task_id = ?retry_key, "Cannot drain document sync outbox without net handle");
             self.reschedule_with_backoff(retry_key).await;
             return;
         };
@@ -553,7 +557,7 @@ impl OperationsTaskHandler {
             {
                 Ok(batch) => batch,
                 Err(error) => {
-                    warn!(error = %error, "Failed to read document sync outbox record");
+                    warn!(task_id = ?retry_key, error = %error, "Failed to read document sync outbox record");
                     read_failed = true;
                     break;
                 }
@@ -800,7 +804,7 @@ impl OperationsTaskHandler {
                         },
                     )) => {
                         warn!(
-                            key = ?retry_key,
+                            task_id = ?retry_key,
                             published = published_indices.len(),
                             retry = retry_indices.len(),
                             error = %error,
@@ -815,7 +819,7 @@ impl OperationsTaskHandler {
                             }
                             Some(_) => {}
                             None => {
-                                warn!(key = ?retry_key, "Invalid partial document publish indices");
+                                warn!(task_id = ?retry_key, "Invalid partial document publish indices");
                             }
                         }
                     }
@@ -823,15 +827,15 @@ impl OperationsTaskHandler {
                         error,
                         ..
                     })) => {
-                        warn!(key = ?retry_key, error = %error, "Failed to create local document sync batch");
+                        warn!(task_id = ?retry_key, error = %error, "Failed to create local document sync batch");
                         totals.retry_needed = true;
                     }
                     Event::Net(NetEvent::Error(error)) => {
-                        warn!(key = ?retry_key, error = ?error, "Failed to create local document sync batch");
+                        warn!(task_id = ?retry_key, error = ?error, "Failed to create local document sync batch");
                         totals.retry_needed = true;
                     }
                     other => {
-                        warn!(key = ?retry_key, event = ?other, "Unexpected local document sync batch result");
+                        warn!(task_id = ?retry_key, event = ?other, "Unexpected local document sync batch result");
                         totals.retry_needed = true;
                     }
                 }
@@ -989,22 +993,22 @@ impl OperationsTaskHandler {
                     delete_outbox_records(&self.context.storage_handle, record_keys).await;
                 outcome.delete_elapsed = delete_started.elapsed();
                 if let Err(error) = deleted {
-                    warn!(key = ?retry_key, error = %error, "Failed to delete document sync outbox records");
+                    warn!(task_id = ?retry_key, error = %error, "Failed to delete document sync outbox records");
                     outcome.retry_needed = true;
                 } else if targets_change_dashboard(&refresh_targets) {
                     notify_dashboard_change(self.context.as_ref());
                 }
             }
             Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error { error, .. })) => {
-                warn!(key = ?retry_key, error = %error, "Failed to sync document batch");
+                warn!(task_id = ?retry_key, error = %error, "Failed to sync document batch");
                 outcome.retry_needed = true;
             }
             Event::Net(NetEvent::Error(error)) => {
-                warn!(key = ?retry_key, error = ?error, "Failed to sync document batch");
+                warn!(task_id = ?retry_key, error = ?error, "Failed to sync document batch");
                 outcome.retry_needed = true;
             }
             other => {
-                warn!(key = ?retry_key, event = ?other, "Unexpected document sync batch result");
+                warn!(task_id = ?retry_key, event = ?other, "Unexpected document sync batch result");
                 outcome.retry_needed = true;
             }
         }
@@ -1023,7 +1027,7 @@ impl OperationsTaskHandler {
                 project_metadata_create_events(&self.context, metadata_create_events, local_node_id)
                     .await
             {
-                warn!(key = ?retry_key, error = ?error, "Failed to project metadata create event batch after document sync");
+                warn!(task_id = ?retry_key, error = ?error, "Failed to project metadata create event batch after document sync");
                 return Err(());
             }
             return Ok(());
@@ -1044,7 +1048,7 @@ impl OperationsTaskHandler {
         if let Err(error) =
             project_metadata_create_events_from_log(&self.context, create_event_targets).await
         {
-            warn!(key = ?retry_key, error = ?error, "Failed to project metadata create event batch from log after document sync");
+            warn!(task_id = ?retry_key, error = ?error, "Failed to project metadata create event batch from log after document sync");
             return Err(());
         }
         Ok(())
@@ -1052,7 +1056,7 @@ impl OperationsTaskHandler {
 
     async fn publish_usage_snapshots(&self) {
         let Some(net_handle) = self.context.net_handle.as_ref() else {
-            warn!("Cannot publish usage snapshots without net handle");
+            warn!(task_id = ?TaskKey::PublishUsageSnapshots, "Cannot publish usage snapshots without net handle");
             return;
         };
         let node_id = net_handle.node_id();
@@ -1067,7 +1071,7 @@ impl OperationsTaskHandler {
         {
             Ok(_) => {}
             Err(error) => {
-                warn!(error = %error, "Failed to publish usage snapshots");
+                warn!(task_id = ?TaskKey::PublishUsageSnapshots, error = %error, "Failed to publish usage snapshots");
                 self.reschedule_timer(
                     TaskKey::PublishUsageSnapshots,
                     crate::usage_stats::USAGE_SNAPSHOT_PUBLISH_DEBOUNCE,
@@ -1085,10 +1089,10 @@ impl OperationsTaskHandler {
                 crate::node_info::refresh_node_info_heartbeat(&self.context, node_id, realm_id)
                     .await
             {
-                warn!(error = %error, "Failed to publish node info heartbeat");
+                warn!(task_id = ?TaskKey::PublishNodeInfo, error = %error, "Failed to publish node info heartbeat");
             }
         } else {
-            warn!("Cannot publish node info without net handle");
+            warn!(task_id = ?TaskKey::PublishNodeInfo, "Cannot publish node info without net handle");
         }
         // Periodic heartbeat: always re-arm for the next interval regardless of
         // outcome so a transient failure never stops the heartbeat.
@@ -1101,7 +1105,7 @@ impl OperationsTaskHandler {
 
     async fn publish_watch_interest(&self) {
         let Some(net_handle) = self.context.net_handle.as_ref() else {
-            warn!("Cannot publish watch interest without net handle");
+            warn!(task_id = ?TaskKey::PublishWatchInterest, "Cannot publish watch interest without net handle");
             return;
         };
         let node_id = net_handle.node_id();
@@ -1119,7 +1123,7 @@ impl OperationsTaskHandler {
             }
             Ok(false) => {}
             Err(error) => {
-                warn!(error = %error, "Failed to publish watch interest");
+                warn!(task_id = ?TaskKey::PublishWatchInterest, error = %error, "Failed to publish watch interest");
                 self.reschedule_timer(
                     TaskKey::PublishWatchInterest,
                     WATCH_INTEREST_PUBLISH_DEBOUNCE,
@@ -1158,7 +1162,7 @@ impl OperationsTaskHandler {
                         .await;
                     }
                     Err(error) => {
-                        warn!(error = ?error, "Failed to probe metadata materialization jobs");
+                        warn!(task_id = ?TaskKey::DrainMetadataMaterializationQueue, error = ?error, "Failed to probe metadata materialization jobs");
                         self.reschedule_timer(
                             TaskKey::DrainMetadataMaterializationQueue,
                             METADATA_MATERIALIZATION_RETRY_AFTER,
@@ -1168,7 +1172,7 @@ impl OperationsTaskHandler {
                 }
             }
             Err(error) => {
-                warn!(error = ?error, "Failed to drain metadata materialization queue");
+                warn!(task_id = ?TaskKey::DrainMetadataMaterializationQueue, error = ?error, "Failed to drain metadata materialization queue");
                 self.reschedule_timer(
                     TaskKey::DrainMetadataMaterializationQueue,
                     METADATA_MATERIALIZATION_RETRY_AFTER,
@@ -1206,7 +1210,7 @@ impl OperationsTaskHandler {
                     .await;
                 }
                 Err(error) => {
-                    warn!(error = ?error, "Failed to probe metadata graph prune jobs");
+                    warn!(task_id = ?TaskKey::DrainMetadataGraphPruneQueue, error = ?error, "Failed to probe metadata graph prune jobs");
                     self.reschedule_timer(
                         TaskKey::DrainMetadataGraphPruneQueue,
                         METADATA_GRAPH_PRUNE_RETRY_AFTER,
@@ -1215,7 +1219,7 @@ impl OperationsTaskHandler {
                 }
             },
             Err(error) => {
-                warn!(error = ?error, "Failed to drain metadata graph prune queue");
+                warn!(task_id = ?TaskKey::DrainMetadataGraphPruneQueue, error = ?error, "Failed to drain metadata graph prune queue");
                 self.reschedule_timer(
                     TaskKey::DrainMetadataGraphPruneQueue,
                     METADATA_GRAPH_PRUNE_RETRY_AFTER,
@@ -1236,7 +1240,7 @@ impl OperationsTaskHandler {
             }
             Ok(result) if result.markers_examined == 0 => {
                 if let Err(error) = replay_metadata_event_log(&self.context).await {
-                    warn!(error = ?error, "Failed to replay metadata event log fallback");
+                    warn!(task_id = ?TaskKey::DrainMetadataProjectionQueue, error = ?error, "Failed to replay metadata event log fallback");
                     self.reschedule_timer(
                         TaskKey::DrainMetadataProjectionQueue,
                         METADATA_PROJECTION_RETRY_AFTER,
@@ -1246,7 +1250,7 @@ impl OperationsTaskHandler {
             }
             Ok(_) => {}
             Err(error) => {
-                warn!(error = ?error, "Failed to drain metadata projection queue");
+                warn!(task_id = ?TaskKey::DrainMetadataProjectionQueue, error = ?error, "Failed to drain metadata projection queue");
                 self.reschedule_timer(
                     TaskKey::DrainMetadataProjectionQueue,
                     METADATA_PROJECTION_RETRY_AFTER,
@@ -1269,12 +1273,37 @@ impl OperationsTaskHandler {
                 }
             }
             Err(error) => {
-                warn!(error = ?error, "Failed to drain blob replication queue");
+                warn!(task_id = ?TaskKey::DrainBlobReplicationQueue, error = ?error, "Failed to drain blob replication queue");
                 self.reschedule_timer(
                     TaskKey::DrainBlobReplicationQueue,
                     BLOB_REPLICATION_RETRY_AFTER,
                 )
                 .await;
+            }
+        }
+    }
+
+    async fn drain_mirror_repair(&self) {
+        let Some(net_handle) = self.context.net_handle.as_ref() else {
+            self.reschedule_timer(TaskKey::DrainSyncMirrorRepair, MIRROR_REPAIR_RETRY_AFTER)
+                .await;
+            return;
+        };
+        match process_mirror_repairs(&self.context, net_handle.node_id()).await {
+            Ok(result) if result.has_more_due => {
+                self.reschedule_timer(TaskKey::DrainSyncMirrorRepair, Duration::ZERO)
+                    .await;
+            }
+            Ok(result) => {
+                if let Some(after) = result.next_due_after {
+                    self.reschedule_timer(TaskKey::DrainSyncMirrorRepair, after)
+                        .await;
+                }
+            }
+            Err(error) => {
+                warn!(task_id = ?TaskKey::DrainSyncMirrorRepair, %error, "Failed to drain sync mirror repair queue");
+                self.reschedule_timer(TaskKey::DrainSyncMirrorRepair, MIRROR_REPAIR_RETRY_AFTER)
+                    .await;
             }
         }
     }
@@ -1292,7 +1321,7 @@ impl OperationsTaskHandler {
                 }
             }
             Err(error) => {
-                warn!(error = ?error, "Failed to drain reference metadata refresh queue");
+                warn!(task_id = ?TaskKey::DrainReferenceMetadataRefreshQueue, error = ?error, "Failed to drain reference metadata refresh queue");
                 self.reschedule_timer(
                     TaskKey::DrainReferenceMetadataRefreshQueue,
                     REFERENCE_METADATA_REFRESH_RETRY_AFTER,
@@ -1318,17 +1347,17 @@ impl OperationsTaskHandler {
             }) => match RealmConfigDocument::from_bytes(&bytes) {
                 Ok(document) => Some(document),
                 Err(error) => {
-                    warn!(realm_id = %realm_id, error = %error, "Failed to decode realm config for notification drain");
+                    warn!(task_id = ?TaskKey::DrainNotificationOutbox, realm_id = %realm_id, error = %error, "Failed to decode realm config for notification drain");
                     None
                 }
             },
             Event::Storage(StorageEvent::ReadResult { value: None, .. }) => None,
             Event::Storage(StorageEvent::Error { error }) => {
-                warn!(realm_id = %realm_id, error = %error, "Failed to read realm config for notification drain");
+                warn!(task_id = ?TaskKey::DrainNotificationOutbox, realm_id = %realm_id, error = %error, "Failed to read realm config for notification drain");
                 None
             }
             other => {
-                warn!(realm_id = %realm_id, event = ?other, "Unexpected realm config read result for notification drain");
+                warn!(task_id = ?TaskKey::DrainNotificationOutbox, realm_id = %realm_id, event = ?other, "Unexpected realm config read result for notification drain");
                 None
             }
         }
@@ -1338,7 +1367,7 @@ impl OperationsTaskHandler {
         let retry_key = TaskKey::DrainNotificationOutbox;
 
         let Some(net_handle) = self.context.net_handle.as_ref() else {
-            warn!(key = ?retry_key, "Cannot drain notification outbox without net handle");
+            warn!(task_id = ?retry_key, "Cannot drain notification outbox without net handle");
             self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
                 .await;
             return;
@@ -1353,13 +1382,13 @@ impl OperationsTaskHandler {
         {
             Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
             Event::Storage(StorageEvent::Error { error }) => {
-                warn!(error = %error, "Failed to start notification outbox snapshot");
+                warn!(task_id = ?retry_key, error = %error, "Failed to start notification outbox snapshot");
                 self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
                     .await;
                 return;
             }
             other => {
-                warn!(event = ?other, "Unexpected notification outbox snapshot start result");
+                warn!(task_id = ?retry_key, event = ?other, "Unexpected notification outbox snapshot start result");
                 self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
                     .await;
                 return;
@@ -1386,7 +1415,7 @@ impl OperationsTaskHandler {
             {
                 Ok(batch) => batch,
                 Err(error) => {
-                    warn!(error = %error, "Failed to read notification outbox record");
+                    warn!(task_id = ?retry_key, error = %error, "Failed to read notification outbox record");
                     retry_needed = true;
                     break;
                 }
@@ -1412,14 +1441,14 @@ impl OperationsTaskHandler {
                 let age_ms =
                     unix_timestamp_millis().saturating_sub(outbox_record.outbox_id.timestamp_ms());
                 if age_ms > NOTIFICATION_OUTBOX_RETENTION_MS {
-                    warn!(outbox_id = %outbox_record.outbox_id, age_ms, "Dropping expired notification outbox record");
+                    warn!(task_id = ?retry_key, outbox_id = %outbox_record.outbox_id, age_ms, "Dropping expired notification outbox record");
                     if let Err(error) = delete_notification_outbox_records(
                         &self.context.storage_handle,
                         vec![record_key],
                     )
                     .await
                     {
-                        warn!(error = %error, "Failed to delete expired notification outbox record");
+                        warn!(task_id = ?retry_key, error = %error, "Failed to delete expired notification outbox record");
                         retry_needed = true;
                     }
                     continue;
@@ -1434,7 +1463,7 @@ impl OperationsTaskHandler {
                     entry.insert(config);
                 }
                 let Some(config) = realm_configs.get(&realm_id).and_then(Option::as_ref) else {
-                    warn!(realm_id = %realm_id, "Notification realm config unavailable; retrying delivery");
+                    warn!(task_id = ?retry_key, realm_id = %realm_id, "Notification realm config unavailable; retrying delivery");
                     retry_needed = true;
                     continue;
                 };
@@ -1442,13 +1471,13 @@ impl OperationsTaskHandler {
                 let holder = match resolve_inbox_holder(&record.recipient, config) {
                     Ok(holder) => holder,
                     Err(error) => {
-                        warn!(recipient = %record.recipient, error = %error, "Failed to resolve notification inbox holder");
+                        warn!(task_id = ?retry_key, recipient = %record.recipient, error = %error, "Failed to resolve notification inbox holder");
                         retry_needed = true;
                         continue;
                     }
                 };
                 let Some(holder) = holder else {
-                    warn!(recipient = %record.recipient, "No eligible notification inbox holder; retrying delivery");
+                    warn!(task_id = ?retry_key, recipient = %record.recipient, "No eligible notification inbox holder; retrying delivery");
                     retry_needed = true;
                     continue;
                 };
@@ -1479,12 +1508,12 @@ impl OperationsTaskHandler {
                         )
                         .await
                         {
-                            warn!(error = %error, "Failed to delete delivered notification outbox records");
+                            warn!(task_id = ?retry_key, error = %error, "Failed to delete delivered notification outbox records");
                             retry_needed = true;
                         }
                     }
                     Err(error) => {
-                        warn!(error = %error, "Failed to deliver notifications to local inbox");
+                        warn!(task_id = ?retry_key, error = %error, "Failed to deliver notifications to local inbox");
                         retry_needed = true;
                     }
                 }
@@ -1497,12 +1526,12 @@ impl OperationsTaskHandler {
                             delete_notification_outbox_records(&self.context.storage_handle, keys)
                                 .await
                         {
-                            warn!(error = %error, "Failed to delete delivered notification outbox records");
+                            warn!(task_id = ?retry_key, error = %error, "Failed to delete delivered notification outbox records");
                             retry_needed = true;
                         }
                     }
                     Err(error) => {
-                        warn!(holder = %holder, error = %error, "Failed to deliver notifications to remote holder");
+                        warn!(task_id = ?retry_key, holder = %holder, error = %error, "Failed to deliver notifications to remote holder");
                         failed_holders.insert(holder);
                         retry_needed = true;
                     }
@@ -1524,11 +1553,11 @@ impl OperationsTaskHandler {
         {
             Event::Storage(StorageEvent::TransactionCommitted { .. }) => {}
             Event::Storage(StorageEvent::Error { error }) => {
-                warn!(error = %error, "Failed to close notification outbox snapshot");
+                warn!(task_id = ?retry_key, error = %error, "Failed to close notification outbox snapshot");
                 retry_needed = true;
             }
             other => {
-                warn!(event = ?other, "Unexpected notification outbox snapshot close result");
+                warn!(task_id = ?retry_key, event = ?other, "Unexpected notification outbox snapshot close result");
                 retry_needed = true;
             }
         }
@@ -1544,7 +1573,7 @@ impl OperationsTaskHandler {
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    warn!(error = %error, "Failed to check for notification outbox records appended during drain");
+                    warn!(task_id = ?retry_key, error = %error, "Failed to check for notification outbox records appended during drain");
                     self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
                         .await;
                 }
@@ -1560,7 +1589,7 @@ impl OperationsTaskHandler {
                 .unwrap_or(NOTIFICATION_PRUNE_POLL_AFTER)
                 .min(NOTIFICATION_PRUNE_POLL_AFTER),
             Err(error) => {
-                warn!(error = %error, "Failed to prune notifications");
+                warn!(task_id = ?TaskKey::PruneNotifications, error = %error, "Failed to prune notifications");
                 NOTIFICATION_PRUNE_RETRY_AFTER
             }
         };
@@ -1573,7 +1602,7 @@ impl OperationsTaskHandler {
             return;
         }
         let Some(net_handle) = self.context.net_handle.as_ref() else {
-            warn!(key = ?TaskKey::DrainJobQueue, "Cannot drain job queue without net handle");
+            warn!(task_id = ?TaskKey::DrainJobQueue, "Cannot drain job queue without net handle");
             self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
                 .await;
             return;
@@ -1604,7 +1633,7 @@ impl OperationsTaskHandler {
         {
             Ok(result) => result,
             Err(error) => {
-                warn!(error = %error, "Failed to drain job queue");
+                warn!(task_id = ?TaskKey::DrainJobQueue, error = %error, "Failed to drain job queue");
                 self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
                     .await;
                 return;
@@ -1667,7 +1696,7 @@ impl OperationsTaskHandler {
                 .unwrap_or(JOB_PRUNE_POLL_AFTER)
                 .min(JOB_PRUNE_POLL_AFTER),
             Err(error) => {
-                warn!(error = %error, "Failed to prune jobs");
+                warn!(task_id = ?TaskKey::PruneJobs, error = %error, "Failed to prune jobs");
                 JOB_PRUNE_RETRY_AFTER
             }
         };
@@ -1710,6 +1739,7 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
         restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
         restore_job_queue_timer(&context.storage_handle, &task_handle).await;
         restore_job_prune_timer(&context.storage_handle, &task_handle).await;
+        restore_mirror_timer(&context.storage_handle, &task_handle).await;
     }
 }
 
@@ -1731,7 +1761,7 @@ pub async fn initialize_task_incoming(
             .recover_stale_jobs(&context.storage_handle)
             .await
     {
-        warn!(error = %error, "Failed to recover stale jobs at startup");
+        warn!(task_id = ?TaskKey::DrainJobQueue, error = %error, "Failed to recover stale jobs at startup");
     }
     task_handle
         .set_inbound_handler(Arc::new(OperationsTaskHandler::new(
@@ -1762,6 +1792,7 @@ pub async fn initialize_task_incoming(
         restore_job_queue_timer(&context.storage_handle, &task_handle).await;
     }
     restore_job_prune_timer(&context.storage_handle, &task_handle).await;
+    restore_mirror_timer(&context.storage_handle, &task_handle).await;
 }
 
 /// Runs one document sync outbox drain pass synchronously against `context`.
@@ -1848,6 +1879,9 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::PruneJobs => {
                 self.prune_jobs().await;
+            }
+            TaskKey::DrainSyncMirrorRepair => {
+                self.drain_mirror_repair().await;
             }
         }
     }
@@ -3343,7 +3377,7 @@ mod tests {
 
         let b_id = net_b.node_id();
         let recipient = loop {
-            let candidate = UserId::new(Ulid::r#gen(), realm_id);
+            let candidate = UserId::new(Ulid::generate(), realm_id);
             if resolve_inbox_holder(&candidate, &config).expect("resolve holder") == Some(b_id) {
                 break candidate;
             }

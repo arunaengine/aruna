@@ -90,8 +90,18 @@ pub enum BlobEffect {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StagingSourceEffect {
+    Check {
+        access: ResolvedSourceAccess,
+    },
     Head {
         access: ResolvedSourceAccess,
+    },
+    List {
+        access: ResolvedSourceAccess,
+        offset: usize,
+        limit: usize,
+        recursive: bool,
+        files_only: bool,
     },
     Read {
         access: ResolvedSourceAccess,

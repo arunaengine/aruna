@@ -73,7 +73,7 @@ pub struct CreateUserAccessOperation {
 
 impl CreateUserAccessOperation {
     pub fn new(config: CreateUserAccessConfig) -> Self {
-        Self::new_with_key(config, Ulid::r#gen().to_string())
+        Self::new_with_key(config, Ulid::generate().to_string())
     }
 
     pub fn new_with_key(config: CreateUserAccessConfig, key_id: String) -> Self {
@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn test_create_user_access_happy_path() {
         let user_identity = make_user_identity();
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let mut op = CreateUserAccessOperation::new(make_config(user_identity, group_id));
 
         // 1. Start -> Should transition to CreateUserAccess and emit Storage::Write
@@ -322,7 +322,7 @@ mod tests {
     #[test]
     fn test_create_user_access_invalid_steps() {
         let user_identity = make_user_identity();
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
 
         // 1. Invalid state: start twice -> second start calls abort since state is not Init
         let mut op = CreateUserAccessOperation::new(make_config(user_identity, group_id));
@@ -341,7 +341,7 @@ mod tests {
         let mut op = CreateUserAccessOperation::new(make_config(user_identity, group_id));
         op.start();
         // Feed a ReadResult instead of WriteResult
-        let key = Ulid::r#gen().to_bytes().into();
+        let key = Ulid::generate().to_bytes().into();
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key,
             value: None,

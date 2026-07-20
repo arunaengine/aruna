@@ -39,6 +39,8 @@ pub enum ServerError {
     BadRequestMessage(String),
     #[error("Bad gateway")]
     BadGateway,
+    #[error("{0}")]
+    BadGatewayReason(String),
     #[error("Service unavailable")]
     ServiceUnavailable,
     #[error("{0}")]
@@ -206,7 +208,7 @@ impl ServerError {
             ServerError::BadRequest
             | ServerError::BadRequestReason(_)
             | ServerError::BadRequestMessage(_) => StatusCode::BAD_REQUEST,
-            ServerError::BadGateway => StatusCode::BAD_GATEWAY,
+            ServerError::BadGateway | ServerError::BadGatewayReason(_) => StatusCode::BAD_GATEWAY,
             ServerError::ServiceUnavailable | ServerError::ServiceUnavailableReason(_) => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
@@ -224,7 +226,7 @@ impl ServerError {
             ServerError::BadRequest
             | ServerError::BadRequestReason(_)
             | ServerError::BadRequestMessage(_) => "Bad request".to_string(),
-            ServerError::BadGateway => "Bad gateway".to_string(),
+            ServerError::BadGateway | ServerError::BadGatewayReason(_) => "Bad gateway".to_string(),
             ServerError::ServiceUnavailable | ServerError::ServiceUnavailableReason(_) => {
                 "Service unavailable".to_string()
             }

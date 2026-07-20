@@ -797,15 +797,15 @@ mod test {
             key: "range.txt".to_string(),
             version_id: None,
             range: Some(ObjectRangeRequest::StartEnd { start: 2, end: 4 }),
-            group_id: Ulid::r#gen(),
-            user_identity: UserId::local(Ulid::r#gen(), RealmId([0u8; 32])),
+            group_id: Ulid::generate(),
+            user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
         });
-        let txn_id = Ulid::r#gen();
+        let txn_id = Ulid::generate();
         let location = BackendLocation {
             root: "/tmp".to_string(),
             storage_bucket: "aruna_test".to_string(),
             backend_path: "s3test/range.txt".to_string(),
-            ulid: Ulid::r#gen(),
+            ulid: Ulid::generate(),
             compressed: false,
             encrypted: false,
             created_by: Default::default(),
@@ -836,10 +836,10 @@ mod test {
             key: "range.txt".to_string(),
             version_id: None,
             range: Some(ObjectRangeRequest::Suffix { length: 4 }),
-            group_id: Ulid::r#gen(),
-            user_identity: UserId::local(Ulid::r#gen(), RealmId([0u8; 32])),
+            group_id: Ulid::generate(),
+            user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
         });
-        let txn_id = Ulid::r#gen();
+        let txn_id = Ulid::generate();
         let access = ResolvedSourceAccess::OpenDal {
             kind: SourceConnectorKind::Http,
             config: HashMap::new(),
@@ -906,8 +906,8 @@ mod test {
             key: "range.txt".to_string(),
             version_id: None,
             range: Some(ObjectRangeRequest::StartEnd { start: 1, end: 3 }),
-            group_id: Ulid::r#gen(),
-            user_identity: UserId::local(Ulid::r#gen(), RealmId([0u8; 32])),
+            group_id: Ulid::generate(),
+            user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
         });
         operation.source_metadata = Some(SourceMetadata {
             content_length: 10,
@@ -976,10 +976,10 @@ mod test {
 
         let bucket = "s3test".to_string();
         let key = "test.txt".to_string();
-        let blob_ulid = Ulid::r#gen();
+        let blob_ulid = Ulid::generate();
         let location = BackendLocation {
             root: temp_root.to_string(),
-            storage_bucket: format!("aruna_{}", Ulid::r#gen()),
+            storage_bucket: format!("aruna_{}", Ulid::generate()),
             backend_path: format!("{bucket}/{key}_{blob_ulid}"),
             ulid: blob_ulid,
             compressed: false,
@@ -1014,7 +1014,7 @@ mod test {
                 })
                 .await;
 
-            let version_id = Ulid::r#gen();
+            let version_id = Ulid::generate();
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
                     key_space: BLOB_HEAD_KEYSPACE.to_string(),
@@ -1068,7 +1068,7 @@ mod test {
             key,
             version_id: None,
             range: None,
-            group_id: Ulid::r#gen(),
+            group_id: Ulid::generate(),
             user_identity: Default::default(),
         });
 
@@ -1124,10 +1124,10 @@ mod test {
 
         let bucket = "s3test".to_string();
         let key = "test.txt".to_string();
-        let blob_ulid = Ulid::r#gen();
+        let blob_ulid = Ulid::generate();
         let location = BackendLocation {
             root: temp_root.to_string(),
-            storage_bucket: format!("aruna_{}", Ulid::r#gen()),
+            storage_bucket: format!("aruna_{}", Ulid::generate()),
             backend_path: format!("{bucket}/{key}_{blob_ulid}"),
             ulid: blob_ulid,
             compressed: false,
@@ -1161,7 +1161,7 @@ mod test {
                 })
                 .await;
 
-            let version_id = Ulid::r#gen();
+            let version_id = Ulid::generate();
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
                     key_space: BLOB_HEAD_KEYSPACE.to_string(),
@@ -1214,7 +1214,7 @@ mod test {
             key,
             version_id: None,
             range: None,
-            group_id: Ulid::r#gen(),
+            group_id: Ulid::generate(),
             user_identity: Default::default(),
         });
 
@@ -1277,8 +1277,8 @@ mod test {
 
         let bucket = "s3test".to_string();
         let key = "test.txt".to_string();
-        let version_id = Ulid::r#gen();
-        let connector_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
+        let connector_id = Ulid::generate();
         let cached_metadata = SourceMetadata {
             content_length: 15,
             content_type: Some("text/plain".to_string()),
@@ -1349,8 +1349,8 @@ mod test {
                 key,
                 version_id: None,
                 range: None,
-                group_id: Ulid::r#gen(),
-                user_identity: UserId::local(Ulid::r#gen(), RealmId([0u8; 32])),
+                group_id: Ulid::generate(),
+                user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
             }),
             &driver_ctx,
         )
@@ -1443,7 +1443,7 @@ mod test {
             compute_handle: None,
         };
 
-        let version_id = Ulid::r#gen();
+        let version_id = Ulid::generate();
         let source = VersionSourceBinding {
             strategy: StagingStrategy::Reference,
             descriptor: PortableSourceDescriptor {
@@ -1454,7 +1454,7 @@ mod test {
                 capabilities: Vec::new(),
                 origin_node_id: None,
             },
-            connector_id: Some(Ulid::r#gen()),
+            connector_id: Some(Ulid::generate()),
         };
 
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle
@@ -1514,8 +1514,8 @@ mod test {
                 key: "refresh.txt".to_string(),
                 version_id: None,
                 range: None,
-                group_id: Ulid::r#gen(),
-                user_identity: UserId::local(Ulid::r#gen(), RealmId([0u8; 32])),
+                group_id: Ulid::generate(),
+                user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
             }),
             &driver_ctx,
         )

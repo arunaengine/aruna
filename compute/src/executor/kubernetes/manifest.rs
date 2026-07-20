@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use aruna_core::compute::{
-    BackendError, FenceContext, StagingMode, TaskSpec, normalize_container_path,
+    BackendError, FenceContext, NetworkAccess, StagingMode, TaskSpec, normalize_container_path,
 };
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod, Secret};
@@ -12,6 +12,7 @@ use serde_json::json;
 
 use super::{EPOCH_ANNOTATION, GENERATION_ANNOTATION, ROLE_LABEL, STATE_ANNOTATION};
 use crate::executor::config::KubernetesConfig;
+use crate::executor::digest_pinned;
 use crate::executor::staging::StageLayout;
 
 pub const WORKLOAD_SA: &str = "aruna-workload";
@@ -39,9 +40,10 @@ pub fn job_manifest(
     let mut labels = labels(context, "task");
     labels.insert(
         "aruna-engine.org/network".to_string(),
-        match spec.staging_mode {
-            StagingMode::Files => "none",
-            StagingMode::DirectS3 => "s3",
+        match spec.security.network {
+            NetworkAccess::Isolated => "none",
+            NetworkAccess::S3Only => "s3",
+            NetworkAccess::Open => "task",
         }
         .to_string(),
     );
@@ -114,10 +116,16 @@ pub fn job_manifest(
             "timeoutSeconds":2
         })
     });
+    // Tags can move between attempts, so Kubernetes must pull them every time.
+    let image_pull_policy = if digest_pinned(&spec.image) {
+        "IfNotPresent"
+    } else {
+        "Always"
+    };
     let container = json!({
         "name":"task",
         "image":spec.image,
-        "imagePullPolicy":"IfNotPresent",
+        "imagePullPolicy":image_pull_policy,
         "command":spec.entrypoint,
         "args":if spec.command.is_empty() { None::<Vec<String>> } else { Some(spec.command.clone()) },
         "workingDir":spec.workdir,
@@ -494,6 +502,40 @@ mod tests {
         let pod = job.spec.unwrap().template.spec.unwrap();
         assert_eq!(pod.init_containers.unwrap().len(), 1);
         assert!(pod.containers[0].startup_probe.is_some());
+    }
+
+    #[test]
+    fn selects_pull_policy() {
+        let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = job_manifest(&context(), &spec, &config(), &layout).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        assert_eq!(
+            pod.containers[0].image_pull_policy.as_deref(),
+            Some("Always")
+        );
+
+        spec.image = "registry.example/task@sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = job_manifest(&context(), &spec, &config(), &layout).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        assert_eq!(
+            pod.containers[0].image_pull_policy.as_deref(),
+            Some("IfNotPresent")
+        );
+    }
+
+    #[test]
+    fn labels_open_network() {
+        let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
+        spec.security.network = NetworkAccess::Open;
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = job_manifest(&context(), &spec, &config(), &layout).unwrap();
+
+        assert_eq!(
+            job.spec.unwrap().template.metadata.unwrap().labels.unwrap()["aruna-engine.org/network"],
+            "task"
+        );
     }
 
     #[test]

@@ -87,7 +87,7 @@ impl IdEnvironment for SystemEnvironment {
     }
 
     fn random_nonce(&self) -> u64 {
-        (Ulid::r#gen().random() as u64) & layout::NONCE_MASK
+        (Ulid::generate().random() as u64) & layout::NONCE_MASK
     }
 }
 

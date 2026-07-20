@@ -309,7 +309,7 @@ mod tests {
             recipient,
             NotificationClass::Direct,
             NotificationKind::AddedToGroup {
-                group_id: Ulid::r#gen(),
+                group_id: Ulid::generate(),
                 actor_user_id: user(recipient.realm_id.0[0], 200),
             },
             created_at_ms,
@@ -517,7 +517,7 @@ mod tests {
     #[test]
     fn rejects_too_many_ids() {
         let recipient = user(1, 1);
-        let ids = (0..=MARK_READ_MAX_IDS).map(|_| Ulid::r#gen()).collect();
+        let ids = (0..=MARK_READ_MAX_IDS).map(|_| Ulid::generate()).collect();
         let mut operation = MarkReadOperation::new(MarkReadInput {
             recipient,
             ids,

@@ -7,7 +7,7 @@ use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     ResolvedSourceAccess, ResolvedSourceConnector, SourceConnector, SourceConnectorKind,
-    VersionSourceBinding,
+    StagingStrategy, VersionSourceBinding,
 };
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
@@ -18,11 +18,15 @@ use crate::connectors::repository::{
     read_connector_secret_effect,
 };
 
+pub(crate) const ARUNA_NATIVE_RELATIONSHIP_ID: &str = "relationship_id";
+pub(crate) const ARUNA_NATIVE_ORIGIN_NODE_ID: &str = "origin_node_id";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolveSourceConnectorInput {
     pub group_id: GroupId,
     pub connector_id: Ulid,
     pub source_path: String,
+    pub allow_root: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,8 +92,8 @@ impl ResolveSourceConnectorOperation {
     }
 
     fn handle_init(&mut self) -> Effects {
-        if !is_valid_relative_source_path(&self.input.source_path) {
-            return self.emit_error(SourceConnectorResolutionError::InvalidSourcePath);
+        if let Err(error) = validate_source_path(&self.input.source_path, self.input.allow_root) {
+            return self.emit_error(error);
         }
 
         self.state = ResolveSourceConnectorState::ReadConnector;
@@ -128,6 +132,7 @@ impl ResolveSourceConnectorOperation {
             secret.clone().map(|secret| secret.secret_config),
             &self.input.source_path,
             None,
+            self.input.allow_root,
         ) {
             Ok(access) => access,
             Err(error) => return self.emit_error(error),
@@ -161,6 +166,16 @@ impl ResolveVersionSourceBindingOperation {
     }
 
     fn handle_init(&mut self) -> Effects {
+        if self.input.source.descriptor.kind == SourceConnectorKind::ArunaNative {
+            let access = match build_source_access_from_binding(&self.input.source, None) {
+                Ok(access) => access,
+                Err(error) => return self.emit_error(error),
+            };
+            self.state = ResolveVersionSourceBindingState::Finish;
+            self.output = Some(Ok(access));
+            return smallvec![];
+        }
+
         let effect = match read_source_binding_secret_effect(&self.input.source, None) {
             Ok(effect) => effect,
             Err(error) => return self.emit_error(error),
@@ -291,10 +306,9 @@ pub(crate) fn build_source_access(
     secret_config: Option<HashMap<String, String>>,
     source_path: &str,
     version: Option<String>,
+    allow_root: bool,
 ) -> Result<ResolvedSourceAccess, SourceConnectorResolutionError> {
-    if !is_valid_relative_source_path(source_path) {
-        return Err(SourceConnectorResolutionError::InvalidSourcePath);
-    }
+    validate_source_path(source_path, allow_root)?;
 
     if kind == SourceConnectorKind::ArunaNative {
         return Err(SourceConnectorResolutionError::UnsupportedConnectorKind(
@@ -313,6 +327,14 @@ pub(crate) fn build_source_access(
         path: source_path.to_string(),
         version,
     })
+}
+
+pub fn resolve_inline_access(
+    kind: SourceConnectorKind,
+    public_config: &HashMap<String, String>,
+    secret_config: HashMap<String, String>,
+) -> Result<ResolvedSourceAccess, SourceConnectorResolutionError> {
+    build_source_access(kind, public_config, Some(secret_config), "", None, true)
 }
 
 pub(crate) fn secret_fingerprint(secret: &aruna_core::structs::SourceConnectorSecret) -> [u8; 16] {
@@ -337,13 +359,70 @@ pub(crate) fn build_source_access_from_binding(
     source: &VersionSourceBinding,
     secret_config: Option<HashMap<String, String>>,
 ) -> Result<ResolvedSourceAccess, SourceConnectorResolutionError> {
+    if source.descriptor.kind == SourceConnectorKind::ArunaNative {
+        return build_native_access(source);
+    }
+
     build_source_access(
         source.descriptor.kind,
         &source.descriptor.public_config,
         secret_config,
         &source.descriptor.source_path,
         source_binding_version(source)?,
+        false,
     )
+}
+
+fn build_native_access(
+    source: &VersionSourceBinding,
+) -> Result<ResolvedSourceAccess, SourceConnectorResolutionError> {
+    if source.strategy != StagingStrategy::Reference || source.connector_id.is_some() {
+        return Err(SourceConnectorResolutionError::ResolveFailed);
+    }
+    validate_source_path(&source.descriptor.source_path, false)?;
+    let (bucket, key) = source
+        .descriptor
+        .source_path
+        .split_once('/')
+        .filter(|(bucket, key)| !bucket.is_empty() && !key.is_empty())
+        .ok_or(SourceConnectorResolutionError::InvalidSourcePath)?;
+    if bucket.contains('/') || key.trim().is_empty() {
+        return Err(SourceConnectorResolutionError::InvalidSourcePath);
+    }
+
+    let relationship_id = source
+        .descriptor
+        .public_config
+        .get(ARUNA_NATIVE_RELATIONSHIP_ID)
+        .and_then(|value| Ulid::from_string(value).ok())
+        .ok_or(SourceConnectorResolutionError::ResolveFailed)?;
+    let origin_node_id = source
+        .descriptor
+        .origin_node_id
+        .ok_or(SourceConnectorResolutionError::ResolveFailed)?;
+    let version = source
+        .descriptor
+        .version_selector
+        .as_deref()
+        .and_then(|selector| selector.strip_prefix("version:"))
+        .and_then(|value| Ulid::from_string(value.trim()).ok())
+        .ok_or(SourceConnectorResolutionError::ResolveFailed)?;
+
+    let mut config = source.descriptor.public_config.clone();
+    config.insert(
+        ARUNA_NATIVE_RELATIONSHIP_ID.to_string(),
+        relationship_id.to_string(),
+    );
+    config.insert(
+        ARUNA_NATIVE_ORIGIN_NODE_ID.to_string(),
+        origin_node_id.to_string(),
+    );
+    Ok(ResolvedSourceAccess::OpenDal {
+        kind: SourceConnectorKind::ArunaNative,
+        config,
+        path: source.descriptor.source_path.clone(),
+        version: Some(version.to_string()),
+    })
 }
 
 fn source_binding_version(
@@ -393,10 +472,15 @@ pub(crate) fn resolve_source_binding_access(
     build_source_access_from_binding(source, secret.map(|secret| secret.secret_config))
 }
 
-fn is_valid_relative_source_path(path: &str) -> bool {
+pub fn validate_source_path(
+    path: &str,
+    allow_root: bool,
+) -> Result<(), SourceConnectorResolutionError> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
-        return false;
+        return allow_root
+            .then_some(())
+            .ok_or(SourceConnectorResolutionError::InvalidSourcePath);
     }
 
     let mut has_normal_component = false;
@@ -406,11 +490,15 @@ fn is_valid_relative_source_path(path: &str) -> bool {
             Component::CurDir
             | Component::ParentDir
             | Component::RootDir
-            | Component::Prefix(_) => return false,
+            | Component::Prefix(_) => {
+                return Err(SourceConnectorResolutionError::InvalidSourcePath);
+            }
         }
     }
 
     has_normal_component
+        .then_some(())
+        .ok_or(SourceConnectorResolutionError::InvalidSourcePath)
 }
 
 #[cfg(test)]
@@ -440,7 +528,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         };
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
 
         let created = drive(
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
@@ -470,6 +558,7 @@ mod tests {
                 group_id,
                 connector_id: created.connector.connector_id,
                 source_path: "run-1/data.txt".to_string(),
+                allow_root: false,
             }),
             &context,
         )
@@ -616,7 +705,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         };
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
 
         let created = drive(
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
@@ -695,16 +784,16 @@ mod tests {
 
     #[test]
     fn reject_absolute_source_paths() {
-        assert!(!is_valid_relative_source_path("/absolute/file.txt"));
-        assert!(is_valid_relative_source_path("nested/file.txt"));
+        assert!(validate_source_path("/absolute/file.txt", false).is_err());
+        assert!(validate_source_path("nested/file.txt", false).is_ok());
     }
 
     #[test]
     fn reject_non_normal_relative_source_paths() {
-        assert!(!is_valid_relative_source_path(""));
-        assert!(!is_valid_relative_source_path("   "));
-        assert!(!is_valid_relative_source_path("./file.txt"));
-        assert!(!is_valid_relative_source_path("nested/../file.txt"));
+        assert!(validate_source_path("", false).is_err());
+        assert!(validate_source_path("   ", false).is_err());
+        assert!(validate_source_path("./file.txt", false).is_err());
+        assert!(validate_source_path("nested/../file.txt", false).is_err());
     }
 
     #[test]
@@ -718,6 +807,7 @@ mod tests {
             None,
             "bucket/key",
             None,
+            false,
         )
         .unwrap_err();
         assert_eq!(
@@ -725,6 +815,70 @@ mod tests {
             SourceConnectorResolutionError::UnsupportedConnectorKind(
                 SourceConnectorKind::ArunaNative
             )
+        );
+    }
+
+    #[test]
+    fn native_binding_resolves() {
+        let relationship_id = Ulid::from_bytes([7u8; 16]);
+        let version_id = Ulid::from_bytes([8u8; 16]);
+        let origin = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: aruna_core::structs::PortableSourceDescriptor {
+                kind: SourceConnectorKind::ArunaNative,
+                public_config: HashMap::from([(
+                    ARUNA_NATIVE_RELATIONSHIP_ID.to_string(),
+                    relationship_id.to_string(),
+                )]),
+                source_path: "source-bucket/nested/data.txt".to_string(),
+                version_selector: Some(format!("version:{version_id}")),
+                capabilities: Vec::new(),
+                origin_node_id: Some(origin),
+            },
+            connector_id: None,
+        };
+
+        let mut operation =
+            ResolveVersionSourceBindingOperation::new(ResolveVersionSourceBindingInput { source });
+        assert!(operation.start().is_empty());
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize().unwrap(),
+            ResolvedSourceAccess::OpenDal {
+                kind: SourceConnectorKind::ArunaNative,
+                config: HashMap::from([
+                    (
+                        ARUNA_NATIVE_RELATIONSHIP_ID.to_string(),
+                        relationship_id.to_string(),
+                    ),
+                    (ARUNA_NATIVE_ORIGIN_NODE_ID.to_string(), origin.to_string()),
+                ]),
+                path: "source-bucket/nested/data.txt".to_string(),
+                version: Some(version_id.to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn native_binding_rejects() {
+        let origin = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: aruna_core::structs::PortableSourceDescriptor {
+                kind: SourceConnectorKind::ArunaNative,
+                public_config: HashMap::new(),
+                source_path: "source-bucket/data.txt".to_string(),
+                version_selector: Some(format!("version:{}", Ulid::generate())),
+                capabilities: Vec::new(),
+                origin_node_id: Some(origin),
+            },
+            connector_id: None,
+        };
+
+        assert_eq!(
+            build_source_access_from_binding(&source, None),
+            Err(SourceConnectorResolutionError::ResolveFailed)
         );
     }
 }

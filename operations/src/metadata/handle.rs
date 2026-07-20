@@ -22,10 +22,11 @@ use aruna_core::metadata::{
 };
 use aruna_core::storage_entries::metadata_graph_lifecycle_key;
 use aruna_core::structs::{
-    AuthContext, MetadataRegistryRecord, Permission, RealmConfigDocument, RealmId, RealmNodeKind,
+    AuthContext, BucketInfo, MetadataRegistryRecord, Permission, RealmConfigDocument, RealmId,
+    RealmNodeKind, SyncRelationship, blob_bucket_permission_path,
 };
 use aruna_core::telemetry::{duration_ms, record_duration_ms, record_elapsed_ms};
-use aruna_core::types::GroupId;
+use aruna_core::types::{GroupId, UserId};
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
@@ -62,8 +63,18 @@ use crate::auth::{
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::list_groups::ListGroupOperation;
+use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
+use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, SearchBucketsOperation};
+use crate::sync_mirror_repair::RECONCILE_GRACE;
+use crate::sync_relationship::{
+    DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, StoreSyncRelationshipOperation,
+    SyncRelationshipDirection, SyncRelationshipError, remove_outgoing_relationship,
+};
 
 const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
+const SYNC_MIRROR_REQUEST_TIMEOUT: Duration =
+    RECONCILE_GRACE.saturating_sub(Duration::from_secs(10));
 const METADATA_GRAPH_SYNC_ATTEMPTS: usize = 3;
 const METADATA_GRAPH_SYNC_RETRY_AFTER: Duration = Duration::from_millis(250);
 const SLOW_METADATA_BACKEND_THRESHOLD: Duration = Duration::from_millis(100);
@@ -82,6 +93,58 @@ PREFIX fts: <urn:craqle:fts:>\n";
 static CRAQLE_LATENCY: LazyLock<aruna_core::telemetry::LatencyAggregator> =
     LazyLock::new(|| aruna_core::telemetry::LatencyAggregator::new("craqle"));
 const METADATA_VISIBILITY_CACHE_TTL: Duration = Duration::from_secs(30);
+
+fn sync_identity_matches(left: &SyncRelationship, right: &SyncRelationship) -> bool {
+    left.id == right.id
+        && left.source == right.source
+        && left.target == right.target
+        && left.mode == right.mode
+        && left.replicate_deletes == right.replicate_deletes
+        && left.created_by == right.created_by
+        && left.created_at == right.created_at
+}
+
+fn valid_sync_request(
+    relationship: &SyncRelationship,
+    source_bucket: &str,
+    target_bucket: &str,
+    realm_id: RealmId,
+    user_id: UserId,
+    delete: bool,
+) -> bool {
+    !source_bucket.is_empty()
+        && !target_bucket.is_empty()
+        && relationship.source.key_prefix() != Some("")
+        && relationship.target.key_prefix() != Some("")
+        && relationship.source.realm_id == realm_id
+        && relationship.target.realm_id == realm_id
+        && relationship.created_by == user_id
+        && (delete || (!source_bucket.starts_with("ws-") && !target_bucket.starts_with("ws-")))
+}
+
+async fn create_sync_bucket(
+    context: &DriverContext,
+    bucket: &str,
+    group_id: GroupId,
+    relationship: &SyncRelationship,
+) -> Result<(), CreateBucketError> {
+    drive(
+        CreateBucketOperation::new(
+            bucket.to_string(),
+            BucketInfo {
+                group_id,
+                created_at: relationship.created_at,
+                created_by: relationship.created_by,
+                cors_configuration: None,
+            },
+        ),
+        context,
+    )
+    .await?
+    .transpose()?
+    .ok_or(CreateBucketError::CreateBucketFailed)?;
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct MetadataHandle {
@@ -1137,6 +1200,63 @@ impl MetadataHandle {
                 },
                 Err(error) => MetadataTransportMessage::Reject(error.to_string()),
             },
+            MetadataTransportMessage::SearchBuckets {
+                auth_token,
+                query,
+                limit,
+            } => match bucket_search_auth(
+                &self.inner.auth_validation,
+                &self.inner.storage_handle,
+                peer,
+                self.inner.net_handle.as_ref().map(|net| *net.realm_id()),
+                auth_token,
+            )
+            .await
+            {
+                Some(auth) => match self.inner.net_handle.as_ref() {
+                    Some(net_handle) => match drive(
+                        SearchBucketsOperation::new(SearchBucketsInput {
+                            auth,
+                            realm_id: *net_handle.realm_id(),
+                            node_id: net_handle.node_id(),
+                            query,
+                            limit,
+                        }),
+                        context.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(hits) => MetadataTransportMessage::BucketSearchResults { hits },
+                        Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                    },
+                    None => MetadataTransportMessage::Reject(
+                        "metadata network handle unavailable".to_string(),
+                    ),
+                },
+                None => MetadataTransportMessage::BucketSearchResults { hits: Vec::new() },
+            },
+            MetadataTransportMessage::CreateSyncMirror {
+                auth_token,
+                source_group_id,
+                relationship,
+            } => {
+                self.apply_sync_mirror(
+                    context,
+                    peer,
+                    auth_token,
+                    *relationship,
+                    Some(source_group_id),
+                    false,
+                )
+                .await
+            }
+            MetadataTransportMessage::DeleteSyncMirror {
+                auth_token,
+                relationship,
+            } => {
+                self.apply_sync_mirror(context, peer, auth_token, *relationship, None, true)
+                    .await
+            }
             forward @ (MetadataTransportMessage::ForwardCreateDocument { .. }
             | MetadataTransportMessage::ForwardUpdateDocument { .. }
             | MetadataTransportMessage::ForwardDeleteDocument { .. }) => {
@@ -1144,6 +1264,9 @@ impl MetadataHandle {
             }
             MetadataTransportMessage::QueryResults { .. }
             | MetadataTransportMessage::SearchResults { .. }
+            | MetadataTransportMessage::BucketSearchResults { .. }
+            | MetadataTransportMessage::SyncMirrorCreated
+            | MetadataTransportMessage::SyncMirrorDeleted
             | MetadataTransportMessage::ForwardedRecord { .. }
             | MetadataTransportMessage::ForwardedDelete
             | MetadataTransportMessage::ForwardedUpdateInvalidInput { .. }
@@ -1164,6 +1287,161 @@ impl MetadataHandle {
         record_elapsed_ms(&span, "elapsed_ms", total_started);
         span.record("response", transport_message_kind(&response));
         Ok(())
+    }
+
+    async fn apply_sync_mirror(
+        &self,
+        context: &Arc<DriverContext>,
+        peer: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        relationship: SyncRelationship,
+        source_group_id: Option<GroupId>,
+        delete: bool,
+    ) -> MetadataTransportMessage {
+        let Some(net_handle) = self.inner.net_handle.as_ref() else {
+            return MetadataTransportMessage::Reject("mirror_internal".to_string());
+        };
+        let auth = match authorize_remote_metadata_peer(
+            &self.inner.auth_validation,
+            &self.inner.storage_handle,
+            peer,
+            Some(*net_handle.realm_id()),
+            auth_token,
+            true,
+        )
+        .await
+        {
+            Ok(Some(auth)) => auth,
+            Ok(None) => {
+                return MetadataTransportMessage::Reject("access_denied".to_string());
+            }
+            Err(_) => return MetadataTransportMessage::Reject("access_denied".to_string()),
+        };
+
+        let Some(source_bucket) = relationship.source.bucket() else {
+            return MetadataTransportMessage::Reject("invalid_relationship".to_string());
+        };
+        let Some(target_bucket) = relationship.target.bucket() else {
+            return MetadataTransportMessage::Reject("invalid_relationship".to_string());
+        };
+        if !valid_sync_request(
+            &relationship,
+            source_bucket,
+            target_bucket,
+            *net_handle.realm_id(),
+            auth.user_id,
+            delete,
+        ) {
+            return MetadataTransportMessage::Reject("invalid_relationship".to_string());
+        }
+
+        let local_node = net_handle.node_id();
+        let (local_bucket, direction) =
+            if relationship.source.node_id == peer && relationship.target.node_id == local_node {
+                (target_bucket, SyncRelationshipDirection::Incoming)
+            } else if delete
+                && relationship.target.node_id == peer
+                && relationship.source.node_id == local_node
+            {
+                (source_bucket, SyncRelationshipDirection::Outgoing)
+            } else {
+                return MetadataTransportMessage::Reject("invalid_relationship".to_string());
+            };
+
+        if delete {
+            let stored = match drive(
+                GetSyncRelationshipOperation::new(relationship.id, direction),
+                context.as_ref(),
+            )
+            .await
+            {
+                Ok(stored) => stored,
+                Err(SyncRelationshipError::NotFound) => {
+                    return MetadataTransportMessage::SyncMirrorDeleted;
+                }
+                Err(_) => {
+                    return MetadataTransportMessage::Reject("mirror_internal".to_string());
+                }
+            };
+            if !sync_identity_matches(&stored, &relationship) {
+                return MetadataTransportMessage::Reject("invalid_relationship".to_string());
+            }
+            // Outgoing reference relationships are detached instead of
+            // deleted so the peer's retained reference records stay readable.
+            let removed = match direction {
+                SyncRelationshipDirection::Outgoing => {
+                    remove_outgoing_relationship(context.as_ref(), stored).await
+                }
+                SyncRelationshipDirection::Incoming => {
+                    drive(
+                        DeleteSyncRelationshipOperation::new(stored, direction),
+                        context.as_ref(),
+                    )
+                    .await
+                }
+            };
+            return match removed {
+                Ok(()) => MetadataTransportMessage::SyncMirrorDeleted,
+                Err(_) => MetadataTransportMessage::Reject("mirror_internal".to_string()),
+            };
+        }
+
+        let (group_id, create_bucket) = match drive(
+            GetBucketInfoOperation::new(local_bucket.to_string()),
+            context.as_ref(),
+        )
+        .await
+        {
+            Ok(Some(Ok(bucket_info))) => (bucket_info.group_id, false),
+            Ok(Some(Err(GetBucketInfoError::NotFound))) | Ok(None) => {
+                let Some(source_group_id) = source_group_id else {
+                    return MetadataTransportMessage::Reject("invalid_relationship".to_string());
+                };
+                (source_group_id, true)
+            }
+            Ok(Some(Err(_))) => {
+                return MetadataTransportMessage::Reject("mirror_internal".to_string());
+            }
+            Err(_) => return MetadataTransportMessage::Reject("mirror_internal".to_string()),
+        };
+        let permitted = match drive(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: auth,
+                path: blob_bucket_permission_path(
+                    *net_handle.realm_id(),
+                    group_id,
+                    net_handle.node_id(),
+                    local_bucket,
+                ),
+                required_permission: Permission::WRITE,
+            }),
+            context.as_ref(),
+        )
+        .await
+        {
+            Ok(permitted) => permitted,
+            Err(_) => return MetadataTransportMessage::Reject("mirror_internal".to_string()),
+        };
+        if !permitted {
+            return MetadataTransportMessage::Reject("access_denied".to_string());
+        }
+        if create_bucket
+            && create_sync_bucket(context.as_ref(), local_bucket, group_id, &relationship)
+                .await
+                .is_err()
+        {
+            return MetadataTransportMessage::Reject("mirror_internal".to_string());
+        }
+
+        match drive(
+            StoreSyncRelationshipOperation::new(relationship, direction),
+            context.as_ref(),
+        )
+        .await
+        {
+            Ok(_) => MetadataTransportMessage::SyncMirrorCreated,
+            Err(_) => MetadataTransportMessage::Reject("mirror_internal".to_string()),
+        }
     }
 
     /// Validates a forwarded caller's bearer token and confirms the forwarding
@@ -1431,6 +1709,110 @@ impl MetadataHandle {
         .await
     }
 
+    #[tracing::instrument(
+        name = "metadata.bucket_search.remote",
+        level = "debug",
+        skip(self, auth_token, query),
+        fields(
+            peer = ?node_id,
+            query_len = query.len() as u64,
+            limit = limit as u64,
+            elapsed_ms = field::Empty,
+            result = field::Empty,
+            hit_count = field::Empty,
+        )
+    )]
+    pub async fn request_bucket_search(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        query: String,
+        limit: usize,
+    ) -> Result<Vec<BucketSearchHit>, MetadataError> {
+        let started = Instant::now();
+        let span = Span::current();
+        let result = match send_remote_metadata_request(
+            &self.inner,
+            &span,
+            node_id,
+            MetadataTransportMessage::SearchBuckets {
+                auth_token,
+                query,
+                limit,
+            },
+        )
+        .await
+        .map_err(MetadataRequestError::into_metadata_error)?
+        {
+            MetadataTransportMessage::BucketSearchResults { hits } => Ok(hits),
+            MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
+            other => Err(MetadataError::Backend(format!(
+                "unexpected bucket search response: {other:?}"
+            ))),
+        };
+        record_elapsed_ms(&span, "elapsed_ms", started);
+        match &result {
+            Ok(hits) => {
+                span.record("result", "ok");
+                span.record("hit_count", hits.len() as u64);
+            }
+            Err(error) => record_error(&span, &error.to_string()),
+        }
+        result
+    }
+
+    pub async fn request_sync_create(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        source_group_id: GroupId,
+        relationship: SyncRelationship,
+    ) -> Result<(), MetadataError> {
+        match with_sync_timeout(send_remote_metadata_request(
+            &self.inner,
+            &Span::current(),
+            node_id,
+            MetadataTransportMessage::CreateSyncMirror {
+                auth_token,
+                source_group_id,
+                relationship: Box::new(relationship),
+            },
+        ))
+        .await?
+        {
+            MetadataTransportMessage::SyncMirrorCreated => Ok(()),
+            MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
+            other => Err(MetadataError::Backend(format!(
+                "unexpected sync mirror response: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn request_sync_delete(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        relationship: SyncRelationship,
+    ) -> Result<(), MetadataError> {
+        match with_sync_timeout(send_remote_metadata_request(
+            &self.inner,
+            &Span::current(),
+            node_id,
+            MetadataTransportMessage::DeleteSyncMirror {
+                auth_token,
+                relationship: Box::new(relationship),
+            },
+        ))
+        .await?
+        {
+            MetadataTransportMessage::SyncMirrorDeleted => Ok(()),
+            MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
+            other => Err(MetadataError::Backend(format!(
+                "unexpected sync mirror response: {other:?}"
+            ))),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn request_remote_filtered_search_graphs(
         &self,
@@ -1527,6 +1909,29 @@ where
         .await
         .map(Some)
         .map_err(|error| MetadataError::Backend(format!("invalid metadata auth token: {error}")))
+}
+
+async fn bucket_search_auth<S>(
+    state: &S,
+    storage_handle: &StorageHandle,
+    peer: NodeId,
+    local_realm_id: Option<RealmId>,
+    auth_token: Option<MetadataAuthToken>,
+) -> Option<AuthContext>
+where
+    S: ArunaBearerTokenValidationState + ?Sized,
+{
+    let auth = authorize_remote_metadata_peer(
+        state,
+        storage_handle,
+        peer,
+        local_realm_id,
+        auth_token,
+        false,
+    )
+    .await
+    .ok()??;
+    (Some(auth.realm_id) == local_realm_id).then_some(auth)
 }
 
 async fn authorize_remote_metadata_peer<S>(
@@ -1668,6 +2073,15 @@ async fn send_remote_metadata_request(
     };
 
     send_request(&net_handle, node_id, message).await
+}
+
+async fn with_sync_timeout<T>(
+    request: impl std::future::Future<Output = Result<T, MetadataRequestError>>,
+) -> Result<T, MetadataError> {
+    timeout(SYNC_MIRROR_REQUEST_TIMEOUT, request)
+        .await
+        .map_err(|_| MetadataError::Backend("sync mirror request timed out".to_string()))?
+        .map_err(MetadataRequestError::into_metadata_error)
 }
 
 async fn load_metadata_auth_state<T>(
@@ -3572,6 +3986,12 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::SearchGraphs { .. } => "search_graphs",
         MetadataTransportMessage::FilteredSearchGraphs { .. } => "filtered_search_graphs",
         MetadataTransportMessage::SearchResults { .. } => "search_results",
+        MetadataTransportMessage::SearchBuckets { .. } => "search_buckets",
+        MetadataTransportMessage::BucketSearchResults { .. } => "bucket_search_results",
+        MetadataTransportMessage::CreateSyncMirror { .. } => "create_sync_mirror",
+        MetadataTransportMessage::DeleteSyncMirror { .. } => "delete_sync_mirror",
+        MetadataTransportMessage::SyncMirrorCreated => "sync_mirror_created",
+        MetadataTransportMessage::SyncMirrorDeleted => "sync_mirror_deleted",
         MetadataTransportMessage::ForwardCreateDocument { .. } => "forward_create_document",
         MetadataTransportMessage::ForwardUpdateDocument { .. } => "forward_update_document",
         MetadataTransportMessage::ForwardDeleteDocument { .. } => "forward_delete_document",
@@ -3971,6 +4391,7 @@ async fn fill_visibility_caches(
         .collect::<Vec<_>>();
     records.retain(|record| !deleted_graphs.contains(&record.graph_iri));
     let records = Arc::new(records);
+    warn_unprojected_graphs(inner.clone(), records.as_ref()).await;
     let store_accepted = inner.visibility_cache.store_visibility_fill(
         records.clone(),
         lifecycle_entries,
@@ -4042,6 +4463,80 @@ async fn list_registry_records_for_local_read(
     record_elapsed_ms(span, "registry_ms", registry_started);
     span.record("registry_records", records.len() as u64);
     Ok(records)
+}
+
+async fn warn_unprojected_graphs(inner: Arc<MetadataInner>, records: &[MetadataRegistryRecord]) {
+    let projected = records
+        .iter()
+        .map(|record| record.graph_iri.clone())
+        .collect::<BTreeSet<_>>();
+    let node = inner.node.clone();
+    let policies = match tokio::task::spawn_blocking(move || {
+        node.graphs()?
+            .into_iter()
+            .map(|graph| {
+                let policy = node.graph_policy(&graph)?;
+                Ok((graph.as_str().to_string(), policy))
+            })
+            .collect::<Result<BTreeMap<_, _>, CraqleError>>()
+    })
+    .await
+    {
+        Ok(Ok(policies)) => policies,
+        Ok(Err(error)) => {
+            warn!(
+                event = "metadata.authorization.graph_scan_failed",
+                error = %error,
+                "Could not audit metadata graphs against the authorization projection"
+            );
+            return;
+        }
+        Err(error) => {
+            warn!(
+                event = "metadata.authorization.graph_scan_failed",
+                error = %error,
+                "Could not audit metadata graphs against the authorization projection"
+            );
+            return;
+        }
+    };
+    let graphs = policies.keys().cloned().collect::<BTreeSet<_>>();
+    let missing = graphs.difference(&projected).cloned().collect::<Vec<_>>();
+    if !missing.is_empty() {
+        warn!(
+            event = "metadata.authorization.projection_missing",
+            count = missing.len() as u64,
+            sample_graph_iris = ?missing.iter().take(8).collect::<Vec<_>>(),
+            "excluding metadata graphs missing from the authorization projection"
+        );
+    }
+    let unmaterialized = projected.difference(&graphs).cloned().collect::<Vec<_>>();
+    if !unmaterialized.is_empty() {
+        warn!(
+            event = "metadata.authorization.graph_missing",
+            count = unmaterialized.len() as u64,
+            sample_graph_iris = ?unmaterialized.iter().take(8).collect::<Vec<_>>(),
+            "metadata authorization projection references graphs missing from Craqle"
+        );
+    }
+    let stale = records
+        .iter()
+        .filter(|record| {
+            policies.get(&record.graph_iri).is_some_and(|policy| {
+                policy.public != record.public
+                    || policy.permission_paths != [record.permission_path.clone()]
+            })
+        })
+        .map(|record| record.graph_iri.as_str())
+        .collect::<Vec<_>>();
+    if !stale.is_empty() {
+        warn!(
+            event = "metadata.authorization.projection_stale",
+            count = stale.len() as u64,
+            sample_graph_iris = ?stale.iter().take(8).collect::<Vec<_>>(),
+            "metadata authorization projection disagrees with Craqle graph policy"
+        );
+    }
 }
 
 #[tracing::instrument(
@@ -5151,7 +5646,8 @@ mod tests {
     use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
     use aruna_core::keyspaces::{API_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::{
-        PathRestriction, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
+        ArunaArn, PathRestriction, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
+        SyncMode, SyncState, SyncStatusSnapshot, TokenClaims,
     };
     use aruna_storage::{FjallStorage, StorageHandle};
     use byteview::ByteView;
@@ -5161,6 +5657,104 @@ mod tests {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde::Serialize;
     use tempfile::{TempDir, tempdir};
+
+    #[test]
+    fn workspace_delete_allowed() {
+        let (_, realm_id, user_id) = realm_fixture();
+        let relationship = SyncRelationship {
+            id: Ulid::generate(),
+            source: ArunaArn::s3_bucket(realm_id, node_id_from_seed(1), "ws-temporary").unwrap(),
+            target: ArunaArn::s3_bucket(realm_id, node_id_from_seed(2), "target").unwrap(),
+            mode: SyncMode::Continuous,
+            reference_handling: Default::default(),
+            reference_serving: false,
+            replicate_deletes: true,
+            created_by: user_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            state: SyncState::Enabled,
+            status: SyncStatusSnapshot::default(),
+        };
+
+        assert!(valid_sync_request(
+            &relationship,
+            "ws-temporary",
+            "target",
+            realm_id,
+            user_id,
+            true,
+        ));
+        assert!(!valid_sync_request(
+            &relationship,
+            "ws-temporary",
+            "target",
+            realm_id,
+            user_id,
+            false,
+        ));
+        assert!(!valid_sync_request(
+            &relationship,
+            "ws-temporary",
+            "target",
+            realm_id,
+            UserId::local(Ulid::generate(), realm_id),
+            true,
+        ));
+    }
+
+    #[tokio::test]
+    async fn sync_creates_bucket() {
+        let tempdir = tempdir().unwrap();
+        let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let (_, realm_id, user_id) = realm_fixture();
+        let group_id = Ulid::generate();
+        let relationship = SyncRelationship {
+            id: Ulid::generate(),
+            source: ArunaArn::s3_bucket(realm_id, node_id_from_seed(1), "source").unwrap(),
+            target: ArunaArn::s3_bucket(realm_id, node_id_from_seed(2), "foobar").unwrap(),
+            mode: SyncMode::Once,
+            reference_handling: Default::default(),
+            reference_serving: false,
+            replicate_deletes: false,
+            created_by: user_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            state: SyncState::Enabled,
+            status: SyncStatusSnapshot::default(),
+        };
+
+        create_sync_bucket(&context, "foobar", group_id, &relationship)
+            .await
+            .unwrap();
+        let bucket = drive(GetBucketInfoOperation::new("foobar".to_string()), &context)
+            .await
+            .unwrap()
+            .transpose()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(bucket.group_id, group_id);
+        assert_eq!(bucket.created_by, user_id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sync_timeout_fires() {
+        assert!(SYNC_MIRROR_REQUEST_TIMEOUT < RECONCILE_GRACE);
+        let result =
+            with_sync_timeout(std::future::pending::<Result<(), MetadataRequestError>>()).await;
+
+        assert!(matches!(
+            result,
+            Err(MetadataError::Backend(message))
+                if message == "sync mirror request timed out"
+        ));
+    }
 
     #[test]
     fn metadata_query_validation_allows_common_prefixes_and_rejects_unsafe_forms() {
@@ -5321,6 +5915,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bad_bucket_token() {
+        let (_dir, storage) = auth_storage();
+        let realm_id = RealmId([17u8; 32]);
+        let auth = bucket_search_auth(
+            &MetadataAuthValidationState::new(storage.clone()),
+            &storage,
+            node_id_from_seed(18),
+            Some(realm_id),
+            Some(MetadataAuthToken::bearer("invalid-token").unwrap()),
+        )
+        .await;
+
+        assert!(auth.is_none());
+    }
+
+    #[tokio::test]
     async fn remote_metadata_auth_peer_gate_rejects_peer_from_wrong_realm() {
         let (realm_signing_key, realm_id, user_id) = realm_fixture();
         let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
@@ -5434,7 +6044,7 @@ mod tests {
     async fn remote_metadata_auth_preserves_path_restrictions() {
         let (realm_signing_key, realm_id, user_id) = realm_fixture();
         let restrictions = vec![PathRestriction {
-            pattern: format!("/{realm_id}/g/{}/meta/**", Ulid::r#gen()),
+            pattern: format!("/{realm_id}/g/{}/meta/**", Ulid::generate()),
             permission: Permission::READ,
         }];
         let mut claims = token_claims(realm_id, user_id);
@@ -5570,7 +6180,7 @@ mod tests {
     fn realm_fixture() -> (SigningKey, RealmId, UserId) {
         let signing_key = signing_key();
         let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let user_id = UserId::local(Ulid::generate(), realm_id);
         (signing_key, realm_id, user_id)
     }
 
@@ -5590,7 +6200,7 @@ mod tests {
             iss: realm_id.to_string(),
             iat: now,
             exp: now + 600,
-            jti: Ulid::r#gen().to_string(),
+            jti: Ulid::generate().to_string(),
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,
@@ -5608,10 +6218,10 @@ mod tests {
     }
 
     fn registry_record(document_path: &str) -> MetadataRegistryRecord {
-        let document_id = Ulid::r#gen();
+        let document_id = Ulid::generate();
         MetadataRegistryRecord {
             realm_id: RealmId([7u8; 32]),
-            group_id: Ulid::r#gen(),
+            group_id: Ulid::generate(),
             document_id,
             document_path: document_path.to_string(),
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
@@ -5680,8 +6290,8 @@ mod tests {
 
     #[test]
     fn group_snapshots_are_scoped_and_invalidate_per_group() {
-        let group_a = Ulid::r#gen();
-        let group_b = Ulid::r#gen();
+        let group_a = Ulid::generate();
+        let group_b = Ulid::generate();
         let mut record_a = registry_record("datasets/a");
         record_a.group_id = group_a;
         let mut record_b = registry_record("datasets/b");
@@ -5820,8 +6430,8 @@ mod tests {
 
     #[test]
     fn rejected_cold_group_fill_filters_fresh_records_for_requested_group() {
-        let group_a = Ulid::r#gen();
-        let group_b = Ulid::r#gen();
+        let group_a = Ulid::generate();
+        let group_b = Ulid::generate();
         let mut record_a = registry_record("datasets/a");
         record_a.group_id = group_a;
         let mut record_b = registry_record("datasets/b");
@@ -5869,7 +6479,7 @@ mod tests {
         assert!(
             registry_record_for_graph(
                 &records,
-                &MetadataRegistryRecord::graph_iri_for(Ulid::r#gen())
+                &MetadataRegistryRecord::graph_iri_for(Ulid::generate())
             )
             .is_none()
         );
@@ -5906,7 +6516,7 @@ mod tests {
         assert!(!anonymous.graph_visible(&cache, &deleted_record.graph_iri));
         assert!(!anonymous.graph_visible(
             &cache,
-            &MetadataRegistryRecord::graph_iri_for(Ulid::r#gen())
+            &MetadataRegistryRecord::graph_iri_for(Ulid::generate())
         ));
 
         let member = GraphVisibilityScope {

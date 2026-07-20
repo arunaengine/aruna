@@ -77,7 +77,13 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
             }
         }
         Effect::StagingSource(staging_source_effect) => {
-            if let Some(blob_handle) = &context.blob_handle {
+            if crate::native_reference::is_native_effect(&staging_source_effect) {
+                Box::pin(crate::native_reference::send_native_effect(
+                    staging_source_effect,
+                    context,
+                ))
+                .await
+            } else if let Some(blob_handle) = &context.blob_handle {
                 blob_handle
                     .send_staging_source_effect(staging_source_effect)
                     .await
@@ -191,11 +197,19 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
             }
         }
         Effect::Search() => {
-            tracing::warn!("Search effect is not handled by driver yet");
+            tracing::warn!(
+                depth,
+                effect = effect_name,
+                "Search effect is not handled by driver yet"
+            );
             Event::Search()
         }
         Effect::Stream() => {
-            tracing::warn!("Top-level stream effect is not handled by driver yet");
+            tracing::warn!(
+                depth,
+                effect = effect_name,
+                "Top-level stream effect is not handled by driver yet"
+            );
             Event::Stream()
         }
     };

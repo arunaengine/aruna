@@ -41,7 +41,7 @@ async fn group_creation_replicates_to_all_realm_nodes() -> Result<(), Box<dyn st
 
     let creator = Actor {
         node_id: nodes[0].net.node_id(),
-        user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
+        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
         realm_id,
     };
 
@@ -82,7 +82,7 @@ async fn unheld_group_replicates() -> Result<(), Box<dyn std::error::Error>> {
             CreateGroupOperation::new(CreateGroupConfig {
                 actor: Actor {
                     node_id: origin,
-                    user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
+                    user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
                     realm_id,
                 },
                 display_name: format!("unheld group {attempt}"),

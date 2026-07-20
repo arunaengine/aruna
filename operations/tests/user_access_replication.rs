@@ -38,8 +38,8 @@ async fn access_key_replicates_realm_wide() -> Result<(), Box<dyn std::error::Er
         permission: aruna_core::structs::Permission::READ,
     }];
     let config = CreateUserAccessConfig {
-        user_identity: UserId::local(Ulid::r#gen(), realm_id),
-        group_id: Ulid::r#gen(),
+        user_identity: UserId::local(Ulid::generate(), realm_id),
+        group_id: Ulid::generate(),
         expiry: SystemTime::now() + Duration::from_secs(3600),
         path_restrictions: Some(restrictions.clone()),
         issued_by: *nodes[0].net.node_id().as_bytes(),
@@ -71,8 +71,8 @@ async fn revocation_propagates_realm_wide() -> Result<(), Box<dyn std::error::Er
     let nodes = build_realm_nodes(&realm_id, 2).await?;
 
     let config = CreateUserAccessConfig {
-        user_identity: UserId::local(Ulid::r#gen(), realm_id),
-        group_id: Ulid::r#gen(),
+        user_identity: UserId::local(Ulid::generate(), realm_id),
+        group_id: Ulid::generate(),
         expiry: SystemTime::now() + Duration::from_secs(3600),
         path_restrictions: None,
         issued_by: *nodes[0].net.node_id().as_bytes(),

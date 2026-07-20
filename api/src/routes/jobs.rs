@@ -5,12 +5,14 @@ use std::sync::Arc;
 use aruna_core::compute::normalize_container_path;
 use aruna_core::structs::{
     AuthContext, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId,
-    JobRecord, JobState, Permission, WorkspaceOutput, blob_group_permission_path,
+    JobRecord, JobState, Permission, WorkspaceMode, WorkspaceOutput, blob_bucket_permission_path,
+    blob_group_permission_path,
 };
 use aruna_operations::jobs::service::{
     CancelJobOutcome, cancel_owned_job, list_owned_jobs, read_job_run_crate_status, read_owned_job,
     submit_execution_job,
 };
+use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -24,6 +26,7 @@ use utoipa::{OpenApi, ToSchema};
 use crate::auth::{ensure_permission, require_unrestricted_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
+use aruna_operations::driver::drive;
 
 const DEFAULT_LIST_LIMIT: usize = 50;
 const MAX_LIST_LIMIT: usize = 200;
@@ -65,6 +68,21 @@ pub struct ExecutionOutputRequest {
     pub dest_key: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceModeRequest {
+    Temporary,
+    Kept,
+    Existing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WorkspaceRequest {
+    pub mode: WorkspaceModeRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SubmitExecutionRequest {
     pub group_id: String,
@@ -91,6 +109,8 @@ pub struct SubmitExecutionRequest {
     pub output_prefixes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -138,6 +158,7 @@ pub struct JobStatusResponse {
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_bucket: Option<String>,
+    pub workspace_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_crate: Option<serde_json::Value>,
 }
@@ -176,6 +197,7 @@ fn job_status_response(record: &JobRecord) -> JobStatusResponse {
         }),
         result: record.result.as_ref().map(|result| result.to_public_json()),
         workspace_bucket: record.workspace_bucket.clone(),
+        workspace_mode: record.workspace_mode.name().to_string(),
         run_crate: None,
     }
 }
@@ -225,8 +247,54 @@ fn map_submit_error(error: aruna_operations::jobs::submit::SubmitJobError) -> Se
         SubmitJobError::JobPlanConflict { existing_job_id } => ServerError::Conflict(format!(
             "idempotency key already bound to job {existing_job_id}"
         )),
+        SubmitJobError::InvalidWorkspace(_) => ServerError::BadRequest,
         other => ServerError::InternalError(other.to_string()),
     }
+}
+
+fn workspace_request(
+    workspace: Option<WorkspaceRequest>,
+) -> ServerResult<(WorkspaceMode, Option<String>)> {
+    let Some(workspace) = workspace else {
+        return Ok((WorkspaceMode::Kept, None));
+    };
+    match (workspace.mode, workspace.bucket) {
+        (WorkspaceModeRequest::Temporary, None) => Ok((WorkspaceMode::Temporary, None)),
+        (WorkspaceModeRequest::Kept, None) => Ok((WorkspaceMode::Kept, None)),
+        (WorkspaceModeRequest::Existing, Some(bucket)) if !bucket.trim().is_empty() => {
+            Ok((WorkspaceMode::Existing, Some(bucket)))
+        }
+        _ => Err(ServerError::BadRequest),
+    }
+}
+
+async fn validate_existing_workspace(
+    state: &ServerState,
+    auth: &AuthContext,
+    group_id: Ulid,
+    bucket: &str,
+) -> ServerResult<()> {
+    let info = match drive(
+        GetBucketInfoOperation::new(bucket.to_string()),
+        &state.get_ctx(),
+    )
+    .await
+    .and_then(|result| result.transpose())
+    {
+        Ok(Some(info)) => info,
+        Ok(None) | Err(GetBucketInfoError::NotFound) => return Err(ServerError::BadRequest),
+        Err(error) => return Err(ServerError::InternalError(error.to_string())),
+    };
+    if info.group_id != group_id {
+        return Err(ServerError::BadRequest);
+    }
+    ensure_permission(
+        state,
+        auth,
+        blob_bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket),
+        Permission::WRITE,
+    )
+    .await
 }
 
 /// Canonical absolute container path or 400.
@@ -356,6 +424,7 @@ pub async fn submit_job(
 ) -> ServerResult<(StatusCode, Json<SubmitJobResponse>)> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let group_id = Ulid::from_string(&request.group_id).map_err(|_| ServerError::BadRequest)?;
+    let (workspace_mode, workspace_bucket) = workspace_request(request.workspace)?;
     if request.image.trim().is_empty() {
         return Err(ServerError::BadRequest);
     }
@@ -375,6 +444,9 @@ pub async fn submit_job(
         Permission::WRITE,
     )
     .await?;
+    if let Some(bucket) = workspace_bucket.as_deref() {
+        validate_existing_workspace(&state, &auth, group_id, bucket).await?;
+    }
 
     if request.inputs.len() > MAX_INPUTS || request.outputs.len() > MAX_INPUTS {
         return Err(ServerError::BadRequest);
@@ -429,6 +501,8 @@ pub async fn submit_job(
         auth.user_id,
         state.get_node_id(),
         request.idempotency_key,
+        workspace_mode,
+        workspace_bucket,
     )
     .await
     .map_err(map_submit_error)?;
@@ -794,6 +868,7 @@ mod tests {
                 outputs: Vec::new(),
                 output_prefixes: Vec::new(),
                 idempotency_key: None,
+                workspace: None,
             };
             let result = submit_job(
                 State(state.clone()),
@@ -875,6 +950,23 @@ mod tests {
         assert!(validate_output_prefixes(vec![String::new()]).is_err());
         assert!(
             validate_output_prefixes(vec!["result".to_string(); MAX_OUTPUT_PREFIXES + 1]).is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_defaults_kept() {
+        assert_eq!(
+            workspace_request(None).unwrap(),
+            (WorkspaceMode::Kept, None)
+        );
+        let record = job_for(JobId(Ulid::from_parts(1, 0)), user(2), 1);
+        assert_eq!(job_status_response(&record).workspace_mode, "kept");
+        assert!(
+            workspace_request(Some(WorkspaceRequest {
+                mode: WorkspaceModeRequest::Existing,
+                bucket: None,
+            }))
+            .is_err()
         );
     }
 

@@ -431,7 +431,7 @@ fn apply_realm_config_node_ensure(
 ) -> Result<AdminDocumentEvent, AdminDocumentReducerError> {
     let observed = state.clock.clone();
     let event = AdminDocumentEvent {
-        event_id: Ulid::r#gen(),
+        event_id: Ulid::generate(),
         target: state.target.clone(),
         origin_node_id: actor.node_id,
         origin_seq: observed.sequence_for(&actor.node_id) + 1,
@@ -603,7 +603,7 @@ mod tests {
             .insert(path.clone(), conflict(&path));
 
         let mut operation = EnsureRealmConfigOperation::new(config(actor.clone(), 7));
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         operation.txn_id = Some(txn_id);
         let writes = batch_write(
             operation
@@ -663,7 +663,7 @@ mod tests {
         let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         document.ensure_node(actor.node_id, RealmNodeKind::Management);
         let mut operation = EnsureRealmConfigOperation::new(config(actor.clone(), 3));
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         operation.txn_id = Some(txn_id);
         let writes = batch_write(
             operation
@@ -704,7 +704,7 @@ mod tests {
         document.ensure_node(actor.node_id, RealmNodeKind::Management);
 
         let mut operation = EnsureRealmConfigOperation::new(config(actor.clone(), 3));
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         operation.txn_id = Some(txn_id);
         let effects = operation
             .emit_write_document_and_admin_state(
@@ -879,7 +879,7 @@ mod tests {
             reject_kind_mismatch: true,
             ..config(actor.clone(), 3)
         });
-        operation.txn_id = Some(TxnId::r#gen());
+        operation.txn_id = Some(TxnId::generate());
 
         let error = operation
             .emit_write_document_and_admin_state(

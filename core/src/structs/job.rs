@@ -10,6 +10,7 @@ use ulid::Ulid;
 use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::invert_timestamp_ms;
+use crate::structs::{AuthContext, StagingStrategy};
 use crate::types::{GroupId, Key, UserId};
 
 /// Version prefix keeping the record wrappable in a version envelope later (#286).
@@ -26,7 +27,7 @@ pub struct JobId(pub Ulid);
 impl JobId {
     #[inline]
     pub fn new() -> Self {
-        Self(Ulid::r#gen())
+        Self(Ulid::generate())
     }
 
     #[inline]
@@ -208,6 +209,81 @@ pub struct ExecutionSpec {
     pub output_prefixes: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagingJobItem {
+    pub source_path: String,
+    pub target_key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagingJobPrefix {
+    pub source_prefix: String,
+    pub target_prefix: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagingJobSpec {
+    pub auth_context: AuthContext,
+    pub group_id: GroupId,
+    pub node_id: NodeId,
+    pub connector_id: Ulid,
+    pub bucket: String,
+    pub strategy: StagingStrategy,
+    pub items: Vec<StagingJobItem>,
+    pub prefixes: Vec<StagingJobPrefix>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StagingJobPhase {
+    Queued,
+    Discovering,
+    Inspecting,
+    Registering,
+    Downloading,
+    Writing,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagingJobError {
+    pub source_path: String,
+    pub target_key: String,
+    pub error: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagingJobDirectory {
+    pub source_path: String,
+    pub target_prefix: String,
+    pub offset: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagingPendingItem {
+    pub source_path: String,
+    pub target_key: String,
+    pub size: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagingJobCheckpoint {
+    pub phase: StagingJobPhase,
+    pub pending_items: Vec<StagingPendingItem>,
+    pub pending_directories: Vec<StagingJobDirectory>,
+    pub items_current: u64,
+    pub items_succeeded: u64,
+    pub items_failed: u64,
+    pub items_total: Option<u64>,
+    pub bytes_current: u64,
+    pub bytes_total: Option<u64>,
+    pub bytes_discovered: u64,
+    pub unknown_sizes: u64,
+    pub current_path: Option<String>,
+    pub errors: Vec<StagingJobError>,
+}
+
 impl ExecutionSpec {
     /// Materialize workspace output intents against the resolved bucket.
     /// Deterministic across retries: the bucket name derives from the `JobId`.
@@ -245,7 +321,9 @@ pub enum JobPayload {
     /// Follow-on internal obligation: write the run crate for a finished execution
     /// job. Idempotent by dedup key `run-crate/{JobId}`; a failure never affects
     /// the parent job.
-    WriteRunCrate { for_job: JobId },
+    WriteRunCrate {
+        for_job: JobId,
+    },
     /// Durable internal obligation to revoke the workspace credential and remove
     /// the terminal backend attempt.
     TerminalCleanup {
@@ -253,6 +331,7 @@ pub enum JobPayload {
         attempt: Option<AttemptIntent>,
         access_key: String,
     },
+    Staging(StagingJobSpec),
 }
 
 impl JobPayload {
@@ -261,6 +340,7 @@ impl JobPayload {
         match self {
             JobPayload::Probe { .. } => "probe",
             JobPayload::Execution(_) => "execution",
+            JobPayload::Staging(_) => "staging",
             JobPayload::WriteRunCrate { .. } => "write_run_crate",
             JobPayload::TerminalCleanup { .. } => "terminal_cleanup",
         }
@@ -271,6 +351,7 @@ impl JobPayload {
         match self {
             JobPayload::Probe { .. } => "steps",
             JobPayload::Execution(_) => "phases",
+            JobPayload::Staging(_) => "items",
             JobPayload::WriteRunCrate { .. } | JobPayload::TerminalCleanup { .. } => "steps",
         }
     }
@@ -280,6 +361,7 @@ impl JobPayload {
     pub fn execution_class(&self) -> JobExecutionClass {
         match self {
             JobPayload::Probe { .. }
+            | JobPayload::Staging(_)
             | JobPayload::WriteRunCrate { .. }
             | JobPayload::TerminalCleanup { .. } => JobExecutionClass::InProcess,
             JobPayload::Execution(_) => JobExecutionClass::ExternalAttempt,
@@ -393,6 +475,10 @@ pub enum JobResultPayload {
         resource: String,
     },
     Cleanup,
+    Staging {
+        completed_items: u64,
+        failed_items: u64,
+    },
 }
 
 impl JobResultPayload {
@@ -402,6 +488,7 @@ impl JobResultPayload {
             JobResultPayload::Execution { .. } => "execution",
             JobResultPayload::RunCrate { .. } => "run_crate",
             JobResultPayload::Cleanup => "cleanup",
+            JobResultPayload::Staging { .. } => "staging",
         }
     }
 
@@ -437,6 +524,13 @@ impl JobResultPayload {
                 serde_json::json!({ "resource": resource })
             }
             JobResultPayload::Cleanup => serde_json::json!({}),
+            JobResultPayload::Staging {
+                completed_items,
+                failed_items,
+            } => serde_json::json!({
+                "completed_items": completed_items,
+                "failed_items": failed_items,
+            }),
         }
     }
 }
@@ -547,6 +641,24 @@ pub struct JobClaim {
     pub lease_expires_at_ms: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceMode {
+    Temporary,
+    #[default]
+    Kept,
+    Existing,
+}
+
+impl WorkspaceMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Temporary => "temporary",
+            Self::Kept => "kept",
+            Self::Existing => "existing",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRecord {
     pub job_id: JobId,
@@ -573,6 +685,8 @@ pub struct JobRecord {
     pub attempt_intent: Option<AttemptIntent>,
     /// Durable workspace/run bucket name (`ws-{jobid}`) for execution jobs.
     pub workspace_bucket: Option<String>,
+    #[serde(default)]
+    pub workspace_mode: WorkspaceMode,
 }
 
 impl JobRecord {
@@ -613,6 +727,7 @@ impl JobRecord {
             plan_digest,
             attempt_intent: None,
             workspace_bucket: None,
+            workspace_mode: WorkspaceMode::default(),
         }
     }
 
@@ -626,7 +741,15 @@ impl JobRecord {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
+        match postcard::from_bytes(bytes) {
+            Ok(record) => Ok(record),
+            Err(postcard::Error::DeserializeUnexpectedEnd) => {
+                let mut legacy = bytes.to_vec();
+                legacy.extend(postcard::to_allocvec(&WorkspaceMode::default())?);
+                Ok(postcard::from_bytes(&legacy)?)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -1117,6 +1240,19 @@ mod tests {
         let record = probe_record(JobId::from_bytes([5u8; 16]), 1_700_000_000_000);
         let bytes = record.to_bytes().unwrap();
         assert_eq!(JobRecord::from_bytes(&bytes).unwrap(), record);
+    }
+
+    #[test]
+    fn legacy_record_defaults() {
+        let record = probe_record(JobId::from_bytes([6u8; 16]), 1_700_000_000_000);
+        let mut bytes = record.to_bytes().unwrap();
+        let mode = postcard::to_allocvec(&WorkspaceMode::Kept).unwrap();
+        bytes.truncate(bytes.len() - mode.len());
+
+        let decoded = JobRecord::from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.workspace_mode, WorkspaceMode::Kept);
+        assert_eq!(decoded.workspace_bucket, record.workspace_bucket);
     }
 
     #[test]

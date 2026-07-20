@@ -78,7 +78,21 @@ impl BlobHandle {
 
     pub async fn send_staging_source_effect(&self, effect: StagingSourceEffect) -> Event {
         let staging_source_event = match effect {
+            StagingSourceEffect::Check { access } => {
+                self.handler.check_staging_source(access).await
+            }
             StagingSourceEffect::Head { access } => self.handler.head_staging_source(access).await,
+            StagingSourceEffect::List {
+                access,
+                offset,
+                limit,
+                recursive,
+                files_only,
+            } => {
+                self.handler
+                    .list_staging_source(access, offset, limit, recursive, files_only)
+                    .await
+            }
             StagingSourceEffect::Read { access, range } => {
                 self.handler.read_staging_source(access, range).await
             }
@@ -303,9 +317,9 @@ impl BlobHandler {
                 stream_id
             }
             None => {
-                let mut candidate = Ulid::r#gen();
+                let mut candidate = Ulid::generate();
                 while candidate.is_nil() || connections.contains_key(&candidate) {
-                    candidate = Ulid::r#gen();
+                    candidate = Ulid::generate();
                 }
                 candidate
             }

@@ -1014,7 +1014,7 @@ pub mod test {
         let realm_id = RealmId([0u8; 32]);
         let actor = Actor {
             node_id: node(1),
-            user_id: UserId::local(Ulid::r#gen(), realm_id),
+            user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
         };
         drive(
@@ -1105,7 +1105,7 @@ pub mod test {
                 realm_id,
                 group_id,
                 role: Role {
-                    role_id: Ulid::r#gen(),
+                    role_id: Ulid::generate(),
                     name: name.to_string(),
                     permissions: HashMap::from([(
                         format!("/{realm_id}/g/{group_id}/data/**"),
@@ -1145,7 +1145,7 @@ pub mod test {
                 realm_id,
                 group_id,
                 role: Role {
-                    role_id: Ulid::r#gen(),
+                    role_id: Ulid::generate(),
                     name: "public".to_string(),
                     permissions: HashMap::from([(
                         format!("/{realm_id}/g/{group_id}/data/**"),
@@ -1184,7 +1184,7 @@ pub mod test {
             realm_id,
             group_id,
             role: Role {
-                role_id: Ulid::r#gen(),
+                role_id: Ulid::generate(),
                 name: "foreign-nil".to_string(),
                 permissions: HashMap::from([(
                     format!("/{realm_id}/g/{group_id}/data/**"),
@@ -1207,9 +1207,9 @@ pub mod test {
         // Inputs
         //
         let realm_id = aruna_core::structs::RealmId([0u8; 32]);
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let user_id = UserId::local(Ulid::generate(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let auth_doc =
             GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
         let group = Group {
@@ -1229,7 +1229,7 @@ pub mod test {
             user_id,
             realm_id,
         };
-        let role_id = Ulid::r#gen();
+        let role_id = Ulid::generate();
         let add_role_input = AddGroupRoleConfig {
             auth_context: auth_context.clone(),
             actor: actor.clone(),
@@ -1243,7 +1243,7 @@ pub mod test {
                         "{}/g/{}/meta/{}",
                         realm_id,
                         group_id.to_string(),
-                        Ulid::r#gen(),
+                        Ulid::generate(),
                     ),
                     Permission::READ,
                 )]),
@@ -1312,7 +1312,7 @@ pub mod test {
             AddGroupRoleState::StartTransaction
         );
 
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         let effects = add_role_operation.step(Event::Storage(
             aruna_core::events::StorageEvent::TransactionStarted { txn_id },
         ));
@@ -1528,7 +1528,7 @@ pub mod test {
     async fn assigned_users_emit_membership_notifications_for_new_members() {
         let (context, _tempdir) = test_context().await;
         let (actor, group, auth_doc) = setup_group(&context).await;
-        let second_admin = UserId::local(Ulid::r#gen(), actor.realm_id);
+        let second_admin = UserId::local(Ulid::generate(), actor.realm_id);
         drive(
             AddUserToGroupOperation::new(AddUserToGroupInput {
                 actor: actor.clone(),
@@ -1541,7 +1541,7 @@ pub mod test {
         .await
         .unwrap();
 
-        let member = UserId::local(Ulid::r#gen(), actor.realm_id);
+        let member = UserId::local(Ulid::generate(), actor.realm_id);
         drive(
             AddGroupRoleOperation::new(AddGroupRoleConfig {
                 auth_context: auth_context(&actor),
@@ -1549,7 +1549,7 @@ pub mod test {
                 realm_id: actor.realm_id,
                 group_id: group.group_id,
                 role: Role {
-                    role_id: Ulid::r#gen(),
+                    role_id: Ulid::generate(),
                     name: "custom_member".to_string(),
                     permissions: HashMap::from([(
                         format!("/{}/g/{}/data/**", actor.realm_id, group.group_id),
@@ -1590,7 +1590,7 @@ pub mod test {
                 realm_id: actor.realm_id,
                 group_id: group.group_id,
                 role: Role {
-                    role_id: Ulid::r#gen(),
+                    role_id: Ulid::generate(),
                     name: "public_viewer".to_string(),
                     permissions: HashMap::from([(
                         format!("/{}/g/{}/data/**", actor.realm_id, group.group_id),

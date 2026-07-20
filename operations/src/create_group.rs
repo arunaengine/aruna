@@ -116,7 +116,7 @@ impl CreateGroupOperation {
 
     #[tracing::instrument(name = "group.create.emit_group", level = "debug", skip(self), fields(state = ?self.state, group_name = %self.config.display_name))]
     fn emit_create_group(&mut self) -> Result<Effects, CreateGroupError> {
-        let group_id = Ulid::r#gen();
+        let group_id = Ulid::generate();
         let auth_doc = GroupAuthorizationDocument::new_default_group_doc(
             self.config.actor.user_id,
             self.config.actor.realm_id,
@@ -681,7 +681,7 @@ mod test {
     fn seeds_group_reducer_state_and_admin_outbox_in_order() {
         let realm_id = RealmId::from_bytes([2; 32]);
         let actor = actor(realm_id, 3, 4);
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         let mut operation = CreateGroupOperation::new(config(actor.clone()));
         operation.txn_id = Some(txn_id);
 
@@ -812,7 +812,7 @@ mod test {
     fn schedules_outbox_drain_and_finishes_without_direct_replication() {
         let realm_id = RealmId::from_bytes([5; 32]);
         let actor = actor(realm_id, 6, 7);
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         let mut operation = operation_ready_to_schedule(actor, txn_id);
 
         let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
@@ -867,7 +867,7 @@ mod test {
         };
 
         let realm_id = aruna_core::structs::RealmId([0u8; 32]);
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let user_id = UserId::local(Ulid::generate(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let group_config = CreateGroupConfig {
             actor: Actor {
@@ -947,7 +947,7 @@ mod test {
         };
 
         let realm_id = aruna_core::structs::RealmId([0u8; 32]);
-        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let user_id = UserId::local(Ulid::generate(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let actor = Actor {
             node_id,

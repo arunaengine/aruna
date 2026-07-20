@@ -222,7 +222,7 @@ async fn placement_is_uniform_across_nodes() -> Result<(), Box<dyn std::error::E
     let nodes = build_realm_nodes(&realm_id, 3).await?;
 
     for _ in 0..20 {
-        let recipient = UserId::local(Ulid::r#gen(), realm_id);
+        let recipient = UserId::local(Ulid::generate(), realm_id);
         let mut holders = Vec::with_capacity(nodes.len());
         for node in &nodes {
             holders.push(resolve_holder_on(node, recipient).await?);
@@ -350,8 +350,8 @@ fn added_to_group_record(
         recipient,
         NotificationClass::Direct,
         NotificationKind::AddedToGroup {
-            group_id: Ulid::r#gen(),
-            actor_user_id: UserId::local(Ulid::r#gen(), realm_id),
+            group_id: Ulid::generate(),
+            actor_user_id: UserId::local(Ulid::generate(), realm_id),
         },
         created_at_ms,
     )
@@ -372,7 +372,7 @@ fn user_with_holder(
     realm_id: RealmId,
 ) -> UserId {
     for _ in 0..10_000 {
-        let candidate = UserId::local(Ulid::r#gen(), realm_id);
+        let candidate = UserId::local(Ulid::generate(), realm_id);
         if matches!(resolve_inbox_holder(&candidate, realm_config), Ok(Some(node)) if node == holder)
         {
             return candidate;

@@ -11,8 +11,8 @@ use aruna_compute::ExecutorBackend;
 use aruna_compute::executor::logs::NullSink;
 use aruna_core::compute::{
     AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind,
-    FenceContext, LogLimits, LogTails, ReconcileEvidence, ResourceRequest, SecurityContext,
-    StagingMode, TaskInput, TaskSpec, TombstoneSpec, UserSpec,
+    FenceContext, LogLimits, LogTails, NetworkAccess, ReconcileEvidence, ResourceRequest,
+    SecurityContext, StagingMode, TaskInput, TaskSpec, TombstoneSpec, UserSpec,
 };
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
@@ -45,6 +45,7 @@ use workspace::{
 /// Fallback walltime when a spec declares none. Enforcement, reconcile
 /// validation, and credential expiry must all agree on this value.
 pub(crate) const DEFAULT_WALLTIME: Duration = Duration::from_secs(24 * 60 * 60);
+const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
 
 /// Drive a claimed execution job through prepare -> submit -> supervise -> finalize.
 /// External attempts never share the generic in-process supervisor because a lost
@@ -63,13 +64,17 @@ pub async fn run_execution_job(
     let JobPayload::Execution(mut spec) = record.payload.clone() else {
         return;
     };
-    spec.resolve_outputs(&JobRecord::workspace_bucket_name(job_id));
+    let bucket = record
+        .workspace_bucket
+        .clone()
+        .unwrap_or_else(|| JobRecord::workspace_bucket_name(job_id));
+    spec.resolve_outputs(&bucket);
 
     // A fresh cancel before any attempt was submitted: no container exists, so
     // terminalize directly (Claimed -> Cancelled).
     if record.cancel_requested && record.attempt_intent.is_none() {
         match cancel_running_job(storage, job_id, token, unix_timestamp_millis()).await {
-            Ok(_) => finalize_followups(&context, job_id).await,
+            Ok(record) => cleanup_and_crate(&context, job_id, Some(record)).await,
             Err(error) => {
                 warn!(job_id = %job_id, error = %error, "Fresh cancellation write failed")
             }
@@ -117,15 +122,15 @@ pub async fn run_execution_job(
     tokio::pin!(heartbeat);
 
     let prepare_and_submit = async {
-        let bucket = JobRecord::workspace_bucket_name(job_id);
-        let inputs =
-            match prepare_workspace(&context, &spec, &record, node_id, &bucket, token).await {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    requeue_or_fail_pre_submit(&context, job_id, token, &record, error).await;
-                    return None;
-                }
-            };
+        let inputs = match prepare_workspace(&context, &spec, &record, node_id, &bucket, token)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                requeue_or_fail_pre_submit(&context, job_id, token, &record, error, false).await;
+                return None;
+            }
+        };
 
         // Preparing -> Ready.
         if transition_to_ready(storage, job_id, token, unix_timestamp_millis())
@@ -141,12 +146,13 @@ pub async fn run_execution_job(
         let pinned_image = match backend.resolve_image(&spec.image, &cancel).await {
             Ok(image) => image,
             Err(error) => {
+                warn!(job_id = %job_id, image = %spec.image, %error, "image resolution failed");
                 let job_error = if error.retryable() {
                     JobError::retryable(format!("image resolution failed: {error}"))
                 } else {
                     JobError::permanent(format!("image resolution failed: {error}"))
                 };
-                requeue_or_fail_pre_submit(&context, job_id, token, &record, job_error).await;
+                requeue_or_fail_pre_submit(&context, job_id, token, &record, job_error, true).await;
                 return None;
             }
         };
@@ -185,7 +191,7 @@ pub async fn run_execution_job(
                 {
                     match cancel_running_job(storage, job_id, token, unix_timestamp_millis()).await
                     {
-                        Ok(_) => finalize_followups(&context, job_id).await,
+                        Ok(record) => cleanup_and_crate(&context, job_id, Some(record)).await,
                         Err(error) => {
                             warn!(job_id = %job_id, error = %error, "Pre-submit cancellation write failed")
                         }
@@ -197,7 +203,7 @@ pub async fn run_execution_job(
         };
         if intent_commit.record.cancel_requested {
             match cancel_running_job(storage, job_id, token, unix_timestamp_millis()).await {
-                Ok(_) => finalize_followups(&context, job_id).await,
+                Ok(record) => cleanup_and_crate(&context, job_id, Some(record)).await,
                 Err(error) => {
                     warn!(job_id = %job_id, error = %error, "Pre-submit cancellation write failed")
                 }
@@ -331,7 +337,7 @@ async fn prepare_workspace(
     token: ulid::Ulid,
 ) -> Result<Vec<TaskInput>, JobError> {
     ensure_group_write(context, spec, record, node_id).await?;
-    ensure_workspace_bucket(context, spec, record, bucket).await?;
+    ensure_workspace_bucket(context, spec, record, node_id, bucket).await?;
     set_workspace_bucket(
         &context.storage_handle,
         record.job_id,
@@ -376,6 +382,15 @@ fn build_task_spec(
         workspace: None,
         security: SecurityContext {
             run_as,
+            network: if spec
+                .tags
+                .get(NETWORK_TAG_KEY)
+                .is_some_and(|value| value == "open")
+            {
+                NetworkAccess::Open
+            } else {
+                NetworkAccess::Isolated
+            },
             ..Default::default()
         },
         log_limits: Default::default(),
@@ -626,7 +641,7 @@ pub(super) async fn requeue_after_tombstone(
     } else {
         JobError::permanent(format!("submit failed: {error}"))
     };
-    requeue_or_fail_pre_submit(context, job_id, token, record, job_error).await;
+    requeue_or_fail_pre_submit(context, job_id, token, record, job_error, false).await;
 }
 
 async fn park_failed_submit(
@@ -1128,8 +1143,42 @@ async fn terminal_cancel(
 /// Wake the drain for the terminal obligations persisted with terminalization.
 async fn cleanup_and_crate(context: &DriverContext, job_id: JobId, record: Option<JobRecord>) {
     // Only act on a terminal record WE wrote (a lost race returns None).
-    let Some(_) = record else { return };
+    let Some(record) = record else { return };
+    log_compute_summary(&record);
     finalize_followups(context, job_id).await;
+}
+
+fn log_compute_summary(record: &JobRecord) {
+    let JobPayload::Execution(spec) = &record.payload else {
+        return;
+    };
+    let attempt = record
+        .attempt_intent
+        .as_ref()
+        .map(|intent| intent.attempt_no)
+        .unwrap_or(record.attempts);
+    let executor_kind = record
+        .attempt_intent
+        .as_ref()
+        .map(|intent| intent.executor_kind.as_str())
+        .or(spec.executor_constraint.as_deref())
+        .unwrap_or("unresolved");
+    let outcome = match record.state {
+        aruna_core::structs::JobState::Succeeded => "success",
+        aruna_core::structs::JobState::Failed => "failure",
+        aruna_core::structs::JobState::Cancelled => "cancelled",
+        _ => return,
+    };
+    info!(
+        event = "pipeline.compute.summary",
+        job_id = %record.job_id,
+        attempt,
+        image = %spec.image,
+        executor_kind,
+        state = record.state.name(),
+        outcome,
+        "Compute job summary"
+    );
 }
 
 /// Wake the drain for internal jobs persisted with terminalization.
@@ -1151,9 +1200,7 @@ async fn fail_and_crate(
 ) {
     let result = execution_result(record, None, Vec::new());
     let terminal = terminal_fail(&context.storage_handle, job_id, token, error, result).await;
-    if terminal.is_some() {
-        finalize_followups(context, job_id).await;
-    }
+    cleanup_and_crate(context, job_id, terminal).await;
 }
 
 async fn requeue_or_fail_pre_submit(
@@ -1162,8 +1209,12 @@ async fn requeue_or_fail_pre_submit(
     token: ulid::Ulid,
     record: &JobRecord,
     error: JobError,
+    error_logged: bool,
 ) {
     if error.kind == aruna_core::structs::JobErrorKind::Permanent {
+        if !error_logged {
+            warn!(job_id = %job_id, error = ?error, "Permanent pre-submit failure");
+        }
         fail_and_crate(context, job_id, token, record, error).await;
         return;
     }
@@ -1177,7 +1228,7 @@ async fn requeue_or_fail_pre_submit(
     .await
     {
         Ok(record) if record.state == aruna_core::structs::JobState::Failed => {
-            finalize_followups(context, job_id).await;
+            cleanup_and_crate(context, job_id, Some(record)).await;
         }
         Ok(_) => {}
         Err(error) => warn!(job_id = %job_id, error = %error, "Pre-submit requeue failed"),
@@ -1584,8 +1635,15 @@ mod tests {
         );
         let bucket = JobRecord::workspace_bucket_name(job_id);
 
-        let Err(error) =
-            prepare_workspace(&context, &spec, &record, node_id(7), &bucket, Ulid::r#gen()).await
+        let Err(error) = prepare_workspace(
+            &context,
+            &spec,
+            &record,
+            node_id(7),
+            &bucket,
+            Ulid::generate(),
+        )
+        .await
         else {
             panic!("workspace preparation unexpectedly succeeded");
         };
@@ -1964,6 +2022,7 @@ mod tests {
 
         let ctx = JobContext {
             driver: context(storage.clone()),
+            job_id,
             claim_token: token,
             cancel: CancellationToken::new(),
             shutdown: CancellationToken::new(),
@@ -2010,5 +2069,22 @@ mod tests {
         );
 
         assert_eq!(spec.security.run_as, run_as);
+    }
+
+    #[test]
+    fn carries_requested_network_access() {
+        let mut execution = execution_spec();
+        execution
+            .tags
+            .insert(NETWORK_TAG_KEY.to_string(), "open".to_string());
+        let spec = build_task_spec(
+            &execution,
+            &AttemptRef::new("job", 1),
+            "alpine@sha256:digest",
+            Vec::new(),
+            NOBODY,
+        );
+
+        assert_eq!(spec.security.network, NetworkAccess::Open);
     }
 }
