@@ -463,7 +463,7 @@ pub async fn create_task(
         caller.auth.user_id,
         state.get_node_id(),
         idempotency_key,
-        aruna_core::structs::WorkspaceMode::Kept,
+        aruna_core::structs::WorkspaceMode::None,
         None,
     )
     .await
@@ -888,7 +888,7 @@ fn map_input(input: &TesInput) -> Result<InputSelection, TesError> {
             version_id: None,
         },
         dest_key: input.path[1..].to_string(),
-        mode: InputMode::Snapshot,
+        mode: InputMode::Mount,
         container_path: Some(input.path.clone()),
         name: input.name.clone(),
         description: input.description.clone(),
@@ -1414,7 +1414,7 @@ mod tests {
     use aruna_core::keyspaces::{AUTH_KEYSPACE, USER_ACCESS_KEYSPACE};
     use aruna_core::structs::{
         Actor, GroupAuthorizationDocument, JobError, NodeCapabilities, OutputObject,
-        RealmAuthorizationDocument, RealmId, UserAccess,
+        RealmAuthorizationDocument, RealmId, UserAccess, WorkspaceMode,
     };
     use aruna_core::types::{NodeId, UserId};
     use aruna_operations::driver::DriverContext;
@@ -1688,6 +1688,7 @@ mod tests {
         assert_eq!(spec.resources.disk_bytes, Some(8_000_000_000));
         assert!(spec.resources.preemptible);
         assert_eq!(spec.inputs.len(), 1);
+        assert_eq!(spec.inputs[0].mode, InputMode::Mount);
         assert_eq!(spec.inputs[0].dest_key, "in/data.csv");
         assert_eq!(
             spec.inputs[0].container_path.as_deref(),
@@ -2164,6 +2165,8 @@ mod tests {
             panic!("TES created a non-execution job");
         };
         assert_eq!(spec.group_id, group);
+        assert_eq!(record.workspace_mode, WorkspaceMode::None);
+        assert!(record.workspace_bucket.is_none());
     }
 
     #[tokio::test]
