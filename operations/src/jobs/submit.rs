@@ -113,6 +113,7 @@ impl SubmitJobOperation {
                 WorkspaceMode::Temporary | WorkspaceMode::Kept => {
                     Some(JobRecord::workspace_bucket_name(record.job_id))
                 }
+                WorkspaceMode::None => None,
             };
             record.plan_digest = Some(workspace_plan_digest(
                 &record.payload,

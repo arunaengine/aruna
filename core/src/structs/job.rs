@@ -121,11 +121,11 @@ impl JobState {
     }
 }
 
-/// How an input is captured into the workspace. v1 supports snapshot only:
-/// resolved bytes are copied into the workspace at submit time.
+/// How an input is exposed to the task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputMode {
     Snapshot,
+    Mount,
 }
 
 /// Where an input comes from. v1 supports internal S3 objects only.
@@ -466,7 +466,7 @@ pub enum JobResultPayload {
     Execution {
         /// Container exit code; `None` when the outcome is evidence-free.
         exit_code: Option<i32>,
-        workspace_bucket: String,
+        workspace_bucket: Option<String>,
         outputs: Vec<OutputObject>,
         stdout: String,
         stderr: String,
@@ -647,11 +647,13 @@ pub enum WorkspaceMode {
     #[default]
     Kept,
     Existing,
+    None,
 }
 
 impl WorkspaceMode {
     pub fn name(self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::Temporary => "temporary",
             Self::Kept => "kept",
             Self::Existing => "existing",

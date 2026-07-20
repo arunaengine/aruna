@@ -4,6 +4,7 @@ pub mod reconcile;
 pub mod run_crate;
 pub mod workspace;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,14 +12,14 @@ use aruna_compute::ExecutorBackend;
 use aruna_compute::executor::logs::NullSink;
 use aruna_core::compute::{
     AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind,
-    FenceContext, LogLimits, LogTails, NetworkAccess, ReconcileEvidence, ResourceRequest,
-    SecurityContext, StagingMode, TaskInput, TaskSpec, TombstoneSpec, UserSpec,
+    FenceContext, LogLimits, LogTails, NetworkAccess, ReconcileEvidence, ResourceRequest, S3Mount,
+    Secret, SecurityContext, StagingMode, TaskInput, TaskSpec, TombstoneSpec, UserSpec,
 };
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::structs::{
     AttemptIntent, ExecutionSpec, JobError, JobId, JobPayload, JobRecord, JobResultPayload,
-    OutputObject,
+    OutputObject, WorkspaceMode,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::NodeId;
@@ -39,7 +40,7 @@ use crate::driver::DriverContext;
 use compute::{RecoveryAction, recovery_action};
 use workspace::{
     capture_outputs, collect_outputs, ensure_group_write, ensure_workspace_bucket, load_inputs,
-    merge_outputs, stage_inputs,
+    merge_outputs, mint_input_credential, prepare_mounts, stage_inputs,
 };
 
 /// Fallback walltime when a spec declares none. Enforcement, reconcile
@@ -64,11 +65,10 @@ pub async fn run_execution_job(
     let JobPayload::Execution(mut spec) = record.payload.clone() else {
         return;
     };
-    let bucket = record
-        .workspace_bucket
-        .clone()
-        .unwrap_or_else(|| JobRecord::workspace_bucket_name(job_id));
-    spec.resolve_outputs(&bucket);
+    let bucket = job_bucket(&record);
+    if !bucket.is_empty() {
+        spec.resolve_outputs(&bucket);
+    }
 
     // A fresh cancel before any attempt was submitted: no container exists, so
     // terminalize directly (Claimed -> Cancelled).
@@ -122,9 +122,7 @@ pub async fn run_execution_job(
     tokio::pin!(heartbeat);
 
     let prepare_and_submit = async {
-        let inputs = match prepare_workspace(&context, &spec, &record, node_id, &bucket, token)
-            .await
-        {
+        let prepared = match prepare_task(&context, &spec, &record, node_id, &bucket, token).await {
             Ok(prepared) => prepared,
             Err(error) => {
                 requeue_or_fail_pre_submit(&context, job_id, token, &record, error, false).await;
@@ -160,7 +158,7 @@ pub async fn run_execution_job(
             &spec,
             &attempt,
             &pinned_image,
-            inputs,
+            prepared,
             backend.run_identity(),
         );
 
@@ -351,13 +349,102 @@ async fn prepare_workspace(
     load_inputs(context, spec, record, bucket).await
 }
 
-fn build_task_spec(
+pub(super) struct PreparedTask {
+    inputs: Vec<TaskInput>,
+    mounts: Vec<S3Mount>,
+    secrets: BTreeMap<String, Secret>,
+    staging: StagingMode,
+}
+
+pub(super) fn job_bucket(record: &JobRecord) -> String {
+    match (&record.workspace_bucket, record.workspace_mode) {
+        (Some(bucket), _) => bucket.clone(),
+        (None, WorkspaceMode::None) => String::new(),
+        (None, _) => JobRecord::workspace_bucket_name(record.job_id),
+    }
+}
+
+async fn mounted_task(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+) -> Result<PreparedTask, JobError> {
+    let mounts = prepare_mounts(context, spec, record, node_id).await?;
+    let mut secrets = BTreeMap::new();
+    if !mounts.is_empty() {
+        let buckets = mounts
+            .iter()
+            .map(|mount| mount.bucket.clone())
+            .collect::<BTreeSet<_>>();
+        let credential = mint_input_credential(context, spec, record, node_id, &buckets).await?;
+        secrets.insert(
+            "access_key_id".to_string(),
+            Secret::new(credential.access_key),
+        );
+        secrets.insert(
+            "secret_access_key".to_string(),
+            Secret::new(credential.secret),
+        );
+    }
+    Ok(PreparedTask {
+        inputs: Vec::new(),
+        mounts,
+        secrets,
+        staging: StagingMode::S3Mount,
+    })
+}
+
+async fn prepare_task(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+    bucket: &str,
+    token: ulid::Ulid,
+) -> Result<PreparedTask, JobError> {
+    if record.workspace_mode == WorkspaceMode::None {
+        return mounted_task(context, spec, record, node_id).await;
+    }
+    Ok(PreparedTask {
+        inputs: prepare_workspace(context, spec, record, node_id, bucket, token).await?,
+        mounts: Vec::new(),
+        secrets: BTreeMap::new(),
+        staging: StagingMode::Files,
+    })
+}
+
+pub(super) async fn reload_task(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+    bucket: &str,
+) -> Result<PreparedTask, JobError> {
+    if record.workspace_mode == WorkspaceMode::None {
+        return mounted_task(context, spec, record, node_id).await;
+    }
+    Ok(PreparedTask {
+        inputs: load_inputs(context, spec, record, bucket).await?,
+        mounts: Vec::new(),
+        secrets: BTreeMap::new(),
+        staging: StagingMode::Files,
+    })
+}
+
+pub(super) fn build_task_spec(
     spec: &ExecutionSpec,
     attempt: &AttemptRef,
     pinned_image: &str,
-    inputs: Vec<TaskInput>,
+    prepared: PreparedTask,
     run_as: UserSpec,
 ) -> TaskSpec {
+    let PreparedTask {
+        inputs,
+        mounts,
+        secrets,
+        staging,
+    } = prepared;
     let resources = ResourceRequest {
         cpu_cores: spec.resources.cpu_cores,
         ram_bytes: spec.resources.ram_bytes,
@@ -377,7 +464,7 @@ fn build_task_spec(
         command: spec.command.clone(),
         workdir: spec.workdir.clone(),
         env: spec.env.clone(),
-        secret_env: std::collections::BTreeMap::new(),
+        secret_env: secrets,
         resources,
         workspace: None,
         security: SecurityContext {
@@ -395,8 +482,8 @@ fn build_task_spec(
         },
         log_limits: Default::default(),
         inputs,
-        s3_mounts: Vec::new(),
-        staging_mode: StagingMode::Files,
+        s3_mounts: mounts,
+        staging_mode: staging,
         output_paths: spec
             .file_outputs
             .iter()
@@ -580,7 +667,12 @@ async fn retry_same_submit(
     record: &JobRecord,
     cancel: &CancellationToken,
 ) -> Result<AttemptStatus, BackendError> {
-    let inputs = load_inputs(context, spec, record, bucket)
+    let node_id = context
+        .net_handle
+        .as_ref()
+        .map(|net| net.node_id())
+        .ok_or_else(|| BackendError::Unavailable("execution needs a net handle".to_string()))?;
+    let prepared = reload_task(context, spec, record, node_id, bucket)
         .await
         .map_err(|error| BackendError::Unavailable(error.message))?;
     let pinned_image = record
@@ -593,7 +685,7 @@ async fn retry_same_submit(
         spec,
         &fence.attempt,
         pinned_image,
-        inputs,
+        prepared,
         backend.run_identity(),
     );
     backend.submit(fence, &task_spec, cancel).await
@@ -1369,10 +1461,7 @@ fn execution_result(
     exit_code: Option<i32>,
     outputs: Vec<OutputObject>,
 ) -> JobResultPayload {
-    let bucket = record
-        .workspace_bucket
-        .clone()
-        .unwrap_or_else(|| JobRecord::workspace_bucket_name(record.job_id));
+    let bucket = job_bucket(record);
     execution_result_for(&bucket, exit_code, outputs, LogTails::default())
 }
 
@@ -1384,7 +1473,7 @@ fn execution_result_for(
 ) -> JobResultPayload {
     JobResultPayload::Execution {
         exit_code,
-        workspace_bucket: bucket.to_string(),
+        workspace_bucket: (!bucket.is_empty()).then(|| bucket.to_string()),
         outputs,
         stdout: log_tail(logs.stdout, logs.stdout_truncated),
         stderr: log_tail(logs.stderr, logs.stderr_truncated),
@@ -2044,7 +2133,12 @@ mod tests {
             &execution_spec(),
             &AttemptRef::new("job", 1),
             "alpine@sha256:digest",
-            Vec::new(),
+            PreparedTask {
+                inputs: Vec::new(),
+                mounts: Vec::new(),
+                secrets: BTreeMap::new(),
+                staging: StagingMode::Files,
+            },
             NOBODY,
         );
 
@@ -2065,7 +2159,12 @@ mod tests {
             &execution_spec(),
             &AttemptRef::new("job", 1),
             "alpine@sha256:digest",
-            Vec::new(),
+            PreparedTask {
+                inputs: Vec::new(),
+                mounts: Vec::new(),
+                secrets: BTreeMap::new(),
+                staging: StagingMode::Files,
+            },
             run_as,
         );
 
@@ -2082,7 +2181,12 @@ mod tests {
             &execution,
             &AttemptRef::new("job", 1),
             "alpine@sha256:digest",
-            Vec::new(),
+            PreparedTask {
+                inputs: Vec::new(),
+                mounts: Vec::new(),
+                secrets: BTreeMap::new(),
+                staging: StagingMode::Files,
+            },
             NOBODY,
         );
 

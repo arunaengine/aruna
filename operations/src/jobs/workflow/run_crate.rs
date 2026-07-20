@@ -200,10 +200,16 @@ fn build_run_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id:
     let action_id = format!("#run-{}", record.job_id);
     let agent_id = format!("#agent-{}", record.created_by);
     let software_id = format!("#software-{}", record.job_id);
-    let workspace = record
-        .workspace_bucket
-        .clone()
-        .unwrap_or_else(|| JobRecord::workspace_bucket_name(record.job_id));
+    let bucket = super::job_bucket(record);
+    let description = (!bucket.is_empty()).then_some(bucket).map_or_else(
+        || format!("Aruna execution run for job {}", record.job_id),
+        |workspace| {
+            format!(
+                "Aruna execution run for job {} in workspace {}",
+                record.job_id, workspace
+            )
+        },
+    );
 
     let (exit_code, outputs) = match &record.result {
         Some(JobResultPayload::Execution {
@@ -298,10 +304,7 @@ fn build_run_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id:
             "@id": root,
             "@type": "Dataset",
             "name": format!("Run {}", record.job_id),
-            "description": format!(
-                "Aruna execution run for job {} in workspace {}",
-                record.job_id, workspace
-            ),
+            "description": description,
             "datePublished": rfc3339(record.created_at_ms),
             "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
             "conformsTo": [{"@id": CRATE_PROFILE}, {"@id": PROCESS_PROFILE}],
@@ -400,7 +403,7 @@ mod tests {
         record.finished_at_ms = Some(3_000);
         record.result = Some(JobResultPayload::Execution {
             exit_code: Some(0),
-            workspace_bucket: JobRecord::workspace_bucket_name(job_id),
+            workspace_bucket: Some(JobRecord::workspace_bucket_name(job_id)),
             outputs: vec![OutputObject {
                 bucket: "src".to_string(),
                 key: "out.txt".to_string(),

@@ -2368,7 +2368,7 @@ mod tests {
     fn execution_result() -> JobResultPayload {
         JobResultPayload::Execution {
             exit_code: Some(0),
-            workspace_bucket: "ws-test".to_string(),
+            workspace_bucket: Some("ws-test".to_string()),
             outputs: Vec::new(),
             stdout: String::new(),
             stderr: String::new(),
@@ -2657,7 +2657,7 @@ mod tests {
             token,
             JobResultPayload::Execution {
                 exit_code: Some(0),
-                workspace_bucket: "ws-test".to_string(),
+                workspace_bucket: Some("ws-test".to_string()),
                 outputs: Vec::new(),
                 stdout: String::new(),
                 stderr: String::new(),

@@ -1,15 +1,17 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use aruna_compute::ExecutorBackend;
-use aruna_core::compute::{BackendError, FenceContext, MAX_TRANSFER_BYTES, TaskInput};
+use aruna_core::compute::{BackendError, FenceContext, MAX_TRANSFER_BYTES, S3Mount, TaskInput};
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BucketInfo, ExecutionSpec, InputSelection, InputSource, JobError,
-    JobRecord, OutputDestination, OutputObject, OutputSelection, PathRestriction, Permission,
-    UserAccess, WorkspaceMode, blob_bucket_permission_path, blob_group_permission_path,
-    blob_object_permission_path, workspace_credential_id,
+    AuthContext, BackendLocation, BucketInfo, ExecutionSpec, InputMode, InputSelection,
+    InputSource, JobError, JobRecord, OutputDestination, OutputObject, OutputSelection,
+    PathRestriction, Permission, UserAccess, WorkspaceMode, blob_bucket_permission_path,
+    blob_group_permission_path, blob_object_permission_path, ensure_confined_relative_path,
+    workspace_credential_id,
 };
 use aruna_core::types::NodeId;
 use futures_util::StreamExt;
@@ -162,6 +164,44 @@ pub async fn mint_workspace_credential(
             permission: Permission::WRITE,
         },
     ];
+    mint_credential(context, spec, record, node_id, restrictions).await
+}
+
+/// Mint one read-only credential restricted to the input buckets mounted by a job.
+pub async fn mint_input_credential(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+    buckets: &BTreeSet<String>,
+) -> Result<WorkspaceCredential, JobError> {
+    let realm_id = record.created_by.realm_id;
+    let restrictions = buckets
+        .iter()
+        .flat_map(|bucket| {
+            let path = blob_bucket_permission_path(realm_id, spec.group_id, node_id, bucket);
+            [
+                PathRestriction {
+                    pattern: path.clone(),
+                    permission: Permission::READ,
+                },
+                PathRestriction {
+                    pattern: format!("{path}/**"),
+                    permission: Permission::READ,
+                },
+            ]
+        })
+        .collect();
+    mint_credential(context, spec, record, node_id, restrictions).await
+}
+
+async fn mint_credential(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+    restrictions: Vec<PathRestriction>,
+) -> Result<WorkspaceCredential, JobError> {
     let key_id = workspace_credential_id(record.job_id);
     let access_key =
         UserAccess::build_access_key(&record.created_by, &key_id).map_err(|error| {
@@ -222,6 +262,104 @@ pub async fn mint_workspace_credential(
         access_key: access.access_key,
         secret: access.secret,
     })
+}
+
+/// Validate mounted inputs and resolve the exact S3 objects exposed to the task.
+pub async fn prepare_mounts(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+) -> Result<Vec<S3Mount>, JobError> {
+    let mut mounts = Vec::with_capacity(spec.inputs.len());
+    for input in &spec.inputs {
+        if input.mode != InputMode::Mount {
+            return Err(JobError::permanent("mounted job contains a snapshot input"));
+        }
+        let InputSource::S3 {
+            bucket,
+            key,
+            version_id,
+        } = &input.source;
+        if version_id.is_some() {
+            return Err(JobError::permanent(
+                "mounted input versions are not supported",
+            ));
+        }
+        ensure_confined_relative_path(Path::new(key))
+            .map_err(|error| JobError::permanent(format!("invalid mounted input key: {error}")))?;
+        let path = input
+            .container_path
+            .clone()
+            .ok_or_else(|| JobError::permanent("mounted input has no container path"))?;
+        let bucket_info = drive(GetBucketInfoOperation::new(bucket.clone()), context)
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(|error| bucket_lookup_error("input", error))?
+            .ok_or_else(|| JobError::permanent(format!("input bucket {bucket} not found")))?;
+        if bucket_info.group_id != spec.group_id {
+            return Err(JobError::permanent(
+                "input bucket is outside the execution group",
+            ));
+        }
+        let allowed = drive(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: AuthContext {
+                    user_id: record.created_by,
+                    realm_id: record.created_by.realm_id,
+                    path_restrictions: None,
+                },
+                path: blob_object_permission_path(
+                    record.created_by.realm_id,
+                    spec.group_id,
+                    node_id,
+                    bucket,
+                    key,
+                ),
+                required_permission: Permission::READ,
+            }),
+            context,
+        )
+        .await
+        .map_err(|error| authorization_error("input", error))?;
+        if !allowed {
+            return Err(JobError::permanent(format!(
+                "input {bucket}/{key} access denied"
+            )));
+        }
+        match drive(
+            HeadObjectOperation::new(HeadObjectInput {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: None,
+            }),
+            context,
+        )
+        .await
+        .and_then(|result| result.transpose())
+        {
+            Ok(Some(_)) => {}
+            Ok(None)
+            | Err(
+                HeadObjectError::NoSuchKey
+                | HeadObjectError::NoSuchVersion
+                | HeadObjectError::DeleteMarker,
+            ) => {
+                return Err(JobError::permanent(format!(
+                    "input {bucket}/{key} not found"
+                )));
+            }
+            Err(error) => {
+                return Err(JobError::retryable(format!("input lookup failed: {error}")));
+            }
+        }
+        mounts.push(S3Mount {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            path,
+        });
+    }
+    Ok(mounts)
 }
 
 /// Snapshot each declared input into the workspace bucket by copying resolved

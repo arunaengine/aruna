@@ -1603,7 +1603,7 @@ mod tests {
         record.state = JobState::Succeeded;
         record.result = Some(JobResultPayload::Execution {
             exit_code: Some(0),
-            workspace_bucket: "ws".to_string(),
+            workspace_bucket: Some("ws".to_string()),
             outputs: Vec::new(),
             stdout: String::new(),
             stderr: String::new(),
@@ -1965,7 +1965,7 @@ mod tests {
         assert_eq!(tes_state(&record), TesState::SystemError);
         record.result = Some(JobResultPayload::Execution {
             exit_code: Some(1),
-            workspace_bucket: "ws".to_string(),
+            workspace_bucket: Some("ws".to_string()),
             outputs: Vec::new(),
             stdout: String::new(),
             stderr: String::new(),
@@ -2006,7 +2006,7 @@ mod tests {
         record.last_error = Some(JobError::permanent("prior failure"));
         record.result = Some(JobResultPayload::Execution {
             exit_code: Some(0),
-            workspace_bucket: "ws-x".to_string(),
+            workspace_bucket: Some("ws-x".to_string()),
             outputs: vec![OutputObject {
                 bucket: "dest".to_string(),
                 key: "out/r.txt".to_string(),

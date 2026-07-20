@@ -33,6 +33,11 @@ pub async fn submit_execution_job(
     workspace_bucket: Option<String>,
 ) -> Result<SubmitJobResult, SubmitJobError> {
     match workspace_mode {
+        WorkspaceMode::None if workspace_bucket.is_some() => {
+            return Err(SubmitJobError::InvalidWorkspace(
+                "none mode does not accept a bucket".to_string(),
+            ));
+        }
         WorkspaceMode::Existing
             if workspace_bucket
                 .as_deref()
@@ -48,6 +53,28 @@ pub async fn submit_execution_job(
             ));
         }
         _ => {}
+    }
+    if workspace_mode == WorkspaceMode::None
+        && (spec
+            .inputs
+            .iter()
+            .any(|input| input.mode != aruna_core::structs::InputMode::Mount)
+            || !spec.workspace_outputs.is_empty()
+            || !spec.output_prefixes.is_empty())
+    {
+        return Err(SubmitJobError::InvalidWorkspace(
+            "none mode requires mounted inputs and explicit output destinations".to_string(),
+        ));
+    }
+    if workspace_mode != WorkspaceMode::None
+        && spec
+            .inputs
+            .iter()
+            .any(|input| input.mode == aruna_core::structs::InputMode::Mount)
+    {
+        return Err(SubmitJobError::InvalidWorkspace(
+            "mounted inputs require none workspace mode".to_string(),
+        ));
     }
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
     drive(

@@ -16,10 +16,10 @@ use super::super::store::{
     read_job_record, record_attempt_started, record_attempt_tombstone, release_job,
     transition_external_to_running,
 };
-use super::workspace::load_inputs;
 use super::{
     DEFAULT_WALLTIME, build_task_spec, fail_and_crate, finalize_attempt, finalize_cancel,
-    requeue_after_tombstone, supervise_and_finalize, with_execution_heartbeat,
+    job_bucket, reload_task, requeue_after_tombstone, supervise_and_finalize,
+    with_execution_heartbeat,
 };
 use crate::driver::DriverContext;
 
@@ -100,11 +100,10 @@ impl ExternalReconciler for ComputeReconciler {
             return;
         };
 
-        let bucket = adopted
-            .workspace_bucket
-            .clone()
-            .unwrap_or_else(|| JobRecord::workspace_bucket_name(job_id));
-        spec.resolve_outputs(&bucket);
+        let bucket = job_bucket(&adopted);
+        if !bucket.is_empty() {
+            spec.resolve_outputs(&bucket);
+        }
         let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), intent.attempt_no);
         let fence = FenceContext {
             attempt: attempt.clone(),
@@ -384,8 +383,19 @@ pub(super) async fn resume_attempt(
             token,
             cancel.clone(),
             async {
-                let inputs = match load_inputs(&context, &spec, &record, &bucket).await {
-                    Ok(inputs) => inputs,
+                let Some(node_id) = context.net_handle.as_ref().map(|net| net.node_id()) else {
+                    fail_or_park(
+                        &context,
+                        job_id,
+                        token,
+                        &record,
+                        JobError::permanent("execution needs a net handle"),
+                    )
+                    .await;
+                    return false;
+                };
+                let prepared = match reload_task(&context, &spec, &record, node_id, &bucket).await {
+                    Ok(prepared) => prepared,
                     Err(error) => {
                         fail_or_park(&context, job_id, token, &record, error).await;
                         return false;
@@ -411,7 +421,7 @@ pub(super) async fn resume_attempt(
                     &spec,
                     &fence.attempt,
                     pinned_image,
-                    inputs,
+                    prepared,
                     backend.run_identity(),
                 );
                 let status = match backend.submit(&fence, &task_spec, &cancel).await {
