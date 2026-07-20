@@ -679,6 +679,11 @@ fn validate_spec(context: &FenceContext, spec: &TaskSpec) -> Result<(), BackendE
                 "Files staging does not support S3-only networking".to_string(),
             ));
         }
+        (StagingMode::S3Mount, _) => {
+            return Err(BackendError::InvalidSpec(
+                "S3 mounts are supported only by Kubernetes".to_string(),
+            ));
+        }
     }
     if spec.resources.disk_bytes.is_some() {
         return Err(BackendError::InvalidSpec(

@@ -17,10 +17,10 @@ use json_patch::Patch as JsonPatch;
 use k8s_openapi::api::authorization::v1::SelfSubjectAccessReview;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{
-    ConfigMap, Namespace, PersistentVolumeClaim, Pod, Secret, ServiceAccount,
+    ConfigMap, Namespace, PersistentVolume, PersistentVolumeClaim, Pod, Secret, ServiceAccount,
 };
 use k8s_openapi::api::networking::v1::NetworkPolicy;
-use k8s_openapi::api::storage::v1::StorageClass;
+use k8s_openapi::api::storage::v1::{CSIDriver, StorageClass};
 use kube::api::{
     Api, AttachParams, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams,
     Preconditions,
@@ -41,7 +41,8 @@ use super::{BackendCaps, ExecutorBackend, digest_pinned};
 mod manifest;
 
 use manifest::{
-    HELPER_PATH, StageMarker, WORKLOAD_SA, helper_pod, job_manifest, marker_manifest, marker_name,
+    HELPER_PATH, S3_DRIVER, StageMarker, WORKLOAD_SA, helper_pod, job_manifest, marker_manifest,
+    marker_name, mount_buckets, mount_name, mount_pv_manifest, mount_pvc_manifest, needs_workspace,
     network_policies, pvc_manifest, secret_manifest, secret_name, workspace_name,
 };
 
@@ -82,6 +83,10 @@ impl KubernetesBackend {
 
     fn pvcs(&self) -> Api<PersistentVolumeClaim> {
         Api::namespaced(self.client.clone(), &self.config.namespace)
+    }
+
+    fn pvs(&self) -> Api<PersistentVolume> {
+        Api::all(self.client.clone())
     }
 
     fn markers(&self) -> Api<ConfigMap> {
@@ -172,6 +177,96 @@ impl KubernetesBackend {
             }
             Err(error) => Err(kube_error(error)),
         }
+    }
+
+    async fn ensure_mounts(
+        &self,
+        context: &FenceContext,
+        layout: &StageLayout,
+    ) -> Result<(), BackendError> {
+        for (index, bucket) in mount_buckets(layout).iter().enumerate() {
+            let name = mount_name(&context.attempt.external_name(), index);
+            let pv = mount_pv_manifest(context, &self.config, index, bucket)?;
+            match self.pvs().create(&PostParams::default(), &pv).await {
+                Ok(_) => {}
+                Err(error) if api_code(&error) == Some(409) => {
+                    let existing = self.pvs().get(&name).await.map_err(kube_error)?;
+                    let valid = existing
+                        .metadata
+                        .annotations
+                        .as_ref()
+                        .and_then(|annotations| annotations.get(EPOCH_ANNOTATION))
+                        .and_then(|epoch| epoch.parse::<u64>().ok())
+                        == Some(context.attempt_epoch)
+                        && existing
+                            .spec
+                            .as_ref()
+                            .and_then(|spec| spec.csi.as_ref())
+                            .is_some_and(|csi| {
+                                csi.driver == S3_DRIVER
+                                    && csi.volume_handle == name
+                                    && csi
+                                        .volume_attributes
+                                        .as_ref()
+                                        .and_then(|attributes| attributes.get("bucketName"))
+                                        == Some(bucket)
+                            });
+                    if !valid {
+                        return Err(BackendError::Conflict(format!(
+                            "S3 PersistentVolume `{name}` belongs to another attempt"
+                        )));
+                    }
+                }
+                Err(error) => return Err(kube_error(error)),
+            }
+            let pvc = mount_pvc_manifest(context, &self.config, index)?;
+            match self.pvcs().create(&PostParams::default(), &pvc).await {
+                Ok(_) => {}
+                Err(error) if api_code(&error) == Some(409) => {
+                    let existing = self.pvcs().get(&name).await.map_err(kube_error)?;
+                    let valid = existing
+                        .metadata
+                        .annotations
+                        .as_ref()
+                        .and_then(|annotations| annotations.get(EPOCH_ANNOTATION))
+                        .and_then(|epoch| epoch.parse::<u64>().ok())
+                        == Some(context.attempt_epoch)
+                        && existing
+                            .spec
+                            .as_ref()
+                            .and_then(|spec| spec.volume_name.as_deref())
+                            == Some(name.as_str());
+                    if !valid {
+                        return Err(BackendError::Conflict(format!(
+                            "S3 PersistentVolumeClaim `{name}` belongs to another attempt"
+                        )));
+                    }
+                }
+                Err(error) => return Err(kube_error(error)),
+            }
+        }
+        Ok(())
+    }
+
+    async fn remove_mounts(&self, context: &FenceContext) -> Result<(), BackendError> {
+        let selector = format!("{},{}=s3-mount", attempt_selector(context), ROLE_LABEL);
+        for pvc in self
+            .pvcs()
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .map_err(kube_error)?
+        {
+            delete_named(self.pvcs(), &pvc.name_any()).await?;
+        }
+        for pv in self
+            .pvs()
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .map_err(kube_error)?
+        {
+            delete_named(self.pvs(), &pv.name_any()).await?;
+        }
+        Ok(())
     }
 
     async fn apply_network(&self) -> Result<(), BackendError> {
@@ -671,6 +766,8 @@ impl ExecutorBackend for KubernetesBackend {
             .get(&self.config.storage_class)
             .await
             .map_err(kube_error)?;
+        let drivers: Api<CSIDriver> = Api::all(self.client.clone());
+        drivers.get(S3_DRIVER).await.map_err(kube_error)?;
         let accounts: Api<ServiceAccount> =
             Api::namespaced(self.client.clone(), &self.config.namespace);
         accounts.get(WORKLOAD_SA).await.map_err(kube_error)?;
@@ -743,6 +840,20 @@ impl ExecutorBackend for KubernetesBackend {
                 self.stage(context, spec, cancel).await?;
             }
             StagingMode::DirectS3 => self.ensure_secret(context, spec).await?,
+            StagingMode::S3Mount => {
+                if !spec.s3_mounts.is_empty() {
+                    self.ensure_secret(context, spec).await?;
+                    self.ensure_mounts(context, &layout).await?;
+                }
+                if needs_workspace(spec) {
+                    self.ensure_pvc(
+                        context,
+                        spec.resources.disk_bytes.unwrap_or(DEFAULT_WORKSPACE_BYTES),
+                    )
+                    .await?;
+                    self.stage(context, spec, cancel).await?;
+                }
+            }
         }
         self.unsuspend(context, cancel).await
     }
@@ -753,7 +864,7 @@ impl ExecutorBackend for KubernetesBackend {
         spec: &TaskSpec,
         cancel: &CancellationToken,
     ) -> Result<(), BackendError> {
-        if spec.staging_mode != StagingMode::Files {
+        if !needs_workspace(spec) {
             return Ok(());
         }
         let job = self.get_job(context).await?;
@@ -803,7 +914,7 @@ impl ExecutorBackend for KubernetesBackend {
             .as_ref()
             .and_then(|annotations| annotations.get("aruna-engine.org/staging-mode"))
             .map(String::as_str);
-        if staging == Some("files") {
+        if matches!(staging, Some("files" | "s3-mount")) && job_workspace(&job) {
             let marker = self
                 .markers()
                 .get(&marker_name(&context.attempt.external_name()))
@@ -953,16 +1064,22 @@ impl ExecutorBackend for KubernetesBackend {
                     .as_ref()
                     .is_some_and(|spec| spec.suspend == Some(true))
                 {
-                    let marker = self
-                        .markers()
-                        .get_opt(&marker_name(&context.attempt.external_name()))
-                        .await;
-                    if marker.is_ok_and(|marker| {
-                        marker.is_some_and(|marker| validate_marker(&marker, &job, context).is_ok())
-                    }) {
+                    if !job_workspace(&job) {
                         ResumePoint::Unsuspend
                     } else {
-                        ResumePoint::Stage
+                        let marker = self
+                            .markers()
+                            .get_opt(&marker_name(&context.attempt.external_name()))
+                            .await;
+                        if marker.is_ok_and(|marker| {
+                            marker.is_some_and(|marker| {
+                                validate_marker(&marker, &job, context).is_ok()
+                            })
+                        }) {
+                            ResumePoint::Unsuspend
+                        } else {
+                            ResumePoint::Stage
+                        }
                     }
                 } else {
                     ResumePoint::Observe
@@ -1012,6 +1129,7 @@ impl ExecutorBackend for KubernetesBackend {
         self.strip_finalizer(context, &job).await?;
         self.remove_helpers(context).await?;
         self.delete_tasks(context).await?;
+        self.remove_mounts(context).await?;
         delete_named(
             self.pvcs(),
             &workspace_name(&context.attempt.external_name()),
@@ -1058,7 +1176,13 @@ impl KubernetesBackend {
             .get_opt(&marker_name(&context.attempt.external_name()))
             .await
             .map_err(kube_error)?;
-        if pods.items.is_empty() && pvc.is_none() && marker.is_none() {
+        let mount_selector = format!("{},{}=s3-mount", attempt_selector(context), ROLE_LABEL);
+        let mounts = self
+            .pvs()
+            .list(&ListParams::default().labels(&mount_selector))
+            .await
+            .map_err(kube_error)?;
+        if pods.items.is_empty() && pvc.is_none() && marker.is_none() && mounts.items.is_empty() {
             return Ok(None);
         }
         let reference = pods
@@ -1066,14 +1190,20 @@ impl KubernetesBackend {
             .first()
             .and_then(|pod| pod.metadata.uid.clone())
             .or_else(|| pvc.and_then(|pvc| pvc.metadata.uid))
-            .or_else(|| marker.and_then(|marker| marker.metadata.uid));
+            .or_else(|| marker.and_then(|marker| marker.metadata.uid))
+            .or_else(|| {
+                mounts
+                    .items
+                    .first()
+                    .and_then(|mount| mount.metadata.uid.clone())
+            });
         Ok(Some(ArtifactEvidence {
             artifact_kind: "kubernetes-accessory".to_string(),
             backend_ref: reference,
             observed_epoch: Some(context.attempt_epoch),
             observed_generation: None,
             exact_identity: true,
-            multiple: pods.items.len() > 1,
+            multiple: pods.items.len() + mounts.items.len() > 1,
             foreign: false,
         }))
     }
@@ -1132,6 +1262,25 @@ fn validate_spec(
                 "Files staging does not support S3-only networking".to_string(),
             ));
         }
+        (
+            StagingMode::S3Mount,
+            aruna_core::compute::NetworkAccess::Isolated | aruna_core::compute::NetworkAccess::Open,
+        ) => {}
+        (StagingMode::S3Mount, _) => {
+            return Err(BackendError::InvalidSpec(
+                "S3Mount does not expose S3 networking to the task".to_string(),
+            ));
+        }
+    }
+    if spec.staging_mode == StagingMode::S3Mount
+        && !spec.s3_mounts.is_empty()
+        && !["access_key_id", "secret_access_key"]
+            .iter()
+            .all(|key| spec.secret_env.contains_key(*key))
+    {
+        return Err(BackendError::InvalidSpec(
+            "S3Mount credentials are incomplete".to_string(),
+        ));
     }
     if let Some(extension) = spec.resources.backend_extensions.keys().next() {
         return Err(BackendError::InvalidSpec(format!(
@@ -1311,6 +1460,14 @@ fn job_state(job: &Job) -> Option<&str> {
         .map(String::as_str)
 }
 
+fn job_workspace(job: &Job) -> bool {
+    job.metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get("aruna-engine.org/workspace"))
+        .is_some_and(|value| value == "true")
+}
+
 fn cas_patch(job: &Job, replacements: Vec<(String, Value)>) -> Result<JsonPatch, BackendError> {
     let uid = job_uid(job)?;
     let version = job
@@ -1367,6 +1524,10 @@ fn required_access() -> Vec<(
         ("", "pods", Some("exec"), "create"),
         ("", "pods", Some("exec"), "get"),
         ("", "pods", Some("log"), "get"),
+        ("", "persistentvolumes", None, "create"),
+        ("", "persistentvolumes", None, "get"),
+        ("", "persistentvolumes", None, "list"),
+        ("", "persistentvolumes", None, "delete"),
         ("", "persistentvolumeclaims", None, "create"),
         ("", "persistentvolumeclaims", None, "get"),
         ("", "persistentvolumeclaims", None, "list"),
@@ -1384,6 +1545,7 @@ fn required_access() -> Vec<(
         ("networking.k8s.io", "networkpolicies", None, "get"),
         ("networking.k8s.io", "networkpolicies", None, "patch"),
         ("storage.k8s.io", "storageclasses", None, "get"),
+        ("storage.k8s.io", "csidrivers", None, "get"),
     ]
 }
 
@@ -1400,12 +1562,12 @@ async fn check_access(
         "apiVersion":"authorization.k8s.io/v1",
         "kind":"SelfSubjectAccessReview",
         "spec":{"resourceAttributes":{
-            "namespace":if resource == "storageclasses" { None } else { Some(namespace) },
+            "namespace":if matches!(resource,"storageclasses" | "csidrivers" | "persistentvolumes") { None } else { Some(namespace) },
             "group":group,
             "resource":resource,
             "subresource":subresource,
             "verb":verb,
-            "name":if resource == "storageclasses" { Some("") } else { None }
+            "name":if matches!(resource,"storageclasses" | "csidrivers") { Some("") } else { None }
         }}
     }))
     .map_err(|error| BackendError::Api(format!("build access review: {error}")))?;
@@ -1772,6 +1934,14 @@ mod tests {
                     (200, job_json("tombstone"))
                 }
                 ("GET", "/api/v1/namespaces/compute/pods") => (200, pod_list()),
+                ("GET", "/api/v1/namespaces/compute/persistentvolumeclaims") => (
+                    200,
+                    json!({"apiVersion":"v1","kind":"PersistentVolumeClaimList","items":[]}),
+                ),
+                ("GET", "/api/v1/persistentvolumes") => (
+                    200,
+                    json!({"apiVersion":"v1","kind":"PersistentVolumeList","items":[]}),
+                ),
                 ("DELETE", "/api/v1/namespaces/compute/pods/task-pod") => {
                     (200, core_object("Pod", "task-pod"))
                 }

@@ -166,10 +166,18 @@ pub struct WorkspaceBinding {
     pub region: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct S3Mount {
+    pub bucket: String,
+    pub key: String,
+    pub path: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StagingMode {
     Files,
     DirectS3,
+    S3Mount,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,6 +340,7 @@ pub struct TaskSpec {
     pub command: Vec<String>,
     pub workdir: Option<String>,
     pub inputs: Vec<TaskInput>,
+    pub s3_mounts: Vec<S3Mount>,
     pub staging_mode: StagingMode,
     pub output_paths: Vec<String>,
     pub env: BTreeMap<String, String>,
@@ -351,6 +360,7 @@ impl TaskSpec {
             command: Vec::new(),
             workdir: None,
             inputs: Vec::new(),
+            s3_mounts: Vec::new(),
             staging_mode: StagingMode::Files,
             output_paths: Vec::new(),
             env: BTreeMap::new(),

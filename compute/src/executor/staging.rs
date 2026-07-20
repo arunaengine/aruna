@@ -1,13 +1,15 @@
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use aruna_core::compute::{
     BackendError, InputStream, StagingMode, TaskSpec, normalize_container_path, paths_overlap,
 };
+use aruna_core::structs::ensure_confined_relative_path;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StageLayout {
     pub files: Vec<StagedPath>,
+    pub mounts: Vec<MountedPath>,
     pub output_parents: BTreeSet<PathBuf>,
     pub mode: StagingMode,
 }
@@ -17,6 +19,13 @@ pub struct StagedPath {
     pub path: PathBuf,
     pub size: u64,
     pub workspace_key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MountedPath {
+    pub path: PathBuf,
+    pub bucket: String,
+    pub key: String,
 }
 
 pub struct StagePlan {
@@ -44,7 +53,26 @@ impl StageLayout {
                     "DirectS3 staging must not include container file inputs".to_string(),
                 ));
             }
+            StagingMode::S3Mount if !spec.inputs.is_empty() || spec.workspace.is_some() => {
+                return Err(BackendError::InvalidSpec(
+                    "S3Mount staging must not include copied inputs or a workspace binding"
+                        .to_string(),
+                ));
+            }
             _ => {}
+        }
+        if spec.staging_mode != StagingMode::S3Mount && !spec.s3_mounts.is_empty() {
+            return Err(BackendError::InvalidSpec(
+                "S3 mounts require S3Mount staging".to_string(),
+            ));
+        }
+        if spec.staging_mode == StagingMode::S3Mount
+            && !spec.s3_mounts.is_empty()
+            && spec.secret_env.is_empty()
+        {
+            return Err(BackendError::InvalidSpec(
+                "S3 mounts require credentials".to_string(),
+            ));
         }
         if spec.security.read_only_rootfs && !spec.output_paths.is_empty() {
             return Err(BackendError::InvalidSpec(
@@ -65,6 +93,23 @@ impl StageLayout {
                 path,
                 size: input.size(),
                 workspace_key: input.workspace_key.clone(),
+            });
+        }
+        let mut mounts = Vec::with_capacity(spec.s3_mounts.len());
+        for mount in &spec.s3_mounts {
+            let path = normalize_container_path(&mount.path).map_err(BackendError::InvalidSpec)?;
+            ensure_confined_relative_path(Path::new(&mount.key))
+                .map_err(|error| BackendError::InvalidSpec(error.to_string()))?;
+            if mount.bucket.is_empty() || !input_paths.insert(path.clone()) {
+                return Err(BackendError::InvalidSpec(format!(
+                    "duplicate or invalid S3 mount path `{}`",
+                    mount.path
+                )));
+            }
+            mounts.push(MountedPath {
+                path,
+                bucket: mount.bucket.clone(),
+                key: mount.key.clone(),
             });
         }
         for path in &input_paths {
@@ -98,15 +143,19 @@ impl StageLayout {
             }
             output_parents.insert(parent.to_path_buf());
         }
-        for input in &files {
-            if outputs.contains(&input.path) {
+        for input in files
+            .iter()
+            .map(|input| &input.path)
+            .chain(mounts.iter().map(|mount| &mount.path))
+        {
+            if outputs.contains(input) {
                 return Err(BackendError::InvalidSpec(
                     "input and output paths overlap".to_string(),
                 ));
             }
             for parent in &output_parents {
                 if paths_overlap(
-                    input.path.to_str().ok_or_else(|| {
+                    input.to_str().ok_or_else(|| {
                         BackendError::InvalidSpec("input path is not UTF-8".to_string())
                     })?,
                     parent.to_str().ok_or_else(|| {
@@ -123,6 +172,7 @@ impl StageLayout {
         }
         Ok(Self {
             files,
+            mounts,
             output_parents,
             mode: spec.staging_mode,
         })
@@ -141,6 +191,14 @@ impl StageLayout {
                 )
             })
             .collect::<Vec<_>>();
+        rows.extend(self.mounts.iter().map(|mount| {
+            format!(
+                "m\0{}\0{}\0{}",
+                mount.path.display(),
+                mount.bucket,
+                mount.key
+            )
+        }));
         rows.extend(
             self.output_parents
                 .iter()
@@ -151,6 +209,7 @@ impl StageLayout {
         hasher.update(match self.mode {
             StagingMode::Files => b"files",
             StagingMode::DirectS3 => b"direct-s3",
+            StagingMode::S3Mount => b"s3-mount",
         });
         for row in rows {
             hasher.update(row.as_bytes());
@@ -188,7 +247,7 @@ impl StagePlan {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::compute::{AttemptRef, TaskInput, TaskSpec};
+    use aruna_core::compute::{AttemptRef, S3Mount, Secret, TaskInput, TaskSpec};
 
     use super::*;
 
@@ -211,5 +270,20 @@ mod tests {
         spec.inputs = vec![TaskInput::from_bytes("/work/.command.sh", "data")];
         spec.output_paths = vec!["/work/out.txt".to_string()];
         assert!(StageLayout::from_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn rejects_mount_escape() {
+        let mut spec = TaskSpec::new(AttemptRef::new("job", 0), "image");
+        spec.staging_mode = StagingMode::S3Mount;
+        spec.s3_mounts.push(S3Mount {
+            bucket: "bucket".to_string(),
+            key: "../escape".to_string(),
+            path: "/input".to_string(),
+        });
+        spec.secret_env
+            .insert("access_key_id".to_string(), Secret::new("key"));
+
+        assert!(StageLayout::from_spec(&spec).is_err());
     }
 }

@@ -395,6 +395,7 @@ fn build_task_spec(
         },
         log_limits: Default::default(),
         inputs,
+        s3_mounts: Vec::new(),
         staging_mode: StagingMode::Files,
         output_paths: spec
             .file_outputs
