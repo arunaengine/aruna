@@ -452,9 +452,18 @@ pub async fn create_task(
         return error.into_response();
     }
 
-    let (spec, idempotency_key) = match map_task_to_spec(&task, caller.credential_group) {
+    // S3 mounts are a local deployment property; without them TES stages inputs
+    // via a kept workspace snapshot, matching submit validation on both sides.
+    let s3_mounts = state.s3_mounts_available();
+    let (spec, idempotency_key) = match map_task_to_spec(&task, caller.credential_group, s3_mounts)
+    {
         Ok(mapped) => mapped,
         Err(error) => return error.into_response(),
+    };
+    let workspace_mode = if s3_mounts {
+        aruna_core::structs::WorkspaceMode::None
+    } else {
+        aruna_core::structs::WorkspaceMode::Kept
     };
 
     match submit_execution_job(
@@ -463,7 +472,7 @@ pub async fn create_task(
         caller.auth.user_id,
         state.get_node_id(),
         idempotency_key,
-        aruna_core::structs::WorkspaceMode::None,
+        workspace_mode,
         None,
     )
     .await
@@ -697,6 +706,7 @@ fn resolve_task_group(task: &TesTask, credential_group: Option<Ulid>) -> Result<
 fn map_task_to_spec(
     task: &TesTask,
     credential_group: Option<Ulid>,
+    s3_mounts: bool,
 ) -> Result<(ExecutionSpec, Option<String>), TesError> {
     if task.id.is_some()
         || task.state.is_some()
@@ -746,7 +756,7 @@ fn map_task_to_spec(
     }
     let mut inputs: Vec<InputSelection> = Vec::with_capacity(task.inputs.len());
     for input in &task.inputs {
-        let input = map_input(input)?;
+        let input = map_input(input, s3_mounts)?;
         if inputs
             .iter()
             .any(|existing| existing.container_path == input.container_path)
@@ -866,7 +876,7 @@ fn map_task_to_spec(
     Ok((spec, idempotency_key))
 }
 
-fn map_input(input: &TesInput) -> Result<InputSelection, TesError> {
+fn map_input(input: &TesInput, s3_mounts: bool) -> Result<InputSelection, TesError> {
     if input.kind != TesFileType::File {
         return Err(TesError::bad_request("directory inputs are not supported"));
     }
@@ -888,7 +898,11 @@ fn map_input(input: &TesInput) -> Result<InputSelection, TesError> {
             version_id: None,
         },
         dest_key: input.path[1..].to_string(),
-        mode: InputMode::Mount,
+        mode: if s3_mounts {
+            InputMode::Mount
+        } else {
+            InputMode::Snapshot
+        },
         container_path: Some(input.path.clone()),
         name: input.name.clone(),
         description: input.description.clone(),
@@ -1509,7 +1523,7 @@ mod tests {
         }
     }
 
-    async fn build_state() -> (TempDir, Arc<ServerState>) {
+    async fn build_state(s3_mounts: bool) -> (TempDir, Arc<ServerState>) {
         let dir = tempfile::tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = Arc::new(DriverContext {
@@ -1529,7 +1543,8 @@ mod tests {
             None,
             JobsRuntime::new(),
         )
-        .await;
+        .await
+        .with_s3_mounts(s3_mounts);
         (dir, Arc::new(state))
     }
 
@@ -1591,7 +1606,7 @@ mod tests {
         // TES 1.1 requires taskLog.logs and taskLog.outputs to be present;
         // executor logs appear only once the task is terminal.
         let group = Ulid::from_bytes([5u8; 16]);
-        let (spec, _) = map_task_to_spec(&sample_task(group), None).unwrap();
+        let (spec, _) = map_task_to_spec(&sample_task(group), None, true).unwrap();
         let mut record = execution_record(JobId::from_bytes([9u8; 16]), user(2), spec);
 
         let running = build_task_log(&record, "");
@@ -1660,19 +1675,19 @@ mod tests {
         let group = Ulid::from_bytes([5u8; 16]);
         let mut task = sample_task(group);
         task.inputs = vec![task.inputs[0].clone(); MAX_TASK_IO + 1];
-        let error = map_task_to_spec(&task, None).unwrap_err();
+        let error = map_task_to_spec(&task, None, true).unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
 
         let mut task = sample_task(group);
         task.outputs = vec![task.outputs[0].clone(); MAX_TASK_IO + 1];
-        let error = map_task_to_spec(&task, None).unwrap_err();
+        let error = map_task_to_spec(&task, None, true).unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn maps_task() {
         let group = Ulid::from_bytes([5u8; 16]);
-        let (spec, dedup) = map_task_to_spec(&sample_task(group), None).unwrap();
+        let (spec, dedup) = map_task_to_spec(&sample_task(group), None, true).unwrap();
         assert_eq!(spec.group_id, group);
         assert_eq!(spec.name.as_deref(), Some("align reads"));
         assert_eq!(spec.description.as_deref(), Some("sample task"));
@@ -1717,7 +1732,7 @@ mod tests {
     #[test]
     fn filters_tasks() {
         let group = Ulid::from_bytes([5u8; 16]);
-        let (spec, _) = map_task_to_spec(&sample_task(group), None).unwrap();
+        let (spec, _) = map_task_to_spec(&sample_task(group), None, true).unwrap();
         let mut record = execution_record(JobId::from_bytes([6u8; 16]), user(2), spec);
         record.state = JobState::Running;
         let uri: axum::http::Uri = "/ga4gh/tes/v1/tasks?state=RUNNING&name_prefix=align&tag_key=project&tag_key=aruna-engine.org%2Fgroup&tag_value=alpha"
@@ -1789,7 +1804,7 @@ mod tests {
         input.url = Some("s3://src/other.csv".to_string());
         task.inputs.push(input);
         assert_eq!(
-            map_task_to_spec(&task, None).unwrap_err().status,
+            map_task_to_spec(&task, None, true).unwrap_err().status,
             StatusCode::BAD_REQUEST
         );
     }
@@ -1800,13 +1815,13 @@ mod tests {
         for size_gb in [-1.0, 0.0, f64::NAN, 1e-10, f64::MAX] {
             task.resources.as_mut().unwrap().ram_gb = Some(size_gb);
             assert_eq!(
-                map_task_to_spec(&task, None).unwrap_err().status,
+                map_task_to_spec(&task, None, true).unwrap_err().status,
                 StatusCode::BAD_REQUEST
             );
             task.resources.as_mut().unwrap().ram_gb = Some(4.0);
             task.resources.as_mut().unwrap().disk_gb = Some(size_gb);
             assert_eq!(
-                map_task_to_spec(&task, None).unwrap_err().status,
+                map_task_to_spec(&task, None, true).unwrap_err().status,
                 StatusCode::BAD_REQUEST
             );
             task.resources.as_mut().unwrap().disk_gb = Some(8.0);
@@ -1817,7 +1832,7 @@ mod tests {
     fn rejects_multi_executor() {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
         task.executors.push(task.executors[0].clone());
-        let error = map_task_to_spec(&task, None).unwrap_err();
+        let error = map_task_to_spec(&task, None, true).unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert!(error.message.contains("single executor"));
     }
@@ -1826,7 +1841,7 @@ mod tests {
     fn rejects_missing_group() {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
         task.tags.clear();
-        let error = map_task_to_spec(&task, None).unwrap_err();
+        let error = map_task_to_spec(&task, None, true).unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert!(error.message.contains(GROUP_TAG_KEY));
     }
@@ -1836,7 +1851,7 @@ mod tests {
         let group = Ulid::from_bytes([5u8; 16]);
         let mut task = sample_task(group);
         task.tags.remove(GROUP_TAG_KEY);
-        let (spec, _) = map_task_to_spec(&task, Some(group)).unwrap();
+        let (spec, _) = map_task_to_spec(&task, Some(group), true).unwrap();
         assert_eq!(spec.group_id, group);
     }
 
@@ -1844,7 +1859,8 @@ mod tests {
     fn rejects_group_override() {
         let group = Ulid::from_bytes([5u8; 16]);
         let credential_group = Ulid::from_bytes([6u8; 16]);
-        let error = map_task_to_spec(&sample_task(group), Some(credential_group)).unwrap_err();
+        let error =
+            map_task_to_spec(&sample_task(group), Some(credential_group), true).unwrap_err();
         assert_eq!(error.status, StatusCode::FORBIDDEN);
     }
 
@@ -1853,19 +1869,19 @@ mod tests {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
         task.executors[0].workdir = Some("work".to_string());
         assert_eq!(
-            map_task_to_spec(&task, None).unwrap_err().status,
+            map_task_to_spec(&task, None, true).unwrap_err().status,
             StatusCode::BAD_REQUEST
         );
         task.executors[0].workdir = Some("/work".to_string());
         task.inputs[0].path = "/in/../data.csv".to_string();
         assert_eq!(
-            map_task_to_spec(&task, None).unwrap_err().status,
+            map_task_to_spec(&task, None, true).unwrap_err().status,
             StatusCode::BAD_REQUEST
         );
         task.inputs[0].path = "/in/data.csv".to_string();
         task.outputs[0].path = "/out//report.txt".to_string();
         assert_eq!(
-            map_task_to_spec(&task, None).unwrap_err().status,
+            map_task_to_spec(&task, None, true).unwrap_err().status,
             StatusCode::BAD_REQUEST
         );
     }
@@ -1874,26 +1890,26 @@ mod tests {
     fn rejects_unsupported_fields() {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
         task.id = Some("server-owned".to_string());
-        assert!(map_task_to_spec(&task, None).is_err());
+        assert!(map_task_to_spec(&task, None, true).is_err());
         task.id = None;
         task.inputs[0].kind = TesFileType::Directory;
-        assert!(map_task_to_spec(&task, None).is_err());
+        assert!(map_task_to_spec(&task, None, true).is_err());
         task.inputs[0].kind = TesFileType::File;
         task.outputs[0].kind = TesFileType::Directory;
-        assert!(map_task_to_spec(&task, None).is_err());
+        assert!(map_task_to_spec(&task, None, true).is_err());
         task.outputs[0].kind = TesFileType::File;
         task.executors[0].stdout = Some("/logs/out".to_string());
-        assert!(map_task_to_spec(&task, None).is_err());
+        assert!(map_task_to_spec(&task, None, true).is_err());
         task.executors[0].stdout = None;
         task.volumes.push("/data".to_string());
-        assert!(map_task_to_spec(&task, None).is_err());
+        assert!(map_task_to_spec(&task, None, true).is_err());
         task.volumes.clear();
         task.resources
             .as_mut()
             .unwrap()
             .zones
             .push("zone-a".to_string());
-        assert!(map_task_to_spec(&task, None).is_err());
+        assert!(map_task_to_spec(&task, None, true).is_err());
     }
 
     #[test]
@@ -1902,15 +1918,15 @@ mod tests {
         let mut output = task.outputs[0].clone();
         output.url = Some("s3://dest/out/other.txt".to_string());
         task.outputs.push(output);
-        assert!(map_task_to_spec(&task, None).is_err());
+        assert!(map_task_to_spec(&task, None, true).is_err());
 
         task.outputs[1].path = "/out/other.txt".to_string();
         task.outputs[1].url = task.outputs[0].url.clone();
-        assert!(map_task_to_spec(&task, None).is_err());
+        assert!(map_task_to_spec(&task, None, true).is_err());
 
         task.outputs.truncate(1);
         task.outputs[0].path = task.inputs[0].path.clone();
-        assert!(map_task_to_spec(&task, None).is_err());
+        assert!(map_task_to_spec(&task, None, true).is_err());
     }
 
     #[test]
@@ -1918,7 +1934,7 @@ mod tests {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
         task.inputs[0].path = "/work/.command.sh".to_string();
         task.outputs[0].path = "/work/out.txt".to_string();
-        assert!(map_task_to_spec(&task, None).is_ok());
+        assert!(map_task_to_spec(&task, None, true).is_ok());
     }
 
     #[test]
@@ -1980,7 +1996,8 @@ mod tests {
 
     #[test]
     fn view_projections() {
-        let (spec, _) = map_task_to_spec(&sample_task(Ulid::from_bytes([5u8; 16])), None).unwrap();
+        let (spec, _) =
+            map_task_to_spec(&sample_task(Ulid::from_bytes([5u8; 16])), None, true).unwrap();
         let mut record = execution_record(JobId::from_bytes([2u8; 16]), user(2), spec);
         let queued = project_task(&record, TesView::Full, "http://x");
         assert!(queued.logs[0].start_time.is_none());
@@ -2090,7 +2107,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_basic() {
-        let (_dir, state) = build_state().await;
+        let (_dir, state) = build_state(false).await;
         let group = Ulid::from_bytes([5u8; 16]);
         let access = credential(group);
         let mut revoked = access.clone();
@@ -2116,7 +2133,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_restricted_basic() {
-        let (_dir, state) = build_state().await;
+        let (_dir, state) = build_state(false).await;
         let mut access = credential(Ulid::from_bytes([5u8; 16]));
         access.path_restrictions = Some(Vec::new());
         write_credential(&state, &access).await;
@@ -2133,7 +2150,7 @@ mod tests {
 
     #[tokio::test]
     async fn creates_tagless_basic() {
-        let (_dir, state) = build_state().await;
+        let (_dir, state) = build_state(true).await;
         let group = Ulid::from_bytes([5u8; 16]);
         let access = credential(group);
         write_credential(&state, &access).await;
@@ -2169,9 +2186,55 @@ mod tests {
         assert!(record.workspace_bucket.is_none());
     }
 
+    #[test]
+    fn switches_input_mode() {
+        // Inputs mount when S3 mounts are available and snapshot otherwise.
+        let group = Ulid::from_bytes([5u8; 16]);
+        let (mounted, _) = map_task_to_spec(&sample_task(group), None, true).unwrap();
+        assert_eq!(mounted.inputs[0].mode, InputMode::Mount);
+        let (snapshot, _) = map_task_to_spec(&sample_task(group), None, false).unwrap();
+        assert_eq!(snapshot.inputs[0].mode, InputMode::Snapshot);
+    }
+
+    #[tokio::test]
+    async fn snapshot_when_disabled() {
+        // Without S3 mounts, TES falls back to a kept workspace and snapshot inputs.
+        let (_dir, state) = build_state(false).await;
+        let group = Ulid::from_bytes([5u8; 16]);
+        let access = credential(group);
+        write_credential(&state, &access).await;
+        write_auth(&state, group, access.user_identity).await;
+
+        let response = create_task(
+            State(state.clone()),
+            Extension(None),
+            basic_headers(&access, access.secret.as_str()),
+            Json(sample_task(group)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: TesCreateTaskResponse = serde_json::from_slice(&body).unwrap();
+        let record = read_owned_job(
+            &state.get_ctx(),
+            access.user_identity,
+            JobId::from_str(&created.id).unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(record.workspace_mode, WorkspaceMode::Kept);
+        let JobPayload::Execution(spec) = record.payload else {
+            panic!("TES created a non-execution job");
+        };
+        assert_eq!(spec.inputs[0].mode, InputMode::Snapshot);
+    }
+
     #[tokio::test]
     async fn basic_scopes_tasks() {
-        let (_dir, state) = build_state().await;
+        let (_dir, state) = build_state(false).await;
         let owner = user(2);
         let group = Ulid::from_bytes([5u8; 16]);
         let sibling = Ulid::from_bytes([6u8; 16]);
@@ -2185,7 +2248,7 @@ mod tests {
         let visible_id = JobId::from_bytes([9u8; 16]);
         let hidden_id = JobId::from_bytes([10u8; 16]);
         for (job_id, group_id) in [(visible_id, group), (hidden_id, sibling)] {
-            let (spec, _) = map_task_to_spec(&sample_task(group_id), None).unwrap();
+            let (spec, _) = map_task_to_spec(&sample_task(group_id), None, true).unwrap();
             insert_job(
                 &state.get_ctx().storage_handle,
                 &execution_record(job_id, owner, spec),
@@ -2250,13 +2313,13 @@ mod tests {
     #[tokio::test]
     async fn lists_zero_pagesize() {
         // page_size=0 must fall back to the default, not report an empty page.
-        let (_dir, state) = build_state().await;
+        let (_dir, state) = build_state(false).await;
         let owner = user(2);
         let group = Ulid::from_bytes([5u8; 16]);
         let access = credential(group);
         write_credential(&state, &access).await;
         let headers = basic_headers(&access, access.secret.as_str());
-        let (spec, _) = map_task_to_spec(&sample_task(group), None).unwrap();
+        let (spec, _) = map_task_to_spec(&sample_task(group), None, true).unwrap();
         insert_job(
             &state.get_ctx().storage_handle,
             &execution_record(JobId::from_bytes([9u8; 16]), owner, spec),
@@ -2285,9 +2348,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_resolves() {
-        let (_dir, state) = build_state().await;
+        let (_dir, state) = build_state(false).await;
         let owner = user(2);
-        let (spec, _) = map_task_to_spec(&sample_task(Ulid::from_bytes([5u8; 16])), None).unwrap();
+        let (spec, _) =
+            map_task_to_spec(&sample_task(Ulid::from_bytes([5u8; 16])), None, true).unwrap();
         let job_id = JobId::from_bytes([9u8; 16]);
         insert_job(
             &state.get_ctx().storage_handle,
@@ -2322,9 +2386,10 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_maps_through() {
-        let (_dir, state) = build_state().await;
+        let (_dir, state) = build_state(false).await;
         let owner = user(2);
-        let (spec, _) = map_task_to_spec(&sample_task(Ulid::from_bytes([5u8; 16])), None).unwrap();
+        let (spec, _) =
+            map_task_to_spec(&sample_task(Ulid::from_bytes([5u8; 16])), None, true).unwrap();
         let job_id = JobId::from_bytes([9u8; 16]);
         insert_job(
             &state.get_ctx().storage_handle,
