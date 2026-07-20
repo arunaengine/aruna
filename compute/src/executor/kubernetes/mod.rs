@@ -408,7 +408,7 @@ impl KubernetesBackend {
             .await
             .map_err(|error| BackendError::Api(format!("stage archive task failed: {error}")))?;
         built?;
-        attached.join().await.map_err(remote_error)
+        join_exec(attached).await
     }
 
     async fn cas_generation(&self, context: &FenceContext, job: Job) -> Result<(), BackendError> {
@@ -1365,6 +1365,7 @@ fn required_access() -> Vec<(
         ("", "pods", None, "watch"),
         ("", "pods", None, "delete"),
         ("", "pods", Some("exec"), "create"),
+        ("", "pods", Some("exec"), "get"),
         ("", "pods", Some("log"), "get"),
         ("", "persistentvolumeclaims", None, "create"),
         ("", "persistentvolumeclaims", None, "get"),
@@ -1575,9 +1576,28 @@ async fn stream_output<R: AsyncRead + Unpin>(
         }
     }
     let _ = tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await;
-    if let Err(error) = attached.join().await {
-        let _ = tx.send(Err(remote_error(error))).await;
+    if let Err(error) = join_exec(attached).await {
+        let _ = tx.send(Err(error)).await;
     }
+}
+
+async fn join_exec(mut attached: kube::api::AttachedProcess) -> Result<(), BackendError> {
+    let status = attached.take_status().ok_or_else(|| {
+        BackendError::Api("Kubernetes exec status stream is unavailable".to_string())
+    })?;
+    attached.join().await.map_err(remote_error)?;
+    let status = status
+        .await
+        .ok_or_else(|| BackendError::Api("Kubernetes exec returned no status".to_string()))?;
+    if status.status.as_deref() == Some("Success") {
+        return Ok(());
+    }
+    Err(BackendError::Api(
+        status
+            .message
+            .or(status.reason)
+            .unwrap_or_else(|| "Kubernetes exec failed".to_string()),
+    ))
 }
 
 struct ChannelStream(mpsc::Receiver<Result<Bytes, BackendError>>);
