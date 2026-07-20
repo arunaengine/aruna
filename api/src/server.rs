@@ -5,8 +5,10 @@ use crate::portal;
 use crate::routes::rest_router;
 pub(crate) use crate::server_state::{ServerState, swagger_ui};
 use axum::Router;
-use axum::extract::DefaultBodyLimit;
-use axum::middleware::from_fn;
+use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::http::{Method, Uri, header};
+use axum::middleware::{Next, from_fn, from_fn_with_state};
+use axum::response::{IntoResponse, Redirect, Response};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -44,6 +46,11 @@ impl Server {
     pub fn build_router(&self) -> Router {
         // Build the main API router
         let api_v1 = Router::new().merge(rest_router(self.state.clone()));
+        let api_authority = self
+            .api_public_url
+            .as_deref()
+            .and_then(|url| url.parse::<Uri>().ok())
+            .and_then(|url| url.authority().map(ToString::to_string));
 
         // Build the root router with body size limit for REST API
 
@@ -55,6 +62,7 @@ impl Server {
                 self.state.clone(),
                 self.config.portal_csp.clone(),
             ))
+            .layer(from_fn_with_state(api_authority, redirect_swagger))
             .layer(from_fn(baseline_security_headers));
         if let Some(cors_layer) = self.config.cors.rest_layer() {
             router = router.layer(cors_layer);
@@ -83,4 +91,28 @@ impl Server {
 
         Ok(())
     }
+}
+
+async fn redirect_swagger(
+    State(api_authority): State<Option<String>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let is_alias = matches!(request.uri().path(), "/" | "/api/v1" | "/swagger");
+    let is_api_host = api_authority.as_deref().is_some_and(|authority| {
+        request
+            .headers()
+            .get(header::HOST)
+            .and_then(|host| host.to_str().ok())
+            .is_some_and(|host| host.eq_ignore_ascii_case(authority))
+    });
+
+    if (request.method() == Method::GET || request.method() == Method::HEAD)
+        && is_alias
+        && is_api_host
+    {
+        return Redirect::temporary("/swagger-ui/").into_response();
+    }
+
+    next.run(request).await
 }

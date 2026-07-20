@@ -3766,8 +3766,8 @@ mod tests {
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
                     path: "datasets/capacity".to_string(),
-                    name: "Capacity Dataset".to_string(),
-                    description: "capacity".to_string(),
+                    name: "Placeholder Dataset".to_string(),
+                    description: "placeholder".to_string(),
                     date_published: "2026-01-01".to_string(),
                     license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
                     public: true,
