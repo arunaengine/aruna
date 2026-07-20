@@ -885,7 +885,7 @@ pub fn cleanup_job_id(job_id: JobId) -> JobId {
 }
 
 pub fn workspace_credential_id(job_id: JobId) -> String {
-    format!("workspace-{job_id}")
+    format!("ws{job_id}")
 }
 
 /// Dedup key of a user-supplied idempotency key: namespaced under `user/` and
@@ -1224,7 +1224,7 @@ mod tests {
         assert_eq!(user_dedup_key(user_a, "k"), user_dedup_key(user_a, "k"));
         assert_eq!(cleanup_job_id(job), cleanup_job_id(job));
         assert_ne!(cleanup_job_id(job), crate_job_id(job));
-        assert_eq!(workspace_credential_id(job), format!("workspace-{job}"));
+        assert_eq!(workspace_credential_id(job), format!("ws{job}"));
     }
 
     #[test]

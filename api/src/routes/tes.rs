@@ -1446,7 +1446,7 @@ mod tests {
     fn credential(group_id: Ulid) -> UserAccess {
         let user_identity = user(2);
         UserAccess {
-            access_key: UserAccess::build_access_key(&user_identity, "tes").unwrap(),
+            access_key: UserAccess::build_access_key("tes").unwrap(),
             user_identity,
             group_id,
             secret: "tes-secret".to_string(),

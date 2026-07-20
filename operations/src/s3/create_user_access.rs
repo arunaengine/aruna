@@ -87,11 +87,10 @@ impl CreateUserAccessOperation {
 
     fn handle_init(&mut self) -> Effects {
         if let CreateUserAccessState::Init = self.state {
-            let access_key =
-                match UserAccess::build_access_key(&self.config.user_identity, &self.key_id) {
-                    Ok(access_key) => access_key,
-                    Err(err) => return self.handle_error(err.into()),
-                };
+            let access_key = match UserAccess::build_access_key(&self.key_id) {
+                Ok(access_key) => access_key,
+                Err(err) => return self.handle_error(err.into()),
+            };
             let access = UserAccess {
                 access_key: access_key.clone(),
                 user_identity: self.config.user_identity,

@@ -203,10 +203,9 @@ async fn mint_credential(
     restrictions: Vec<PathRestriction>,
 ) -> Result<WorkspaceCredential, JobError> {
     let key_id = workspace_credential_id(record.job_id);
-    let access_key =
-        UserAccess::build_access_key(&record.created_by, &key_id).map_err(|error| {
-            JobError::permanent(format!("workspace credential key failed: {error}"))
-        })?;
+    let access_key = UserAccess::build_access_key(&key_id).map_err(|error| {
+        JobError::permanent(format!("workspace credential key failed: {error}"))
+    })?;
     match drive(GetUserAccessOperation::new(access_key.clone()), context).await {
         Ok(Some(Ok(access))) => {
             let matches_job = access.access_key == access_key

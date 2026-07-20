@@ -596,17 +596,20 @@ pub struct UserAccess {
 }
 
 impl UserAccess {
-    pub fn build_access_key(
-        user_identity: &UserId,
-        key_id: &str,
-    ) -> Result<String, ConversionError> {
-        let access_key = format!("{user_identity}:{key_id}");
-        if access_key.len() > ACCESS_KEY_MAX_LEN {
+    /// Access keys are the key id itself, kept strictly alphanumeric so every
+    /// S3 client and the CSI mount driver accept them verbatim.
+    pub fn build_access_key(key_id: &str) -> Result<String, ConversionError> {
+        if key_id.is_empty() || key_id.len() > ACCESS_KEY_MAX_LEN {
             return Err(ConversionError::InvalidLength(format!(
-                "access key must be <= {ACCESS_KEY_MAX_LEN} characters"
+                "access key must be 1..={ACCESS_KEY_MAX_LEN} characters"
             )));
         }
-        Ok(access_key)
+        if !key_id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return Err(ConversionError::FromStrError(
+                "access key must be alphanumeric".to_string(),
+            ));
+        }
+        Ok(key_id.to_string())
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {

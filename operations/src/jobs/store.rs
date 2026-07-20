@@ -331,9 +331,8 @@ async fn insert_cleanup_obligation(
     if !matches!(&record.payload, JobPayload::Execution(_)) {
         return Ok(());
     }
-    let access_key =
-        UserAccess::build_access_key(&record.created_by, &workspace_credential_id(record.job_id))
-            .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+    let access_key = UserAccess::build_access_key(&workspace_credential_id(record.job_id))
+        .map_err(|error| JobMutationError::Storage(error.to_string()))?;
     let now_ms = record.finished_at_ms.unwrap_or(record.updated_at_ms);
     let child = JobRecord::new(
         cleanup_job_id(record.job_id),
@@ -2674,7 +2673,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let expected_access =
-            UserAccess::build_access_key(&owner, &workspace_credential_id(job_id)).unwrap();
+            UserAccess::build_access_key(&workspace_credential_id(job_id)).unwrap();
         assert_eq!(
             child.payload,
             JobPayload::TerminalCleanup {
