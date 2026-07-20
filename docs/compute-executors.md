@@ -138,6 +138,9 @@ Required configuration:
   defaults to `300`.
 - `ARUNA_COMPUTE_K8S_S3_CIDRS`: comma-separated egress CIDRs for Direct-S3.
 - `ARUNA_COMPUTE_K8S_S3_PORT`: S3 TCP port; defaults to `443`.
+- `ARUNA_COMPUTE_K8S_S3_MOUNT_DRIVER`: CSI driver name for S3 mounts. Unset
+  disables S3-mount staging; set it to the deployed driver, for example
+  `s3.csi.scality.com`.
 
 The Kubernetes executor supports Kubernetes 1.32 or newer. Files mode requires a
 CSI driver that enforces `ReadWriteOncePod`. Each attempt creates a suspended Job
@@ -171,8 +174,9 @@ The controller ServiceAccount needs these namespace permissions:
 | NetworkPolicies | create, get, patch |
 | ServiceAccounts | get |
 
-Its narrowly bound ClusterRole needs `get` on StorageClasses and `create` on
-SelfSubjectAccessReviews. The `aruna-workload` ServiceAccount must already exist
+Its narrowly bound ClusterRole needs `get` on StorageClasses, `create` on
+SelfSubjectAccessReviews, and `get` on CSIDrivers only when
+`ARUNA_COMPUTE_K8S_S3_MOUNT_DRIVER` is set. The `aruna-workload` ServiceAccount must already exist
 in the namespace and must not have a Role or ClusterRole binding. Workload and
 helper Pods disable token automount.
 
@@ -185,9 +189,9 @@ The operator must also provide:
 - sufficient namespace quota for Jobs, Pods, PVCs, ConfigMaps, and Secrets;
 - routable, stable S3 CIDRs or an egress proxy when Direct-S3 is enabled.
 
-Startup health is intentionally cheap: namespace access, StorageClass GET,
-workload-ServiceAccount existence, and SelfSubjectAccessReview checks for the
-required verbs. It does not launch RWOP, NetworkPolicy, quota, or admission
+Startup health is intentionally cheap: namespace access, StorageClass GET, the
+S3-mount CSIDriver GET when that driver is configured, workload-ServiceAccount
+existence, and SelfSubjectAccessReview checks for the required verbs. It does not launch RWOP, NetworkPolicy, quota, or admission
 canaries. Those operator prerequisites are enforced lazily by the first real
 object, and a failure parks the attempt without force deletion or a weaker
 release fallback.
