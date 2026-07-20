@@ -111,6 +111,21 @@ pub fn job_manifest(
                 }));
             }
         }
+        // Mounted jobs have no workspace PVC, so give the task a writable
+        // working directory that read-only inputs nest beneath.
+        if let Some(workdir) = spec.workdir.as_deref() {
+            let scratch = normalize_container_path(workdir).map_err(BackendError::InvalidSpec)?;
+            let taken = layout.mounts.iter().any(|input| input.path == scratch)
+                || layout.output_parents.contains(&scratch);
+            if !taken {
+                let empty_dir = match spec.resources.disk_bytes {
+                    Some(bytes) => json!({"sizeLimit":bytes.to_string()}),
+                    None => json!({}),
+                };
+                volumes.push(json!({"name":"scratch","emptyDir":empty_dir}));
+                mounts.push(json!({"name":"scratch","mountPath":scratch}));
+            }
+        }
     } else if spec.staging_mode == StagingMode::DirectS3 {
         env_from.push(json!({"secretRef":{"name":secret_name(&name)}}));
     }
@@ -684,6 +699,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pv["spec"]["csi"]["driver"], "s3.csi.example.org");
+    }
+
+    #[test]
+    fn mounts_scratch_dir() {
+        // Mounted jobs get a writable working directory instead of a workspace.
+        let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
+        spec.staging_mode = StagingMode::S3Mount;
+        spec.workdir = Some("/work".to_string());
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = job_manifest(&context(), &spec, &config(), &layout).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+
+        let mount = pod.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|mount| mount.mount_path == "/work")
+            .unwrap();
+        assert_eq!(mount.name, "scratch");
+        assert_ne!(mount.read_only, Some(true));
+        let volume = pod
+            .volumes
+            .unwrap()
+            .into_iter()
+            .find(|volume| volume.name == "scratch")
+            .unwrap();
+        assert!(volume.empty_dir.is_some());
     }
 
     #[test]
