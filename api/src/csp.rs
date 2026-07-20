@@ -259,7 +259,7 @@ pub(crate) async fn baseline_security_headers(request: Request, next: Next) -> R
 /// generated theme stylesheet.
 fn content_security_policy(origins: &ResolvedOrigins) -> String {
     let connect_src = directive(
-        &format!("connect-src 'self' {NPM_ORIGIN} {PYPI_ORIGIN}"),
+        &format!("connect-src 'self' https: {NPM_ORIGIN} {PYPI_ORIGIN}"),
         &origins.connect,
     );
     let img_src = directive("img-src 'self' data: blob:", &origins.img);
@@ -395,7 +395,7 @@ mod tests {
         ));
 
         assert!(policy.ends_with(&format!(
-            "connect-src 'self' {NPM_ORIGIN} {PYPI_ORIGIN} http://127.0.0.1:9000 https://issuer.test"
+            "connect-src 'self' https: {NPM_ORIGIN} {PYPI_ORIGIN} http://127.0.0.1:9000 https://issuer.test"
         )));
     }
 
