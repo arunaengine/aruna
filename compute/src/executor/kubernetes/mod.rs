@@ -41,8 +41,8 @@ use super::{BackendCaps, ExecutorBackend, digest_pinned};
 mod manifest;
 
 use manifest::{
-    HELPER_PATH, S3_DRIVER, StageMarker, WORKLOAD_SA, helper_pod, job_manifest, marker_manifest,
-    marker_name, mount_buckets, mount_name, mount_pv_manifest, mount_pvc_manifest, needs_workspace,
+    HELPER_PATH, StageMarker, WORKLOAD_SA, helper_pod, job_manifest, marker_manifest, marker_name,
+    mount_buckets, mount_name, mount_pv_manifest, mount_pvc_manifest, needs_workspace,
     network_policies, pvc_manifest, secret_manifest, secret_name, workspace_name,
 };
 
@@ -184,6 +184,9 @@ impl KubernetesBackend {
         context: &FenceContext,
         layout: &StageLayout,
     ) -> Result<(), BackendError> {
+        let driver = self.config.s3_mount_driver.as_deref().ok_or_else(|| {
+            BackendError::InvalidSpec("S3 mounts are disabled on this backend".to_string())
+        })?;
         for (index, bucket) in mount_buckets(layout).iter().enumerate() {
             let name = mount_name(&context.attempt.external_name(), index);
             let pv = mount_pv_manifest(context, &self.config, index, bucket)?;
@@ -203,7 +206,7 @@ impl KubernetesBackend {
                             .as_ref()
                             .and_then(|spec| spec.csi.as_ref())
                             .is_some_and(|csi| {
-                                csi.driver == S3_DRIVER
+                                csi.driver == driver
                                     && csi.volume_handle == name
                                     && csi
                                         .volume_attributes
@@ -766,12 +769,16 @@ impl ExecutorBackend for KubernetesBackend {
             .get(&self.config.storage_class)
             .await
             .map_err(kube_error)?;
-        let drivers: Api<CSIDriver> = Api::all(self.client.clone());
-        drivers.get(S3_DRIVER).await.map_err(kube_error)?;
+        if let Some(driver) = &self.config.s3_mount_driver {
+            let drivers: Api<CSIDriver> = Api::all(self.client.clone());
+            drivers.get(driver).await.map_err(kube_error)?;
+        }
         let accounts: Api<ServiceAccount> =
             Api::namespaced(self.client.clone(), &self.config.namespace);
         accounts.get(WORKLOAD_SA).await.map_err(kube_error)?;
-        for (group, resource, subresource, verb) in required_access() {
+        for (group, resource, subresource, verb) in
+            required_access(self.config.s3_mount_driver.is_some())
+        {
             check_access(
                 self.client.clone(),
                 &self.config.namespace,
@@ -1245,6 +1252,11 @@ fn validate_spec(
             "Kubernetes tasks must run as 65534:65534".to_string(),
         ));
     }
+    if spec.staging_mode == StagingMode::S3Mount && config.s3_mount_driver.is_none() {
+        return Err(BackendError::InvalidSpec(
+            "S3 mounts are disabled on this backend".to_string(),
+        ));
+    }
     match (spec.staging_mode, spec.security.network) {
         (
             StagingMode::Files,
@@ -1503,13 +1515,15 @@ fn logs_name(name: &str) -> String {
     format!("{name}-logs")
 }
 
-fn required_access() -> Vec<(
+fn required_access(
+    s3_mount: bool,
+) -> Vec<(
     &'static str,
     &'static str,
     Option<&'static str>,
     &'static str,
 )> {
-    vec![
+    let mut access = vec![
         ("batch", "jobs", None, "create"),
         ("batch", "jobs", None, "get"),
         ("batch", "jobs", None, "list"),
@@ -1545,8 +1559,11 @@ fn required_access() -> Vec<(
         ("networking.k8s.io", "networkpolicies", None, "get"),
         ("networking.k8s.io", "networkpolicies", None, "patch"),
         ("storage.k8s.io", "storageclasses", None, "get"),
-        ("storage.k8s.io", "csidrivers", None, "get"),
-    ]
+    ];
+    if s3_mount {
+        access.push(("storage.k8s.io", "csidrivers", None, "get"));
+    }
+    access
 }
 
 async fn check_access(
@@ -1825,6 +1842,7 @@ mod tests {
             pull_deadline: Duration::from_secs(30),
             s3_cidrs: Vec::new(),
             s3_port: 443,
+            s3_mount_driver: None,
         }
     }
 
@@ -2053,6 +2071,7 @@ mod tests {
             pull_deadline: Duration::from_secs(30),
             s3_cidrs: Vec::new(),
             s3_port: 443,
+            s3_mount_driver: None,
         };
         assert!(validate_config(&config).is_err());
     }
@@ -2083,6 +2102,101 @@ mod tests {
         assert_eq!(
             attempt_selector(&context()),
             "aruna-engine.org/job-id=job,aruna-engine.org/attempt=1"
+        );
+    }
+
+    #[test]
+    fn rejects_disabled_mount() {
+        // A disabled backend must refuse S3Mount specs before submission.
+        let context = context();
+        let mut spec = TaskSpec::new(context.attempt.clone(), "registry.example/task:latest");
+        spec.staging_mode = StagingMode::S3Mount;
+        assert!(matches!(
+            validate_spec(&context, &spec, &test_config()),
+            Err(BackendError::InvalidSpec(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn gates_driver_check() {
+        // Health probes the CSIDriver only when the S3-mount driver is set.
+        fn probe_client(seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Client {
+            fake_client(move |method, path| {
+                seen.lock().expect("record request").push(path.to_string());
+                if method == "POST" {
+                    return (
+                        200,
+                        json!({
+                            "apiVersion":"authorization.k8s.io/v1",
+                            "kind":"SelfSubjectAccessReview",
+                            "status":{"allowed":true}
+                        }),
+                    );
+                }
+                if path.contains("storageclasses") {
+                    return (
+                        200,
+                        json!({
+                            "apiVersion":"storage.k8s.io/v1","kind":"StorageClass",
+                            "metadata":{"name":"csi"},"provisioner":"driver"
+                        }),
+                    );
+                }
+                if path.contains("csidrivers") {
+                    return (
+                        200,
+                        json!({
+                            "apiVersion":"storage.k8s.io/v1","kind":"CSIDriver",
+                            "metadata":{"name":"driver"},"spec":{}
+                        }),
+                    );
+                }
+                if path.contains("serviceaccounts") {
+                    return (
+                        200,
+                        json!({
+                            "apiVersion":"v1","kind":"ServiceAccount",
+                            "metadata":{"name":WORKLOAD_SA}
+                        }),
+                    );
+                }
+                (
+                    200,
+                    json!({
+                        "apiVersion":"v1","kind":"Namespace","metadata":{"name":"compute"}
+                    }),
+                )
+            })
+        }
+
+        let disabled = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend = KubernetesBackend {
+            client: probe_client(disabled.clone()),
+            config: test_config(),
+        };
+        backend.health().await.unwrap();
+        assert!(
+            !disabled
+                .lock()
+                .expect("read requests")
+                .iter()
+                .any(|path| path.contains("csidrivers"))
+        );
+
+        let enabled = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut config = test_config();
+        config.s3_mount_driver = Some("s3.csi.scality.com".to_string());
+        let backend = KubernetesBackend {
+            client: probe_client(enabled.clone()),
+            config,
+        };
+        backend.health().await.unwrap();
+        assert!(
+            enabled
+                .lock()
+                .expect("read requests")
+                .iter()
+                .any(|path| path.contains("csidrivers"))
         );
     }
 }

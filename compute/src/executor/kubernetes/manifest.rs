@@ -21,7 +21,6 @@ pub const MARKER_PATH: &str = "/aruna-marker/marker";
 pub const SENTINEL_PATH: &str = "/workspace/.aruna-stage";
 pub const TASK_SENTINEL: &str = "/aruna-workspace/.aruna-stage";
 pub const HELPER_PATH: &str = "/aruna-compute-helper";
-pub const S3_DRIVER: &str = "s3.csi.scality.com";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageMarker {
@@ -223,6 +222,9 @@ pub fn mount_pv_manifest(
     bucket: &str,
 ) -> Result<PersistentVolume, BackendError> {
     let name = mount_name(&context.attempt.external_name(), index);
+    let driver = config.s3_mount_driver.as_deref().ok_or_else(|| {
+        BackendError::InvalidSpec("S3 mounts are disabled on this backend".to_string())
+    })?;
     serde_json::from_value(json!({
         "apiVersion":"v1",
         "kind":"PersistentVolume",
@@ -241,7 +243,7 @@ pub fn mount_pv_manifest(
                 "uid=65534","gid=65534","allow-other","file-mode=0444","dir-mode=0555"
             ],
             "csi":{
-                "driver":S3_DRIVER,
+                "driver":driver,
                 "volumeHandle":name,
                 "readOnly":true,
                 "volumeAttributes":{
@@ -588,6 +590,7 @@ mod tests {
             pull_deadline: std::time::Duration::from_secs(30),
             s3_cidrs: Vec::new(),
             s3_port: 443,
+            s3_mount_driver: Some("s3.csi.scality.com".to_string()),
         }
     }
 
@@ -660,7 +663,7 @@ mod tests {
             mount_pv_manifest(&context(), &config(), 0, "input-bucket").unwrap(),
         )
         .unwrap();
-        assert_eq!(pv["spec"]["csi"]["driver"], S3_DRIVER);
+        assert_eq!(pv["spec"]["csi"]["driver"], "s3.csi.scality.com");
         assert_eq!(
             pv["spec"]["csi"]["volumeAttributes"]["bucketName"],
             "input-bucket"
@@ -670,6 +673,17 @@ mod tests {
             "aruna-job-a1-env"
         );
         assert_eq!(pv["spec"]["csi"]["readOnly"], true);
+    }
+
+    #[test]
+    fn uses_configured_driver() {
+        let mut config = config();
+        config.s3_mount_driver = Some("s3.csi.example.org".to_string());
+        let pv = serde_json::to_value(
+            mount_pv_manifest(&context(), &config, 0, "input-bucket").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pv["spec"]["csi"]["driver"], "s3.csi.example.org");
     }
 
     #[test]

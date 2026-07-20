@@ -620,6 +620,9 @@ async fn build_kubernetes(
         .map(|value| value.parse::<u16>())
         .unwrap_or(Ok(443))
         .map_err(|_| "ARUNA_COMPUTE_K8S_S3_PORT must be a valid port".to_string())?;
+    let s3_mount_driver = dotenvy::var("ARUNA_COMPUTE_K8S_S3_MOUNT_DRIVER")
+        .ok()
+        .filter(|driver| !driver.is_empty());
     let backend = aruna_compute::executor::kubernetes::KubernetesBackend::with_config(
         aruna_compute::KubernetesConfig {
             namespace: dotenvy::var("ARUNA_COMPUTE_K8S_NAMESPACE")
@@ -629,6 +632,7 @@ async fn build_kubernetes(
             pull_deadline: env_duration("ARUNA_COMPUTE_K8S_PULL_DEADLINE", 300)?,
             s3_cidrs,
             s3_port,
+            s3_mount_driver,
         },
     )
     .await
