@@ -130,7 +130,7 @@ async fn restart_traffic_body() -> Result<(), BoxError> {
     node2.task_handle.clear_inbound_handler().await;
     node2.net.shutdown().await;
     drop(node2);
-    aux.shutdown().await;
+    aux.shutdown().await?;
     println!("node 2 shut down");
 
     let node2 = respawn_with_retry(realm_id, secret, node2_dir.path()).await?;
@@ -222,13 +222,15 @@ impl AuxRuntime {
             .clone()
     }
 
-    async fn shutdown(mut self) {
+    async fn shutdown(mut self) -> Result<(), BoxError> {
         if let Some(runtime) = self.0.take() {
-            let _ = tokio::task::spawn_blocking(move || {
-                runtime.shutdown_timeout(Duration::from_secs(10))
-            })
-            .await;
+            let shutdown = tokio::task::spawn_blocking(move || drop(runtime));
+            tokio::time::timeout(CONVERGENCE_TIMEOUT, shutdown)
+                .await
+                .map_err(|_| "aux runtime shutdown timed out")?
+                .map_err(|error| format!("aux runtime shutdown failed: {error}"))?;
         }
+        Ok(())
     }
 }
 
