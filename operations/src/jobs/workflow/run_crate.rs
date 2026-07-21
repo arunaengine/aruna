@@ -6,11 +6,12 @@ use aruna_core::structs::{
 use serde_json::json;
 use ulid::Ulid;
 
-/// Workflow Run RO-Crate "Process Run Crate" profile identifiers (0.5).
+/// Process Run Crate profile identifiers (0.5).
 const CRATE_CONTEXT: &str = "https://w3id.org/ro/crate/1.2/context";
 const WORKFLOW_RUN_CONTEXT: &str = "https://w3id.org/ro/terms/workflow-run/context";
 const CRATE_PROFILE: &str = "https://w3id.org/ro/crate/1.2";
 const PROCESS_PROFILE: &str = "https://w3id.org/ro/wfrun/process/0.5";
+const WORKSPACE_PROPERTY: &str = "https://w3id.org/aruna/terms/workspace-bucket";
 
 use super::super::executor::{JobContext, JobRunOutcome};
 use super::super::store::{put_run_crate_status, read_job_record, read_run_crate_status};
@@ -189,42 +190,54 @@ fn is_transient(error: &MetadataWriteError) -> bool {
     )
 }
 
-/// RO-Crate 1.2 JSON-LD conforming to the Workflow Run RO-Crate "Process Run
-/// Crate" profile: a metadata descriptor, the run `Dataset` (conforming to the
-/// crate and process profiles and mentioning the action), a `CreateAction`
-/// binding agent/instrument/object/result/status/times, the instrument
-/// `SoftwareApplication`, and the input/output `File` entities. No secrets
-/// (spec 16.10).
+/// RO-Crate 1.2 JSON-LD conforming to the Process Run Crate 0.5 profile. No
+/// secrets are included (spec 16.10).
 fn build_run_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id: Ulid) -> String {
     let root = format!("https://w3id.org/aruna/{document_id}");
     let action_id = format!("#run-{}", record.job_id);
     let agent_id = format!("#agent-{}", record.created_by);
     let software_id = format!("#software-{}", record.job_id);
-    let bucket = super::job_bucket(record);
-    let description = (!bucket.is_empty()).then_some(bucket).map_or_else(
-        || format!("Aruna execution run for job {}", record.job_id),
-        |workspace| {
-            format!(
-                "Aruna execution run for job {} in workspace {}",
-                record.job_id, workspace
-            )
-        },
-    );
+    let container_id = format!("#container-{}", record.job_id);
+    let image = record
+        .attempt_intent
+        .as_ref()
+        .map(|intent| intent.pinned_image.as_str())
+        .unwrap_or(spec.image.as_str());
+    let (repository, pinned_tag, digest) = split_image(image);
+    let (_, submitted_tag, _) = split_image(&spec.image);
+    let (registry, image_name) = split_registry(&repository);
+    let application_name = image_name.rsplit('/').next().unwrap_or(image_name.as_str());
+    let run_name = spec
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Run {application_name}"));
+    let run_description = spec
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Container execution using {application_name}"));
 
-    let (exit_code, outputs) = match &record.result {
+    let (exit_code, result_workspace, outputs) = match &record.result {
         Some(JobResultPayload::Execution {
-            exit_code, outputs, ..
-        }) => (*exit_code, outputs.clone()),
-        _ => (None, Vec::new()),
+            exit_code,
+            workspace_bucket,
+            outputs,
+            ..
+        }) => (*exit_code, workspace_bucket.clone(), outputs.clone()),
+        _ => (None, None, Vec::new()),
     };
+    let workspace = record.workspace_bucket.clone().or(result_workspace);
     let action_status = if record.state == JobState::Succeeded {
         "http://schema.org/CompletedActionStatus"
     } else {
         "http://schema.org/FailedActionStatus"
     };
-
-    let mut command = spec.entrypoint.clone().unwrap_or_default();
-    command.extend(spec.command.iter().cloned());
+    let command = command_line(spec);
 
     // Inputs are the action `object`, keyed by their S3 source URL.
     let mut object_ids = Vec::with_capacity(spec.inputs.len());
@@ -257,18 +270,37 @@ fn build_run_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id:
         .map(|id| json!({ "@id": id.clone() }))
         .collect();
 
+    let workspace_property = workspace.as_deref().map(|bucket| {
+        json!({
+            "@id": "#workspace-bucket",
+            "@type": "PropertyValue",
+            "name": "Workspace bucket",
+            "propertyID": WORKSPACE_PROPERTY,
+            "value": bucket
+        })
+    });
+
     let mut action = json!({
         "@id": action_id.clone(),
         "@type": "CreateAction",
-        "name": format!("execution of {}", spec.image),
+        "name": run_name.clone(),
         "agent": {"@id": agent_id.clone()},
         "instrument": {"@id": software_id.clone()},
+        "containerImage": {"@id": container_id.clone()},
         "object": object_ids,
         "result": result_ids,
-        "actionStatus": {"@id": action_status},
-        "command": command
+        "actionStatus": {"@id": action_status}
     });
     if let Some(map) = action.as_object_mut() {
+        if workspace_property.is_some() {
+            map.insert(
+                "additionalProperty".to_string(),
+                json!([{"@id": "#workspace-bucket"}]),
+            );
+        }
+        if !command.is_empty() {
+            map.insert("description".to_string(), json!(command));
+        }
         if let Some(started) = record.started_at_ms {
             map.insert("startTime".to_string(), json!(rfc3339(started)));
         }
@@ -280,17 +312,43 @@ fn build_run_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id:
         }
     }
 
-    // A digest-pinned image reference is not a valid IRI, so the node keeps a
-    // minted @id and carries the raw reference as `identifier`.
-    let (image_name, image_version) = split_image(&spec.image);
     let mut software = json!({
         "@id": software_id,
         "@type": "SoftwareApplication",
-        "name": image_name,
-        "identifier": spec.image.clone()
+        "name": application_name,
+        "identifier": image
     });
-    if let (Some(map), Some(version)) = (software.as_object_mut(), image_version) {
+    let image_url = image_url(&registry, &image_name);
+    if let Some(map) = software.as_object_mut()
+        && let Some(version) = submitted_tag
+            .as_ref()
+            .or(pinned_tag.as_ref())
+            .or(digest.as_ref())
+    {
         map.insert("softwareVersion".to_string(), json!(version));
+    }
+
+    let mut container = json!({
+        "@id": container_id,
+        "@type": "https://w3id.org/ro/terms/workflow-run#ContainerImage",
+        "additionalType": {"@id": "https://w3id.org/ro/terms/workflow-run#DockerImage"},
+        "identifier": image,
+        "registry": registry,
+        "name": image_name
+    });
+    if let Some(map) = container.as_object_mut() {
+        if let Some(tag) = submitted_tag.as_ref().or(pinned_tag.as_ref()) {
+            map.insert("tag".to_string(), json!(tag));
+        }
+        if let Some(sha256) = digest
+            .as_deref()
+            .and_then(|value| value.strip_prefix("sha256:"))
+        {
+            map.insert("sha256".to_string(), json!(sha256));
+        }
+        if let Some(url) = image_url {
+            map.insert("url".to_string(), json!(url));
+        }
     }
 
     let mut graph = vec![
@@ -303,11 +361,11 @@ fn build_run_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id:
         json!({
             "@id": root,
             "@type": "Dataset",
-            "name": format!("Run {}", record.job_id),
-            "description": description,
+            "name": run_name,
+            "description": run_description,
             "datePublished": rfc3339(record.created_at_ms),
             "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
-            "conformsTo": [{"@id": CRATE_PROFILE}, {"@id": PROCESS_PROFILE}],
+            "conformsTo": {"@id": PROCESS_PROFILE},
             "hasPart": has_part,
             "mentions": {"@id": action_id}
         }),
@@ -318,29 +376,100 @@ fn build_run_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id:
             "identifier": record.created_by.to_string()
         }),
         software,
+        container,
+        json!({
+            "@id": PROCESS_PROFILE,
+            "@type": ["CreativeWork", "http://www.w3.org/ns/dx/prof/Profile"],
+            "name": "Process Run Crate",
+            "version": "0.5"
+        }),
     ];
     graph.extend(files);
+    if let Some(property) = workspace_property {
+        graph.push(property);
+    }
 
     json!({
-        "@context": [CRATE_CONTEXT, WORKFLOW_RUN_CONTEXT],
+        "@context": [
+            CRATE_CONTEXT,
+            WORKFLOW_RUN_CONTEXT,
+            {
+                "containerImage": "https://w3id.org/ro/terms/workflow-run#containerImage",
+                "registry": "https://w3id.org/ro/terms/workflow-run#registry",
+                "tag": "https://w3id.org/ro/terms/workflow-run#tag",
+                "sha256": "https://w3id.org/ro/terms/workflow-run#sha256"
+            }
+        ],
         "@graph": graph
     })
     .to_string()
 }
 
-/// Split a container image reference into a `SoftwareApplication` name and
-/// optional version: a digest after `@`, otherwise a trailing `:tag` that holds
-/// no path separator (so a `host:port/image` registry prefix is not a version).
-fn split_image(image: &str) -> (String, Option<String>) {
-    if let Some((name, digest)) = image.split_once('@') {
-        return (name.to_string(), Some(digest.to_string()));
+fn command_line(spec: &ExecutionSpec) -> String {
+    spec.entrypoint
+        .iter()
+        .flatten()
+        .chain(spec.command.iter())
+        .map(|argument| quote_argument(argument.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn quote_argument(argument: &str) -> String {
+    if !argument.is_empty()
+        && argument
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"%+,-./:=@_".contains(&byte))
+    {
+        return argument.to_string();
     }
-    if let Some((name, tag)) = image.rsplit_once(':')
+    format!("'{}'", argument.replace('\'', "'\"'\"'"))
+}
+
+fn split_image(image: &str) -> (String, Option<String>, Option<String>) {
+    let (name, digest) = image
+        .split_once('@')
+        .map_or((image, None), |(name, digest)| (name, Some(digest)));
+    if let Some((repository, tag)) = name.rsplit_once(':')
         && !tag.contains('/')
     {
-        return (name.to_string(), Some(tag.to_string()));
+        return (
+            repository.to_string(),
+            Some(tag.to_string()),
+            digest.map(str::to_string),
+        );
     }
-    (image.to_string(), None)
+    (name.to_string(), None, digest.map(str::to_string))
+}
+
+fn split_registry(repository: &str) -> (String, String) {
+    if let Some((registry, name)) = repository.split_once('/')
+        && (registry.contains('.') || registry.contains(':') || registry == "localhost")
+    {
+        return (registry.to_string(), name.to_string());
+    }
+    let name = if repository.contains('/') {
+        repository.to_string()
+    } else {
+        format!("library/{repository}")
+    };
+    ("docker.io".to_string(), name)
+}
+
+fn image_url(registry: &str, name: &str) -> Option<String> {
+    let valid_name = name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"-._/".contains(&byte));
+    if name.is_empty() || !valid_name {
+        return None;
+    }
+    match registry {
+        "docker.io" | "index.docker.io" | "registry-1.docker.io" => {
+            Some(format!("https://hub.docker.com/r/{name}"))
+        }
+        "ghcr.io" => Some(format!("https://ghcr.io/{name}")),
+        _ => None,
+    }
 }
 
 fn rfc3339(ms: u64) -> String {
@@ -353,7 +482,8 @@ fn rfc3339(ms: u64) -> String {
 mod tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::structs::{InputMode, InputSelection, OutputObject, RealmId};
+    use aruna_core::structs::{AttemptIntent, InputMode, InputSelection, OutputObject, RealmId};
+    use serde_json::Value;
 
     fn execution_record() -> (JobRecord, ExecutionSpec) {
         // Succeeded run with one S3 input and one produced output.
@@ -362,12 +492,16 @@ mod tests {
         let node = iroh::SecretKey::from_bytes(&[3; 32]).public();
         let spec = ExecutionSpec {
             group_id: Ulid::from_bytes([4; 16]),
-            name: None,
-            description: None,
+            name: Some("Variant calling".to_string()),
+            description: Some("Call variants for sample one".to_string()),
             tags: Default::default(),
-            image: "busybox:1.36".to_string(),
-            entrypoint: Some(vec!["/bin/sh".to_string()]),
-            command: vec!["-c".to_string(), "true".to_string()],
+            image: "docker.io/aruna/tool:2.0".to_string(),
+            entrypoint: Some(vec!["/usr/bin/python".to_string()]),
+            command: vec![
+                "/work/script.py".to_string(),
+                "--label".to_string(),
+                "sample one".to_string(),
+            ],
             workdir: None,
             env: Default::default(),
             resources: Default::default(),
@@ -381,7 +515,7 @@ mod tests {
                 dest_key: "inputs/in.txt".to_string(),
                 mode: InputMode::Snapshot,
                 container_path: None,
-                name: None,
+                name: Some("Input sample".to_string()),
                 description: None,
             }],
             file_outputs: Vec::new(),
@@ -401,13 +535,21 @@ mod tests {
         record.state = JobState::Succeeded;
         record.started_at_ms = Some(2_000);
         record.finished_at_ms = Some(3_000);
+        record.attempt_intent = Some(AttemptIntent {
+            attempt_no: 2,
+            external_name: "aruna-task-a2".to_string(),
+            executor_kind: "kubernetes".to_string(),
+            pinned_image: format!("docker.io/aruna/tool@sha256:{}", "a".repeat(64)),
+            attempt_epoch: 7,
+        });
+        record.workspace_bucket = Some("workspace-sample-one".to_string());
         record.result = Some(JobResultPayload::Execution {
             exit_code: Some(0),
-            workspace_bucket: Some(JobRecord::workspace_bucket_name(job_id)),
+            workspace_bucket: Some("workspace-sample-one".to_string()),
             outputs: vec![OutputObject {
                 bucket: "src".to_string(),
                 key: "out.txt".to_string(),
-                container_path: "/out.txt".to_string(),
+                container_path: "/work/out.txt".to_string(),
                 size: 7,
                 digest: None,
             }],
@@ -422,27 +564,35 @@ mod tests {
         serde_json::from_str(&build_run_crate_jsonld(record, spec, doc)).unwrap()
     }
 
+    fn entity_id(value: &Value) -> Option<&str> {
+        value
+            .as_str()
+            .or_else(|| value.get("@id").and_then(Value::as_str))
+    }
+
     #[test]
     fn crate_declares_profiles() {
-        // Root Dataset must conform to both the crate and process profiles.
+        // The descriptor declares 1.2; the root declares the exact run profile.
         let (record, spec) = execution_record();
         let value = parse(&record, &spec);
         assert_eq!(value["@context"][0], CRATE_CONTEXT);
         assert_eq!(value["@context"][1], WORKFLOW_RUN_CONTEXT);
+        assert_eq!(
+            value["@context"][2]["containerImage"],
+            "https://w3id.org/ro/terms/workflow-run#containerImage"
+        );
         let graph = value["@graph"].as_array().unwrap();
         let by_id = |id: &str| graph.iter().find(|e| e["@id"] == id).expect("entity");
         let descriptor = by_id("ro-crate-metadata.json");
         assert_eq!(descriptor["conformsTo"]["@id"], CRATE_PROFILE);
         let root_id = descriptor["about"]["@id"].as_str().unwrap().to_string();
         let root = by_id(&root_id);
-        let conforms: Vec<&str> = root["conformsTo"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|c| c["@id"].as_str().unwrap())
-            .collect();
-        assert!(conforms.contains(&CRATE_PROFILE));
-        assert!(conforms.contains(&PROCESS_PROFILE));
+        assert_eq!(root["conformsTo"]["@id"], PROCESS_PROFILE);
+        let profile = by_id(PROCESS_PROFILE);
+        assert_eq!(profile["@type"][0], "CreativeWork");
+        assert_eq!(profile["@type"][1], "http://www.w3.org/ns/dx/prof/Profile");
+        assert_eq!(profile["name"], "Process Run Crate");
+        assert!(!graph.iter().any(|entity| entity["@id"] == CRATE_PROFILE));
         assert_eq!(root["mentions"]["@id"], format!("#run-{}", record.job_id));
     }
 
@@ -454,49 +604,129 @@ mod tests {
         let by_id = |id: &str| graph.iter().find(|e| e["@id"] == id).expect("entity");
         let action = by_id(&format!("#run-{}", record.job_id));
         assert_eq!(action["@type"], "CreateAction");
+        assert_eq!(action["name"], "Variant calling");
+        assert_eq!(
+            action["description"],
+            "/usr/bin/python /work/script.py --label 'sample one'"
+        );
+        assert!(action.get("command").is_none());
         let instrument = action["instrument"]["@id"].as_str().unwrap();
         assert_eq!(instrument, format!("#software-{}", record.job_id));
         let software = by_id(instrument);
         assert_eq!(software["@type"], "SoftwareApplication");
-        assert_eq!(software["name"], "busybox");
-        assert_eq!(software["identifier"], "busybox:1.36");
-        assert_eq!(software["softwareVersion"], "1.36");
+        assert_eq!(software["name"], "tool");
+        assert_eq!(
+            software["identifier"],
+            format!("docker.io/aruna/tool@sha256:{}", "a".repeat(64))
+        );
+        assert_eq!(software["softwareVersion"], "2.0");
+        let container = by_id(action["containerImage"]["@id"].as_str().unwrap());
+        assert_eq!(
+            container["@type"],
+            "https://w3id.org/ro/terms/workflow-run#ContainerImage"
+        );
+        assert_eq!(container["registry"], "docker.io");
+        assert_eq!(container["name"], "aruna/tool");
+        assert_eq!(container["tag"], "2.0");
+        assert_eq!(container["sha256"], "a".repeat(64));
+        assert_eq!(container["url"], "https://hub.docker.com/r/aruna/tool");
+        assert_eq!(
+            image_url("ghcr.io", "astral-sh/uv").as_deref(),
+            Some("https://ghcr.io/astral-sh/uv")
+        );
         assert_eq!(action["object"][0]["@id"], "s3://src/in.txt");
         assert_eq!(action["result"][0]["@id"], "s3://src/out.txt");
         assert_eq!(
             action["actionStatus"]["@id"],
             "http://schema.org/CompletedActionStatus"
         );
-        assert_eq!(action["command"][0], "/bin/sh");
         assert!(action["startTime"].is_string());
         assert!(action["endTime"].is_string());
         let agent = by_id(action["agent"]["@id"].as_str().unwrap());
         assert_eq!(agent["@type"], "Person");
-        assert_eq!(by_id("s3://src/in.txt")["@type"], "File");
-        assert_eq!(by_id("s3://src/out.txt")["contentSize"], "7");
+        let input = by_id("s3://src/in.txt");
+        assert_eq!(input["name"], "Input sample");
+        let output = by_id("s3://src/out.txt");
+        assert_eq!(output["name"], "out.txt");
+        assert_eq!(output["contentSize"], "7");
+        let workspace = by_id("#workspace-bucket");
+        assert_eq!(action["additionalProperty"][0]["@id"], "#workspace-bucket");
+        assert_eq!(workspace["propertyID"], WORKSPACE_PROPERTY);
+        assert_eq!(workspace["value"], "workspace-sample-one");
+        let descriptor = by_id("ro-crate-metadata.json");
+        let root = by_id(descriptor["about"]["@id"].as_str().unwrap());
+        assert_eq!(root["name"], "Variant calling");
+        assert_eq!(root["description"], "Call variants for sample one");
     }
 
     #[test]
-    fn digest_image_id() {
-        // A digest-pinned image keeps a valid @id and carries the raw reference.
-        let (mut record, mut spec) = execution_record();
-        let image =
-            "ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        spec.image = image.to_string();
-        record.payload = JobPayload::Execution(spec.clone());
-        let value = parse(&record, &spec);
+    fn crate_survives_roundtrip() {
+        // Storage must retain exact profile and workflow-run terms.
+        let (record, spec) = execution_record();
+        let document_id = Ulid::from_bytes(record.job_id.to_bytes());
+        let root_id = format!("https://w3id.org/aruna/{document_id}");
+        let jsonld = build_run_crate_jsonld(&record, &spec, document_id);
+        let directory = tempfile::tempdir().unwrap();
+        let node = craqle::CraqleNode::open(directory.path()).unwrap();
+        let graph_id = craqle::GraphId::new(&root_id);
+        node.apply_rocrate_document_checked_with_policy(
+            &craqle::AllowAllAuthorizer,
+            graph_id.clone(),
+            &jsonld,
+            craqle::GraphPolicy::default(),
+        )
+        .unwrap();
+
+        let exported = node
+            .export_rocrate(&craqle::AllowAllAuthorizer, &graph_id)
+            .unwrap();
+        let value: Value = serde_json::from_str(&exported).unwrap();
         let graph = value["@graph"].as_array().unwrap();
-        let by_id = |id: &str| graph.iter().find(|e| e["@id"] == id).expect("entity");
-        let action = by_id(&format!("#run-{}", record.job_id));
-        let instrument = action["instrument"]["@id"].as_str().unwrap();
-        assert_eq!(instrument, format!("#software-{}", record.job_id));
-        let software = by_id(instrument);
-        assert_eq!(software["identifier"], image);
-        assert_eq!(software["name"], "ubuntu");
+        let by_id = |id: &str| {
+            graph
+                .iter()
+                .find(|entity| entity["@id"] == id)
+                .expect("entity")
+        };
+        let has_type = |entity: &Value, expected: &str| match &entity["@type"] {
+            Value::String(value) => value == expected,
+            Value::Array(values) => values.iter().any(|value| value == expected),
+            _ => false,
+        };
+        let root = by_id(&root_id);
+        assert_eq!(entity_id(&root["conformsTo"]), Some(PROCESS_PROFILE));
+        let action = graph
+            .iter()
+            .find(|entity| has_type(entity, "CreateAction"))
+            .expect("action");
         assert_eq!(
-            software["softwareVersion"],
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            action["description"],
+            "/usr/bin/python /work/script.py --label 'sample one'"
         );
+        assert_eq!(
+            entity_id(&action["additionalProperty"]),
+            Some("#workspace-bucket")
+        );
+        let container = by_id(entity_id(&action["containerImage"]).unwrap());
+        assert!(has_type(
+            container,
+            "https://w3id.org/ro/terms/workflow-run#ContainerImage"
+        ));
+        assert_eq!(container["registry"], "docker.io");
+        assert_eq!(container["sha256"], "a".repeat(64));
+        let profile = by_id(PROCESS_PROFILE);
+        assert!(has_type(profile, "http://www.w3.org/ns/dx/prof/Profile"));
+        assert!(graph.iter().any(|entity| {
+            entity["propertyID"] == WORKSPACE_PROPERTY && entity["value"] == "workspace-sample-one"
+        }));
+    }
+
+    #[test]
+    fn command_quotes_arguments() {
+        let (_, mut spec) = execution_record();
+        spec.entrypoint = Some(vec!["/bin/echo".to_string()]);
+        spec.command = vec![String::new(), "it's ready".to_string()];
+        assert_eq!(command_line(&spec), "/bin/echo '' 'it'\"'\"'s ready'");
     }
 
     #[test]
