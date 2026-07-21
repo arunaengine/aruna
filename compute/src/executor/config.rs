@@ -55,4 +55,6 @@ pub struct KubernetesConfig {
     pub pull_deadline: Duration,
     pub s3_cidrs: Vec<String>,
     pub s3_port: u16,
+    /// CSI driver name for S3 mounts; `None` disables the feature.
+    pub s3_mount_driver: Option<String>,
 }

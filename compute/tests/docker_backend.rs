@@ -86,6 +86,7 @@ impl DockerTestExt for DockerBackend {
             command: spec.command.clone(),
             workdir: spec.workdir.clone(),
             inputs,
+            s3_mounts: spec.s3_mounts.clone(),
             staging_mode: spec.staging_mode,
             output_paths: spec.output_paths.clone(),
             env: spec.env.clone(),

@@ -199,6 +199,14 @@ impl AuthProvider {
 
     #[tracing::instrument(level = "trace", skip(self))]
     async fn query_user_access(&self, access_key_id: &str) -> S3Result<UserAccess> {
+        // Legacy-format key ids can never match a stored credential; reject them
+        // before the lookup, indistinguishably from an unknown key.
+        if UserAccess::build_access_key(access_key_id).is_err() {
+            return Err(s3_error!(
+                InvalidAccessKeyId,
+                "The Access Key Id you provided does not exist in our records."
+            ));
+        }
         let operation = GetUserAccessOperation::new(access_key_id.to_string());
         match drive(operation, self.driver_ctx.as_ref())
             .await
@@ -302,5 +310,38 @@ impl AuthProvider {
 
     fn group_data_path(&self, group_id: ulid::Ulid) -> String {
         blob_group_permission_path(self.realm_id, group_id, self.node_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_storage::FjallStorage;
+
+    fn provider(path: &str) -> AuthProvider {
+        let storage = FjallStorage::open(path).unwrap();
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        AuthProvider {
+            driver_ctx,
+            realm_id: RealmId([1u8; 32]),
+            node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_legacy_key() {
+        // Legacy `{ulid}@{ulid}:workspace-{ulid}` ids must fail before any lookup.
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider(dir.path().to_str().unwrap());
+        let legacy = "01ARZ3NDEKTSV4RRFFQ69G5FAV@01ARZ3NDEKTSV4RRFFQ69G5FAW:workspace-01ARZ3";
+        let error = provider.get_secret_key(legacy).await.unwrap_err();
+        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidAccessKeyId);
     }
 }

@@ -150,8 +150,7 @@ mod test {
         let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
 
         let user_identity = Default::default();
-        let access_key_id =
-            UserAccess::build_access_key(&user_identity, &Ulid::generate().to_string()).unwrap();
+        let access_key_id = UserAccess::build_access_key(&Ulid::generate().to_string()).unwrap();
         let user_access = UserAccess {
             access_key: access_key_id.clone(),
             user_identity,

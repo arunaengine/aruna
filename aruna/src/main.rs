@@ -121,7 +121,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let compute_handle = build_compute_registry(&config)
+    let (compute_handle, s3_mounts_available) = build_compute_registry(&config)
         .await
         .map_err(std::io::Error::other)?;
 
@@ -387,7 +387,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             jobs_runtime.clone(),
         )
         .await
-        .with_metrics(metrics.clone()),
+        .with_metrics(metrics.clone())
+        .with_s3_mounts(s3_mounts_available),
     );
     portal::initialize(config.portal.clone(), state.clone()).await;
 
@@ -471,10 +472,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn build_compute_registry(
     config: &Config,
-) -> Result<Option<Arc<aruna_compute::ExecutorRegistry>>, String> {
+) -> Result<(Option<Arc<aruna_compute::ExecutorRegistry>>, bool), String> {
     let selected = dotenvy::var("ARUNA_COMPUTE_EXECUTOR").unwrap_or_else(|_| "none".to_string());
     let result = match selected.as_str() {
-        "none" => return Ok(None),
+        "none" => return Ok((None, false)),
         "docker" => build_docker(config).await,
         "apptainer" => build_apptainer(config).await,
         "kubernetes" => build_kubernetes(config).await,
@@ -482,14 +483,26 @@ async fn build_compute_registry(
             "unknown ARUNA_COMPUTE_EXECUTOR `{other}`"
         ))),
     };
-    match result {
-        Ok(registry) => Ok(Some(Arc::new(registry))),
+    let registry = match result {
+        Ok(registry) => Some(Arc::new(registry)),
         Err(ComputeBuildError::Unavailable(error)) if env_true("ARUNA_COMPUTE_OPTIONAL") => {
             warn!(executor = %selected, reason = %error, "Compute executor unavailable; running without compute");
-            Ok(None)
+            None
         }
-        Err(ComputeBuildError::Config(error) | ComputeBuildError::Unavailable(error)) => Err(error),
-    }
+        Err(ComputeBuildError::Config(error) | ComputeBuildError::Unavailable(error)) => {
+            return Err(error);
+        }
+    };
+    // S3 mounts are a local deployment property: Kubernetes with a CSI driver.
+    let s3_mounts_available =
+        registry.is_some() && selected == "kubernetes" && read_mount_driver().is_some();
+    Ok((registry, s3_mounts_available))
+}
+
+fn read_mount_driver() -> Option<String> {
+    dotenvy::var("ARUNA_COMPUTE_K8S_S3_MOUNT_DRIVER")
+        .ok()
+        .filter(|driver| !driver.is_empty())
 }
 
 enum ComputeBuildError {
@@ -620,6 +633,7 @@ async fn build_kubernetes(
         .map(|value| value.parse::<u16>())
         .unwrap_or(Ok(443))
         .map_err(|_| "ARUNA_COMPUTE_K8S_S3_PORT must be a valid port".to_string())?;
+    let s3_mount_driver = read_mount_driver();
     let backend = aruna_compute::executor::kubernetes::KubernetesBackend::with_config(
         aruna_compute::KubernetesConfig {
             namespace: dotenvy::var("ARUNA_COMPUTE_K8S_NAMESPACE")
@@ -629,6 +643,7 @@ async fn build_kubernetes(
             pull_deadline: env_duration("ARUNA_COMPUTE_K8S_PULL_DEADLINE", 300)?,
             s3_cidrs,
             s3_port,
+            s3_mount_driver,
         },
     )
     .await

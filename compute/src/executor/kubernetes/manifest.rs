@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use aruna_core::compute::{
     BackendError, FenceContext, NetworkAccess, StagingMode, TaskSpec, normalize_container_path,
 };
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod, Secret};
+use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolume, PersistentVolumeClaim, Pod, Secret};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -52,19 +52,21 @@ pub fn job_manifest(
     let mut mounts = Vec::new();
     let mut init = Vec::new();
     let mut env_from = Vec::new();
-    if spec.staging_mode == StagingMode::Files {
+    if needs_workspace(spec) {
         volumes.extend([
             json!({"name":"workspace","persistentVolumeClaim":{"claimName":workspace_name(&name)}}),
             json!({"name":"marker","configMap":{"name":marker_name(&name)}}),
             json!({"name":"tools","emptyDir":{}}),
         ]);
-        for input in &layout.files {
-            mounts.push(json!({
-                "name":"workspace",
-                "mountPath":input.path,
-                "subPath":relative_path(&input.path)?,
-                "readOnly":true
-            }));
+        if spec.staging_mode == StagingMode::Files {
+            for input in &layout.files {
+                mounts.push(json!({
+                    "name":"workspace",
+                    "mountPath":input.path,
+                    "subPath":relative_path(&input.path)?,
+                    "readOnly":true
+                }));
+            }
         }
         for output in &layout.output_parents {
             mounts.push(json!({
@@ -92,7 +94,39 @@ pub fn job_manifest(
                 {"name":"tools","mountPath":"/tools"}
             ]
         }));
-    } else {
+    }
+    if spec.staging_mode == StagingMode::S3Mount {
+        let buckets = mount_buckets(layout);
+        for (index, bucket) in buckets.iter().enumerate() {
+            volumes.push(json!({
+                "name":mount_name(&name,index),
+                "persistentVolumeClaim":{"claimName":mount_name(&name,index)}
+            }));
+            for input in layout.mounts.iter().filter(|input| &input.bucket == bucket) {
+                mounts.push(json!({
+                    "name":mount_name(&name,index),
+                    "mountPath":input.path,
+                    "subPath":input.key,
+                    "readOnly":true
+                }));
+            }
+        }
+        // Mounted jobs have no workspace PVC, so give the task a writable
+        // working directory that read-only inputs nest beneath.
+        if let Some(workdir) = spec.workdir.as_deref() {
+            let scratch = normalize_container_path(workdir).map_err(BackendError::InvalidSpec)?;
+            let taken = layout.mounts.iter().any(|input| input.path == scratch)
+                || layout.output_parents.contains(&scratch);
+            if !taken {
+                let empty_dir = match spec.resources.disk_bytes {
+                    Some(bytes) => json!({"sizeLimit":bytes.to_string()}),
+                    None => json!({}),
+                };
+                volumes.push(json!({"name":"scratch","emptyDir":empty_dir}));
+                mounts.push(json!({"name":"scratch","mountPath":scratch}));
+            }
+        }
+    } else if spec.staging_mode == StagingMode::DirectS3 {
         env_from.push(json!({"secretRef":{"name":secret_name(&name)}}));
     }
     let mut env = spec
@@ -108,7 +142,7 @@ pub fn job_manifest(
             json!({"name":"ARUNA_WORKSPACE_BUCKET","value":workspace.bucket_name}),
         ]);
     }
-    let startup_probe = (spec.staging_mode == StagingMode::Files).then(|| {
+    let startup_probe = needs_workspace(spec).then(|| {
         json!({
             "exec":{"command":["/aruna-tools/probe","probe","--marker",MARKER_PATH,"--sentinel",TASK_SENTINEL]},
             "failureThreshold":3,
@@ -191,6 +225,76 @@ pub fn pvc_manifest(
             "accessModes":["ReadWriteOncePod"],
             "storageClassName":config.storage_class,
             "resources":{"requests":{"storage":bytes.to_string()}}
+        }
+    }))
+    .map_err(manifest_error)
+}
+
+pub fn mount_pv_manifest(
+    context: &FenceContext,
+    config: &KubernetesConfig,
+    index: usize,
+    bucket: &str,
+) -> Result<PersistentVolume, BackendError> {
+    let name = mount_name(&context.attempt.external_name(), index);
+    let driver = config.s3_mount_driver.as_deref().ok_or_else(|| {
+        BackendError::InvalidSpec("S3 mounts are disabled on this backend".to_string())
+    })?;
+    serde_json::from_value(json!({
+        "apiVersion":"v1",
+        "kind":"PersistentVolume",
+        "metadata":{
+            "name":name,
+            "labels":labels(context,"s3-mount"),
+            "annotations":annotations_base(context,"active")
+        },
+        "spec":{
+            "capacity":{"storage":"1Gi"},
+            "accessModes":["ReadWriteMany"],
+            "persistentVolumeReclaimPolicy":"Retain",
+            "storageClassName":"",
+            "claimRef":{"namespace":config.namespace,"name":name},
+            "mountOptions":[
+                "uid=65534","gid=65534","allow-other","file-mode=0444","dir-mode=0555"
+            ],
+            "csi":{
+                "driver":driver,
+                "volumeHandle":name,
+                "readOnly":true,
+                "volumeAttributes":{
+                    "bucketName":bucket,
+                    "authenticationSource":"secret"
+                },
+                "nodePublishSecretRef":{
+                    "name":secret_name(&context.attempt.external_name()),
+                    "namespace":config.namespace
+                }
+            }
+        }
+    }))
+    .map_err(manifest_error)
+}
+
+pub fn mount_pvc_manifest(
+    context: &FenceContext,
+    config: &KubernetesConfig,
+    index: usize,
+) -> Result<PersistentVolumeClaim, BackendError> {
+    let name = mount_name(&context.attempt.external_name(), index);
+    serde_json::from_value(json!({
+        "apiVersion":"v1",
+        "kind":"PersistentVolumeClaim",
+        "metadata":{
+            "name":name,
+            "namespace":config.namespace,
+            "labels":labels(context,"s3-mount"),
+            "annotations":annotations_base(context,"active")
+        },
+        "spec":{
+            "accessModes":["ReadWriteMany"],
+            "storageClassName":"",
+            "volumeName":name,
+            "resources":{"requests":{"storage":"1Gi"}}
         }
     }))
     .map_err(manifest_error)
@@ -331,6 +435,25 @@ pub fn workspace_name(name: &str) -> String {
     format!("{name}-ws")
 }
 
+pub fn mount_name(name: &str, index: usize) -> String {
+    format!("{name}-s3-{index}")
+}
+
+pub fn mount_buckets(layout: &StageLayout) -> Vec<String> {
+    layout
+        .mounts
+        .iter()
+        .map(|mount| mount.bucket.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+pub fn needs_workspace(spec: &TaskSpec) -> bool {
+    spec.staging_mode == StagingMode::Files
+        || (spec.staging_mode == StagingMode::S3Mount && !spec.output_paths.is_empty())
+}
+
 pub fn secret_name(name: &str) -> String {
     format!("{name}-env")
 }
@@ -375,8 +498,13 @@ fn annotations(
         match spec.staging_mode {
             StagingMode::Files => "files",
             StagingMode::DirectS3 => "direct-s3",
+            StagingMode::S3Mount => "s3-mount",
         }
         .to_string(),
+    );
+    annotations.insert(
+        "aruna-engine.org/workspace".to_string(),
+        needs_workspace(spec).to_string(),
     );
     annotations.insert(
         "aruna-engine.org/output-paths".to_string(),
@@ -455,7 +583,7 @@ fn manifest_error(error: serde_json::Error) -> BackendError {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::compute::{AttemptRef, TaskInput};
+    use aruna_core::compute::{AttemptRef, S3Mount, Secret, TaskInput};
 
     use super::*;
 
@@ -477,6 +605,7 @@ mod tests {
             pull_deadline: std::time::Duration::from_secs(30),
             s3_cidrs: Vec::new(),
             s3_port: 443,
+            s3_mount_driver: Some("s3.csi.scality.com".to_string()),
         }
     }
 
@@ -502,6 +631,102 @@ mod tests {
         let pod = job.spec.unwrap().template.spec.unwrap();
         assert_eq!(pod.init_containers.unwrap().len(), 1);
         assert!(pod.containers[0].startup_probe.is_some());
+    }
+
+    #[test]
+    fn runs_without_workspace() {
+        let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
+        spec.staging_mode = StagingMode::S3Mount;
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = job_manifest(&context(), &spec, &config(), &layout).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+
+        assert!(pod.volumes.unwrap_or_default().is_empty());
+        assert!(pod.init_containers.unwrap_or_default().is_empty());
+        assert!(pod.containers[0].startup_probe.is_none());
+    }
+
+    #[test]
+    fn mounts_s3_inputs() {
+        let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
+        spec.staging_mode = StagingMode::S3Mount;
+        spec.s3_mounts.push(S3Mount {
+            bucket: "input-bucket".to_string(),
+            key: "data/input.txt".to_string(),
+            path: "/input.txt".to_string(),
+        });
+        spec.secret_env
+            .insert("access_key_id".to_string(), Secret::new("temporary-access"));
+        spec.secret_env.insert(
+            "secret_access_key".to_string(),
+            Secret::new("temporary-secret"),
+        );
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = job_manifest(&context(), &spec, &config(), &layout).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        let mount = pod.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|mount| mount.mount_path == "/input.txt")
+            .unwrap();
+        assert_eq!(mount.sub_path.as_deref(), Some("data/input.txt"));
+        assert_eq!(mount.read_only, Some(true));
+
+        let pv = serde_json::to_value(
+            mount_pv_manifest(&context(), &config(), 0, "input-bucket").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pv["spec"]["csi"]["driver"], "s3.csi.scality.com");
+        assert_eq!(
+            pv["spec"]["csi"]["volumeAttributes"]["bucketName"],
+            "input-bucket"
+        );
+        assert_eq!(
+            pv["spec"]["csi"]["nodePublishSecretRef"]["name"],
+            "aruna-job-a1-env"
+        );
+        assert_eq!(pv["spec"]["csi"]["readOnly"], true);
+    }
+
+    #[test]
+    fn uses_configured_driver() {
+        let mut config = config();
+        config.s3_mount_driver = Some("s3.csi.example.org".to_string());
+        let pv = serde_json::to_value(
+            mount_pv_manifest(&context(), &config, 0, "input-bucket").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pv["spec"]["csi"]["driver"], "s3.csi.example.org");
+    }
+
+    #[test]
+    fn mounts_scratch_dir() {
+        // Mounted jobs get a writable working directory instead of a workspace.
+        let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
+        spec.staging_mode = StagingMode::S3Mount;
+        spec.workdir = Some("/work".to_string());
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = job_manifest(&context(), &spec, &config(), &layout).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+
+        let mount = pod.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|mount| mount.mount_path == "/work")
+            .unwrap();
+        assert_eq!(mount.name, "scratch");
+        assert_ne!(mount.read_only, Some(true));
+        let volume = pod
+            .volumes
+            .unwrap()
+            .into_iter()
+            .find(|volume| volume.name == "scratch")
+            .unwrap();
+        assert!(volume.empty_dir.is_some());
     }
 
     #[test]

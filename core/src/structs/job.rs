@@ -121,11 +121,11 @@ impl JobState {
     }
 }
 
-/// How an input is captured into the workspace. v1 supports snapshot only:
-/// resolved bytes are copied into the workspace at submit time.
+/// How an input is exposed to the task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputMode {
     Snapshot,
+    Mount,
 }
 
 /// Where an input comes from. v1 supports internal S3 objects only.
@@ -466,7 +466,7 @@ pub enum JobResultPayload {
     Execution {
         /// Container exit code; `None` when the outcome is evidence-free.
         exit_code: Option<i32>,
-        workspace_bucket: String,
+        workspace_bucket: Option<String>,
         outputs: Vec<OutputObject>,
         stdout: String,
         stderr: String,
@@ -647,11 +647,13 @@ pub enum WorkspaceMode {
     #[default]
     Kept,
     Existing,
+    None,
 }
 
 impl WorkspaceMode {
     pub fn name(self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::Temporary => "temporary",
             Self::Kept => "kept",
             Self::Existing => "existing",
@@ -883,7 +885,7 @@ pub fn cleanup_job_id(job_id: JobId) -> JobId {
 }
 
 pub fn workspace_credential_id(job_id: JobId) -> String {
-    format!("workspace-{job_id}")
+    format!("ws{job_id}")
 }
 
 /// Dedup key of a user-supplied idempotency key: namespaced under `user/` and
@@ -1222,7 +1224,7 @@ mod tests {
         assert_eq!(user_dedup_key(user_a, "k"), user_dedup_key(user_a, "k"));
         assert_eq!(cleanup_job_id(job), cleanup_job_id(job));
         assert_ne!(cleanup_job_id(job), crate_job_id(job));
-        assert_eq!(workspace_credential_id(job), format!("workspace-{job}"));
+        assert_eq!(workspace_credential_id(job), format!("ws{job}"));
     }
 
     #[test]
