@@ -2839,7 +2839,7 @@ mod tests {
         let key = DhtKeyId::from_data(b"unchanged-replay");
         let entry = make_entry(1, key, now_unix_secs().saturating_add(200));
         let encoded = encode_entries(std::slice::from_ref(&entry)).expect("encode entry");
-        let txn_id = TxnId::r#gen();
+        let txn_id = TxnId::generate();
         let worker = std::thread::spawn(move || {
             let (effect, response, ..) = receiver.recv().expect("transaction start");
             assert!(matches!(
