@@ -170,6 +170,7 @@ struct RevisionRequest {
 pub struct DhtDriver {
     state: DhtStateMachine,
     clock: DhtClock,
+    clock_diverged: bool,
     endpoint: Endpoint,
     connection_pool: ConnectionPool,
     storage: StorageHandle,
@@ -314,6 +315,7 @@ impl DhtDriver {
         Self {
             state,
             clock,
+            clock_diverged: false,
             endpoint,
             connection_pool,
             storage,
@@ -357,14 +359,24 @@ impl DhtDriver {
                 break DhtIoError::Shutdown;
             }
             let now_secs = match self.clock.now_secs() {
-                Ok(now_secs) => now_secs,
+                Ok(now_secs) => {
+                    self.clock_diverged = false;
+                    now_secs
+                }
                 Err(error) => {
-                    warn!(error = %error, "Stopping DHT driver because the system clock is unhealthy");
-                    let terminal_error = clock_error(error);
-                    if let DriverEvent::Command(cmd) = event {
-                        reject_driver_cmd(cmd, terminal_error.clone());
+                    if !self.clock_diverged {
+                        warn!(error = %error, "DHT clock diverged; failing new operations until it re-anchors");
+                        self.clock_diverged = true;
                     }
-                    break terminal_error;
+                    if let DriverEvent::Command(cmd) = event {
+                        // A mutation must not be stamped under an unstable clock; fail
+                        // the command loudly, but keep the driver alive so it recovers
+                        // once the clock re-anchors on a later sample.
+                        reject_driver_cmd(cmd, clock_error(error));
+                        continue;
+                    }
+                    // In-flight work still resolves on the last ratcheted time.
+                    self.clock.current_secs()
                 }
             };
             match event {

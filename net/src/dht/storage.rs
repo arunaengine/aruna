@@ -6,6 +6,7 @@ use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::structs::RealmId;
 use aruna_core::util::unix_timestamp_secs;
 use aruna_core::{IdEnvironment, SystemEnvironment};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -30,10 +31,18 @@ struct ClockAnchor {
     monotonic_ms: u64,
 }
 
+struct AnchorState {
+    anchor: ClockAnchor,
+    // Candidate anchor captured from the previous diverged sample. A re-anchor only
+    // commits once a second sample agrees with it, so a lone spurious wall reading
+    // fails one op but is discarded rather than adopted as the new anchor.
+    pending: Option<ClockAnchor>,
+}
+
 #[derive(Clone)]
 pub(crate) struct DhtClock<E = SystemEnvironment> {
     env: E,
-    anchor: ClockAnchor,
+    anchor: Arc<Mutex<AnchorState>>,
     last_ms: Arc<AtomicU64>,
 }
 
@@ -48,20 +57,23 @@ impl DhtClock<SystemEnvironment> {
             wall_ms: now_secs.saturating_mul(1_000),
             monotonic_ms: env.monotonic_ms(),
         };
-        Self {
-            env,
-            anchor,
-            last_ms: Arc::new(AtomicU64::new(anchor.wall_ms)),
-        }
+        Self::from_anchor(env, anchor)
     }
 }
 
 impl<E: IdEnvironment> DhtClock<E> {
     fn with_env(env: E) -> Self {
         let anchor = Self::sample_time(&env);
+        Self::from_anchor(env, anchor)
+    }
+
+    fn from_anchor(env: E, anchor: ClockAnchor) -> Self {
         Self {
             env,
-            anchor,
+            anchor: Arc::new(Mutex::new(AnchorState {
+                anchor,
+                pending: None,
+            })),
             last_ms: Arc::new(AtomicU64::new(anchor.wall_ms)),
         }
     }
@@ -89,17 +101,42 @@ impl<E: IdEnvironment> DhtClock<E> {
 
     pub(crate) fn now_secs(&self) -> Result<u64, DhtClockError> {
         let sample = Self::sample_time(&self.env);
-        let Some(elapsed_ms) = sample.monotonic_ms.checked_sub(self.anchor.monotonic_ms) else {
-            return Err(DhtClockError::Diverged { drift_ms: u64::MAX });
-        };
-        let expected_ms = self.anchor.wall_ms.saturating_add(elapsed_ms);
-        let drift_ms = sample.wall_ms.abs_diff(expected_ms);
-        if drift_ms > MAX_CLOCK_SKEW_SECS.saturating_mul(1_000) {
-            return Err(DhtClockError::Diverged { drift_ms });
+        let threshold_ms = MAX_CLOCK_SKEW_SECS.saturating_mul(1_000);
+        {
+            let mut state = self.anchor.lock();
+            let anchor_drift = clock_drift_ms(&state.anchor, &sample);
+            if anchor_drift.is_some_and(|drift| drift <= threshold_ms) {
+                state.pending = None;
+            } else if state
+                .pending
+                .and_then(|pending| clock_drift_ms(&pending, &sample))
+                .is_some_and(|drift| drift <= threshold_ms)
+            {
+                // Two consecutive samples agree on the new offset: the wall clock has
+                // settled, so re-anchor and resume service.
+                state.anchor = sample;
+                state.pending = None;
+            } else {
+                state.pending = Some(sample);
+                return Err(DhtClockError::Diverged {
+                    drift_ms: anchor_drift.unwrap_or(u64::MAX),
+                });
+            }
         }
-        let previous = self.last_ms.fetch_max(sample.wall_ms, Ordering::AcqRel);
-        Ok(previous.max(sample.wall_ms) / 1_000)
+        // The emitted seconds ratchet across re-anchoring: a backward wall step never
+        // rolls the returned value back.
+        let ratcheted = self
+            .last_ms
+            .fetch_max(sample.wall_ms, Ordering::AcqRel)
+            .max(sample.wall_ms);
+        Ok(ratcheted / 1_000)
     }
+}
+
+fn clock_drift_ms(anchor: &ClockAnchor, sample: &ClockAnchor) -> Option<u64> {
+    let elapsed_ms = sample.monotonic_ms.checked_sub(anchor.monotonic_ms)?;
+    let expected_ms = anchor.wall_ms.saturating_add(elapsed_ms);
+    Some(sample.wall_ms.abs_diff(expected_ms))
 }
 
 pub fn now_unix_secs() -> u64 {
@@ -461,6 +498,46 @@ mod tests {
                 drift_ms: max_skew_ms + 1
             })
         );
+    }
+
+    #[test]
+    fn clock_recovers_divergence() {
+        // A divergence fails one sampling op, then a second agreeing sample re-anchors
+        // so service resumes; a later backward wall step never rolls the value back.
+        let max_skew_ms = MAX_CLOCK_SKEW_SECS * 1_000;
+        let env = FakeEnv::new(100_000, 10_000);
+        let clock = DhtClock::with_env(env);
+
+        clock.env.set_time(101_000 + max_skew_ms + 1, 11_000);
+        assert!(matches!(
+            clock.now_secs(),
+            Err(DhtClockError::Diverged { .. })
+        ));
+        assert_eq!(clock.current_secs(), 100);
+
+        clock.env.set_time(102_000 + max_skew_ms + 1, 12_000);
+        assert_eq!(clock.now_secs(), Ok(402));
+
+        clock.env.set_time(403_001, 13_000);
+        assert_eq!(clock.now_secs(), Ok(403));
+
+        clock.env.set_time(402_501, 13_500);
+        assert_eq!(clock.now_secs(), Ok(403));
+    }
+
+    #[test]
+    fn clock_debounces_glitch() {
+        // A single diverging sample fails one op but must not re-anchor; the next
+        // healthy sample resumes on the original anchor.
+        let max_skew_ms = MAX_CLOCK_SKEW_SECS * 1_000;
+        let env = FakeEnv::new(100_000, 10_000);
+        let clock = DhtClock::with_env(env);
+
+        clock.env.set_time(101_000 + max_skew_ms + 1, 11_000);
+        assert!(clock.now_secs().is_err());
+
+        clock.env.set_time(102_000, 12_000);
+        assert_eq!(clock.now_secs(), Ok(102));
     }
 
     #[test]
