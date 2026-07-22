@@ -1413,22 +1413,28 @@ impl DhtStateMachine {
             OpState::Put(_) | OpState::Bootstrap(_) => {
                 out.push(DhtEffect::Output(DhtOutput::Failed { op_id, error }));
             }
-            OpState::Get(mut op) => {
-                if stage != StorageStage::GetLocalRead {
-                    out.push(DhtEffect::Output(DhtOutput::Failed { op_id, error }));
-                    return;
+            OpState::Get(mut op) => match stage {
+                StorageStage::GetLocalRead => {
+                    op.frontier.add_candidates(
+                        self.routing_table
+                            .closest(op.key.as_bytes(), LOOKUP_MAX_QUERIES)
+                            .into_iter()
+                            .map(|peer| peer.node_id),
+                        self.local_id,
+                        op.key.as_bytes(),
+                    );
+                    self.dispatch_get_requests(op_id, &mut op, out);
+                    self.maybe_complete_get(op_id, op, out);
                 }
-                op.frontier.add_candidates(
-                    self.routing_table
-                        .closest(op.key.as_bytes(), LOOKUP_MAX_QUERIES)
-                        .into_iter()
-                        .map(|peer| peer.node_id),
-                    self.local_id,
-                    op.key.as_bytes(),
-                );
-                self.dispatch_get_requests(op_id, &mut op, out);
-                self.maybe_complete_get(op_id, op, out);
-            }
+                StorageStage::GetRemoteMerge => {
+                    // Read-repair write-back is best-effort: the looked-up values are
+                    // already signature-validated, so a losing write-back (stale
+                    // revision, full store, retry exhaustion) still completes the get.
+                    tracing::debug!(op_id, %error, "DHT read-repair write-back failed; completing get");
+                    self.maybe_complete_get(op_id, op, out);
+                }
+                _ => out.push(DhtEffect::Output(DhtOutput::Failed { op_id, error })),
+            },
             OpState::InboundGet(op) => {
                 out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
                     inbound_id: op.inbound_id,
@@ -2882,7 +2888,9 @@ mod tests {
     }
 
     #[test]
-    fn cache_failure_fails() {
+    fn writeback_error_completes() {
+        // A failed read-repair write-back (here a full store) still returns the
+        // signature-validated values the lookup already collected.
         let local_secret = make_secret(93);
         let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
         let key = DhtKeyId::from_data(b"remote-cache-failure");
@@ -2898,6 +2906,16 @@ mod tests {
                 closer_nodes: Vec::new(),
             },
         }));
+        assert!(pending.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(inner)
+                    if matches!(&**inner, DhtIoRequest::StorageMerge {
+                        stage: StorageStage::GetRemoteMerge,
+                        ..
+                    })
+            )
+        }));
         assert!(
             pending
                 .iter()
@@ -2907,11 +2925,56 @@ mod tests {
         let effects = state.step(DhtInput::Io(DhtIo::StorageError {
             op_id: 83,
             stage: StorageStage::GetRemoteMerge,
-            error: DhtIoError::storage("cache write failed"),
+            error: DhtIoError::StorageFull,
         }));
         assert!(matches!(
             effects.as_slice(),
-            [DhtEffect::Output(DhtOutput::Failed { op_id: 83, .. })]
+            [DhtEffect::Output(DhtOutput::Completed {
+                op_id: 83,
+                result: DhtOutputValue::GetValues { values, stats },
+            })] if values.len() == 1
+                && values[0].value == b"remote".to_vec()
+                && stats.completed_reason == DhtGetCompletedReason::RemoteValue
+                && stats.remote_value_count == 1
+        ));
+    }
+
+    #[test]
+    fn writeback_stale_completes() {
+        // A concurrent inbound put can advance the stored revision past the fetched
+        // one, so the write-back merge fails as stale; the get must still complete.
+        let local_secret = make_secret(96);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let key = DhtKeyId::from_data(b"remote-cache-stale");
+        let peer = make_node(97);
+        start_get(&mut state, 86, key, peer);
+
+        let pending = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 86,
+            phase: RpcPhase::GetLookup,
+            peer,
+            response: DhtResponse::Value {
+                entries: vec![make_value(98, key, make_realm(1), b"remote", 2_000)],
+                closer_nodes: Vec::new(),
+            },
+        }));
+        assert!(
+            pending
+                .iter()
+                .all(|effect| !matches!(effect, DhtEffect::Output(_)))
+        );
+
+        let effects = state.step(DhtInput::Io(DhtIo::StorageError {
+            op_id: 86,
+            stage: StorageStage::GetRemoteMerge,
+            error: DhtIoError::invalid_request("record version is stale or conflicting"),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [DhtEffect::Output(DhtOutput::Completed {
+                op_id: 86,
+                result: DhtOutputValue::GetValues { values, .. },
+            })] if values.len() == 1 && values[0].value == b"remote".to_vec()
         ));
     }
 

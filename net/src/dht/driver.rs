@@ -1858,7 +1858,12 @@ async fn run_storage_txn(
     };
     let entries = match mutation {
         StorageMutation::Merge { entries, .. } => {
-            match merge_storage_entries(&key, original_entries.clone(), entries, now_secs) {
+            let merged = if stage == StorageStage::GetRemoteMerge {
+                merge_fresh_entries(&key, original_entries.clone(), entries, now_secs)
+            } else {
+                merge_storage_entries(&key, original_entries.clone(), entries, now_secs)
+            };
+            match merged {
                 Ok(entries) => entries,
                 Err(MergeError::Stale) => {
                     abort_storage_txn(storage, op_id, stage, txn_id).await;
@@ -2068,6 +2073,25 @@ fn merge_storage_entries(
     entries.iter().try_fold(original, |current, entry| {
         merge_entry(key, current, entry.clone(), now_secs)
     })
+}
+
+fn merge_fresh_entries(
+    key: &DhtKeyId,
+    original: Vec<StoredEntry>,
+    entries: &[StoredEntry],
+    now_secs: u64,
+) -> Result<Vec<StoredEntry>, MergeError> {
+    let mut current = original;
+    for entry in entries {
+        match merge_entry(key, current.clone(), entry.clone(), now_secs) {
+            Ok(merged) => current = merged,
+            // Read-repair drops an entry that lost a concurrent revision race rather
+            // than failing the whole write-back; the winning entries still persist.
+            Err(MergeError::Stale) => {}
+            Err(other) => return Err(other),
+        }
+    }
+    Ok(current)
 }
 
 async fn read_key_count(
@@ -2786,6 +2810,10 @@ mod tests {
     }
 
     fn make_entry(seed: u8, key: DhtKeyId, expires_at: u64) -> StoredEntry {
+        make_entry_rev(seed, key, expires_at, 1)
+    }
+
+    fn make_entry_rev(seed: u8, key: DhtKeyId, expires_at: u64, revision: u64) -> StoredEntry {
         let mut secret = [0u8; 32];
         secret[0] = seed;
         let secret = iroh::SecretKey::from_bytes(&secret);
@@ -2794,7 +2822,6 @@ mod tests {
         realm[0] = seed;
         let realm_id = RealmId::from_bytes(realm);
         let value = vec![seed];
-        let revision = 1;
         let signed = super::super::rpc::signed_record_bytes(
             &key, &publisher, &realm_id, &value, expires_at, revision,
         );
@@ -3739,6 +3766,45 @@ mod tests {
 
         let entries = read_entries(&storage, key).await;
         assert_eq!(entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn writeback_drops_stale() {
+        // A read-repair batch commits the entries that still win and silently drops
+        // the one that lost a concurrent revision race, rather than failing wholesale.
+        let (_directory, storage) = open_storage();
+        let key = DhtKeyId::from_data(b"read-repair-mixed-batch");
+        let expires_at = now_unix_secs().saturating_add(200);
+
+        let winner = StorageMutation::Merge {
+            entries: vec![make_entry_rev(1, key, expires_at, 2)],
+        };
+        mutate_storage_entries(&storage, 20, StorageStage::InboundPutMerge, key, &winner)
+            .await
+            .expect("seed winning revision");
+
+        let clock = DhtClock::new();
+        let batch = StorageMutation::Merge {
+            entries: vec![
+                make_entry_rev(1, key, expires_at, 1),
+                make_entry(2, key, expires_at),
+            ],
+        };
+        mutate_storage_checked(
+            &storage,
+            21,
+            StorageStage::GetRemoteMerge,
+            key,
+            &batch,
+            &clock,
+        )
+        .await
+        .expect("read-repair commits fresh subset");
+
+        let entries = read_entries(&storage, key).await;
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|entry| entry.value == vec![2]));
+        assert!(entries.iter().any(|entry| entry.revision == 2));
     }
 
     #[tokio::test]
