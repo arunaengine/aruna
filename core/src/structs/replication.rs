@@ -1,8 +1,42 @@
 use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::structs::RealmId;
+use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
+use ulid::Ulid;
+
+pub const ARUNA_DATA_PREFIX: &str = "https://w3id.org/aruna/data/";
+
+const ARN_KEY_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'!')
+    .add(b'"')
+    .add(b'#')
+    .add(b'$')
+    .add(b'%')
+    .add(b'&')
+    .add(b'\'')
+    .add(b'(')
+    .add(b')')
+    .add(b'*')
+    .add(b'+')
+    .add(b',')
+    .add(b':')
+    .add(b';')
+    .add(b'<')
+    .add(b'=')
+    .add(b'>')
+    .add(b'?')
+    .add(b'@')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ArunaArn {
@@ -123,6 +157,151 @@ impl fmt::Display for ArunaArn {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VersionedObjectArn {
+    pub realm_id: RealmId,
+    pub node_id: NodeId,
+    pub bucket: String,
+    pub key: String,
+    pub version: Ulid,
+}
+
+impl VersionedObjectArn {
+    pub fn new(
+        realm_id: RealmId,
+        node_id: NodeId,
+        bucket: impl Into<String>,
+        key: impl Into<String>,
+        version: Ulid,
+    ) -> Result<Self, ConversionError> {
+        let bucket = bucket.into();
+        let key = key.into();
+        if bucket.is_empty() || bucket.contains(['/', '@']) {
+            return Err(ConversionError::FromStrError(
+                "versioned ARN bucket is invalid".to_string(),
+            ));
+        }
+        if key.is_empty() {
+            return Err(ConversionError::FromStrError(
+                "versioned ARN key must not be empty".to_string(),
+            ));
+        }
+        Ok(Self {
+            realm_id,
+            node_id,
+            bucket,
+            key,
+            version,
+        })
+    }
+
+    pub fn parse(input: &str) -> Result<Self, ConversionError> {
+        let arn = ArunaArn::parse(input)?;
+        if arn.resource_type != ArunaArnType::S3 {
+            return Err(ConversionError::FromStrError(
+                "versioned object ARN must use the s3 resource type".to_string(),
+            ));
+        }
+        let (bucket, object) = arn.path.split_once('/').ok_or_else(|| {
+            ConversionError::FromStrError("versioned object ARN is missing a key".to_string())
+        })?;
+        let (encoded_key, version) = object.rsplit_once('@').ok_or_else(|| {
+            ConversionError::FromStrError("versioned object ARN is missing a version".to_string())
+        })?;
+        let key = percent_decode_str(encoded_key)
+            .decode_utf8()
+            .map_err(|_| {
+                ConversionError::FromStrError(
+                    "versioned object ARN key is not valid UTF-8".to_string(),
+                )
+            })?
+            .into_owned();
+        if encode_object_key(&key) != encoded_key {
+            return Err(ConversionError::FromStrError(
+                "versioned object ARN key is not canonically encoded".to_string(),
+            ));
+        }
+        if version.len() != 26
+            || !version
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'A'..=b'H' | b'J'..=b'K' | b'M'..=b'N' | b'P'..=b'T' | b'V'..=b'Z'))
+        {
+            return Err(ConversionError::FromStrError(
+                "versioned object ARN has an invalid ULID".to_string(),
+            ));
+        }
+        let version = Ulid::from_string(version)?;
+        Self::new(arn.realm_id, arn.node_id, bucket, key, version)
+    }
+
+    pub fn to_w3id(&self) -> String {
+        format!("{ARUNA_DATA_PREFIX}{self}")
+    }
+}
+
+impl FromStr for VersionedObjectArn {
+    type Err = ConversionError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl fmt::Display for VersionedObjectArn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "arn:aruna:{}:{}:s3/{}/{}@{}",
+            self.realm_id,
+            self.node_id,
+            self.bucket,
+            encode_object_key(&self.key),
+            self.version
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum W3idDataIdentifier {
+    ContentHash([u8; 32]),
+    VersionedObject(VersionedObjectArn),
+}
+
+impl W3idDataIdentifier {
+    pub fn parse(input: &str) -> Result<Self, ConversionError> {
+        let suffix = input.strip_prefix(ARUNA_DATA_PREFIX).ok_or_else(|| {
+            ConversionError::FromStrError("identifier is not an Aruna data W3ID".to_string())
+        })?;
+        if suffix.len() == 64
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            let mut hash = [0; 32];
+            hex::decode_to_slice(suffix, &mut hash)
+                .map_err(|error| ConversionError::FromStrError(error.to_string()))?;
+            return Ok(Self::ContentHash(hash));
+        }
+        if suffix.starts_with("arn:") {
+            return Ok(Self::VersionedObject(VersionedObjectArn::parse(suffix)?));
+        }
+        Err(ConversionError::FromStrError(
+            "Aruna data W3ID has an unsupported suffix".to_string(),
+        ))
+    }
+
+    pub fn to_w3id(&self) -> String {
+        match self {
+            Self::ContentHash(hash) => format!("{ARUNA_DATA_PREFIX}{}", hex::encode(hash)),
+            Self::VersionedObject(arn) => arn.to_w3id(),
+        }
+    }
+}
+
+fn encode_object_key(key: &str) -> String {
+    utf8_percent_encode(key, ARN_KEY_ENCODE_SET).to_string()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ArunaArnType {
     S3,
     ContentHash,
@@ -200,10 +379,14 @@ pub enum ReplicationSuboperationResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArunaArn, ArunaArnType};
+    use super::{
+        ARUNA_DATA_PREFIX, ArunaArn, ArunaArnType, VersionedObjectArn, W3idDataIdentifier,
+    };
     use crate::errors::ConversionError;
     use crate::{NodeId, structs::RealmId};
+    use proptest::prelude::*;
     use std::str::FromStr;
+    use ulid::Ulid;
 
     fn test_node_id() -> NodeId {
         NodeId::from_str("ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6")
@@ -269,5 +452,90 @@ mod tests {
             err,
             ConversionError::FromStrError("ARN must start with `arn:aruna:`".to_string())
         );
+    }
+
+    #[test]
+    fn formats_versioned_arn() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let node_id = test_node_id();
+        let version = Ulid::from_bytes([2u8; 16]);
+        let arn =
+            VersionedObjectArn::new(realm_id, node_id, "bucket", "dir/a @ %.txt", version).unwrap();
+
+        assert_eq!(
+            arn.to_string(),
+            format!("arn:aruna:{realm_id}:{node_id}:s3/bucket/dir/a%20%40%20%25.txt@{version}")
+        );
+        assert_eq!(VersionedObjectArn::parse(&arn.to_string()).unwrap(), arn);
+    }
+
+    #[test]
+    fn classifies_w3id() {
+        let hash = [3u8; 32];
+        let hash_url = format!("{ARUNA_DATA_PREFIX}{}", hex::encode(hash));
+        assert_eq!(
+            W3idDataIdentifier::parse(&hash_url).unwrap(),
+            W3idDataIdentifier::ContentHash(hash)
+        );
+
+        let arn = VersionedObjectArn::new(
+            RealmId::from_bytes([1u8; 32]),
+            test_node_id(),
+            "bucket",
+            "key",
+            Ulid::from_bytes([2u8; 16]),
+        )
+        .unwrap();
+        assert_eq!(
+            W3idDataIdentifier::parse(&arn.to_w3id()).unwrap(),
+            W3idDataIdentifier::VersionedObject(arn)
+        );
+    }
+
+    #[test]
+    fn rejects_w3id_suffix() {
+        assert!(W3idDataIdentifier::parse(&format!("{ARUNA_DATA_PREFIX}ABC")).is_err());
+        assert!(
+            W3idDataIdentifier::parse(&format!("{ARUNA_DATA_PREFIX}{}", "A".repeat(64))).is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_uncanonical_key() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let node_id = test_node_id();
+        let version = Ulid::from_bytes([2u8; 16]);
+        assert!(
+            VersionedObjectArn::parse(&format!(
+                "arn:aruna:{realm_id}:{node_id}:s3/bucket/raw@key@{version}"
+            ))
+            .is_err()
+        );
+        assert!(
+            VersionedObjectArn::parse(&format!(
+                "arn:aruna:{realm_id}:{node_id}:s3/bucket/%6bey@{version}"
+            ))
+            .is_err()
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn versioned_arn_roundtrips(
+            chars in proptest::collection::vec(any::<char>(), 1..64),
+            version in any::<[u8; 16]>(),
+        ) {
+            let key: String = chars.into_iter().collect();
+            let arn = VersionedObjectArn::new(
+                RealmId::from_bytes([1u8; 32]),
+                test_node_id(),
+                "bucket",
+                key,
+                Ulid::from_bytes(version),
+            )
+            .unwrap();
+
+            prop_assert_eq!(VersionedObjectArn::parse(&arn.to_string()).unwrap(), arn);
+        }
     }
 }

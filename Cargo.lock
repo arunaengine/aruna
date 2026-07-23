@@ -376,6 +376,7 @@ dependencies = [
  "irokle",
  "nix",
  "oxrdf",
+ "percent-encoding",
  "postcard",
  "prometheus-client",
  "proptest",

@@ -68,6 +68,9 @@ pub const JOB_OWNER_INDEX_KEYSPACE: &str = "job_owner_index";
 pub const JOB_DEDUP_INDEX_KEYSPACE: &str = "job_dedup_index";
 pub const JOB_RUN_CRATE_KEYSPACE: &str = "job_run_crate";
 pub const JOB_ATTEMPT_CONTROL_KEYSPACE: &str = "job_attempt_control";
+pub const JOB_ENTRY_KEYSPACE: &str = "job_entries";
+pub const ROCRATE_JOB_STATE_KEYSPACE: &str = "rocrate_job_state";
+pub const ROCRATE_UPLOAD_KEYSPACE: &str = "rocrate_uploads";
 pub const STAGING_JOB_STATE_KEYSPACE: &str = "staging_job_state";
 
 pub const BUCKET_STATS_DB: &str = "bucket_stats";
