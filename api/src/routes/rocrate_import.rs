@@ -1,20 +1,18 @@
-use std::io;
 use std::path::{Component, Path as FsPath};
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use aruna_core::effects::BlobEffect;
 use aruna_core::errors::{BlobError, SourceConnectorResolutionError, StagingSourceError};
-use aruna_core::events::{BlobEvent, Event};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
     AuthContext, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget,
-    JobPayload, MetadataRegistryRecord, Permission, RoCrateMediaType, RoCrateUploadRecord,
-    blob_bucket_permission_path, blob_object_permission_path, user_dedup_key,
+    JobPayload, MetadataRegistryRecord, Permission, RoCrateMediaType, blob_bucket_permission_path,
+    blob_object_permission_path, user_dedup_key,
 };
-use aruna_operations::blob::hidden::delete_hidden;
 use aruna_operations::driver::drive;
-use aruna_operations::jobs::import::{read_rocrate_upload, write_rocrate_upload};
+use aruna_operations::jobs::import::{
+    CreateRoCrateUploadConfig, CreateRoCrateUploadError, CreateRoCrateUploadOperation,
+    load_rocrate_upload,
+};
 use aruna_operations::jobs::service::{lookup_job_dedup, read_owned_job, submit_rocrate_import};
 use aruna_operations::list_metadata_documents::ListMetadataDocumentsOperation;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
@@ -30,9 +28,8 @@ use axum::routing::post;
 use axum::{Extension, Json, Router};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures_util::{StreamExt, stream};
+use futures_util::{Stream, stream};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 
@@ -164,60 +161,25 @@ pub async fn upload_rocrate(
         .ok_or_else(|| ServerError::InternalError("upload expiry is invalid".to_string()))?;
     let owner_node_url = owner_node_url(&state).await?;
     let upload_id = Ulid::generate();
-    let Some(blob_handle) = state.get_ctx().blob_handle.as_ref().cloned() else {
-        return Err(ServerError::ServiceUnavailableReason(
-            "blob storage is unavailable".to_string(),
-        ));
-    };
-    let event = blob_handle
-        .send_blob_effect(BlobEffect::SpoolHidden {
-            namespace: upload_id,
-            name: "input".to_string(),
-            created_by: auth.user_id,
-            max_bytes: Some(limit),
+    let record = drive(
+        CreateRoCrateUploadOperation::new(CreateRoCrateUploadConfig {
+            upload_id,
+            owner: auth.user_id,
+            media_type,
+            expires_at_ms,
+            max_bytes: limit,
             blob: upload_body_stream(body),
-        })
-        .await;
-    let (location, blake3, size) = match event {
-        Event::Blob(BlobEvent::HiddenSpooled {
-            location,
-            blake3,
-            size,
-        }) => (location, blake3, size),
-        Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { limit })) => {
-            return Err(ServerError::PayloadTooLarge(format!(
-                "upload exceeds limit {limit}"
-            )));
-        }
-        Event::Blob(BlobEvent::Error(error)) => {
-            return Err(ServerError::InternalError(error.to_string()));
-        }
-        other => {
-            return Err(ServerError::InternalError(format!(
-                "unexpected hidden upload event: {other:?}"
-            )));
-        }
-    };
-    let record = RoCrateUploadRecord {
-        upload_id,
-        owner: auth.user_id,
-        location: location.clone(),
-        blake3,
-        size,
-        media_type,
-        expires_at_ms,
-        claimed_by: None,
-    };
-    if let Err(error) = write_rocrate_upload(&state.get_ctx().storage_handle, &record).await {
-        let _ = delete_hidden(&state.get_ctx(), &location).await;
-        return Err(ServerError::InternalError(error));
-    }
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_upload_error)?;
     Ok((
         StatusCode::CREATED,
         Json(UploadRoCrateResponse {
             upload_id: upload_id.to_string(),
-            blake3: hex::encode(blake3),
-            size,
+            blake3: hex::encode(record.blake3),
+            size: record.size,
             expires_at: timestamp.to_rfc3339(),
             owner_node_url,
         }),
@@ -382,7 +344,7 @@ async fn fast_source_check(
 ) -> ServerResult<()> {
     match source {
         ImportRoCrateSource::Upload { upload_id } => {
-            let record = read_rocrate_upload(&state.get_ctx().storage_handle, *upload_id)
+            let record = load_rocrate_upload(&state.get_ctx(), *upload_id)
                 .await
                 .map_err(ServerError::InternalError)?
                 .ok_or(ServerError::NotFound)?;
@@ -577,21 +539,23 @@ async fn load_bucket(
 }
 
 fn upload_body_stream(body: Body) -> BackendStream<Result<Bytes, aruna_core::stream::StreamError>> {
-    let (sender, receiver) = mpsc::channel::<Result<Bytes, io::Error>>(8);
-    tokio::spawn(async move {
-        let mut body = body.into_data_stream();
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|error| io::Error::other(error.to_string()));
-            if sender.send(chunk).await.is_err() {
-                break;
-            }
-        }
-    });
-    let receiver = Arc::new(Mutex::new(receiver));
+    let body = Mutex::new(Box::pin(body.into_data_stream()));
     BackendStream::new(stream::poll_fn(move |cx| {
-        let mut receiver = receiver.lock().expect("upload receiver mutex poisoned");
-        Pin::new(&mut *receiver).poll_recv(cx)
+        let mut body = body.lock().unwrap_or_else(|error| error.into_inner());
+        body.as_mut().poll_next(cx)
     }))
+}
+
+fn map_upload_error(error: CreateRoCrateUploadError) -> ServerError {
+    match error {
+        CreateRoCrateUploadError::Blob(BlobError::SizeLimitExceeded { limit }) => {
+            ServerError::PayloadTooLarge(format!("upload exceeds limit {limit}"))
+        }
+        CreateRoCrateUploadError::Blob(BlobError::HandleMissing) => {
+            ServerError::ServiceUnavailableReason("blob storage is unavailable".to_string())
+        }
+        other => ServerError::InternalError(other.to_string()),
+    }
 }
 
 fn parse_media_type(headers: &HeaderMap) -> ServerResult<RoCrateMediaType> {

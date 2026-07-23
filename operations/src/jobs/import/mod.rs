@@ -15,8 +15,9 @@ pub(crate) mod fixture {
 }
 
 pub use upload::{
-    UploadClaimError, claim_rocrate_upload, delete_rocrate_upload, read_rocrate_upload,
-    write_rocrate_upload,
+    CreateRoCrateUploadConfig, CreateRoCrateUploadError, CreateRoCrateUploadOperation,
+    UploadClaimError, claim_rocrate_upload, delete_rocrate_upload, load_rocrate_upload,
+    read_rocrate_upload, write_rocrate_upload,
 };
 
 use std::collections::HashMap;
