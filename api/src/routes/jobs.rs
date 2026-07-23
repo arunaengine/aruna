@@ -1301,7 +1301,7 @@ mod tests {
                 total: Some(2),
                 unit: "entries".to_string(),
             },
-            3_000,
+            aruna_core::util::unix_timestamp_millis(),
         )
         .await
         .unwrap()
