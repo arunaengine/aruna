@@ -13,7 +13,6 @@ use crate::jobs::rocrate_jsonld::JsonLdKeywords;
 const JSONLD_BASE_IRI: &str = "https://craqle.invalid/";
 const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const SCHEMA_MEDIA_IRI: &str = "http://schema.org/MediaObject";
-const SCHEMA_MEDIA_HTTPS_IRI: &str = "https://schema.org/MediaObject";
 const SCHEMA_CONTENT_IRI: &str = "http://schema.org/contentUrl";
 const LOCAL_PATH_IRI: &str = "https://w3id.org/ro/terms#localPath";
 
@@ -45,10 +44,14 @@ pub struct RewriteOutcome {
 }
 
 pub fn validate_document(jsonld: &str) -> Result<ValidatedDocument, CrateValidationError> {
-    let canonical = craqle::validate_rocrate_jsonld(jsonld).map_err(map_validation_error)?;
-    let file_subjects = file_subjects(&canonical.nquads)?;
     let value: Value = serde_json::from_str(jsonld)
         .map_err(|error| CrateValidationError::Invalid(error.to_string()))?;
+    let mut validation = value.clone();
+    normalize_ids(&mut validation);
+    let validation = serde_json::to_string(&validation)
+        .map_err(|error| CrateValidationError::Invalid(error.to_string()))?;
+    let canonical = craqle::validate_rocrate_jsonld(&validation).map_err(map_validation_error)?;
+    let file_subjects = file_subjects(&canonical.nquads)?;
     let keywords = JsonLdKeywords::new(&value);
     let mut file_ids = Vec::new();
     collect_file_ids(&value, &file_subjects, &keywords, &mut file_ids)?;
@@ -120,7 +123,7 @@ fn collect_file_ids(
         Value::Object(object) => {
             if object.len() > 1
                 && let Some((_, id)) = keywords.object_id(object)
-                && (subjects.contains(&expanded_id(id)?) || has_file_type(object, keywords))
+                && subjects.contains(&expanded_id(id)?)
             {
                 if file_ids.iter().any(|existing| existing == id) {
                     return Err(CrateValidationError::Invalid(format!(
@@ -138,22 +141,17 @@ fn collect_file_ids(
     Ok(())
 }
 
-fn has_file_type(object: &Map<String, Value>, keywords: &JsonLdKeywords) -> bool {
-    object.iter().any(|(key, value)| {
-        keywords.expands_to(key, &["@type"])
-            && match value {
-                Value::String(value) => {
-                    keywords.expands_to(value, &["File", SCHEMA_MEDIA_IRI, SCHEMA_MEDIA_HTTPS_IRI])
-                }
-                Value::Array(values) => values.iter().any(|value| {
-                    value.as_str().is_some_and(|value| {
-                        keywords
-                            .expands_to(value, &["File", SCHEMA_MEDIA_IRI, SCHEMA_MEDIA_HTTPS_IRI])
-                    })
-                }),
-                _ => false,
+fn normalize_ids(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(normalize_ids),
+        Value::Object(object) => {
+            if let Some(Value::String(id)) = object.get_mut("@id") {
+                *id = id.replace(' ', "%20");
             }
-    })
+            object.values_mut().for_each(normalize_ids);
+        }
+        _ => {}
+    }
 }
 
 fn expanded_id(id: &str) -> Result<String, CrateValidationError> {
