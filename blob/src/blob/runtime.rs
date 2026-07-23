@@ -55,13 +55,17 @@ impl BlobHandle {
                 blob,
             } => {
                 return Event::Blob(
-                    self.handler
-                        .spool_hidden_blob(namespace, &name, created_by, max_bytes, blob)
-                        .await,
+                    Box::pin(
+                        self.handler
+                            .spool_hidden_blob(namespace, &name, created_by, max_bytes, blob),
+                    )
+                    .await,
                 );
             }
             BlobEffect::ReadHiddenRange { location, range } => {
-                return Event::Blob(self.handler.read_hidden_range(location, range).await);
+                return Event::Blob(
+                    Box::pin(self.handler.read_hidden_range(location, range)).await,
+                );
             }
             effect => effect,
         };

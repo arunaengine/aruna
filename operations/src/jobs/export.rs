@@ -19,6 +19,7 @@ use aruna_core::structs::{
 use aruna_core::types::{Key, NodeId, Value};
 use aruna_core::util::unix_timestamp_millis;
 use async_zip::{Compression, ZipEntryBuilder};
+#[cfg(test)]
 use bytes::Bytes;
 use byteview::ByteView;
 use futures_util::StreamExt;
@@ -246,7 +247,14 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
             ExportPhase::Snapshot => snapshot_export(ctx, spec, &mut checkpoint).await,
             ExportPhase::Resolve => resolve_entries(ctx, spec, &mut checkpoint).await,
             ExportPhase::Plan => {
-                match probe_sources(ctx, spec, &mut checkpoint, &candidate_failures).await {
+                match Box::pin(probe_sources(
+                    ctx,
+                    spec,
+                    &mut checkpoint,
+                    &candidate_failures,
+                ))
+                .await
+                {
                     Ok(entries) => {
                         let result = plan_export(spec, &mut checkpoint, &entries);
                         probed = Some(entries);
@@ -257,7 +265,14 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
             }
             ExportPhase::Assemble => {
                 if probed.is_none() {
-                    match probe_sources(ctx, spec, &mut checkpoint, &candidate_failures).await {
+                    match Box::pin(probe_sources(
+                        ctx,
+                        spec,
+                        &mut checkpoint,
+                        &candidate_failures,
+                    ))
+                    .await
+                    {
                         Ok(entries) => {
                             if let Err(error) = plan_export(spec, &mut checkpoint, &entries) {
                                 return finish_export(ctx, &mut checkpoint, error).await;
@@ -270,7 +285,7 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
                 let Some(entries) = probed.take() else {
                     return permanent("planned export sources are missing");
                 };
-                match assemble_export(ctx, spec, &checkpoint, entries).await {
+                match Box::pin(assemble_export(ctx, spec, &checkpoint, entries)).await {
                     Ok(artifact) => {
                         checkpoint.refs.hidden_locations = vec![artifact.location.clone()];
                         checkpoint.artifact = Some(artifact);
@@ -447,56 +462,21 @@ async fn resolve_entries(
         }
 
         if let Some(hash) = hash {
-            let aliases = drive(ResolveBlobPermissionPathsOperation::new(hash), &ctx.driver)
-                .await
-                .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
-            for alias in aliases
-                .into_iter()
-                .filter(|alias| alias.realm_id == spec.auth_context.realm_id)
-            {
-                match resolve_alias(ctx, spec, &alias).await? {
-                    ResolveResult::Candidate(candidate) => {
-                        if !candidates.contains(&candidate) {
-                            candidates.push(candidate);
-                        }
-                    }
-                    ResolveResult::Denied => denied = true,
-                    ResolveResult::Missing { .. } => {}
-                }
-            }
-
-            match drive(
-                GetBlobHoldersOperation::new(hash, spec.auth_context.realm_id, ctx.owner_node_id),
-                &ctx.driver,
+            let unavailable = extend_hash_candidates(
+                ctx,
+                spec,
+                hash,
+                exact_version,
+                &mut candidates,
+                &mut denied,
             )
-            .await
-            {
-                Ok(holders) => {
-                    let remote_count = candidates
-                        .iter()
-                        .filter(|candidate| !matches!(candidate.source, CandidateSource::Local(_)))
-                        .count();
-                    let holder_limit = REMOTE_ATTEMPTS.saturating_sub(remote_count);
-                    for node_id in holders.into_iter().take(holder_limit) {
-                        let candidate = ExportCandidate {
-                            source: CandidateSource::RemoteHash { node_id, hash },
-                            report_source: ExportReportSource::Hash,
-                            resolved_version: exact_version,
-                            expected_blake3: Some(hash),
-                        };
-                        if !candidates.contains(&candidate) {
-                            candidates.push(candidate);
-                        }
-                    }
-                }
-                Err(_) if candidates.is_empty() => {
-                    checkpoint.entities[index].omission = Some(ReasonCode::Offline);
-                    checkpoint.entities[index].message =
-                        Some("blob holder discovery is unavailable".to_string());
-                    ctx.progress.advance(1);
-                    continue;
-                }
-                Err(_) => {}
+            .await?;
+            if unavailable && candidates.is_empty() {
+                checkpoint.entities[index].omission = Some(ReasonCode::Offline);
+                checkpoint.entities[index].message =
+                    Some("blob holder discovery is unavailable".to_string());
+                ctx.progress.advance(1);
+                continue;
             }
         }
 
@@ -521,6 +501,60 @@ async fn resolve_entries(
     }
     checkpoint.phase = ExportPhase::Plan;
     Ok(())
+}
+
+async fn extend_hash_candidates(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    hash: [u8; 32],
+    resolved_version: Option<Ulid>,
+    candidates: &mut Vec<ExportCandidate>,
+    denied: &mut bool,
+) -> Result<bool, ExportFailure> {
+    let aliases = drive(ResolveBlobPermissionPathsOperation::new(hash), &ctx.driver)
+        .await
+        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    for alias in aliases
+        .into_iter()
+        .filter(|alias| alias.realm_id == spec.auth_context.realm_id)
+    {
+        match resolve_alias(ctx, spec, &alias).await? {
+            ResolveResult::Candidate(candidate) => {
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
+            }
+            ResolveResult::Denied => *denied = true,
+            ResolveResult::Missing { .. } => {}
+        }
+    }
+
+    let holders = match drive(
+        GetBlobHoldersOperation::new(hash, spec.auth_context.realm_id, ctx.owner_node_id),
+        &ctx.driver,
+    )
+    .await
+    {
+        Ok(holders) => holders,
+        Err(_) => return Ok(true),
+    };
+    let remote_count = candidates
+        .iter()
+        .filter(|candidate| !matches!(candidate.source, CandidateSource::Local(_)))
+        .count();
+    let holder_limit = REMOTE_ATTEMPTS.saturating_sub(remote_count);
+    for node_id in holders.into_iter().take(holder_limit) {
+        let candidate = ExportCandidate {
+            source: CandidateSource::RemoteHash { node_id, hash },
+            report_source: ExportReportSource::Hash,
+            resolved_version,
+            expected_blake3: Some(hash),
+        };
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    Ok(false)
 }
 
 async fn resolve_exact(
@@ -660,6 +694,31 @@ async fn storage_value(
     }
 }
 
+fn learn_probe_hash(entity: &mut ExportEntity, candidate_index: usize, hash: [u8; 32]) -> bool {
+    let Some(candidate) = entity.candidates.get_mut(candidate_index) else {
+        return false;
+    };
+    let (node_id, realm_id, resolved_version) = match &candidate.source {
+        CandidateSource::RemoteExact { node_id, target } if candidate.expected_blake3.is_none() => {
+            (*node_id, target.realm_id, candidate.resolved_version)
+        }
+        _ => return false,
+    };
+    candidate.expected_blake3 = Some(hash);
+    entity.hash = Some(hash);
+    entity.hash_realm = Some(realm_id);
+    let fallback = ExportCandidate {
+        source: CandidateSource::RemoteHash { node_id, hash },
+        report_source: ExportReportSource::Hash,
+        resolved_version,
+        expected_blake3: Some(hash),
+    };
+    if !entity.candidates.contains(&fallback) {
+        entity.candidates.push(fallback);
+    }
+    true
+}
+
 async fn probe_sources(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
@@ -702,8 +761,19 @@ async fn probe_sources(
             if ctx.shutdown.is_cancelled() {
                 return Err(ExportFailure::Interrupted);
             }
-            match open_candidate(&ctx.driver, spec, &candidate, true).await? {
+            match Box::pin(open_candidate(&ctx.driver, spec, &candidate, true)).await? {
                 CandidateOpen::Opened(BaoReadOutput::Metadata { size, blake3 }) => {
+                    if learn_probe_hash(&mut checkpoint.entities[index], candidate_index, blake3) {
+                        extend_hash_candidates(
+                            ctx,
+                            spec,
+                            blake3,
+                            candidate.resolved_version,
+                            &mut checkpoint.entities[index].candidates,
+                            &mut denied,
+                        )
+                        .await?;
+                    }
                     selected = Some(ProbedEntry {
                         entity_index: index,
                         candidate_index,
@@ -937,7 +1007,7 @@ fn plan_export(
             entity
                 .zip_path
                 .as_ref()
-                .map(|path| (entity.entity_id.clone(), path.clone()))
+                .map(|path| (entity.entity_id.clone(), jsonld_path(path)))
         })
         .collect::<BTreeMap<_, _>>();
     let unrewritten = scan_unrewritten(&document, &replacements);
@@ -997,7 +1067,7 @@ fn recognize_entities(
     let raw_ids = raw_entity_ids(document, &keywords)?;
     let mut files = BTreeSet::new();
     let mut content_urls = BTreeMap::<String, Vec<String>>::new();
-    let mut local_paths = BTreeMap::<String, String>::new();
+    let mut local_paths = BTreeMap::<String, Vec<String>>::new();
     for quad in NQuadsParser::new().for_slice(nquads) {
         let quad = quad.map_err(|error| ExportFailure::Permanent(error.to_string()))?;
         let NamedOrBlankNode::NamedNode(subject) = quad.subject else {
@@ -1021,7 +1091,7 @@ fn recognize_entities(
             }
             LOCAL_PATH_IRI | LOCAL_PATH_HTTP_IRI => {
                 if let Some(value) = term_value(&quad.object) {
-                    local_paths.entry(subject).or_insert(value);
+                    local_paths.entry(subject).or_default().push(value);
                 }
             }
             _ => {}
@@ -1029,7 +1099,7 @@ fn recognize_entities(
     }
 
     let mut entities = Vec::new();
-    for (subject, entity_id) in raw_ids {
+    for (subject, entity_id, raw_path) in raw_ids {
         if !files.remove(&subject) {
             continue;
         }
@@ -1046,9 +1116,13 @@ fn recognize_entities(
         let supported_hash =
             identity.hash.is_some() && hash_realm.is_none_or(|hash_realm| hash_realm == realm_id);
         let unsupported_realm = !external && !supported_exact && !supported_hash;
+        let paths = local_paths.remove(&subject).unwrap_or_default();
+        let local_path = raw_path
+            .filter(|raw_path| paths.contains(raw_path))
+            .or_else(|| paths.into_iter().next());
         entities.push(ExportEntity {
             entity_id,
-            local_path: local_paths.remove(&subject),
+            local_path,
             exact: identity.exact,
             hash: identity.hash,
             hash_realm,
@@ -1084,11 +1158,11 @@ fn recognize_entities(
 fn raw_entity_ids(
     document: &JsonValue,
     keywords: &JsonLdKeywords,
-) -> Result<Vec<(String, String)>, ExportFailure> {
+) -> Result<Vec<(String, String, Option<String>)>, ExportFailure> {
     fn collect(
         value: &JsonValue,
         keywords: &JsonLdKeywords,
-        entities: &mut Vec<(String, String)>,
+        entities: &mut Vec<(String, String, Option<String>)>,
     ) -> Result<(), ExportFailure> {
         match value {
             JsonValue::Array(values) => {
@@ -1101,8 +1175,9 @@ fn raw_entity_ids(
                     && let Some((_, id)) = keywords.object_id(object)
                 {
                     let expanded = expanded_id(id)?;
-                    if let Some((_, existing_id)) =
-                        entities.iter().find(|(existing, _)| existing == &expanded)
+                    if let Some((_, existing_id, _)) = entities
+                        .iter()
+                        .find(|(existing, _, _)| existing == &expanded)
                     {
                         if existing_id != id {
                             return Err(ExportFailure::Permanent(format!(
@@ -1110,7 +1185,7 @@ fn raw_entity_ids(
                             )));
                         }
                     } else {
-                        entities.push((expanded, id.to_string()));
+                        entities.push((expanded, id.to_string(), raw_local_path(object, keywords)));
                     }
                 }
                 for value in object.values() {
@@ -1125,6 +1200,25 @@ fn raw_entity_ids(
     let mut entities = Vec::new();
     collect(document, keywords, &mut entities)?;
     Ok(entities)
+}
+
+fn raw_local_path(
+    object: &serde_json::Map<String, JsonValue>,
+    keywords: &JsonLdKeywords,
+) -> Option<String> {
+    object.iter().find_map(|(key, value)| {
+        keywords
+            .expands_to(key, &["localPath", LOCAL_PATH_IRI, LOCAL_PATH_HTTP_IRI])
+            .then(|| match value {
+                JsonValue::String(value) => Some(value.clone()),
+                JsonValue::Array(values) => values
+                    .iter()
+                    .find_map(JsonValue::as_str)
+                    .map(str::to_string),
+                _ => None,
+            })
+            .flatten()
+    })
 }
 
 fn expanded_id(id: &str) -> Result<String, ExportFailure> {
@@ -1214,6 +1308,20 @@ fn safe_zip_path(value: &str) -> Option<String> {
         return None;
     }
     Some(normalized)
+}
+
+fn jsonld_path(path: &str) -> String {
+    let mut url = Url::parse(JSONLD_BASE_IRI).expect("static JSON-LD base is valid");
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .expect("static JSON-LD base supports path segments");
+        segments.clear();
+        for segment in path.split('/') {
+            segments.push(segment);
+        }
+    }
+    url.path().trim_start_matches('/').to_string()
 }
 
 fn synthesized_path(hash: [u8; 32], entity_id: &str) -> String {
@@ -1601,9 +1709,9 @@ async fn assemble_export(
     let (writer, reader) = tokio::io::duplex(128 * 1024);
     let cancel = ctx.cancel.clone();
     let shutdown = ctx.shutdown.clone();
-    let writer_task = tokio::spawn(async move {
-        write_archive(writer, metadata, entries, report, cancel, shutdown).await
-    });
+    let writer_task = tokio::spawn(Box::pin(write_archive(
+        writer, metadata, entries, report, cancel, shutdown,
+    )));
     let event = blob_handle
         .send_blob_effect(BlobEffect::SpoolHidden {
             namespace: ctx.job_id.0,
@@ -1683,7 +1791,7 @@ async fn write_archive(
                 driver,
                 spec,
                 candidate,
-            } => open_candidate(&driver, &spec, &candidate, false).await?,
+            } => Box::pin(open_candidate(&driver, &spec, &candidate, false)).await?,
             #[cfg(test)]
             PlannedSource::Ready(blob) => CandidateOpen::Opened(BaoReadOutput::Stream {
                 blob,
@@ -1991,12 +2099,23 @@ fn permanent(message: impl Into<String>) -> JobRunOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use crate::jobs::import::fixture::{
+        RewriteTarget, file_id_candidates, inspect_archive, open_archive, payload_entries,
+        read_metadata, rewrite_document, signature_entry, validate_document,
+    };
+    use crate::staging::test_utils::setup_driver_context;
+    use aruna_blob::blob::BlobHandle;
+    use aruna_core::UserId;
+    use aruna_core::structs::{AuthContext, RoCrateLimits};
+    use std::collections::HashMap;
+    use std::io::{Read, Seek, Write};
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Context, Poll};
     use tokio::io::AsyncReadExt;
+
+    const FIXTURE_BYTES: &[u8] = b"duplicate fixture payload";
 
     struct SparseWriter {
         file: std::fs::File,
@@ -2065,6 +2184,401 @@ mod tests {
         let jsonld = serde_json::to_string(document).unwrap();
         let canonical = craqle::canonicalize_jsonld(&jsonld).unwrap();
         recognize_entities(document, &canonical.nquads, realm_id)
+    }
+
+    fn fixture_stream(bytes: Vec<u8>) -> BackendStream<Result<Bytes, StreamError>> {
+        BackendStream::new(tokio_util::io::ReaderStream::new(std::io::Cursor::new(
+            bytes,
+        )))
+    }
+
+    fn fixture_json(version: &str) -> String {
+        json!({
+            "@context": [
+                format!("https://w3id.org/ro/crate/{version}/context"),
+                {"custom": "https://example.test/custom"}
+            ],
+            "@graph": [
+                {
+                    "@id": METADATA_PATH,
+                    "@type": "CreativeWork",
+                    "about": {"@id": "./"},
+                    "conformsTo": {"@id": format!("https://w3id.org/ro/crate/{version}")}
+                },
+                {
+                    "@id": "./",
+                    "@type": "Dataset",
+                    "name": "Round-trip fixture",
+                    "description": "Generated attached crate",
+                    "datePublished": "2026-07-23",
+                    "hasPart": [
+                        {"@id": "data/a%20file.txt"},
+                        {"@id": "data/copy.txt"}
+                    ],
+                    "custom": ["root-one", "root-two"]
+                },
+                {
+                    "@id": "data/a%20file.txt",
+                    "@type": "File",
+                    "name": "Original",
+                    "alternateName": ["A file", "Alpha file"],
+                    "custom": ["file-one", "file-two"]
+                },
+                {
+                    "@id": "data/copy.txt",
+                    "@type": "File",
+                    "name": "Copy",
+                    "alternateName": "Copied file",
+                    "custom": {"@id": "#note"}
+                },
+                {
+                    "@id": "#note",
+                    "@type": "CreativeWork",
+                    "name": "Contextual note"
+                }
+            ]
+        })
+        .to_string()
+    }
+
+    async fn fixture_archive(jsonld: &str, eln: bool) -> Vec<u8> {
+        let prefix = if eln { "experiment/" } else { "" };
+        let mut writer = async_zip::base::write::ZipFileWriter::new(Vec::<u8>::new());
+        for (path, bytes) in [
+            (METADATA_PATH, jsonld.as_bytes()),
+            ("data/a file.txt", FIXTURE_BYTES),
+            ("data/copy.txt", FIXTURE_BYTES),
+            ("notes/unlisted.txt", b"unlisted payload".as_slice()),
+        ] {
+            writer
+                .write_entry_whole(zip_entry(&format!("{prefix}{path}")), bytes)
+                .await
+                .unwrap();
+        }
+        if eln {
+            writer
+                .write_entry_whole(
+                    zip_entry(&format!("{prefix}ro-crate-metadata.json.minisig")),
+                    b"untrusted fixture signature",
+                )
+                .await
+                .unwrap();
+        }
+        writer.close().await.unwrap()
+    }
+
+    async fn spool_fixture(
+        handle: &BlobHandle,
+        bytes: Vec<u8>,
+        seed: u8,
+    ) -> (BackendLocation, u64) {
+        let expected_size = bytes.len() as u64;
+        let expected_hash = *blake3::hash(&bytes).as_bytes();
+        let Event::Blob(BlobEvent::HiddenSpooled {
+            location,
+            blake3,
+            size,
+        }) = handle
+            .send_blob_effect(BlobEffect::SpoolHidden {
+                namespace: Ulid::from_bytes([seed; 16]),
+                name: "fixture".to_string(),
+                created_by: UserId::nil(RealmId::from_bytes([seed; 32])),
+                max_bytes: Some(1024 * 1024),
+                blob: fixture_stream(bytes),
+            })
+            .await
+        else {
+            panic!("fixture spool failed")
+        };
+        assert_eq!(size, expected_size);
+        assert_eq!(blake3, expected_hash);
+        (location, size)
+    }
+
+    fn read_entry<R: Read + Seek>(archive: &mut zip::ZipArchive<R>, path: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        archive
+            .by_name(path)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    async fn assert_roundtrip(handle: &BlobHandle, eln: bool, version: &str, seed: u8) {
+        let limits = RoCrateLimits::default();
+        let source_json = fixture_json(version);
+        let source_bytes = fixture_archive(&source_json, eln).await;
+        let (source_location, source_size) =
+            spool_fixture(handle, source_bytes, seed.saturating_add(1)).await;
+        let inspection = inspect_archive(
+            handle.clone(),
+            source_location.clone(),
+            source_size,
+            eln,
+            &limits,
+        )
+        .await
+        .unwrap();
+        assert_eq!(inspection.wrapper.as_deref(), eln.then_some("experiment"));
+        assert_eq!(signature_entry(&inspection).is_some(), eln);
+
+        let mut reader = open_archive(handle.clone(), source_location, source_size)
+            .await
+            .unwrap();
+        let metadata = read_metadata(
+            &mut reader,
+            inspection.metadata_index,
+            limits.metadata_bytes,
+        )
+        .await
+        .unwrap();
+        let validated = validate_document(&metadata).unwrap();
+        let payload = payload_entries(&inspection);
+        let mut described = BTreeMap::new();
+        for file_id in &validated.file_ids {
+            let candidates = file_id_candidates(file_id).unwrap().unwrap();
+            let matches = candidates
+                .into_iter()
+                .filter(|path| payload.contains_key(path))
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1, "{file_id}");
+            described.insert(file_id.clone(), matches[0].clone());
+        }
+        assert_eq!(
+            payload
+                .keys()
+                .filter(|path| !described.values().any(|value| value == *path))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["notes/unlisted.txt".to_string()]
+        );
+
+        let realm_id = RealmId::from_bytes([seed; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[seed.saturating_add(1); 32]).public();
+        let payload_hash = *blake3::hash(FIXTURE_BYTES).as_bytes();
+        let targets = described
+            .iter()
+            .enumerate()
+            .map(|(index, (file_id, path))| {
+                let version = Ulid::from_bytes(
+                    [seed.saturating_add(u8::try_from(index).unwrap())
+                        .saturating_add(2); 16],
+                );
+                let arn =
+                    VersionedObjectArn::new(realm_id, node_id, "fixture", path, version).unwrap();
+                (
+                    file_id.clone(),
+                    RewriteTarget {
+                        w3id: arn.to_w3id(),
+                        hash_w3id: format!(
+                            "{}{}",
+                            aruna_core::structs::ARUNA_DATA_PREFIX,
+                            hex::encode(payload_hash)
+                        ),
+                        local_path: path.clone(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let rewritten = rewrite_document(validated.value, &targets).unwrap();
+        assert!(rewritten.warnings.is_empty());
+        let imported: JsonValue = serde_json::from_str(&rewritten.jsonld).unwrap();
+        let source: JsonValue = serde_json::from_str(&source_json).unwrap();
+        assert!(imported["@graph"][1].get("license").is_none());
+        assert_eq!(
+            imported["@graph"][1]["custom"],
+            source["@graph"][1]["custom"]
+        );
+        assert_eq!(
+            imported["@graph"][2]["alternateName"],
+            source["@graph"][2]["alternateName"]
+        );
+
+        let entities = recognized_entities(&imported, realm_id).unwrap();
+        assert_eq!(entities.len(), 2);
+        assert!(entities.iter().all(|entity| {
+            entity.exact.is_some()
+                && entity.hash == Some(payload_hash)
+                && entity
+                    .local_path
+                    .as_ref()
+                    .is_some_and(|path| described.values().any(|value| value == path))
+        }));
+        let spec = ExportRoCrateSpec {
+            auth_context: AuthContext {
+                user_id: UserId::nil(realm_id),
+                realm_id,
+                path_restrictions: None,
+            },
+            document_id: Ulid::from_bytes([seed.saturating_add(8); 16]),
+            limits: limits.clone(),
+        };
+        let opened = entities
+            .iter()
+            .enumerate()
+            .map(|(entity_index, entity)| ProbedEntry {
+                entity_index,
+                candidate_index: 0,
+                size: FIXTURE_BYTES.len() as u64,
+                hash: payload_hash,
+                report_source: ExportReportSource::Local,
+                resolved_version: entity.exact.as_ref().map(|exact| exact.version),
+            })
+            .collect::<Vec<_>>();
+        let mut checkpoint = ExportCheckpoint {
+            raw_jsonld: Some(rewritten.jsonld.clone()),
+            entities,
+            ..ExportCheckpoint::default()
+        };
+        plan_export(&spec, &mut checkpoint, &opened).unwrap();
+        assert!(checkpoint.report_json.is_none());
+        assert!(
+            checkpoint
+                .entities
+                .iter()
+                .all(|entity| !entity.path_synthesized)
+        );
+
+        let entries = checkpoint
+            .entities
+            .iter()
+            .enumerate()
+            .map(|(entity_index, entity)| PlannedEntry {
+                entity_index,
+                candidate_index: 0,
+                path: entity.zip_path.clone().unwrap(),
+                source: PlannedSource::Ready(byte_stream(FIXTURE_BYTES)),
+                expected_blake3: payload_hash,
+            })
+            .collect();
+        let (writer, mut reader) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(write_archive(
+            writer,
+            checkpoint.rewritten_jsonld.clone().unwrap(),
+            entries,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        let mut exported = Vec::new();
+        reader.read_to_end(&mut exported).await.unwrap();
+        task.await.unwrap().unwrap();
+
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&exported)).unwrap();
+        let names = (0..archive.len())
+            .map(|index| archive.by_index(index).unwrap().name().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                METADATA_PATH.to_string(),
+                "data/a file.txt".to_string(),
+                "data/copy.txt".to_string(),
+            ]
+        );
+        assert_eq!(read_entry(&mut archive, "data/a file.txt"), FIXTURE_BYTES);
+        assert_eq!(read_entry(&mut archive, "data/copy.txt"), FIXTURE_BYTES);
+        drop(archive);
+
+        let (export_location, export_size) =
+            spool_fixture(handle, exported, seed.saturating_add(9)).await;
+        let exported_inspection = inspect_archive(
+            handle.clone(),
+            export_location.clone(),
+            export_size,
+            false,
+            &limits,
+        )
+        .await
+        .unwrap();
+        assert!(exported_inspection.wrapper.is_none());
+        let mut reader = open_archive(handle.clone(), export_location, export_size)
+            .await
+            .unwrap();
+        let metadata = read_metadata(
+            &mut reader,
+            exported_inspection.metadata_index,
+            limits.metadata_bytes,
+        )
+        .await
+        .unwrap();
+        let validated = validate_document(&metadata).unwrap();
+        assert_eq!(
+            validated.file_ids,
+            vec!["data/a%20file.txt".to_string(), "data/copy.txt".to_string()]
+        );
+        let payload = payload_entries(&exported_inspection);
+        let by_path = targets
+            .values()
+            .map(|target| (target.local_path.clone(), target.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut targets = HashMap::new();
+        for file_id in &validated.file_ids {
+            let candidates = file_id_candidates(file_id).unwrap().unwrap();
+            let matches = candidates
+                .into_iter()
+                .filter(|path| payload.contains_key(path))
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1, "{file_id}");
+            targets.insert(file_id.clone(), by_path[&matches[0]].clone());
+        }
+        let reimported = rewrite_document(validated.value, &targets).unwrap();
+        assert!(reimported.warnings.is_empty());
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&reimported.jsonld).unwrap(),
+            imported
+        );
+    }
+
+    #[tokio::test]
+    async fn fixture_roundtrip() {
+        let fixture = setup_driver_context().await;
+        let handle = fixture.driver_context.blob_handle.as_ref().unwrap();
+        assert_roundtrip(handle, false, "1.2", 20).await;
+        assert_roundtrip(handle, true, "1.1", 40).await;
+    }
+
+    #[test]
+    fn learns_probe_hash() {
+        let realm_id = RealmId::from_bytes([2; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let version = Ulid::from_bytes([4; 16]);
+        let exact = VersionedObjectArn::new(realm_id, node_id, "bucket", "key", version).unwrap();
+        let document = json!({"@graph": [{"@id": exact.to_w3id(), "@type": "File"}]});
+        let mut entity = recognized_entities(&document, realm_id).unwrap().remove(0);
+        entity.candidates.push(ExportCandidate {
+            source: CandidateSource::RemoteExact {
+                node_id,
+                target: exact,
+            },
+            report_source: ExportReportSource::Remote,
+            resolved_version: Some(version),
+            expected_blake3: None,
+        });
+        let hash = [7; 32];
+
+        assert!(learn_probe_hash(&mut entity, 0, hash));
+        assert_eq!(entity.hash, Some(hash));
+        assert_eq!(entity.hash_realm, Some(realm_id));
+        assert_eq!(entity.candidates[0].expected_blake3, Some(hash));
+        assert!(matches!(
+            &entity.candidates[1],
+            ExportCandidate {
+                source: CandidateSource::RemoteHash {
+                    node_id: holder,
+                    hash: candidate_hash,
+                },
+                report_source: ExportReportSource::Hash,
+                resolved_version: Some(candidate_version),
+                expected_blake3: Some(expected),
+            } if *holder == node_id
+                && *candidate_hash == hash
+                && *candidate_version == version
+                && *expected == hash
+        ));
+        assert!(!learn_probe_hash(&mut entity, 0, hash));
+        assert_eq!(entity.candidates.len(), 2);
     }
 
     async fn sample_archive() -> Vec<u8> {
@@ -2160,6 +2674,28 @@ mod tests {
 
         assert_eq!(entities[0].hash, Some([0x11; 32]));
         assert_eq!(entities[0].local_path.as_deref(), Some("data/a.txt"));
+    }
+
+    #[test]
+    fn keeps_import_path() {
+        let realm_id = RealmId::from_bytes([2; 32]);
+        let mut entity = file_entity(
+            &format!(
+                "{}{}",
+                aruna_core::structs::ARUNA_DATA_PREFIX,
+                "11".repeat(32)
+            ),
+            None,
+        );
+        entity["localPath"] = json!(["data/canonical.txt", "aaa-original.txt"]);
+        let document = json!({"@graph": [entity]});
+
+        let entities = recognized_entities(&document, realm_id).unwrap();
+
+        assert_eq!(
+            entities[0].local_path.as_deref(),
+            Some("data/canonical.txt")
+        );
     }
 
     #[test]
@@ -2270,6 +2806,7 @@ mod tests {
         assert_eq!(safe_zip_path("./a/b.txt").as_deref(), Some("a/b.txt"));
         assert_eq!(safe_zip_path("../escape"), None);
         assert_eq!(safe_zip_path("a%2fb"), None);
+        assert_eq!(jsonld_path("data/a file.txt"), "data/a%20file.txt");
         assert_ne!(
             synthesized_path([7; 32], "one"),
             synthesized_path([7; 32], "two")
@@ -2305,7 +2842,7 @@ mod tests {
         add_report(&mut document).unwrap();
 
         assert_eq!(
-            document["@graph"][0]["hasPart"]["@id"],
+            document["@graph"][0]["hasPart"][0]["@id"],
             JsonValue::String("data/file".to_string())
         );
         assert_eq!(
