@@ -3227,6 +3227,16 @@ fn upsert_entity_via_rocrate_document(
 }
 
 fn graph_snapshot_jsonld(node: &CraqleNode, graph: &GraphId) -> Result<String, CraqleError> {
+    let exported = node.export_rocrate(&AllowAllAuthorizer, graph)?;
+    let context = serde_json::from_str::<Value>(&exported)
+        .map_err(|error| CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(error.to_string())))?
+        .get("@context")
+        .cloned()
+        .ok_or_else(|| {
+            CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(
+                "RO-Crate export is missing @context".to_string(),
+            ))
+        })?;
     let snapshot = node.graph_snapshot(graph)?;
     let mut by_subject = BTreeMap::<String, Map<String, Value>>::new();
     for quad in snapshot.quads {
@@ -3242,6 +3252,7 @@ fn graph_snapshot_jsonld(node: &CraqleNode, graph: &GraphId) -> Result<String, C
     }
 
     let mut document = Map::new();
+    document.insert("@context".to_string(), context);
     document.insert(
         "@graph".to_string(),
         Value::Array(by_subject.into_values().map(Value::Object).collect()),

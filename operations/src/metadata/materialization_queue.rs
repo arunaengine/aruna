@@ -44,6 +44,7 @@ use super::queue_storage::{
     MetadataQueueStorageError, abort_storage_transaction_best_effort, commit_storage_transaction,
     start_write_transaction,
 };
+use super::raw::MetadataRawReadError;
 
 const MATERIALIZATION_SCAN_PAGE_SIZE: usize = 512;
 const MATERIALIZATION_BATCH_SIZE: usize = 128;
@@ -117,6 +118,17 @@ impl From<MetadataQueueStorageError> for MetadataMaterializationQueueError {
         match error {
             MetadataQueueStorageError::Storage(error) => Self::Storage(error),
             MetadataQueueStorageError::UnexpectedEvent(event) => Self::UnexpectedEvent(event),
+        }
+    }
+}
+
+impl From<MetadataRawReadError> for MetadataMaterializationQueueError {
+    fn from(error: MetadataRawReadError) -> Self {
+        match error {
+            MetadataRawReadError::Storage(error) => Self::Storage(error),
+            MetadataRawReadError::Conversion(error) => Self::Conversion(error),
+            MetadataRawReadError::Metadata(error) => Self::Metadata(error),
+            MetadataRawReadError::UnexpectedEvent(event) => Self::UnexpectedEvent(event),
         }
     }
 }
@@ -865,26 +877,29 @@ async fn process_materialization_job(
     let apply_result = materialize_create_event(context, &event).await;
     let craqle_elapsed = apply_started.elapsed();
     match apply_result {
-        Ok(()) => {
-            let raw_revision = match crate::metadata::raw::load_raw_revision(
-                context,
-                event.record.document_id,
-                Some(event.event_id),
-            )
-            .await
-            {
-                Ok(revision) => revision,
-                Err(error) => {
-                    reschedule_materialization_job(
-                        &context.storage_handle,
-                        &job_key,
-                        &job,
-                        &event,
-                        error.to_string(),
-                    )
-                    .await?;
-                    return Ok(ProcessedMaterializationJob::rescheduled(craqle_elapsed));
-                }
+        Ok(materialized_revision) => {
+            let raw_revision = match materialized_revision {
+                Some(revision) => Some(revision),
+                None => match crate::metadata::raw::load_raw_revision(
+                    context,
+                    event.record.document_id,
+                    Some(event.event_id),
+                )
+                .await
+                {
+                    Ok(revision) => revision,
+                    Err(error) => {
+                        reschedule_materialization_job(
+                            &context.storage_handle,
+                            &job_key,
+                            &job,
+                            &event,
+                            error.to_string(),
+                        )
+                        .await?;
+                        return Ok(ProcessedMaterializationJob::rescheduled(craqle_elapsed));
+                    }
+                },
             };
             let iri_index_writes = match project_materialized_iri_references(context, &event).await
             {
@@ -1717,18 +1732,32 @@ async fn metadata_graph_deleted(
 async fn materialize_create_event(
     context: &DriverContext,
     event: &MetadataCreateEventRecord,
-) -> Result<(), MetadataMaterializationQueueError> {
+) -> Result<Option<MetadataRawRevision>, MetadataMaterializationQueueError> {
+    let raw_revision = if matches!(
+        &event.payload,
+        MetadataCreateEventPayload::UpsertDataEntity { .. }
+            | MetadataCreateEventPayload::UpsertContextualEntity { .. }
+    ) {
+        crate::metadata::raw::load_raw_revision(
+            context,
+            event.record.document_id,
+            Some(event.event_id),
+        )
+        .await?
+    } else {
+        None
+    };
     let metadata_handle = context
         .metadata_handle
         .as_ref()
         .ok_or(MetadataMaterializationQueueError::MetadataHandleMissing)?;
     match metadata_handle
-        .send_effect(graph_materialization_effect(event))
+        .send_effect(graph_materialization_effect(event, raw_revision.as_ref()))
         .await
     {
         Event::Metadata(MetadataEvent::CreateCrateResult { .. })
         | Event::Metadata(MetadataEvent::ApplyRoCrateResult { .. })
-        | Event::Metadata(MetadataEvent::EntityUpsertResult { .. }) => Ok(()),
+        | Event::Metadata(MetadataEvent::EntityUpsertResult { .. }) => Ok(raw_revision),
         Event::Metadata(MetadataEvent::Error { error, .. }) => Err(error.into()),
         other => Err(MetadataMaterializationQueueError::UnexpectedEvent(format!(
             "{other:?}"
@@ -1756,13 +1785,33 @@ async fn project_materialized_iri_references(
         .map_err(MetadataMaterializationQueueError::from)
 }
 
-fn graph_materialization_effect(event: &MetadataCreateEventRecord) -> Effect {
+fn graph_materialization_effect(
+    event: &MetadataCreateEventRecord,
+    raw_revision: Option<&MetadataRawRevision>,
+) -> Effect {
     let policy = MetadataGraphPolicy {
         public: event.record.public,
         permission_paths: vec![event.record.permission_path.clone()],
     }
     .normalized();
     let deterministic_actor = Some(deterministic_materialization_actor(event.event_id));
+    if let Some(raw_revision) = raw_revision {
+        if matches!(
+            &event.payload,
+            MetadataCreateEventPayload::UpsertDataEntity { .. }
+                | MetadataCreateEventPayload::UpsertContextualEntity { .. }
+        ) {
+            return Effect::Metadata(MetadataEffect::ApplyRoCrate {
+                request: MetadataApplyRoCrateRequest {
+                    graph_iri: event.record.graph_iri.clone(),
+                    jsonld: raw_revision.jsonld.clone(),
+                    policy,
+                    durability: MetadataRequestDurability::WalAlreadyDurable,
+                    deterministic_actor,
+                },
+            });
+        }
+    }
     match &event.payload {
         MetadataCreateEventPayload::Scaffold {
             name,
@@ -2972,7 +3021,7 @@ mod tests {
         let event = create_event(document_id, event_id, "deterministic");
         let deterministic_actor = Some(deterministic_materialization_actor(event_id));
 
-        match graph_materialization_effect(&event) {
+        match graph_materialization_effect(&event, None) {
             Effect::Metadata(MetadataEffect::CreateCrate { request }) => {
                 assert_eq!(
                     request.durability,
@@ -2989,7 +3038,7 @@ mod tests {
                 jsonld: "{}".to_string(),
             },
         );
-        match graph_materialization_effect(&rocrate) {
+        match graph_materialization_effect(&rocrate, None) {
             Effect::Metadata(MetadataEffect::ApplyRoCrate { request }) => {
                 assert_eq!(
                     request.durability,
@@ -3006,7 +3055,7 @@ mod tests {
                 jsonld: r#"{"@id":"./file.txt","@type":"File","name":"file"}"#.to_string(),
             },
         );
-        match graph_materialization_effect(&data) {
+        match graph_materialization_effect(&data, None) {
             Effect::Metadata(MetadataEffect::UpsertDataEntity { request }) => {
                 assert_eq!(
                     request.durability,
@@ -3023,8 +3072,27 @@ mod tests {
                 jsonld: r##"{"@id":"#lab","@type":"Organization","name":"lab"}"##.to_string(),
             },
         );
-        match graph_materialization_effect(&contextual) {
+        match graph_materialization_effect(&contextual, None) {
             Effect::Metadata(MetadataEffect::UpsertContextualEntity { request }) => {
+                assert_eq!(
+                    request.durability,
+                    MetadataRequestDurability::WalAlreadyDurable
+                );
+                assert_eq!(request.deterministic_actor, deterministic_actor);
+            }
+            other => panic!("unexpected materialization effect: {other:?}"),
+        }
+
+        let raw_revision = MetadataRawRevision {
+            jsonld: r#"{"@context":"https://w3id.org/ro/crate/1.2/context","@graph":[]}"#
+                .to_string(),
+            winning_event_id: event_id,
+            context_digest: [1; 32],
+            dataset_digest: Some([2; 32]),
+        };
+        match graph_materialization_effect(&contextual, Some(&raw_revision)) {
+            Effect::Metadata(MetadataEffect::ApplyRoCrate { request }) => {
+                assert_eq!(request.jsonld, raw_revision.jsonld);
                 assert_eq!(
                     request.durability,
                     MetadataRequestDurability::WalAlreadyDurable
@@ -3049,8 +3117,8 @@ mod tests {
 
         for event in [event, data] {
             assert_eq!(
-                graph_materialization_effect(&event),
-                graph_materialization_effect(&event)
+                graph_materialization_effect(&event, None),
+                graph_materialization_effect(&event, None)
             );
         }
     }
