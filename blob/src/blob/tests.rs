@@ -447,6 +447,29 @@ async fn reuses_bucket_until_max_object_count_is_reached() {
 }
 
 #[tokio::test]
+async fn hidden_bucket_registered() {
+    let context = setup_blob_handle(5).await;
+
+    assert!(matches!(
+        context
+            .blob_handle
+            .send_blob_effect(BlobEffect::SpoolHidden {
+                namespace: Ulid::from_bytes([2u8; 16]),
+                name: "partial".to_string(),
+                created_by: test_user_id(),
+                max_bytes: Some(0),
+                blob: stream_from_bytes(b"x"),
+            })
+            .await,
+        Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { limit: 0 }))
+    ));
+    assert_eq!(
+        keyspace_count(&context.storage_handle, BUCKET_STATS_DB).await,
+        1
+    );
+}
+
+#[tokio::test]
 async fn creates_new_bucket_after_reaching_max_object_count() {
     let context = setup_blob_handle(1).await;
 
@@ -708,6 +731,83 @@ async fn hidden_spool_limits() {
         panic!("hidden list failed")
     };
     assert!(entries.is_empty());
+}
+
+#[tokio::test]
+async fn range_bypasses_loop() {
+    // Import readers fetch hidden ranges while the blob loop consumes their payload.
+    let context = setup_blob_handle(5).await;
+    let namespace = Ulid::from_bytes([6u8; 16]);
+    let Event::Blob(BlobEvent::HiddenSpooled { location, .. }) = context
+        .blob_handle
+        .send_blob_effect(BlobEffect::SpoolHidden {
+            namespace,
+            name: "source".to_string(),
+            created_by: test_user_id(),
+            max_bytes: None,
+            blob: stream_from_bytes(b"source"),
+        })
+        .await
+    else {
+        panic!("source spool failed")
+    };
+    let (body_sender, body_receiver) =
+        tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(1);
+    let body_receiver = std::sync::Arc::new(std::sync::Mutex::new(body_receiver));
+    let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+    let started_sender = std::sync::Arc::new(std::sync::Mutex::new(Some(started_sender)));
+    let body = BackendStream::new(futures::stream::poll_fn(move |context| {
+        if let Some(sender) = started_sender.lock().unwrap().take() {
+            let _ = sender.send(());
+        }
+        let mut receiver = body_receiver.lock().unwrap();
+        std::pin::Pin::new(&mut *receiver).poll_recv(context)
+    }));
+    let write_handle = context.blob_handle.clone();
+    let write_task = tokio::spawn(async move {
+        write_handle
+            .send_blob_effect(BlobEffect::Write {
+                bucket: "target".to_string(),
+                key: "object".to_string(),
+                created_by: test_user_id(),
+                blob: body,
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(30), started_receiver)
+        .await
+        .expect("blob write did not start")
+        .unwrap();
+
+    let event = tokio::time::timeout(
+        Duration::from_secs(30),
+        context
+            .blob_handle
+            .send_blob_effect(BlobEffect::ReadHiddenRange {
+                location,
+                range: 0..6,
+            }),
+    )
+    .await
+    .expect("hidden range read deadlocked");
+    let Event::Blob(BlobEvent::HiddenRead { blob, .. }) = event else {
+        panic!("hidden range read failed")
+    };
+    let chunks: Vec<bytes::Bytes> = blob.try_collect().await.unwrap();
+    assert_eq!(chunks.concat(), b"source");
+
+    body_sender
+        .send(Ok(bytes::Bytes::from_static(b"target")))
+        .await
+        .unwrap();
+    drop(body_sender);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(30), write_task)
+            .await
+            .expect("blob write did not finish")
+            .unwrap(),
+        Event::Blob(BlobEvent::WriteFinished { .. })
+    ));
 }
 
 #[tokio::test]

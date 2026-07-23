@@ -61,6 +61,7 @@ impl BlobHandler {
             make_bucket(&bucket_name, &self.backend_config.service_config).await?;
         }
 
+        self.write_bucket_load(&bucket_name, 0).await?;
         Ok(bucket_name)
     }
 

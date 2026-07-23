@@ -60,6 +60,9 @@ impl BlobHandle {
                         .await,
                 );
             }
+            BlobEffect::ReadHiddenRange { location, range } => {
+                return Event::Blob(self.handler.read_hidden_range(location, range).await);
+            }
             effect => effect,
         };
         let blob_event = {
