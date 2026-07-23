@@ -7,7 +7,7 @@ use futures::{AsyncReadExt, AsyncSeekExt};
 use iroh_io::{AsyncSliceReader, AsyncSliceWriter, AsyncStreamReader, AsyncStreamWriter};
 use opendal::{FuturesAsyncReader, Operator};
 use std::{future::Future, io, time::Duration};
-use tokio::io::AsyncWriteExt as TokioAsyncWriteExt;
+use tokio::io::{AsyncWriteExt as TokioAsyncWriteExt, DuplexStream};
 use tokio::time::timeout;
 use tracing::debug;
 
@@ -155,6 +155,68 @@ pub struct OpenDalWriter {
     storage_path: String,
     pub hasher: Hasher,
     idle_timeout: Duration,
+}
+
+pub struct BaoReadWriter {
+    writer: DuplexStream,
+    hasher: Hasher,
+    written: u64,
+}
+
+impl BaoReadWriter {
+    pub fn new(writer: DuplexStream) -> Self {
+        Self {
+            writer,
+            hasher: Hasher::new(),
+            written: 0,
+        }
+    }
+
+    pub fn finish(self, size: u64, expected_blake3: [u8; 32]) -> io::Result<()> {
+        if self.written != size {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "bao read ended after {} bytes, expected {size}",
+                    self.written
+                ),
+            ));
+        }
+        if self.hasher.finalize().blake3.as_bytes() != &expected_blake3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bao read content hash mismatch",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl AsyncSliceWriter for BaoReadWriter {
+    async fn write_at(&mut self, offset: u64, data: &[u8]) -> io::Result<()> {
+        if offset != self.written {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bao read produced non-sequential output",
+            ));
+        }
+        self.writer.write_all(data).await?;
+        self.hasher.update(data);
+        self.written += data.len() as u64;
+        Ok(())
+    }
+
+    async fn write_bytes_at(&mut self, offset: u64, data: Bytes) -> io::Result<()> {
+        self.write_at(offset, &data).await
+    }
+
+    async fn set_len(&mut self, _len: u64) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn sync(&mut self) -> io::Result<()> {
+        self.writer.flush().await
+    }
 }
 
 impl AsyncSliceWriter for OpenDalWriter {
@@ -317,7 +379,8 @@ impl OpenDalReader {
 
 #[cfg(test)]
 mod tests {
-    use super::{idle_timeout_error, with_transfer_idle_timeout};
+    use super::{BaoReadWriter, idle_timeout_error, with_transfer_idle_timeout};
+    use iroh_io::AsyncSliceWriter;
     use std::io;
     use std::time::Duration;
 
@@ -350,5 +413,42 @@ mod tests {
             err.to_string(),
             "data-transfer idle timeout after 1800s while writing replicated chunk to backend storage"
         );
+    }
+
+    #[tokio::test]
+    async fn sink_accepts_content() {
+        let (writer, _reader) = tokio::io::duplex(64);
+        let mut writer = BaoReadWriter::new(writer);
+        let content = b"verified";
+
+        writer.write_at(0, content).await.unwrap();
+
+        writer
+            .finish(content.len() as u64, *blake3::hash(content).as_bytes())
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_sink_mismatch() {
+        let (writer, _reader) = tokio::io::duplex(64);
+        let mut writer = BaoReadWriter::new(writer);
+
+        writer.write_at(0, b"content").await.unwrap();
+
+        let error = writer.finish(7, [9u8; 32]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn rejects_sink_truncation() {
+        let (writer, _reader) = tokio::io::duplex(64);
+        let mut writer = BaoReadWriter::new(writer);
+
+        writer.write_at(0, b"short").await.unwrap();
+
+        let error = writer
+            .finish(6, *blake3::hash(b"short").as_bytes())
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

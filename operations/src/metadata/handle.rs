@@ -23,7 +23,7 @@ use aruna_core::metadata::{
 use aruna_core::storage_entries::metadata_graph_lifecycle_key;
 use aruna_core::structs::{
     AuthContext, BucketInfo, MetadataRegistryRecord, Permission, RealmConfigDocument, RealmId,
-    RealmNodeKind, SyncRelationship, blob_bucket_permission_path,
+    SyncRelationship, blob_bucket_permission_path,
 };
 use aruna_core::telemetry::{duration_ms, record_duration_ms, record_elapsed_ms};
 use aruna_core::types::{GroupId, UserId};
@@ -63,6 +63,7 @@ use crate::auth::{
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::list_groups::ListGroupOperation;
+use crate::realm_peer::{RealmPeerError, ensure_realm_peer};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, SearchBucketsOperation};
@@ -2017,33 +2018,20 @@ async fn ensure_remote_metadata_peer_is_configured_for_realm(
         }) => {
             let document = RealmConfigDocument::from_bytes(&bytes)
                 .map_err(|error| MetadataError::Backend(error.to_string()))?;
-            if document.realm_id != realm_id {
-                return Err(MetadataError::InvalidInput(format!(
-                    "realm config `{}` does not match remote metadata realm `{realm_id}`",
-                    document.realm_id
-                )));
-            }
-            let peer_id = peer.to_string();
-            let node = document
-                .nodes
-                .iter()
-                .find(|node| node.node_id == peer_id)
-                .ok_or_else(|| {
-                    MetadataError::InvalidInput(format!(
-                        "remote metadata peer `{peer}` is not configured in realm `{realm_id}`"
-                    ))
-                })?;
-            if require_internal_trust
-                && !matches!(
-                    &node.kind,
-                    RealmNodeKind::Management | RealmNodeKind::Server
-                )
-            {
-                return Err(MetadataError::InvalidInput(format!(
-                    "remote metadata peer `{peer}` is not trusted for internal auth in realm `{realm_id}`"
-                )));
-            }
-            Ok(())
+            ensure_realm_peer(&document, peer, realm_id, require_internal_trust)
+                .map_err(|error| {
+                    MetadataError::InvalidInput(match error {
+                        RealmPeerError::RealmMismatch { configured, .. } => format!(
+                            "realm config `{configured}` does not match remote metadata realm `{realm_id}`"
+                        ),
+                        RealmPeerError::NotConfigured { .. } => format!(
+                            "remote metadata peer `{peer}` is not configured in realm `{realm_id}`"
+                        ),
+                        RealmPeerError::NotTrusted { .. } => format!(
+                            "remote metadata peer `{peer}` is not trusted for internal auth in realm `{realm_id}`"
+                        ),
+                    })
+                })
         }
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
             Err(MetadataError::InvalidInput(format!(

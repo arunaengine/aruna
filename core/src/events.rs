@@ -89,6 +89,9 @@ pub enum BlobEvent {
     ReplicationFinished {
         location: BackendLocation,
     },
+    ReadServed {
+        stream_id: Ulid,
+    },
     Error(BlobError),
 }
 

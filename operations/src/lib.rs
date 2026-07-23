@@ -52,6 +52,7 @@ mod queue_backoff;
 pub mod queue_lag;
 pub mod read_realm_authorization;
 pub mod read_user_document;
+pub mod realm_peer;
 pub mod register_or_get_oidc_user;
 pub mod remove_group_role;
 pub mod remove_user_from_group;

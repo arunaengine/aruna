@@ -1,3 +1,4 @@
+pub mod bao_read;
 mod error;
 pub mod incoming_version_replication;
 pub mod migration;
