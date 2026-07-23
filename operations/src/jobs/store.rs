@@ -418,6 +418,12 @@ where
                     }
                     Some(JobResultPayload::ExportRoCrate(result)) => {
                         result.report_digest = digest;
+                        if let Some(artifact) = result.artifact.as_mut() {
+                            artifact.expires_at_ms = record
+                                .finished_at_ms
+                                .unwrap_or(record.updated_at_ms)
+                                .saturating_add(record.retention_ms);
+                        }
                     }
                     _ => {}
                 }
@@ -2042,6 +2048,7 @@ mod tests {
                 size: None,
                 arn: None,
                 w3id: None,
+                validation: None,
             },
         }
     }
