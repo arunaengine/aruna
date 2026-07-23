@@ -30,6 +30,7 @@ sha2 = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 ulid = { workspace = true }
 
 [dev-dependencies]
