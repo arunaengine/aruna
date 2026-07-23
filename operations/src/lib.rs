@@ -8,6 +8,7 @@ pub mod announce;
 pub mod announce_realm_presence;
 pub mod auth;
 pub mod blob;
+pub mod blob_holders;
 pub mod bootstrap_onboarding_finalize;
 pub mod check_permissions;
 pub mod claim_initial_realm_admin;
