@@ -269,6 +269,25 @@ pub async fn put_staging_checkpoint(
     token: Ulid,
     value: Value,
 ) -> Result<(), JobMutationError> {
+    put_job_checkpoint(storage, job_id, token, STAGING_JOB_STATE_KEYSPACE, value).await
+}
+
+pub async fn put_rocrate_checkpoint(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    value: Value,
+) -> Result<(), JobMutationError> {
+    put_job_checkpoint(storage, job_id, token, ROCRATE_JOB_STATE_KEYSPACE, value).await
+}
+
+async fn put_job_checkpoint(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    key_space: &str,
+    value: Value,
+) -> Result<(), JobMutationError> {
     for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
         let txn_id = start_write_txn(storage)
             .await
@@ -282,7 +301,7 @@ pub async fn put_staging_checkpoint(
             batch_write(
                 storage,
                 vec![(
-                    STAGING_JOB_STATE_KEYSPACE.to_string(),
+                    key_space.to_string(),
                     ByteView::from(job_id.to_bytes().to_vec()),
                     value.clone(),
                 )],

@@ -3,8 +3,8 @@ use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    ArtifactRef, ExecutionSpec, JobId, JobPayload, JobRecord, JobResultPayload, JobState,
-    RunCrateStatus, StagingJobSpec, WorkspaceMode, user_dedup_key,
+    ArtifactRef, ExecutionSpec, ExportRoCrateSpec, JobId, JobPayload, JobRecord, JobResultPayload,
+    JobState, RunCrateStatus, StagingJobSpec, WorkspaceMode, user_dedup_key,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{NodeId, UserId, Value};
@@ -113,6 +113,31 @@ pub async fn submit_staging_job(
             now_ms: unix_timestamp_millis(),
             workspace_mode: WorkspaceMode::default(),
             workspace_bucket: None,
+        }),
+        context,
+    )
+    .await
+}
+
+pub async fn submit_export_job(
+    context: &DriverContext,
+    spec: ExportRoCrateSpec,
+    owner_node_id: NodeId,
+    idempotency_key: Option<String>,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    let created_by = spec.auth_context.user_id;
+    let retention_ms = spec.limits.artifact_retention_ms;
+    let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
+    drive(
+        SubmitJobOperation::new(SubmitJobSpec {
+            payload: JobPayload::ExportRoCrate(spec),
+            created_by,
+            owner_node_id,
+            dedup_key,
+            now_ms: unix_timestamp_millis(),
+            workspace_mode: WorkspaceMode::default(),
+            workspace_bucket: None,
+            retention_ms,
         }),
         context,
     )
