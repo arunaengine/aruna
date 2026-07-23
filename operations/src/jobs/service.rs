@@ -24,6 +24,7 @@ use super::submit::{
 };
 use super::workflow::finalize_followups;
 use crate::driver::{DriverContext, drive};
+use crate::metadata::repository::StorageReadError;
 
 /// Submit a container execution job on behalf of `created_by`. The drain claims it
 /// and drives the fenced external attempt lifecycle. The idempotency key is
@@ -244,7 +245,10 @@ pub async fn read_owned_artifact(
     let document_path =
         crate::get_metadata_document::load_metadata_record_by_document(context, spec.document_id)
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|error| match error {
+                StorageReadError::Storage(error) => error.to_string(),
+                StorageReadError::Conversion(error) => error.to_string(),
+            })?
             .map(|record| record.document_path);
     Ok(ArtifactLookup::Ready(OwnedArtifact {
         artifact,

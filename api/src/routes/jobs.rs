@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use aruna_core::compute::normalize_container_path;
 use aruna_core::structs::{
-    AuthContext, ComputeResources, ExportReportRow, ImportReportRow, InputMode, InputSelection,
-    InputSource, JobId, JobPayload, JobRecord, JobState, Permission, WorkspaceMode,
+    AuthContext, ComputeResources, ExecutionSpec, ExportReportRow, ImportReportRow, InputMode,
+    InputSelection, InputSource, JobId, JobPayload, JobRecord, JobState, Permission, WorkspaceMode,
     WorkspaceOutput, blob_bucket_permission_path, blob_group_permission_path,
 };
 use aruna_operations::jobs::service::{
