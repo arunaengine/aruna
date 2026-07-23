@@ -38,6 +38,10 @@ aruna-tasks = { path = "tasks" }
 # Third-party crates
 ahash = "0.8.12"
 async-trait = "0.1.89"
+async_zip = { package = "astral_async_zip", version = "0.0.20", features = [
+    "tokio",
+    "deflate",
+] }
 aws-config = { version = "1.9.0", default-features = false, features = [
     "default-https-client",
     "rt-tokio",
@@ -71,7 +75,7 @@ fjall = "3.1.8"
 flate2 = "1.1.9"
 futures = "0.3.33"
 futures-core = "0.3.33"
-futures-util = "0.3.33"
+futures-util = { version = "0.3.33", features = ["io"] }
 globset = "0.4.19"
 hex = "0.4.3"
 http = "1.4.2"
@@ -166,6 +170,7 @@ tracing-subscriber = { version = "0.3.23", features = [
     "registry",
 ] }
 ulid = { version = "3.0.0", features = ["serde"] }
+unicode-normalization = "0.1.25"
 url = "2.5.8"
 utoipa = { version = "5.5.0", features = [
     "chrono",
@@ -176,6 +181,7 @@ utoipa = { version = "5.5.0", features = [
 utoipa-axum = "0.2.0"
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 zeroize = "1.9.0"
+zip = { version = "8.6.0", default-features = false }
 
 [profile.release]
 panic = "abort"

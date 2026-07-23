@@ -6,8 +6,8 @@ use aruna_core::metadata::{
     MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
 use aruna_core::structs::{
-    Actor, AuthContext, MetadataRegistryRecord, Permission, WatchEvent, WatchEventDetail,
-    WatchEventKind,
+    Actor, AuthContext, ExportRoCrateSpec, MetadataRegistryRecord, Permission, WatchEvent,
+    WatchEventDetail, WatchEventKind,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -17,6 +17,7 @@ use aruna_operations::create_metadata_document::{
 };
 use aruna_operations::driver::drive;
 use aruna_operations::get_metadata_document::load_metadata_record_by_document as load_metadata_record_by_document_from_operations;
+use aruna_operations::jobs::service::submit_export_job;
 use aruna_operations::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
     ListVisibleMetadataDocumentsRequest, MetadataApiError, MetadataApiQueryMode,
@@ -53,6 +54,8 @@ use ulid::Ulid;
 use url::form_urlencoded::Serializer;
 use utoipa::{OpenApi, ToSchema};
 
+use super::jobs::{job_urls, map_submit_error};
+
 #[cfg(test)]
 use aruna_operations::metadata::MetadataAuthToken;
 #[cfg(test)]
@@ -76,6 +79,7 @@ use std::time::Duration;
         search_metadata,
         metadata_references,
         export_metadata_rocrate,
+        submit_rocrate_export,
         replace_metadata_rocrate,
         add_metadata_data_entity,
         add_metadata_contextual_entity,
@@ -102,6 +106,10 @@ pub fn router() -> Router<Arc<ServerState>> {
         .route(
             "/metadata/{document_id}/rocrate",
             get(export_metadata_rocrate).put(replace_metadata_rocrate),
+        )
+        .route(
+            "/metadata/{document_id}/rocrate/exports",
+            post(submit_rocrate_export),
         )
         .route(
             "/metadata/{document_id}/rocrate/data-entities",
@@ -252,6 +260,23 @@ pub struct MetadataRoCrateExportParams {
     pub offset: Option<usize>,
     #[serde(default)]
     pub after: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitRoCrateExportRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SubmitRoCrateExportResponse {
+    pub job_id: String,
+    pub created: bool,
+    pub owner_node_url: String,
+    pub status_url: String,
+    pub report_url: String,
+    pub artifact_url: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
@@ -822,6 +847,64 @@ pub async fn export_metadata_rocrate(
     .map_err(map_metadata_api_error)?;
     let response = map_rocrate_export_response(export, &params, view)?;
     Ok((StatusCode::OK, Json(response)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/metadata/{document_id}/rocrate/exports",
+    tag = "metadata",
+    params(("document_id" = String, Path, description = "Metadata document id")),
+    request_body = SubmitRoCrateExportRequest,
+    responses(
+        (status = 202, description = "RO-Crate export job accepted", body = SubmitRoCrateExportResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Metadata READ denied", body = ErrorResponse),
+        (status = 404, description = "Metadata document not found", body = ErrorResponse),
+        (status = 409, description = "Idempotency key conflict or active-job limit", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn submit_rocrate_export(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(document_id): Path<String>,
+    Json(request): Json<SubmitRoCrateExportRequest>,
+) -> ServerResult<(StatusCode, Json<SubmitRoCrateExportResponse>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let document_id = parse_document_id(&document_id)?;
+    let record = load_metadata_record_by_document(&state, document_id).await?;
+    ensure_permission(
+        &state,
+        auth.clone(),
+        record.permission_path,
+        Permission::READ,
+    )
+    .await?;
+    let result = submit_export_job(
+        &state.get_ctx(),
+        ExportRoCrateSpec {
+            auth_context: auth,
+            document_id,
+            limits: state.rocrate_limits().clone(),
+        },
+        state.get_node_id(),
+        request.idempotency_key,
+    )
+    .await
+    .map_err(map_submit_error)?;
+    let urls = job_urls(&state, result.job_id).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SubmitRoCrateExportResponse {
+            job_id: result.job_id.to_string(),
+            created: result.created,
+            owner_node_url: urls.owner_node_url,
+            status_url: urls.status_url,
+            report_url: urls.report_url,
+            artifact_url: urls.artifact_url,
+        }),
+    ))
 }
 
 #[utoipa::path(
@@ -2734,6 +2817,9 @@ mod tests {
             view_param["schema"]["$ref"],
             json!("#/components/schemas/MetadataRoCrateView")
         );
+        let export_submit = &openapi["paths"]["/metadata/{document_id}/rocrate/exports"]["post"];
+        assert!(export_submit["responses"].get("202").is_some());
+        assert_eq!(export_submit["security"][0]["bearer_auth"], json!([]));
 
         let create_examples = openapi["paths"]["/metadata"]["post"]["requestBody"]["content"]
             ["application/json"]["examples"]

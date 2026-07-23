@@ -386,6 +386,7 @@ mod tests {
                 compute_handle: Some(Arc::new(registry)),
             }),
             job_id: JobId::from_bytes([0xCB; 16]),
+            owner_node_id: iroh::SecretKey::from_bytes(&[0xCD; 32]).public(),
             claim_token: Ulid::from_bytes([0xCC; 16]),
             cancel: CancellationToken::new(),
             shutdown: CancellationToken::new(),

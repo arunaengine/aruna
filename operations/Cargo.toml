@@ -15,6 +15,7 @@ aruna-net = { workspace = true }
 aruna-tasks = { workspace = true }
 craqle = { workspace = true }
 async-trait = { workspace = true }
+async_zip = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
 blake3 = { workspace = true }
@@ -43,6 +44,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 ulid = { workspace = true }
+unicode-normalization = { workspace = true }
 ed25519-dalek = { workspace = true }
 oxrdf = { workspace = true }
 
@@ -55,3 +57,4 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-util = { workspace = true }
 tracing-subscriber = { workspace = true }
+zip = { workspace = true }
