@@ -57,7 +57,11 @@ async fn handle_dht_effect(dht: &DhtHandle, effect: DhtEffect) -> NetEvent {
                 "Starting DHT put"
             );
             match dht.put(&key, realm_id, value, ttl).await {
-                Ok(()) => NetEvent::Dht(DhtEvent::PutComplete { key }),
+                Ok(stats) => NetEvent::Dht(DhtEvent::PutComplete {
+                    key,
+                    remote_attempt_count: stats.remote_attempt_count,
+                    remote_store_count: stats.remote_store_count,
+                }),
                 Err(error) => {
                     warn!(key = %hex_prefix(key.as_bytes()), error = %error, "DHT put failed");
                     NetEvent::Dht(DhtEvent::Error {

@@ -1359,7 +1359,7 @@ mod test {
         else {
             panic!("missing DHT blob registration");
         };
-        let entries = decode_entries(dht_value.as_ref());
+        let entries = decode_entries(dht_value.as_ref()).expect("decode DHT entries");
         assert!(entries.iter().any(|entry| {
             entry.realm_id == realm_id
                 && entry.value

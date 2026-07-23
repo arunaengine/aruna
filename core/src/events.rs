@@ -165,6 +165,8 @@ pub enum NetEvent {
 pub enum DhtEvent {
     PutComplete {
         key: DhtKeyId,
+        remote_attempt_count: usize,
+        remote_store_count: usize,
     },
     GetResult {
         key: DhtKeyId,

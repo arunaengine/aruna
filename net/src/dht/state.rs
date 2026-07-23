@@ -8,15 +8,24 @@ use aruna_core::structs::RealmId;
 use aruna_core::util::xor_distance_32;
 use smallvec::SmallVec;
 
-use super::constants::{DRIVER_TICK_INTERVAL, LOOKUP_ALPHA, LOOKUP_MAX_QUERIES, RPC_TIMEOUT_TICKS};
+use super::constants::{
+    LOOKUP_ALPHA, LOOKUP_MAX_QUERIES, MAX_CLOCK_SKEW_SECS, MAX_ENTRIES_PER_KEY, MAX_TTL_SECS,
+    MAX_VALUE_SIZE, RPC_TIMEOUT_TICKS,
+};
 use super::kbucket::{InsertResult, K, PeerInfo, RoutingTable};
 use super::protocol::{
     CLEANUP_OP_ID, DhtCmd, DhtEffect, DhtGetCompletedReason, DhtGetStats, DhtInput, DhtIo,
-    DhtIoError, DhtIoRequest, DhtOutput, DhtOutputValue, DhtPeerError, INTERNAL_OP_START,
-    InboundId, OpId, RpcPhase, StorageStage,
+    DhtIoError, DhtIoRequest, DhtOutput, DhtOutputValue, DhtPeerError, DhtPutStats,
+    INTERNAL_OP_START, InboundId, OpId, RpcPhase, StorageStage,
 };
-use super::rpc::{DhtRequest, DhtResponse, ErrorCode, StoredValue, signed_put_value_bytes};
-use super::storage::{CLEANUP_PAGE_SIZE, StoredEntry, live_entries, merge_entry};
+use super::rpc::{
+    DhtRequest, DhtResponse, ErrorCode, StoredValue, request_kind, response_kind,
+    signed_record_bytes, verify_stored_value,
+};
+use super::storage::{
+    DeadlineEntry, DeadlineIndex, MergeError, StoredEntry, entry_is_fresh, merge_entry,
+    retained_entries, retention_deadline,
+};
 
 const MIN_TTL_SECS: u64 = 1;
 
@@ -42,8 +51,10 @@ pub struct DhtStateMachine {
     routing_table: RoutingTable,
     next_internal_op_id: OpId,
     ops: HashMap<OpId, OpState>,
-    cleanup_cursor: Option<Vec<u8>>,
-    cleanup_inflight: bool,
+    cleanup_active: bool,
+    cleanup_floor: bool,
+    eviction_buckets: HashSet<usize>,
+    peer_epoch: u64,
     current_tick: u64,
     now_secs: u64,
 }
@@ -54,8 +65,8 @@ impl std::fmt::Debug for DhtStateMachine {
             .field("local_id", &self.local_id)
             .field("routing_table_size", &self.routing_table.len())
             .field("ops", &self.ops.len())
-            .field("cleanup_cursor", &self.cleanup_cursor)
-            .field("cleanup_inflight", &self.cleanup_inflight)
+            .field("cleanup_active", &self.cleanup_active)
+            .field("cleanup_floor", &self.cleanup_floor)
             .field("current_tick", &self.current_tick)
             .field("now_secs", &self.now_secs)
             .finish()
@@ -116,12 +127,15 @@ struct PutOp {
     key: DhtKeyId,
     realm_id: RealmId,
     value: Vec<u8>,
-    ttl_secs: u64,
-    signature: iroh::Signature,
+    expires_at: u64,
+    revision: Option<u64>,
+    signature: Option<iroh::Signature>,
     frontier: LookupFrontier,
     local_write_complete: bool,
-    completion_emitted: bool,
     lookup_finished: bool,
+    store_candidates: Vec<NodeId>,
+    store_attempt_count: usize,
+    store_count: usize,
     trace_context: Option<DistributedTraceContext>,
     pending: PendingMap,
 }
@@ -131,12 +145,15 @@ struct GetOp {
     key: DhtKeyId,
     realm_filter: Option<RealmId>,
     values: Vec<DhtEntry>,
-    seen_publishers: HashSet<(NodeId, RealmId)>,
+    value_indices: HashMap<(NodeId, RealmId), usize>,
+    value_versions: HashMap<(NodeId, RealmId), u64>,
+    cache_entries: Vec<StoredEntry>,
+    remote_entries: HashMap<(NodeId, RealmId), StoredEntry>,
+    remote_values: HashSet<(NodeId, RealmId)>,
     frontier: LookupFrontier,
-    local_value_count: usize,
-    remote_value_count: usize,
     peer_error_count: usize,
     peer_errors: Vec<DhtPeerError>,
+    successful_responses: usize,
     trace_context: Option<DistributedTraceContext>,
     pending: PendingMap,
 }
@@ -151,6 +168,7 @@ struct BootstrapOp {
 #[derive(Debug)]
 struct EvictionPingOp {
     oldest_node: NodeId,
+    oldest_seen: u64,
     bucket_idx: usize,
     pending_peer: PeerInfo,
     pending: PendingMap,
@@ -159,6 +177,7 @@ struct EvictionPingOp {
 #[derive(Debug)]
 struct MaintenancePingOp {
     peer: NodeId,
+    peer_seen: u64,
     pending: PendingMap,
 }
 
@@ -173,8 +192,6 @@ struct InboundGetOp {
 #[derive(Debug)]
 struct InboundPutOp {
     inbound_id: InboundId,
-    key: DhtKeyId,
-    new_entry: StoredEntry,
     pending: PendingMap,
 }
 
@@ -182,6 +199,7 @@ struct InboundPutOp {
 struct LookupFrontier {
     discovered: HashSet<NodeId>,
     queried: HashSet<NodeId>,
+    responsive: HashSet<NodeId>,
     pending: Vec<NodeId>,
     sent_queries: usize,
 }
@@ -201,9 +219,22 @@ impl LookupFrontier {
         }
     }
 
-    fn add_candidates<I: IntoIterator<Item = NodeId>>(&mut self, nodes: I, local_id: NodeId) {
+    fn add_candidates<I: IntoIterator<Item = NodeId>>(
+        &mut self,
+        nodes: I,
+        local_id: NodeId,
+        target: &[u8; 32],
+    ) {
         for node_id in nodes {
             self.add_candidate(node_id, local_id);
+        }
+        self.pending
+            .sort_unstable_by(|left, right| compare_distance(target, left, right));
+        let pending_limit = LOOKUP_MAX_QUERIES.saturating_sub(self.queried.len());
+        while self.pending.len() > pending_limit {
+            if let Some(removed) = self.pending.pop() {
+                self.discovered.remove(&removed);
+            }
         }
     }
 
@@ -214,20 +245,35 @@ impl LookupFrontier {
 
         self.pending
             .sort_unstable_by(|a, b| compare_distance(target, a, b));
+        if self.lookup_complete(target) {
+            return None;
+        }
         let next = self.pending.remove(0);
         self.queried.insert(next);
         Some(next)
     }
 
-    fn closest_discovered(&self, target: &[u8; 32], count: usize) -> Vec<NodeId> {
-        let mut nodes: Vec<NodeId> = self.discovered.iter().copied().collect();
+    fn closest_responsive(&self, target: &[u8; 32]) -> Vec<NodeId> {
+        let mut nodes: Vec<NodeId> = self.responsive.iter().copied().collect();
         nodes.sort_unstable_by(|a, b| compare_distance(target, a, b));
-        nodes.truncate(count);
         nodes
     }
 
-    fn pending_exhausted(&self) -> bool {
-        self.pending.is_empty() || self.sent_queries >= LOOKUP_MAX_QUERIES
+    fn lookup_complete(&self, target: &[u8; 32]) -> bool {
+        if self.pending.is_empty() || self.sent_queries >= LOOKUP_MAX_QUERIES {
+            return true;
+        }
+        if self.responsive.len() < K {
+            return false;
+        }
+
+        let mut responsive: Vec<NodeId> = self.responsive.iter().copied().collect();
+        responsive.sort_unstable_by(|a, b| compare_distance(target, a, b));
+        let farthest = responsive[K - 1];
+        !self
+            .pending
+            .iter()
+            .any(|peer| compare_distance(target, peer, &farthest).is_lt())
     }
 }
 
@@ -239,8 +285,10 @@ impl DhtStateMachine {
             routing_table: RoutingTable::new(local_id),
             next_internal_op_id: INTERNAL_OP_START,
             ops: HashMap::new(),
-            cleanup_cursor: None,
-            cleanup_inflight: false,
+            cleanup_active: false,
+            cleanup_floor: false,
+            eviction_buckets: HashSet::new(),
+            peer_epoch: 0,
             current_tick: 0,
             now_secs: start_unix_secs,
         }
@@ -258,7 +306,8 @@ impl DhtStateMachine {
         match input {
             DhtInput::Cmd(cmd) => self.handle_cmd(cmd, &mut out),
             DhtInput::Io(io) => self.handle_io(io, &mut out),
-            DhtInput::Tick { now_tick } => self.handle_tick(now_tick, &mut out),
+            DhtInput::Clock { now_secs } => self.update_clock(now_secs),
+            DhtInput::Tick { now_tick, now_secs } => self.handle_tick(now_tick, now_secs, &mut out),
         }
 
         out
@@ -266,6 +315,10 @@ impl DhtStateMachine {
 
     pub(crate) fn contains_op(&self, op_id: OpId) -> bool {
         self.ops.contains_key(&op_id)
+    }
+
+    pub(crate) fn clock_secs(&self) -> u64 {
+        self.now_secs
     }
 
     #[tracing::instrument(
@@ -330,24 +383,47 @@ impl DhtStateMachine {
             return;
         }
 
-        let ttl_secs = ttl.as_secs().max(MIN_TTL_SECS);
-        let signed_data = signed_put_value_bytes(&key, &realm_id, &value, ttl_secs);
-        let signature = self.secret_key.sign(&signed_data);
+        if value.len() > MAX_VALUE_SIZE {
+            out.push(DhtEffect::Output(DhtOutput::Failed {
+                op_id,
+                error: DhtIoError::invalid_request("DHT value exceeds the maximum size"),
+            }));
+            return;
+        }
 
+        let ttl_secs = ttl.as_secs().max(MIN_TTL_SECS);
+        if ttl_secs > MAX_TTL_SECS {
+            out.push(DhtEffect::Output(DhtOutput::Failed {
+                op_id,
+                error: DhtIoError::invalid_request("DHT TTL exceeds the maximum"),
+            }));
+            return;
+        }
+
+        let Some(expires_at) = self.now_secs.checked_add(ttl_secs) else {
+            out.push(DhtEffect::Output(DhtOutput::Failed {
+                op_id,
+                error: DhtIoError::invalid_request("DHT expiry overflows Unix time"),
+            }));
+            return;
+        };
         let mut op = OpState::Put(PutOp {
             key,
             realm_id,
             value,
-            ttl_secs,
-            signature,
+            expires_at,
+            revision: None,
+            signature: None,
             frontier: LookupFrontier::default(),
             local_write_complete: false,
-            completion_emitted: false,
             lookup_finished: false,
+            store_candidates: Vec::new(),
+            store_attempt_count: 0,
+            store_count: 0,
             trace_context,
             pending: HashMap::new(),
         });
-        self.queue_storage_read(op_id, &mut op, StorageStage::PutLocalRead, key, None, out);
+        self.queue_storage_revision(op_id, &mut op, out);
         self.ops.insert(op_id, op);
     }
 
@@ -377,12 +453,15 @@ impl DhtStateMachine {
             key,
             realm_filter,
             values: Vec::new(),
-            seen_publishers: HashSet::new(),
+            value_indices: HashMap::new(),
+            value_versions: HashMap::new(),
+            cache_entries: Vec::new(),
+            remote_entries: HashMap::new(),
+            remote_values: HashSet::new(),
             frontier: LookupFrontier::default(),
-            local_value_count: 0,
-            remote_value_count: 0,
             peer_error_count: 0,
             peer_errors: Vec::new(),
+            successful_responses: 0,
             trace_context,
             pending: HashMap::new(),
         });
@@ -476,10 +555,7 @@ impl DhtStateMachine {
                 peer,
                 request,
                 trace_context: _,
-            } => {
-                self.insert_peer(peer, out);
-                self.handle_inbound_request(inbound_id, request, out);
-            }
+            } => self.handle_inbound_request(inbound_id, peer, request, out),
             DhtIo::InboundReadError { .. } => {}
             DhtIo::InboundDropped { .. } => {}
             DhtIo::StorageReadResult {
@@ -487,18 +563,20 @@ impl DhtStateMachine {
                 stage,
                 entries,
             } => self.handle_storage_read(op_id, stage, entries, out),
+            DhtIo::StorageRevisionResult {
+                op_id,
+                stage,
+                revision,
+            } => self.handle_storage_revision(op_id, stage, revision, out),
             DhtIo::StorageWriteResult { op_id, stage } => {
                 self.handle_storage_write(op_id, stage, out)
-            }
-            DhtIo::StorageDeleteResult { op_id, stage } => {
-                self.handle_storage_delete(op_id, stage, out)
             }
             DhtIo::StorageIterResult {
                 op_id,
                 stage,
-                values,
-                next_start_after,
-            } => self.handle_storage_iter(op_id, stage, values, next_start_after, out),
+                index,
+                entries,
+            } => self.handle_storage_iter(op_id, stage, index, entries, out),
             DhtIo::StorageError {
                 op_id,
                 stage,
@@ -512,17 +590,11 @@ impl DhtStateMachine {
         name = "dht.state.tick",
         level = "debug",
         skip(self, out),
-        fields(now_tick)
+        fields(now_tick, now_secs)
     )]
-    fn handle_tick(&mut self, now_tick: u64, out: &mut SmallVec<[DhtEffect; 4]>) {
-        let previous_tick = self.current_tick;
+    fn handle_tick(&mut self, now_tick: u64, now_secs: u64, out: &mut SmallVec<[DhtEffect; 4]>) {
         self.current_tick = now_tick;
-        if now_tick > previous_tick {
-            let delta = now_tick.saturating_sub(previous_tick);
-            self.now_secs = self
-                .now_secs
-                .saturating_add(delta.saturating_mul(DRIVER_TICK_INTERVAL.as_secs()));
-        }
+        self.update_clock(now_secs);
 
         let mut timed_out = self.collect_timed_out_rpc();
         timed_out.sort_unstable_by(|(op_a, phase_a, peer_a), (op_b, phase_b, peer_b)| {
@@ -539,11 +611,15 @@ impl DhtStateMachine {
         self.schedule_cleanup(out);
     }
 
+    fn update_clock(&mut self, now_secs: u64) {
+        self.now_secs = self.now_secs.max(now_secs);
+    }
+
     #[tracing::instrument(
         name = "dht.state.rpc_response",
         level = "debug",
         skip(self, response, out),
-        fields(op_id, phase = ?phase, peer = %peer, response = ?response)
+        fields(op_id, phase = ?phase, peer = %peer, response = response_kind(&response))
     )]
     fn handle_rpc_response(
         &mut self,
@@ -593,7 +669,7 @@ impl DhtStateMachine {
         name = "dht.state.rpc_response_state",
         level = "trace",
         skip(self, response, op_state, out),
-        fields(op_id, phase = ?phase, peer = %peer, response = ?response)
+        fields(op_id, phase = ?phase, peer = %peer, response = response_kind(&response))
     )]
     fn handle_rpc_response_state(
         &mut self,
@@ -605,16 +681,16 @@ impl DhtStateMachine {
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
         match op_state {
-            OpState::Put(op) => self.handle_rpc_response_put(op_id, phase, response, op, out),
+            OpState::Put(op) => self.handle_rpc_response_put(op_id, phase, peer, response, op, out),
             OpState::Get(op) => self.handle_rpc_response_get(op_id, phase, peer, response, op, out),
             OpState::Bootstrap(op) => {
                 self.handle_rpc_response_bootstrap(op_id, phase, peer, response, op, out)
             }
             OpState::EvictionPing(op) => {
-                self.handle_rpc_response_eviction_ping(op_id, phase, response, op)
+                self.handle_rpc_response_eviction_ping(op_id, phase, response, op, out)
             }
             OpState::MaintenancePing(op) => {
-                self.handle_rpc_response_maintenance_ping(op_id, phase, peer, response, op)
+                self.handle_rpc_response_maintenance_ping(op_id, phase, peer, response, op, out)
             }
             OpState::InboundGet(op) => {
                 self.ops.insert(op_id, OpState::InboundGet(op));
@@ -629,6 +705,7 @@ impl DhtStateMachine {
         &mut self,
         op_id: OpId,
         phase: RpcPhase,
+        peer: NodeId,
         response: DhtResponse,
         mut op: PutOp,
         out: &mut SmallVec<[DhtEffect; 4]>,
@@ -637,12 +714,15 @@ impl DhtStateMachine {
             RpcPhase::PutLookup => {
                 match response {
                     DhtResponse::Nodes { nodes } => {
-                        op.frontier.add_candidates(nodes, self.local_id);
+                        op.frontier.responsive.insert(peer);
+                        self.insert_peer(peer, out);
+                        op.frontier
+                            .add_candidates(nodes, self.local_id, op.key.as_bytes());
                     }
-                    DhtResponse::Value { closer_nodes, .. } => {
-                        op.frontier.add_candidates(closer_nodes, self.local_id);
-                    }
-                    DhtResponse::Pong | DhtResponse::Stored | DhtResponse::Error { .. } => {}
+                    DhtResponse::Pong
+                    | DhtResponse::Value { .. }
+                    | DhtResponse::Stored
+                    | DhtResponse::Error { .. } => {}
                 }
 
                 self.dispatch_put_lookup_requests(op_id, &mut op, out);
@@ -650,11 +730,12 @@ impl DhtStateMachine {
                     self.begin_put_store(op_id, &mut op, out);
                 }
             }
-            RpcPhase::PutStore => match response {
-                DhtResponse::Stored => {}
-                DhtResponse::Error { .. } => {}
-                _ => {}
-            },
+            RpcPhase::PutStore => {
+                if matches!(response, DhtResponse::Stored) {
+                    op.store_count = op.store_count.saturating_add(1);
+                }
+                self.queue_put_stores(op_id, &mut op, out);
+            }
             _ => {
                 self.ops.insert(op_id, OpState::Put(op));
                 return;
@@ -683,48 +764,86 @@ impl DhtStateMachine {
                 entries,
                 closer_nodes,
             } => {
-                let value_count_before = op.values.len();
-                let now = self.now_secs;
+                let mut valid_response = entries.is_empty();
                 for entry in entries {
-                    if entry.expires_at <= now {
+                    if !stored_value_bounded(&op.key, &entry, self.now_secs)
+                        || !realm_matches_filter(op.realm_filter.as_ref(), &entry.realm_id)
+                    {
+                        record_get_peer_error(&mut op, peer, "invalid_record");
                         continue;
                     }
-                    if !realm_matches_filter(op.realm_filter.as_ref(), &entry.realm_id) {
+                    valid_response = true;
+                    let record_key = (entry.publisher, entry.realm_id);
+                    let stored = stored_value_entry(entry.clone(), self.now_secs);
+                    let existing = op.cache_entries.iter().find(|existing| {
+                        existing.publisher == entry.publisher && existing.realm_id == entry.realm_id
+                    });
+                    if existing.is_none() && op.cache_entries.len() >= MAX_ENTRIES_PER_KEY {
+                        out.push(DhtEffect::Output(DhtOutput::Failed {
+                            op_id,
+                            error: DhtIoError::StorageFull,
+                        }));
+                        return;
+                    }
+                    if existing.is_some_and(|existing| {
+                        existing.revision == entry.revision
+                            && !stored_value_matches(&entry, existing)
+                    }) {
+                        out.push(DhtEffect::Output(DhtOutput::Failed {
+                            op_id,
+                            error: DhtIoError::invalid_response(
+                                "publisher returned conflicting DHT records",
+                            ),
+                        }));
+                        return;
+                    }
+                    if existing.is_some_and(|existing| entry.revision <= existing.revision) {
                         continue;
                     }
-                    if op.seen_publishers.insert((entry.publisher, entry.realm_id)) {
-                        op.values.push(DhtEntry {
-                            node_id: entry.publisher,
-                            realm_id: entry.realm_id,
-                            value: entry.value,
-                            expires_at: entry.expires_at,
-                        });
+                    let merged = match merge_entry(
+                        &op.key,
+                        op.cache_entries.clone(),
+                        stored.clone(),
+                        self.now_secs,
+                    ) {
+                        Ok(merged) => merged,
+                        Err(MergeError::Stale) => continue,
+                        Err(MergeError::Capacity) => {
+                            out.push(DhtEffect::Output(DhtOutput::Failed {
+                                op_id,
+                                error: DhtIoError::StorageFull,
+                            }));
+                            return;
+                        }
+                        Err(MergeError::Encoding | MergeError::Invalid) => {
+                            record_get_peer_error(&mut op, peer, "invalid_record");
+                            continue;
+                        }
+                    };
+                    op.cache_entries = merged;
+                    if entry_is_fresh(entry.expires_at, self.now_secs) {
+                        if insert_get_value(&mut op, entry) {
+                            op.remote_values.insert(record_key);
+                            op.remote_entries.insert(record_key, stored);
+                        }
+                    } else if insert_get_floor(&mut op, &entry) {
+                        op.remote_entries.insert(record_key, stored);
                     }
                 }
-                op.remote_value_count = op
-                    .remote_value_count
-                    .saturating_add(op.values.len().saturating_sub(value_count_before));
-
-                for node_id in &closer_nodes {
-                    self.routing_table.insert(PeerInfo::new(*node_id));
+                if valid_response {
+                    op.successful_responses = op.successful_responses.saturating_add(1);
+                    op.frontier.responsive.insert(peer);
+                    self.insert_peer(peer, out);
                 }
-                op.frontier.add_candidates(closer_nodes, self.local_id);
-            }
-            DhtResponse::Nodes { nodes } => {
-                for node_id in &nodes {
-                    self.routing_table.insert(PeerInfo::new(*node_id));
-                }
-                op.frontier.add_candidates(nodes, self.local_id);
+                op.frontier
+                    .add_candidates(closer_nodes, self.local_id, op.key.as_bytes());
             }
             DhtResponse::Error { code, .. } => {
                 record_get_peer_error(&mut op, peer, format!("remote_error:{code:?}"));
             }
-            DhtResponse::Pong | DhtResponse::Stored => {}
-        }
-
-        if !op.values.is_empty() {
-            self.maybe_complete_get(op_id, op, out);
-            return;
+            DhtResponse::Pong | DhtResponse::Nodes { .. } | DhtResponse::Stored => {
+                record_get_peer_error(&mut op, peer, "unexpected_response");
+            }
         }
 
         self.dispatch_get_requests(op_id, &mut op, out);
@@ -746,7 +865,7 @@ impl DhtStateMachine {
         }
 
         if matches!(response, DhtResponse::Pong) {
-            self.routing_table.insert(PeerInfo::new(peer));
+            self.insert_peer(peer, out);
             op.active_nodes = op.active_nodes.saturating_add(1);
         }
 
@@ -764,15 +883,22 @@ impl DhtStateMachine {
         phase: RpcPhase,
         response: DhtResponse,
         op: EvictionPingOp,
+        out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
         if phase != RpcPhase::EvictionPing {
             self.ops.insert(op_id, OpState::EvictionPing(op));
             return;
         }
 
+        self.eviction_buckets.remove(&op.bucket_idx);
         let peer_alive = matches!(response, DhtResponse::Pong);
-        if !peer_alive {
-            let _ = self.routing_table.remove(&op.oldest_node);
+        if peer_alive {
+            self.insert_peer(op.oldest_node, out);
+        } else if self
+            .routing_table
+            .remove_seen(&op.oldest_node, op.oldest_seen)
+            .is_some()
+        {
             self.routing_table.insert(op.pending_peer.clone());
         }
 
@@ -788,6 +914,7 @@ impl DhtStateMachine {
         peer: NodeId,
         response: DhtResponse,
         op: MaintenancePingOp,
+        out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
         if phase != RpcPhase::MaintenancePing {
             self.ops.insert(op_id, OpState::MaintenancePing(op));
@@ -795,7 +922,9 @@ impl DhtStateMachine {
         }
 
         if matches!(response, DhtResponse::Pong) {
-            self.routing_table.insert(PeerInfo::new(peer));
+            self.insert_peer(peer, out);
+        } else {
+            let _ = self.routing_table.remove_seen(&op.peer, op.peer_seen);
         }
 
         if pending_rpc_count(&op.pending, RpcPhase::MaintenancePing) > 0 {
@@ -850,7 +979,7 @@ impl DhtStateMachine {
                     self.begin_put_store(op_id, &mut op, out);
                 }
             }
-            RpcPhase::PutStore => {}
+            RpcPhase::PutStore => self.queue_put_stores(op_id, &mut op, out),
             _ => {
                 self.ops.insert(op_id, OpState::Put(op));
                 return;
@@ -901,8 +1030,14 @@ impl DhtStateMachine {
             return;
         }
 
-        let _ = self.routing_table.evict_oldest(op.bucket_idx);
-        self.routing_table.insert(op.pending_peer.clone());
+        self.eviction_buckets.remove(&op.bucket_idx);
+        if self
+            .routing_table
+            .remove_seen(&op.oldest_node, op.oldest_seen)
+            .is_some()
+        {
+            self.routing_table.insert(op.pending_peer.clone());
+        }
     }
 
     fn handle_rpc_error_maintenance_ping(
@@ -916,7 +1051,68 @@ impl DhtStateMachine {
             return;
         }
 
-        let _ = self.routing_table.remove(&op.peer);
+        let _ = self.routing_table.remove_seen(&op.peer, op.peer_seen);
+    }
+
+    fn handle_storage_revision(
+        &mut self,
+        op_id: OpId,
+        stage: StorageStage,
+        revision: u64,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        let Some(mut op_state) = self.ops.remove(&op_id) else {
+            return;
+        };
+        if stage != StorageStage::PutRevision
+            || !take_pending_storage(op_state.pending_mut(), stage)
+        {
+            self.ops.insert(op_id, op_state);
+            return;
+        }
+        if revision == 0 {
+            out.push(DhtEffect::Output(DhtOutput::Failed {
+                op_id,
+                error: DhtIoError::storage("DHT revision must be non-zero"),
+            }));
+            return;
+        }
+
+        let OpState::Put(mut op) = op_state else {
+            self.ops.insert(op_id, op_state);
+            return;
+        };
+        let signed_data = signed_record_bytes(
+            &op.key,
+            &self.local_id,
+            &op.realm_id,
+            &op.value,
+            op.expires_at,
+            revision,
+        );
+        let signature = self.secret_key.sign(&signed_data);
+        let entry = StoredEntry {
+            publisher: self.local_id,
+            realm_id: op.realm_id,
+            value: op.value.clone(),
+            expires_at: op.expires_at,
+            revision,
+            signature,
+            retain_until: op.expires_at,
+        };
+        op.revision = Some(revision);
+        op.signature = Some(signature);
+        let key = op.key;
+        let mut op_state = OpState::Put(op);
+        self.queue_storage_merge(
+            op_id,
+            &mut op_state,
+            StorageStage::PutLocalMerge,
+            key,
+            vec![entry],
+            out,
+        );
+        self.ops.insert(op_id, op_state);
     }
 
     #[tracing::instrument(
@@ -945,28 +1141,7 @@ impl DhtStateMachine {
         }
 
         match op_state {
-            OpState::Put(mut op) => {
-                if stage != StorageStage::PutLocalRead {
-                    self.ops.insert(op_id, OpState::Put(op));
-                    return;
-                }
-
-                let new_entry = StoredEntry {
-                    publisher: self.local_id,
-                    realm_id: op.realm_id,
-                    value: op.value.clone(),
-                    expires_at: self.now_secs.saturating_add(op.ttl_secs),
-                    signature: Some(op.signature),
-                };
-                let merged = merge_entry(entries, new_entry, self.now_secs);
-                self.queue_storage_write_pending(
-                    op_id,
-                    &mut op.pending,
-                    StorageStage::PutLocalWrite,
-                    op.key,
-                    merged,
-                    out,
-                );
+            OpState::Put(op) => {
                 self.ops.insert(op_id, OpState::Put(op));
             }
             OpState::Get(mut op) => {
@@ -975,36 +1150,30 @@ impl DhtStateMachine {
                     return;
                 }
 
-                let now = self.now_secs;
-                let value_count_before = op.values.len();
-                for entry in live_entries(entries, now) {
+                let entries = retained_entries(entries, self.now_secs);
+                op.cache_entries = entries.clone();
+                for entry in entries {
                     if !realm_matches_filter(op.realm_filter.as_ref(), &entry.realm_id) {
                         continue;
                     }
-                    if op.seen_publishers.insert((entry.publisher, entry.realm_id)) {
-                        op.values.push(DhtEntry {
-                            node_id: entry.publisher,
-                            realm_id: entry.realm_id,
-                            value: entry.value,
-                            expires_at: entry.expires_at,
-                        });
+                    let value = stored_entry_value(entry);
+                    if !stored_value_bounded(&op.key, &value, self.now_secs) {
+                        continue;
                     }
-                }
-                op.local_value_count = op
-                    .local_value_count
-                    .saturating_add(op.values.len().saturating_sub(value_count_before));
-
-                if !op.values.is_empty() {
-                    self.maybe_complete_get(op_id, op, out);
-                    return;
+                    if entry_is_fresh(value.expires_at, self.now_secs) {
+                        insert_get_value(&mut op, value);
+                    } else {
+                        insert_get_floor(&mut op, &value);
+                    }
                 }
 
                 op.frontier.add_candidates(
                     self.routing_table
-                        .closest(op.key.as_bytes(), K)
+                        .closest(op.key.as_bytes(), LOOKUP_MAX_QUERIES)
                         .into_iter()
                         .map(|peer| peer.node_id),
                     self.local_id,
+                    op.key.as_bytes(),
                 );
 
                 self.dispatch_get_requests(op_id, &mut op, out);
@@ -1017,15 +1186,12 @@ impl DhtStateMachine {
                 }
 
                 let now = self.now_secs;
-                let values: Vec<StoredValue> = live_entries(entries, now)
+                let values: Vec<StoredValue> = retained_entries(entries, now)
                     .into_iter()
-                    .filter(|entry| realm_matches_filter(op.realm_filter.as_ref(), &entry.realm_id))
-                    .map(|entry| StoredValue {
-                        publisher: entry.publisher,
-                        realm_id: entry.realm_id,
-                        value: entry.value,
-                        expires_at: entry.expires_at,
-                        signature: entry.signature,
+                    .map(stored_entry_value)
+                    .filter(|entry| {
+                        realm_matches_filter(op.realm_filter.as_ref(), &entry.realm_id)
+                            && stored_value_bounded(&op.key, entry, now)
                     })
                     .collect();
                 let closer_nodes = self
@@ -1043,21 +1209,7 @@ impl DhtStateMachine {
                     },
                 })));
             }
-            OpState::InboundPut(mut op) => {
-                if stage != StorageStage::InboundPutRead {
-                    self.ops.insert(op_id, OpState::InboundPut(op));
-                    return;
-                }
-
-                let merged = merge_entry(entries, op.new_entry.clone(), self.now_secs);
-                self.queue_storage_write_pending(
-                    op_id,
-                    &mut op.pending,
-                    StorageStage::InboundPutWrite,
-                    op.key,
-                    merged,
-                    out,
-                );
+            OpState::InboundPut(op) => {
                 self.ops.insert(op_id, OpState::InboundPut(op));
             }
             OpState::Bootstrap(op) => {
@@ -1085,6 +1237,17 @@ impl DhtStateMachine {
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
         if op_id == CLEANUP_OP_ID {
+            match stage {
+                StorageStage::CleanupActivePrune => {
+                    self.cleanup_active = false;
+                    self.schedule_active(out);
+                }
+                StorageStage::CleanupFloorPrune => {
+                    self.cleanup_floor = false;
+                    self.schedule_floor(out);
+                }
+                _ => {}
+            }
             return;
         }
 
@@ -1098,7 +1261,7 @@ impl DhtStateMachine {
 
         match op_state {
             OpState::Put(mut op) => {
-                if stage != StorageStage::PutLocalWrite {
+                if stage != StorageStage::PutLocalMerge {
                     self.ops.insert(op_id, OpState::Put(op));
                     return;
                 }
@@ -1107,10 +1270,11 @@ impl DhtStateMachine {
 
                 op.frontier.add_candidates(
                     self.routing_table
-                        .closest(op.key.as_bytes(), K)
+                        .closest(op.key.as_bytes(), LOOKUP_MAX_QUERIES)
                         .into_iter()
                         .map(|peer| peer.node_id),
                     self.local_id,
+                    op.key.as_bytes(),
                 );
 
                 self.dispatch_put_lookup_requests(op_id, &mut op, out);
@@ -1120,7 +1284,7 @@ impl DhtStateMachine {
                 self.maybe_complete_put(op_id, op, out);
             }
             OpState::InboundPut(op) => {
-                if stage != StorageStage::InboundPutWrite {
+                if stage != StorageStage::InboundPutMerge {
                     self.ops.insert(op_id, OpState::InboundPut(op));
                     return;
                 }
@@ -1131,7 +1295,11 @@ impl DhtStateMachine {
                 })));
             }
             OpState::Get(op) => {
-                self.ops.insert(op_id, OpState::Get(op));
+                if stage == StorageStage::GetRemoteMerge {
+                    self.maybe_complete_get(op_id, op, out);
+                } else {
+                    self.ops.insert(op_id, OpState::Get(op));
+                }
             }
             OpState::Bootstrap(op) => {
                 self.ops.insert(op_id, OpState::Bootstrap(op));
@@ -1149,74 +1317,62 @@ impl DhtStateMachine {
     }
 
     #[tracing::instrument(
-        name = "dht.state.storage_delete",
-        level = "debug",
-        skip(self, _out),
-        fields(op_id, stage = ?stage)
-    )]
-    fn handle_storage_delete(
-        &mut self,
-        op_id: OpId,
-        stage: StorageStage,
-        _out: &mut SmallVec<[DhtEffect; 4]>,
-    ) {
-        if op_id == CLEANUP_OP_ID {
-            return;
-        }
-
-        let Some(mut op_state) = self.ops.remove(&op_id) else {
-            return;
-        };
-        let _ = take_pending_storage(op_state.pending_mut(), stage);
-        self.ops.insert(op_id, op_state);
-    }
-
-    #[tracing::instrument(
         name = "dht.state.storage_iter",
         level = "debug",
-        skip(self, values, next_start_after, out),
-        fields(op_id, stage = ?stage, page_len = values.len(), has_next = next_start_after.is_some())
+        skip(self, entries, out),
+        fields(op_id, stage = ?stage, index = ?index, page_len = entries.len())
     )]
     fn handle_storage_iter(
         &mut self,
         op_id: OpId,
         stage: StorageStage,
-        values: Vec<(Vec<u8>, Vec<StoredEntry>)>,
-        next_start_after: Option<Vec<u8>>,
+        index: DeadlineIndex,
+        entries: Vec<DeadlineEntry>,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
-        if op_id != CLEANUP_OP_ID || stage != StorageStage::CleanupIter {
+        if op_id != CLEANUP_OP_ID {
             return;
         }
 
-        for (raw_key, entries) in values {
-            let Ok(key_bytes): Result<[u8; 32], _> = raw_key.as_slice().try_into() else {
-                continue;
-            };
-            let key = DhtKeyId::from_bytes(key_bytes);
-
-            let original_len = entries.len();
-            let live = live_entries(entries, self.now_secs);
-            if live.is_empty() {
-                out.push(DhtEffect::IoRequest(Box::new(
-                    DhtIoRequest::StorageDelete {
-                        op_id: CLEANUP_OP_ID,
-                        stage: StorageStage::CleanupDelete,
-                        key,
-                    },
-                )));
-            } else if live.len() < original_len {
-                out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::StorageWrite {
-                    op_id: CLEANUP_OP_ID,
-                    stage: StorageStage::CleanupWrite,
-                    key,
-                    entries: live,
-                })));
+        let prune_stage = match (stage, index) {
+            (StorageStage::CleanupActiveIter, DeadlineIndex::Active) => {
+                StorageStage::CleanupActivePrune
             }
+            (StorageStage::CleanupFloorIter, DeadlineIndex::Floor) => {
+                StorageStage::CleanupFloorPrune
+            }
+            (StorageStage::CleanupActiveIter, _) => {
+                self.cleanup_active = false;
+                return;
+            }
+            (StorageStage::CleanupFloorIter, _) => {
+                self.cleanup_floor = false;
+                return;
+            }
+            _ => return,
+        };
+        let Some(entry) = entries.into_iter().next() else {
+            match index {
+                DeadlineIndex::Active => self.cleanup_active = false,
+                DeadlineIndex::Floor => self.cleanup_floor = false,
+            }
+            return;
+        };
+        if entry.deadline > self.now_secs {
+            match index {
+                DeadlineIndex::Active => self.cleanup_active = false,
+                DeadlineIndex::Floor => self.cleanup_floor = false,
+            }
+            return;
         }
 
-        self.cleanup_cursor = next_start_after;
-        self.cleanup_inflight = false;
+        out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::StoragePrune {
+            op_id: CLEANUP_OP_ID,
+            stage: prune_stage,
+            index,
+            entry,
+            now_secs: self.now_secs,
+        })));
     }
 
     #[tracing::instrument(
@@ -1233,8 +1389,14 @@ impl DhtStateMachine {
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
         if op_id == CLEANUP_OP_ID {
-            if stage == StorageStage::CleanupIter {
-                self.cleanup_inflight = false;
+            match stage {
+                StorageStage::CleanupActiveIter | StorageStage::CleanupActivePrune => {
+                    self.cleanup_active = false;
+                }
+                StorageStage::CleanupFloorIter | StorageStage::CleanupFloorPrune => {
+                    self.cleanup_floor = false;
+                }
+                _ => {}
             }
             return;
         }
@@ -1248,25 +1410,41 @@ impl DhtStateMachine {
         }
 
         match op_state {
-            OpState::Put(_) | OpState::Get(_) | OpState::Bootstrap(_) => {
+            OpState::Put(_) | OpState::Bootstrap(_) => {
                 out.push(DhtEffect::Output(DhtOutput::Failed { op_id, error }));
             }
+            OpState::Get(mut op) => match stage {
+                StorageStage::GetLocalRead => {
+                    op.frontier.add_candidates(
+                        self.routing_table
+                            .closest(op.key.as_bytes(), LOOKUP_MAX_QUERIES)
+                            .into_iter()
+                            .map(|peer| peer.node_id),
+                        self.local_id,
+                        op.key.as_bytes(),
+                    );
+                    self.dispatch_get_requests(op_id, &mut op, out);
+                    self.maybe_complete_get(op_id, op, out);
+                }
+                StorageStage::GetRemoteMerge => {
+                    // Read-repair write-back is best-effort: the looked-up values are
+                    // already signature-validated, so a losing write-back (stale
+                    // revision, full store, retry exhaustion) still completes the get.
+                    tracing::debug!(op_id, %error, "DHT read-repair write-back failed; completing get");
+                    self.maybe_complete_get(op_id, op, out);
+                }
+                _ => out.push(DhtEffect::Output(DhtOutput::Failed { op_id, error })),
+            },
             OpState::InboundGet(op) => {
                 out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
                     inbound_id: op.inbound_id,
-                    response: DhtResponse::Error {
-                        code: ErrorCode::Internal,
-                        message: "storage error".to_string(),
-                    },
+                    response: storage_error_response(&error),
                 })));
             }
             OpState::InboundPut(op) => {
                 out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
                     inbound_id: op.inbound_id,
-                    response: DhtResponse::Error {
-                        code: ErrorCode::Internal,
-                        message: "storage error".to_string(),
-                    },
+                    response: storage_error_response(&error),
                 })));
             }
             OpState::EvictionPing(_) | OpState::MaintenancePing(_) => {}
@@ -1277,14 +1455,18 @@ impl DhtStateMachine {
         name = "dht.state.inbound_request",
         level = "debug",
         skip(self, request, out),
-        fields(inbound_id, request = ?request)
+        fields(inbound_id, request = request_kind(&request))
     )]
     fn handle_inbound_request(
         &mut self,
         inbound_id: InboundId,
+        peer: NodeId,
         request: DhtRequest,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
+        if !matches!(&request, DhtRequest::PutValue { .. }) {
+            self.insert_peer(peer, out);
+        }
         match request {
             DhtRequest::Ping => {
                 out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
@@ -1327,7 +1509,8 @@ impl DhtStateMachine {
                 key,
                 realm_id,
                 value,
-                ttl_secs,
+                expires_at,
+                revision,
                 publisher,
                 signature,
             } => {
@@ -1342,18 +1525,34 @@ impl DhtStateMachine {
                     return;
                 };
 
-                if ttl_secs == 0 {
+                if value.len() > MAX_VALUE_SIZE {
                     out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
                         inbound_id,
                         response: DhtResponse::Error {
                             code: ErrorCode::InvalidRequest,
-                            message: "TTL must be greater than zero".to_string(),
+                            message: "DHT value exceeds the maximum size".to_string(),
                         },
                     })));
                     return;
                 }
 
-                let signed_data = signed_put_value_bytes(&key, &realm_id, &value, ttl_secs);
+                if revision == 0
+                    || !entry_is_fresh(expires_at, self.now_secs)
+                    || expires_at.saturating_sub(self.now_secs)
+                        > MAX_TTL_SECS.saturating_add(MAX_CLOCK_SKEW_SECS)
+                {
+                    out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
+                        inbound_id,
+                        response: DhtResponse::Error {
+                            code: ErrorCode::InvalidRequest,
+                            message: "DHT expiry is invalid".to_string(),
+                        },
+                    })));
+                    return;
+                }
+
+                let signed_data =
+                    signed_record_bytes(&key, &publisher, &realm_id, &value, expires_at, revision);
 
                 if publisher.verify(&signed_data, &signature).is_err() {
                     out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
@@ -1366,27 +1565,29 @@ impl DhtStateMachine {
                     return;
                 }
 
+                self.insert_peer(peer, out);
+
                 let new_entry = StoredEntry {
                     publisher,
                     realm_id,
                     value,
-                    expires_at: self.now_secs.saturating_add(ttl_secs),
-                    signature: Some(signature),
+                    expires_at,
+                    revision,
+                    signature,
+                    retain_until: expires_at,
                 };
 
                 let op_id = self.alloc_internal_op_id();
                 let mut op = OpState::InboundPut(InboundPutOp {
                     inbound_id,
-                    key,
-                    new_entry,
                     pending: HashMap::new(),
                 });
-                self.queue_storage_read(
+                self.queue_storage_merge(
                     op_id,
                     &mut op,
-                    StorageStage::InboundPutRead,
+                    StorageStage::InboundPutMerge,
                     key,
-                    None,
+                    vec![new_entry],
                     out,
                 );
                 self.ops.insert(op_id, op);
@@ -1464,7 +1665,7 @@ impl DhtStateMachine {
     fn put_lookup_exhausted(&self, op: &PutOp) -> bool {
         !op.lookup_finished
             && pending_rpc_count(&op.pending, RpcPhase::PutLookup) == 0
-            && op.frontier.pending_exhausted()
+            && op.frontier.lookup_complete(op.key.as_bytes())
     }
 
     #[tracing::instrument(
@@ -1478,9 +1679,19 @@ impl DhtStateMachine {
             return;
         }
         op.lookup_finished = true;
+        op.store_candidates = op.frontier.closest_responsive(op.key.as_bytes());
+        self.queue_put_stores(op_id, op, out);
+    }
 
-        let targets = op.frontier.closest_discovered(op.key.as_bytes(), K);
-        for peer in targets {
+    fn queue_put_stores(&self, op_id: OpId, op: &mut PutOp, out: &mut SmallVec<[DhtEffect; 4]>) {
+        let (Some(revision), Some(signature)) = (op.revision, op.signature) else {
+            return;
+        };
+        while op.store_count + pending_rpc_count(&op.pending, RpcPhase::PutStore) < K
+            && !op.store_candidates.is_empty()
+        {
+            let peer = op.store_candidates.remove(0);
+            op.store_attempt_count = op.store_attempt_count.saturating_add(1);
             self.queue_rpc_pending(
                 op_id,
                 &mut op.pending,
@@ -1490,9 +1701,10 @@ impl DhtStateMachine {
                     key: op.key,
                     realm_id: op.realm_id,
                     value: op.value.clone(),
-                    ttl_secs: op.ttl_secs,
+                    expires_at: op.expires_at,
+                    revision,
                     publisher: self.local_id,
-                    signature: Some(op.signature),
+                    signature: Some(signature),
                 },
                 op.trace_context.clone(),
                 out,
@@ -1506,21 +1718,66 @@ impl DhtStateMachine {
         skip(self, op, out),
         fields(op_id, key = %op.key, value_count = op.values.len())
     )]
-    fn maybe_complete_get(&mut self, op_id: OpId, op: GetOp, out: &mut SmallVec<[DhtEffect; 4]>) {
-        if !op.values.is_empty() {
-            let completed_reason = if op.remote_value_count > 0 {
-                DhtGetCompletedReason::RemoteValue
-            } else {
-                DhtGetCompletedReason::LocalValue
-            };
-            complete_get(op_id, op, completed_reason, out);
-        } else if pending_rpc_count(&op.pending, RpcPhase::GetLookup) == 0
-            && op.frontier.pending_exhausted()
+    fn maybe_complete_get(
+        &mut self,
+        op_id: OpId,
+        mut op: GetOp,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if pending_rpc_count(&op.pending, RpcPhase::GetLookup) > 0
+            || !op.frontier.lookup_complete(op.key.as_bytes())
         {
-            complete_get(op_id, op, DhtGetCompletedReason::LookupExhausted, out);
-        } else {
             self.ops.insert(op_id, OpState::Get(op));
+            return;
         }
+
+        if op.pending.contains_key(&PendingKey::Storage {
+            stage: StorageStage::GetRemoteMerge,
+        }) {
+            self.ops.insert(op_id, OpState::Get(op));
+            return;
+        }
+
+        if !op.remote_entries.is_empty() {
+            let key = op.key;
+            let mut entries = std::mem::take(&mut op.remote_entries)
+                .into_values()
+                .collect::<Vec<_>>();
+            entries.sort_unstable_by(|left, right| {
+                left.publisher
+                    .as_bytes()
+                    .cmp(right.publisher.as_bytes())
+                    .then_with(|| left.realm_id.as_bytes().cmp(right.realm_id.as_bytes()))
+            });
+            let mut op = OpState::Get(op);
+            self.queue_storage_merge(
+                op_id,
+                &mut op,
+                StorageStage::GetRemoteMerge,
+                key,
+                entries,
+                out,
+            );
+            self.ops.insert(op_id, op);
+            return;
+        }
+
+        if op.values.is_empty() && op.successful_responses == 0 {
+            out.push(DhtEffect::Output(DhtOutput::Failed {
+                op_id,
+                error: DhtIoError::network("all DHT lookup peers were unavailable"),
+            }));
+            return;
+        }
+
+        let completed_reason = if op.values.is_empty() {
+            DhtGetCompletedReason::LookupExhausted
+        } else if !op.remote_values.is_empty() {
+            DhtGetCompletedReason::RemoteValue
+        } else {
+            DhtGetCompletedReason::LocalValue
+        };
+        complete_get(op_id, op, completed_reason, out);
     }
 
     #[tracing::instrument(
@@ -1530,21 +1787,20 @@ impl DhtStateMachine {
         fields(op_id, key = %op.key)
     )]
     fn maybe_complete_put(&mut self, op_id: OpId, op: PutOp, out: &mut SmallVec<[DhtEffect; 4]>) {
-        let mut op = op;
-
-        if op.local_write_complete && !op.completion_emitted {
-            op.completion_emitted = true;
+        if op.local_write_complete
+            && op.lookup_finished
+            && pending_rpc_count(&op.pending, RpcPhase::PutStore) == 0
+            && (op.store_count >= K || op.store_candidates.is_empty())
+        {
             out.push(DhtEffect::Output(DhtOutput::Completed {
                 op_id,
-                result: DhtOutputValue::Unit,
+                result: DhtOutputValue::PutStored {
+                    stats: DhtPutStats {
+                        remote_attempt_count: op.store_attempt_count,
+                        remote_store_count: op.store_count,
+                    },
+                },
             }));
-        }
-
-        if op.completion_emitted {
-            if op.lookup_finished && pending_rpc_count(&op.pending, RpcPhase::PutStore) == 0 {
-                return;
-            }
-            self.ops.insert(op_id, OpState::Put(op));
         } else {
             self.ops.insert(op_id, OpState::Put(op));
         }
@@ -1591,18 +1847,19 @@ impl DhtStateMachine {
 
         peers.sort_unstable_by(|a, b| a.node_id.as_bytes().cmp(b.node_id.as_bytes()));
         let idx = (now_tick as usize) % peers.len();
-        let peer = peers[idx].node_id;
+        let peer = peers[idx].clone();
 
         let op_id = self.alloc_internal_op_id();
         let mut op = OpState::MaintenancePing(MaintenancePingOp {
-            peer,
+            peer: peer.node_id,
+            peer_seen: peer.last_seen,
             pending: HashMap::new(),
         });
         self.queue_rpc(
             op_id,
             &mut op,
             RpcPhase::MaintenancePing,
-            peer,
+            peer.node_id,
             DhtRequest::Ping,
             out,
         );
@@ -1611,16 +1868,35 @@ impl DhtStateMachine {
 
     #[tracing::instrument(name = "dht.state.schedule_cleanup", level = "trace", skip(self, out))]
     fn schedule_cleanup(&mut self, out: &mut SmallVec<[DhtEffect; 4]>) {
-        if self.cleanup_inflight {
+        self.schedule_active(out);
+        self.schedule_floor(out);
+    }
+
+    fn schedule_active(&mut self, out: &mut SmallVec<[DhtEffect; 4]>) {
+        if self.cleanup_active {
             return;
         }
 
-        self.cleanup_inflight = true;
+        self.cleanup_active = true;
         out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::StorageIter {
             op_id: CLEANUP_OP_ID,
-            stage: StorageStage::CleanupIter,
-            start_after: self.cleanup_cursor.clone(),
-            limit: CLEANUP_PAGE_SIZE,
+            stage: StorageStage::CleanupActiveIter,
+            index: DeadlineIndex::Active,
+            limit: 1,
+        })));
+    }
+
+    fn schedule_floor(&mut self, out: &mut SmallVec<[DhtEffect; 4]>) {
+        if self.cleanup_floor {
+            return;
+        }
+
+        self.cleanup_floor = true;
+        out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::StorageIter {
+            op_id: CLEANUP_OP_ID,
+            stage: StorageStage::CleanupFloorIter,
+            index: DeadlineIndex::Floor,
+            limit: 1,
         })));
     }
 
@@ -1635,7 +1911,10 @@ impl DhtStateMachine {
             return;
         }
 
-        let result = self.routing_table.insert(PeerInfo::new(node_id));
+        self.peer_epoch = self.peer_epoch.saturating_add(1);
+        let result = self
+            .routing_table
+            .insert(PeerInfo::seen(node_id, self.peer_epoch));
         let InsertResult::BucketFull { oldest, pending } = result else {
             return;
         };
@@ -1645,13 +1924,14 @@ impl DhtStateMachine {
         };
 
         let bucket_idx = self.local_id.bucket_index(&oldest_peer.node_id);
-        if bucket_idx >= 256 {
+        if bucket_idx >= 256 || !self.eviction_buckets.insert(bucket_idx) {
             return;
         }
 
         let op_id = self.alloc_internal_op_id();
         let mut op = OpState::EvictionPing(EvictionPingOp {
             oldest_node: oldest_peer.node_id,
+            oldest_seen: oldest_peer.last_seen,
             bucket_idx,
             pending_peer: pending,
             pending: HashMap::new(),
@@ -1671,7 +1951,7 @@ impl DhtStateMachine {
         name = "dht.state.queue_rpc",
         level = "debug",
         skip(self, op, request, out),
-        fields(op_id, phase = ?phase, peer = %peer, request = ?request)
+        fields(op_id, phase = ?phase, peer = %peer, request = request_kind(&request))
     )]
     fn queue_rpc(
         &self,
@@ -1699,7 +1979,7 @@ impl DhtStateMachine {
         name = "dht.state.queue_rpc_pending",
         level = "debug",
         skip(self, pending, request, trace_context, out),
-        fields(op_id, phase = ?phase, peer = %peer, request = ?request)
+        fields(op_id, phase = ?phase, peer = %peer, request = request_kind(&request))
     )]
     fn queue_rpc_pending(
         &self,
@@ -1755,32 +2035,46 @@ impl DhtStateMachine {
             stage,
             key,
             realm_filter,
+            now_secs: self.now_secs,
         })));
     }
 
-    #[tracing::instrument(
-        name = "dht.state.queue_storage_write",
-        level = "debug",
-        skip(self, pending, entries, out),
-        fields(op_id, stage = ?stage, key = %key, entry_count = entries.len())
-    )]
-    fn queue_storage_write_pending(
+    fn queue_storage_revision(
         &self,
         op_id: OpId,
-        pending: &mut PendingMap,
+        op: &mut OpState,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        let stage = StorageStage::PutRevision;
+        op.pending_mut().insert(
+            PendingKey::Storage { stage },
+            PendingMeta {
+                deadline_tick: None,
+            },
+        );
+        out.push(DhtEffect::IoRequest(Box::new(
+            DhtIoRequest::StorageRevision { op_id, stage },
+        )));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn queue_storage_merge(
+        &self,
+        op_id: OpId,
+        op: &mut OpState,
         stage: StorageStage,
         key: DhtKeyId,
         entries: Vec<StoredEntry>,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
-        pending.insert(
+        op.pending_mut().insert(
             PendingKey::Storage { stage },
             PendingMeta {
                 deadline_tick: None,
             },
         );
 
-        out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::StorageWrite {
+        out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::StorageMerge {
             op_id,
             stage,
             key,
@@ -1818,11 +2112,17 @@ impl DhtStateMachine {
 
 fn complete_get(
     op_id: OpId,
-    op: GetOp,
+    mut op: GetOp,
     completed_reason: DhtGetCompletedReason,
     out: &mut SmallVec<[DhtEffect; 4]>,
 ) {
     let stats = get_stats(&op, completed_reason);
+    op.values.sort_unstable_by(|left, right| {
+        left.node_id
+            .as_bytes()
+            .cmp(right.node_id.as_bytes())
+            .then_with(|| left.realm_id.as_bytes().cmp(right.realm_id.as_bytes()))
+    });
     out.push(DhtEffect::Output(DhtOutput::Completed {
         op_id,
         result: DhtOutputValue::GetValues {
@@ -1832,14 +2132,134 @@ fn complete_get(
     }));
 }
 
+fn stored_entry_value(entry: StoredEntry) -> StoredValue {
+    StoredValue {
+        publisher: entry.publisher,
+        realm_id: entry.realm_id,
+        value: entry.value,
+        expires_at: entry.expires_at,
+        revision: entry.revision,
+        signature: entry.signature,
+    }
+}
+
+fn stored_value_entry(entry: StoredValue, now_secs: u64) -> StoredEntry {
+    StoredEntry {
+        publisher: entry.publisher,
+        realm_id: entry.realm_id,
+        value: entry.value,
+        expires_at: entry.expires_at,
+        revision: entry.revision,
+        signature: entry.signature,
+        retain_until: retention_deadline(entry.expires_at, now_secs),
+    }
+}
+
+fn stored_value_matches(value: &StoredValue, stored: &StoredEntry) -> bool {
+    value.publisher == stored.publisher
+        && value.realm_id == stored.realm_id
+        && value.value == stored.value
+        && value.expires_at == stored.expires_at
+        && value.revision == stored.revision
+        && value.signature == stored.signature
+}
+
+fn stored_value_bounded(key: &DhtKeyId, entry: &StoredValue, now_secs: u64) -> bool {
+    entry.value.len() <= MAX_VALUE_SIZE
+        && entry.revision > 0
+        && entry.expires_at.saturating_sub(now_secs)
+            <= MAX_TTL_SECS.saturating_add(MAX_CLOCK_SKEW_SECS)
+        && retention_deadline(entry.expires_at, now_secs) > now_secs
+        && verify_stored_value(key, entry)
+}
+
+fn insert_get_value(op: &mut GetOp, entry: StoredValue) -> bool {
+    let record_key = (entry.publisher, entry.realm_id);
+    let revision = entry.revision;
+    let value = DhtEntry {
+        node_id: entry.publisher,
+        realm_id: entry.realm_id,
+        value: entry.value,
+        expires_at: entry.expires_at,
+    };
+
+    if let Some(index) = op.value_indices.get(&record_key).copied() {
+        let existing = &op.values[index];
+        let existing_revision = op.value_versions[&record_key];
+        if revision
+            .cmp(&existing_revision)
+            .then_with(|| value.expires_at.cmp(&existing.expires_at))
+            .then_with(|| value.value.cmp(&existing.value))
+            .is_gt()
+        {
+            op.values[index] = value;
+            op.value_versions.insert(record_key, revision);
+            return true;
+        }
+        return false;
+    }
+
+    if op
+        .value_versions
+        .get(&record_key)
+        .is_some_and(|current| revision <= *current)
+    {
+        return false;
+    }
+
+    op.value_indices.insert(record_key, op.values.len());
+    op.value_versions.insert(record_key, revision);
+    op.values.push(value);
+    true
+}
+
+fn insert_get_floor(op: &mut GetOp, entry: &StoredValue) -> bool {
+    let record_key = (entry.publisher, entry.realm_id);
+    if op
+        .value_versions
+        .get(&record_key)
+        .is_some_and(|revision| entry.revision <= *revision)
+    {
+        return false;
+    }
+
+    op.value_versions.insert(record_key, entry.revision);
+    remove_get_value(op, record_key);
+    true
+}
+
+fn remove_get_value(op: &mut GetOp, record_key: (NodeId, RealmId)) {
+    let Some(index) = op.value_indices.remove(&record_key) else {
+        return;
+    };
+    op.remote_values.remove(&record_key);
+    op.values.swap_remove(index);
+    if let Some(moved) = op.values.get(index) {
+        op.value_indices
+            .insert((moved.node_id, moved.realm_id), index);
+    }
+}
+
+fn storage_error_response(error: &DhtIoError) -> DhtResponse {
+    let (code, message) = match error {
+        DhtIoError::StorageFull => (ErrorCode::StorageFull, "DHT key capacity exceeded"),
+        DhtIoError::InvalidRequest(_) => (ErrorCode::InvalidRequest, "stale DHT record"),
+        _ => (ErrorCode::Internal, "storage error"),
+    };
+    DhtResponse::Error {
+        code,
+        message: message.to_string(),
+    }
+}
+
 fn get_stats(op: &GetOp, completed_reason: DhtGetCompletedReason) -> DhtGetStats {
     let queried_peers = limited_sorted_peers(&op.frontier.queried, LOOKUP_LOG_PEER_LIMIT);
     let queried_peer_count = op.frontier.queried.len();
 
     DhtGetStats {
         completed_reason,
-        local_value_count: op.local_value_count,
-        remote_value_count: op.remote_value_count,
+        local_value_count: op.values.len().saturating_sub(op.remote_values.len()),
+        remote_value_count: op.remote_values.len(),
         queried_peer_count,
         queried_peers,
         queried_peers_truncated: queried_peer_count > LOOKUP_LOG_PEER_LIMIT,
@@ -1876,6 +2296,8 @@ fn dht_io_error_label(error: &DhtIoError) -> &'static str {
         DhtIoError::Network(_) => "network",
         DhtIoError::Storage(_) => "storage",
         DhtIoError::InvalidResponse(_) => "invalid_response",
+        DhtIoError::InvalidRequest(_) => "invalid_request",
+        DhtIoError::StorageFull => "storage_full",
     }
 }
 
@@ -1924,6 +2346,7 @@ fn dht_input_kind(input: &DhtInput) -> &'static str {
     match input {
         DhtInput::Cmd(cmd) => dht_cmd_kind(cmd),
         DhtInput::Io(io) => dht_io_kind(io),
+        DhtInput::Clock { .. } => "clock",
         DhtInput::Tick { .. } => "tick",
     }
 }
@@ -1946,8 +2369,8 @@ fn dht_io_kind(io: &DhtIo) -> &'static str {
         DhtIo::InboundReadError { .. } => "inbound_read_error",
         DhtIo::InboundDropped { .. } => "inbound_dropped",
         DhtIo::StorageReadResult { .. } => "storage_read_result",
+        DhtIo::StorageRevisionResult { .. } => "storage_revision_result",
         DhtIo::StorageWriteResult { .. } => "storage_write_result",
-        DhtIo::StorageDeleteResult { .. } => "storage_delete_result",
         DhtIo::StorageIterResult { .. } => "storage_iter_result",
         DhtIo::StorageError { .. } => "storage_error",
         DhtIo::PeerSeen { .. } => "peer_seen",
@@ -1959,8 +2382,8 @@ fn dht_io_op_id(io: &DhtIo) -> Option<OpId> {
         DhtIo::RpcResponse { op_id, .. }
         | DhtIo::RpcError { op_id, .. }
         | DhtIo::StorageReadResult { op_id, .. }
+        | DhtIo::StorageRevisionResult { op_id, .. }
         | DhtIo::StorageWriteResult { op_id, .. }
-        | DhtIo::StorageDeleteResult { op_id, .. }
         | DhtIo::StorageIterResult { op_id, .. }
         | DhtIo::StorageError { op_id, .. } => Some(*op_id),
         DhtIo::InboundRequest { .. }
@@ -1978,8 +2401,8 @@ fn dht_io_inbound_id(io: &DhtIo) -> Option<InboundId> {
         DhtIo::RpcResponse { .. }
         | DhtIo::RpcError { .. }
         | DhtIo::StorageReadResult { .. }
+        | DhtIo::StorageRevisionResult { .. }
         | DhtIo::StorageWriteResult { .. }
-        | DhtIo::StorageDeleteResult { .. }
         | DhtIo::StorageIterResult { .. }
         | DhtIo::StorageError { .. }
         | DhtIo::PeerSeen { .. } => None,
@@ -1991,9 +2414,13 @@ mod tests {
     use super::*;
 
     fn make_node(seed: u8) -> NodeId {
+        make_secret(seed).public()
+    }
+
+    fn make_secret(seed: u8) -> iroh::SecretKey {
         let mut seed_bytes = [0u8; 32];
         seed_bytes[0] = seed;
-        iroh::SecretKey::from_bytes(&seed_bytes).public()
+        iroh::SecretKey::from_bytes(&seed_bytes)
     }
 
     fn make_realm(seed: u8) -> RealmId {
@@ -2007,6 +2434,1141 @@ mod tests {
             format!("00-{seed:032x}-{seed:016x}-01"),
             Some(format!("test={seed}")),
         )
+    }
+
+    fn make_value(
+        seed: u8,
+        key: DhtKeyId,
+        realm_id: RealmId,
+        value: &[u8],
+        expires_at: u64,
+    ) -> StoredValue {
+        make_version(seed, key, realm_id, value, expires_at, 1)
+    }
+
+    fn make_version(
+        seed: u8,
+        key: DhtKeyId,
+        realm_id: RealmId,
+        value: &[u8],
+        expires_at: u64,
+        revision: u64,
+    ) -> StoredValue {
+        let secret = make_secret(seed);
+        let publisher = secret.public();
+        let signed_data =
+            signed_record_bytes(&key, &publisher, &realm_id, value, expires_at, revision);
+        StoredValue {
+            publisher,
+            realm_id,
+            value: value.to_vec(),
+            expires_at,
+            revision,
+            signature: secret.sign(&signed_data),
+        }
+    }
+
+    fn make_entry(
+        seed: u8,
+        key: DhtKeyId,
+        realm_id: RealmId,
+        value: &[u8],
+        expires_at: u64,
+    ) -> StoredEntry {
+        let value = make_value(seed, key, realm_id, value, expires_at);
+        StoredEntry {
+            publisher: value.publisher,
+            realm_id: value.realm_id,
+            value: value.value,
+            expires_at: value.expires_at,
+            revision: value.revision,
+            signature: value.signature,
+            retain_until: value.expires_at,
+        }
+    }
+
+    fn start_get(state: &mut DhtStateMachine, op_id: OpId, key: DhtKeyId, peer: NodeId) {
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id,
+            key,
+            realm_filter: None,
+            trace_context: None,
+        }));
+        let effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id,
+            stage: StorageStage::GetLocalRead,
+            entries: Vec::new(),
+        }));
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(inner)
+                    if matches!(
+                        &**inner,
+                        DhtIoRequest::RpcRequest {
+                            phase: RpcPhase::GetLookup,
+                            peer: request_peer,
+                            ..
+                        } if *request_peer == peer
+                    )
+            )
+        }));
+    }
+
+    fn finish_get(
+        state: &mut DhtStateMachine,
+        op_id: OpId,
+        effects: &[DhtEffect],
+    ) -> SmallVec<[DhtEffect; 4]> {
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(inner)
+                    if matches!(&**inner, DhtIoRequest::StorageMerge {
+                        stage: StorageStage::GetRemoteMerge,
+                        ..
+                    })
+            )
+        }));
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, DhtEffect::Output(_)))
+        );
+        state.step(DhtInput::Io(DhtIo::StorageWriteResult {
+            op_id,
+            stage: StorageStage::GetRemoteMerge,
+        }))
+    }
+
+    fn start_put(
+        state: &mut DhtStateMachine,
+        op_id: OpId,
+        key: DhtKeyId,
+    ) -> SmallVec<[DhtEffect; 4]> {
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Put {
+            op_id,
+            key,
+            realm_id: make_realm(1),
+            value: b"value".to_vec(),
+            ttl: std::time::Duration::from_secs(60),
+            trace_context: None,
+        }));
+        let _ = reserve_put(state, op_id);
+        state.step(DhtInput::Io(DhtIo::StorageWriteResult {
+            op_id,
+            stage: StorageStage::PutLocalMerge,
+        }))
+    }
+
+    fn reserve_put(state: &mut DhtStateMachine, op_id: OpId) -> SmallVec<[DhtEffect; 4]> {
+        state.step(DhtInput::Io(DhtIo::StorageRevisionResult {
+            op_id,
+            stage: StorageStage::PutRevision,
+            revision: op_id.max(1),
+        }))
+    }
+
+    fn bucket_nodes(local_id: NodeId, count: usize) -> Vec<NodeId> {
+        let mut buckets: HashMap<usize, Vec<NodeId>> = HashMap::new();
+        for seed in 1u64..100_000 {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&seed.to_le_bytes());
+            let node = iroh::SecretKey::from_bytes(&bytes).public();
+            let bucket = local_id.bucket_index(&node);
+            if bucket >= 256 {
+                continue;
+            }
+            let nodes = buckets.entry(bucket).or_default();
+            nodes.push(node);
+            if nodes.len() == count {
+                return nodes.clone();
+            }
+        }
+        panic!("failed to generate peers for one bucket");
+    }
+
+    #[test]
+    fn forged_value_rejected() {
+        let local_secret = make_secret(70);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let key = DhtKeyId::from_data(b"forged-value");
+        let peer = make_node(71);
+        start_get(&mut state, 70, key, peer);
+
+        let mut forged = make_value(72, key, make_realm(1), b"authentic", 2_000);
+        forged.value = b"forged".to_vec();
+        let effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 70,
+            phase: RpcPhase::GetLookup,
+            peer,
+            response: DhtResponse::Value {
+                entries: vec![forged],
+                closer_nodes: Vec::new(),
+            },
+        }));
+
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::Output(DhtOutput::Failed { op_id: 70, .. })
+            )
+        }));
+    }
+
+    #[test]
+    fn expiry_tamper_rejected() {
+        let local_secret = make_secret(73);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let key = DhtKeyId::from_data(b"expiry-tamper");
+        let peer = make_node(74);
+        start_get(&mut state, 71, key, peer);
+
+        let mut forged = make_value(75, key, make_realm(1), b"value", 2_000);
+        forged.expires_at = 3_000;
+        let effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 71,
+            phase: RpcPhase::GetLookup,
+            peer,
+            response: DhtResponse::Value {
+                entries: vec![forged],
+                closer_nodes: Vec::new(),
+            },
+        }));
+
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::Output(DhtOutput::Failed { op_id: 71, .. })
+            )
+        }));
+    }
+
+    #[test]
+    fn revision_tamper_rejected() {
+        let local_secret = make_secret(91);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let key = DhtKeyId::from_data(b"revision-tamper");
+        let peer = make_node(92);
+        start_get(&mut state, 79, key, peer);
+
+        let mut forged = make_value(93, key, make_realm(1), b"value", 2_000);
+        forged.revision = forged.revision.saturating_add(1);
+        let effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 79,
+            phase: RpcPhase::GetLookup,
+            peer,
+            response: DhtResponse::Value {
+                entries: vec![forged],
+                closer_nodes: Vec::new(),
+            },
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [DhtEffect::Output(DhtOutput::Failed { op_id: 79, .. })]
+        ));
+    }
+
+    #[test]
+    fn get_fails_unavailable() {
+        let local_secret = make_secret(76);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let key = DhtKeyId::from_data(b"unavailable-get");
+        let peer = make_node(77);
+        start_get(&mut state, 72, key, peer);
+
+        let effects = state.step(DhtInput::Io(DhtIo::RpcError {
+            op_id: 72,
+            phase: RpcPhase::GetLookup,
+            peer,
+            error: DhtIoError::Timeout,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [DhtEffect::Output(DhtOutput::Failed {
+                op_id: 72,
+                error: DhtIoError::Network(_)
+            })]
+        ));
+    }
+
+    #[test]
+    fn get_empty_succeeds() {
+        let local_secret = make_secret(78);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let key = DhtKeyId::from_data(b"empty-get");
+        let peer = make_node(79);
+        start_get(&mut state, 73, key, peer);
+
+        let effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 73,
+            phase: RpcPhase::GetLookup,
+            peer,
+            response: DhtResponse::Value {
+                entries: Vec::new(),
+                closer_nodes: Vec::new(),
+            },
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [DhtEffect::Output(DhtOutput::Completed {
+                result: DhtOutputValue::GetValues { values, .. },
+                ..
+            })] if values.is_empty()
+        ));
+    }
+
+    #[test]
+    fn get_storage_fallback() {
+        let local_secret = make_secret(83);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let key = DhtKeyId::from_data(b"storage-fallback");
+        let peer = make_node(84);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id: 80,
+            key,
+            realm_filter: None,
+            trace_context: None,
+        }));
+
+        let effects = state.step(DhtInput::Io(DhtIo::StorageError {
+            op_id: 80,
+            stage: StorageStage::GetLocalRead,
+            error: DhtIoError::storage("local read failed"),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [DhtEffect::IoRequest(request)]
+                if matches!(
+                    &**request,
+                    DhtIoRequest::RpcRequest {
+                        phase: RpcPhase::GetLookup,
+                        peer: request_peer,
+                        ..
+                    } if *request_peer == peer
+                )
+        ));
+
+        let value = make_value(85, key, make_realm(1), b"remote", 2_000);
+        let effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 80,
+            phase: RpcPhase::GetLookup,
+            peer,
+            response: DhtResponse::Value {
+                entries: vec![value],
+                closer_nodes: Vec::new(),
+            },
+        }));
+        let effects = finish_get(&mut state, 80, &effects);
+        assert!(matches!(
+            effects.as_slice(),
+            [DhtEffect::Output(DhtOutput::Completed {
+                result: DhtOutputValue::GetValues { values, .. },
+                ..
+            })] if values.len() == 1 && values[0].value == b"remote"
+        ));
+    }
+
+    #[test]
+    fn old_floor_rejected() {
+        let local_secret = make_secret(86);
+        let now_secs = MAX_TTL_SECS + MAX_CLOCK_SKEW_SECS + 1_000;
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, now_secs);
+        let key = DhtKeyId::from_data(b"old-remote-floor");
+        let peer = make_node(87);
+        start_get(&mut state, 81, key, peer);
+
+        let floor = make_version(
+            88,
+            key,
+            make_realm(1),
+            b"expired",
+            now_secs - MAX_TTL_SECS - MAX_CLOCK_SKEW_SECS,
+            2,
+        );
+        let effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 81,
+            phase: RpcPhase::GetLookup,
+            peer,
+            response: DhtResponse::Value {
+                entries: vec![floor],
+                closer_nodes: Vec::new(),
+            },
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [DhtEffect::Output(DhtOutput::Failed { op_id: 81, .. })]
+        ));
+        assert!(effects.iter().all(|effect| !matches!(
+            effect,
+            DhtEffect::IoRequest(inner)
+                if matches!(&**inner, DhtIoRequest::StorageMerge { .. })
+        )));
+    }
+
+    #[test]
+    fn remote_floor_wins() {
+        let local_secret = make_secret(89);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let key = DhtKeyId::from_data(b"remote-floor-wins");
+        let realm_id = make_realm(1);
+        let first_peer = make_node(90);
+        let second_peer = make_node(91);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer {
+            node_id: first_peer,
+        }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer {
+            node_id: second_peer,
+        }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id: 82,
+            key,
+            realm_filter: None,
+            trace_context: None,
+        }));
+        let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 82,
+            stage: StorageStage::GetLocalRead,
+            entries: Vec::new(),
+        }));
+
+        let first = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 82,
+            phase: RpcPhase::GetLookup,
+            peer: first_peer,
+            response: DhtResponse::Value {
+                entries: vec![make_version(92, key, realm_id, b"live", 2_000, 1)],
+                closer_nodes: Vec::new(),
+            },
+        }));
+        assert!(
+            first
+                .iter()
+                .all(|effect| !matches!(effect, DhtEffect::Output(_)))
+        );
+
+        let pending = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 82,
+            phase: RpcPhase::GetLookup,
+            peer: second_peer,
+            response: DhtResponse::Value {
+                entries: vec![make_version(92, key, realm_id, b"floor", 900, 2)],
+                closer_nodes: Vec::new(),
+            },
+        }));
+        assert!(pending.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(inner)
+                    if matches!(&**inner, DhtIoRequest::StorageMerge {
+                        stage: StorageStage::GetRemoteMerge,
+                        entries,
+                        ..
+                    } if entries.len() == 1
+                        && entries[0].revision == 2
+                        && entries[0].expires_at == 900)
+            )
+        }));
+
+        let complete = finish_get(&mut state, 82, &pending);
+        assert!(matches!(
+            complete.as_slice(),
+            [DhtEffect::Output(DhtOutput::Completed {
+                result: DhtOutputValue::GetValues { values, stats },
+                ..
+            })] if values.is_empty()
+                && stats.completed_reason == DhtGetCompletedReason::LookupExhausted
+                && stats.local_value_count == 0
+                && stats.remote_value_count == 0
+        ));
+    }
+
+    #[test]
+    fn writeback_error_completes() {
+        // A failed read-repair write-back (here a full store) still returns the
+        // signature-validated values the lookup already collected.
+        let local_secret = make_secret(93);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let key = DhtKeyId::from_data(b"remote-cache-failure");
+        let peer = make_node(94);
+        start_get(&mut state, 83, key, peer);
+
+        let pending = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 83,
+            phase: RpcPhase::GetLookup,
+            peer,
+            response: DhtResponse::Value {
+                entries: vec![make_value(95, key, make_realm(1), b"remote", 2_000)],
+                closer_nodes: Vec::new(),
+            },
+        }));
+        assert!(pending.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(inner)
+                    if matches!(&**inner, DhtIoRequest::StorageMerge {
+                        stage: StorageStage::GetRemoteMerge,
+                        ..
+                    })
+            )
+        }));
+        assert!(
+            pending
+                .iter()
+                .all(|effect| !matches!(effect, DhtEffect::Output(_)))
+        );
+
+        let effects = state.step(DhtInput::Io(DhtIo::StorageError {
+            op_id: 83,
+            stage: StorageStage::GetRemoteMerge,
+            error: DhtIoError::StorageFull,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [DhtEffect::Output(DhtOutput::Completed {
+                op_id: 83,
+                result: DhtOutputValue::GetValues { values, stats },
+            })] if values.len() == 1
+                && values[0].value == b"remote".to_vec()
+                && stats.completed_reason == DhtGetCompletedReason::RemoteValue
+                && stats.remote_value_count == 1
+        ));
+    }
+
+    #[test]
+    fn writeback_stale_completes() {
+        // A concurrent inbound put can advance the stored revision past the fetched
+        // one, so the write-back merge fails as stale; the get must still complete.
+        let local_secret = make_secret(96);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let key = DhtKeyId::from_data(b"remote-cache-stale");
+        let peer = make_node(97);
+        start_get(&mut state, 86, key, peer);
+
+        let pending = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 86,
+            phase: RpcPhase::GetLookup,
+            peer,
+            response: DhtResponse::Value {
+                entries: vec![make_value(98, key, make_realm(1), b"remote", 2_000)],
+                closer_nodes: Vec::new(),
+            },
+        }));
+        assert!(
+            pending
+                .iter()
+                .all(|effect| !matches!(effect, DhtEffect::Output(_)))
+        );
+
+        let effects = state.step(DhtInput::Io(DhtIo::StorageError {
+            op_id: 86,
+            stage: StorageStage::GetRemoteMerge,
+            error: DhtIoError::invalid_request("record version is stale or conflicting"),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [DhtEffect::Output(DhtOutput::Completed {
+                op_id: 86,
+                result: DhtOutputValue::GetValues { values, .. },
+            })] if values.len() == 1 && values[0].value == b"remote".to_vec()
+        ));
+    }
+
+    #[test]
+    fn equal_conflict_fails() {
+        let local_secret = make_secret(99);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let key = DhtKeyId::from_data(b"equal-revision-conflict");
+        let realm_id = make_realm(1);
+        let first_peer = make_node(100);
+        let second_peer = make_node(101);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer {
+            node_id: first_peer,
+        }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer {
+            node_id: second_peer,
+        }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id: 84,
+            key,
+            realm_filter: None,
+            trace_context: None,
+        }));
+        let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 84,
+            stage: StorageStage::GetLocalRead,
+            entries: Vec::new(),
+        }));
+
+        let _ = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 84,
+            phase: RpcPhase::GetLookup,
+            peer: first_peer,
+            response: DhtResponse::Value {
+                entries: vec![make_value(102, key, realm_id, b"first", 2_000)],
+                closer_nodes: Vec::new(),
+            },
+        }));
+        let effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 84,
+            phase: RpcPhase::GetLookup,
+            peer: second_peer,
+            response: DhtResponse::Value {
+                entries: vec![make_value(102, key, realm_id, b"second", 2_100)],
+                closer_nodes: Vec::new(),
+            },
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [DhtEffect::Output(DhtOutput::Failed {
+                op_id: 84,
+                error: DhtIoError::InvalidResponse(_)
+            })]
+        ));
+    }
+
+    #[test]
+    fn cache_capacity_fails() {
+        let local_secret = make_secret(103);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let key = DhtKeyId::from_data(b"cache-capacity-bound");
+        let peer = make_node(104);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id: 85,
+            key,
+            realm_filter: None,
+            trace_context: None,
+        }));
+
+        let entries = (0..super::super::constants::MAX_ENTRIES_PER_KEY)
+            .map(|seed| make_entry(seed as u8, key, make_realm(seed as u8), b"local", 2_000))
+            .collect();
+        let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 85,
+            stage: StorageStage::GetLocalRead,
+            entries,
+        }));
+
+        let effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 85,
+            phase: RpcPhase::GetLookup,
+            peer,
+            response: DhtResponse::Value {
+                entries: vec![make_value(0, key, make_realm(1), b"remote", 2_000)],
+                closer_nodes: Vec::new(),
+            },
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [DhtEffect::Output(DhtOutput::Failed {
+                op_id: 85,
+                error: DhtIoError::StorageFull
+            })]
+        ));
+    }
+
+    #[test]
+    fn tick_sets_expiry() {
+        let local_secret = make_secret(80);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let _ = state.step(DhtInput::Tick {
+            now_tick: 1,
+            now_secs: 10_000,
+        });
+
+        let key = DhtKeyId::from_data(b"sampled-time");
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Put {
+            op_id: 74,
+            key,
+            realm_id: make_realm(1),
+            value: b"value".to_vec(),
+            ttl: std::time::Duration::from_secs(60),
+            trace_context: None,
+        }));
+        let effects = reserve_put(&mut state, 74);
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(inner)
+                    if matches!(
+                        &**inner,
+                        DhtIoRequest::StorageMerge { entries, .. }
+                            if entries.len() == 1 && entries[0].expires_at == 10_060
+                    )
+            )
+        }));
+    }
+
+    #[test]
+    fn oversized_put_rejected() {
+        let local_secret = make_secret(81);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let effects = state.step(DhtInput::Cmd(DhtCmd::Put {
+            op_id: 75,
+            key: DhtKeyId::from_data(b"oversized-put"),
+            realm_id: make_realm(1),
+            value: vec![0; MAX_VALUE_SIZE + 1],
+            ttl: std::time::Duration::from_secs(60),
+            trace_context: None,
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [DhtEffect::Output(DhtOutput::Failed {
+                op_id: 75,
+                error: DhtIoError::InvalidRequest(_)
+            })]
+        ));
+    }
+
+    #[test]
+    fn long_ttl_rejected() {
+        let local_secret = make_secret(82);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let effects = state.step(DhtInput::Cmd(DhtCmd::Put {
+            op_id: 76,
+            key: DhtKeyId::from_data(b"long-ttl"),
+            realm_id: make_realm(1),
+            value: b"value".to_vec(),
+            ttl: std::time::Duration::from_secs(MAX_TTL_SECS + 1),
+            trace_context: None,
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [DhtEffect::Output(DhtOutput::Failed {
+                op_id: 76,
+                error: DhtIoError::InvalidRequest(_)
+            })]
+        ));
+    }
+
+    #[test]
+    fn eviction_probe_serialized() {
+        let local_secret = make_secret(83);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
+        let nodes = bucket_nodes(local_id, K + 2);
+        for node_id in &nodes[..K] {
+            assert!(
+                state
+                    .step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: *node_id }))
+                    .is_empty()
+            );
+        }
+
+        let first = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: nodes[K] }));
+        assert_eq!(
+            first
+                .iter()
+                .filter(|effect| matches!(
+                    effect,
+                    DhtEffect::IoRequest(inner)
+                        if matches!(&**inner, DhtIoRequest::RpcRequest {
+                            phase: RpcPhase::EvictionPing,
+                            ..
+                        })
+                ))
+                .count(),
+            1
+        );
+
+        let duplicate = state.step(DhtInput::Cmd(DhtCmd::AddPeer {
+            node_id: nodes[K + 1],
+        }));
+        assert!(duplicate.is_empty());
+    }
+
+    #[test]
+    fn pong_refreshes_lru() {
+        let local_secret = make_secret(84);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
+        let nodes = bucket_nodes(local_id, K + 2);
+        for node_id in &nodes[..K] {
+            let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: *node_id }));
+        }
+
+        let effects = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: nodes[K] }));
+        let op_id = effects
+            .iter()
+            .find_map(|effect| {
+                if let DhtEffect::IoRequest(inner) = effect
+                    && let DhtIoRequest::RpcRequest {
+                        op_id,
+                        phase: RpcPhase::EvictionPing,
+                        peer,
+                        ..
+                    } = &**inner
+                    && *peer == nodes[0]
+                {
+                    Some(*op_id)
+                } else {
+                    None
+                }
+            })
+            .expect("eviction probe");
+        let _ = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id,
+            phase: RpcPhase::EvictionPing,
+            peer: nodes[0],
+            response: DhtResponse::Pong,
+        }));
+
+        let next = state.step(DhtInput::Cmd(DhtCmd::AddPeer {
+            node_id: nodes[K + 1],
+        }));
+        assert!(next.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(inner)
+                    if matches!(&**inner, DhtIoRequest::RpcRequest {
+                        phase: RpcPhase::EvictionPing,
+                        peer,
+                        ..
+                    } if *peer == nodes[1])
+            )
+        }));
+    }
+
+    #[test]
+    fn eviction_removes_probed() {
+        let local_secret = make_secret(85);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
+        let nodes = bucket_nodes(local_id, K + 1);
+        for node_id in &nodes[..K] {
+            let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: *node_id }));
+        }
+
+        let effects = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: nodes[K] }));
+        let op_id = effects
+            .iter()
+            .find_map(|effect| {
+                if let DhtEffect::IoRequest(inner) = effect
+                    && let DhtIoRequest::RpcRequest {
+                        op_id,
+                        phase: RpcPhase::EvictionPing,
+                        ..
+                    } = &**inner
+                {
+                    Some(*op_id)
+                } else {
+                    None
+                }
+            })
+            .expect("eviction probe");
+        let _ = state.step(DhtInput::Io(DhtIo::RpcError {
+            op_id,
+            phase: RpcPhase::EvictionPing,
+            peer: nodes[0],
+            error: DhtIoError::Timeout,
+        }));
+
+        let peers: HashSet<NodeId> = state
+            .routing_table
+            .all_peers()
+            .into_iter()
+            .map(|peer| peer.node_id)
+            .collect();
+        assert_eq!(peers.len(), K);
+        assert!(!peers.contains(&nodes[0]));
+        assert!(peers.contains(&nodes[1]));
+        assert!(peers.contains(&nodes[K]));
+    }
+
+    #[test]
+    fn stale_probe_preserves() {
+        let local_secret = make_secret(90);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
+        let nodes = bucket_nodes(local_id, K + 1);
+        for node_id in &nodes[..K] {
+            let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: *node_id }));
+        }
+
+        let effects = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: nodes[K] }));
+        let op_id = effects
+            .iter()
+            .find_map(|effect| {
+                if let DhtEffect::IoRequest(inner) = effect
+                    && let DhtIoRequest::RpcRequest {
+                        op_id,
+                        phase: RpcPhase::EvictionPing,
+                        ..
+                    } = &**inner
+                {
+                    Some(*op_id)
+                } else {
+                    None
+                }
+            })
+            .expect("eviction probe");
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: nodes[0] }));
+        let _ = state.step(DhtInput::Io(DhtIo::RpcError {
+            op_id,
+            phase: RpcPhase::EvictionPing,
+            peer: nodes[0],
+            error: DhtIoError::Timeout,
+        }));
+
+        let peers: HashSet<NodeId> = state
+            .routing_table
+            .all_peers()
+            .into_iter()
+            .map(|peer| peer.node_id)
+            .collect();
+        assert_eq!(peers.len(), K);
+        assert!(peers.contains(&nodes[0]));
+        assert!(!peers.contains(&nodes[K]));
+    }
+
+    #[test]
+    fn eviction_aba_preserves() {
+        let local_secret = make_secret(91);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
+        let nodes = bucket_nodes(local_id, K + 1);
+        for node_id in &nodes[..K] {
+            let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: *node_id }));
+        }
+
+        let effects = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: nodes[K] }));
+        let op_id = effects
+            .iter()
+            .find_map(|effect| {
+                if let DhtEffect::IoRequest(inner) = effect
+                    && let DhtIoRequest::RpcRequest {
+                        op_id,
+                        phase: RpcPhase::EvictionPing,
+                        ..
+                    } = &**inner
+                {
+                    Some(*op_id)
+                } else {
+                    None
+                }
+            })
+            .expect("eviction probe");
+
+        let _ = state.routing_table.remove(&nodes[0]);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: nodes[0] }));
+        let _ = state.step(DhtInput::Io(DhtIo::RpcError {
+            op_id,
+            phase: RpcPhase::EvictionPing,
+            peer: nodes[0],
+            error: DhtIoError::Timeout,
+        }));
+
+        let peers = state.routing_table.all_peers();
+        assert!(peers.iter().any(|peer| peer.node_id == nodes[0]));
+        assert!(!peers.iter().any(|peer| peer.node_id == nodes[K]));
+    }
+
+    #[test]
+    fn expiry_breaks_ties() {
+        let local_secret = make_secret(92);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
+        let key = DhtKeyId::from_data(b"expiry-tie-break");
+        let realm_id = make_realm(1);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id: 91,
+            key,
+            realm_filter: None,
+            trace_context: None,
+        }));
+        let OpState::Get(mut op) = state.ops.remove(&91).expect("get operation") else {
+            panic!("expected get operation");
+        };
+
+        let shorter = make_value(93, key, realm_id, b"same", 1_500);
+        let longer = make_value(93, key, realm_id, b"same", 1_600);
+        assert!(insert_get_value(&mut op, shorter.clone()));
+        assert!(insert_get_value(&mut op, longer));
+        assert!(!insert_get_value(&mut op, shorter));
+        assert_eq!(op.values[0].expires_at, 1_600);
+    }
+
+    #[test]
+    fn put_uses_responders() {
+        let local_secret = make_secret(86);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
+        let first = make_node(87);
+        let second = make_node(88);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: first }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: second }));
+        let key = DhtKeyId::from_data(b"responsive-targets");
+        let lookup = start_put(&mut state, 77, key);
+        let lookup_peers: Vec<NodeId> = lookup
+            .iter()
+            .filter_map(|effect| {
+                if let DhtEffect::IoRequest(inner) = effect
+                    && let DhtIoRequest::RpcRequest {
+                        phase: RpcPhase::PutLookup,
+                        peer,
+                        ..
+                    } = &**inner
+                {
+                    Some(*peer)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(lookup_peers.len(), 2);
+
+        let responsive = lookup_peers[0];
+        let failed = lookup_peers[1];
+        let _ = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 77,
+            phase: RpcPhase::PutLookup,
+            peer: responsive,
+            response: DhtResponse::Nodes { nodes: Vec::new() },
+        }));
+        let store = state.step(DhtInput::Io(DhtIo::RpcError {
+            op_id: 77,
+            phase: RpcPhase::PutLookup,
+            peer: failed,
+            error: DhtIoError::Timeout,
+        }));
+
+        let store_peers: Vec<NodeId> = store
+            .iter()
+            .filter_map(|effect| {
+                if let DhtEffect::IoRequest(inner) = effect
+                    && let DhtIoRequest::RpcRequest {
+                        phase: RpcPhase::PutStore,
+                        peer,
+                        ..
+                    } = &**inner
+                {
+                    Some(*peer)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(store_peers, vec![responsive]);
+    }
+
+    #[test]
+    fn put_uses_fallbacks() {
+        let local_secret = make_secret(89);
+        let local_id = local_secret.public();
+        let state = DhtStateMachine::new(local_id, local_secret.clone(), 1_000);
+        let key = DhtKeyId::from_data(b"store-fallbacks");
+        let realm_id = make_realm(1);
+        let value = b"value".to_vec();
+        let expires_at = 2_000;
+        let revision = 1;
+        let signed_data =
+            signed_record_bytes(&key, &local_id, &realm_id, &value, expires_at, revision);
+        let mut op = PutOp {
+            key,
+            realm_id,
+            value,
+            expires_at,
+            revision: Some(revision),
+            signature: Some(local_secret.sign(&signed_data)),
+            frontier: LookupFrontier::default(),
+            local_write_complete: true,
+            lookup_finished: true,
+            store_candidates: (1..=K + 1).map(|seed| make_node(seed as u8)).collect(),
+            store_attempt_count: 0,
+            store_count: 0,
+            trace_context: None,
+            pending: HashMap::new(),
+        };
+
+        let mut initial = SmallVec::new();
+        state.queue_put_stores(78, &mut op, &mut initial);
+        assert_eq!(pending_rpc_count(&op.pending, RpcPhase::PutStore), K);
+        let failed = initial
+            .iter()
+            .find_map(|effect| {
+                if let DhtEffect::IoRequest(inner) = effect
+                    && let DhtIoRequest::RpcRequest { peer, .. } = &**inner
+                {
+                    Some(*peer)
+                } else {
+                    None
+                }
+            })
+            .expect("initial store target");
+        assert!(take_pending_rpc(
+            &mut op.pending,
+            RpcPhase::PutStore,
+            failed
+        ));
+
+        let mut fallback = SmallVec::new();
+        state.queue_put_stores(78, &mut op, &mut fallback);
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(op.store_attempt_count, K + 1);
+    }
+
+    #[test]
+    fn lookups_seed_fallbacks() {
+        let local_secret = make_secret(98);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
+        for seed in 1..=K + 1 {
+            let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer {
+                node_id: make_node(seed as u8),
+            }));
+        }
+        assert_eq!(state.routing_table.all_peers().len(), K + 1);
+
+        let get_key = DhtKeyId::from_data(b"get-known-fallbacks");
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id: 79,
+            key: get_key,
+            realm_filter: None,
+            trace_context: None,
+        }));
+        let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 79,
+            stage: StorageStage::GetLocalRead,
+            entries: Vec::new(),
+        }));
+        let OpState::Get(get) = state.ops.get(&79).expect("get operation") else {
+            panic!("expected get operation");
+        };
+        assert_eq!(get.frontier.discovered.len(), K + 1);
+
+        let put_key = DhtKeyId::from_data(b"put-known-fallbacks");
+        let _ = start_put(&mut state, 80, put_key);
+        let OpState::Put(put) = state.ops.get(&80).expect("put operation") else {
+            panic!("expected put operation");
+        };
+        assert_eq!(put.frontier.discovered.len(), K + 1);
+    }
+
+    #[test]
+    fn frontier_stays_bounded() {
+        let target = [0u8; 32];
+        let local_id = make_node(255);
+        let mut nodes = (1..=LOOKUP_MAX_QUERIES + 1)
+            .map(|seed| make_node(seed as u8))
+            .collect::<Vec<_>>();
+        nodes.sort_unstable_by(|left, right| compare_distance(&target, left, right));
+        let closest = nodes[0];
+        let mut frontier = LookupFrontier::default();
+        frontier.add_candidates(nodes.into_iter().skip(1), local_id, &target);
+        assert_eq!(frontier.discovered.len(), LOOKUP_MAX_QUERIES);
+
+        frontier.add_candidates([closest], local_id, &target);
+
+        assert_eq!(frontier.discovered.len(), LOOKUP_MAX_QUERIES);
+        assert!(frontier.discovered.contains(&closest));
     }
 
     #[test]
@@ -2057,14 +3619,14 @@ mod tests {
                 ttl: std::time::Duration::from_secs(30),
                 trace_context: None,
             }),
-            DhtInput::Io(DhtIo::StorageReadResult {
+            DhtInput::Io(DhtIo::StorageRevisionResult {
                 op_id: 1,
-                stage: StorageStage::PutLocalRead,
-                entries: Vec::new(),
+                stage: StorageStage::PutRevision,
+                revision: 1,
             }),
             DhtInput::Io(DhtIo::StorageWriteResult {
                 op_id: 1,
-                stage: StorageStage::PutLocalWrite,
+                stage: StorageStage::PutLocalMerge,
             }),
         ];
 
@@ -2110,6 +3672,7 @@ mod tests {
 
         let timeout_effects = state.step(DhtInput::Tick {
             now_tick: RPC_TIMEOUT_TICKS,
+            now_secs: 0,
         });
         assert!(timeout_effects.iter().any(|effect| {
             matches!(
@@ -2270,7 +3833,7 @@ mod tests {
     }
 
     #[test]
-    fn put_succeeds_without_remote_store_targets() {
+    fn put_reports_local() {
         let local_secret = iroh::SecretKey::from_bytes(&[41u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
@@ -2284,15 +3847,10 @@ mod tests {
             ttl: std::time::Duration::from_secs(60),
             trace_context: None,
         }));
-        let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
-            op_id: 11,
-            stage: StorageStage::PutLocalRead,
-            entries: Vec::new(),
-        }));
-
+        let _ = reserve_put(&mut state, 11);
         let effects = state.step(DhtInput::Io(DhtIo::StorageWriteResult {
             op_id: 11,
-            stage: StorageStage::PutLocalWrite,
+            stage: StorageStage::PutLocalMerge,
         }));
 
         assert!(effects.iter().any(|effect| {
@@ -2300,14 +3858,14 @@ mod tests {
                 effect,
                 DhtEffect::Output(DhtOutput::Completed {
                     op_id: 11,
-                    result: DhtOutputValue::Unit
-                })
+                    result: DhtOutputValue::PutStored { stats }
+                }) if stats.remote_attempt_count == 0 && stats.remote_store_count == 0
             )
         }));
     }
 
     #[test]
-    fn put_with_zero_ttl_clamps_to_minimum_before_local_write() {
+    fn zero_ttl_clamped() {
         let local_secret = iroh::SecretKey::from_bytes(&[61u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
@@ -2323,39 +3881,39 @@ mod tests {
             ttl: std::time::Duration::ZERO,
             trace_context: None,
         }));
+        let effects = reserve_put(&mut state, 24);
 
-        let effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
-            op_id: 24,
-            stage: StorageStage::PutLocalRead,
-            entries: Vec::new(),
-        }));
-
-        let entries = effects
+        let entry = effects
             .iter()
             .find_map(|effect| {
                 if let DhtEffect::IoRequest(inner) = effect
-                    && let DhtIoRequest::StorageWrite {
-                        stage: StorageStage::PutLocalWrite,
+                    && let DhtIoRequest::StorageMerge {
+                        stage: StorageStage::PutLocalMerge,
                         entries,
                         ..
                     } = &(**inner)
                 {
-                    Some(entries)
+                    entries.first()
                 } else {
                     None
                 }
             })
-            .expect("put should enqueue local storage write");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].expires_at, 1_000 + MIN_TTL_SECS);
+            .expect("put should enqueue atomic local storage merge");
+        assert_eq!(entry.expires_at, 1_000 + MIN_TTL_SECS);
 
-        let signature = entries[0].signature.as_ref().expect("put is signed");
-        let signed_data = signed_put_value_bytes(&key, &realm_id, &value, MIN_TTL_SECS);
-        assert!(local_id.verify(&signed_data, signature).is_ok());
+        let signed_data = signed_record_bytes(
+            &key,
+            &local_id,
+            &realm_id,
+            &value,
+            1_000 + MIN_TTL_SECS,
+            entry.revision,
+        );
+        assert!(local_id.verify(&signed_data, &entry.signature).is_ok());
     }
 
     #[test]
-    fn put_succeeds_when_store_rpc_times_out() {
+    fn put_reports_timeout() {
         let local_secret = iroh::SecretKey::from_bytes(&[42u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 100);
@@ -2372,25 +3930,17 @@ mod tests {
             ttl: std::time::Duration::from_secs(60),
             trace_context: None,
         }));
-        let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
-            op_id: 12,
-            stage: StorageStage::PutLocalRead,
-            entries: Vec::new(),
-        }));
+        let _ = reserve_put(&mut state, 12);
         let write_effects = state.step(DhtInput::Io(DhtIo::StorageWriteResult {
             op_id: 12,
-            stage: StorageStage::PutLocalWrite,
+            stage: StorageStage::PutLocalMerge,
         }));
 
-        assert!(write_effects.iter().any(|effect| {
-            matches!(
-                effect,
-                DhtEffect::Output(DhtOutput::Completed {
-                    op_id: 12,
-                    result: DhtOutputValue::Unit
-                })
-            )
-        }));
+        assert!(
+            write_effects
+                .iter()
+                .all(|effect| !matches!(effect, DhtEffect::Output(_)))
+        );
 
         assert!(write_effects.iter().any(|effect| {
             match effect {
@@ -2434,11 +3984,19 @@ mod tests {
             error: DhtIoError::Timeout,
         }));
 
-        assert!(fail_effects.is_empty());
+        assert!(fail_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::Output(DhtOutput::Completed {
+                    op_id: 12,
+                    result: DhtOutputValue::PutStored { stats }
+                }) if stats.remote_attempt_count == 1 && stats.remote_store_count == 0
+            )
+        }));
     }
 
     #[test]
-    fn put_succeeds_on_non_stored_response() {
+    fn put_reports_rejection() {
         let local_secret = iroh::SecretKey::from_bytes(&[43u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 100);
@@ -2455,25 +4013,17 @@ mod tests {
             ttl: std::time::Duration::from_secs(60),
             trace_context: None,
         }));
-        let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
-            op_id: 13,
-            stage: StorageStage::PutLocalRead,
-            entries: Vec::new(),
-        }));
+        let _ = reserve_put(&mut state, 13);
         let write_effects = state.step(DhtInput::Io(DhtIo::StorageWriteResult {
             op_id: 13,
-            stage: StorageStage::PutLocalWrite,
+            stage: StorageStage::PutLocalMerge,
         }));
 
-        assert!(write_effects.iter().any(|effect| {
-            matches!(
-                effect,
-                DhtEffect::Output(DhtOutput::Completed {
-                    op_id: 13,
-                    result: DhtOutputValue::Unit
-                })
-            )
-        }));
+        assert!(
+            write_effects
+                .iter()
+                .all(|effect| !matches!(effect, DhtEffect::Output(_)))
+        );
 
         let _ = state.step(DhtInput::Io(DhtIo::RpcResponse {
             op_id: 13,
@@ -2492,11 +4042,19 @@ mod tests {
             },
         }));
 
-        assert!(fail_effects.is_empty());
+        assert!(fail_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::Output(DhtOutput::Completed {
+                    op_id: 13,
+                    result: DhtOutputValue::PutStored { stats }
+                }) if stats.remote_attempt_count == 1 && stats.remote_store_count == 0
+            )
+        }));
     }
 
     #[test]
-    fn put_continues_best_effort_replication_after_local_success() {
+    fn put_reports_replication() {
         let local_secret = iroh::SecretKey::from_bytes(&[44u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 100);
@@ -2515,14 +4073,10 @@ mod tests {
             ttl: std::time::Duration::from_secs(60),
             trace_context: None,
         }));
-        let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
-            op_id: 14,
-            stage: StorageStage::PutLocalRead,
-            entries: Vec::new(),
-        }));
+        let _ = reserve_put(&mut state, 14);
         let write_effects = state.step(DhtInput::Io(DhtIo::StorageWriteResult {
             op_id: 14,
-            stage: StorageStage::PutLocalWrite,
+            stage: StorageStage::PutLocalMerge,
         }));
 
         let mut lookup_peers = Vec::new();
@@ -2542,15 +4096,11 @@ mod tests {
             lookup_peers.len() >= 2,
             "expected lookup fanout to both peers"
         );
-        assert!(write_effects.iter().any(|effect| {
-            matches!(
-                effect,
-                DhtEffect::Output(DhtOutput::Completed {
-                    op_id: 14,
-                    result: DhtOutputValue::Unit
-                })
-            )
-        }));
+        assert!(
+            write_effects
+                .iter()
+                .all(|effect| !matches!(effect, DhtEffect::Output(_)))
+        );
 
         let _ = state.step(DhtInput::Io(DhtIo::RpcResponse {
             op_id: 14,
@@ -2603,11 +4153,19 @@ mod tests {
             peer: late_peer,
             error: DhtIoError::Timeout,
         }));
-        assert!(late_effects.is_empty());
+        assert!(late_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::Output(DhtOutput::Completed {
+                    op_id: 14,
+                    result: DhtOutputValue::PutStored { stats }
+                }) if stats.remote_attempt_count == 2 && stats.remote_store_count == 1
+            )
+        }));
     }
 
     #[test]
-    fn get_short_circuits_on_local_value_without_lookup() {
+    fn get_merges_local() {
         let local_secret = iroh::SecretKey::from_bytes(&[45u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
@@ -2626,16 +4184,33 @@ mod tests {
         let effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
             op_id: 15,
             stage: StorageStage::GetLocalRead,
-            entries: vec![StoredEntry {
-                publisher: make_node(9),
-                realm_id: make_realm(1),
-                value: b"cached".to_vec(),
-                expires_at: 2_000,
-                signature: None,
-            }],
+            entries: vec![make_entry(9, key, make_realm(1), b"cached", 2_000)],
         }));
 
         assert!(effects.iter().any(|effect| {
+            match effect {
+                DhtEffect::IoRequest(inner) => matches!(
+                    **inner,
+                    DhtIoRequest::RpcRequest {
+                        phase: RpcPhase::GetLookup,
+                        peer: req_peer,
+                        ..
+                    } if req_peer == peer
+                ),
+                _ => false,
+            }
+        }));
+
+        let complete = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 15,
+            phase: RpcPhase::GetLookup,
+            peer,
+            response: DhtResponse::Value {
+                entries: Vec::new(),
+                closer_nodes: Vec::new(),
+            },
+        }));
+        assert!(complete.iter().any(|effect| {
             matches!(
                 effect,
                 DhtEffect::Output(DhtOutput::Completed {
@@ -2645,26 +4220,80 @@ mod tests {
                     && stats.completed_reason == DhtGetCompletedReason::LocalValue
                     && stats.local_value_count == 1
                     && stats.remote_value_count == 0
-                    && stats.queried_peer_count == 0
+                    && stats.queried_peer_count == 1
                     && stats.peer_error_count == 0
             )
-        }));
-        assert!(!effects.iter().any(|effect| {
-            match effect {
-                DhtEffect::IoRequest(inner) => matches!(
-                    **inner,
-                    DhtIoRequest::RpcRequest {
-                        phase: RpcPhase::GetLookup,
-                        ..
-                    }
-                ),
-                _ => false,
-            }
         }));
     }
 
     #[test]
-    fn get_applies_realm_filter_to_local_results() {
+    fn highwater_blocks_get() {
+        let local_secret = make_secret(96);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 801);
+        let peer = make_node(97);
+        let key = DhtKeyId::from_data(b"get-highwater");
+        let realm_id = make_realm(1);
+        let publisher_secret = make_secret(98);
+        let publisher = publisher_secret.public();
+        let value = b"newer".to_vec();
+        let expires_at = 500;
+        let revision = 2;
+        let signed = signed_record_bytes(&key, &publisher, &realm_id, &value, expires_at, revision);
+        let highwater = StoredEntry {
+            publisher,
+            realm_id,
+            value,
+            expires_at,
+            revision,
+            signature: publisher_secret.sign(&signed),
+            retain_until: 86_800,
+        };
+
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id: 92,
+            key,
+            realm_filter: None,
+            trace_context: None,
+        }));
+        let lookup = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 92,
+            stage: StorageStage::GetLocalRead,
+            entries: vec![highwater],
+        }));
+        assert!(lookup.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(inner)
+                    if matches!(&**inner, DhtIoRequest::RpcRequest {
+                        phase: RpcPhase::GetLookup,
+                        peer: request_peer,
+                        ..
+                    } if *request_peer == peer)
+            )
+        }));
+
+        let effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 92,
+            phase: RpcPhase::GetLookup,
+            peer,
+            response: DhtResponse::Value {
+                entries: vec![make_value(98, key, realm_id, b"older", 1_000)],
+                closer_nodes: Vec::new(),
+            },
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [DhtEffect::Output(DhtOutput::Completed {
+                result: DhtOutputValue::GetValues { values, .. },
+                ..
+            })] if values.is_empty()
+        ));
+    }
+
+    #[test]
+    fn local_realm_filter() {
         let local_secret = iroh::SecretKey::from_bytes(&[58u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
@@ -2680,25 +4309,13 @@ mod tests {
         let effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
             op_id: 22,
             stage: StorageStage::GetLocalRead,
-            entries: vec![StoredEntry {
-                publisher: make_node(23),
-                realm_id: make_realm(2),
-                value: b"foreign".to_vec(),
-                expires_at: 2_000,
-                signature: None,
-            }],
+            entries: vec![make_entry(23, key, make_realm(2), b"foreign", 2_000)],
         }));
 
         assert!(effects.iter().any(|effect| {
             matches!(
                 effect,
-                DhtEffect::Output(DhtOutput::Completed {
-                    op_id: 22,
-                    result: DhtOutputValue::GetValues { values, stats }
-                }) if values.is_empty()
-                    && stats.completed_reason == DhtGetCompletedReason::LookupExhausted
-                    && stats.local_value_count == 0
-                    && stats.remote_value_count == 0
+                DhtEffect::Output(DhtOutput::Failed { op_id: 22, .. })
             )
         }));
     }
@@ -2747,7 +4364,7 @@ mod tests {
     }
 
     #[test]
-    fn get_short_circuits_on_first_remote_value() {
+    fn get_collects_publishers() {
         let local_secret = iroh::SecretKey::from_bytes(&[46u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
@@ -2794,53 +4411,41 @@ mod tests {
             phase: RpcPhase::GetLookup,
             peer: lookup_peers[0],
             response: DhtResponse::Value {
-                entries: vec![StoredValue {
-                    publisher: make_node(12),
-                    realm_id: make_realm(1),
-                    value: b"first".to_vec(),
-                    expires_at: 2_000,
-                    signature: None,
-                }],
-                closer_nodes: vec![make_node(13)],
+                entries: vec![make_value(12, key, make_realm(1), b"first", 2_000)],
+                closer_nodes: Vec::new(),
             },
         }));
 
-        assert!(response_effects.iter().any(|effect| {
+        assert!(
+            response_effects
+                .iter()
+                .all(|effect| !matches!(effect, DhtEffect::Output(_)))
+        );
+
+        let pending = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 16,
+            phase: RpcPhase::GetLookup,
+            peer: lookup_peers[1],
+            response: DhtResponse::Value {
+                entries: vec![make_value(13, key, make_realm(1), b"second", 2_000)],
+                closer_nodes: Vec::new(),
+            },
+        }));
+        let complete = finish_get(&mut state, 16, &pending);
+        assert!(complete.iter().any(|effect| {
             matches!(
                 effect,
                 DhtEffect::Output(DhtOutput::Completed {
                     op_id: 16,
                     result: DhtOutputValue::GetValues { values, stats }
                 }) if values.iter().any(|entry| entry.value == b"first".to_vec())
+                    && values.iter().any(|entry| entry.value == b"second".to_vec())
                     && stats.completed_reason == DhtGetCompletedReason::RemoteValue
                     && stats.local_value_count == 0
-                    && stats.remote_value_count == 1
+                    && stats.remote_value_count == 2
                     && stats.queried_peer_count == lookup_peers.len()
             )
         }));
-        assert!(!response_effects.iter().any(|effect| {
-            match effect {
-                DhtEffect::IoRequest(inner) => matches!(
-                    **inner,
-                    DhtIoRequest::RpcRequest {
-                        phase: RpcPhase::GetLookup,
-                        ..
-                    }
-                ),
-                _ => false,
-            }
-        }));
-
-        let late_effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
-            op_id: 16,
-            phase: RpcPhase::GetLookup,
-            peer: lookup_peers[1],
-            response: DhtResponse::Value {
-                entries: Vec::new(),
-                closer_nodes: Vec::new(),
-            },
-        }));
-        assert!(late_effects.is_empty());
     }
 
     #[test]
@@ -2904,16 +4509,11 @@ mod tests {
             phase: RpcPhase::GetLookup,
             peer: value_peer,
             response: DhtResponse::Value {
-                entries: vec![StoredValue {
-                    publisher: make_node(30),
-                    realm_id: make_realm(1),
-                    value: b"after-error".to_vec(),
-                    expires_at: 2_000,
-                    signature: None,
-                }],
+                entries: vec![make_value(30, key, make_realm(1), b"after-error", 2_000)],
                 closer_nodes: Vec::new(),
             },
         }));
+        let response_effects = finish_get(&mut state, op_id, &response_effects);
 
         let (values, stats) = response_effects
             .iter()
@@ -3033,7 +4633,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_storage_stage_is_ignored_and_get_still_completes() {
+    fn wrong_stage_ignored() {
         let local_secret = iroh::SecretKey::from_bytes(&[49u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 0);
@@ -3061,11 +4661,7 @@ mod tests {
         assert!(complete.iter().any(|effect| {
             matches!(
                 effect,
-                DhtEffect::Output(DhtOutput::Completed {
-                    op_id: 19,
-                    result: DhtOutputValue::GetValues { values, stats }
-                }) if values.is_empty()
-                    && stats.completed_reason == DhtGetCompletedReason::LookupExhausted
+                DhtEffect::Output(DhtOutput::Failed { op_id: 19, .. })
             )
         }));
     }
@@ -3086,7 +4682,8 @@ mod tests {
                 key,
                 realm_id,
                 value: b"value".to_vec(),
-                ttl_secs: 30,
+                expires_at: 30,
+                revision: 1,
                 publisher,
                 signature: None,
             },
@@ -3111,7 +4708,7 @@ mod tests {
     }
 
     #[test]
-    fn inbound_put_zero_ttl_returns_invalid_request_error() {
+    fn expired_put_rejected() {
         let local_secret = iroh::SecretKey::from_bytes(&[62u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 0);
@@ -3120,8 +4717,11 @@ mod tests {
         let key = DhtKeyId::from_data(b"zero-ttl-inbound-put");
         let realm_id = make_realm(1);
         let value = b"value".to_vec();
-        let ttl_secs = 0;
-        let signed_data = signed_put_value_bytes(&key, &realm_id, &value, ttl_secs);
+        let publisher = publisher_secret.public();
+        let expires_at = 0;
+        let revision = 1;
+        let signed_data =
+            signed_record_bytes(&key, &publisher, &realm_id, &value, expires_at, revision);
         let signature = publisher_secret.sign(&signed_data);
 
         let effects = state.step(DhtInput::Io(DhtIo::InboundRequest {
@@ -3131,8 +4731,9 @@ mod tests {
                 key,
                 realm_id,
                 value,
-                ttl_secs,
-                publisher: publisher_secret.public(),
+                expires_at,
+                revision,
+                publisher,
                 signature: Some(signature),
             },
             trace_context: None,
@@ -3148,7 +4749,7 @@ mod tests {
                             code: ErrorCode::InvalidRequest,
                             message,
                         }
-                    } if message.contains("TTL")
+                    } if message.contains("expiry")
                 ),
                 _ => false,
             }
@@ -3157,7 +4758,7 @@ mod tests {
             matches!(
                 effect,
                 DhtEffect::IoRequest(inner)
-                    if matches!(&**inner, DhtIoRequest::StorageRead { .. })
+                    if matches!(&**inner, DhtIoRequest::StorageMerge { .. })
             )
         }));
     }
@@ -3190,9 +4791,10 @@ mod tests {
                         stage: StorageStage::InboundGetRead,
                         key: req_key,
                         realm_filter: Some(req_realm_filter),
+                        now_secs,
                     } = &(**inner)
                 {
-                    if *req_key == key && *req_realm_filter == realm_filter {
+                    if *req_key == key && *req_realm_filter == realm_filter && *now_secs == 1_000 {
                         Some(op_id)
                     } else {
                         None
@@ -3207,20 +4809,8 @@ mod tests {
             op_id: *op_id,
             stage: StorageStage::InboundGetRead,
             entries: vec![
-                StoredEntry {
-                    publisher: make_node(26),
-                    realm_id: realm_filter,
-                    value: b"allowed".to_vec(),
-                    expires_at: 2_000,
-                    signature: None,
-                },
-                StoredEntry {
-                    publisher: make_node(27),
-                    realm_id: make_realm(5),
-                    value: b"foreign".to_vec(),
-                    expires_at: 2_000,
-                    signature: None,
-                },
+                make_entry(26, key, realm_filter, b"allowed", 2_000),
+                make_entry(27, key, make_realm(5), b"foreign", 2_000),
             ],
         }));
 
@@ -3243,7 +4833,58 @@ mod tests {
     }
 
     #[test]
-    fn inbound_put_invalid_signature_returns_invalid_signature_error() {
+    fn expired_floor_propagates() {
+        let local_secret = make_secret(96);
+        let mut state = DhtStateMachine::new(local_secret.public(), local_secret, 1_000);
+        let key = DhtKeyId::from_data(b"propagated-floor");
+
+        let effects = state.step(DhtInput::Io(DhtIo::InboundRequest {
+            inbound_id: 12,
+            peer: make_node(97),
+            request: DhtRequest::GetValue {
+                key,
+                realm_filter: None,
+            },
+            trace_context: None,
+        }));
+        let op_id = effects
+            .iter()
+            .find_map(|effect| {
+                if let DhtEffect::IoRequest(inner) = effect
+                    && let DhtIoRequest::StorageRead {
+                        op_id,
+                        stage: StorageStage::InboundGetRead,
+                        ..
+                    } = &**inner
+                {
+                    Some(*op_id)
+                } else {
+                    None
+                }
+            })
+            .expect("inbound get storage read");
+        let mut floor = make_entry(98, key, make_realm(1), b"floor", 900);
+        floor.retain_until = retention_deadline(floor.expires_at, 1_000);
+
+        let effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id,
+            stage: StorageStage::InboundGetRead,
+            entries: vec![floor],
+        }));
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(inner)
+                    if matches!(&**inner, DhtIoRequest::RpcResponse {
+                        inbound_id: 12,
+                        response: DhtResponse::Value { entries, .. },
+                    } if entries.len() == 1 && entries[0].expires_at == 900)
+            )
+        }));
+    }
+
+    #[test]
+    fn invalid_put_rejected() {
         let local_secret = iroh::SecretKey::from_bytes(&[51u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 0);
@@ -3254,8 +4895,11 @@ mod tests {
         let key = DhtKeyId::from_data(b"invalid-signature");
         let realm_id = make_realm(1);
         let value = b"value".to_vec();
-        let ttl_secs: u64 = 45;
-        let signed_data = signed_put_value_bytes(&key, &realm_id, &value, ttl_secs);
+        let expires_at: u64 = 45;
+        let revision = 1;
+        let publisher = publisher_secret.public();
+        let signed_data =
+            signed_record_bytes(&key, &publisher, &realm_id, &value, expires_at, revision);
         let invalid_signature = attacker_secret.sign(&signed_data);
 
         let effects = state.step(DhtInput::Io(DhtIo::InboundRequest {
@@ -3265,8 +4909,9 @@ mod tests {
                 key,
                 realm_id,
                 value,
-                ttl_secs,
-                publisher: publisher_secret.public(),
+                expires_at,
+                revision,
+                publisher,
                 signature: Some(invalid_signature),
             },
             trace_context: None,
@@ -3287,10 +4932,11 @@ mod tests {
                 _ => false,
             }
         }));
+        assert!(state.routing_table.all_peers().is_empty());
     }
 
     #[test]
-    fn inbound_put_valid_signature_enqueues_storage_read() {
+    fn valid_put_merges() {
         let local_secret = iroh::SecretKey::from_bytes(&[56u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 0);
@@ -3299,9 +4945,12 @@ mod tests {
         let key = DhtKeyId::from_data(b"valid-signature");
         let realm_id = make_realm(1);
         let value = b"value".to_vec();
-        let ttl_secs: u64 = 45;
+        let expires_at: u64 = 45;
+        let revision = 1;
+        let publisher = publisher_secret.public();
 
-        let signed_data = signed_put_value_bytes(&key, &realm_id, &value, ttl_secs);
+        let signed_data =
+            signed_record_bytes(&key, &publisher, &realm_id, &value, expires_at, revision);
         let signature = publisher_secret.sign(&signed_data);
 
         let effects = state.step(DhtInput::Io(DhtIo::InboundRequest {
@@ -3311,8 +4960,9 @@ mod tests {
                 key,
                 realm_id,
                 value,
-                ttl_secs,
-                publisher: publisher_secret.public(),
+                expires_at,
+                revision,
+                publisher,
                 signature: Some(signature),
             },
             trace_context: None,
@@ -3322,14 +4972,15 @@ mod tests {
             match effect {
                 DhtEffect::IoRequest(inner) => matches!(
                 **inner,
-                DhtIoRequest::StorageRead {
-                    stage: StorageStage::InboundPutRead,
+                DhtIoRequest::StorageMerge {
+                    stage: StorageStage::InboundPutMerge,
                     key: req_key,
                     ..
                 } if req_key == key),
                 _ => false,
             }
         }));
+        assert_eq!(state.routing_table.all_peers().len(), 1);
     }
 
     #[test]
@@ -3350,7 +5001,10 @@ mod tests {
             })]
         ));
 
-        let tick_effects = state.step(DhtInput::Tick { now_tick: 1 });
+        let tick_effects = state.step(DhtInput::Tick {
+            now_tick: 1,
+            now_secs: 0,
+        });
         assert!(tick_effects.iter().any(|effect| {
             match effect {
                 DhtEffect::IoRequest(inner) => matches!(
@@ -3367,6 +5021,7 @@ mod tests {
 
         let _ = state.step(DhtInput::Tick {
             now_tick: 1 + RPC_TIMEOUT_TICKS,
+            now_secs: 0,
         });
 
         let after = state.step(DhtInput::Cmd(DhtCmd::RoutingTableSize { op_id: 21 }));
@@ -3377,6 +5032,140 @@ mod tests {
                 result: DhtOutputValue::RoutingTableSize(0)
             })]
         ));
+    }
+
+    #[test]
+    fn stale_maintenance_preserves() {
+        let local_secret = make_secret(94);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 0);
+        let peer = make_node(95);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer }));
+        let _ = state.step(DhtInput::Tick {
+            now_tick: 1,
+            now_secs: 0,
+        });
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer }));
+        let _ = state.step(DhtInput::Tick {
+            now_tick: 1 + RPC_TIMEOUT_TICKS,
+            now_secs: 0,
+        });
+
+        assert!(
+            state
+                .routing_table
+                .all_peers()
+                .iter()
+                .any(|entry| entry.node_id == peer)
+        );
+    }
+
+    #[test]
+    fn invalid_ping_evicts() {
+        let local_secret = make_secret(96);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 0);
+        let peer = make_node(97);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer }));
+
+        let effects = state.step(DhtInput::Tick {
+            now_tick: 1,
+            now_secs: 0,
+        });
+        let op_id = effects
+            .iter()
+            .find_map(|effect| match effect {
+                DhtEffect::IoRequest(request) => match &**request {
+                    DhtIoRequest::RpcRequest {
+                        op_id,
+                        phase: RpcPhase::MaintenancePing,
+                        ..
+                    } => Some(*op_id),
+                    _ => None,
+                },
+                DhtEffect::Output(_) => None,
+            })
+            .expect("maintenance ping");
+
+        let _ = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id,
+            phase: RpcPhase::MaintenancePing,
+            peer,
+            response: DhtResponse::Error {
+                code: ErrorCode::InvalidRequest,
+                message: "invalid ping".to_string(),
+            },
+        }));
+
+        assert!(state.routing_table.all_peers().is_empty());
+    }
+
+    #[test]
+    fn cleanup_runs_parallel() {
+        let local_secret = make_secret(98);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 100);
+
+        let effects = state.step(DhtInput::Tick {
+            now_tick: 1,
+            now_secs: 100,
+        });
+
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, DhtEffect::IoRequest(request) if matches!(&**request, DhtIoRequest::StorageIter { .. })))
+                .count(),
+            2
+        );
+        assert!(state.cleanup_active);
+        assert!(state.cleanup_floor);
+    }
+
+    #[test]
+    fn cleanup_drains_heads() {
+        let local_secret = make_secret(99);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 100);
+        let _ = state.step(DhtInput::Tick {
+            now_tick: 1,
+            now_secs: 100,
+        });
+        let entry = DeadlineEntry {
+            deadline: 100,
+            key: DhtKeyId::from_data(b"due-head"),
+        };
+
+        let effects = state.step(DhtInput::Io(DhtIo::StorageIterResult {
+            op_id: CLEANUP_OP_ID,
+            stage: StorageStage::CleanupActiveIter,
+            index: DeadlineIndex::Active,
+            entries: vec![entry],
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [DhtEffect::IoRequest(request)]
+                if matches!(&**request, DhtIoRequest::StoragePrune {
+                    stage: StorageStage::CleanupActivePrune,
+                    entry: request_entry,
+                    ..
+                } if *request_entry == entry)
+        ));
+
+        let effects = state.step(DhtInput::Io(DhtIo::StorageWriteResult {
+            op_id: CLEANUP_OP_ID,
+            stage: StorageStage::CleanupActivePrune,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [DhtEffect::IoRequest(request)]
+                if matches!(&**request, DhtIoRequest::StorageIter {
+                    stage: StorageStage::CleanupActiveIter,
+                    ..
+                })
+        ));
+        assert!(state.cleanup_active);
+        assert!(state.cleanup_floor);
     }
 
     #[test]

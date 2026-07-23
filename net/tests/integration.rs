@@ -140,7 +140,13 @@ async fn test_multi_node_dht_put_get() -> Result<(), Box<dyn std::error::Error>>
             .await;
         last_put_event = Some(format!("{put:?}"));
 
-        if matches!(put, Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. }))) {
+        if matches!(
+            put,
+            Event::Net(NetEvent::Dht(DhtEvent::PutComplete {
+                remote_store_count: 1..,
+                ..
+            }))
+        ) {
             put_succeeded = true;
             break;
         }

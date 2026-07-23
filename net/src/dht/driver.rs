@@ -3,12 +3,14 @@ use std::time::{Duration, Instant};
 
 use aruna_core::DistributedTraceContext;
 use aruna_core::alpn::Alpn;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::keyspaces::DHT_KEYSPACE;
 use aruna_core::structs::RealmId;
+use aruna_core::types::TxnId;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use crossfire::{AsyncRx, MAsyncTx, MTx, mpsc};
@@ -17,22 +19,31 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::sync::oneshot;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, Span, debug_span, field, info_span, trace, warn};
+use tracing::{Instrument, Span, debug, debug_span, field, info_span, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::constants::{
-    DRIVER_IO_EVENT_CAPACITY, DRIVER_TICK_INTERVAL, MAX_MESSAGE_SIZE, RPC_TIMEOUT, STORAGE_TIMEOUT,
+    CMD_CHANNEL_CAPACITY, DHT_KEY_COUNT_KEY, DHT_META_KEYSPACE, DHT_REVISION_KEY,
+    DRIVER_IO_EVENT_CAPACITY, DRIVER_TICK_INTERVAL, INBOUND_STORAGE_BUDGET, MAX_ENTRIES_PER_KEY,
+    MAX_INBOUND_RPCS, MAX_MESSAGE_SIZE, MAX_STORED_KEYS, RPC_TIMEOUT, STORAGE_MUTATION_RETRIES,
+    STORAGE_TIMEOUT,
 };
+use super::kbucket::K;
 use super::protocol::{
     CLEANUP_OP_ID, DhtCmd, DhtEffect, DhtInput, DhtIo, DhtIoError, DhtIoRequest, DhtOutput,
     DhtOutputValue, InboundId, OpId, RpcPhase, StorageStage,
 };
 use super::rpc::{
     DhtRequest, DhtResponse, ErrorCode, decode_request_with_trace_context, decode_response,
-    encode_request_with_trace_context, encode_response,
+    encode_request_with_trace_context, encode_response, request_kind, response_kind,
 };
 use super::state::DhtStateMachine;
-use super::storage::{CLEANUP_PAGE_SIZE, StoredEntry, decode_entries, encode_entries};
+use super::storage::now_unix_secs;
+use super::storage::{
+    CLEANUP_PAGE_SIZE, DeadlineEntry, DeadlineIndex, DhtClock, DhtClockError, MergeError,
+    StoredEntry, active_deadline, deadline_key, decode_entries, encode_entries, floor_deadline,
+    merge_entry, parse_deadline, retained_entries, row_deadline, validate_entries,
+};
 use crate::connection_pool::{ConnectionPool, PoolConnectError};
 use crate::telemetry::{
     current_trace_context, duration_ms, extract_trace_context, record_duration_ms,
@@ -115,8 +126,51 @@ impl std::fmt::Debug for DriverCmd {
     }
 }
 
+fn reject_driver_cmd(cmd: DriverCmd, error: DhtIoError) {
+    match cmd {
+        DriverCmd::Put { reply, .. }
+        | DriverCmd::Get { reply, .. }
+        | DriverCmd::Bootstrap { reply, .. }
+        | DriverCmd::RoutingTableSize { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
+        DriverCmd::AddPeer { .. } => {}
+    }
+}
+
+fn clock_error(error: DhtClockError) -> DhtIoError {
+    DhtIoError::storage(format!("DHT clock unhealthy: {error}"))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DriverLane {
+    Command,
+    Inbound,
+    Io,
+}
+
+enum DriverEvent {
+    Shutdown,
+    Tick,
+    Command(DriverCmd),
+    Inbound(InboundDhtStream),
+    Io(DhtIo),
+    Closed,
+}
+
+// Committed blocks amortize revision I/O; unused values become harmless crash gaps.
+const REVISION_BLOCK_SIZE: u64 = 64;
+
+struct RevisionRequest {
+    op_id: OpId,
+    stage: StorageStage,
+    span: Span,
+}
+
 pub struct DhtDriver {
     state: DhtStateMachine,
+    clock: DhtClock,
+    clock_diverged: bool,
     endpoint: Endpoint,
     connection_pool: ConnectionPool,
     storage: StorageHandle,
@@ -129,9 +183,11 @@ pub struct DhtDriver {
     pending_callers: HashMap<OpId, oneshot::Sender<CallerOutcome>>,
     op_spans: HashMap<OpId, Span>,
     next_op_id: OpId,
-    inbound_contexts: HashMap<InboundId, SendStream>,
+    inbound_contexts: HashMap<InboundId, Option<SendStream>>,
     inbound_spans: HashMap<InboundId, Span>,
     next_inbound_id: InboundId,
+    revision_tx: tokio::sync::mpsc::Sender<RevisionRequest>,
+    revision_task: tokio::task::JoinHandle<()>,
 }
 
 impl std::fmt::Debug for DhtDriver {
@@ -141,6 +197,75 @@ impl std::fmt::Debug for DhtDriver {
             .field("pending_callers", &self.pending_callers.len())
             .field("inbound_contexts", &self.inbound_contexts.len())
             .finish()
+    }
+}
+
+async fn next_driver_event(
+    lane: DriverLane,
+    shutdown: &CancellationToken,
+    ticker: &mut tokio::time::Interval,
+    cmd_rx: &mut DriverCmdReceiver,
+    inbound_rx: &mut InboundReceiver,
+    io_rx: &mut IoReceiver,
+) -> (DriverEvent, DriverLane) {
+    match lane {
+        DriverLane::Command => {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => (DriverEvent::Shutdown, lane),
+                _ = ticker.tick() => (DriverEvent::Tick, lane),
+                result = cmd_rx.recv() => (
+                    result.map_or(DriverEvent::Closed, DriverEvent::Command),
+                    DriverLane::Inbound,
+                ),
+                result = inbound_rx.recv() => (
+                    result.map_or(DriverEvent::Closed, DriverEvent::Inbound),
+                    DriverLane::Io,
+                ),
+                result = io_rx.recv() => (
+                    result.map_or(DriverEvent::Closed, DriverEvent::Io),
+                    DriverLane::Command,
+                ),
+            }
+        }
+        DriverLane::Inbound => {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => (DriverEvent::Shutdown, lane),
+                _ = ticker.tick() => (DriverEvent::Tick, lane),
+                result = inbound_rx.recv() => (
+                    result.map_or(DriverEvent::Closed, DriverEvent::Inbound),
+                    DriverLane::Io,
+                ),
+                result = io_rx.recv() => (
+                    result.map_or(DriverEvent::Closed, DriverEvent::Io),
+                    DriverLane::Command,
+                ),
+                result = cmd_rx.recv() => (
+                    result.map_or(DriverEvent::Closed, DriverEvent::Command),
+                    DriverLane::Inbound,
+                ),
+            }
+        }
+        DriverLane::Io => {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => (DriverEvent::Shutdown, lane),
+                _ = ticker.tick() => (DriverEvent::Tick, lane),
+                result = io_rx.recv() => (
+                    result.map_or(DriverEvent::Closed, DriverEvent::Io),
+                    DriverLane::Command,
+                ),
+                result = cmd_rx.recv() => (
+                    result.map_or(DriverEvent::Closed, DriverEvent::Command),
+                    DriverLane::Inbound,
+                ),
+                result = inbound_rx.recv() => (
+                    result.map_or(DriverEvent::Closed, DriverEvent::Inbound),
+                    DriverLane::Io,
+                ),
+            }
+        }
     }
 }
 
@@ -154,10 +279,43 @@ impl DhtDriver {
         inbound_rx: InboundReceiver,
         shutdown: CancellationToken,
     ) -> Self {
+        let clock = DhtClock::from_secs(state.clock_secs());
+        Self::with_clock(
+            state,
+            clock,
+            endpoint,
+            storage,
+            connection_pool,
+            cmd_rx,
+            inbound_rx,
+            shutdown,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_clock(
+        state: DhtStateMachine,
+        clock: DhtClock,
+        endpoint: Endpoint,
+        storage: StorageHandle,
+        connection_pool: ConnectionPool,
+        cmd_rx: DriverCmdReceiver,
+        inbound_rx: InboundReceiver,
+        shutdown: CancellationToken,
+    ) -> Self {
         let (io_tx, io_rx) = mpsc::bounded_async(DRIVER_IO_EVENT_CAPACITY);
+        let (revision_tx, revision_rx) = tokio::sync::mpsc::channel(CMD_CHANNEL_CAPACITY);
+        let revision_task = tokio::spawn(run_revision_allocator(
+            storage.clone(),
+            io_tx.clone(),
+            revision_rx,
+            shutdown.clone(),
+        ));
 
         Self {
             state,
+            clock,
+            clock_diverged: false,
             endpoint,
             connection_pool,
             storage,
@@ -173,6 +331,8 @@ impl DhtDriver {
             inbound_contexts: HashMap::new(),
             inbound_spans: HashMap::new(),
             next_inbound_id: 1,
+            revision_tx,
+            revision_task,
         }
     }
 
@@ -181,39 +341,75 @@ impl DhtDriver {
         let mut ticker = tokio::time::interval(DRIVER_TICK_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let _ = ticker.tick().await;
+        let mut next_lane = DriverLane::Command;
 
-        loop {
-            tokio::select! {
-                biased;
-                _ = self.shutdown.cancelled() => {
-                    break;
+        let terminal_error = loop {
+            let (event, following_lane) = next_driver_event(
+                next_lane,
+                &self.shutdown,
+                &mut ticker,
+                &mut self.cmd_rx,
+                &mut self.inbound_rx,
+                &mut self.io_rx,
+            )
+            .await;
+            next_lane = following_lane;
+
+            if matches!(&event, DriverEvent::Shutdown | DriverEvent::Closed) {
+                break DhtIoError::Shutdown;
+            }
+            let now_secs = match self.clock.now_secs() {
+                Ok(now_secs) => {
+                    self.clock_diverged = false;
+                    now_secs
                 }
-                maybe_cmd = self.cmd_rx.recv() => {
-                    let Ok(cmd) = maybe_cmd else {
-                        break;
-                    };
+                Err(error) => {
+                    if !self.clock_diverged {
+                        warn!(error = %error, "DHT clock diverged; failing new operations until it re-anchors");
+                        self.clock_diverged = true;
+                    }
+                    if let DriverEvent::Command(cmd) = event {
+                        // A mutation must not be stamped under an unstable clock; fail
+                        // the command loudly, but keep the driver alive so it recovers
+                        // once the clock re-anchors on a later sample.
+                        reject_driver_cmd(cmd, clock_error(error));
+                        continue;
+                    }
+                    // In-flight work still resolves on the last ratcheted time.
+                    self.clock.current_secs()
+                }
+            };
+            match event {
+                DriverEvent::Shutdown | DriverEvent::Closed => break DhtIoError::Shutdown,
+                DriverEvent::Command(cmd) => {
+                    self.process_input(DhtInput::Clock { now_secs });
                     self.handle_driver_cmd(cmd);
                 }
-                maybe_inbound = self.inbound_rx.recv() => {
-                    let Ok(inbound) = maybe_inbound else {
-                        break;
-                    };
-                    self.handle_inbound_stream(inbound);
-                }
-                maybe_io = self.io_rx.recv() => {
-                    let Ok(io) = maybe_io else {
-                        break;
-                    };
+                DriverEvent::Inbound(inbound) => self.handle_inbound_stream(inbound),
+                DriverEvent::Io(io) => {
+                    self.process_input(DhtInput::Clock { now_secs });
                     self.handle_worker_io(io);
                 }
-                _ = ticker.tick() => {
+                DriverEvent::Tick => {
                     self.now_tick = self.now_tick.saturating_add(1);
-                    self.process_input(DhtInput::Tick { now_tick: self.now_tick });
+                    self.process_input(DhtInput::Tick {
+                        now_tick: self.now_tick,
+                        now_secs,
+                    });
                 }
             }
-        }
+        };
 
-        self.fail_pending_callers(DhtIoError::Shutdown);
+        self.revision_task.abort();
+        let _ = (&mut self.revision_task).await;
+        self.fail_pending_callers(terminal_error.clone());
+        let buffered = self.cmd_rx.len();
+        for _ in 0..buffered {
+            let Ok(cmd) = self.cmd_rx.try_recv() else {
+                break;
+            };
+            reject_driver_cmd(cmd, terminal_error.clone());
+        }
         self.inbound_contexts.clear();
     }
 
@@ -490,8 +686,8 @@ impl DhtDriver {
             DhtIo::RpcResponse { op_id, .. }
             | DhtIo::RpcError { op_id, .. }
             | DhtIo::StorageReadResult { op_id, .. }
+            | DhtIo::StorageRevisionResult { op_id, .. }
             | DhtIo::StorageWriteResult { op_id, .. }
-            | DhtIo::StorageDeleteResult { op_id, .. }
             | DhtIo::StorageIterResult { op_id, .. }
             | DhtIo::StorageError { op_id, .. } => self.op_spans.get(op_id).cloned(),
             DhtIo::InboundRequest { inbound_id, .. }
@@ -505,9 +701,10 @@ impl DhtDriver {
         match request {
             DhtIoRequest::RpcRequest { op_id, .. }
             | DhtIoRequest::StorageRead { op_id, .. }
-            | DhtIoRequest::StorageWrite { op_id, .. }
-            | DhtIoRequest::StorageDelete { op_id, .. }
-            | DhtIoRequest::StorageIter { op_id, .. } => {
+            | DhtIoRequest::StorageRevision { op_id, .. }
+            | DhtIoRequest::StorageMerge { op_id, .. }
+            | DhtIoRequest::StorageIter { op_id, .. }
+            | DhtIoRequest::StoragePrune { op_id, .. } => {
                 if *op_id == CLEANUP_OP_ID {
                     return None;
                 }
@@ -538,12 +735,17 @@ impl DhtDriver {
         fields(peer = %inbound.2)
     )]
     fn handle_inbound_stream(&mut self, inbound: InboundDhtStream) {
-        let (send, mut recv, peer) = inbound;
+        let (mut send, mut recv, peer) = inbound;
+        if self.inbound_contexts.len() >= MAX_INBOUND_RPCS {
+            warn!(peer = %peer, "Dropping inbound DHT stream: active RPC limit reached");
+            let _ = send.finish();
+            let _ = recv.stop(0u32.into());
+            return;
+        }
         let inbound_id = self.next_inbound_id;
         self.next_inbound_id = self.next_inbound_id.saturating_add(1);
 
-        self.inbound_contexts.insert(inbound_id, send);
-        self.process_input_for_io(DhtIo::PeerSeen { peer });
+        self.inbound_contexts.insert(inbound_id, Some(send));
 
         let io_tx = self.io_tx.clone();
         tokio::spawn(async move {
@@ -611,7 +813,7 @@ impl DhtDriver {
                 "dht.rpc.receive",
                 "otel.kind" = "server",
                 peer = %peer,
-                request = ?request,
+                request = request_kind(&request),
             );
             if let Some(trace_context) = trace_context.as_ref() {
                 let _ = span.set_parent(extract_trace_context(trace_context));
@@ -622,7 +824,7 @@ impl DhtDriver {
                 trace!(
                     event = "dht.rpc.received",
                     peer = %peer,
-                    request = ?request,
+                    request = request_kind(&request),
                     "Received inbound DHT RPC"
                 );
             }
@@ -636,7 +838,10 @@ impl DhtDriver {
         }
 
         if let DhtIo::InboundReadError { inbound_id, error } = io {
-            let maybe_send = self.inbound_contexts.remove(&inbound_id);
+            let maybe_send = self
+                .inbound_contexts
+                .get_mut(&inbound_id)
+                .and_then(Option::take);
             let io_tx = self.io_tx.clone();
             let span = self.inbound_spans.get(&inbound_id).cloned();
             let future = async move {
@@ -702,22 +907,30 @@ impl DhtDriver {
                 stage,
                 key,
                 realm_filter,
-            } => self.dispatch_storage_read(op_id, stage, key, realm_filter),
-            DhtIoRequest::StorageWrite {
+                now_secs,
+            } => self.dispatch_storage_read(op_id, stage, key, realm_filter, now_secs),
+            DhtIoRequest::StorageRevision { op_id, stage } => {
+                self.dispatch_storage_revision(op_id, stage)
+            }
+            DhtIoRequest::StorageMerge {
                 op_id,
                 stage,
                 key,
                 entries,
-            } => self.dispatch_storage_write(op_id, stage, key, entries),
-            DhtIoRequest::StorageDelete { op_id, stage, key } => {
-                self.dispatch_storage_delete(op_id, stage, key)
-            }
+            } => self.dispatch_storage_merge(op_id, stage, key, entries),
             DhtIoRequest::StorageIter {
                 op_id,
                 stage,
-                start_after,
+                index,
                 limit,
-            } => self.dispatch_storage_iter(op_id, stage, start_after, limit),
+            } => self.dispatch_storage_iter(op_id, stage, index, limit),
+            DhtIoRequest::StoragePrune {
+                op_id,
+                stage,
+                index,
+                entry,
+                now_secs,
+            } => self.dispatch_storage_prune(op_id, stage, index, entry, now_secs),
         }
     }
 
@@ -725,7 +938,7 @@ impl DhtDriver {
         name = "dht.driver.rpc_request.dispatch",
         level = "debug",
         skip(self, request, trace_context),
-        fields(op_id, phase = ?phase, peer = %peer, request = ?request)
+        fields(op_id, phase = ?phase, peer = %peer, request = request_kind(&request))
     )]
     fn dispatch_rpc_request(
         &self,
@@ -742,7 +955,7 @@ impl DhtDriver {
             op_id,
             phase = ?phase,
             peer = %peer,
-            request = ?request,
+            request = request_kind(&request),
             "Dispatching outbound DHT RPC"
         );
         let connection_pool = self.connection_pool.clone();
@@ -754,7 +967,7 @@ impl DhtDriver {
             "otel.status_description" = field::Empty,
             "network.transport" = "quic",
             "rpc.system" = "aruna-dht",
-            "iroh.alpn" = "aruna/dht/1",
+            "iroh.alpn" = "aruna/dht/2",
             "iroh.connect_ms" = field::Empty,
             "iroh.open_bi_ms" = field::Empty,
             "iroh.write_request_ms" = field::Empty,
@@ -768,7 +981,7 @@ impl DhtDriver {
             op_id,
             phase = ?phase,
             peer = %peer,
-            request = ?request,
+            request = request_kind(&request),
         );
         if current_parent.is_disabled()
             && let Some(trace_context) = trace_context.as_ref()
@@ -835,10 +1048,13 @@ impl DhtDriver {
         name = "dht.driver.rpc_response.dispatch",
         level = "debug",
         skip(self, response),
-        fields(inbound_id, response = ?response)
+        fields(inbound_id, response = response_kind(&response))
     )]
     fn dispatch_rpc_response(&mut self, inbound_id: InboundId, response: DhtResponse) {
-        let maybe_send = self.inbound_contexts.remove(&inbound_id);
+        let maybe_send = self
+            .inbound_contexts
+            .get_mut(&inbound_id)
+            .and_then(Option::take);
         let io_tx = self.io_tx.clone();
         tokio::spawn(
             async move {
@@ -881,6 +1097,7 @@ impl DhtDriver {
         stage: StorageStage,
         key: DhtKeyId,
         realm_filter: Option<RealmId>,
+        now_secs: u64,
     ) {
         let storage = self.storage.clone();
         let io_tx = self.io_tx.clone();
@@ -892,15 +1109,41 @@ impl DhtDriver {
                     txn_id: None,
                 });
 
-                match send_storage_effect_with_timeout(&storage, effect, op_id, stage, "read").await
+                match run_storage_io(
+                    stage,
+                    send_storage_effect_with_timeout(&storage, effect, op_id, stage, "read"),
+                )
+                .await
                 {
                     Ok(Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                        let mut entries =
-                            value.map(|data| decode_entries(&data)).unwrap_or_default();
-                        if let Some(realm_filter) = realm_filter {
-                            entries.retain(|entry| entry.realm_id == realm_filter);
+                        let entries = match value {
+                            Some(data) => match decode_entries(&data) {
+                                Ok(entries) => entries,
+                                Err(error) => {
+                                    warn!(op_id, stage = ?stage, key = %key, error = %error, "Failed to decode stored DHT entries");
+                                    let _ = io_tx
+                                        .send(DhtIo::StorageError {
+                                            op_id,
+                                            stage,
+                                            error: DhtIoError::storage(error),
+                                        })
+                                        .await;
+                                    return;
+                                }
+                            },
+                            None => Vec::new(),
+                        };
+                        if let Err(error) = validate_entries(&key, &entries, now_secs) {
+                            warn!(op_id, stage = ?stage, key = %key, error = %error, "Invalid stored DHT entries");
+                            let _ = io_tx
+                                .send(DhtIo::StorageError {
+                                    op_id,
+                                    stage,
+                                    error: DhtIoError::storage(error),
+                                })
+                                .await;
+                            return;
                         }
-
                         let _ = io_tx
                             .send(DhtIo::StorageReadResult {
                                 op_id,
@@ -944,13 +1187,31 @@ impl DhtDriver {
         );
     }
 
+    fn dispatch_storage_revision(&mut self, op_id: OpId, stage: StorageStage) {
+        let request = RevisionRequest {
+            op_id,
+            stage,
+            span: Span::current(),
+        };
+        let error = match self.revision_tx.try_send(request) {
+            Ok(()) => return,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => DhtIoError::QueueFull,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => DhtIoError::Shutdown,
+        };
+        self.process_input_for_io(DhtIo::StorageError {
+            op_id,
+            stage,
+            error,
+        });
+    }
+
     #[tracing::instrument(
-        name = "dht.driver.storage_write.dispatch",
+        name = "dht.driver.storage_merge.dispatch",
         level = "debug",
         skip(self, entries),
         fields(op_id, stage = ?stage, key = %key, entry_count = entries.len())
     )]
-    fn dispatch_storage_write(
+    fn dispatch_storage_merge(
         &self,
         op_id: OpId,
         stage: StorageStage,
@@ -959,51 +1220,18 @@ impl DhtDriver {
     ) {
         let storage = self.storage.clone();
         let io_tx = self.io_tx.clone();
+        let clock = self.clock.clone();
         tokio::spawn(
             async move {
-                let Some(bytes) = encode_entries(&entries) else {
-                    let _ = io_tx
-                        .send(DhtIo::StorageError {
-                            op_id,
-                            stage,
-                            error: DhtIoError::storage("serialize dht entries failed"),
-                        })
-                        .await;
-                    return;
-                };
-
-                let effect = Effect::Storage(StorageEffect::Write {
-                    key_space: DHT_KEYSPACE.to_string(),
-                    key: ByteView::from(key.as_bytes().as_slice()),
-                    value: ByteView::from(bytes),
-                    txn_id: None,
-                });
-
-                match send_storage_effect_with_timeout(&storage, effect, op_id, stage, "write")
-                    .await
+                let mutation = StorageMutation::Merge { entries };
+                match run_storage_io(
+                    stage,
+                    mutate_storage_checked(&storage, op_id, stage, key, &mutation, &clock),
+                )
+                .await
                 {
-                    Ok(Event::Storage(StorageEvent::WriteResult { .. })) => {
+                    Ok(()) => {
                         let _ = io_tx.send(DhtIo::StorageWriteResult { op_id, stage }).await;
-                    }
-                    Ok(Event::Storage(StorageEvent::Error { error })) => {
-                        let _ = io_tx
-                            .send(DhtIo::StorageError {
-                                op_id,
-                                stage,
-                                error: DhtIoError::storage(error),
-                            })
-                            .await;
-                    }
-                    Ok(other) => {
-                        let _ = io_tx
-                            .send(DhtIo::StorageError {
-                                op_id,
-                                stage,
-                                error: DhtIoError::storage(format!(
-                                    "unexpected storage write event: {other:?}"
-                                )),
-                            })
-                            .await;
                     }
                     Err(error) => {
                         let _ = io_tx
@@ -1021,49 +1249,34 @@ impl DhtDriver {
     }
 
     #[tracing::instrument(
-        name = "dht.driver.storage_delete.dispatch",
+        name = "dht.driver.storage_prune.dispatch",
         level = "debug",
         skip(self),
-        fields(op_id, stage = ?stage, key = %key)
+        fields(op_id, stage = ?stage, ?index, key = %entry.key)
     )]
-    fn dispatch_storage_delete(&self, op_id: OpId, stage: StorageStage, key: DhtKeyId) {
+    fn dispatch_storage_prune(
+        &self,
+        op_id: OpId,
+        stage: StorageStage,
+        index: DeadlineIndex,
+        entry: DeadlineEntry,
+        now_secs: u64,
+    ) {
         let storage = self.storage.clone();
         let io_tx = self.io_tx.clone();
+        let clock = self.clock.clone();
         tokio::spawn(
             async move {
-                let effect = Effect::Storage(StorageEffect::Delete {
-                    key_space: DHT_KEYSPACE.to_string(),
-                    key: ByteView::from(key.as_bytes().as_slice()),
-                    txn_id: None,
-                });
-
-                match send_storage_effect_with_timeout(&storage, effect, op_id, stage, "delete")
+                let mutation = StorageMutation::Prune {
+                    index,
+                    entry,
+                    now_secs,
+                };
+                match mutate_storage_checked(&storage, op_id, stage, entry.key, &mutation, &clock)
                     .await
                 {
-                    Ok(Event::Storage(StorageEvent::DeleteResult { .. })) => {
-                        let _ = io_tx
-                            .send(DhtIo::StorageDeleteResult { op_id, stage })
-                            .await;
-                    }
-                    Ok(Event::Storage(StorageEvent::Error { error })) => {
-                        let _ = io_tx
-                            .send(DhtIo::StorageError {
-                                op_id,
-                                stage,
-                                error: DhtIoError::storage(error),
-                            })
-                            .await;
-                    }
-                    Ok(other) => {
-                        let _ = io_tx
-                            .send(DhtIo::StorageError {
-                                op_id,
-                                stage,
-                                error: DhtIoError::storage(format!(
-                                    "unexpected storage delete event: {other:?}"
-                                )),
-                            })
-                            .await;
+                    Ok(()) => {
+                        let _ = io_tx.send(DhtIo::StorageWriteResult { op_id, stage }).await;
                     }
                     Err(error) => {
                         let _ = io_tx
@@ -1083,69 +1296,32 @@ impl DhtDriver {
     #[tracing::instrument(
         name = "dht.driver.storage_iter.dispatch",
         level = "debug",
-        skip(self, start_after),
-        fields(op_id, stage = ?stage, limit, has_cursor = start_after.is_some())
+        skip(self),
+        fields(op_id, stage = ?stage, ?index, limit)
     )]
     fn dispatch_storage_iter(
         &self,
         op_id: OpId,
         stage: StorageStage,
-        start_after: Option<Vec<u8>>,
+        index: DeadlineIndex,
         limit: usize,
     ) {
         let storage = self.storage.clone();
         let io_tx = self.io_tx.clone();
         tokio::spawn(
             async move {
-                let effect = Effect::Storage(StorageEffect::Iter {
-                    key_space: DHT_KEYSPACE.to_string(),
-                    prefix: None,
-                    start: start_after.map(ByteView::from).map(IterStart::After),
-                    limit: if limit == 0 { CLEANUP_PAGE_SIZE } else { limit },
-                    txn_id: None,
-                });
-
-                match send_storage_effect_with_timeout(&storage, effect, op_id, stage, "iter").await
-                {
-                    Ok(Event::Storage(StorageEvent::IterResult {
-                        values,
-                        next_start_after,
-                    })) => {
-                        let decoded_values = values
-                            .into_iter()
-                            .map(|(key, value)| (key.as_ref().to_vec(), decode_entries(&value)))
-                            .collect();
-
+                match iter_deadlines(&storage, op_id, stage, index, limit, None).await {
+                    Ok(entries) => {
                         let _ = io_tx
                             .send(DhtIo::StorageIterResult {
                                 op_id,
                                 stage,
-                                values: decoded_values,
-                                next_start_after: next_start_after.map(|k| k.as_ref().to_vec()),
+                                index,
+                                entries,
                             })
                             .await;
                     }
-                    Ok(Event::Storage(StorageEvent::Error { error })) => {
-                        let _ = io_tx
-                            .send(DhtIo::StorageError {
-                                op_id,
-                                stage,
-                                error: DhtIoError::storage(error),
-                            })
-                            .await;
-                    }
-                    Ok(other) => {
-                        let _ = io_tx
-                            .send(DhtIo::StorageError {
-                                op_id,
-                                stage,
-                                error: DhtIoError::storage(format!(
-                                    "unexpected storage iter event: {other:?}"
-                                )),
-                            })
-                            .await;
-                    }
-                    Err(error) => {
+                    Err(TransactionFailure::Failed(error)) => {
                         let _ = io_tx
                             .send(DhtIo::StorageError {
                                 op_id,
@@ -1154,10 +1330,897 @@ impl DhtDriver {
                             })
                             .await;
                     }
+                    Err(TransactionFailure::Conflict) => {
+                        let _ = io_tx
+                            .send(DhtIo::StorageError {
+                                op_id,
+                                stage,
+                                error: DhtIoError::storage("DHT deadline iteration conflicted"),
+                            })
+                            .await;
+                    }
                 }
             }
             .instrument(Span::current()),
         );
+    }
+}
+
+enum StorageMutation {
+    Merge {
+        entries: Vec<StoredEntry>,
+    },
+    Prune {
+        index: DeadlineIndex,
+        entry: DeadlineEntry,
+        now_secs: u64,
+    },
+}
+
+enum TransactionFailure {
+    Conflict,
+    Failed(DhtIoError),
+}
+
+struct ReclaimRow {
+    index: DeadlineIndex,
+    entry: DeadlineEntry,
+    entries: Vec<StoredEntry>,
+}
+
+async fn start_storage_txn(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+) -> Result<TxnId, TransactionFailure> {
+    let start = Effect::Storage(StorageEffect::StartTransaction { read: false });
+    match send_storage_effect_with_timeout(storage, start, op_id, stage, "start").await {
+        Ok(Event::Storage(StorageEvent::TransactionStarted { txn_id })) => Ok(txn_id),
+        Ok(Event::Storage(StorageEvent::Error { error })) => Err(storage_transaction_error(error)),
+        Ok(other) => Err(TransactionFailure::Failed(DhtIoError::storage(format!(
+            "unexpected transaction start event: {other:?}"
+        )))),
+        Err(error) => Err(TransactionFailure::Failed(error)),
+    }
+}
+
+async fn run_revision_allocator(
+    storage: StorageHandle,
+    io_tx: IoSender,
+    mut revision_rx: tokio::sync::mpsc::Receiver<RevisionRequest>,
+    shutdown: CancellationToken,
+) {
+    let mut revisions = None;
+    loop {
+        let request = tokio::select! {
+            _ = shutdown.cancelled() => return,
+            request = revision_rx.recv() => {
+                let Some(request) = request else {
+                    return;
+                };
+                request
+            }
+        };
+        let RevisionRequest { op_id, stage, span } = request;
+        handle_revision_request(&storage, &io_tx, &mut revisions, op_id, stage)
+            .instrument(span)
+            .await;
+    }
+}
+
+async fn handle_revision_request(
+    storage: &StorageHandle,
+    io_tx: &IoSender,
+    revisions: &mut Option<std::ops::RangeInclusive<u64>>,
+    op_id: OpId,
+    stage: StorageStage,
+) {
+    let revision = match revisions.as_mut().and_then(Iterator::next) {
+        Some(revision) => Ok(revision),
+        None => match reserve_revision_block(storage, op_id, stage).await {
+            Ok(block) => {
+                *revisions = Some(block);
+                revisions.as_mut().and_then(Iterator::next).ok_or_else(|| {
+                    DhtIoError::storage("DHT revision allocator returned an empty block")
+                })
+            }
+            Err(error) => Err(error),
+        },
+    };
+    let io = match revision {
+        Ok(revision) => DhtIo::StorageRevisionResult {
+            op_id,
+            stage,
+            revision,
+        },
+        Err(error) => DhtIo::StorageError {
+            op_id,
+            stage,
+            error,
+        },
+    };
+    let _ = io_tx.send(io).await;
+}
+
+async fn reserve_revision_block(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+) -> Result<std::ops::RangeInclusive<u64>, DhtIoError> {
+    for _ in 0..STORAGE_MUTATION_RETRIES {
+        let txn_id = match start_storage_txn(storage, op_id, stage).await {
+            Ok(txn_id) => txn_id,
+            Err(TransactionFailure::Conflict) => continue,
+            Err(TransactionFailure::Failed(error)) => return Err(error),
+        };
+        match reserve_revision_txn(storage, op_id, stage, txn_id).await {
+            Ok(revisions) => return Ok(revisions),
+            Err(TransactionFailure::Conflict) => continue,
+            Err(TransactionFailure::Failed(error)) => return Err(error),
+        }
+    }
+    Err(DhtIoError::storage(
+        "DHT revision block reservation exceeded conflict retry limit",
+    ))
+}
+
+async fn reserve_revision_txn(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    txn_id: TxnId,
+) -> Result<std::ops::RangeInclusive<u64>, TransactionFailure> {
+    let read = Effect::Storage(StorageEffect::Read {
+        key_space: DHT_META_KEYSPACE.to_string(),
+        key: ByteView::from(DHT_REVISION_KEY),
+        txn_id: Some(txn_id),
+    });
+    let current = match send_storage_effect_with_timeout(
+        storage,
+        read,
+        op_id,
+        stage,
+        "revision_read",
+    )
+    .await
+    {
+        Ok(Event::Storage(StorageEvent::ReadResult { value, .. })) => match decode_counter(value) {
+            Ok(current) => current,
+            Err(error) => {
+                abort_storage_txn(storage, op_id, stage, txn_id).await;
+                return Err(error);
+            }
+        },
+        Ok(Event::Storage(StorageEvent::Error { error })) => {
+            abort_storage_txn(storage, op_id, stage, txn_id).await;
+            return Err(storage_transaction_error(error));
+        }
+        Ok(other) => {
+            abort_storage_txn(storage, op_id, stage, txn_id).await;
+            return Err(TransactionFailure::Failed(DhtIoError::storage(format!(
+                "unexpected revision read event: {other:?}"
+            ))));
+        }
+        Err(error) => {
+            abort_storage_txn(storage, op_id, stage, txn_id).await;
+            return Err(TransactionFailure::Failed(error));
+        }
+    };
+    let Some(first) = current.checked_add(1) else {
+        abort_storage_txn(storage, op_id, stage, txn_id).await;
+        return Err(TransactionFailure::Failed(DhtIoError::storage(
+            "DHT revision counter exhausted",
+        )));
+    };
+    let last = current.saturating_add(REVISION_BLOCK_SIZE);
+    if let Err(error) = write_counter(
+        storage,
+        op_id,
+        stage,
+        txn_id,
+        DHT_REVISION_KEY,
+        last,
+        "revision_write",
+    )
+    .await
+    {
+        abort_storage_txn(storage, op_id, stage, txn_id).await;
+        return Err(error);
+    }
+    commit_storage_txn(storage, op_id, stage, txn_id).await?;
+    Ok(first..=last)
+}
+
+#[cfg(test)]
+async fn mutate_storage_entries(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    key: DhtKeyId,
+    mutation: &StorageMutation,
+) -> Result<(), DhtIoError> {
+    mutate_storage_with(storage, op_id, stage, key, mutation, None).await
+}
+
+async fn mutate_storage_checked(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    key: DhtKeyId,
+    mutation: &StorageMutation,
+    clock: &DhtClock,
+) -> Result<(), DhtIoError> {
+    mutate_storage_with(storage, op_id, stage, key, mutation, Some(clock)).await
+}
+
+async fn mutate_storage_with(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    key: DhtKeyId,
+    mutation: &StorageMutation,
+    clock: Option<&DhtClock>,
+) -> Result<(), DhtIoError> {
+    for _ in 0..STORAGE_MUTATION_RETRIES {
+        let txn_id = match start_storage_txn(storage, op_id, stage).await {
+            Ok(txn_id) => txn_id,
+            Err(TransactionFailure::Conflict) => continue,
+            Err(TransactionFailure::Failed(error)) => return Err(error),
+        };
+
+        match run_storage_txn(storage, op_id, stage, key, txn_id, mutation, clock).await {
+            Ok(()) => return Ok(()),
+            Err(TransactionFailure::Conflict) => continue,
+            Err(TransactionFailure::Failed(error)) => return Err(error),
+        }
+    }
+
+    Err(DhtIoError::storage(
+        "DHT storage mutation exceeded conflict retry limit",
+    ))
+}
+
+async fn iter_deadlines(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    index: DeadlineIndex,
+    limit: usize,
+    txn_id: Option<TxnId>,
+) -> Result<Vec<DeadlineEntry>, TransactionFailure> {
+    let limit = if limit == 0 { CLEANUP_PAGE_SIZE } else { limit };
+    loop {
+        let effect = Effect::Storage(StorageEffect::Iter {
+            key_space: DHT_META_KEYSPACE.to_string(),
+            prefix: Some(ByteView::from(index.prefix())),
+            start: None,
+            limit,
+            txn_id,
+        });
+        let values =
+            match send_storage_effect_with_timeout(storage, effect, op_id, stage, "deadline_iter")
+                .await
+            {
+                Ok(Event::Storage(StorageEvent::IterResult { values, .. })) => values,
+                Ok(Event::Storage(StorageEvent::Error { error })) => {
+                    return Err(storage_transaction_error(error));
+                }
+                Ok(other) => {
+                    return Err(TransactionFailure::Failed(DhtIoError::storage(format!(
+                        "unexpected deadline iteration event: {other:?}"
+                    ))));
+                }
+                Err(error) => return Err(TransactionFailure::Failed(error)),
+            };
+        let mut entries = Vec::with_capacity(values.len());
+        let mut invalid = Vec::new();
+        for (key, _) in values {
+            if let Some(entry) = parse_deadline(index, &key) {
+                entries.push(entry);
+            } else {
+                invalid.push((DHT_META_KEYSPACE.to_string(), key));
+            }
+        }
+        if invalid.is_empty() {
+            return Ok(entries);
+        }
+
+        warn!(
+            index = ?index,
+            key_count = invalid.len(),
+            "Removing invalid DHT deadline index keys"
+        );
+        let effect = Effect::Storage(StorageEffect::BatchDelete {
+            deletes: invalid,
+            txn_id,
+        });
+        match send_storage_effect_with_timeout(storage, effect, op_id, stage, "deadline_repair")
+            .await
+        {
+            Ok(Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {}
+            Ok(Event::Storage(StorageEvent::Error { error })) => {
+                return Err(storage_transaction_error(error));
+            }
+            Ok(other) => {
+                return Err(TransactionFailure::Failed(DhtIoError::storage(format!(
+                    "unexpected deadline repair event: {other:?}"
+                ))));
+            }
+            Err(error) => return Err(TransactionFailure::Failed(error)),
+        }
+        if !entries.is_empty() {
+            return Ok(entries);
+        }
+    }
+}
+
+async fn delete_deadline(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    txn_id: TxnId,
+    index: DeadlineIndex,
+    entry: DeadlineEntry,
+) -> Result<(), TransactionFailure> {
+    apply_batch_delete(
+        storage,
+        op_id,
+        stage,
+        txn_id,
+        vec![(
+            DHT_META_KEYSPACE.to_string(),
+            ByteView::from(deadline_key(index, entry)),
+        )],
+    )
+    .await
+}
+
+async fn find_reclaimable(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    txn_id: TxnId,
+    now_secs: u64,
+) -> Result<Option<ReclaimRow>, TransactionFailure> {
+    let mut remaining = CLEANUP_PAGE_SIZE;
+    for index in [DeadlineIndex::Floor, DeadlineIndex::Active] {
+        loop {
+            if remaining == 0 {
+                return Ok(None);
+            }
+            let Some(entry) = iter_deadlines(storage, op_id, stage, index, 1, Some(txn_id))
+                .await?
+                .into_iter()
+                .next()
+            else {
+                break;
+            };
+            if entry.deadline > now_secs {
+                break;
+            }
+            remaining -= 1;
+
+            let read = Effect::Storage(StorageEffect::Read {
+                key_space: DHT_KEYSPACE.to_string(),
+                key: ByteView::from(entry.key.as_bytes().as_slice()),
+                txn_id: Some(txn_id),
+            });
+            let value =
+                match send_storage_effect_with_timeout(storage, read, op_id, stage, "reclaim_read")
+                    .await
+                {
+                    Ok(Event::Storage(StorageEvent::ReadResult { value, .. })) => value,
+                    Ok(Event::Storage(StorageEvent::Error { error })) => {
+                        return Err(storage_transaction_error(error));
+                    }
+                    Ok(other) => {
+                        return Err(TransactionFailure::Failed(DhtIoError::storage(format!(
+                            "unexpected reclaim read event: {other:?}"
+                        ))));
+                    }
+                    Err(error) => return Err(TransactionFailure::Failed(error)),
+                };
+            let Some(value) = value else {
+                delete_deadline(storage, op_id, stage, txn_id, index, entry).await?;
+                continue;
+            };
+            let entries = match decode_entries(&value) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    warn!(key = %entry.key, error = %error, "Preserving corrupt DHT row during capacity reclaim");
+                    delete_deadline(storage, op_id, stage, txn_id, index, entry).await?;
+                    continue;
+                }
+            };
+            if let Err(error) = validate_entries(&entry.key, &entries, now_secs) {
+                warn!(key = %entry.key, error = %error, "Preserving invalid DHT row during capacity reclaim");
+                delete_deadline(storage, op_id, stage, txn_id, index, entry).await?;
+                continue;
+            }
+            let Some((current_index, current_entry)) = row_deadline(entry.key, &entries, now_secs)
+            else {
+                return Ok(Some(ReclaimRow {
+                    index,
+                    entry,
+                    entries,
+                }));
+            };
+            if current_index == DeadlineIndex::Floor && current_entry.deadline <= now_secs {
+                return Ok(Some(ReclaimRow {
+                    index,
+                    entry,
+                    entries,
+                }));
+            }
+            delete_deadline(storage, op_id, stage, txn_id, index, entry).await?;
+            apply_batch_write(
+                storage,
+                op_id,
+                stage,
+                txn_id,
+                vec![(
+                    DHT_META_KEYSPACE.to_string(),
+                    ByteView::from(deadline_key(current_index, current_entry)),
+                    ByteView::from(Vec::new()),
+                )],
+            )
+            .await?;
+        }
+    }
+    Ok(None)
+}
+
+async fn reserve_key_slot(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    txn_id: TxnId,
+    index: DeadlineIndex,
+    now_secs: u64,
+) -> Result<Option<ReclaimRow>, TransactionFailure> {
+    let count = read_key_count(storage, op_id, stage, txn_id).await?;
+    if count < MAX_STORED_KEYS {
+        write_counter(
+            storage,
+            op_id,
+            stage,
+            txn_id,
+            DHT_KEY_COUNT_KEY,
+            count + 1,
+            "count_write",
+        )
+        .await?;
+        return Ok(None);
+    }
+    if count > MAX_STORED_KEYS {
+        return Err(TransactionFailure::Failed(DhtIoError::storage(
+            "DHT key-count metadata exceeds its limit",
+        )));
+    }
+    if index == DeadlineIndex::Floor {
+        return Err(TransactionFailure::Failed(DhtIoError::StorageFull));
+    }
+
+    find_reclaimable(storage, op_id, stage, txn_id, now_secs)
+        .await?
+        .ok_or(TransactionFailure::Failed(DhtIoError::StorageFull))
+        .map(Some)
+}
+
+async fn run_storage_txn(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    key: DhtKeyId,
+    txn_id: TxnId,
+    mutation: &StorageMutation,
+    clock: Option<&DhtClock>,
+) -> Result<(), TransactionFailure> {
+    let read = Effect::Storage(StorageEffect::Read {
+        key_space: DHT_KEYSPACE.to_string(),
+        key: ByteView::from(key.as_bytes().as_slice()),
+        txn_id: Some(txn_id),
+    });
+    let value = match send_storage_effect_with_timeout(storage, read, op_id, stage, "read").await {
+        Ok(Event::Storage(StorageEvent::ReadResult { value, .. })) => value,
+        Ok(Event::Storage(StorageEvent::Error { error })) => {
+            abort_storage_txn(storage, op_id, stage, txn_id).await;
+            return Err(storage_transaction_error(error));
+        }
+        Ok(other) => {
+            abort_storage_txn(storage, op_id, stage, txn_id).await;
+            return Err(TransactionFailure::Failed(DhtIoError::storage(format!(
+                "unexpected transactional read event: {other:?}"
+            ))));
+        }
+        Err(error) => {
+            abort_storage_txn(storage, op_id, stage, txn_id).await;
+            return Err(TransactionFailure::Failed(error));
+        }
+    };
+
+    let had_value = value.is_some();
+    let (entries, mut preserve_row) = match value {
+        Some(value) => match decode_entries(&value) {
+            Ok(entries) => (entries, false),
+            Err(error) if matches!(mutation, StorageMutation::Prune { .. }) => {
+                warn!(key = %key, error = %error, "Preserving corrupt DHT row during cleanup");
+                (Vec::new(), true)
+            }
+            Err(error) => {
+                abort_storage_txn(storage, op_id, stage, txn_id).await;
+                return Err(TransactionFailure::Failed(DhtIoError::storage(error)));
+            }
+        },
+        None => (Vec::new(), false),
+    };
+    let original_entries = entries;
+    let now_secs = match clock {
+        Some(clock) => match clock.now_secs() {
+            Ok(now_secs) => now_secs,
+            Err(error) => {
+                abort_storage_txn(storage, op_id, stage, txn_id).await;
+                return Err(TransactionFailure::Failed(clock_error(error)));
+            }
+        },
+        None => match mutation {
+            StorageMutation::Merge { .. } => now_unix_secs(),
+            StorageMutation::Prune { now_secs, .. } => *now_secs,
+        },
+    };
+    let entries = match mutation {
+        StorageMutation::Merge { entries, .. } => {
+            let merged = if stage == StorageStage::GetRemoteMerge {
+                merge_fresh_entries(&key, original_entries.clone(), entries, now_secs)
+            } else {
+                merge_storage_entries(&key, original_entries.clone(), entries, now_secs)
+            };
+            match merged {
+                Ok(entries) => entries,
+                Err(MergeError::Stale) => {
+                    abort_storage_txn(storage, op_id, stage, txn_id).await;
+                    return Err(TransactionFailure::Failed(DhtIoError::invalid_request(
+                        "record version is stale or conflicting",
+                    )));
+                }
+                Err(MergeError::Capacity) => {
+                    abort_storage_txn(storage, op_id, stage, txn_id).await;
+                    return Err(TransactionFailure::Failed(DhtIoError::StorageFull));
+                }
+                Err(MergeError::Encoding) => {
+                    abort_storage_txn(storage, op_id, stage, txn_id).await;
+                    return Err(TransactionFailure::Failed(DhtIoError::storage(
+                        "serialize DHT entries failed",
+                    )));
+                }
+                Err(MergeError::Invalid) => {
+                    abort_storage_txn(storage, op_id, stage, txn_id).await;
+                    return Err(TransactionFailure::Failed(DhtIoError::storage(
+                        "stored DHT record set is invalid",
+                    )));
+                }
+            }
+        }
+        StorageMutation::Prune { .. } => {
+            if let Err(error) = validate_entries(&key, &original_entries, now_secs) {
+                warn!(key = %key, error = %error, "Preserving invalid DHT row during cleanup");
+                preserve_row = true;
+                Vec::new()
+            } else {
+                retained_entries(original_entries.clone(), now_secs)
+            }
+        }
+    };
+
+    if matches!(mutation, StorageMutation::Merge { .. })
+        && had_value
+        && !entries.is_empty()
+        && entries == original_entries
+    {
+        abort_storage_txn(storage, op_id, stage, txn_id).await;
+        return Ok(());
+    }
+
+    let mut delete_keys = Vec::with_capacity(3);
+    if let StorageMutation::Prune { index, entry, .. } = mutation {
+        delete_keys.push(deadline_key(*index, *entry));
+    }
+    if had_value {
+        if let Some(entry) = active_deadline(key, &original_entries) {
+            delete_keys.push(deadline_key(DeadlineIndex::Active, entry));
+        }
+        if let Some(entry) = floor_deadline(key, &original_entries) {
+            delete_keys.push(deadline_key(DeadlineIndex::Floor, entry));
+        }
+    }
+    let mut writes = Vec::with_capacity(2);
+    let deadline = if entries.is_empty() {
+        None
+    } else {
+        let Some((index, entry)) = row_deadline(key, &entries, now_secs) else {
+            abort_storage_txn(storage, op_id, stage, txn_id).await;
+            return Err(TransactionFailure::Failed(DhtIoError::storage(
+                "DHT row has no retention deadline",
+            )));
+        };
+        Some((index, entry))
+    };
+    if let Some((index, entry)) = deadline {
+        writes.push((
+            DHT_META_KEYSPACE.to_string(),
+            ByteView::from(deadline_key(index, entry)),
+            ByteView::from(Vec::new()),
+        ));
+        if !had_value || entries != original_entries {
+            let bytes = match encode_entries(&entries) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    abort_storage_txn(storage, op_id, stage, txn_id).await;
+                    return Err(TransactionFailure::Failed(DhtIoError::storage(error)));
+                }
+            };
+            writes.push((
+                DHT_KEYSPACE.to_string(),
+                ByteView::from(key.as_bytes().as_slice()),
+                ByteView::from(bytes),
+            ));
+        }
+    }
+
+    let reclaimed = if let (false, Some((index, _))) = (had_value, deadline) {
+        match reserve_key_slot(storage, op_id, stage, txn_id, index, now_secs).await {
+            Ok(reclaimed) => reclaimed,
+            Err(error) => {
+                abort_storage_txn(storage, op_id, stage, txn_id).await;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    if had_value
+        && entries.is_empty()
+        && !preserve_row
+        && let Err(error) = decrement_key_count(storage, op_id, stage, txn_id).await
+    {
+        abort_storage_txn(storage, op_id, stage, txn_id).await;
+        return Err(error);
+    }
+
+    if let Some(victim) = &reclaimed {
+        delete_keys.push(deadline_key(victim.index, victim.entry));
+        if let Some(entry) = active_deadline(victim.entry.key, &victim.entries) {
+            delete_keys.push(deadline_key(DeadlineIndex::Active, entry));
+        }
+        if let Some(entry) = floor_deadline(victim.entry.key, &victim.entries) {
+            delete_keys.push(deadline_key(DeadlineIndex::Floor, entry));
+        }
+    }
+    delete_keys.sort_unstable();
+    delete_keys.dedup();
+
+    let mut deletes = delete_keys
+        .into_iter()
+        .map(|key| (DHT_META_KEYSPACE.to_string(), ByteView::from(key)))
+        .collect::<Vec<_>>();
+    if had_value && entries.is_empty() && !preserve_row {
+        deletes.push((
+            DHT_KEYSPACE.to_string(),
+            ByteView::from(key.as_bytes().as_slice()),
+        ));
+    }
+    if let Some(victim) = reclaimed {
+        deletes.push((
+            DHT_KEYSPACE.to_string(),
+            ByteView::from(victim.entry.key.as_bytes().as_slice()),
+        ));
+    }
+
+    if let Err(error) = apply_batch_delete(storage, op_id, stage, txn_id, deletes).await {
+        abort_storage_txn(storage, op_id, stage, txn_id).await;
+        return Err(error);
+    }
+    if let Err(error) = apply_batch_write(storage, op_id, stage, txn_id, writes).await {
+        abort_storage_txn(storage, op_id, stage, txn_id).await;
+        return Err(error);
+    }
+
+    commit_storage_txn(storage, op_id, stage, txn_id).await
+}
+
+async fn apply_batch_delete(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    txn_id: TxnId,
+    deletes: Vec<(String, ByteView)>,
+) -> Result<(), TransactionFailure> {
+    if deletes.is_empty() {
+        return Ok(());
+    }
+    let effect = Effect::Storage(StorageEffect::BatchDelete {
+        deletes,
+        txn_id: Some(txn_id),
+    });
+    match send_storage_effect_with_timeout(storage, effect, op_id, stage, "index_delete").await {
+        Ok(Event::Storage(StorageEvent::BatchDeleteResult { .. })) => Ok(()),
+        Ok(Event::Storage(StorageEvent::Error { error })) => Err(storage_transaction_error(error)),
+        Ok(other) => Err(TransactionFailure::Failed(DhtIoError::storage(format!(
+            "unexpected DHT batch-delete event: {other:?}"
+        )))),
+        Err(error) => Err(TransactionFailure::Failed(error)),
+    }
+}
+
+async fn apply_batch_write(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    txn_id: TxnId,
+    writes: Vec<(String, ByteView, ByteView)>,
+) -> Result<(), TransactionFailure> {
+    if writes.is_empty() {
+        return Ok(());
+    }
+    let effect = Effect::Storage(StorageEffect::BatchWrite {
+        writes,
+        txn_id: Some(txn_id),
+    });
+    match send_storage_effect_with_timeout(storage, effect, op_id, stage, "index_write").await {
+        Ok(Event::Storage(StorageEvent::BatchWriteResult { .. })) => Ok(()),
+        Ok(Event::Storage(StorageEvent::Error { error })) => Err(storage_transaction_error(error)),
+        Ok(other) => Err(TransactionFailure::Failed(DhtIoError::storage(format!(
+            "unexpected DHT batch-write event: {other:?}"
+        )))),
+        Err(error) => Err(TransactionFailure::Failed(error)),
+    }
+}
+
+fn merge_storage_entries(
+    key: &DhtKeyId,
+    original: Vec<StoredEntry>,
+    entries: &[StoredEntry],
+    now_secs: u64,
+) -> Result<Vec<StoredEntry>, MergeError> {
+    entries.iter().try_fold(original, |current, entry| {
+        merge_entry(key, current, entry.clone(), now_secs)
+    })
+}
+
+fn merge_fresh_entries(
+    key: &DhtKeyId,
+    original: Vec<StoredEntry>,
+    entries: &[StoredEntry],
+    now_secs: u64,
+) -> Result<Vec<StoredEntry>, MergeError> {
+    let mut current = original;
+    for entry in entries {
+        match merge_entry(key, current.clone(), entry.clone(), now_secs) {
+            Ok(merged) => current = merged,
+            // Read-repair drops an entry that lost a concurrent revision race rather
+            // than failing the whole write-back; the winning entries still persist.
+            Err(MergeError::Stale) => {}
+            Err(other) => return Err(other),
+        }
+    }
+    Ok(current)
+}
+
+async fn read_key_count(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    txn_id: TxnId,
+) -> Result<u64, TransactionFailure> {
+    let read = Effect::Storage(StorageEffect::Read {
+        key_space: DHT_META_KEYSPACE.to_string(),
+        key: ByteView::from(DHT_KEY_COUNT_KEY),
+        txn_id: Some(txn_id),
+    });
+    match send_storage_effect_with_timeout(storage, read, op_id, stage, "count_read").await {
+        Ok(Event::Storage(StorageEvent::ReadResult { value, .. })) => decode_counter(value),
+        Ok(Event::Storage(StorageEvent::Error { error })) => Err(storage_transaction_error(error)),
+        Ok(other) => Err(TransactionFailure::Failed(DhtIoError::storage(format!(
+            "unexpected DHT key-count read event: {other:?}"
+        )))),
+        Err(error) => Err(TransactionFailure::Failed(error)),
+    }
+}
+
+async fn decrement_key_count(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    txn_id: TxnId,
+) -> Result<(), TransactionFailure> {
+    let count = read_key_count(storage, op_id, stage, txn_id).await?;
+    let next = count.checked_sub(1).ok_or_else(|| {
+        TransactionFailure::Failed(DhtIoError::storage("DHT key-count metadata is invalid"))
+    })?;
+    write_counter(
+        storage,
+        op_id,
+        stage,
+        txn_id,
+        DHT_KEY_COUNT_KEY,
+        next,
+        "count_write",
+    )
+    .await
+}
+
+fn decode_counter(value: Option<ByteView>) -> Result<u64, TransactionFailure> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    let bytes: [u8; 8] = value.as_ref().try_into().map_err(|_| {
+        TransactionFailure::Failed(DhtIoError::storage("invalid DHT metadata counter"))
+    })?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+async fn write_counter(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    txn_id: TxnId,
+    key: &'static [u8],
+    value: u64,
+    operation: &'static str,
+) -> Result<(), TransactionFailure> {
+    let write = Effect::Storage(StorageEffect::Write {
+        key_space: DHT_META_KEYSPACE.to_string(),
+        key: ByteView::from(key),
+        value: ByteView::from(value.to_le_bytes().as_slice()),
+        txn_id: Some(txn_id),
+    });
+    match send_storage_effect_with_timeout(storage, write, op_id, stage, operation).await {
+        Ok(Event::Storage(StorageEvent::WriteResult { .. })) => Ok(()),
+        Ok(Event::Storage(StorageEvent::Error { error })) => Err(storage_transaction_error(error)),
+        Ok(other) => Err(TransactionFailure::Failed(DhtIoError::storage(format!(
+            "unexpected DHT metadata write event: {other:?}"
+        )))),
+        Err(error) => Err(TransactionFailure::Failed(error)),
+    }
+}
+
+async fn commit_storage_txn(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    txn_id: TxnId,
+) -> Result<(), TransactionFailure> {
+    let commit = Effect::Storage(StorageEffect::CommitTransaction { txn_id });
+    match send_storage_effect_with_timeout(storage, commit, op_id, stage, "commit").await {
+        Ok(Event::Storage(StorageEvent::TransactionCommitted { .. })) => Ok(()),
+        Ok(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        })) => Err(TransactionFailure::Conflict),
+        Ok(Event::Storage(StorageEvent::Error { error })) => {
+            Err(TransactionFailure::Failed(DhtIoError::storage(error)))
+        }
+        Ok(other) => Err(TransactionFailure::Failed(DhtIoError::storage(format!(
+            "unexpected transaction commit event: {other:?}"
+        )))),
+        Err(error) => Err(TransactionFailure::Failed(error)),
+    }
+}
+
+async fn abort_storage_txn(
+    storage: &StorageHandle,
+    op_id: OpId,
+    stage: StorageStage,
+    txn_id: TxnId,
+) {
+    let abort = Effect::Storage(StorageEffect::AbortTransaction { txn_id });
+    let _ = send_storage_effect_with_timeout(storage, abort, op_id, stage, "abort").await;
+}
+
+fn storage_transaction_error(error: StorageError) -> TransactionFailure {
+    if error == StorageError::TransactionConflict {
+        TransactionFailure::Conflict
+    } else {
+        TransactionFailure::Failed(DhtIoError::storage(error))
     }
 }
 
@@ -1187,6 +2250,22 @@ async fn send_storage_effect_with_timeout(
     }
 }
 
+async fn run_storage_io<T, F>(stage: StorageStage, future: F) -> Result<T, DhtIoError>
+where
+    F: std::future::Future<Output = Result<T, DhtIoError>>,
+{
+    if matches!(
+        stage,
+        StorageStage::InboundGetRead | StorageStage::InboundPutMerge
+    ) {
+        tokio::time::timeout(INBOUND_STORAGE_BUDGET, future)
+            .await
+            .map_err(DhtIoError::from)?
+    } else {
+        future.await
+    }
+}
+
 fn pool_connect_error(error: PoolConnectError) -> DhtIoError {
     match error {
         PoolConnectError::Timeout => DhtIoError::Timeout,
@@ -1205,6 +2284,7 @@ fn dht_input_kind(input: &DhtInput) -> &'static str {
     match input {
         DhtInput::Cmd(cmd) => dht_cmd_kind(cmd),
         DhtInput::Io(io) => dht_io_kind(io),
+        DhtInput::Clock { .. } => "clock",
         DhtInput::Tick { .. } => "tick",
     }
 }
@@ -1241,8 +2321,8 @@ fn dht_io_kind(io: &DhtIo) -> &'static str {
         DhtIo::InboundReadError { .. } => "inbound_read_error",
         DhtIo::InboundDropped { .. } => "inbound_dropped",
         DhtIo::StorageReadResult { .. } => "storage_read_result",
+        DhtIo::StorageRevisionResult { .. } => "storage_revision_result",
         DhtIo::StorageWriteResult { .. } => "storage_write_result",
-        DhtIo::StorageDeleteResult { .. } => "storage_delete_result",
         DhtIo::StorageIterResult { .. } => "storage_iter_result",
         DhtIo::StorageError { .. } => "storage_error",
         DhtIo::PeerSeen { .. } => "peer_seen",
@@ -1254,8 +2334,8 @@ fn dht_io_op_id(io: &DhtIo) -> Option<OpId> {
         DhtIo::RpcResponse { op_id, .. }
         | DhtIo::RpcError { op_id, .. }
         | DhtIo::StorageReadResult { op_id, .. }
+        | DhtIo::StorageRevisionResult { op_id, .. }
         | DhtIo::StorageWriteResult { op_id, .. }
-        | DhtIo::StorageDeleteResult { op_id, .. }
         | DhtIo::StorageIterResult { op_id, .. }
         | DhtIo::StorageError { op_id, .. } => Some(*op_id),
         DhtIo::InboundRequest { .. }
@@ -1273,8 +2353,8 @@ fn dht_io_inbound_id(io: &DhtIo) -> Option<InboundId> {
         DhtIo::RpcResponse { .. }
         | DhtIo::RpcError { .. }
         | DhtIo::StorageReadResult { .. }
+        | DhtIo::StorageRevisionResult { .. }
         | DhtIo::StorageWriteResult { .. }
-        | DhtIo::StorageDeleteResult { .. }
         | DhtIo::StorageIterResult { .. }
         | DhtIo::StorageError { .. }
         | DhtIo::PeerSeen { .. } => None,
@@ -1287,9 +2367,10 @@ fn dht_io_request_kind(request: &DhtIoRequest) -> &'static str {
         DhtIoRequest::RpcResponse { .. } => "rpc_response",
         DhtIoRequest::DropInbound { .. } => "drop_inbound",
         DhtIoRequest::StorageRead { .. } => "storage_read",
-        DhtIoRequest::StorageWrite { .. } => "storage_write",
-        DhtIoRequest::StorageDelete { .. } => "storage_delete",
+        DhtIoRequest::StorageRevision { .. } => "storage_revision",
+        DhtIoRequest::StorageMerge { .. } => "storage_merge",
         DhtIoRequest::StorageIter { .. } => "storage_iter",
+        DhtIoRequest::StoragePrune { .. } => "storage_prune",
     }
 }
 
@@ -1297,9 +2378,10 @@ fn dht_io_request_op_id(request: &DhtIoRequest) -> Option<OpId> {
     match request {
         DhtIoRequest::RpcRequest { op_id, .. }
         | DhtIoRequest::StorageRead { op_id, .. }
-        | DhtIoRequest::StorageWrite { op_id, .. }
-        | DhtIoRequest::StorageDelete { op_id, .. }
-        | DhtIoRequest::StorageIter { op_id, .. } => Some(*op_id),
+        | DhtIoRequest::StorageRevision { op_id, .. }
+        | DhtIoRequest::StorageMerge { op_id, .. }
+        | DhtIoRequest::StorageIter { op_id, .. }
+        | DhtIoRequest::StoragePrune { op_id, .. } => Some(*op_id),
         DhtIoRequest::RpcResponse { .. } | DhtIoRequest::DropInbound { .. } => None,
     }
 }
@@ -1311,9 +2393,10 @@ fn dht_io_request_inbound_id(request: &DhtIoRequest) -> Option<InboundId> {
         }
         DhtIoRequest::RpcRequest { .. }
         | DhtIoRequest::StorageRead { .. }
-        | DhtIoRequest::StorageWrite { .. }
-        | DhtIoRequest::StorageDelete { .. }
-        | DhtIoRequest::StorageIter { .. } => None,
+        | DhtIoRequest::StorageRevision { .. }
+        | DhtIoRequest::StorageMerge { .. }
+        | DhtIoRequest::StorageIter { .. }
+        | DhtIoRequest::StoragePrune { .. } => None,
     }
 }
 
@@ -1327,26 +2410,41 @@ fn internal_operation_kind(request: &DhtIoRequest) -> &'static str {
             RpcPhase::MaintenancePing => "maintenance_ping",
         },
         DhtIoRequest::StorageRead { stage, .. }
-        | DhtIoRequest::StorageWrite { stage, .. }
-        | DhtIoRequest::StorageDelete { stage, .. }
-        | DhtIoRequest::StorageIter { stage, .. } => match stage {
-            StorageStage::PutLocalRead | StorageStage::PutLocalWrite => "put",
-            StorageStage::GetLocalRead => "get",
+        | DhtIoRequest::StorageRevision { stage, .. }
+        | DhtIoRequest::StorageMerge { stage, .. }
+        | DhtIoRequest::StorageIter { stage, .. }
+        | DhtIoRequest::StoragePrune { stage, .. } => match stage {
+            StorageStage::PutRevision
+            | StorageStage::PutLocalRead
+            | StorageStage::PutLocalMerge => "put",
+            StorageStage::GetLocalRead | StorageStage::GetRemoteMerge => "get",
             StorageStage::InboundGetRead => "inbound_get",
-            StorageStage::InboundPutRead | StorageStage::InboundPutWrite => "inbound_put",
-            StorageStage::CleanupIter
-            | StorageStage::CleanupWrite
-            | StorageStage::CleanupDelete => "cleanup",
+            StorageStage::InboundPutRead | StorageStage::InboundPutMerge => "inbound_put",
+            StorageStage::CleanupActiveIter
+            | StorageStage::CleanupFloorIter
+            | StorageStage::CleanupActivePrune
+            | StorageStage::CleanupFloorPrune => "cleanup",
         },
         DhtIoRequest::RpcResponse { .. } | DhtIoRequest::DropInbound { .. } => "inbound",
     }
+}
+
+fn encode_request_frame(
+    request: &DhtRequest,
+    trace_context: Option<DistributedTraceContext>,
+) -> Result<Vec<u8>, DhtIoError> {
+    let bytes = encode_request_with_trace_context(request, trace_context)?;
+    if bytes.len() > MAX_MESSAGE_SIZE {
+        return Err(DhtIoError::invalid_request("request too large"));
+    }
+    Ok(bytes)
 }
 
 #[tracing::instrument(
     name = "dht.rpc.request.io",
     level = "debug",
     skip(connection_pool, request, trace_context),
-    fields(op_id, phase = ?phase, peer = %peer, request = ?request)
+    fields(op_id, phase = ?phase, peer = %peer, request = request_kind(&request))
 )]
 async fn rpc_request(
     connection_pool: ConnectionPool,
@@ -1358,6 +2456,8 @@ async fn rpc_request(
 ) -> Result<DhtResponse, DhtIoError> {
     let span = Span::current();
     let total_started = Instant::now();
+    let request_bytes = encode_request_frame(&request, trace_context)?;
+    span.record("iroh.request_bytes", request_bytes.len() as u64);
 
     let connect_started = Instant::now();
     let conn = match connection_pool.get_or_connect(peer, Alpn::Dht).await {
@@ -1379,7 +2479,7 @@ async fn rpc_request(
         Err(error) => {
             let elapsed = connect_started.elapsed();
             record_duration_ms(&span, "iroh.connect_ms", elapsed);
-            warn!(
+            debug!(
                 event = "dht.rpc.iroh_connect_failed",
                 op_id,
                 phase = ?phase,
@@ -1414,7 +2514,7 @@ async fn rpc_request(
         Ok(Err(error)) => {
             let elapsed = open_started.elapsed();
             record_duration_ms(&span, "iroh.open_bi_ms", elapsed);
-            warn!(
+            debug!(
                 event = "dht.rpc.iroh_open_bi_failed",
                 op_id,
                 phase = ?phase,
@@ -1428,7 +2528,7 @@ async fn rpc_request(
         Err(error) => {
             let elapsed = open_started.elapsed();
             record_duration_ms(&span, "iroh.open_bi_ms", elapsed);
-            warn!(
+            debug!(
                 event = "dht.rpc.iroh_open_bi_timeout",
                 op_id,
                 phase = ?phase,
@@ -1442,8 +2542,6 @@ async fn rpc_request(
         }
     };
 
-    let request_bytes = encode_request_with_trace_context(&request, trace_context)?;
-    span.record("iroh.request_bytes", request_bytes.len() as u64);
     let len = (request_bytes.len() as u32).to_be_bytes();
 
     let write_started = Instant::now();
@@ -1461,7 +2559,7 @@ async fn rpc_request(
         Ok(Err(error)) => {
             let elapsed = write_started.elapsed();
             record_duration_ms(&span, "iroh.write_request_ms", elapsed);
-            warn!(
+            debug!(
                 event = "dht.rpc.write_request_failed",
                 op_id,
                 phase = ?phase,
@@ -1475,7 +2573,7 @@ async fn rpc_request(
         Err(error) => {
             let elapsed = write_started.elapsed();
             record_duration_ms(&span, "iroh.write_request_ms", elapsed);
-            warn!(
+            debug!(
                 event = "dht.rpc.write_request_timeout",
                 op_id,
                 phase = ?phase,
@@ -1527,7 +2625,7 @@ async fn rpc_request(
         Err(error) => {
             let elapsed = wait_response_started.elapsed();
             record_duration_ms(&span, "iroh.wait_response_header_ms", elapsed);
-            warn!(
+            debug!(
                 event = "dht.rpc.iroh_response_timeout",
                 op_id,
                 phase = ?phase,
@@ -1572,7 +2670,7 @@ async fn rpc_request(
         Err(error) => {
             let elapsed = read_body_started.elapsed();
             record_duration_ms(&span, "iroh.read_response_body_ms", elapsed);
-            warn!(
+            debug!(
                 event = "dht.rpc.iroh_response_timeout",
                 op_id,
                 phase = ?phase,
@@ -1599,7 +2697,24 @@ async fn rpc_request(
         "Completed Iroh DHT RPC"
     );
 
-    Ok(decode_response(&response_bytes)?)
+    let response = decode_response(&response_bytes)?;
+    validate_response(&response)?;
+    Ok(response)
+}
+
+fn validate_response(response: &DhtResponse) -> Result<(), DhtIoError> {
+    match response {
+        DhtResponse::Nodes { nodes } if nodes.len() > K => {
+            Err(DhtIoError::invalid_response("too many DHT nodes"))
+        }
+        DhtResponse::Value {
+            entries,
+            closer_nodes,
+        } if entries.len() > MAX_ENTRIES_PER_KEY || closer_nodes.len() > K => {
+            Err(DhtIoError::invalid_response("too many DHT values or nodes"))
+        }
+        _ => Ok(()),
+    }
 }
 
 fn record_selected_path(span: &Span, conn: &Connection) {
@@ -1668,7 +2783,7 @@ async fn write_response_to_stream(
     {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            warn!(
+            debug!(
                 event = "dht.rpc.write_response_failed",
                 duration_ms = duration_ms(started.elapsed()),
                 error = %error,
@@ -1677,7 +2792,7 @@ async fn write_response_to_stream(
             return Err(error);
         }
         Err(error) => {
-            warn!(
+            debug!(
                 event = "dht.rpc.write_response_timeout",
                 duration_ms = duration_ms(started.elapsed()),
                 timeout_ms = duration_ms(RPC_TIMEOUT),
@@ -1691,4 +2806,1143 @@ async fn write_response_to_stream(
     let _ = tokio::time::timeout(Duration::from_millis(100), send.stopped()).await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::RealmId;
+    use aruna_storage::FjallStorage;
+    use tempfile::{TempDir, tempdir};
+
+    fn make_node(seed: u8) -> NodeId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        iroh::SecretKey::from_bytes(&bytes).public()
+    }
+
+    fn make_entry(seed: u8, key: DhtKeyId, expires_at: u64) -> StoredEntry {
+        make_entry_rev(seed, key, expires_at, 1)
+    }
+
+    fn make_entry_rev(seed: u8, key: DhtKeyId, expires_at: u64, revision: u64) -> StoredEntry {
+        let mut secret = [0u8; 32];
+        secret[0] = seed;
+        let secret = iroh::SecretKey::from_bytes(&secret);
+        let publisher = secret.public();
+        let mut realm = [0u8; 32];
+        realm[0] = seed;
+        let realm_id = RealmId::from_bytes(realm);
+        let value = vec![seed];
+        let signed = super::super::rpc::signed_record_bytes(
+            &key, &publisher, &realm_id, &value, expires_at, revision,
+        );
+        StoredEntry {
+            publisher,
+            realm_id,
+            value,
+            expires_at,
+            revision,
+            signature: secret.sign(&signed),
+            retain_until: expires_at,
+        }
+    }
+
+    #[test]
+    fn response_bounds_reject() {
+        let nodes = (1..=K + 1).map(|seed| make_node(seed as u8)).collect();
+        assert!(validate_response(&DhtResponse::Nodes { nodes }).is_err());
+
+        let key = DhtKeyId::from_data(b"response-entry-limit");
+        let entry = make_entry(1, key, 200);
+        let value = super::super::rpc::StoredValue {
+            publisher: entry.publisher,
+            realm_id: entry.realm_id,
+            value: entry.value,
+            expires_at: entry.expires_at,
+            revision: entry.revision,
+            signature: entry.signature,
+        };
+        assert!(
+            validate_response(&DhtResponse::Value {
+                entries: vec![value; MAX_ENTRIES_PER_KEY + 1],
+                closer_nodes: Vec::new(),
+            })
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_skips_write() {
+        let (storage, receiver) = StorageHandle::new();
+        let key = DhtKeyId::from_data(b"unchanged-replay");
+        let entry = make_entry(1, key, now_unix_secs().saturating_add(200));
+        let encoded = encode_entries(std::slice::from_ref(&entry)).expect("encode entry");
+        let txn_id = TxnId::generate();
+        let worker = std::thread::spawn(move || {
+            let (effect, response, ..) = receiver.recv().expect("transaction start");
+            assert!(matches!(
+                effect,
+                StorageEffect::StartTransaction { read: false }
+            ));
+            response.send(StorageEvent::TransactionStarted { txn_id });
+
+            let (effect, response, ..) = receiver.recv().expect("transaction read");
+            assert!(matches!(
+                effect,
+                StorageEffect::Read {
+                    txn_id: Some(id),
+                    ..
+                } if id == txn_id
+            ));
+            response.send(StorageEvent::ReadResult {
+                key: ByteView::from(key.as_bytes().as_slice()),
+                value: Some(ByteView::from(encoded)),
+            });
+
+            let (effect, response, ..) = receiver.recv().expect("transaction abort");
+            assert!(matches!(
+                effect,
+                StorageEffect::AbortTransaction { txn_id: id } if id == txn_id
+            ));
+            response.send(StorageEvent::TransactionAborted { txn_id });
+        });
+
+        let mutation = StorageMutation::Merge {
+            entries: vec![entry],
+        };
+        mutate_storage_entries(&storage, 6, StorageStage::InboundPutMerge, key, &mutation)
+            .await
+            .expect("duplicate succeeds");
+        worker.join().expect("storage worker");
+    }
+
+    fn open_storage() -> (TempDir, StorageHandle) {
+        let directory = tempdir().expect("create storage directory");
+        let storage = FjallStorage::open(directory.path().to_str().expect("utf-8 storage path"))
+            .expect("open storage");
+        (directory, storage)
+    }
+
+    fn spawn_revision_worker(
+        storage: &StorageHandle,
+    ) -> (
+        tokio::sync::mpsc::Sender<RevisionRequest>,
+        IoReceiver,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (io_tx, io_rx) = mpsc::bounded_async(DRIVER_IO_EVENT_CAPACITY);
+        let (revision_tx, revision_rx) = tokio::sync::mpsc::channel(CMD_CHANNEL_CAPACITY);
+        let worker = tokio::spawn(run_revision_allocator(
+            storage.clone(),
+            io_tx,
+            revision_rx,
+            CancellationToken::new(),
+        ));
+        (revision_tx, io_rx, worker)
+    }
+
+    async fn read_entries(storage: &StorageHandle, key: DhtKeyId) -> Vec<StoredEntry> {
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: DHT_KEYSPACE.to_string(),
+                key: ByteView::from(key.as_bytes().as_slice()),
+                txn_id: None,
+            }))
+            .await;
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) = event
+        else {
+            panic!("expected stored DHT entries: {event:?}");
+        };
+        decode_entries(&value).expect("decode stored entries")
+    }
+
+    async fn index_entries(storage: &StorageHandle, index: DeadlineIndex) -> Vec<DeadlineEntry> {
+        iter_deadlines(storage, 0, StorageStage::CleanupActiveIter, index, 16, None)
+            .await
+            .unwrap_or_else(|_| panic!("read {index:?} deadline index"))
+    }
+
+    async fn read_count(storage: &StorageHandle) -> u64 {
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: DHT_META_KEYSPACE.to_string(),
+                key: ByteView::from(DHT_KEY_COUNT_KEY),
+                txn_id: None,
+            }))
+            .await;
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            panic!("expected DHT key count: {event:?}");
+        };
+        match decode_counter(value) {
+            Ok(count) => count,
+            Err(_) => panic!("decode DHT key count"),
+        }
+    }
+
+    async fn write_count(storage: &StorageHandle, count: u64) {
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: DHT_META_KEYSPACE.to_string(),
+                key: ByteView::from(DHT_KEY_COUNT_KEY),
+                value: ByteView::from(count.to_le_bytes().as_slice()),
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    async fn row_exists(storage: &StorageHandle, key: DhtKeyId) -> bool {
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: DHT_KEYSPACE.to_string(),
+                key: ByteView::from(key.as_bytes().as_slice()),
+                txn_id: None,
+            }))
+            .await;
+        matches!(
+            event,
+            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. })
+        )
+    }
+
+    async fn write_indexed_row(
+        storage: &StorageHandle,
+        index: DeadlineIndex,
+        entry: DeadlineEntry,
+        value: Vec<u8>,
+    ) {
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::BatchWrite {
+                writes: vec![
+                    (
+                        DHT_KEYSPACE.to_string(),
+                        ByteView::from(entry.key.as_bytes().as_slice()),
+                        ByteView::from(value),
+                    ),
+                    (
+                        DHT_META_KEYSPACE.to_string(),
+                        ByteView::from(deadline_key(index, entry)),
+                        ByteView::from(Vec::new()),
+                    ),
+                ],
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+    }
+
+    async fn store_due_floor(
+        storage: &StorageHandle,
+        key: DhtKeyId,
+        seed: u8,
+        expires_at: u64,
+    ) -> DeadlineEntry {
+        let entry = make_entry(seed, key, expires_at);
+        let deadline = DeadlineEntry {
+            deadline: entry.retain_until,
+            key,
+        };
+        write_indexed_row(
+            storage,
+            DeadlineIndex::Floor,
+            deadline,
+            encode_entries(std::slice::from_ref(&entry)).unwrap(),
+        )
+        .await;
+        deadline
+    }
+
+    #[tokio::test]
+    async fn ready_lanes_rotate() {
+        let (cmd_tx, mut cmd_rx) = mpsc::bounded_blocking_async(4);
+        let (_inbound_tx, mut inbound_rx) = mpsc::bounded_blocking_async(1);
+        let (io_tx, mut io_rx) = mpsc::bounded_async(4);
+        cmd_tx
+            .try_send(DriverCmd::AddPeer {
+                node_id: make_node(1),
+            })
+            .expect("queue first command");
+        cmd_tx
+            .try_send(DriverCmd::AddPeer {
+                node_id: make_node(2),
+            })
+            .expect("queue second command");
+        io_tx
+            .send(DhtIo::PeerSeen { peer: make_node(3) })
+            .await
+            .expect("queue IO event");
+
+        let shutdown = CancellationToken::new();
+        let mut ticker = tokio::time::interval(Duration::from_secs(3_600));
+        let _ = ticker.tick().await;
+        let (first, next_lane) = next_driver_event(
+            DriverLane::Command,
+            &shutdown,
+            &mut ticker,
+            &mut cmd_rx,
+            &mut inbound_rx,
+            &mut io_rx,
+        )
+        .await;
+        assert!(matches!(first, DriverEvent::Command(_)));
+
+        let (second, _) = next_driver_event(
+            next_lane,
+            &shutdown,
+            &mut ticker,
+            &mut cmd_rx,
+            &mut inbound_rx,
+            &mut io_rx,
+        )
+        .await;
+        assert!(matches!(second, DriverEvent::Io(_)));
+    }
+
+    #[test]
+    fn request_size_bound() {
+        let request = DhtRequest::PutValue {
+            key: DhtKeyId::from_data(b"oversized-request"),
+            realm_id: RealmId::from_bytes([1u8; 32]),
+            value: vec![0; MAX_MESSAGE_SIZE],
+            expires_at: 1,
+            revision: 1,
+            publisher: make_node(1),
+            signature: None,
+        };
+
+        assert!(matches!(
+            encode_request_frame(&request, None),
+            Err(DhtIoError::InvalidRequest(message)) if message == "request too large"
+        ));
+    }
+
+    #[test]
+    fn inbound_budget_precedes() {
+        assert!(INBOUND_STORAGE_BUDGET < RPC_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn revision_blocks_batch() {
+        let (_directory, storage) = open_storage();
+        let (revision_tx, io_rx, worker) = spawn_revision_worker(&storage);
+        let count = REVISION_BLOCK_SIZE + 1;
+        for op_id in 1..=count {
+            revision_tx
+                .send(RevisionRequest {
+                    op_id,
+                    stage: StorageStage::PutRevision,
+                    span: Span::current(),
+                })
+                .await
+                .expect("queue revision");
+        }
+
+        for expected in 1..=count {
+            assert!(matches!(
+                io_rx.recv().await,
+                Ok(DhtIo::StorageRevisionResult {
+                    op_id,
+                    stage: StorageStage::PutRevision,
+                    revision,
+                }) if op_id == expected && revision == expected
+            ));
+        }
+        drop(revision_tx);
+        worker.await.expect("revision worker");
+
+        assert_eq!(storage.snapshot_metrics().conflicts_total, 0);
+        assert_eq!(storage.snapshot_metrics().requests_total, 8);
+    }
+
+    #[tokio::test]
+    async fn revision_restart_skips() {
+        let (_directory, storage) = open_storage();
+        let (first_tx, first_rx, first_worker) = spawn_revision_worker(&storage);
+        first_tx
+            .send(RevisionRequest {
+                op_id: 1,
+                stage: StorageStage::PutRevision,
+                span: Span::current(),
+            })
+            .await
+            .expect("queue first revision");
+        assert!(matches!(
+            first_rx.recv().await,
+            Ok(DhtIo::StorageRevisionResult { revision: 1, .. })
+        ));
+        drop(first_tx);
+        first_worker.await.expect("first revision worker");
+
+        let (second_tx, second_rx, second_worker) = spawn_revision_worker(&storage);
+        second_tx
+            .send(RevisionRequest {
+                op_id: 2,
+                stage: StorageStage::PutRevision,
+                span: Span::current(),
+            })
+            .await
+            .expect("queue second revision");
+        assert!(matches!(
+            second_rx.recv().await,
+            Ok(DhtIo::StorageRevisionResult { revision: 65, .. })
+        ));
+        drop(second_tx);
+        second_worker.await.expect("second revision worker");
+
+        assert_eq!(storage.snapshot_metrics().requests_total, 8);
+    }
+
+    #[tokio::test]
+    async fn key_limit_enforced() {
+        let (_directory, storage) = open_storage();
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: DHT_META_KEYSPACE.to_string(),
+                key: ByteView::from(DHT_KEY_COUNT_KEY),
+                value: ByteView::from(MAX_STORED_KEYS.to_le_bytes().as_slice()),
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        let key = DhtKeyId::from_data(b"full-keyspace");
+        let mutation = StorageMutation::Merge {
+            entries: vec![make_entry(1, key, now_unix_secs().saturating_add(200))],
+        };
+        assert!(matches!(
+            mutate_storage_entries(&storage, 12, StorageStage::InboundPutMerge, key, &mutation,)
+                .await,
+            Err(DhtIoError::StorageFull)
+        ));
+
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: DHT_KEYSPACE.to_string(),
+                key: ByteView::from(key.as_bytes().as_slice()),
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::ReadResult { value: None, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn capacity_retained_floor() {
+        let (_directory, storage) = open_storage();
+        let now_secs = now_unix_secs();
+        let victim = DhtKeyId::from_data(b"floor-victim");
+        let target = DhtKeyId::from_data(b"floor-replacement");
+        let retained = StorageMutation::Merge {
+            entries: vec![make_entry(1, victim, now_secs.saturating_sub(1))],
+        };
+        mutate_storage_entries(
+            &storage,
+            30,
+            StorageStage::InboundPutMerge,
+            victim,
+            &retained,
+        )
+        .await
+        .expect("store retained floor");
+        write_count(&storage, MAX_STORED_KEYS).await;
+        let mutation = StorageMutation::Merge {
+            entries: vec![make_entry(2, target, now_secs.saturating_add(200))],
+        };
+
+        assert!(matches!(
+            mutate_storage_entries(
+                &storage,
+                32,
+                StorageStage::InboundPutMerge,
+                target,
+                &mutation,
+            )
+            .await,
+            Err(DhtIoError::StorageFull)
+        ));
+
+        assert!(row_exists(&storage, victim).await);
+        assert!(!row_exists(&storage, target).await);
+        assert_eq!(read_count(&storage).await, MAX_STORED_KEYS);
+        assert_eq!(
+            index_entries(&storage, DeadlineIndex::Floor)
+                .await
+                .into_iter()
+                .map(|entry| entry.key)
+                .collect::<Vec<_>>(),
+            vec![victim]
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_expired_row() {
+        let (_directory, storage) = open_storage();
+        let now_secs = now_unix_secs();
+        let victim = DhtKeyId::from_data(b"expired-active");
+        let target = DhtKeyId::from_data(b"expired-replacement");
+        let entry = make_entry(1, victim, now_secs);
+        let deadline = DeadlineEntry {
+            deadline: now_secs,
+            key: victim,
+        };
+        write_indexed_row(
+            &storage,
+            DeadlineIndex::Active,
+            deadline,
+            encode_entries(std::slice::from_ref(&entry)).unwrap(),
+        )
+        .await;
+        write_count(&storage, MAX_STORED_KEYS).await;
+        let mutation = StorageMutation::Merge {
+            entries: vec![make_entry(2, target, now_secs.saturating_add(200))],
+        };
+
+        mutate_storage_entries(
+            &storage,
+            33,
+            StorageStage::InboundPutMerge,
+            target,
+            &mutation,
+        )
+        .await
+        .expect("replace overdue active row");
+
+        assert!(!row_exists(&storage, victim).await);
+        assert!(row_exists(&storage, target).await);
+        assert_eq!(read_count(&storage).await, MAX_STORED_KEYS);
+    }
+
+    #[tokio::test]
+    async fn capacity_unsafe_rows() {
+        // Capacity reclaim skips corrupt, invalid, and live rows before choosing a safe victim.
+        let (_directory, storage) = open_storage();
+        let now_secs = now_unix_secs();
+        let corrupt = DhtKeyId::from_data(b"corrupt-victim");
+        let invalid_key = DhtKeyId::from_data(b"invalid-victim");
+        let victim = DhtKeyId::from_data(b"live-victim");
+        let floor_victim = DhtKeyId::from_data(b"later-floor-victim");
+        let target = DhtKeyId::from_data(b"safe-replacement");
+        let _ = store_due_floor(&storage, floor_victim, 2, now_secs.saturating_sub(1)).await;
+        let expires_at = now_secs.saturating_add(200);
+        let entry = make_entry(1, victim, expires_at);
+        let mut invalid = make_entry(4, invalid_key, expires_at);
+        invalid.revision = 0;
+        write_indexed_row(
+            &storage,
+            DeadlineIndex::Floor,
+            DeadlineEntry {
+                deadline: now_secs.saturating_sub(3),
+                key: corrupt,
+            },
+            b"not-postcard".to_vec(),
+        )
+        .await;
+        write_indexed_row(
+            &storage,
+            DeadlineIndex::Floor,
+            DeadlineEntry {
+                deadline: now_secs.saturating_sub(3),
+                key: invalid_key,
+            },
+            encode_entries(std::slice::from_ref(&invalid)).unwrap(),
+        )
+        .await;
+        write_indexed_row(
+            &storage,
+            DeadlineIndex::Floor,
+            DeadlineEntry {
+                deadline: now_secs.saturating_sub(2),
+                key: victim,
+            },
+            encode_entries(std::slice::from_ref(&entry)).unwrap(),
+        )
+        .await;
+        write_count(&storage, MAX_STORED_KEYS).await;
+        let mutation = StorageMutation::Merge {
+            entries: vec![make_entry(3, target, now_secs.saturating_add(300))],
+        };
+
+        mutate_storage_entries(
+            &storage,
+            35,
+            StorageStage::InboundPutMerge,
+            target,
+            &mutation,
+        )
+        .await
+        .expect("replace expired floor row");
+
+        assert!(row_exists(&storage, corrupt).await);
+        assert!(row_exists(&storage, invalid_key).await);
+        assert!(row_exists(&storage, victim).await);
+        assert!(!row_exists(&storage, floor_victim).await);
+        assert!(row_exists(&storage, target).await);
+        assert_eq!(read_count(&storage).await, MAX_STORED_KEYS);
+        assert!(
+            index_entries(&storage, DeadlineIndex::Floor)
+                .await
+                .is_empty()
+        );
+        let active = index_entries(&storage, DeadlineIndex::Active).await;
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().any(|entry| entry.key == victim));
+        assert!(active.iter().any(|entry| entry.key == target));
+    }
+
+    #[tokio::test]
+    async fn capacity_floor_admission() {
+        let (_directory, storage) = open_storage();
+        let now_secs = now_unix_secs();
+        let victim = DhtKeyId::from_data(b"retained-floor");
+        let target = DhtKeyId::from_data(b"new-floor");
+        let _ = store_due_floor(&storage, victim, 1, now_secs.saturating_sub(2)).await;
+        write_count(&storage, MAX_STORED_KEYS).await;
+        let mutation = StorageMutation::Merge {
+            entries: vec![make_entry(2, target, now_secs.saturating_sub(1))],
+        };
+
+        assert!(matches!(
+            mutate_storage_entries(
+                &storage,
+                38,
+                StorageStage::InboundPutMerge,
+                target,
+                &mutation,
+            )
+            .await,
+            Err(DhtIoError::StorageFull)
+        ));
+        assert!(row_exists(&storage, victim).await);
+        assert!(!row_exists(&storage, target).await);
+        assert_eq!(read_count(&storage).await, MAX_STORED_KEYS);
+    }
+
+    #[tokio::test]
+    async fn capacity_concurrent_reclaims() {
+        let (_directory, storage) = open_storage();
+        let now_secs = now_unix_secs();
+        let first_victim = DhtKeyId::from_data(b"first-floor-victim");
+        let second_victim = DhtKeyId::from_data(b"second-floor-victim");
+        let first_target = DhtKeyId::from_data(b"first-admission");
+        let second_target = DhtKeyId::from_data(b"second-admission");
+        let _ = store_due_floor(&storage, first_victim, 1, now_secs.saturating_sub(2)).await;
+        let _ = store_due_floor(&storage, second_victim, 2, now_secs.saturating_sub(1)).await;
+        write_count(&storage, MAX_STORED_KEYS).await;
+        let first = StorageMutation::Merge {
+            entries: vec![make_entry(3, first_target, now_secs.saturating_add(200))],
+        };
+        let second = StorageMutation::Merge {
+            entries: vec![make_entry(4, second_target, now_secs.saturating_add(300))],
+        };
+
+        let (first_result, second_result) = tokio::join!(
+            mutate_storage_entries(
+                &storage,
+                44,
+                StorageStage::InboundPutMerge,
+                first_target,
+                &first,
+            ),
+            mutate_storage_entries(
+                &storage,
+                45,
+                StorageStage::InboundPutMerge,
+                second_target,
+                &second,
+            ),
+        );
+        first_result.expect("first admission succeeds");
+        second_result.expect("second admission retries");
+
+        assert!(!row_exists(&storage, first_victim).await);
+        assert!(!row_exists(&storage, second_victim).await);
+        assert!(row_exists(&storage, first_target).await);
+        assert!(row_exists(&storage, second_target).await);
+        assert_eq!(read_count(&storage).await, MAX_STORED_KEYS);
+        assert!(
+            index_entries(&storage, DeadlineIndex::Floor)
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            index_entries(&storage, DeadlineIndex::Active).await.len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_indexes_row() {
+        let (_directory, storage) = open_storage();
+        let key = DhtKeyId::from_data(b"indexed-row");
+        let expires_at = now_unix_secs().saturating_add(200);
+        let mutation = StorageMutation::Merge {
+            entries: vec![make_entry(1, key, expires_at)],
+        };
+
+        mutate_storage_entries(&storage, 14, StorageStage::InboundPutMerge, key, &mutation)
+            .await
+            .expect("store indexed row");
+
+        assert_eq!(
+            index_entries(&storage, DeadlineIndex::Active).await,
+            vec![DeadlineEntry {
+                deadline: expires_at,
+                key
+            }]
+        );
+        assert!(
+            index_entries(&storage, DeadlineIndex::Floor)
+                .await
+                .is_empty()
+        );
+        assert_eq!(read_count(&storage).await, 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_moves_floor() {
+        let (_directory, storage) = open_storage();
+        let key = DhtKeyId::from_data(b"floor-transition");
+        let expires_at = now_unix_secs().saturating_add(20);
+        let mutation = StorageMutation::Merge {
+            entries: vec![make_entry(1, key, expires_at)],
+        };
+        mutate_storage_entries(&storage, 15, StorageStage::InboundPutMerge, key, &mutation)
+            .await
+            .expect("store active row");
+        let before = read_entries(&storage, key).await;
+        let active = index_entries(&storage, DeadlineIndex::Active).await[0];
+        let prune = StorageMutation::Prune {
+            index: DeadlineIndex::Active,
+            entry: active,
+            now_secs: expires_at,
+        };
+
+        mutate_storage_entries(&storage, 16, StorageStage::CleanupActivePrune, key, &prune)
+            .await
+            .expect("move row to floor index");
+
+        assert_eq!(read_entries(&storage, key).await, before);
+        assert!(
+            index_entries(&storage, DeadlineIndex::Active)
+                .await
+                .is_empty()
+        );
+        assert_eq!(index_entries(&storage, DeadlineIndex::Floor).await.len(), 1);
+        assert_eq!(read_count(&storage).await, 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_deletes_floor() {
+        let (_directory, storage) = open_storage();
+        let key = DhtKeyId::from_data(b"floor-removal");
+        let expires_at = now_unix_secs().saturating_add(20);
+        let mutation = StorageMutation::Merge {
+            entries: vec![make_entry(1, key, expires_at)],
+        };
+        mutate_storage_entries(&storage, 17, StorageStage::InboundPutMerge, key, &mutation)
+            .await
+            .expect("store active row");
+        let active = index_entries(&storage, DeadlineIndex::Active).await[0];
+        let prune = StorageMutation::Prune {
+            index: DeadlineIndex::Active,
+            entry: active,
+            now_secs: expires_at,
+        };
+        mutate_storage_entries(&storage, 18, StorageStage::CleanupActivePrune, key, &prune)
+            .await
+            .expect("move row to floor index");
+        let floor = index_entries(&storage, DeadlineIndex::Floor).await[0];
+        let prune = StorageMutation::Prune {
+            index: DeadlineIndex::Floor,
+            entry: floor,
+            now_secs: floor.deadline,
+        };
+
+        mutate_storage_entries(&storage, 19, StorageStage::CleanupFloorPrune, key, &prune)
+            .await
+            .expect("delete expired floor");
+
+        assert!(
+            index_entries(&storage, DeadlineIndex::Active)
+                .await
+                .is_empty()
+        );
+        assert!(
+            index_entries(&storage, DeadlineIndex::Floor)
+                .await
+                .is_empty()
+        );
+        assert_eq!(read_count(&storage).await, 0);
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: DHT_KEYSPACE.to_string(),
+                key: ByteView::from(key.as_bytes().as_slice()),
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::ReadResult { value: None, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn cleanup_clears_orphan() {
+        let (_directory, storage) = open_storage();
+        let key = DhtKeyId::from_data(b"orphan-index");
+        let entry = DeadlineEntry { deadline: 10, key };
+        let raw_key = deadline_key(DeadlineIndex::Floor, entry);
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: DHT_META_KEYSPACE.to_string(),
+                key: ByteView::from(raw_key),
+                value: ByteView::from(Vec::new()),
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        let prune = StorageMutation::Prune {
+            index: DeadlineIndex::Floor,
+            entry,
+            now_secs: entry.deadline,
+        };
+
+        mutate_storage_entries(&storage, 20, StorageStage::CleanupFloorPrune, key, &prune)
+            .await
+            .expect("remove orphan index");
+
+        assert!(
+            index_entries(&storage, DeadlineIndex::Floor)
+                .await
+                .is_empty()
+        );
+        assert_eq!(read_count(&storage).await, 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_skips_bad() {
+        let (_directory, storage) = open_storage();
+        let key = DhtKeyId::from_data(b"valid-index");
+        let entry = DeadlineEntry { deadline: 10, key };
+        let mut invalid = DeadlineIndex::Active.prefix().to_vec();
+        invalid.extend_from_slice(b"bad");
+        for raw_key in [invalid.clone(), deadline_key(DeadlineIndex::Active, entry)] {
+            let event = storage
+                .send_effect(Effect::Storage(StorageEffect::Write {
+                    key_space: DHT_META_KEYSPACE.to_string(),
+                    key: ByteView::from(raw_key),
+                    value: ByteView::from(Vec::new()),
+                    txn_id: None,
+                }))
+                .await;
+            assert!(matches!(
+                event,
+                Event::Storage(StorageEvent::WriteResult { .. })
+            ));
+        }
+
+        assert_eq!(
+            index_entries(&storage, DeadlineIndex::Active).await,
+            vec![entry]
+        );
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: DHT_META_KEYSPACE.to_string(),
+                key: ByteView::from(invalid),
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::ReadResult { value: None, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn cleanup_preserves_corrupt() {
+        let decode_key = DhtKeyId::from_data(b"corrupt-cleanup");
+        let invalid_key = DhtKeyId::from_data(b"invalid-cleanup");
+        let mut invalid = make_entry(1, invalid_key, 10);
+        invalid.revision = 0;
+        let cases = [
+            (decode_key, b"not-postcard".to_vec()),
+            (
+                invalid_key,
+                encode_entries(std::slice::from_ref(&invalid)).expect("encode invalid row"),
+            ),
+        ];
+        for (key, value) in cases {
+            let (_directory, storage) = open_storage();
+            let entry = DeadlineEntry { deadline: 10, key };
+            let writes = vec![
+                (
+                    DHT_KEYSPACE.to_string(),
+                    ByteView::from(key.as_bytes().as_slice()),
+                    ByteView::from(value.as_slice()),
+                ),
+                (
+                    DHT_META_KEYSPACE.to_string(),
+                    ByteView::from(deadline_key(DeadlineIndex::Active, entry)),
+                    ByteView::from(Vec::new()),
+                ),
+                (
+                    DHT_META_KEYSPACE.to_string(),
+                    ByteView::from(DHT_KEY_COUNT_KEY),
+                    ByteView::from(1u64.to_le_bytes().as_slice()),
+                ),
+            ];
+            let event = storage
+                .send_effect(Effect::Storage(StorageEffect::BatchWrite {
+                    writes,
+                    txn_id: None,
+                }))
+                .await;
+            assert!(matches!(
+                event,
+                Event::Storage(StorageEvent::BatchWriteResult { .. })
+            ));
+            let prune = StorageMutation::Prune {
+                index: DeadlineIndex::Active,
+                entry,
+                now_secs: entry.deadline,
+            };
+
+            mutate_storage_entries(&storage, 21, StorageStage::CleanupActivePrune, key, &prune)
+                .await
+                .expect("quarantine corrupt row");
+
+            assert!(
+                index_entries(&storage, DeadlineIndex::Active)
+                    .await
+                    .is_empty()
+            );
+            assert_eq!(read_count(&storage).await, 1);
+            let event = storage
+                .send_effect(Effect::Storage(StorageEffect::Read {
+                    key_space: DHT_KEYSPACE.to_string(),
+                    key: ByteView::from(key.as_bytes().as_slice()),
+                    txn_id: None,
+                }))
+                .await;
+            let Event::Storage(StorageEvent::ReadResult {
+                value: Some(stored),
+                ..
+            }) = event
+            else {
+                panic!("expected preserved DHT row: {event:?}");
+            };
+            assert_eq!(stored.as_ref(), value);
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_merge_persists() {
+        let (_directory, storage) = open_storage();
+        let key = DhtKeyId::from_data(b"batch-remote-merge");
+        let expires_at = now_unix_secs().saturating_add(200);
+        let mutation = StorageMutation::Merge {
+            entries: vec![
+                make_entry(1, key, expires_at),
+                make_entry(2, key, expires_at),
+            ],
+        };
+        let clock = DhtClock::new();
+
+        mutate_storage_checked(
+            &storage,
+            13,
+            StorageStage::GetRemoteMerge,
+            key,
+            &mutation,
+            &clock,
+        )
+        .await
+        .expect("batch merge succeeds");
+
+        let entries = read_entries(&storage, key).await;
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn writeback_drops_stale() {
+        // A read-repair batch commits the entries that still win and silently drops
+        // the one that lost a concurrent revision race, rather than failing wholesale.
+        let (_directory, storage) = open_storage();
+        let key = DhtKeyId::from_data(b"read-repair-mixed-batch");
+        let expires_at = now_unix_secs().saturating_add(200);
+
+        let winner = StorageMutation::Merge {
+            entries: vec![make_entry_rev(1, key, expires_at, 2)],
+        };
+        mutate_storage_entries(&storage, 20, StorageStage::InboundPutMerge, key, &winner)
+            .await
+            .expect("seed winning revision");
+
+        let clock = DhtClock::new();
+        let batch = StorageMutation::Merge {
+            entries: vec![
+                make_entry_rev(1, key, expires_at, 1),
+                make_entry(2, key, expires_at),
+            ],
+        };
+        mutate_storage_checked(
+            &storage,
+            21,
+            StorageStage::GetRemoteMerge,
+            key,
+            &batch,
+            &clock,
+        )
+        .await
+        .expect("read-repair commits fresh subset");
+
+        let entries = read_entries(&storage, key).await;
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|entry| entry.value == vec![2]));
+        assert!(entries.iter().any(|entry| entry.revision == 2));
+    }
+
+    #[tokio::test]
+    async fn concurrent_merges_preserve() {
+        let (_directory, storage) = open_storage();
+        let key = DhtKeyId::from_data(b"concurrent-merges");
+        let expires_at = now_unix_secs().saturating_add(200);
+        let first = StorageMutation::Merge {
+            entries: vec![make_entry(1, key, expires_at)],
+        };
+        let second = StorageMutation::Merge {
+            entries: vec![make_entry(2, key, expires_at)],
+        };
+
+        let (first_result, second_result) = tokio::join!(
+            mutate_storage_entries(&storage, 1, StorageStage::PutLocalMerge, key, &first),
+            mutate_storage_entries(&storage, 2, StorageStage::InboundPutMerge, key, &second),
+        );
+        first_result.expect("first merge succeeds");
+        second_result.expect("second merge retries and succeeds");
+
+        let entries = read_entries(&storage, key).await;
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cleanup_preserves_fresh() {
+        let (_directory, storage) = open_storage();
+        let key = DhtKeyId::from_data(b"cleanup-race");
+        let now_secs = now_unix_secs();
+        let old = StorageMutation::Merge {
+            entries: vec![make_entry(1, key, now_secs.saturating_add(50))],
+        };
+        mutate_storage_entries(&storage, 3, StorageStage::InboundPutMerge, key, &old)
+            .await
+            .expect("store old entry");
+
+        let entry = DeadlineEntry {
+            deadline: now_secs.saturating_add(50),
+            key,
+        };
+        let prune = StorageMutation::Prune {
+            index: DeadlineIndex::Active,
+            entry,
+            now_secs: now_secs.saturating_add(400),
+        };
+        let merge = StorageMutation::Merge {
+            entries: vec![make_entry(2, key, now_secs.saturating_add(500))],
+        };
+        let (prune_result, merge_result) = tokio::join!(
+            mutate_storage_entries(&storage, 3, StorageStage::CleanupActivePrune, key, &prune,),
+            mutate_storage_entries(&storage, 4, StorageStage::InboundPutMerge, key, &merge),
+        );
+        prune_result.expect("cleanup retries and succeeds");
+        merge_result.expect("fresh merge succeeds");
+
+        let entries = read_entries(&storage, key).await;
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|entry| entry.value == vec![2]));
+        assert!(entries.iter().any(|entry| entry.value == vec![1]));
+    }
+
+    #[tokio::test]
+    async fn corrupt_row_preserved() {
+        let (_directory, storage) = open_storage();
+        let key = DhtKeyId::from_data(b"corrupt-row");
+        let corrupt = ByteView::from(b"not-postcard".as_slice());
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: DHT_KEYSPACE.to_string(),
+                key: ByteView::from(key.as_bytes().as_slice()),
+                value: corrupt.clone(),
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        let mutation = StorageMutation::Merge {
+            entries: vec![make_entry(1, key, now_unix_secs().saturating_add(200))],
+        };
+        assert!(
+            mutate_storage_entries(&storage, 5, StorageStage::InboundPutMerge, key, &mutation,)
+                .await
+                .is_err()
+        );
+
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: DHT_KEYSPACE.to_string(),
+                key: ByteView::from(key.as_bytes().as_slice()),
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::ReadResult { value: Some(value), .. }) if value == corrupt
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_merge_rejected() {
+        let (_directory, storage) = open_storage();
+        let key = DhtKeyId::from_data(b"stale-merge");
+        let mutation = StorageMutation::Merge {
+            entries: vec![make_entry(1, key, 0)],
+        };
+
+        assert!(matches!(
+            mutate_storage_entries(&storage, 6, StorageStage::InboundPutMerge, key, &mutation)
+                .await,
+            Err(DhtIoError::InvalidRequest(_))
+        ));
+
+        let event = storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: DHT_KEYSPACE.to_string(),
+                key: ByteView::from(key.as_bytes().as_slice()),
+                txn_id: None,
+            }))
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::ReadResult { value: None, .. })
+        ));
+    }
 }

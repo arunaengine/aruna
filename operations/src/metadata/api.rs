@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::errors::AuthorizationError;
+use aruna_core::errors::{AuthorizationError, ConversionError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::short_display_id;
 use aruna_core::keyspaces::{
@@ -790,8 +790,23 @@ async fn load_metadata_realm_nodes_with_status(
     realm_id: RealmId,
     local_node_id: NodeId,
 ) -> MetadataRealmNodeDiscovery {
+    let Some(config) = load_realm_config(context, realm_id).await else {
+        return MetadataRealmNodeDiscovery {
+            nodes: vec![local_node_id],
+            failed: true,
+        };
+    };
     let nodes = match drive(GetRealmNodesOperation::new(realm_id), context).await {
-        Ok(nodes) => (nodes, false),
+        Ok(nodes) => match authorized_realm_nodes(&config, nodes) {
+            Ok(nodes) => (nodes, false),
+            Err(error) => {
+                warn!(error = %error, "realm config contains invalid node ids; using local-only metadata results");
+                return MetadataRealmNodeDiscovery {
+                    nodes: vec![local_node_id],
+                    failed: true,
+                };
+            }
+        },
         Err(error) => {
             warn!(
                 error = %error,
@@ -807,6 +822,20 @@ async fn load_metadata_realm_nodes_with_status(
     }
     nodes.sort_by_key(|node_id| node_id.to_string());
     MetadataRealmNodeDiscovery { nodes, failed }
+}
+
+fn authorized_realm_nodes(
+    config: &RealmConfigDocument,
+    nodes: HashSet<NodeId>,
+) -> Result<HashSet<NodeId>, ConversionError> {
+    let authorized = config
+        .sync_eligible_node_ids()?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    Ok(nodes
+        .into_iter()
+        .filter(|node_id| authorized.contains(node_id))
+        .collect())
 }
 
 async fn load_group_metadata_records(
@@ -2352,6 +2381,21 @@ mod tests {
             document_replica_query_nodes(None, &record, local_node_id),
             vec![local_node_id]
         );
+    }
+
+    #[test]
+    fn fanout_filters_nodes() {
+        let server = iroh::SecretKey::from_bytes(&[24u8; 32]).public();
+        let user = iroh::SecretKey::from_bytes(&[25u8; 32]).public();
+        let unknown = iroh::SecretKey::from_bytes(&[26u8; 32]).public();
+        let mut config = RealmConfigDocument::new(RealmId([4u8; 32]), Vec::new(), 2);
+        config.ensure_node(server, aruna_core::structs::RealmNodeKind::Server);
+        config.ensure_node(user, aruna_core::structs::RealmNodeKind::User);
+
+        let nodes = authorized_realm_nodes(&config, HashSet::from([server, user, unknown]))
+            .expect("valid node ids");
+
+        assert_eq!(nodes, HashSet::from([server]));
     }
 
     #[test]

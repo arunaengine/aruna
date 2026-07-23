@@ -2507,7 +2507,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_realm_nodes_reflects_new_presence_without_stale_cache() {
+    async fn presence_tracks_config() {
         let realm_id = test_realm_id(31);
         let coordinator = spawn_distributed_metadata_node(realm_id).await;
         let remote = spawn_distributed_metadata_node(realm_id).await;
@@ -2520,51 +2520,24 @@ mod tests {
             .net
             .add_peer_addr(coordinator.net.endpoint_addr())
             .await;
+        install_distributed_realm_config(&[&coordinator, &remote], realm_id).await;
 
         let initial = load_realm_nodes(coordinator.state.as_ref()).await.unwrap();
         assert_eq!(initial, vec![coordinator.net.node_id()]);
 
         let remote_ctx = remote.state.get_ctx();
-        let mut announced = false;
-        let mut last_announce_error = None;
-        for _ in 0..10 {
-            match drive(
-                AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
-                    realm_id,
-                    node_id: remote.net.node_id(),
-                    schedule_refresh: false,
-                }),
-                remote_ctx.as_ref(),
-            )
-            .await
-            {
-                Ok(()) => {
-                    announced = true;
-                    break;
-                }
-                Err(error) => {
-                    last_announce_error = Some(format!("{error:?}"));
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
-        if !announced {
-            coordinator.net.shutdown().await;
-            remote.net.shutdown().await;
-            panic!(
-                "remote realm presence was not announced: {}",
-                last_announce_error.unwrap_or_else(|| "no attempts".to_string())
-            );
-        }
+        drive(
+            AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+                realm_id,
+                node_id: remote.net.node_id(),
+                schedule_refresh: false,
+            }),
+            remote_ctx.as_ref(),
+        )
+        .await
+        .unwrap();
 
-        let mut discovered = Vec::new();
-        for _ in 0..10 {
-            discovered = load_realm_nodes(coordinator.state.as_ref()).await.unwrap();
-            if discovered.contains(&remote.net.node_id()) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        let discovered = load_realm_nodes(coordinator.state.as_ref()).await.unwrap();
 
         assert!(discovered.contains(&coordinator.net.node_id()));
         assert!(discovered.contains(&remote.net.node_id()));
@@ -4976,6 +4949,16 @@ mod tests {
                 .into(),
         )
         .await;
+        drive(
+            AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+                realm_id,
+                node_id,
+                schedule_refresh: false,
+            }),
+            driver_ctx.as_ref(),
+        )
+        .await
+        .unwrap();
         let group_id = Ulid::generate();
         let group_auth =
             GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);

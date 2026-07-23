@@ -623,16 +623,8 @@ impl NetHandle {
         let (stream_tx, mut stream_rx) = mpsc::channel(64);
 
         let dht_inbound_tx = dht_resources.inbound_stream_tx.clone();
-        let dht_for_inbound = dht.clone();
         let dht_task = tokio::spawn(async move {
             while let Some((send, recv, peer_id)) = dht_rx.recv().await {
-                if let Err(err) = dht_for_inbound.add_peer(peer_id) {
-                    warn!(
-                        node_id = %peer_id,
-                        error = %err,
-                        "Failed to add inbound DHT peer to routing queue"
-                    );
-                }
                 match dht_inbound_tx.try_send((send, recv, peer_id)) {
                     Ok(()) => {}
                     Err(TrySendError::Full(_)) => {
@@ -1421,7 +1413,7 @@ fn spawn_dht_signed_publisher(
 }
 
 fn normalized_dht_signed_timing(ttl: Duration, refresh_after: Duration) -> (Duration, Duration) {
-    let ttl_secs = ttl.as_secs().max(1);
+    let ttl_secs = ttl.as_secs().clamp(1, dht::constants::MAX_TTL_SECS);
     let mut refresh_secs = refresh_after.as_secs().max(1);
     if refresh_secs >= ttl_secs && ttl_secs > 1 {
         refresh_secs = (ttl_secs / 2).max(1);
@@ -1475,8 +1467,15 @@ async fn publish_realm_endpoint_announcement(
         .map_err(|err| NetError::Dht(format!("encode endpoint announcement: {err}")))?;
     let key = realm_endpoint_key(&realm_id, &node_id);
 
-    dht.put(&key, realm_id, value, Duration::from_secs(ttl_secs))
-        .await
+    let stats = dht
+        .put(&key, realm_id, value, Duration::from_secs(ttl_secs))
+        .await?;
+    if stats.remote_store_count == 0 {
+        return Err(NetError::Dht(
+            "DHT announcement was stored locally but not by a remote peer".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 async fn lookup_dht_signed_endpoint(
