@@ -57,10 +57,8 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
     let group_id = Ulid::generate();
     let holders = [nodes[0].net.node_id(), nodes[1].net.node_id()];
 
-    // The bucket is chosen from the canonical path (6.3.6), so documents sharing
-    // one path land in one bucket. Both holders hold every bucket over two nodes
-    // and choose from the same subject, so their choice is the shared shard this
-    // test needs.
+    // This fixture uses one shard so distinct metadata paths can exercise
+    // interleaved writes without violating path uniqueness.
     let placement = shared_path_bucket(&config, &holders, realm_id, group_id);
     let document_ids: Vec<Ulid> = (0..6).map(|_| Ulid::generate()).collect();
 
@@ -206,7 +204,7 @@ async fn create_document(
             },
             group_id,
             document_id,
-            document_path: CONVERGE_PATH.to_string(),
+            document_path: format!("{CONVERGE_PATH}/{index}"),
             public: true,
             payload: CreateMetadataDocumentPayload::Scaffold {
                 name: format!("Converge {index}"),
@@ -340,6 +338,9 @@ async fn install_realm_config(
 ) -> Result<RealmConfigDocument, Box<dyn std::error::Error>> {
     let mut config = RealmConfigDocument::default_for_realm(*realm_id, Vec::new());
     config.seed_default_placement();
+    for strategy in &mut config.strategies {
+        strategy.shard_count = 1;
+    }
     for node in nodes {
         config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
     }
