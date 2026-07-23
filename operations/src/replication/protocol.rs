@@ -33,6 +33,7 @@ pub struct VersionReplicationManifest {
     pub upstream_sources: Vec<ArunaArn>,
     pub writer_auth_context: Option<AuthContext>,
     pub reference_metadata: Option<SourceMetadata>,
+    pub metadata: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -141,9 +142,16 @@ impl VersionReplicationMessage {
         match postcard::from_bytes(payload) {
             Ok(message) => Ok(message),
             Err(postcard::Error::DeserializeUnexpectedEnd) => {
+                let empty_metadata = postcard::to_allocvec(&HashMap::<String, String>::new())?;
+                let mut current = payload.to_vec();
+                current.extend_from_slice(&empty_metadata);
+                if let Ok(message) = postcard::from_bytes(&current) {
+                    return Ok(message);
+                }
                 let reference_none = postcard::to_allocvec(&Option::<SourceMetadata>::None)?;
                 let mut current = payload.to_vec();
                 current.extend_from_slice(&reference_none);
+                current.extend_from_slice(&empty_metadata);
                 if let Ok(message) = postcard::from_bytes(&current) {
                     return Ok(message);
                 }
@@ -151,6 +159,7 @@ impl VersionReplicationMessage {
                 let mut current = payload.to_vec();
                 current.extend_from_slice(&writer_none);
                 current.extend_from_slice(&reference_none);
+                current.extend_from_slice(&empty_metadata);
                 if let Ok(message) = postcard::from_bytes(&current) {
                     return Ok(message);
                 }
@@ -159,6 +168,7 @@ impl VersionReplicationMessage {
                 origin_only.extend_from_slice(&empty_sources);
                 origin_only.extend_from_slice(&writer_none);
                 origin_only.extend_from_slice(&reference_none);
+                origin_only.extend_from_slice(&empty_metadata);
                 if let Ok(message) = postcard::from_bytes(&origin_only) {
                     return Ok(message);
                 }
@@ -167,6 +177,7 @@ impl VersionReplicationMessage {
                 previous.extend_from_slice(&empty_sources);
                 previous.extend_from_slice(&writer_none);
                 previous.extend_from_slice(&reference_none);
+                previous.extend_from_slice(&empty_metadata);
                 if let Ok(message) = postcard::from_bytes(&previous) {
                     return Ok(message);
                 }
@@ -176,6 +187,7 @@ impl VersionReplicationMessage {
                 legacy.extend_from_slice(&empty_sources);
                 legacy.extend_from_slice(&writer_none);
                 legacy.extend_from_slice(&reference_none);
+                legacy.extend_from_slice(&empty_metadata);
                 Ok(postcard::from_bytes(&legacy)?)
             }
             Err(error) => Err(error.into()),
@@ -286,6 +298,7 @@ mod tests {
             upstream_sources: Vec::new(),
             writer_auth_context: None,
             reference_metadata: None,
+            metadata: HashMap::new(),
         }
     }
 
@@ -311,6 +324,9 @@ mod tests {
             last_modified: Some(SystemTime::UNIX_EPOCH),
             source_version: None,
         });
+        manifest
+            .metadata
+            .insert("mtime".to_string(), "1753272000.123456789".to_string());
         let message = VersionReplicationMessage::VersionManifest(manifest);
         let bytes = message.to_bytes().unwrap();
 

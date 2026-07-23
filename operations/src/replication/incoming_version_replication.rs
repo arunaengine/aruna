@@ -382,7 +382,8 @@ impl IncomingVersionReplicationOperation {
             self.manifest.created_at,
             self.manifest.created_by,
             self.manifest.created_at,
-        ))
+        )
+        .with_metadata(self.manifest.metadata.clone()))
     }
 
     fn incoming_logical_bytes(&self) -> Result<u64, IncomingVersionReplicationError> {
@@ -885,7 +886,8 @@ impl IncomingVersionReplicationOperation {
                             self.manifest.created_at,
                             self.manifest.created_by,
                             self.manifest.source.clone(),
-                        ),
+                        )
+                        .with_metadata(self.manifest.metadata.clone()),
                         Some(hash),
                     )
                 }
@@ -2100,6 +2102,7 @@ mod tests {
             upstream_sources: Vec::new(),
             writer_auth_context: None,
             reference_metadata: None,
+            metadata: HashMap::new(),
         }
     }
 
@@ -2782,6 +2785,10 @@ mod tests {
         let source = make_source_binding();
         let mut manifest = make_manifest(ReplicationItemKind::Materialized);
         manifest.source = Some(source.clone());
+        manifest
+            .metadata
+            .insert("mtime".to_string(), "1753272000.123456789".to_string());
+        let expected_metadata = manifest.metadata.clone();
         manifest.current_version = false;
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::generate(),
@@ -2800,6 +2807,7 @@ mod tests {
         };
         let version = BlobVersion::from_bytes(value.as_ref()).unwrap();
         assert_eq!(version.source_binding(), Some(&source));
+        assert_eq!(version.metadata, expected_metadata);
     }
 
     #[test]

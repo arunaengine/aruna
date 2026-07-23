@@ -25,6 +25,7 @@ use aruna_core::structs::{
 use aruna_core::types::{Effects, GroupId, Key, NodeId};
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
+use std::collections::HashMap;
 use std::time::SystemTime;
 use thiserror::Error;
 use tracing::debug;
@@ -71,6 +72,7 @@ enum ReplicationVersion {
         created_by: aruna_core::user_id::UserId,
         location: BackendLocation,
         source: Option<VersionSourceBinding>,
+        metadata: HashMap<String, String>,
     },
     Reference {
         created_at: SystemTime,
@@ -78,6 +80,7 @@ enum ReplicationVersion {
         source: VersionSourceBinding,
         cached_metadata: SourceMetadata,
         last_refresh: SystemTime,
+        metadata: HashMap<String, String>,
     },
     Deleted {
         created_at: SystemTime,
@@ -91,6 +94,7 @@ struct PendingMaterializedReplicationVersion {
     created_by: aruna_core::user_id::UserId,
     blob_hash: [u8; 32],
     source: Option<VersionSourceBinding>,
+    metadata: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1198,6 +1202,7 @@ impl ReplicateObjectVersionOperation {
                     created_at,
                     created_by,
                     source,
+                    metadata,
                     ..
                 } = version
                 else {
@@ -1218,6 +1223,7 @@ impl ReplicateObjectVersionOperation {
                     created_by,
                     location,
                     source: Some(source),
+                    metadata,
                 });
                 self.read_current_lookup()
             }
@@ -1248,19 +1254,20 @@ impl ReplicateObjectVersionOperation {
         let current_version = current_version_pointer.is_some();
         let reference_intent =
             self.sync.as_ref().is_some_and(|sync| sync.reference_intent) || self.preserve_reference;
-        let (kind, created_at, created_by, blob, source, reference_metadata) = match version {
+        let (kind, created_at, created_by, blob, source, reference, metadata) = match version {
             ReplicationVersion::Materialized {
                 created_at,
                 created_by,
                 location,
                 source,
+                metadata,
             } => {
                 if reference_intent {
                     let sync = self
                         .sync
                         .as_ref()
                         .ok_or(ReplicateObjectVersionError::UnresolvedReferenceVersion)?;
-                    let metadata = SourceMetadata {
+                    let reference = SourceMetadata {
                         content_length: location.blob_size,
                         content_type: None,
                         etag: None,
@@ -1273,7 +1280,8 @@ impl ReplicateObjectVersionOperation {
                         created_by,
                         None,
                         Some(self.reference_binding(sync)),
-                        Some(metadata),
+                        Some(reference),
+                        metadata,
                     )
                 } else {
                     let hash = location
@@ -1294,6 +1302,7 @@ impl ReplicateObjectVersionOperation {
                         }),
                         source,
                         None,
+                        metadata,
                     )
                 }
             }
@@ -1307,11 +1316,13 @@ impl ReplicateObjectVersionOperation {
                 None,
                 None,
                 None,
+                HashMap::new(),
             ),
             ReplicationVersion::Reference {
                 created_at,
                 created_by,
                 cached_metadata,
+                metadata,
                 ..
             } => {
                 if !reference_intent {
@@ -1328,6 +1339,7 @@ impl ReplicateObjectVersionOperation {
                     None,
                     Some(self.reference_binding(sync)),
                     Some(cached_metadata),
+                    metadata,
                 )
             }
         };
@@ -1371,7 +1383,8 @@ impl ReplicateObjectVersionOperation {
                 .sync
                 .as_ref()
                 .and_then(|sync| sync.writer_auth_context.clone()),
-            reference_metadata,
+            reference_metadata: reference,
+            metadata,
         });
         if let Some(manifest) = self.manifest.as_ref() {
             debug!(
@@ -1534,6 +1547,7 @@ impl Operation for ReplicateObjectVersionOperation {
                     created_at,
                     created_by,
                     state,
+                    metadata,
                 } = version;
 
                 match state {
@@ -1544,6 +1558,7 @@ impl Operation for ReplicateObjectVersionOperation {
                                 created_by,
                                 blob_hash,
                                 source,
+                                metadata,
                             });
                         self.read_blob_location(blob_hash)
                     }
@@ -1567,6 +1582,7 @@ impl Operation for ReplicateObjectVersionOperation {
                             source,
                             cached_metadata,
                             last_refresh,
+                            metadata,
                         })
                     }
                 }
@@ -1591,6 +1607,7 @@ impl Operation for ReplicateObjectVersionOperation {
                     created_by,
                     blob_hash,
                     source,
+                    metadata,
                 }) = self.pending_materialized_version.take()
                 else {
                     return self.fail(ReplicateObjectVersionError::VersionNotFound);
@@ -1603,6 +1620,7 @@ impl Operation for ReplicateObjectVersionOperation {
                     created_by,
                     location,
                     source,
+                    metadata,
                 });
                 self.read_multipart_summary()
             }
@@ -2418,12 +2436,14 @@ mod tests {
     fn manifest_includes_source_binding_for_materialized_version() {
         let version_id = Ulid::generate();
         let source = reference_source_binding();
+        let metadata = HashMap::from([("mtime".to_string(), "1753272000.123456789".to_string())]);
         let mut op = ReplicateObjectVersionOperation::new(version_request(version_id));
         op.replication_version = Some(ReplicationVersion::Materialized {
             created_at: SystemTime::now(),
             created_by: test_user_id(),
             location: materialized_location(),
             source: Some(source.clone()),
+            metadata: metadata.clone(),
         });
 
         op.build_manifest(None).unwrap();
@@ -2434,6 +2454,7 @@ mod tests {
             aruna_core::structs::ReplicationItemKind::Materialized
         );
         assert_eq!(manifest.source, Some(source));
+        assert_eq!(manifest.metadata, metadata);
     }
 
     #[test]
@@ -2450,6 +2471,7 @@ mod tests {
             created_by: test_user_id(),
             location: location.clone(),
             source: None,
+            metadata: HashMap::new(),
         });
 
         op.build_manifest(None).unwrap();
@@ -2538,6 +2560,7 @@ mod tests {
             source,
             cached_metadata,
             last_refresh,
+            metadata: HashMap::new(),
         });
 
         assert_eq!(

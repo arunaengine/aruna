@@ -477,6 +477,7 @@ pub struct BlobVersion {
     pub created_at: SystemTime,
     pub created_by: UserId,
     pub state: BlobVersionState,
+    pub metadata: HashMap<String, String>,
 }
 
 impl BlobVersion {
@@ -490,6 +491,7 @@ impl BlobVersion {
             created_at,
             created_by,
             state: BlobVersionState::Materialized { blob_hash, source },
+            metadata: HashMap::new(),
         }
     }
 
@@ -498,6 +500,7 @@ impl BlobVersion {
             created_at,
             created_by,
             state: BlobVersionState::Deleted,
+            metadata: HashMap::new(),
         }
     }
 
@@ -516,7 +519,13 @@ impl BlobVersion {
                 cached_metadata,
                 last_refresh,
             },
+            metadata: HashMap::new(),
         }
+    }
+
+    pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
+        self.metadata = metadata;
+        self
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -808,7 +817,11 @@ mod tests {
         };
 
         let versions = vec![
-            BlobVersion::materialized([1u8; 32], created_at, created_by, Some(binding.clone())),
+            BlobVersion::materialized([1u8; 32], created_at, created_by, Some(binding.clone()))
+                .with_metadata(HashMap::from([(
+                    "mtime".to_string(),
+                    "1753272000.123456789".to_string(),
+                )])),
             BlobVersion::reference(
                 binding.clone(),
                 reference_metadata,

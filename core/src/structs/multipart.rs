@@ -45,6 +45,7 @@ pub struct MultipartUpload {
     pub created_at: SystemTime,
     pub status: MultipartUploadStatus,
     pub checksum_hint: Option<MultipartUploadChecksumHint>,
+    pub metadata: HashMap<String, String>,
 }
 
 impl MultipartUpload {

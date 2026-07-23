@@ -388,6 +388,7 @@ mod test {
             created_at,
             status: MultipartUploadStatus::Open,
             checksum_hint: None,
+            metadata: Default::default(),
         }
     }
 

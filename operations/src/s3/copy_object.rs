@@ -5,6 +5,7 @@ use aruna_core::UserId;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{BackendLocation, RealmId, StagingStrategy, VersionSourceBinding};
 use aruna_core::types::{GroupId, NodeId};
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
@@ -31,6 +32,7 @@ pub struct CopyObjectInput {
     pub node_id: NodeId,
     pub quota_ceiling: Option<u64>,
     pub conditions: CopySourceConditions,
+    pub metadata: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -174,6 +176,7 @@ pub async fn copy_object(
                 ..binding
             })
     };
+    let metadata = input.metadata.unwrap_or(source.metadata);
 
     let put_result = drive(
         PutObjectOperation::new(PutObjectConfig {
@@ -192,7 +195,8 @@ pub async fn copy_object(
             exists: false,
             version_source,
             quota_ceiling: input.quota_ceiling,
-        }),
+        })
+        .with_metadata(metadata),
         context,
     )
     .await
@@ -416,6 +420,7 @@ mod test {
                 node_id,
                 quota_ceiling: None,
                 conditions: CopySourceConditions::default(),
+                metadata: None,
             },
         )
         .await
@@ -495,6 +500,7 @@ mod test {
                 node_id,
                 quota_ceiling: None,
                 conditions: CopySourceConditions::default(),
+                metadata: None,
             },
         )
         .await
@@ -589,6 +595,7 @@ mod test {
                 node_id,
                 quota_ceiling: None,
                 conditions: CopySourceConditions::default(),
+                metadata: None,
             },
         )
         .await
@@ -751,6 +758,7 @@ mod test {
                     if_none_match: Some("*".to_string()),
                     ..Default::default()
                 },
+                metadata: None,
             },
         )
         .await

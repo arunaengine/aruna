@@ -795,10 +795,18 @@ impl ArunaS3Service {
     fn build_object_response_fields(
         &self,
         location: Option<&aruna_core::structs::BackendLocation>,
+        metadata: Option<&std::collections::HashMap<String, String>>,
         source_metadata: Option<&aruna_core::structs::SourceMetadata>,
         last_refresh: Option<SystemTime>,
         version_created_at: Option<SystemTime>,
     ) -> ObjectResponseFields {
+        let mut response_metadata = metadata.cloned().unwrap_or_default();
+        if let Some(source_headers) = source_metadata
+            .and_then(|metadata| self.source_metadata_headers(metadata, last_refresh))
+        {
+            response_metadata.extend(source_headers);
+        }
+
         ObjectResponseFields {
             content_length: location
                 .map(|location| location.blob_size as i64)
@@ -825,8 +833,7 @@ impl ArunaS3Service {
                 .or_else(|| {
                     source_metadata.and_then(|metadata| metadata.last_modified.map(Into::into))
                 }),
-            metadata: source_metadata
-                .and_then(|metadata| self.source_metadata_headers(metadata, last_refresh)),
+            metadata: (!response_metadata.is_empty()).then_some(response_metadata),
         }
     }
 
@@ -884,6 +891,7 @@ impl ArunaS3Service {
             .map(|object| {
                 let response_fields = self.build_object_response_fields(
                     object.location.as_ref(),
+                    None,
                     object.source_metadata.as_ref(),
                     object.last_refresh,
                     object.version_created_at,
@@ -1538,8 +1546,9 @@ impl S3 for ArunaS3Service {
                 move || headers.read(Clone::clone),
             ));
         }
+        let metadata = req.input.metadata.clone().unwrap_or_default();
         let input = convert_input(req.input)?;
-        let config = PutObjectConfig {
+        let operation = PutObjectOperation::new(PutObjectConfig {
             user_id: user_access.user_identity,
             group_id,
             realm_id: self.realm_id,
@@ -1550,8 +1559,8 @@ impl S3 for ArunaS3Service {
             version_source: None,
             exists: false,
             quota_ceiling,
-        };
-        let operation = PutObjectOperation::new(config);
+        })
+        .with_metadata(metadata);
 
         let result = drive(operation, &self.state)
             .await
@@ -1658,13 +1667,11 @@ impl S3 for ArunaS3Service {
             .as_ref()
             .map(MetadataDirective::as_str)
             == Some(MetadataDirective::REPLACE);
-        if metadata_replace {
-            return Err(s3_error!(
-                NotImplemented,
-                "MetadataDirective=REPLACE is not supported until object metadata is persisted."
-            ));
-        }
-        if source_bucket == dest_bucket && source_key == dest_key && source_version_id.is_none() {
+        if source_bucket == dest_bucket
+            && source_key == dest_key
+            && source_version_id.is_none()
+            && !metadata_replace
+        {
             return Err(s3_error!(
                 InvalidRequest,
                 "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes."
@@ -1703,6 +1710,7 @@ impl S3 for ArunaS3Service {
                 node_id: self.node_id,
                 quota_ceiling,
                 conditions,
+                metadata: metadata_replace.then(|| req.input.metadata.clone().unwrap_or_default()),
             },
         )
         .await
@@ -1781,7 +1789,8 @@ impl S3 for ArunaS3Service {
                 .unwrap_or(user_access.group_id),
             created_by: user_access.user_identity,
             checksum_hint: checksum_hint.clone(),
-        });
+        })
+        .with_metadata(req.input.metadata.clone().unwrap_or_default());
 
         let result = drive(operation, &self.state)
             .await
@@ -2188,6 +2197,7 @@ impl S3 for ArunaS3Service {
         let reference_refresh = reference_metadata_refresh(response_bucket, response_key, &result);
         let response_fields = self.build_object_response_fields(
             result.location.as_ref(),
+            Some(&result.metadata),
             result.source_metadata.as_ref(),
             result.last_refresh,
             result.version_created_at,
@@ -2318,6 +2328,7 @@ impl S3 for ArunaS3Service {
 
         let response_fields = self.build_object_response_fields(
             result.location.as_ref(),
+            None,
             result.source_metadata.as_ref(),
             None,
             result.version_created_at,
@@ -2455,6 +2466,7 @@ impl S3 for ArunaS3Service {
 
         let response_fields = self.build_object_response_fields(
             result.location.as_ref(),
+            Some(&result.metadata),
             result.source_metadata.as_ref(),
             result.last_refresh,
             result.version_created_at,
@@ -2802,6 +2814,7 @@ impl S3 for ArunaS3Service {
                 } => {
                     let response_fields = self.build_object_response_fields(
                         location.as_ref(),
+                        None,
                         source_metadata.as_ref(),
                         None,
                         Some(created_at),
@@ -4303,7 +4316,7 @@ mod tests {
                 .await
                 .unwrap_err();
             let expected = if allowed {
-                S3ErrorCode::NotImplemented
+                S3ErrorCode::InternalError
             } else {
                 S3ErrorCode::AccessDenied
             };

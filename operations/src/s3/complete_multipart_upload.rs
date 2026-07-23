@@ -735,6 +735,10 @@ impl CompleteMultipartUploadOperation {
             .version_created_at
             .get_or_insert_with(SystemTime::now)
             .to_owned();
+        let Some(upload_record) = self.upload_record.as_ref() else {
+            return self
+                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        };
         let version = BlobVersion::materialized(
             match blake3_hash.try_into() {
                 Ok(hash) => hash,
@@ -746,7 +750,8 @@ impl CompleteMultipartUploadOperation {
             created_at,
             self.input.created_by,
             None,
-        );
+        )
+        .with_metadata(upload_record.metadata.clone());
         let version_key = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
         let effect = match write_blob_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,
@@ -1414,6 +1419,7 @@ mod tests {
             created_at: SystemTime::now(),
             status: MultipartUploadStatus::Completing,
             checksum_hint: None,
+            metadata: HashMap::new(),
         }
     }
 
