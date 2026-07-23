@@ -222,7 +222,10 @@ fn inspect_layout(mut entries: Vec<ArchiveEntry>, eln: bool) -> Result<ArchiveIn
         ([], [(wrapper, metadata_index)]) => {
             let prefix = format!("{wrapper}/");
             if entries.iter().any(|entry| {
-                entry.path != *wrapper && !entry.path.starts_with(&prefix) && !entry.path.is_empty()
+                (entry.path == *wrapper && !entry.directory)
+                    || (entry.path != *wrapper
+                        && !entry.path.starts_with(&prefix)
+                        && !entry.path.is_empty())
             }) {
                 return Err("wrapper archive contains another top-level entry".to_string());
             }
@@ -369,6 +372,20 @@ mod tests {
                 vec![
                     entry(0, "experiment/ro-crate-metadata.json"),
                     entry(1, "outside.txt"),
+                ],
+                true,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn layout_rejects_file() {
+        assert!(
+            inspect_layout(
+                vec![
+                    entry(0, "experiment/ro-crate-metadata.json"),
+                    entry(1, "experiment"),
                 ],
                 true,
             )
