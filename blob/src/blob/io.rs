@@ -126,24 +126,38 @@ impl BlobHandler {
             BlobEvent::WriteFinished { location } => location,
             other => return other,
         };
-        if let Err(err) = self.increment_bucket_load(&location.storage_bucket).await {
-            return BlobEvent::Error(err);
-        }
         let Some(hash) = location.get_blake3() else {
+            let _ = self.discard_hidden(&location).await;
             return BlobEvent::Error(BlobError::IntegrityCheckFailed(
                 "hidden blob hash is missing".to_string(),
             ));
         };
         let Ok(blake3) = hash.try_into() else {
+            let _ = self.discard_hidden(&location).await;
             return BlobEvent::Error(BlobError::IntegrityCheckFailed(
                 "hidden blob hash has an invalid length".to_string(),
             ));
         };
+        if let Err(err) = self.increment_bucket_load(&location.storage_bucket).await {
+            if let Err(cleanup) = self.discard_hidden(&location).await {
+                return BlobEvent::Error(cleanup);
+            }
+            return BlobEvent::Error(err);
+        }
         BlobEvent::HiddenSpooled {
             size: location.blob_size,
             location,
             blake3,
         }
+    }
+
+    async fn discard_hidden(&self, location: &BackendLocation) -> Result<(), BlobError> {
+        let operator = self.operator_from_location(location)?;
+        let storage_path = location.get_storage_path()?;
+        operator
+            .delete(&storage_path)
+            .await
+            .map_err(|error| BlobError::DeleteError(error.to_string()))
     }
 
     pub async fn write_blob(
