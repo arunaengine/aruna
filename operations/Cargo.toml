@@ -15,6 +15,7 @@ aruna-net = { workspace = true }
 aruna-tasks = { workspace = true }
 craqle = { workspace = true }
 async-trait = { workspace = true }
+async_zip = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
 blake3 = { workspace = true }
@@ -45,6 +46,10 @@ tracing-opentelemetry = { workspace = true }
 ulid = { workspace = true }
 ed25519-dalek = { workspace = true }
 oxrdf = { workspace = true }
+oxttl = { workspace = true }
+percent-encoding = { workspace = true }
+unicode-normalization = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

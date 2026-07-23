@@ -612,6 +612,7 @@ async fn run_job(
     let ctx = JobContext {
         driver: context.clone(),
         job_id,
+        owner_node_id: record.owner_node_id,
         claim_token: token,
         cancel: cancel.clone(),
         shutdown,

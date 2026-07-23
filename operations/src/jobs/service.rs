@@ -3,8 +3,8 @@ use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    ArtifactRef, ExecutionSpec, JobId, JobPayload, JobRecord, JobResultPayload, JobState,
-    RunCrateStatus, StagingJobSpec, WorkspaceMode, user_dedup_key,
+    ArtifactRef, ExecutionSpec, ImportRoCrateSpec, JobId, JobPayload, JobRecord, JobResultPayload,
+    JobState, RunCrateStatus, StagingJobSpec, WorkspaceMode, user_dedup_key,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{NodeId, UserId, Value};
@@ -36,6 +36,7 @@ pub async fn submit_execution_job(
     idempotency_key: Option<String>,
     workspace_mode: WorkspaceMode,
     workspace_bucket: Option<String>,
+    retention_ms: u64,
 ) -> Result<SubmitJobResult, SubmitJobError> {
     match workspace_mode {
         WorkspaceMode::None if workspace_bucket.is_some() => {
@@ -89,6 +90,7 @@ pub async fn submit_execution_job(
             owner_node_id,
             dedup_key,
             now_ms: unix_timestamp_millis(),
+            retention_ms,
             workspace_mode,
             workspace_bucket,
         }),
@@ -101,6 +103,7 @@ pub async fn submit_staging_job(
     context: &DriverContext,
     spec: StagingJobSpec,
     owner_node_id: NodeId,
+    retention_ms: u64,
 ) -> Result<SubmitJobResult, SubmitJobError> {
     let created_by = spec.auth_context.user_id;
     drive(
@@ -110,6 +113,32 @@ pub async fn submit_staging_job(
             owner_node_id,
             dedup_key: None,
             now_ms: unix_timestamp_millis(),
+            retention_ms,
+            workspace_mode: WorkspaceMode::default(),
+            workspace_bucket: None,
+        }),
+        context,
+    )
+    .await
+}
+
+pub async fn submit_rocrate_import(
+    context: &DriverContext,
+    spec: ImportRoCrateSpec,
+    owner_node_id: NodeId,
+    idempotency_key: Option<String>,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    let created_by = spec.auth_context.user_id;
+    let retention_ms = spec.limits.artifact_retention_ms;
+    let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
+    drive(
+        SubmitJobOperation::new(SubmitJobSpec {
+            payload: JobPayload::ImportRoCrate(spec),
+            created_by,
+            owner_node_id,
+            dedup_key,
+            now_ms: unix_timestamp_millis(),
+            retention_ms,
             workspace_mode: WorkspaceMode::default(),
             workspace_bucket: None,
         }),

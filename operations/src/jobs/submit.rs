@@ -32,6 +32,7 @@ pub struct SubmitJobSpec {
     pub owner_node_id: NodeId,
     pub dedup_key: Option<Vec<u8>>,
     pub now_ms: u64,
+    pub retention_ms: u64,
     pub workspace_mode: WorkspaceMode,
     pub workspace_bucket: Option<String>,
 }
@@ -117,6 +118,7 @@ impl SubmitJobOperation {
             spec.now_ms,
             spec.dedup_key,
         );
+        record.retention_ms = spec.retention_ms;
         if matches!(&record.payload, JobPayload::Execution(_)) {
             record.workspace_mode = spec.workspace_mode;
             record.workspace_bucket = match spec.workspace_mode {
@@ -454,6 +456,7 @@ mod tests {
             owner_node_id: node_id(7),
             dedup_key,
             now_ms: 1_000,
+            retention_ms: aruna_core::structs::DEFAULT_JOB_RETENTION_MS,
             workspace_mode: WorkspaceMode::Kept,
             workspace_bucket: None,
         }
@@ -539,6 +542,25 @@ mod tests {
 
         assert_eq!(record.workspace_mode, WorkspaceMode::Existing);
         assert_eq!(record.workspace_bucket.as_deref(), Some("shared-workspace"));
+    }
+
+    #[tokio::test]
+    async fn retention_is_stored() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = context(storage.clone());
+        let mut submission = spec(None);
+        submission.retention_ms = 42;
+
+        let result = drive(SubmitJobOperation::new(submission), &ctx)
+            .await
+            .unwrap();
+        let record = read_job_record(&storage, result.job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(record.retention_ms, 42);
     }
 
     #[tokio::test]

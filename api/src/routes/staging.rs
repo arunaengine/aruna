@@ -512,6 +512,7 @@ pub async fn submit_staging(
             prefixes,
         },
         node_id,
+        state.rocrate_limits().artifact_retention_ms,
     )
     .await
     .map_err(|error| ServerError::InternalError(error.to_string()))?;

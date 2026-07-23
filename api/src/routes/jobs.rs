@@ -345,7 +345,9 @@ fn parse_job_id(raw: &str) -> ServerResult<JobId> {
     JobId::from_str(raw).map_err(|_| ServerError::NotFound)
 }
 
-fn map_submit_error(error: aruna_operations::jobs::submit::SubmitJobError) -> ServerError {
+pub(crate) fn map_submit_error(
+    error: aruna_operations::jobs::submit::SubmitJobError,
+) -> ServerError {
     use aruna_operations::jobs::submit::SubmitJobError;
     match error {
         SubmitJobError::JobPlanConflict { existing_job_id } => ServerError::Conflict(format!(
@@ -610,6 +612,7 @@ pub async fn submit_job(
         request.idempotency_key,
         workspace_mode,
         workspace_bucket,
+        state.rocrate_limits().artifact_retention_ms,
     )
     .await
     .map_err(map_submit_error)?;

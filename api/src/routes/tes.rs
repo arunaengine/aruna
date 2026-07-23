@@ -474,6 +474,7 @@ pub async fn create_task(
         idempotency_key,
         workspace_mode,
         None,
+        state.rocrate_limits().artifact_retention_ms,
     )
     .await
     {

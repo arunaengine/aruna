@@ -340,7 +340,8 @@ mod tests {
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
         let mut limits = RoCrateLimits::default();
         limits.artifact_retention_ms = 1;
-        let record = JobRecord::new(
+        let retention_ms = limits.artifact_retention_ms;
+        let mut record = JobRecord::new(
             job_id,
             JobPayload::ImportRoCrate(ImportRoCrateSpec {
                 auth_context: AuthContext {
@@ -369,6 +370,7 @@ mod tests {
             1,
             None,
         );
+        record.retention_ms = retention_ms;
         insert_job(&storage, &record).await.unwrap();
         let ClaimOutcome::Claimed(claimed) =
             claim_job(&storage, job_id, node_id(7), 2).await.unwrap()

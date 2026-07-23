@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aruna_core::structs::{JobError, JobId, JobPayload, JobProgress, JobResultPayload};
+use aruna_core::types::NodeId;
 use tokio_util::sync::CancellationToken;
 
 use crate::driver::DriverContext;
@@ -54,6 +55,7 @@ impl ProgressReporter {
 pub struct JobContext {
     pub driver: Arc<DriverContext>,
     pub job_id: JobId,
+    pub owner_node_id: NodeId,
     pub claim_token: ulid::Ulid,
     /// User-initiated cancel: terminal `Cancelled` plus cleanup.
     pub cancel: CancellationToken,
@@ -108,9 +110,10 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
             .await
         }
         JobPayload::Staging(spec) => crate::jobs::staging::run_staging_job(ctx, spec).await,
-        JobPayload::ImportRoCrate(_) | JobPayload::ExportRoCrate(_) => JobRunOutcome::Failed(
-            JobError::permanent("RO-Crate job executor is not registered"),
-        ),
+        JobPayload::ImportRoCrate(spec) => crate::jobs::import::run_rocrate_import(ctx, spec).await,
+        JobPayload::ExportRoCrate(_) => JobRunOutcome::Failed(JobError::permanent(
+            "RO-Crate export executor is not registered",
+        )),
         // Guard: an execution job must run through the external attempt path.
         JobPayload::Execution(_) => JobRunOutcome::Failed(JobError::permanent(
             "execution payload dispatched through the in-process seam",
