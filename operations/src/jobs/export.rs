@@ -38,7 +38,7 @@ use crate::blob::hidden::delete_hidden;
 use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
 use crate::blob_holders::GetBlobHoldersOperation;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::drive;
+use crate::driver::{DriverContext, drive};
 use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::metadata::raw::load_raw_view;
 use crate::metadata::repository::StorageReadError;
@@ -130,7 +130,7 @@ struct ExportCandidate {
     source: CandidateSource,
     report_source: ExportReportSource,
     resolved_version: Option<Ulid>,
-    expected_blake3: [u8; 32],
+    expected_blake3: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -147,10 +147,9 @@ enum CandidateSource {
 }
 
 #[derive(Debug)]
-struct OpenedEntry {
+struct ProbedEntry {
     entity_index: usize,
     candidate_index: usize,
-    blob: BackendStream<Result<Bytes, StreamError>>,
     size: u64,
     hash: [u8; 32],
     report_source: ExportReportSource,
@@ -162,8 +161,19 @@ struct PlannedEntry {
     entity_index: usize,
     candidate_index: usize,
     path: String,
-    blob: BackendStream<Result<Bytes, StreamError>>,
+    source: PlannedSource,
     expected_blake3: [u8; 32],
+}
+
+#[derive(Debug)]
+enum PlannedSource {
+    Candidate {
+        driver: std::sync::Arc<DriverContext>,
+        spec: std::sync::Arc<ExportRoCrateSpec>,
+        candidate: ExportCandidate,
+    },
+    #[cfg(test)]
+    Ready(BackendStream<Result<Bytes, StreamError>>),
 }
 
 #[derive(Debug)]
@@ -220,7 +230,7 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
             ExportPhase::Plan | ExportPhase::Assemble | ExportPhase::Publish => total,
         });
     }
-    let mut opened = None;
+    let mut probed = None;
     let mut candidate_failures = BTreeMap::<usize, BTreeMap<usize, OpenStatus>>::new();
 
     loop {
@@ -236,29 +246,29 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
             ExportPhase::Snapshot => snapshot_export(ctx, spec, &mut checkpoint).await,
             ExportPhase::Resolve => resolve_entries(ctx, spec, &mut checkpoint).await,
             ExportPhase::Plan => {
-                match open_sources(ctx, spec, &mut checkpoint, &candidate_failures).await {
+                match probe_sources(ctx, spec, &mut checkpoint, &candidate_failures).await {
                     Ok(entries) => {
                         let result = plan_export(spec, &mut checkpoint, &entries);
-                        opened = Some(entries);
+                        probed = Some(entries);
                         result
                     }
                     Err(error) => Err(error),
                 }
             }
             ExportPhase::Assemble => {
-                if opened.is_none() {
-                    match open_sources(ctx, spec, &mut checkpoint, &candidate_failures).await {
+                if probed.is_none() {
+                    match probe_sources(ctx, spec, &mut checkpoint, &candidate_failures).await {
                         Ok(entries) => {
                             if let Err(error) = plan_export(spec, &mut checkpoint, &entries) {
                                 return finish_export(ctx, &mut checkpoint, error).await;
                             }
-                            opened = Some(entries);
+                            probed = Some(entries);
                         }
                         Err(error) => return finish_export(ctx, &mut checkpoint, error).await,
                     }
                 }
-                let Some(entries) = opened.take() else {
-                    return permanent("planned export streams are missing");
+                let Some(entries) = probed.take() else {
+                    return permanent("planned export sources are missing");
                 };
                 match assemble_export(ctx, spec, &checkpoint, entries).await {
                     Ok(artifact) => {
@@ -396,7 +406,7 @@ async fn resolve_entries(
             if exact.node_id == ctx.owner_node_id {
                 match resolve_exact(ctx, spec, exact).await? {
                     ResolveResult::Candidate(candidate) => {
-                        if hash.is_some_and(|hash| hash != candidate.expected_blake3) {
+                        if hash.is_some_and(|hash| Some(hash) != candidate.expected_blake3) {
                             mismatched = true;
                         } else {
                             candidates.push(candidate);
@@ -415,7 +425,7 @@ async fn resolve_entries(
                         }
                     }
                 }
-            } else if let Some(hash) = hash {
+            } else {
                 candidates.push(ExportCandidate {
                     source: CandidateSource::RemoteExact {
                         node_id: exact.node_id,
@@ -472,7 +482,7 @@ async fn resolve_entries(
                             source: CandidateSource::RemoteHash { node_id, hash },
                             report_source: ExportReportSource::Hash,
                             resolved_version: exact_version,
-                            expected_blake3: hash,
+                            expected_blake3: Some(hash),
                         };
                         if !candidates.contains(&candidate) {
                             candidates.push(candidate);
@@ -495,11 +505,6 @@ async fn resolve_entries(
         if target.candidates.is_empty() {
             target.omission = Some(if denied {
                 ReasonCode::Denied
-            } else if target.exact.as_ref().is_some_and(|exact| {
-                exact.realm_id == spec.auth_context.realm_id && exact.node_id != ctx.owner_node_id
-            }) && hash.is_none()
-            {
-                ReasonCode::Unsupported
             } else {
                 ReasonCode::Missing
             });
@@ -507,9 +512,6 @@ async fn resolve_entries(
                 match target.omission {
                     Some(ReasonCode::Denied) => "payload READ permission denied",
                     Some(ReasonCode::Offline) => "payload is currently unreachable",
-                    Some(ReasonCode::Unsupported) => {
-                        "remote exact-version export requires an Aruna content hash"
-                    }
                     _ => "no readable payload version was found",
                 }
                 .to_string(),
@@ -571,7 +573,7 @@ async fn resolve_exact(
         source: CandidateSource::Local(location),
         report_source: ExportReportSource::Local,
         resolved_version: Some(exact.version),
-        expected_blake3: hash,
+        expected_blake3: Some(hash),
     }))
 }
 
@@ -612,7 +614,7 @@ async fn resolve_alias(
         source: CandidateSource::Local(location),
         report_source: ExportReportSource::Hash,
         resolved_version: Some(alias.version_id),
-        expected_blake3: alias.blake3_hash,
+        expected_blake3: Some(alias.blake3_hash),
     }))
 }
 
@@ -658,13 +660,13 @@ async fn storage_value(
     }
 }
 
-async fn open_sources(
+async fn probe_sources(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
     checkpoint: &mut ExportCheckpoint,
     candidate_failures: &BTreeMap<usize, BTreeMap<usize, OpenStatus>>,
-) -> Result<Vec<OpenedEntry>, ExportFailure> {
-    let mut opened = Vec::new();
+) -> Result<Vec<ProbedEntry>, ExportFailure> {
+    let mut probed = Vec::new();
     for index in 0..checkpoint.entities.len() {
         if ctx.cancel.is_cancelled() {
             return Err(ExportFailure::Cancelled);
@@ -700,18 +702,22 @@ async fn open_sources(
             if ctx.shutdown.is_cancelled() {
                 return Err(ExportFailure::Interrupted);
             }
-            match open_candidate(ctx, spec, &candidate).await? {
-                CandidateOpen::Opened(output) => {
-                    selected = Some(OpenedEntry {
+            match open_candidate(&ctx.driver, spec, &candidate, true).await? {
+                CandidateOpen::Opened(BaoReadOutput::Metadata { size, blake3 }) => {
+                    selected = Some(ProbedEntry {
                         entity_index: index,
                         candidate_index,
-                        blob: output.blob,
-                        size: output.size,
-                        hash: candidate.expected_blake3,
+                        size,
+                        hash: blake3,
                         report_source: candidate.report_source,
                         resolved_version: candidate.resolved_version,
                     });
                     break;
+                }
+                CandidateOpen::Opened(BaoReadOutput::Stream { .. }) => {
+                    return Err(ExportFailure::Retryable(
+                        "source probe unexpectedly opened a stream".to_string(),
+                    ));
                 }
                 CandidateOpen::Status(OpenStatus::Denied) => denied = true,
                 CandidateOpen::Status(OpenStatus::Missing) => missing = true,
@@ -720,7 +726,7 @@ async fn open_sources(
             }
         }
         if let Some(selected) = selected {
-            opened.push(selected);
+            probed.push(selected);
             continue;
         }
         if corrupt {
@@ -754,17 +760,23 @@ async fn open_sources(
             .to_string(),
         );
     }
-    Ok(opened)
+    Ok(probed)
 }
 
 async fn open_candidate(
-    ctx: &JobContext,
+    driver: &DriverContext,
     spec: &ExportRoCrateSpec,
     candidate: &ExportCandidate,
+    metadata_only: bool,
 ) -> Result<CandidateOpen, ExportFailure> {
     match &candidate.source {
         CandidateSource::Local(location) => {
-            let Some(blob_handle) = ctx.driver.blob_handle.as_ref() else {
+            let Some(blake3) = candidate.expected_blake3 else {
+                return Err(ExportFailure::Permanent(
+                    "local export candidate has no BLAKE3 hash".to_string(),
+                ));
+            };
+            let Some(blob_handle) = driver.blob_handle.as_ref() else {
                 return Err(ExportFailure::Retryable(
                     "blob handle unavailable".to_string(),
                 ));
@@ -776,9 +788,17 @@ async fn open_candidate(
                 .await
             {
                 Event::Blob(BlobEvent::ReadFinished { blob, stream_size }) => {
-                    Ok(CandidateOpen::Opened(BaoReadOutput {
-                        blob,
-                        size: stream_size,
+                    Ok(CandidateOpen::Opened(if metadata_only {
+                        BaoReadOutput::Metadata {
+                            size: stream_size,
+                            blake3,
+                        }
+                    } else {
+                        BaoReadOutput::Stream {
+                            blob,
+                            size: stream_size,
+                            blake3,
+                        }
                     }))
                 }
                 Event::Blob(BlobEvent::Error(BlobError::IntegrityCheckFailed(_))) => {
@@ -792,21 +812,23 @@ async fn open_candidate(
         }
         CandidateSource::RemoteExact { node_id, target } => {
             open_remote(
-                ctx,
+                driver,
                 spec,
                 *node_id,
                 BaoReadTarget::ExactVersion(target.clone()),
                 candidate.expected_blake3,
+                metadata_only,
             )
             .await
         }
         CandidateSource::RemoteHash { node_id, hash } => {
             open_remote(
-                ctx,
+                driver,
                 spec,
                 *node_id,
                 BaoReadTarget::Blake3(*hash),
                 candidate.expected_blake3,
+                metadata_only,
             )
             .await
         }
@@ -814,11 +836,12 @@ async fn open_candidate(
 }
 
 async fn open_remote(
-    ctx: &JobContext,
+    driver: &DriverContext,
     spec: &ExportRoCrateSpec,
     node_id: NodeId,
     target: BaoReadTarget,
-    expected_blake3: [u8; 32],
+    expected_blake3: Option<[u8; 32]>,
+    metadata_only: bool,
 ) -> Result<CandidateOpen, ExportFailure> {
     match drive(
         BaoReadOperation::new(
@@ -828,9 +851,10 @@ async fn open_remote(
                 realm_id: spec.auth_context.realm_id,
                 target,
                 expected_blake3,
+                metadata_only,
             },
         ),
-        &ctx.driver,
+        driver,
     )
     .await
     {
@@ -867,7 +891,7 @@ async fn open_remote(
 fn plan_export(
     spec: &ExportRoCrateSpec,
     checkpoint: &mut ExportCheckpoint,
-    opened: &[OpenedEntry],
+    opened: &[ProbedEntry],
 ) -> Result<(), ExportFailure> {
     let mut paths = HashSet::new();
     for entry in opened {
@@ -1487,7 +1511,7 @@ fn precheck_size(
     spec: &ExportRoCrateSpec,
     metadata: &[u8],
     report: Option<&[u8]>,
-    opened: &[OpenedEntry],
+    opened: &[ProbedEntry],
     entities: &[ExportEntity],
 ) -> Result<(), ExportFailure> {
     let mut size = (metadata.len() as u64)
@@ -1534,23 +1558,37 @@ async fn assemble_export(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
     checkpoint: &ExportCheckpoint,
-    opened: Vec<OpenedEntry>,
+    opened: Vec<ProbedEntry>,
 ) -> Result<ArtifactRef, ExportFailure> {
     let metadata = checkpoint
         .rewritten_jsonld
         .clone()
         .ok_or_else(|| ExportFailure::Permanent("rewritten metadata is missing".to_string()))?;
     let mut entries = Vec::with_capacity(opened.len());
+    let source_spec = std::sync::Arc::new(spec.clone());
     for entry in opened {
-        let path = checkpoint.entities[entry.entity_index]
+        let entity = &checkpoint.entities[entry.entity_index];
+        let path = entity
             .zip_path
             .clone()
             .ok_or_else(|| ExportFailure::Permanent("planned ZIP path is missing".to_string()))?;
+        let mut candidate = entity
+            .candidates
+            .get(entry.candidate_index)
+            .cloned()
+            .ok_or_else(|| {
+                ExportFailure::Permanent("planned export candidate is missing".to_string())
+            })?;
+        candidate.expected_blake3 = Some(entry.hash);
         entries.push(PlannedEntry {
             entity_index: entry.entity_index,
             candidate_index: entry.candidate_index,
             path,
-            blob: entry.blob,
+            source: PlannedSource::Candidate {
+                driver: ctx.driver.clone(),
+                spec: source_spec.clone(),
+                candidate,
+            },
             expected_blake3: entry.hash,
         });
     }
@@ -1632,9 +1670,58 @@ async fn write_archive(
         .write_entry_whole(zip_entry(METADATA_PATH), &metadata)
         .await
         .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
-    for mut entry in entries {
+    for entry in entries {
+        let PlannedEntry {
+            entity_index,
+            candidate_index,
+            path,
+            source,
+            expected_blake3,
+        } = entry;
+        let opened = match source {
+            PlannedSource::Candidate {
+                driver,
+                spec,
+                candidate,
+            } => open_candidate(&driver, &spec, &candidate, false).await?,
+            #[cfg(test)]
+            PlannedSource::Ready(blob) => CandidateOpen::Opened(BaoReadOutput::Stream {
+                blob,
+                size: 0,
+                blake3: expected_blake3,
+            }),
+        };
+        let mut blob = match opened {
+            CandidateOpen::Opened(BaoReadOutput::Stream { blob, blake3, .. })
+                if blake3 == expected_blake3 =>
+            {
+                blob
+            }
+            CandidateOpen::Opened(BaoReadOutput::Stream { .. })
+            | CandidateOpen::Status(OpenStatus::Corrupt) => {
+                return Err(ExportFailure::Candidate {
+                    entity_index,
+                    candidate_index,
+                    status: OpenStatus::Corrupt,
+                    message: format!("payload integrity check failed for `{path}`"),
+                });
+            }
+            CandidateOpen::Opened(BaoReadOutput::Metadata { .. }) => {
+                return Err(ExportFailure::Retryable(
+                    "source open unexpectedly returned metadata".to_string(),
+                ));
+            }
+            CandidateOpen::Status(status) => {
+                return Err(ExportFailure::Candidate {
+                    entity_index,
+                    candidate_index,
+                    status,
+                    message: format!("payload source became unavailable for `{path}`"),
+                });
+            }
+        };
         let mut writer = archive
-            .write_entry_stream(zip_entry(&entry.path))
+            .write_entry_stream(zip_entry(&path))
             .await
             .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
         let mut hasher = blake3::Hasher::new();
@@ -1643,7 +1730,7 @@ async fn write_archive(
                 biased;
                 _ = cancel.cancelled() => return Err(ExportFailure::Cancelled),
                 _ = shutdown.cancelled() => return Err(ExportFailure::Interrupted),
-                next = entry.blob.next() => next,
+                next = blob.next() => next,
             };
             match next {
                 Some(Ok(bytes)) => {
@@ -1655,8 +1742,8 @@ async fn write_archive(
                 }
                 Some(Err(error)) => {
                     return Err(ExportFailure::Candidate {
-                        entity_index: entry.entity_index,
-                        candidate_index: entry.candidate_index,
+                        entity_index,
+                        candidate_index,
                         status: stream_status(&error),
                         message: error.to_string(),
                     });
@@ -1664,12 +1751,12 @@ async fn write_archive(
                 None => break,
             }
         }
-        if hasher.finalize().as_bytes() != &entry.expected_blake3 {
+        if hasher.finalize().as_bytes() != &expected_blake3 {
             return Err(ExportFailure::Candidate {
-                entity_index: entry.entity_index,
-                candidate_index: entry.candidate_index,
+                entity_index,
+                candidate_index,
                 status: OpenStatus::Corrupt,
-                message: format!("payload integrity check failed for `{}`", entry.path),
+                message: format!("payload integrity check failed for `{path}`"),
             });
         }
         writer
@@ -1948,14 +2035,14 @@ mod tests {
                     entity_index: 0,
                     candidate_index: 0,
                     path: "data/b".to_string(),
-                    blob: byte_stream(b"b"),
+                    source: PlannedSource::Ready(byte_stream(b"b")),
                     expected_blake3: *blake3::hash(b"b").as_bytes(),
                 },
                 PlannedEntry {
                     entity_index: 1,
                     candidate_index: 0,
                     path: "data/a".to_string(),
-                    blob: byte_stream(b"a"),
+                    source: PlannedSource::Ready(byte_stream(b"a")),
                     expected_blake3: *blake3::hash(b"a").as_bytes(),
                 },
             ],
@@ -2251,7 +2338,7 @@ mod tests {
                 entity_index: 4,
                 candidate_index: 2,
                 path: "data/corrupt".to_string(),
-                blob: byte_stream(b"wrong"),
+                source: PlannedSource::Ready(byte_stream(b"wrong")),
                 expected_blake3: [0; 32],
             }],
             None,
@@ -2284,9 +2371,9 @@ mod tests {
                 entity_index: 0,
                 candidate_index: 0,
                 path: "data/pending".to_string(),
-                blob: BackendStream::new(futures_util::stream::pending::<
+                source: PlannedSource::Ready(BackendStream::new(futures_util::stream::pending::<
                     Result<Bytes, std::io::Error>,
-                >()),
+                >())),
                 expected_blake3: [0; 32],
             }],
             None,

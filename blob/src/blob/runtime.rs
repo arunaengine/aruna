@@ -23,21 +23,7 @@ use ulid::Ulid;
 impl Handle for BlobHandle {
     async fn send_effect(&self, effect: Effect) -> Event {
         match effect {
-            Effect::Blob(blob_effect) => {
-                let (response_tx, response_rx) = oneshot::oneshot();
-                if self
-                    .write_channel
-                    .send((blob_effect, response_tx))
-                    .await
-                    .is_err()
-                {
-                    return Event::Blob(BlobEvent::Error(BlobError::ChannelClosed));
-                }
-                match response_rx.await {
-                    Ok(event) => Event::Blob(event),
-                    Err(_) => Event::Blob(BlobEvent::Error(BlobError::ChannelClosed)),
-                }
-            }
+            Effect::Blob(blob_effect) => self.send_blob_effect(blob_effect).await,
             Effect::StagingSource(staging_source_effect) => {
                 self.send_staging_source_effect(staging_source_effect).await
             }
@@ -59,6 +45,23 @@ impl BlobHandle {
     }
 
     pub async fn send_blob_effect(&self, effect: BlobEffect) -> Event {
+        // Hidden spools may consume streams that request further blob effects.
+        let effect = match effect {
+            BlobEffect::SpoolHidden {
+                namespace,
+                name,
+                created_by,
+                max_bytes,
+                blob,
+            } => {
+                return Event::Blob(
+                    self.handler
+                        .spool_hidden_blob(namespace, &name, created_by, max_bytes, blob)
+                        .await,
+                );
+            }
+            effect => effect,
+        };
         let blob_event = {
             let (response_tx, response_rx) = oneshot::oneshot();
             if self

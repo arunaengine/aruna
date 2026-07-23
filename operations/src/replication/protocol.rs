@@ -62,7 +62,8 @@ pub struct BaoReadRequest {
     pub auth_context: AuthContext,
     pub realm_id: aruna_core::structs::RealmId,
     pub target: BaoReadTarget,
-    pub expected_blake3: [u8; 32],
+    pub expected_blake3: Option<[u8; 32]>,
+    pub metadata_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -147,7 +148,7 @@ pub enum VersionReplicationMessage {
     VersionApplyComplete,
     VersionApplyRejected(String),
     BaoReadRequest(BaoReadRequest),
-    BaoReadAccepted { size: u64 },
+    BaoReadAccepted { size: u64, blake3: [u8; 32] },
     BaoReadRefused(BaoReadRefusal),
 }
 
@@ -340,9 +341,13 @@ mod tests {
             },
             realm_id: test_realm_id(),
             target: BaoReadTarget::Blake3([8u8; 32]),
-            expected_blake3: [8u8; 32],
+            expected_blake3: Some([8u8; 32]),
+            metadata_only: false,
         });
-        let accepted = VersionReplicationMessage::BaoReadAccepted { size: 42 };
+        let accepted = VersionReplicationMessage::BaoReadAccepted {
+            size: 42,
+            blake3: [8u8; 32],
+        };
         let refused = VersionReplicationMessage::BaoReadRefused(BaoReadRefusal::ReadDenied);
 
         for message in [request, accepted, refused] {
