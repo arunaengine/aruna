@@ -166,12 +166,10 @@ async fn claim_in_txn(
     if record.owner != owner {
         return Err(UploadClaimError::WrongOwner);
     }
-    if record.expires_at_ms <= now_ms {
-        return Err(UploadClaimError::Expired);
-    }
     match record.claimed_by {
         Some(existing) if existing != job_id => return Err(UploadClaimError::AlreadyClaimed),
         Some(_) => return Ok(record),
+        None if record.expires_at_ms <= now_ms => return Err(UploadClaimError::Expired),
         None => record.claimed_by = Some(job_id),
     }
     let value = postcard::to_allocvec(&record)
@@ -235,4 +233,62 @@ async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
 
 fn upload_key(upload_id: Ulid) -> ByteView {
     ByteView::from(upload_id.to_bytes().to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::{BackendLocation, RealmId, RoCrateMediaType};
+    use aruna_storage::FjallStorage;
+    use std::collections::HashMap;
+    use std::time::SystemTime;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn reclaims_expired_upload() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let owner = UserId::nil(realm_id);
+        let upload_id = Ulid::from_bytes([2u8; 16]);
+        let job_id = JobId::from_bytes([3u8; 16]);
+        let record = RoCrateUploadRecord {
+            upload_id,
+            owner,
+            location: BackendLocation {
+                root: "/data".to_string(),
+                storage_bucket: "storage".to_string(),
+                backend_path: "_jobs/input".to_string(),
+                ulid: Ulid::from_bytes([4u8; 16]),
+                compressed: false,
+                encrypted: false,
+                created_by: owner,
+                created_at: SystemTime::UNIX_EPOCH,
+                staging: false,
+                partial: false,
+                blob_size: 1,
+                hashes: HashMap::new(),
+            },
+            blake3: [5u8; 32],
+            size: 1,
+            media_type: RoCrateMediaType::Zip,
+            expires_at_ms: 10,
+            claimed_by: None,
+        };
+        write_rocrate_upload(&storage, &record).await.unwrap();
+        claim_rocrate_upload(&storage, upload_id, owner, job_id, 9)
+            .await
+            .unwrap();
+
+        let reclaimed = claim_rocrate_upload(&storage, upload_id, owner, job_id, 11)
+            .await
+            .unwrap();
+
+        assert_eq!(reclaimed.claimed_by, Some(job_id));
+        assert!(matches!(
+            claim_rocrate_upload(&storage, upload_id, owner, JobId::from_bytes([6u8; 16]), 11)
+                .await,
+            Err(UploadClaimError::AlreadyClaimed)
+        ));
+    }
 }
