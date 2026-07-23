@@ -3,11 +3,12 @@ use crate::blob::blob_keyspace_helper::{
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::replication::queue::write_live_replication_obligation_effect;
+use crate::replication::util::dht_registration_effect;
 use crate::usage_stats::{
     QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError,
     schedule_usage_snapshot_publish_effect,
 };
-use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
+use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::{
@@ -18,7 +19,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
-    RealmId, UsageDelta, VersionKey, VersionSourceBinding,
+    RealmId, RoCrateLimits, UsageDelta, VersionKey, VersionSourceBinding,
 };
 use aruna_core::types::{Effects, GroupId, NodeId, UserId};
 use bytes::Bytes;
@@ -144,6 +145,7 @@ pub struct PutObjectOperation {
     output: Option<Result<BackendLocation, PutObjectError>>,
     expected_bucket: Option<BucketInfo>,
     metadata: HashMap<String, String>,
+    rocrate_limits: RoCrateLimits,
 }
 
 impl PutObjectOperation {
@@ -165,6 +167,7 @@ impl PutObjectOperation {
             output: None,
             expected_bucket: None,
             metadata: HashMap::new(),
+            rocrate_limits: RoCrateLimits::default(),
         }
     }
 
@@ -236,6 +239,11 @@ impl PutObjectOperation {
         self.output = Some(Ok(location));
         self.state = PutObjectState::Finish;
         smallvec![]
+    }
+
+    pub fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
+        self.rocrate_limits = limits;
+        self
     }
 
     fn handle_init(&mut self) -> Effects {
@@ -775,18 +783,16 @@ impl PutObjectOperation {
         let Some(blake3_hash) = location.get_blake3() else {
             return self.continue_after_dht_registration();
         };
-        let key = match blake3_hash.try_into() {
-            Ok(key) => aruna_core::id::DhtKeyId::from_bytes(key),
-            Err(_) => return self.continue_after_dht_registration(),
-        };
-
         self.state = PutObjectState::RegisterBlobInDht;
-        smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Put {
-            key,
-            realm_id: self.config.realm_id,
-            value: self.config.node_id.as_bytes().to_vec(),
-            ttl: Default::default(),
-        }))]
+        match dht_registration_effect(
+            blake3_hash,
+            self.config.realm_id,
+            self.config.node_id,
+            &self.rocrate_limits,
+        ) {
+            Ok(effect) => smallvec![effect],
+            Err(_) => self.continue_after_dht_registration(),
+        }
     }
 
     fn handle_blob_registered_in_dht(&mut self, event: Event) -> Effects {

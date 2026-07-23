@@ -20,7 +20,7 @@ use aruna_core::NodeId;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
-    ArunaArn, AuthContext, BlobHeadKey, BucketInfo, Permission, RealmId, SyncMode,
+    ArunaArn, AuthContext, BlobHeadKey, BucketInfo, Permission, RealmId, RoCrateLimits, SyncMode,
     SyncRelationship, SyncState, SyncStatusSnapshot, UserAccess, WatchEvent, WatchEventDetail,
     WatchEventKind, blob_bucket_permission_path, blob_object_permission_path,
     data_watch_resource_path,
@@ -215,6 +215,7 @@ pub struct ArunaS3Service {
     state: Arc<DriverContext>,
     realm_id: RealmId,
     node_id: NodeId,
+    rocrate_limits: RoCrateLimits,
 }
 
 impl Debug for ArunaS3Service {
@@ -231,7 +232,13 @@ impl ArunaS3Service {
             state: driver_ctx,
             realm_id,
             node_id,
+            rocrate_limits: RoCrateLimits::default(),
         }
+    }
+
+    pub fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
+        self.rocrate_limits = limits;
+        self
     }
 
     async fn can_access_bucket(
@@ -1561,6 +1568,7 @@ impl S3 for ArunaS3Service {
             exists: false,
             quota_ceiling,
         })
+        .with_rocrate_limits(self.rocrate_limits.clone())
         .with_metadata(metadata);
 
         let result = drive(operation, &self.state)
@@ -2092,7 +2100,8 @@ impl S3 for ArunaS3Service {
             object_size: req.input.mpu_object_size.map(checked_size).transpose()?,
             created_by: user_access.user_identity,
             quota_ceiling,
-        });
+        })
+        .with_rocrate_limits(self.rocrate_limits.clone());
 
         let result = drive(operation, &self.state)
             .await
