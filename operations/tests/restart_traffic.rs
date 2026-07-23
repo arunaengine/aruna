@@ -266,7 +266,7 @@ async fn run_writer(
                     },
                     group_id,
                     document_id,
-                    document_path: format!("datasets/restart-{index}"),
+                    document_path: format!("datasets/restart-{index}-{document_id}"),
                     public: true,
                     payload: CreateMetadataDocumentPayload::Scaffold {
                         name: format!("Restart Dataset {index}"),
