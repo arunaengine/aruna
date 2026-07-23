@@ -135,7 +135,7 @@ pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionErr
     Ok(writes)
 }
 
-/// Deletes for a pruned terminal job (its dedup entry is already gone).
+/// Deletes for a pruned terminal job.
 pub fn job_prune_delete_entries(record: &JobRecord) -> JobDeletes {
     let mut deletes = vec![
         (JOB_KEYSPACE.to_string(), job_record_key(record.job_id)),
@@ -165,6 +165,12 @@ pub fn job_prune_delete_entries(record: &JobRecord) -> JobDeletes {
             JOB_ACTIVE_USER_KEYSPACE.to_string(),
             job_active_key(record.created_by, record.job_id),
         ));
+        if let Some(dedup_key) = &record.dedup_key {
+            deletes.push((
+                JOB_DEDUP_INDEX_KEYSPACE.to_string(),
+                job_dedup_index_key(record.created_by, dedup_key),
+            ));
+        }
     }
     // Epochs are handed out from 1; every used epoch left a control row.
     for epoch in 1..record.next_attempt_epoch {
@@ -596,8 +602,8 @@ async fn mark_crate_failed(
     .map_err(JobMutationError::Storage)
 }
 
-/// Remove the dedup row only when it still references THIS job: a raced submit may
-/// have repointed it at a newer job that must survive this one going terminal.
+/// Remove a non-RO-Crate dedup row only when it still references THIS job.
+/// RO-Crate dedup rows persist until their jobs are pruned.
 async fn cleanup_dedup_entry(
     storage: &StorageHandle,
     txn_id: TxnId,
@@ -607,7 +613,7 @@ async fn cleanup_dedup_entry(
     let Some(dedup_key) = &old.dedup_key else {
         return Ok(());
     };
-    if old.state.is_terminal() || !new.state.is_terminal() {
+    if old.payload.is_rocrate() || old.state.is_terminal() || !new.state.is_terminal() {
         return Ok(());
     }
     let key = job_dedup_index_key(old.created_by, dedup_key);
@@ -948,7 +954,10 @@ pub async fn requeue_job(
         record.updated_at_ms = now_ms;
         record.claim = None;
         if record.attempts >= JOB_MAX_ATTEMPTS
-            && !matches!(&record.payload, JobPayload::TerminalCleanup { .. })
+            && !matches!(
+                &record.payload,
+                JobPayload::TerminalCleanup { .. } | JobPayload::ImportRoCrate(_)
+            )
         {
             record.state = JobState::Failed;
             record.finished_at_ms = Some(now_ms);
@@ -1795,6 +1804,17 @@ pub async fn find_dedup_job(
     dedup_key: &[u8],
     txn_id: Option<TxnId>,
 ) -> Result<Option<JobId>, String> {
+    Ok(find_dedup_plan(storage, created_by, dedup_key, txn_id)
+        .await?
+        .map(|(job_id, _)| job_id))
+}
+
+pub async fn find_dedup_plan(
+    storage: &StorageHandle,
+    created_by: UserId,
+    dedup_key: &[u8],
+    txn_id: Option<TxnId>,
+) -> Result<Option<(JobId, [u8; 32])>, String> {
     match read_raw(
         storage,
         JOB_DEDUP_INDEX_KEYSPACE,
@@ -1803,11 +1823,9 @@ pub async fn find_dedup_job(
     )
     .await?
     {
-        Some(value) => {
-            let (job_id, _) =
-                parse_job_dedup_value(value.as_ref()).map_err(|error| error.to_string())?;
-            Ok(Some(job_id))
-        }
+        Some(value) => parse_job_dedup_value(value.as_ref())
+            .map(Some)
+            .map_err(|error| error.to_string()),
         None => Ok(None),
     }
 }
@@ -2175,6 +2193,19 @@ mod tests {
     }
 
     #[test]
+    fn prune_covers_dedup() {
+        let mut record = rocrate_record(JobId::from_bytes([0x57; 16]));
+        record.dedup_key = Some(b"import".to_vec());
+
+        let deletes = job_prune_delete_entries(&record);
+
+        assert!(deletes.contains(&(
+            JOB_DEDUP_INDEX_KEYSPACE.to_string(),
+            job_dedup_index_key(record.created_by, b"import"),
+        )));
+    }
+
+    #[test]
     fn schedule_uses_retention() {
         let mut record = queued_record(JobId::from_bytes([0x56; 16]));
         record.state = JobState::Succeeded;
@@ -2529,6 +2560,31 @@ mod tests {
                 .unwrap()
         else {
             panic!("cleanup must remain retryable");
+        };
+        assert_eq!(requeued.state, JobState::Queued);
+        assert_eq!(requeued.attempts, JOB_MAX_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn import_retries_cleanup() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0xC7; 16]);
+        let mut record = rocrate_record(job_id);
+        record.attempts = JOB_MAX_ATTEMPTS - 1;
+        record.state = JobState::Running;
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id(3),
+            claim_token: Ulid::generate(),
+            lease_expires_at_ms: 5_000,
+        });
+        insert_job(&storage, &record).await.unwrap();
+
+        let RequeueOutcome::Requeued(requeued) =
+            requeue_job(&storage, job_id, None, 6_000, None, None)
+                .await
+                .unwrap()
+        else {
+            panic!("import cleanup must remain retryable");
         };
         assert_eq!(requeued.state, JobState::Queued);
         assert_eq!(requeued.attempts, JOB_MAX_ATTEMPTS);

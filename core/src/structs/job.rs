@@ -286,7 +286,7 @@ pub struct StagingJobCheckpoint {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum ImportRoCrateSource {
     Upload {
         upload_id: Ulid,
@@ -1545,6 +1545,42 @@ mod tests {
     #[test]
     fn record_roundtrips() {
         let record = probe_record(JobId::from_bytes([5u8; 16]), 1_700_000_000_000);
+        let bytes = record.to_bytes().unwrap();
+        assert_eq!(JobRecord::from_bytes(&bytes).unwrap(), record);
+    }
+
+    #[test]
+    fn rocrate_record_roundtrips() {
+        let owner = user(1, 2);
+        let record = JobRecord::new(
+            JobId::from_bytes([5u8; 16]),
+            JobPayload::ImportRoCrate(ImportRoCrateSpec {
+                auth_context: AuthContext {
+                    user_id: owner,
+                    realm_id: RealmId([1u8; 32]),
+                    path_restrictions: None,
+                },
+                source: ImportRoCrateSource::Upload {
+                    upload_id: Ulid::from_bytes([3u8; 16]),
+                },
+                target: ImportRoCrateTarget {
+                    bucket: "target".to_string(),
+                    prefix: "crate".to_string(),
+                },
+                metadata: ImportMetadataTarget {
+                    group_id: Ulid::from_bytes([4u8; 16]),
+                    path: "crate".to_string(),
+                    public: false,
+                },
+                limits: RoCrateLimits::default(),
+                document_id: Ulid::from_bytes([5u8; 16]),
+            }),
+            owner,
+            node_id(7),
+            1_700_000_000_000,
+            1_700_000_000_000,
+            Some(b"dedup".to_vec()),
+        );
         let bytes = record.to_bytes().unwrap();
         assert_eq!(JobRecord::from_bytes(&bytes).unwrap(), record);
     }

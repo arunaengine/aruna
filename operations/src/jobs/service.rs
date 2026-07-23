@@ -16,7 +16,7 @@ use tracing::warn;
 
 use super::runtime::JobsRuntime;
 use super::store::{
-    CancelRequestOutcome, JobMutationError, list_job_entries, list_jobs_for_user,
+    CancelRequestOutcome, JobMutationError, find_dedup_plan, list_job_entries, list_jobs_for_user,
     read_artifact_tombstone, read_job_record, read_run_crate_status, set_cancel_requested,
 };
 use super::submit::{
@@ -148,6 +148,38 @@ pub async fn submit_rocrate_import(
     .await
 }
 
+pub async fn lookup_job_dedup(
+    context: &DriverContext,
+    created_by: UserId,
+    idempotency_key: &str,
+    plan_digest: [u8; 32],
+) -> Result<Option<SubmitJobResult>, SubmitJobError> {
+    let dedup_key = user_dedup_key(created_by, idempotency_key);
+    let Some((job_id, existing_digest)) =
+        find_dedup_plan(&context.storage_handle, created_by, &dedup_key, None)
+            .await
+            .map_err(SubmitJobError::UnexpectedEvent)?
+    else {
+        return Ok(None);
+    };
+    if read_job_record(&context.storage_handle, job_id, None)
+        .await
+        .map_err(SubmitJobError::UnexpectedEvent)?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    if existing_digest != plan_digest {
+        return Err(SubmitJobError::JobPlanConflict {
+            existing_job_id: job_id,
+        });
+    }
+    Ok(Some(SubmitJobResult {
+        job_id,
+        created: false,
+    }))
+}
+
 pub async fn submit_export_job(
     context: &DriverContext,
     spec: ExportRoCrateSpec,
@@ -234,6 +266,10 @@ pub async fn read_owned_report(
     }
     if !record.state.is_terminal() {
         return Ok(JobReportLookup::Pending(record.state));
+    }
+    let finished_at_ms = record.finished_at_ms.unwrap_or(record.updated_at_ms);
+    if finished_at_ms.saturating_add(record.retention_ms) <= unix_timestamp_millis() {
+        return Ok(JobReportLookup::NotFound);
     }
     let report_digest = record
         .report_digest
@@ -402,7 +438,10 @@ async fn kick_drain(context: &DriverContext) {
 mod tests {
     use super::super::store::{insert_job, preserve_artifact_tombstone, read_job_record};
     use super::*;
-    use aruna_core::structs::{JobState, RealmId};
+    use aruna_core::structs::{
+        AuthContext, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
+        ImportRoCrateTarget, JobState, RealmId, RoCrateLimits,
+    };
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
@@ -410,6 +449,52 @@ mod tests {
 
     fn node_id() -> NodeId {
         iroh::SecretKey::from_bytes(&[7u8; 32]).public()
+    }
+
+    #[tokio::test]
+    async fn dedup_lookup_matches() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        let payload = JobPayload::Probe {
+            steps: 1,
+            step_sleep_ms: 0,
+            fail_at: None,
+            panic_at: None,
+            cleanup_marker: None,
+        };
+        let mut record = JobRecord::new(
+            JobId::from_bytes([3u8; 16]),
+            payload.clone(),
+            owner,
+            node_id(),
+            1,
+            1,
+            Some(user_dedup_key(owner, "key")),
+        );
+        record.state = JobState::Succeeded;
+        record.finished_at_ms = Some(1);
+        insert_job(&storage, &record).await.unwrap();
+
+        let found = lookup_job_dedup(&context, owner, "key", payload.plan_digest())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.job_id, record.job_id);
+        assert!(!found.created);
+        assert!(matches!(
+            lookup_job_dedup(&context, owner, "key", [9u8; 32]).await,
+            Err(SubmitJobError::JobPlanConflict { existing_job_id })
+                if existing_job_id == record.job_id
+        ));
     }
 
     #[test]
@@ -454,6 +539,62 @@ mod tests {
             )
             .await,
             Ok(ArtifactLookup::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn report_expiry_hides() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let realm_id = RealmId([1u8; 32]);
+        let owner = UserId::new(Ulid::from_bytes([2u8; 16]), realm_id);
+        let job_id = JobId::from_bytes([3u8; 16]);
+        let mut record = JobRecord::new(
+            job_id,
+            JobPayload::ImportRoCrate(ImportRoCrateSpec {
+                auth_context: AuthContext {
+                    user_id: owner,
+                    realm_id,
+                    path_restrictions: None,
+                },
+                source: ImportRoCrateSource::Upload {
+                    upload_id: Ulid::from_bytes([4u8; 16]),
+                },
+                target: ImportRoCrateTarget {
+                    bucket: "target".to_string(),
+                    prefix: String::new(),
+                },
+                metadata: ImportMetadataTarget {
+                    group_id: Ulid::from_bytes([5u8; 16]),
+                    path: "crate".to_string(),
+                    public: false,
+                },
+                limits: RoCrateLimits::default(),
+                document_id: Ulid::from_bytes([6u8; 16]),
+            }),
+            owner,
+            node_id(),
+            1,
+            1,
+            None,
+        );
+        record.state = JobState::Succeeded;
+        record.finished_at_ms = Some(1);
+        record.retention_ms = 1;
+        record.report_digest = Some([7u8; 32]);
+        insert_job(&storage, &record).await.unwrap();
+
+        assert!(matches!(
+            read_owned_report(&context, owner, job_id, None, None, 1).await,
+            Ok(JobReportLookup::NotFound)
         ));
     }
 

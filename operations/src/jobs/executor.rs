@@ -57,6 +57,7 @@ pub struct JobContext {
     pub job_id: JobId,
     pub owner_node_id: NodeId,
     pub claim_token: ulid::Ulid,
+    pub final_attempt: bool,
     /// User-initiated cancel: terminal `Cancelled` plus cleanup.
     pub cancel: CancellationToken,
     /// Node shutdown: stop where you are, the lease is handed back and the job re-runs.

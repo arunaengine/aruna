@@ -388,6 +388,7 @@ mod tests {
             job_id: JobId::from_bytes([0xCB; 16]),
             owner_node_id: iroh::SecretKey::from_bytes(&[0xCD; 32]).public(),
             claim_token: Ulid::from_bytes([0xCC; 16]),
+            final_attempt: false,
             cancel: CancellationToken::new(),
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("steps")),

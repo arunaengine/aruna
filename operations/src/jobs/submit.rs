@@ -40,7 +40,7 @@ pub struct SubmitJobSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmitJobResult {
     pub job_id: JobId,
-    /// `false` when a live job with the same `dedup_key` already existed.
+    /// `false` when a job with the same `dedup_key` already existed.
     pub created: bool,
 }
 
@@ -705,18 +705,39 @@ mod tests {
     async fn rocrate_dedup_first() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let ctx = context(storage);
+        let ctx = context(storage.clone());
         let submission = rocrate_spec(1, Some(b"import".to_vec()));
         let first = drive(SubmitJobOperation::new(submission.clone()), &ctx)
             .await
             .unwrap();
-        let second = drive(SubmitJobOperation::new(submission), &ctx)
+        let second = drive(SubmitJobOperation::new(submission.clone()), &ctx)
             .await
             .unwrap();
 
         assert!(first.created);
         assert!(!second.created);
         assert_eq!(second.job_id, first.job_id);
+
+        let crate::jobs::store::ClaimOutcome::Claimed(claimed) =
+            crate::jobs::store::claim_job(&storage, first.job_id, node_id(3), 2_000)
+                .await
+                .unwrap()
+        else {
+            panic!("job must be claimed");
+        };
+        let token = claimed.claim.unwrap().claim_token;
+        crate::jobs::store::transition_to_running(&storage, first.job_id, token, 2_100)
+            .await
+            .unwrap();
+        crate::jobs::store::cancel_running_job(&storage, first.job_id, token, 2_200)
+            .await
+            .unwrap();
+
+        let terminal = drive(SubmitJobOperation::new(submission), &ctx)
+            .await
+            .unwrap();
+        assert!(!terminal.created);
+        assert_eq!(terminal.job_id, first.job_id);
     }
 
     // Equal logical keys from different owners must not share a dedup row.
