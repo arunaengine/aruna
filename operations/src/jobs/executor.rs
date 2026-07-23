@@ -111,9 +111,7 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
         }
         JobPayload::Staging(spec) => crate::jobs::staging::run_staging_job(ctx, spec).await,
         JobPayload::ExportRoCrate(spec) => crate::jobs::export::run_export_job(ctx, spec).await,
-        JobPayload::ImportRoCrate(_) => JobRunOutcome::Failed(JobError::permanent(
-            "RO-Crate import executor is not registered",
-        )),
+        JobPayload::ImportRoCrate(spec) => crate::jobs::import::run_rocrate_import(ctx, spec).await,
         // Guard: an execution job must run through the external attempt path.
         JobPayload::Execution(_) => JobRunOutcome::Failed(JobError::permanent(
             "execution payload dispatched through the in-process seam",

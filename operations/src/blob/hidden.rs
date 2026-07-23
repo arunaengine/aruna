@@ -4,9 +4,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE};
+use aruna_core::keyspaces::{JOB_KEYSPACE, ROCRATE_JOB_STATE_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE};
 use aruna_core::structs::{
-    BackendLocation, HiddenBlobEntry, HiddenBlobKey, JobId, JobRecord, RoCrateUploadRecord,
+    BackendLocation, HiddenBlobEntry, HiddenBlobKey, JobId, JobRecord, JobResultPayload,
+    RoCrateCheckpointRefs, RoCrateUploadRecord,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Key;
@@ -61,8 +62,7 @@ pub async fn restore_hidden_sweep(storage: &StorageHandle, task_handle: &TaskHan
 }
 
 async fn sweep_at(context: &DriverContext, now_ms: u64) -> Result<HiddenSweepOutcome, String> {
-    let (jobs, active_jobs) = scan_jobs(&context.storage_handle).await?;
-    let mut referenced = HashSet::new();
+    let (active_jobs, active_rocrate, mut referenced) = scan_jobs(&context.storage_handle).await?;
     let uploads_deleted = sweep_uploads(context, &active_jobs, now_ms, &mut referenced).await?;
     let entries = list_hidden(context).await?;
     let cutoff = UNIX_EPOCH
@@ -72,7 +72,7 @@ async fn sweep_at(context: &DriverContext, now_ms: u64) -> Result<HiddenSweepOut
         .unwrap_or(UNIX_EPOCH);
     let mut orphans_deleted = 0usize;
     for entry in entries {
-        if is_orphaned(&entry, &referenced, &jobs, cutoff) {
+        if is_orphaned(&entry, &referenced, &active_rocrate, cutoff) {
             delete_key(context, entry.key).await?;
             orphans_deleted = orphans_deleted.saturating_add(1);
         }
@@ -83,9 +83,12 @@ async fn sweep_at(context: &DriverContext, now_ms: u64) -> Result<HiddenSweepOut
     })
 }
 
-async fn scan_jobs(storage: &StorageHandle) -> Result<(HashSet<JobId>, HashSet<JobId>), String> {
-    let mut jobs = HashSet::new();
+async fn scan_jobs(
+    storage: &StorageHandle,
+) -> Result<(HashSet<JobId>, HashSet<JobId>, HashSet<HiddenBlobKey>), String> {
     let mut active = HashSet::new();
+    let mut active_rocrate = HashSet::new();
+    let mut referenced = HashSet::new();
     let mut start_after = None;
     loop {
         let (values, next) = iter_prefix_page(
@@ -99,9 +102,25 @@ async fn scan_jobs(storage: &StorageHandle) -> Result<(HashSet<JobId>, HashSet<J
         .await?;
         for (_, value) in values {
             let record = JobRecord::from_bytes(&value).map_err(|error| error.to_string())?;
-            jobs.insert(record.job_id);
             if !record.state.is_terminal() {
                 active.insert(record.job_id);
+                if record.payload.is_rocrate() {
+                    active_rocrate.insert(record.job_id);
+                    for location in checkpoint_refs(storage, record.job_id).await? {
+                        referenced.insert(
+                            HiddenBlobKey::try_from(&location)
+                                .map_err(|error| error.to_string())?,
+                        );
+                    }
+                }
+            }
+            if let Some(JobResultPayload::ExportRoCrate(result)) = record.result
+                && let Some(artifact) = result.artifact
+            {
+                referenced.insert(
+                    HiddenBlobKey::try_from(&artifact.location)
+                        .map_err(|error| error.to_string())?,
+                );
             }
         }
         match next {
@@ -109,7 +128,32 @@ async fn scan_jobs(storage: &StorageHandle) -> Result<(HashSet<JobId>, HashSet<J
             None => break,
         }
     }
-    Ok((jobs, active))
+    Ok((active, active_rocrate, referenced))
+}
+
+async fn checkpoint_refs(
+    storage: &StorageHandle,
+    job_id: JobId,
+) -> Result<Vec<BackendLocation>, String> {
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: ROCRATE_JOB_STATE_KEYSPACE.to_string(),
+            key: job_id.to_bytes().to_vec().into(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => postcard::take_from_bytes::<RoCrateCheckpointRefs>(value.as_ref())
+            .map(|(refs, _)| refs.hidden_locations)
+            .map_err(|error| error.to_string()),
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(Vec::new()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!(
+            "unexpected RO-Crate checkpoint read event: {other:?}"
+        )),
+    }
 }
 
 async fn sweep_uploads(
@@ -161,16 +205,17 @@ fn upload_is_live(record: &RoCrateUploadRecord, active_jobs: &HashSet<JobId>, no
 fn is_orphaned(
     entry: &HiddenBlobEntry,
     referenced: &HashSet<HiddenBlobKey>,
-    jobs: &HashSet<JobId>,
+    active_rocrate: &HashSet<JobId>,
     cutoff: SystemTime,
 ) -> bool {
     if referenced.contains(&entry.key) {
         return false;
     }
-    let Ok(namespace) = entry.key.namespace() else {
-        return false;
-    };
-    if jobs.contains(&JobId(namespace)) {
+    if entry
+        .key
+        .namespace()
+        .is_ok_and(|namespace| active_rocrate.contains(&JobId(namespace)))
+    {
         return false;
     }
     entry.modified_at.is_some_and(|modified| modified <= cutoff)
@@ -224,6 +269,7 @@ mod tests {
     use super::*;
     use aruna_core::structs::{BackendLocation, RealmId, RoCrateMediaType};
     use aruna_core::types::UserId;
+    use serde::Serialize;
     use std::collections::HashMap;
     use ulid::Ulid;
 
@@ -317,5 +363,28 @@ mod tests {
             &HashSet::from([JobId(namespace)]),
             UNIX_EPOCH
         ));
+    }
+
+    #[test]
+    fn checkpoint_prefix_decodes() {
+        #[derive(Serialize)]
+        struct Checkpoint {
+            refs: RoCrateCheckpointRefs,
+            phase: u8,
+        }
+
+        let location = upload_record(Ulid::from_bytes([8u8; 16]), 10, None).location;
+        let encoded = postcard::to_allocvec(&Checkpoint {
+            refs: RoCrateCheckpointRefs {
+                hidden_locations: vec![location.clone()],
+            },
+            phase: 3,
+        })
+        .unwrap();
+        let (refs, remainder) =
+            postcard::take_from_bytes::<RoCrateCheckpointRefs>(&encoded).unwrap();
+
+        assert_eq!(refs.hidden_locations, vec![location]);
+        assert!(!remainder.is_empty());
     }
 }

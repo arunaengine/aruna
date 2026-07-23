@@ -36,6 +36,7 @@ use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation
 use crate::driver::drive;
 use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::metadata::raw::load_raw_view;
+use crate::metadata::repository::StorageReadError;
 use crate::replication::bao_read::{BaoReadError, BaoReadOperation, BaoReadOutput};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 
@@ -283,7 +284,10 @@ async fn snapshot_export(
 ) -> Result<(), ExportFailure> {
     let record = load_metadata_record_by_document(&ctx.driver, spec.document_id)
         .await
-        .map_err(|error| ExportFailure::Retryable(error.to_string()))?
+        .map_err(|error| match error {
+            StorageReadError::Storage(error) => ExportFailure::Retryable(error.to_string()),
+            StorageReadError::Conversion(error) => ExportFailure::Retryable(error.to_string()),
+        })?
         .ok_or_else(|| ExportFailure::Permanent("metadata document not found".to_string()))?;
     if record.permission_path.is_empty() {
         return Err(ExportFailure::Permanent(

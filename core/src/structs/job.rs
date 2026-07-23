@@ -19,6 +19,7 @@ pub const JOB_RECORD_KEY_PREFIX: &[u8] = b"jobs-v1/";
 pub const JOB_DUE_INDEX_PREFIX: &[u8] = b"due/";
 pub const JOB_LEASE_INDEX_PREFIX: &[u8] = b"lease/";
 pub const JOB_PRUNE_INDEX_PREFIX: &[u8] = b"prune/";
+pub const DEFAULT_JOB_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// Creation-ordered job identifier.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -344,7 +345,7 @@ impl Default for RoCrateLimits {
             metadata_bytes: 16 * 1024 * 1024,
             key_bytes: 1024,
             upload_retention_ms: DAY_MS,
-            artifact_retention_ms: 7 * DAY_MS,
+            artifact_retention_ms: DEFAULT_JOB_RETENTION_MS,
             max_active_jobs: 4,
             holder_ttl_ms: DAY_MS,
             holder_refresh_ms: 8 * 60 * 60 * 1000,
@@ -451,6 +452,11 @@ pub struct RoCrateUploadRecord {
     pub media_type: RoCrateMediaType,
     pub expires_at_ms: u64,
     pub claimed_by: Option<JobId>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoCrateCheckpointRefs {
+    pub hidden_locations: Vec<BackendLocation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -937,6 +943,7 @@ pub struct JobRecord {
     #[serde(default)]
     pub workspace_mode: WorkspaceMode,
     pub report_digest: Option<[u8; 32]>,
+    pub retention_ms: u64,
 }
 
 impl JobRecord {
@@ -979,6 +986,7 @@ impl JobRecord {
             workspace_bucket: None,
             workspace_mode: WorkspaceMode::default(),
             report_digest: None,
+            retention_ms: DEFAULT_JOB_RETENTION_MS,
         }
     }
 
@@ -997,12 +1005,14 @@ impl JobRecord {
             Err(postcard::Error::DeserializeUnexpectedEnd) => {
                 let mut previous = bytes.to_vec();
                 previous.extend(postcard::to_allocvec(&Option::<[u8; 32]>::None)?);
+                previous.extend(postcard::to_allocvec(&DEFAULT_JOB_RETENTION_MS)?);
                 if let Ok(record) = postcard::from_bytes(&previous) {
                     return Ok(record);
                 }
                 let mut legacy = bytes.to_vec();
                 legacy.extend(postcard::to_allocvec(&WorkspaceMode::default())?);
                 legacy.extend(postcard::to_allocvec(&Option::<[u8; 32]>::None)?);
+                legacy.extend(postcard::to_allocvec(&DEFAULT_JOB_RETENTION_MS)?);
                 Ok(postcard::from_bytes(&legacy)?)
             }
             Err(error) => Err(error.into()),
@@ -1533,6 +1543,8 @@ mod tests {
     fn legacy_record_defaults() {
         let record = probe_record(JobId::from_bytes([6u8; 16]), 1_700_000_000_000);
         let mut bytes = record.to_bytes().unwrap();
+        let retention = postcard::to_allocvec(&record.retention_ms).unwrap();
+        bytes.truncate(bytes.len() - retention.len());
         let digest = postcard::to_allocvec(&Option::<[u8; 32]>::None).unwrap();
         bytes.truncate(bytes.len() - digest.len());
         let mode = postcard::to_allocvec(&WorkspaceMode::Kept).unwrap();
@@ -1543,6 +1555,7 @@ mod tests {
         assert_eq!(decoded.workspace_mode, WorkspaceMode::Kept);
         assert_eq!(decoded.workspace_bucket, record.workspace_bucket);
         assert_eq!(decoded.report_digest, None);
+        assert_eq!(decoded.retention_ms, DEFAULT_JOB_RETENTION_MS);
     }
 
     #[test]

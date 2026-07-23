@@ -612,6 +612,7 @@ pub async fn submit_job(
         request.idempotency_key,
         workspace_mode,
         workspace_bucket,
+        state.rocrate_limits().artifact_retention_ms,
     )
     .await
     .map_err(map_submit_error)?;

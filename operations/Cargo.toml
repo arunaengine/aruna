@@ -47,6 +47,9 @@ ulid = { workspace = true }
 unicode-normalization = { workspace = true }
 ed25519-dalek = { workspace = true }
 oxrdf = { workspace = true }
+oxttl = { workspace = true }
+percent-encoding = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

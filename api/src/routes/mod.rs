@@ -15,6 +15,7 @@ pub mod jobs;
 pub mod metadata;
 pub mod notifications;
 pub mod onboarding;
+pub mod rocrate_import;
 pub mod search;
 pub mod staging;
 pub mod sync;
@@ -34,6 +35,7 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
         .merge(groups::router())
         .merge(jobs::router())
         .merge(metadata::router())
+        .merge(rocrate_import::router())
         .merge(notifications::router())
         .merge(search::router())
         .merge(tes::router())

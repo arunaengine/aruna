@@ -24,7 +24,7 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, JOB_MUTATE_MAX_ATTEMPTS, JOB_RETENTION_MS};
+use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, JOB_MUTATE_MAX_ATTEMPTS};
 use crate::queue_backoff::queue_retry_after_ms;
 
 type JobWrites = Vec<(KeySpace, Key, Value)>;
@@ -60,7 +60,7 @@ pub enum JobMutationError {
 }
 
 /// Schedule-index key by state: queued -> due/, claimed/running -> lease/, terminal -> prune/.
-fn schedule_index_key_for(record: &JobRecord) -> Key {
+fn job_schedule_key(record: &JobRecord) -> Key {
     match record.state {
         JobState::Queued => job_due_index_key(record.due_at_ms, record.job_id),
         JobState::Claimed
@@ -78,12 +78,7 @@ fn schedule_index_key_for(record: &JobRecord) -> Key {
         }
         JobState::Succeeded | JobState::Failed | JobState::Cancelled => {
             let finished = record.finished_at_ms.unwrap_or(record.updated_at_ms);
-            let retention_ms = record
-                .payload
-                .rocrate_limits()
-                .map(|limits| limits.artifact_retention_ms)
-                .unwrap_or(JOB_RETENTION_MS);
-            job_prune_index_key(finished.saturating_add(retention_ms), record.job_id)
+            job_prune_index_key(finished.saturating_add(record.retention_ms), record.job_id)
         }
     }
 }
@@ -108,7 +103,7 @@ pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionErr
         ),
         (
             JOB_SCHEDULE_INDEX_KEYSPACE.to_string(),
-            schedule_index_key_for(record),
+            job_schedule_key(record),
             empty_value(),
         ),
     ];
@@ -153,7 +148,7 @@ pub fn job_prune_delete_entries(record: &JobRecord) -> JobDeletes {
         ),
         (
             JOB_SCHEDULE_INDEX_KEYSPACE.to_string(),
-            schedule_index_key_for(record),
+            job_schedule_key(record),
         ),
         (
             STAGING_JOB_STATE_KEYSPACE.to_string(),
@@ -191,8 +186,8 @@ fn index_deltas(
     )];
     let mut deletes = Vec::new();
 
-    let old_schedule = schedule_index_key_for(old);
-    let new_schedule = schedule_index_key_for(new);
+    let old_schedule = job_schedule_key(old);
+    let new_schedule = job_schedule_key(new);
     if old_schedule != new_schedule {
         deletes.push((JOB_SCHEDULE_INDEX_KEYSPACE.to_string(), old_schedule));
     }
@@ -486,7 +481,7 @@ async fn insert_cleanup_obligation(
     let access_key = UserAccess::build_access_key(&workspace_credential_id(record.job_id))
         .map_err(|error| JobMutationError::Storage(error.to_string()))?;
     let now_ms = record.finished_at_ms.unwrap_or(record.updated_at_ms);
-    let child = JobRecord::new(
+    let mut child = JobRecord::new(
         cleanup_job_id(record.job_id),
         JobPayload::TerminalCleanup {
             for_job: record.job_id,
@@ -499,6 +494,7 @@ async fn insert_cleanup_obligation(
         now_ms,
         Some(cleanup_dedup_key(record.job_id)),
     );
+    child.retention_ms = record.retention_ms;
     let writes =
         job_insert_entries(&child).map_err(|error| JobMutationError::Storage(error.to_string()))?;
     batch_write(storage, writes, Some(txn_id))
@@ -515,7 +511,7 @@ async fn insert_crate_obligation(
         return Ok(());
     }
     let now_ms = record.finished_at_ms.unwrap_or(record.updated_at_ms);
-    let child = JobRecord::new(
+    let mut child = JobRecord::new(
         crate_job_id(record.job_id),
         JobPayload::WriteRunCrate {
             for_job: record.job_id,
@@ -526,6 +522,7 @@ async fn insert_crate_obligation(
         now_ms,
         Some(run_crate_dedup_key(record.job_id)),
     );
+    child.retention_ms = record.retention_ms;
     let mut writes =
         job_insert_entries(&child).map_err(|error| JobMutationError::Storage(error.to_string()))?;
     writes.push((
@@ -2135,6 +2132,20 @@ mod tests {
                 attempt_control_key(record.job_id, 2),
             ]
         );
+    }
+
+    #[test]
+    fn schedule_uses_retention() {
+        let mut record = queued_record(JobId::from_bytes([0x56; 16]));
+        record.state = JobState::Succeeded;
+        record.finished_at_ms = Some(2_000);
+        record.retention_ms = 42;
+
+        let (expiry, job_id) =
+            parse_job_schedule_index_key(job_schedule_key(&record).as_ref()).unwrap();
+
+        assert_eq!(expiry, 2_042);
+        assert_eq!(job_id, record.job_id);
     }
 
     #[tokio::test]

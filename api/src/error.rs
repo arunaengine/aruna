@@ -32,6 +32,8 @@ pub enum ServerError {
     InternalError(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("{0}")]
+    PayloadTooLarge(String),
     #[error("Bad request")]
     BadRequest,
     #[error("{0}")]
@@ -242,6 +244,7 @@ impl ServerError {
             ServerError::Forbidden => StatusCode::FORBIDDEN,
             ServerError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::Conflict(_) => StatusCode::CONFLICT,
+            ServerError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             ServerError::BadRequest
             | ServerError::BadRequestReason(_)
             | ServerError::BadRequestMessage(_)
@@ -261,6 +264,7 @@ impl ServerError {
             ServerError::Forbidden => "Forbidden".to_string(),
             ServerError::InternalError(_) => "Internal error".to_string(),
             ServerError::Conflict(_) => "Conflict".to_string(),
+            ServerError::PayloadTooLarge(_) => "Payload too large".to_string(),
             ServerError::BadRequest
             | ServerError::BadRequestReason(_)
             | ServerError::BadRequestMessage(_) => "Bad request".to_string(),

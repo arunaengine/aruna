@@ -254,6 +254,7 @@ dependencies = [
  "axum",
  "base64",
  "blake3",
+ "bytes",
  "byteview",
  "chrono",
  "crypto_box",
@@ -492,6 +493,8 @@ dependencies = [
  "lru 0.18.1",
  "opentelemetry",
  "oxrdf",
+ "oxttl",
+ "percent-encoding",
  "postcard",
  "proptest",
  "rand 0.10.2",
@@ -510,6 +513,7 @@ dependencies = [
  "tracing-subscriber",
  "ulid 3.0.0",
  "unicode-normalization",
+ "url",
  "zip 8.6.0",
 ]
 
