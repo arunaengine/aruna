@@ -5,13 +5,14 @@ use aruna_core::document::{
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::keyspaces::{METADATA_CREATE_ACCEPTANCE_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::metadata::{
-    MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord, MetadataEffect, MetadataError,
-    MetadataEvent, MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord,
+    MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
+    MetadataEffect, MetadataError, MetadataEvent, MetadataGraphLifecycleRecord,
+    MetadataGraphPruneJobRecord,
 };
 use aruna_core::operation::Operation;
-use aruna_core::storage_entries::metadata_document_lifecycle_revision_change;
+use aruna_core::storage_entries::{metadata_document_lifecycle_revision_change, metadata_path_key};
 use aruna_core::structs::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord, PlacementRef,
     RealmConfigDocument,
@@ -69,6 +70,8 @@ enum DeleteMetadataDocumentState {
     WriteDocumentLifecycle,
     DeleteRegistry,
     DeleteDocumentIndex,
+    ReadPathFence,
+    DeletePathFence,
     DeleteHolders,
     WriteAudit,
     WriteDocumentLifecycleOutbox,
@@ -498,6 +501,75 @@ impl Operation for DeleteMetadataDocumentOperation {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(DeleteMetadataDocumentError::MissingTransaction);
                     };
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
+                    };
+                    self.state = DeleteMetadataDocumentState::ReadPathFence;
+                    smallvec![Effect::Storage(StorageEffect::Read {
+                        key_space: METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+                        key: metadata_path_key(
+                            &record.realm_id,
+                            record.group_id,
+                            &record.document_path,
+                        ),
+                        txn_id: Some(txn_id),
+                    })]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => {
+                    self.unexpected_event("document index delete result", format!("{other:?}"))
+                }
+            },
+            DeleteMetadataDocumentState::ReadPathFence => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(DeleteMetadataDocumentError::MissingTransaction);
+                    };
+                    let Some(bytes) = value else {
+                        self.state = DeleteMetadataDocumentState::DeleteHolders;
+                        return smallvec![delete_holders_effect(
+                            self.group_id,
+                            self.document_id,
+                            Some(txn_id)
+                        )];
+                    };
+                    let event: MetadataCreateEventRecord = match postcard::from_bytes(&bytes) {
+                        Ok(event) => event,
+                        Err(error) => {
+                            return self
+                                .fail(DeleteMetadataDocumentError::ConversionError(error.into()));
+                        }
+                    };
+                    if event.record.document_id != self.document_id {
+                        self.state = DeleteMetadataDocumentState::DeleteHolders;
+                        return smallvec![delete_holders_effect(
+                            self.group_id,
+                            self.document_id,
+                            Some(txn_id)
+                        )];
+                    }
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
+                    };
+                    self.state = DeleteMetadataDocumentState::DeletePathFence;
+                    smallvec![Effect::Storage(StorageEffect::Delete {
+                        key_space: METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+                        key: metadata_path_key(
+                            &record.realm_id,
+                            record.group_id,
+                            &record.document_path,
+                        ),
+                        txn_id: Some(txn_id),
+                    })]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("path fence read result", format!("{other:?}")),
+            },
+            DeleteMetadataDocumentState::DeletePathFence => match event {
+                Event::Storage(StorageEvent::DeleteResult { .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(DeleteMetadataDocumentError::MissingTransaction);
+                    };
                     self.state = DeleteMetadataDocumentState::DeleteHolders;
                     smallvec![delete_holders_effect(
                         self.group_id,
@@ -506,9 +578,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                     )]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => {
-                    self.unexpected_event("document index delete result", format!("{other:?}"))
-                }
+                other => self.unexpected_event("path fence delete result", format!("{other:?}")),
             },
             DeleteMetadataDocumentState::DeleteHolders => match event {
                 Event::Storage(StorageEvent::DeleteResult { .. }) => {
@@ -734,6 +804,7 @@ mod tests {
         DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
         METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
     };
+    use aruna_core::metadata::MetadataCreateEventPayload;
     use aruna_core::storage_entries::document_sync_revision_key;
     use aruna_core::structs::{PlacementStrategy, RealmId, RealmNodeKind};
 
@@ -1036,6 +1107,68 @@ mod tests {
             effects.as_slice(),
             [Effect::Metadata(MetadataEffect::DeleteGraph { graph_iri })]
                 if graph_iri == &record.graph_iri
+        ));
+    }
+
+    #[test]
+    fn delete_releases_path() {
+        let actor = actor();
+        let record = record(&actor);
+        let txn_id = Ulid::generate();
+        let mut operation =
+            DeleteMetadataDocumentOperation::new(actor, record.group_id, record.document_id);
+        operation.record = Some(record.clone());
+        operation.txn_id = Some(txn_id);
+        operation.state = DeleteMetadataDocumentState::DeleteDocumentIndex;
+
+        let effects = operation.step(Event::Storage(StorageEvent::DeleteResult {
+            key: record.document_id.to_bytes().to_vec().into(),
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read {
+                key_space,
+                key,
+                txn_id: Some(read_txn),
+            })]
+                if key_space == METADATA_CREATE_ACCEPTANCE_KEYSPACE
+                    && key == &metadata_path_key(
+                        &record.realm_id,
+                        record.group_id,
+                        &record.document_path,
+                    )
+                    && *read_txn == txn_id
+        ));
+        let path_event = MetadataCreateEventRecord {
+            event_id: record.last_event_id,
+            record: record.clone(),
+            user_id: operation.actor.user_id,
+            node_id: operation.actor.node_id,
+            payload: MetadataCreateEventPayload::RoCrate {
+                jsonld: "{}".to_string(),
+            },
+            occurred_at_ms: record.created_at_ms,
+        };
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: metadata_path_key(&record.realm_id, record.group_id, &record.document_path),
+            value: Some(postcard::to_allocvec(&path_event).unwrap().into()),
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Delete {
+                key_space,
+                key,
+                txn_id: Some(delete_txn),
+            })]
+                if key_space == METADATA_CREATE_ACCEPTANCE_KEYSPACE
+                    && key == &metadata_path_key(
+                        &record.realm_id,
+                        record.group_id,
+                        &record.document_path,
+                    )
+                    && *delete_txn == txn_id
         ));
     }
 }
