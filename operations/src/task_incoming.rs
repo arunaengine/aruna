@@ -22,6 +22,9 @@ use tracing::{debug, error, info, warn};
 use crate::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation, REALM_PRESENCE_REFRESH_AFTER,
 };
+use crate::blob::hidden::{
+    HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, process_hidden_sweep, restore_hidden_sweep,
+};
 use crate::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::document_sync_outbox::{
     OUTBOX_DRAIN_BATCH_SIZE, delete_outbox_records, read_outbox_records,
@@ -1702,6 +1705,18 @@ impl OperationsTaskHandler {
         };
         self.reschedule_timer(TaskKey::PruneJobs, after).await;
     }
+
+    async fn sweep_hidden_blobs(&self) {
+        let after = match process_hidden_sweep(&self.context).await {
+            Ok(_) => HIDDEN_SWEEP_AFTER,
+            Err(error) => {
+                warn!(task_id = ?TaskKey::SweepHiddenBlobs, error = %error, "Failed to sweep hidden blobs");
+                HIDDEN_SWEEP_RETRY
+            }
+        };
+        self.reschedule_timer(TaskKey::SweepHiddenBlobs, after)
+            .await;
+    }
 }
 
 fn spawn_durable_queue_rearm(context: &Arc<DriverContext>, task_handle: &TaskHandle) {
@@ -1793,6 +1808,9 @@ pub async fn initialize_task_incoming(
     }
     restore_job_prune_timer(&context.storage_handle, &task_handle).await;
     restore_mirror_timer(&context.storage_handle, &task_handle).await;
+    if context.blob_handle.is_some() {
+        restore_hidden_sweep(&context.storage_handle, &task_handle).await;
+    }
 }
 
 /// Runs one document sync outbox drain pass synchronously against `context`.
@@ -1882,6 +1900,9 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::DrainSyncMirrorRepair => {
                 self.drain_mirror_repair().await;
+            }
+            TaskKey::SweepHiddenBlobs => {
+                self.sweep_hidden_blobs().await;
             }
         }
     }

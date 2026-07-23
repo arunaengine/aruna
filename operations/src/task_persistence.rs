@@ -389,6 +389,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hidden_sweep_persists() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+
+        persist_task_effect(
+            &storage,
+            &TaskEffect::ResetTimer {
+                key: TaskKey::SweepHiddenBlobs,
+                after: Duration::ZERO,
+            },
+        )
+        .await
+        .expect("sweep timer persists");
+
+        let timer = read_timer(&storage, &TaskKey::SweepHiddenBlobs)
+            .await
+            .expect("timer read")
+            .expect("timer exists");
+        assert_eq!(timer.key, TaskKey::SweepHiddenBlobs);
+    }
+
+    #[tokio::test]
     async fn metadata_projection_timer_restores_to_new_task_handle() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))

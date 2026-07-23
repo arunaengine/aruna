@@ -10,7 +10,7 @@ use ulid::Ulid;
 use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::invert_timestamp_ms;
-use crate::structs::{AuthContext, StagingStrategy};
+use crate::structs::{AuthContext, BackendLocation, StagingStrategy};
 use crate::types::{GroupId, Key, UserId};
 
 /// Version prefix keeping the record wrappable in a version envelope later (#286).
@@ -284,6 +284,202 @@ pub struct StagingJobCheckpoint {
     pub errors: Vec<StagingJobError>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ImportRoCrateSource {
+    Upload {
+        upload_id: Ulid,
+    },
+    Object {
+        bucket: String,
+        key: String,
+        version: Option<Ulid>,
+    },
+    Connector {
+        group_id: GroupId,
+        connector_id: Ulid,
+        path: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportRoCrateTarget {
+    pub bucket: String,
+    pub prefix: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportMetadataTarget {
+    pub group_id: GroupId,
+    pub path: String,
+    pub public: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoCrateLimits {
+    pub direct_upload_bytes: u64,
+    pub import_source_bytes: u64,
+    pub expanded_import_bytes: u64,
+    pub export_artifact_bytes: u64,
+    pub max_entries: u64,
+    pub metadata_bytes: u64,
+    pub key_bytes: u64,
+    pub upload_retention_ms: u64,
+    pub artifact_retention_ms: u64,
+    pub max_active_jobs: u32,
+    pub holder_ttl_ms: u64,
+    pub holder_refresh_ms: u64,
+}
+
+impl Default for RoCrateLimits {
+    fn default() -> Self {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+        Self {
+            direct_upload_bytes: 8 * GIB,
+            import_source_bytes: 100 * GIB,
+            expanded_import_bytes: 100 * GIB,
+            export_artifact_bytes: 100 * GIB,
+            max_entries: 100_000,
+            metadata_bytes: 16 * 1024 * 1024,
+            key_bytes: 1024,
+            upload_retention_ms: DAY_MS,
+            artifact_retention_ms: 7 * DAY_MS,
+            max_active_jobs: 4,
+            holder_ttl_ms: DAY_MS,
+            holder_refresh_ms: 8 * 60 * 60 * 1000,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportRoCrateSpec {
+    pub auth_context: AuthContext,
+    pub source: ImportRoCrateSource,
+    pub target: ImportRoCrateTarget,
+    pub metadata: ImportMetadataTarget,
+    pub limits: RoCrateLimits,
+    pub document_id: Ulid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportRoCrateSpec {
+    pub auth_context: AuthContext,
+    pub document_id: Ulid,
+    pub limits: RoCrateLimits,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasonCode {
+    Imported,
+    Unlisted,
+    Failed,
+    NotAttempted,
+    Included,
+    External,
+    Denied,
+    Missing,
+    Offline,
+    Unsupported,
+    PathSynthesized,
+    UnrewrittenReference,
+    SignatureDropped,
+    UnsupportedCrateVersion,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobReportRow<T> {
+    pub entry_key: String,
+    pub code: ReasonCode,
+    pub message: Option<String>,
+    pub detail: T,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportReportDetail {
+    pub archive_path: String,
+    pub target_key: Option<String>,
+    pub version_id: Option<Ulid>,
+    pub blake3: Option<String>,
+    pub size: Option<u64>,
+    pub arn: Option<String>,
+    pub w3id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportReportSource {
+    Local,
+    Remote,
+    Hash,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportReportDetail {
+    pub entity_id: String,
+    pub zip_path: Option<String>,
+    pub source: Option<ExportReportSource>,
+    pub resolved_version: Option<Ulid>,
+}
+
+pub type ImportReportRow = JobReportRow<ImportReportDetail>;
+pub type ExportReportRow = JobReportRow<ExportReportDetail>;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactRef {
+    pub location: BackendLocation,
+    pub blake3: [u8; 32],
+    pub size: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoCrateMediaType {
+    Zip,
+    Eln,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoCrateUploadRecord {
+    pub upload_id: Ulid,
+    pub owner: UserId,
+    pub location: BackendLocation,
+    pub blake3: [u8; 32],
+    pub size: u64,
+    pub media_type: RoCrateMediaType,
+    pub expires_at_ms: u64,
+    pub claimed_by: Option<JobId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportRoCrateResult {
+    pub document_id: Option<Ulid>,
+    pub entries_total: u64,
+    pub imported: u64,
+    pub unlisted: u64,
+    pub failed: u64,
+    pub report_digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportOmissionCounts {
+    pub external: u64,
+    pub denied: u64,
+    pub missing: u64,
+    pub offline: u64,
+    pub unsupported: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportRoCrateResult {
+    pub artifact: Option<ArtifactRef>,
+    pub included: u64,
+    pub omitted: ExportOmissionCounts,
+    pub report_digest: [u8; 32],
+}
+
 impl ExecutionSpec {
     /// Materialize workspace output intents against the resolved bucket.
     /// Deterministic across retries: the bucket name derives from the `JobId`.
@@ -332,6 +528,8 @@ pub enum JobPayload {
         access_key: String,
     },
     Staging(StagingJobSpec),
+    ImportRoCrate(ImportRoCrateSpec),
+    ExportRoCrate(ExportRoCrateSpec),
 }
 
 impl JobPayload {
@@ -341,6 +539,8 @@ impl JobPayload {
             JobPayload::Probe { .. } => "probe",
             JobPayload::Execution(_) => "execution",
             JobPayload::Staging(_) => "staging",
+            JobPayload::ImportRoCrate(_) => "import_rocrate",
+            JobPayload::ExportRoCrate(_) => "export_rocrate",
             JobPayload::WriteRunCrate { .. } => "write_run_crate",
             JobPayload::TerminalCleanup { .. } => "terminal_cleanup",
         }
@@ -351,7 +551,9 @@ impl JobPayload {
         match self {
             JobPayload::Probe { .. } => "steps",
             JobPayload::Execution(_) => "phases",
-            JobPayload::Staging(_) => "items",
+            JobPayload::Staging(_)
+            | JobPayload::ImportRoCrate(_)
+            | JobPayload::ExportRoCrate(_) => "items",
             JobPayload::WriteRunCrate { .. } | JobPayload::TerminalCleanup { .. } => "steps",
         }
     }
@@ -362,6 +564,8 @@ impl JobPayload {
         match self {
             JobPayload::Probe { .. }
             | JobPayload::Staging(_)
+            | JobPayload::ImportRoCrate(_)
+            | JobPayload::ExportRoCrate(_)
             | JobPayload::WriteRunCrate { .. }
             | JobPayload::TerminalCleanup { .. } => JobExecutionClass::InProcess,
             JobPayload::Execution(_) => JobExecutionClass::ExternalAttempt,
@@ -479,6 +683,8 @@ pub enum JobResultPayload {
         completed_items: u64,
         failed_items: u64,
     },
+    ImportRoCrate(ImportRoCrateResult),
+    ExportRoCrate(ExportRoCrateResult),
 }
 
 impl JobResultPayload {
@@ -489,6 +695,8 @@ impl JobResultPayload {
             JobResultPayload::RunCrate { .. } => "run_crate",
             JobResultPayload::Cleanup => "cleanup",
             JobResultPayload::Staging { .. } => "staging",
+            JobResultPayload::ImportRoCrate(_) => "import_rocrate",
+            JobResultPayload::ExportRoCrate(_) => "export_rocrate",
         }
     }
 
@@ -530,6 +738,30 @@ impl JobResultPayload {
             } => serde_json::json!({
                 "completed_items": completed_items,
                 "failed_items": failed_items,
+            }),
+            JobResultPayload::ImportRoCrate(result) => serde_json::json!({
+                "document_id": result.document_id.map(|id| id.to_string()),
+                "entries_total": result.entries_total,
+                "imported": result.imported,
+                "unlisted": result.unlisted,
+                "failed": result.failed,
+                "report_digest": hex::encode(result.report_digest),
+            }),
+            JobResultPayload::ExportRoCrate(result) => serde_json::json!({
+                "artifact": result.artifact.as_ref().map(|artifact| serde_json::json!({
+                    "blake3": hex::encode(artifact.blake3),
+                    "size": artifact.size,
+                    "expires_at_ms": artifact.expires_at_ms,
+                })),
+                "included": result.included,
+                "omitted": {
+                    "external": result.omitted.external,
+                    "denied": result.omitted.denied,
+                    "missing": result.omitted.missing,
+                    "offline": result.omitted.offline,
+                    "unsupported": result.omitted.unsupported,
+                },
+                "report_digest": hex::encode(result.report_digest),
             }),
         }
     }

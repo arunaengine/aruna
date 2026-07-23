@@ -12,14 +12,15 @@ use aruna_core::alpn::Alpn;
 use aruna_core::effects::{BlobEffect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
-use aruna_core::keyspaces::BUCKET_STATS_DB;
+use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB, HASH_PATHS_INDEX_KEYSPACE};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
-    Backend, BackendConfig, BackendLocation, BlobTimeoutConfig, RealmId, ResolvedSourceAccess,
-    SourceConnectorKind,
+    Backend, BackendConfig, BackendLocation, BlobTimeoutConfig, HiddenBlobKey, RealmId,
+    ResolvedSourceAccess, SourceConnectorKind,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::storage;
+use futures::TryStreamExt;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 use tempfile::tempdir;
@@ -206,6 +207,22 @@ async fn bucket_load(storage_handle: &storage::StorageHandle, bucket: &str) -> u
     value
         .map(|value| u64::from_le_bytes(value.as_ref().try_into().unwrap()))
         .unwrap_or(0)
+}
+
+async fn keyspace_count(storage_handle: &storage::StorageHandle, key_space: &str) -> usize {
+    let Event::Storage(StorageEvent::IterResult { values, .. }) = storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: key_space.to_string(),
+            prefix: None,
+            start: None,
+            limit: 16,
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("unexpected storage event")
+    };
+    values.len()
 }
 
 fn test_user_id() -> UserId {
@@ -549,6 +566,151 @@ async fn multipart_part_bucket_is_excluded_from_bucket_stats() {
 }
 
 #[tokio::test]
+async fn hidden_spool_roundtrip() {
+    let context = setup_blob_handle(5).await;
+    let namespace = Ulid::from_bytes([3u8; 16]);
+    let Event::Blob(BlobEvent::HiddenSpooled {
+        location,
+        blake3,
+        size,
+    }) = context
+        .blob_handle
+        .send_blob_effect(BlobEffect::SpoolHidden {
+            namespace,
+            name: "input.zip".to_string(),
+            created_by: test_user_id(),
+            max_bytes: Some(16),
+            blob: stream_from_bytes(b"hidden"),
+        })
+        .await
+    else {
+        panic!("hidden spool failed")
+    };
+
+    assert_eq!(size, 6);
+    assert_eq!(blake3, *blake3::hash(b"hidden").as_bytes());
+    assert!(
+        location
+            .backend_path
+            .starts_with(&format!("_jobs/{namespace}/input.zip_"))
+    );
+    assert_eq!(
+        keyspace_count(&context.storage_handle, BLOB_LOCATIONS_KEYSPACE).await,
+        0
+    );
+    assert_eq!(
+        keyspace_count(&context.storage_handle, HASH_PATHS_INDEX_KEYSPACE).await,
+        0
+    );
+
+    let Event::Blob(BlobEvent::HiddenListed { entries }) = context
+        .blob_handle
+        .send_blob_effect(BlobEffect::ListHidden {
+            namespace: Some(namespace),
+        })
+        .await
+    else {
+        panic!("hidden list failed")
+    };
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].key, HiddenBlobKey::try_from(&location).unwrap());
+
+    let Event::Blob(BlobEvent::HiddenRead { blob, stream_size }) = context
+        .blob_handle
+        .send_blob_effect(BlobEffect::ReadHiddenRange {
+            location: location.clone(),
+            range: 1..4,
+        })
+        .await
+    else {
+        panic!("hidden read failed")
+    };
+    let chunks: Vec<bytes::Bytes> = blob.try_collect().await.unwrap();
+    assert_eq!(stream_size, 3);
+    assert_eq!(chunks.concat(), b"idd");
+
+    assert!(matches!(
+        context
+            .blob_handle
+            .send_blob_effect(BlobEffect::ReadHiddenRange {
+                location: location.clone(),
+                range: 0..7,
+            })
+            .await,
+        Event::Blob(BlobEvent::Error(BlobError::ReadError(_)))
+    ));
+
+    let Event::Blob(BlobEvent::HiddenDeleted) = context
+        .blob_handle
+        .send_blob_effect(BlobEffect::DeleteHidden {
+            key: HiddenBlobKey::try_from(&location).unwrap(),
+        })
+        .await
+    else {
+        panic!("hidden delete failed")
+    };
+    let Event::Blob(BlobEvent::HiddenListed { entries }) = context
+        .blob_handle
+        .send_blob_effect(BlobEffect::ListHidden {
+            namespace: Some(namespace),
+        })
+        .await
+    else {
+        panic!("hidden list failed")
+    };
+    assert!(entries.is_empty());
+}
+
+#[tokio::test]
+async fn hidden_spool_limits() {
+    let context = setup_blob_handle(5).await;
+    let namespace = Ulid::from_bytes([5u8; 16]);
+    let Event::Blob(BlobEvent::HiddenSpooled { location, .. }) = context
+        .blob_handle
+        .send_blob_effect(BlobEffect::SpoolHidden {
+            namespace,
+            name: "seed".to_string(),
+            created_by: test_user_id(),
+            max_bytes: None,
+            blob: stream_from_bytes(b"seed"),
+        })
+        .await
+    else {
+        panic!("seed spool failed")
+    };
+    let _ = context
+        .blob_handle
+        .send_blob_effect(BlobEffect::DeleteHidden {
+            key: HiddenBlobKey::try_from(&location).unwrap(),
+        })
+        .await;
+
+    assert!(matches!(
+        context
+            .blob_handle
+            .send_blob_effect(BlobEffect::SpoolHidden {
+                namespace,
+                name: "limited".to_string(),
+                created_by: test_user_id(),
+                max_bytes: Some(3),
+                blob: stream_from_bytes(b"four"),
+            })
+            .await,
+        Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { limit: 3 }))
+    ));
+    let Event::Blob(BlobEvent::HiddenListed { entries }) = context
+        .blob_handle
+        .send_blob_effect(BlobEffect::ListHidden {
+            namespace: Some(namespace),
+        })
+        .await
+    else {
+        panic!("hidden list failed")
+    };
+    assert!(entries.is_empty());
+}
+
+#[tokio::test]
 async fn staging_source_effect_dispatches_via_blob_handle() {
     let context = setup_blob_handle(1).await;
 
@@ -800,6 +962,17 @@ fn build_backend_path_rejects_traversal_keys() {
             ),
             "key {key:?} must be rejected"
         );
+    }
+}
+
+#[test]
+fn reserved_bucket_rejected() {
+    let ulid = Ulid::generate();
+    for bucket in ["_jobs", "./_jobs"] {
+        assert!(matches!(
+            build_backend_path(bucket, "object", ulid),
+            Err(ConversionError::UnsafePath(_))
+        ));
     }
 }
 
