@@ -328,34 +328,41 @@ impl Service<Request<Incoming>> for WrappingService {
             if method == Method::OPTIONS
                 && let Some(origin_header) = origin_header.as_ref()
             {
-                if let Some(config) = bucket_cors.as_ref() {
-                    let response = requested_method.as_deref().map_or_else(
-                        build_preflight_forbidden_response,
-                        |requested_method| match match_preflight_rule(
+                let bucket_rule = bucket_cors.as_ref().and_then(|config| {
+                    requested_method.as_deref().and_then(|requested_method| {
+                        match_preflight_rule(
                             config,
                             origin.as_deref().unwrap_or_default(),
                             requested_method,
                             &requested_headers,
-                        ) {
-                            Some(matched_rule) => build_preflight_response(matched_rule),
-                            None => build_preflight_forbidden_response(),
-                        },
-                    );
-                    let code = response.status().as_u16();
-                    emit_request_completed(&span, "s3", code, started);
-                    record_s3_request(&metrics, &method, code, "cors_preflight", started.elapsed());
-                    return Ok(response);
-                }
-
-                let mut response = http::Response::builder()
-                    .status(StatusCode::NO_CONTENT)
-                    .body(s3s::Body::empty())
-                    .expect("static response must build");
-                if let Some(cors_headers) =
+                        )
+                    })
+                });
+                // A stored bucket configuration EXTENDS cross-origin access for
+                // additional origins; the node's own allowlist (its portals)
+                // stays authoritative. Without this fallback a bucket whose
+                // stored rules omit e.g. PUT locks the portal out of every
+                // write on it - including the PutBucketCors call that would
+                // repair the stored rules.
+                let response = if let Some(matched_rule) = bucket_rule {
+                    build_preflight_response(matched_rule)
+                } else if let Some(cors_headers) =
                     cors.s3_preflight_headers(origin_header, requested_headers_value.as_ref())
                 {
+                    let mut response = http::Response::builder()
+                        .status(StatusCode::NO_CONTENT)
+                        .body(s3s::Body::empty())
+                        .expect("static response must build");
                     response.headers_mut().extend(cors_headers);
-                }
+                    response
+                } else if bucket_cors.is_some() {
+                    build_preflight_forbidden_response()
+                } else {
+                    http::Response::builder()
+                        .status(StatusCode::NO_CONTENT)
+                        .body(s3s::Body::empty())
+                        .expect("static response must build")
+                };
                 let code = response.status().as_u16();
                 emit_request_completed(&span, "s3", code, started);
                 record_s3_request(&metrics, &method, code, "cors_preflight", started.elapsed());
@@ -364,13 +371,17 @@ impl Service<Request<Incoming>> for WrappingService {
 
             let mut result = shared.call(s3s_request).instrument(span.clone()).await;
             if let Ok(response) = &mut result {
-                if let Some(config) = bucket_cors.as_ref() {
-                    if let Some(origin) = origin.as_deref()
-                        && let Some(matched_rule) = match_actual_rule(config, origin, &method)
-                    {
-                        inject_actual_cors_headers(response, matched_rule);
-                    }
+                let bucket_rule = bucket_cors.as_ref().and_then(|config| {
+                    origin
+                        .as_deref()
+                        .and_then(|origin| match_actual_rule(config, origin, &method))
+                });
+                if let Some(matched_rule) = bucket_rule {
+                    inject_actual_cors_headers(response, matched_rule);
                 } else {
+                    // Same fallback as the preflight: allowlisted origins keep
+                    // readable responses on buckets whose stored rules do not
+                    // cover this request.
                     cors.apply_s3_response_headers(origin_header.as_ref(), response.headers_mut());
                 }
             }
