@@ -1992,7 +1992,49 @@ fn permanent(message: impl Into<String>) -> JobRunOutcome {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
     use tokio::io::AsyncReadExt;
+
+    struct SparseWriter {
+        file: std::fs::File,
+        enabled: Arc<AtomicBool>,
+    }
+
+    impl futures_util::io::AsyncWrite for SparseWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let result = if self.enabled.load(Ordering::Relaxed) {
+                std::io::Seek::seek(
+                    &mut self.file,
+                    std::io::SeekFrom::Current(bytes.len() as i64),
+                )
+                .map(|_| bytes.len())
+            } else {
+                std::io::Write::write(&mut self.file, bytes)
+            };
+            Poll::Ready(result)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(std::io::Write::flush(&mut self.file))
+        }
+
+        fn poll_close(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(std::io::Write::flush(&mut self.file))
+        }
+    }
 
     fn file_entity(id: &str, local_path: Option<&str>) -> JsonValue {
         let mut entity = json!({
@@ -2408,6 +2450,54 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.as_file_mut().write_all(&bytes).unwrap();
         file.as_file_mut().flush().unwrap();
+        if let Ok(status) = std::process::Command::new("unzip")
+            .arg("-t")
+            .arg(file.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            assert!(status.success());
+        }
+    }
+
+    #[tokio::test]
+    async fn zip64_large_entry() {
+        const ENTRY_SIZE: u64 = u32::MAX as u64 + 2;
+        const CHUNK_SIZE: usize = 1024 * 1024;
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let sparse = Arc::new(AtomicBool::new(false));
+        let mut writer = async_zip::base::write::ZipFileWriter::new(SparseWriter {
+            file: file.reopen().unwrap(),
+            enabled: Arc::clone(&sparse),
+        });
+        let mut entry = writer
+            .write_entry_stream(zip_entry("data/large"))
+            .await
+            .unwrap();
+        let zeros = vec![0; CHUNK_SIZE];
+        sparse.store(true, Ordering::Relaxed);
+        for _ in 0..ENTRY_SIZE / CHUNK_SIZE as u64 {
+            entry.write_all(&zeros).await.unwrap();
+        }
+        entry
+            .write_all(&zeros[..(ENTRY_SIZE % CHUNK_SIZE as u64) as usize])
+            .await
+            .unwrap();
+        sparse.store(false, Ordering::Relaxed);
+        entry.close().await.unwrap();
+        drop(writer.close().await.unwrap());
+
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(file.path()).unwrap()).unwrap();
+        assert_eq!(archive.len(), 1);
+        let archived = archive.by_name("data/large").unwrap();
+        assert_eq!(archived.size(), ENTRY_SIZE);
+        assert_eq!(archived.compressed_size(), ENTRY_SIZE);
+        assert_eq!(archived.compression(), zip::CompressionMethod::Stored);
+        drop(archived);
+        drop(archive);
+
         if let Ok(status) = std::process::Command::new("unzip")
             .arg("-t")
             .arg(file.path())
