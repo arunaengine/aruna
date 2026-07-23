@@ -194,6 +194,7 @@ pub async fn copy_object(
             checksum_type: None,
             exists: false,
             version_source,
+            preassigned_version_id: None,
             quota_ceiling: input.quota_ceiling,
         })
         .with_metadata(metadata),
@@ -312,6 +313,7 @@ mod test {
             checksum_type: None,
             exists: false,
             version_source: None,
+            preassigned_version_id: None,
             quota_ceiling: None,
         }
     }

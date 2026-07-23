@@ -752,6 +752,7 @@ mod tests {
                     expected_checksums: vec![],
                     checksum_type: None,
                     version_source: None,
+                    preassigned_version_id: None,
                     quota_ceiling: None,
                     exists: false,
                 }),

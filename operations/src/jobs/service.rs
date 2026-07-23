@@ -1,17 +1,22 @@
-use aruna_core::events::Event;
+use aruna_core::effects::BlobEffect;
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
+use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    ExecutionSpec, JobId, JobPayload, JobRecord, RunCrateStatus, StagingJobSpec, WorkspaceMode,
-    user_dedup_key,
+    ArtifactRef, ExecutionSpec, JobId, JobPayload, JobRecord, JobResultPayload, JobState,
+    RunCrateStatus, StagingJobSpec, WorkspaceMode, user_dedup_key,
 };
 use aruna_core::task::TaskEvent;
-use aruna_core::types::{NodeId, UserId};
+use aruna_core::types::{NodeId, UserId, Value};
 use aruna_core::util::unix_timestamp_millis;
+use bytes::Bytes;
+use std::ops::Range;
+use std::path::Path;
 use tracing::warn;
 
 use super::runtime::JobsRuntime;
 use super::store::{
-    CancelRequestOutcome, JobMutationError, list_jobs_for_user, read_job_record,
+    CancelRequestOutcome, JobMutationError, list_job_entries, list_jobs_for_user, read_job_record,
     read_run_crate_status, set_cancel_requested,
 };
 use super::submit::{
@@ -147,6 +152,135 @@ pub async fn read_owned_job(
     )
 }
 
+pub enum JobReportLookup {
+    NotFound,
+    Pending(JobState),
+    CursorConflict,
+    Ready {
+        record: JobRecord,
+        rows: Vec<(Vec<u8>, Value)>,
+        next_key: Option<Vec<u8>>,
+    },
+}
+
+pub async fn read_owned_report(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+    expected_digest: Option<[u8; 32]>,
+    last_key: Option<Vec<u8>>,
+    limit: usize,
+) -> Result<JobReportLookup, String> {
+    let Some(record) = read_owned_job(context, user_id, job_id).await? else {
+        return Ok(JobReportLookup::NotFound);
+    };
+    if !record.payload.is_rocrate() {
+        return Ok(JobReportLookup::NotFound);
+    }
+    if !record.state.is_terminal() {
+        return Ok(JobReportLookup::Pending(record.state));
+    }
+    let report_digest = record
+        .report_digest
+        .ok_or_else(|| "terminal RO-Crate job is missing its report digest".to_string())?;
+    if expected_digest.is_some_and(|expected| expected != report_digest) {
+        return Ok(JobReportLookup::CursorConflict);
+    }
+    let (rows, next_key) =
+        list_job_entries(&context.storage_handle, job_id, last_key, limit).await?;
+    Ok(JobReportLookup::Ready {
+        record,
+        rows,
+        next_key,
+    })
+}
+
+pub struct OwnedArtifact {
+    pub artifact: ArtifactRef,
+    pub filename: String,
+}
+
+pub enum ArtifactLookup {
+    NotFound,
+    Pending(JobState),
+    Gone,
+    Ready(OwnedArtifact),
+}
+
+fn artifact_filename(document_path: Option<&str>, document_id: ulid::Ulid) -> String {
+    let stem = document_path
+        .and_then(|path| Path::new(path.trim_end_matches('/')).file_stem())
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| document_id.to_string());
+    format!("{stem}.zip")
+}
+
+pub async fn read_owned_artifact(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+    now_ms: u64,
+) -> Result<ArtifactLookup, String> {
+    let Some(record) = read_owned_job(context, user_id, job_id).await? else {
+        return Ok(ArtifactLookup::NotFound);
+    };
+    let JobPayload::ExportRoCrate(spec) = &record.payload else {
+        return Ok(ArtifactLookup::NotFound);
+    };
+    if !record.state.is_terminal() {
+        return Ok(ArtifactLookup::Pending(record.state));
+    }
+    let Some(JobResultPayload::ExportRoCrate(result)) = &record.result else {
+        return Ok(ArtifactLookup::NotFound);
+    };
+    let Some(artifact) = result.artifact.clone() else {
+        return Ok(ArtifactLookup::NotFound);
+    };
+    if artifact.expires_at_ms <= now_ms {
+        return Ok(ArtifactLookup::Gone);
+    }
+    let document_path =
+        crate::get_metadata_document::load_metadata_record_by_document(context, spec.document_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .map(|record| record.document_path);
+    Ok(ArtifactLookup::Ready(OwnedArtifact {
+        artifact,
+        filename: artifact_filename(document_path.as_deref(), spec.document_id),
+    }))
+}
+
+pub struct ArtifactRead {
+    pub blob: BackendStream<Result<Bytes, StreamError>>,
+    pub stream_size: u64,
+}
+
+pub async fn read_artifact_range(
+    context: &DriverContext,
+    artifact: &ArtifactRef,
+    range: Range<u64>,
+) -> Result<ArtifactRead, String> {
+    let blob_handle = context
+        .blob_handle
+        .as_ref()
+        .ok_or_else(|| "blob handle unavailable".to_string())?;
+    match blob_handle
+        .send_blob_effect(BlobEffect::ReadHiddenRange {
+            location: artifact.location.clone(),
+            range,
+        })
+        .await
+    {
+        Event::Blob(BlobEvent::HiddenRead { blob, stream_size }) => {
+            Ok(ArtifactRead { blob, stream_size })
+        }
+        Event::Blob(BlobEvent::Error(error)) => Err(error.to_string()),
+        event => Err(format!("unexpected hidden artifact read event: {event:?}")),
+    }
+}
+
 pub enum CancelJobOutcome {
     NotFound,
     AlreadyTerminal(JobRecord),
@@ -213,6 +347,17 @@ mod tests {
 
     fn node_id() -> NodeId {
         iroh::SecretKey::from_bytes(&[7u8; 32]).public()
+    }
+
+    #[test]
+    fn artifact_uses_stem() {
+        assert_eq!(
+            artifact_filename(
+                Some("datasets/experiment.crate"),
+                Ulid::from_bytes([1u8; 16])
+            ),
+            "experiment.zip"
+        );
     }
 
     #[tokio::test]

@@ -10,7 +10,9 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, USER_KEYSPACE};
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingSyncTicket};
-use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, OidcProviderConfig, RealmId};
+use aruna_core::structs::{
+    Actor, AuthContext, NodeCapabilities, OidcProviderConfig, RealmId, RoCrateLimits,
+};
 use aruna_operations::auth::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache,
 };
@@ -71,6 +73,7 @@ pub struct ServerState {
     metrics: Arc<NodeMetrics>,
     // True when this node can mount S3 inputs (Kubernetes with a CSI driver).
     s3_mounts_available: bool,
+    rocrate_limits: RoCrateLimits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -174,6 +177,7 @@ impl ServerState {
             portal: Arc::new(RwLock::new(PortalRuntimeState::default())),
             metrics: Arc::new(NodeMetrics::new()),
             s3_mounts_available: false,
+            rocrate_limits: RoCrateLimits::default(),
         };
         state.persist_trusted_realms().await;
         state
@@ -203,6 +207,15 @@ impl ServerState {
 
     pub fn s3_mounts_available(&self) -> bool {
         self.s3_mounts_available
+    }
+
+    pub fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
+        self.rocrate_limits = limits;
+        self
+    }
+
+    pub fn rocrate_limits(&self) -> &RoCrateLimits {
+        &self.rocrate_limits
     }
 
     pub fn jobs_runtime(&self) -> Arc<JobsRuntime> {

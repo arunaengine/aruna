@@ -31,6 +31,8 @@ use ulid::Ulid;
 #[derive(Debug, Eq, PartialEq)]
 pub enum PutObjectState {
     Init,
+    ReadPreassignedVersion,
+    ReadPreassignedLocation,
     WriteBlob,
     CleanupFailedWrite,
     StartTransaction,
@@ -77,6 +79,8 @@ pub enum PutObjectError {
     WriteFailed(String),
     #[error("blob backend write failed: {0}")]
     BlobWriteFailed(String),
+    #[error("preassigned version exists without a materialized blob")]
+    InvalidPreassignedVersion,
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
@@ -108,6 +112,9 @@ pub struct PutObjectConfig {
     pub checksum_type: Option<String>,
     pub exists: bool, //Note: For version shenanigans which will be implemented later
     pub version_source: Option<VersionSourceBinding>,
+    /// Retry fence. Must be a freshly minted, time-meaningful ULID because its
+    /// timestamp defines `created_at` and ULID ordering defines version order.
+    pub preassigned_version_id: Option<Ulid>,
     /// Hard ceiling (bytes) the group's realm-wide `logical_bytes` may reach,
     /// resolved from the realm quota config at the request surface. `None` =
     /// unlimited, so no gate is enforced.
@@ -141,11 +148,12 @@ pub struct PutObjectOperation {
 
 impl PutObjectOperation {
     pub fn new(config: PutObjectConfig) -> Self {
+        let version_id = config.preassigned_version_id;
         PutObjectOperation {
             state: PutObjectState::Init,
             config,
             txn_id: None,
-            version_id: None,
+            version_id,
             written_location: None,
             cleanup_location: None,
             existing_pointer: None,
@@ -168,6 +176,66 @@ impl PutObjectOperation {
     pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
         self.metadata = metadata;
         self
+    }
+
+    fn begin(&mut self) -> Effects {
+        let Some(version_id) = self.config.preassigned_version_id else {
+            return self.handle_init();
+        };
+        let key = match VersionKey::new(
+            self.config.request.bucket.clone(),
+            self.config.request.key.clone(),
+            version_id,
+        )
+        .to_bytes()
+        {
+            Ok(key) => key.into(),
+            Err(error) => return self.emit_error(error.into()),
+        };
+        self.state = PutObjectState::ReadPreassignedVersion;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            key,
+            txn_id: None,
+        })]
+    }
+
+    fn handle_preassigned_version(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+        let Some(value) = value else {
+            return self.handle_init();
+        };
+        let version = match BlobVersion::from_bytes(value.as_ref()) {
+            Ok(version) => version,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        let Some(hash) = version.blob_hash() else {
+            return self.emit_error(PutObjectError::InvalidPreassignedVersion);
+        };
+        self.state = PutObjectState::ReadPreassignedLocation;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+            key: hash.to_vec().into(),
+            txn_id: None,
+        })]
+    }
+
+    fn handle_preassigned_location(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) = event
+        else {
+            return self.emit_error(PutObjectError::InvalidPreassignedVersion);
+        };
+        let location = match BackendLocation::from_bytes(value.as_ref()) {
+            Ok(location) => location,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        self.output = Some(Ok(location));
+        self.state = PutObjectState::Finish;
+        smallvec![]
     }
 
     fn handle_init(&mut self) -> Effects {
@@ -804,13 +872,15 @@ impl Operation for PutObjectOperation {
         if self.state != PutObjectState::Init {
             self.emit_error(PutObjectError::InvalidOperationState)
         } else {
-            self.handle_init()
+            self.begin()
         }
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match &self.state {
-            PutObjectState::Init => self.handle_init(),
+            PutObjectState::Init => self.begin(),
+            PutObjectState::ReadPreassignedVersion => self.handle_preassigned_version(event),
+            PutObjectState::ReadPreassignedLocation => self.handle_preassigned_location(event),
             PutObjectState::WriteBlob => self.handle_write_finished(event),
             PutObjectState::CleanupFailedWrite => self.handle_failed_write_cleanup(event),
             PutObjectState::StartTransaction => self.handle_transaction_started(event),
@@ -978,6 +1048,7 @@ mod test {
             checksum_type: None,
             exists: false,
             version_source: None,
+            preassigned_version_id: None,
             quota_ceiling: Some(1),
         }
     }
@@ -1222,8 +1293,10 @@ mod test {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = Ulid::generate();
         let node_id = net_handle.node_id();
+        let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let preassigned_version_id = Ulid::generate();
         let put_config = PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id,
             group_id,
             realm_id,
             node_id,
@@ -1237,6 +1310,7 @@ mod test {
             checksum_type: None,
             exists: false,
             version_source: None,
+            preassigned_version_id: Some(preassigned_version_id),
             quota_ceiling: None,
         };
         let put_operation = PutObjectOperation::new(put_config);
@@ -1380,6 +1454,62 @@ mod test {
                         .as_bytes()
                         .to_vec()
         }));
+
+        let retry_data = b"different content";
+        let retry = drive(
+            PutObjectOperation::new(PutObjectConfig {
+                user_id,
+                group_id,
+                realm_id,
+                node_id,
+                request: PutObjectInput {
+                    bucket: "mybucket".to_string(),
+                    key: "some-file.txt".to_string(),
+                    content_length: Some(retry_data.len() as u64),
+                    body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+                        &retry_data[..],
+                    ))),
+                },
+                expected_checksums: vec![],
+                checksum_type: None,
+                exists: false,
+                version_source: None,
+                preassigned_version_id: Some(preassigned_version_id),
+                quota_ceiling: None,
+            }),
+            &context,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(retry, result);
+        assert_eq!(
+            read_to_string(retry.location.get_full_path().unwrap()).unwrap(),
+            String::from_utf8_lossy(&data[..]).to_string()
+        );
+
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(blob_head_value),
+            ..
+        }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                key: BlobHeadKey::new("mybucket", "some-file.txt")
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("missing blob head entry");
+        };
+        assert_eq!(
+            CurrentVersionPointer::from_bytes(blob_head_value.as_ref()).unwrap(),
+            CurrentVersionPointer::new_with_generation(result.version_id, 1)
+        );
     }
 
     #[tokio::test]
@@ -1440,6 +1570,7 @@ mod test {
                 checksum_type: None,
                 exists: false,
                 version_source: None,
+                preassigned_version_id: None,
                 quota_ceiling: None,
             }),
             &context,
@@ -1467,6 +1598,7 @@ mod test {
                 checksum_type: None,
                 exists: false,
                 version_source: None,
+                preassigned_version_id: None,
                 quota_ceiling: None,
             }),
             &context,
@@ -1559,6 +1691,7 @@ mod test {
             checksum_type: None,
             exists: false,
             version_source: None,
+            preassigned_version_id: None,
             quota_ceiling: None,
         });
         let version_id = Ulid::generate();
@@ -1659,6 +1792,7 @@ mod test {
                 checksum_type: None,
                 exists: false,
                 version_source: None,
+                preassigned_version_id: None,
                 quota_ceiling: None,
             }),
             &context,
@@ -1686,6 +1820,7 @@ mod test {
                 checksum_type: None,
                 exists: false,
                 version_source: None,
+                preassigned_version_id: None,
                 quota_ceiling: None,
             }),
             &context,
@@ -1846,6 +1981,7 @@ mod test {
                 checksum_type: None,
                 exists: false,
                 version_source: None,
+                preassigned_version_id: None,
                 quota_ceiling: None,
             }),
             &context,

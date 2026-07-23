@@ -117,6 +117,7 @@ pub async fn materialize_snapshot(
             checksum_type: None,
             exists: false,
             version_source: Some(version_source.clone()),
+            preassigned_version_id: None,
             quota_ceiling: input.quota_ceiling,
         })
         .with_bucket_guard(input.expected_bucket),
