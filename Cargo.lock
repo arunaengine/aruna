@@ -1806,13 +1806,14 @@ dependencies = [
 [[package]]
 name = "craqle"
 version = "0.1.1"
-source = "git+https://github.com/arunaengine/craqle?branch=main#0aae6511d8b91c746024fe35b2a0159901907396"
+source = "git+https://github.com/arunaengine/craqle?branch=feat%2Frocrate-fidelity#aeb25642416a9f97736ea6c642dbe58ff9e1d95c"
 dependencies = [
  "blake3",
  "chrono",
  "fjall",
  "globset",
  "irokle",
+ "oxjsonld",
  "oxrdf",
  "postcard",
  "ro-crate-rs",
@@ -8010,7 +8011,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

@@ -103,7 +103,7 @@ async fn create_crate_graph(handle: &MetadataHandle, index: usize) -> Result<(),
                 name: format!("Cold Start Dataset {index:05}"),
                 description: format!("Cold start corpus graph {index}"),
                 date_published: "2026-01-01".to_string(),
-                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 policy: MetadataGraphPolicy {
                     public: true,
                     permission_paths: Vec::new(),

@@ -245,7 +245,7 @@ async fn create_metadata_document(
                 name: "Issue 261 placement".to_string(),
                 description: "Integration placement fixture".to_string(),
                 date_published: "2026-07-10".to_string(),
-                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             },
         }),
         node.context.as_ref(),

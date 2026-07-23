@@ -50,7 +50,7 @@ pub enum CreateMetadataDocumentPayload {
         name: String,
         description: String,
         date_published: String,
-        license: String,
+        license: Option<String>,
     },
     RoCrate {
         jsonld: String,
@@ -883,7 +883,7 @@ mod tests {
                 name: "Fast Create".to_string(),
                 description: "Validate then append only".to_string(),
                 date_published: "2026-01-01".to_string(),
-                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             },
         }
     }

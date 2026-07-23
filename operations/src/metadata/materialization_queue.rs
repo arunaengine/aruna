@@ -15,8 +15,8 @@ use aruna_core::metadata::{
     MetadataApplyRoCrateRequest, MetadataCreateCrateRequest, MetadataCreateEventPayload,
     MetadataCreateEventRecord, MetadataEffect, MetadataError, MetadataEvent,
     MetadataGraphLifecycleRecord, MetadataGraphPolicy, MetadataMaterializationJobRecord,
-    MetadataMaterializationState, MetadataMaterializationStatusRecord, MetadataRequestDurability,
-    deterministic_materialization_actor,
+    MetadataMaterializationState, MetadataMaterializationStatusRecord, MetadataRawRevision,
+    MetadataRequestDurability, deterministic_materialization_actor,
 };
 use aruna_core::storage_entries::{
     metadata_event_log_key, metadata_graph_lifecycle_key,
@@ -866,6 +866,26 @@ async fn process_materialization_job(
     let craqle_elapsed = apply_started.elapsed();
     match apply_result {
         Ok(()) => {
+            let raw_revision = match crate::metadata::raw::load_raw_revision(
+                context,
+                event.record.document_id,
+                Some(event.event_id),
+            )
+            .await
+            {
+                Ok(revision) => revision,
+                Err(error) => {
+                    reschedule_materialization_job(
+                        &context.storage_handle,
+                        &job_key,
+                        &job,
+                        &event,
+                        error.to_string(),
+                    )
+                    .await?;
+                    return Ok(ProcessedMaterializationJob::rescheduled(craqle_elapsed));
+                }
+            };
             let iri_index_writes = match project_materialized_iri_references(context, &event).await
             {
                 Ok(writes) => writes,
@@ -885,7 +905,11 @@ async fn process_materialization_job(
                 CompletedMaterializationJob {
                     job_key,
                     document_job_key: Some(document_job_key),
-                    status: Some(materialization_success_status(&job, &event)),
+                    status: Some(materialization_success_status(
+                        &job,
+                        &event,
+                        raw_revision.as_ref(),
+                    )),
                     iri_index_writes,
                     sync: Some(CompletedMaterializationSync {
                         graph_iri: event.record.graph_iri.clone(),
@@ -1795,11 +1819,14 @@ fn graph_materialization_effect(event: &MetadataCreateEventRecord) -> Effect {
 fn materialization_success_status(
     job: &MetadataMaterializationJobRecord,
     event: &MetadataCreateEventRecord,
+    raw_revision: Option<&MetadataRawRevision>,
 ) -> MetadataMaterializationStatusRecord {
     MetadataMaterializationStatusRecord {
         document_id: event.record.document_id,
         event_id: event.event_id,
         graph_iri: event.record.graph_iri.clone(),
+        context_digest: raw_revision.map(|revision| revision.context_digest),
+        dataset_digest: raw_revision.and_then(|revision| revision.dataset_digest),
         state: MetadataMaterializationState::Materialized,
         attempts: job.attempts.saturating_add(1),
         last_error: None,
@@ -1817,6 +1844,8 @@ fn materialization_failure_status(
         document_id: event.record.document_id,
         event_id: event.event_id,
         graph_iri: event.record.graph_iri.clone(),
+        context_digest: None,
+        dataset_digest: None,
         state: if terminal {
             MetadataMaterializationState::Failed
         } else {
@@ -2098,7 +2127,7 @@ mod tests {
                 name: name.to_string(),
                 description: "Materialization test".to_string(),
                 date_published: "2026-01-01".to_string(),
-                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             },
             occurred_at_ms: 1,
         }
@@ -2570,6 +2599,8 @@ mod tests {
             document_id,
             event_id,
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            context_digest: None,
+            dataset_digest: None,
             state: MetadataMaterializationState::Pending,
             attempts: 1,
             last_error: Some("transient".to_string()),
@@ -3039,6 +3070,8 @@ mod tests {
             document_id,
             event_id: newer_event_id,
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            context_digest: None,
+            dataset_digest: None,
             state: MetadataMaterializationState::Pending,
             attempts: 0,
             last_error: None,
@@ -3068,6 +3101,8 @@ mod tests {
             document_id,
             event_id: older_event_id,
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            context_digest: None,
+            dataset_digest: None,
             state: MetadataMaterializationState::Pending,
             attempts: 1,
             last_error: Some("transient".to_string()),
@@ -3077,6 +3112,8 @@ mod tests {
             document_id,
             event_id: newer_event_id,
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            context_digest: None,
+            dataset_digest: None,
             state: MetadataMaterializationState::Pending,
             attempts: 0,
             last_error: None,
@@ -3098,6 +3135,8 @@ mod tests {
             document_id,
             event_id,
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            context_digest: None,
+            dataset_digest: None,
             state: MetadataMaterializationState::Pending,
             attempts: 1,
             last_error: Some("transient".to_string()),
@@ -3142,6 +3181,8 @@ mod tests {
             document_id,
             event_id: newer_event_id,
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            context_digest: None,
+            dataset_digest: None,
             state: MetadataMaterializationState::Pending,
             attempts: 7,
             last_error: Some("newer pending".to_string()),
@@ -3170,7 +3211,7 @@ mod tests {
                     )
                     .to_vec(),
                 ),
-                status: Some(materialization_success_status(&old_job, &old_event)),
+                status: Some(materialization_success_status(&old_job, &old_event, None)),
                 iri_index_writes: vec![(
                     METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
                     ByteView::from(stale_index_key.clone()),
@@ -3246,7 +3287,7 @@ mod tests {
                 document_job_key: Some(
                     metadata_materialization_document_job_key(document_id, event_id).to_vec(),
                 ),
-                status: Some(materialization_success_status(&job, &event)),
+                status: Some(materialization_success_status(&job, &event, None)),
                 iri_index_writes: vec![(
                     METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
                     aruna_core::storage_entries::metadata_iri_reference_key(
@@ -3393,6 +3434,8 @@ mod tests {
             document_id,
             event_id: newer_event_id,
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            context_digest: None,
+            dataset_digest: None,
             state: MetadataMaterializationState::Pending,
             attempts: 0,
             last_error: None,

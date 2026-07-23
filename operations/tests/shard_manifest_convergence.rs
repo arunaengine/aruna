@@ -212,7 +212,7 @@ async fn create_document(
                 name: format!("Converge {index}"),
                 description: "convergence test".to_string(),
                 date_published: "2026-07-07".to_string(),
-                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             },
         }),
         node.context.as_ref(),

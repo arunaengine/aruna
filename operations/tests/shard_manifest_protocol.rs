@@ -143,7 +143,7 @@ async fn new_holder_verifies_shard_against_co_holder() -> Result<(), Box<dyn std
                 name: "Verify Canary".to_string(),
                 description: "verification test".to_string(),
                 date_published: "2026-07-07".to_string(),
-                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             },
         }),
         nodes[0].context.as_ref(),

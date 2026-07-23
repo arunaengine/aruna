@@ -115,6 +115,7 @@ pub enum MetadataRoCrateExportView {
     Full,
     Summary,
     Page,
+    Raw,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +141,11 @@ pub enum ExportMetadataRoCrateResult {
     Page {
         record: MetadataRegistryRecord,
         page: MetadataRoCratePage,
+    },
+    Raw {
+        record: MetadataRegistryRecord,
+        raw: crate::metadata::raw::MetadataRawView,
+        dataset_digest: Option<[u8; 32]>,
     },
 }
 
@@ -388,28 +394,48 @@ pub async fn export_metadata_rocrate(
 ) -> Result<ExportMetadataRoCrateResult, MetadataApiError> {
     let record = load_record_by_document(context, request.document_id).await?;
     ensure_record_readable(context, realm_id, request.auth.as_ref(), &record).await?;
-    ensure_record_materialized_for_graph_read(context, &record).await?;
 
     match request.view {
-        MetadataRoCrateExportView::Full => Ok(ExportMetadataRoCrateResult::Full {
-            jsonld: export_rocrate_jsonld(context, &record.graph_iri).await?,
-            record,
-        }),
-        MetadataRoCrateExportView::Summary => Ok(ExportMetadataRoCrateResult::Summary {
-            jsonld: export_rocrate_summary_jsonld(context, &record.graph_iri).await?,
-            record,
-        }),
-        MetadataRoCrateExportView::Page => Ok(ExportMetadataRoCrateResult::Page {
-            page: export_rocrate_page(
-                context,
-                &record.graph_iri,
-                request.limit,
-                request.offset,
-                request.after,
-            )
-            .await?,
-            record,
-        }),
+        MetadataRoCrateExportView::Full => {
+            ensure_record_materialized_for_graph_read(context, &record).await?;
+            Ok(ExportMetadataRoCrateResult::Full {
+                jsonld: export_rocrate_jsonld(context, &record.graph_iri).await?,
+                record,
+            })
+        }
+        MetadataRoCrateExportView::Summary => {
+            ensure_record_materialized_for_graph_read(context, &record).await?;
+            Ok(ExportMetadataRoCrateResult::Summary {
+                jsonld: export_rocrate_summary_jsonld(context, &record.graph_iri).await?,
+                record,
+            })
+        }
+        MetadataRoCrateExportView::Page => {
+            ensure_record_materialized_for_graph_read(context, &record).await?;
+            Ok(ExportMetadataRoCrateResult::Page {
+                page: export_rocrate_page(
+                    context,
+                    &record.graph_iri,
+                    request.limit,
+                    request.offset,
+                    request.after,
+                )
+                .await?,
+                record,
+            })
+        }
+        MetadataRoCrateExportView::Raw => {
+            let raw = crate::metadata::raw::load_raw_view(context, record.document_id)
+                .await
+                .map_err(|error| MetadataApiError::Internal(error.to_string()))?
+                .ok_or(MetadataApiError::ServiceUnavailable)?;
+            let dataset_digest = raw.revision.dataset_digest;
+            Ok(ExportMetadataRoCrateResult::Raw {
+                record,
+                raw,
+                dataset_digest,
+            })
+        }
     }
 }
 
@@ -2027,7 +2053,7 @@ async fn run_search_distributed(
                             graph_iris,
                             query,
                             limit,
-                            super::iri_index::SCHEMA_CONFORMS_TO_IRI.to_string(),
+                            super::iri_index::DCTERMS_CONFORMS_TO_IRI.to_string(),
                             object_iri,
                             group_id,
                         )
@@ -2070,7 +2096,7 @@ async fn run_search_distributed(
                             graph_iris,
                             query,
                             limit,
-                            super::iri_index::SCHEMA_CONFORMS_TO_IRI.to_string(),
+                            super::iri_index::DCTERMS_CONFORMS_TO_IRI.to_string(),
                             object_iri,
                             group_id,
                         )

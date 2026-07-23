@@ -105,7 +105,7 @@ async fn create_and_materialize_document(
                 name: document_name().to_string(),
                 description: "Restart persistence contract".to_string(),
                 date_published: "2026-01-01".to_string(),
-                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             },
         }),
         context.as_ref(),

@@ -291,7 +291,7 @@ mod tests {
                 name: "Forwarded".to_string(),
                 description: "Placed by a holder".to_string(),
                 date_published: "2026-01-01".to_string(),
-                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             },
         };
         let bytes = postcard::to_allocvec(&message).unwrap();

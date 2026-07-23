@@ -401,7 +401,7 @@ fn scaffold_payload(label: &str, writer: usize, index: usize) -> CreateMetadataD
         name: format!("Bench Dataset {label}-{writer}-{index}"),
         description: "Throughput benchmark document".to_string(),
         date_published: "2026-06-10".to_string(),
-        license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+        license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
     }
 }
 

@@ -62,7 +62,7 @@ pub struct SearchParams {
     /// Documents-only: restrict metadata hits to a single group id.
     #[serde(default)]
     pub group_id: Option<String>,
-    /// Documents-only: exact schema.org conformsTo profile IRI.
+    /// Documents-only: exact RO-Crate conformsTo profile IRI.
     #[serde(default)]
     pub conforms_to: Option<String>,
     /// Documents-only: search mode (local or distributed).
@@ -257,7 +257,7 @@ pub async fn bucket_search(
         ("limit" = Option<usize>, Query, description = "Per-section page size (default 10, clamped to 1..=100)"),
         ("cursor" = Option<String>, Query, description = "Opaque continuation token. Only accepted when exactly one type is requested"),
         ("group_id" = Option<String>, Query, description = "Documents-only: restrict metadata hits to a single group id"),
-        ("conforms_to" = Option<String>, Query, description = "Documents-only: exact schema.org conformsTo profile IRI"),
+        ("conforms_to" = Option<String>, Query, description = "Documents-only: exact RO-Crate conformsTo profile IRI"),
         ("mode" = Option<MetadataQueryMode>, Query, description = "Documents-only: search mode local or distributed")
     ),
     responses(
@@ -718,7 +718,7 @@ mod tests {
                     name: name.to_string(),
                     description: "desc".to_string(),
                     date_published: "2026-01-01".to_string(),
-                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public: true,
                 },
             )),

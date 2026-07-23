@@ -1,6 +1,7 @@
 use std::array::TryFromSliceError;
 
 use aruna_core::errors::ConversionError;
+use aruna_core::metadata::MetadataValidationViolation;
 use aruna_operations::auth::ArunaBearerTokenError;
 use axum::Json;
 use axum::http::StatusCode;
@@ -37,6 +38,8 @@ pub enum ServerError {
     BadRequestReason(String),
     #[error("{0}")]
     BadRequestMessage(String),
+    #[error("Metadata validation failed")]
+    MetadataValidation(Vec<MetadataValidationViolation>),
     #[error("Bad gateway")]
     BadGateway,
     #[error("{0}")]
@@ -134,6 +137,29 @@ pub struct ErrorResponse {
     /// Optional additional details about the error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
+    /// Structured metadata validation failures.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub violations: Option<Vec<ValidationViolationResponse>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ValidationViolationResponse {
+    pub code: String,
+    pub message: String,
+    pub pointer: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_id: Option<String>,
+}
+
+impl From<MetadataValidationViolation> for ValidationViolationResponse {
+    fn from(violation: MetadataValidationViolation) -> Self {
+        Self {
+            code: violation.code,
+            message: violation.message,
+            pointer: violation.pointer,
+            entity_id: violation.entity_id,
+        }
+    }
 }
 
 impl ErrorResponse {
@@ -145,6 +171,7 @@ impl ErrorResponse {
             error: error.into(),
             code: None,
             details: None,
+            violations: None,
         }
     }
 
@@ -161,6 +188,13 @@ impl ErrorResponse {
     #[must_use]
     pub fn with_details(mut self, details: impl Into<String>) -> Self {
         self.details = Some(details.into());
+        self
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn with_violations(mut self, violations: Vec<ValidationViolationResponse>) -> Self {
+        self.violations = Some(violations);
         self
     }
 }
@@ -180,7 +214,10 @@ impl IntoResponse for ServerError {
         let code = self.error_code();
         let message = self.public_message();
 
-        let body = ErrorResponse::new(&message).with_code(code);
+        let mut body = ErrorResponse::new(&message).with_code(code);
+        if let ServerError::MetadataValidation(violations) = &self {
+            body = body.with_violations(violations.iter().cloned().map(Into::into).collect());
+        }
 
         let mut response = (status, Json(body)).into_response();
         if matches!(
@@ -207,7 +244,8 @@ impl ServerError {
             ServerError::Conflict(_) => StatusCode::CONFLICT,
             ServerError::BadRequest
             | ServerError::BadRequestReason(_)
-            | ServerError::BadRequestMessage(_) => StatusCode::BAD_REQUEST,
+            | ServerError::BadRequestMessage(_)
+            | ServerError::MetadataValidation(_) => StatusCode::BAD_REQUEST,
             ServerError::BadGateway | ServerError::BadGatewayReason(_) => StatusCode::BAD_GATEWAY,
             ServerError::ServiceUnavailable | ServerError::ServiceUnavailableReason(_) => {
                 StatusCode::SERVICE_UNAVAILABLE
@@ -226,6 +264,7 @@ impl ServerError {
             ServerError::BadRequest
             | ServerError::BadRequestReason(_)
             | ServerError::BadRequestMessage(_) => "Bad request".to_string(),
+            ServerError::MetadataValidation(_) => "Validation failed".to_string(),
             ServerError::BadGateway | ServerError::BadGatewayReason(_) => "Bad gateway".to_string(),
             ServerError::ServiceUnavailable | ServerError::ServiceUnavailableReason(_) => {
                 "Service unavailable".to_string()
@@ -250,4 +289,32 @@ pub enum ServerSetupError {
     Runtime(String),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ErrorResponse, ServerError};
+    use aruna_core::metadata::MetadataValidationViolation;
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    #[tokio::test]
+    async fn validation_is_structured() {
+        let response = ServerError::MetadataValidation(vec![MetadataValidationViolation {
+            code: "missing_root_data_entity".to_string(),
+            message: "missing root".to_string(),
+            pointer: "/@graph".to_string(),
+            entity_id: Some("./".to_string()),
+        }])
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: ErrorResponse =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let violations = body.violations.unwrap();
+        assert_eq!(violations[0].code, "missing_root_data_entity");
+        assert_eq!(violations[0].pointer, "/@graph");
+    }
 }

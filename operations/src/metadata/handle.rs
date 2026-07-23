@@ -18,7 +18,7 @@ use aruna_core::metadata::{
     MetadataBatch, MetadataCreateCrateRequest, MetadataDot, MetadataEffect, MetadataError,
     MetadataEvent, MetadataGraphLifecycleRecord, MetadataGraphPolicy, MetadataQuadOp,
     MetadataQueryResults, MetadataRequestDurability, MetadataRoCratePage, MetadataSearchHit,
-    MetadataUpsertEntityRequest,
+    MetadataUpsertEntityRequest, MetadataValidationViolation,
 };
 use aruna_core::storage_entries::metadata_graph_lifecycle_key;
 use aruna_core::structs::{
@@ -3583,7 +3583,9 @@ fn property_named_node(property: &str) -> Result<NamedNode, CraqleError> {
         "datePublished" => Ok(vocab::schema_date_published()),
         "license" => Ok(vocab::schema_license()),
         "about" => Ok(vocab::schema_about()),
-        "conformsTo" => Ok(vocab::schema_conforms_to()),
+        "conformsTo" => Ok(NamedNode::new_unchecked(
+            super::iri_index::DCTERMS_CONFORMS_TO_IRI,
+        )),
         other if other.contains("://") => Ok(NamedNode::new_unchecked(other)),
         other if other.contains(':') => expand_known_compact_iri(other),
         other => Ok(NamedNode::new_unchecked(format!(
@@ -3846,6 +3848,12 @@ fn looks_like_identifier(value: &str) -> bool {
 fn metadata_error_from_craqle(error: CraqleError) -> MetadataError {
     match error {
         CraqleError::RoCrate(rocrate_error) => match rocrate_error {
+            RoCrateError::Update(craqle::UpdateError::ValidationFailed(violations)) => {
+                metadata_violations(violations)
+            }
+            RoCrateError::Json(_) | RoCrateError::JsonLd(_) => {
+                MetadataError::InvalidInput(rocrate_error.to_string())
+            }
             RoCrateError::InvalidGraph(_)
             | RoCrateError::EntityNotFound(_)
             | RoCrateError::UnsupportedJsonLd(_)
@@ -3860,10 +3868,24 @@ fn metadata_error_from_craqle(error: CraqleError) -> MetadataError {
             MetadataError::InvalidInput("unsupported update across multiple graphs".to_string())
         }
         CraqleError::Update(craqle::UpdateError::ValidationFailed(violations)) => {
-            MetadataError::InvalidInput(format!("validation failed: {violations:?}"))
+            metadata_violations(violations)
         }
         other => MetadataError::Backend(other.to_string()),
     }
+}
+
+fn metadata_violations(violations: Vec<craqle::CrateViolation>) -> MetadataError {
+    MetadataError::Validation(
+        violations
+            .into_iter()
+            .map(|violation| MetadataValidationViolation {
+                code: violation.code.to_string(),
+                message: violation.message,
+                pointer: violation.pointer,
+                entity_id: violation.entity_id,
+            })
+            .collect(),
+    )
 }
 
 fn record_error(span: &Span, error: &str) {
@@ -5657,6 +5679,25 @@ mod tests {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde::Serialize;
     use tempfile::{TempDir, tempdir};
+
+    #[test]
+    fn maps_violations() {
+        let error = metadata_error_from_craqle(CraqleError::Update(
+            craqle::UpdateError::ValidationFailed(vec![craqle::CrateViolation {
+                code: "missing_root_data_entity",
+                message: "missing root".to_string(),
+                pointer: "/@graph".to_string(),
+                entity_id: Some("./".to_string()),
+            }]),
+        ));
+
+        let MetadataError::Validation(violations) = error else {
+            panic!("expected structured metadata validation error");
+        };
+        assert_eq!(violations[0].code, "missing_root_data_entity");
+        assert_eq!(violations[0].pointer, "/@graph");
+        assert_eq!(violations[0].entity_id.as_deref(), Some("./"));
+    }
 
     #[test]
     fn workspace_delete_allowed() {

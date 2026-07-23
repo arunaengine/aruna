@@ -74,7 +74,7 @@ async fn lost_response_retries() -> Result<(), Box<dyn std::error::Error>> {
             name: "Lost Response".to_string(),
             description: "Retry before asynchronous projection".to_string(),
             date_published: "2026-01-01".to_string(),
-            license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
         },
     };
 
@@ -173,7 +173,7 @@ async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std
                 name: "Initial Dataset".to_string(),
                 description: "Created through Craqle".to_string(),
                 date_published: "2026-01-01".to_string(),
-                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             },
         }),
         test.context.as_ref(),
@@ -332,7 +332,7 @@ async fn generated_metadata_create_foreground_storage_effect_count_is_reduced()
                     name: "Generated Fast Path".to_string(),
                     description: "Generated ids avoid duplicate foreground reads".to_string(),
                     date_published: "2026-01-01".to_string(),
-                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 },
             },
         ),
@@ -391,7 +391,7 @@ async fn metadata_event_log_replay_repairs_wal_only_create()
             name: "Replayed Dataset".to_string(),
             description: "Recovered from the metadata WAL".to_string(),
             date_published: "2026-01-01".to_string(),
-            license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
         },
         occurred_at_ms: 1,
     };
@@ -786,7 +786,7 @@ fn build_create_event(
             name: name.to_string(),
             description: "Recovered from the metadata WAL".to_string(),
             date_published: "2026-01-01".to_string(),
-            license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
         },
         occurred_at_ms: 1,
     };

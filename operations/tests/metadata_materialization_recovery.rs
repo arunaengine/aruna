@@ -89,6 +89,8 @@ async fn final_status_with_leftover_job_is_cleaned_without_reapply()
         document_id,
         event_id,
         graph_iri: event.record.graph_iri.clone(),
+        context_digest: None,
+        dataset_digest: None,
         state: MetadataMaterializationState::Materialized,
         attempts: 1,
         last_error: None,
@@ -209,7 +211,7 @@ fn create_event(
             name: name.to_string(),
             description: "Materialization recovery".to_string(),
             date_published: "2026-01-01".to_string(),
-            license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
         },
     )
 }

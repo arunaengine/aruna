@@ -1085,7 +1085,7 @@ mod tests {
                 name: "Lifecycle Outbox".to_string(),
                 description: "Projector outbox envelope".to_string(),
                 date_published: "2026-01-01".to_string(),
-                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             },
             occurred_at_ms: 1_000,
         }
