@@ -2246,10 +2246,10 @@ mod tests {
         let (second, cursor) = list_job_entries(&storage, job_id, cursor, 1).await.unwrap();
         assert_eq!(second[0].0, b"b");
         assert!(cursor.is_none());
-        assert_eq!(
+        assert!(matches!(
             put_job_entry(&storage, job_id, token, b"c", &report_row("c")).await,
             Err(JobMutationError::ReportFrozen)
-        );
+        ));
     }
 
     // The framework is opt-in: a write to any other keyspace never touches a job one.

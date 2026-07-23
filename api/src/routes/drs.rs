@@ -814,7 +814,6 @@ mod tests {
     use crate::server_state::ServerState;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
     };

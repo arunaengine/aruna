@@ -3360,6 +3360,7 @@ mod tests {
                 state,
                 realm_id,
                 node_id,
+                rocrate_limits: RoCrateLimits::default(),
             },
         )
     }

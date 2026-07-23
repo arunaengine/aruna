@@ -6672,7 +6672,7 @@ mod tests {
                 name: "Lifecycle".to_string(),
                 description: "Lifecycle event".to_string(),
                 date_published: "2026-01-01".to_string(),
-                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             },
             occurred_at_ms: updated_at_ms,
         }

@@ -777,7 +777,7 @@ impl PutObjectOperation {
     }
 
     fn register_blob_in_dht_or_continue(&mut self) -> Effects {
-        let Some(location) = self.get_output() else {
+        let Some(location) = self.get_output().cloned() else {
             return self.continue_after_dht_registration();
         };
         let Some(blake3_hash) = location.get_blake3() else {

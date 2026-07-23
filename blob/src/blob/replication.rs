@@ -104,7 +104,7 @@ impl BlobHandler {
         let transfer_timeout = self.transfer_idle_timeout();
 
         tokio::spawn(async move {
-            let result = async {
+            let result: Result<(), BlobError> = async {
                 let mut stream = connection.stream.lock().await;
                 let receiver = RecvStreamWrapper::new(&mut stream.1, transfer_timeout);
                 let mut writer = BaoReadWriter::new(writer);
