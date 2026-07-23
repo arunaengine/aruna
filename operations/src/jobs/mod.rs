@@ -6,6 +6,7 @@ pub mod export;
 pub mod import;
 pub mod prune;
 pub mod reconcile;
+mod rocrate_jsonld;
 pub mod runtime;
 pub mod service;
 pub mod staging;

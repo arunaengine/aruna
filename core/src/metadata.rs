@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use craqle::VectorClock;
 use serde::{Deserialize, Serialize};
@@ -198,18 +198,23 @@ fn apply_raw_upsert(
 ) -> Result<(), MetadataError> {
     let entity: serde_json::Value = serde_json::from_str(jsonld)
         .map_err(|error| MetadataError::InvalidInput(error.to_string()))?;
-    let entity_id = raw_entity_id(&entity)
+    let terms = RawTerms::new(document);
+    let entity_id = raw_entity_id(&entity, &terms)
         .ok_or_else(|| MetadataError::InvalidInput("entity @id is missing".to_string()))?;
     let graph = document
         .as_object_mut()
-        .and_then(|object| object.get_mut("@graph"))
+        .and_then(|object| {
+            object
+                .iter_mut()
+                .find_map(|(key, value)| terms.is_graph(key).then_some(value))
+        })
         .and_then(serde_json::Value::as_array_mut)
         .ok_or_else(|| {
             MetadataError::InvalidInput("RO-Crate @graph array is missing".to_string())
         })?;
     if let Some(existing) = graph
         .iter_mut()
-        .find(|entry| raw_entity_id(entry).as_deref() == Some(entity_id.as_str()))
+        .find(|entry| raw_entity_id(entry, &terms).as_deref() == Some(entity_id.as_str()))
     {
         let existing = existing.as_object_mut().ok_or_else(|| {
             MetadataError::InvalidInput("RO-Crate entity must be an object".to_string())
@@ -218,9 +223,8 @@ fn apply_raw_upsert(
             MetadataError::InvalidInput("entity payload must be an object".to_string())
         })?;
         for (property, value) in update {
-            if matches!(property.as_str(), "@id" | "id") {
-                existing.remove("@id");
-                existing.remove("id");
+            if terms.is_id(property) {
+                existing.retain(|key, _| !terms.is_id(key));
             }
             existing.insert(property.clone(), value.clone());
         }
@@ -228,17 +232,85 @@ fn apply_raw_upsert(
         graph.push(entity);
     }
     if link_root {
-        link_raw_entity(graph, &entity_id)?;
+        link_raw_entity(graph, &entity_id, &terms)?;
     }
     Ok(())
 }
 
-fn raw_entity_id(entity: &serde_json::Value) -> Option<String> {
+struct RawTerms {
+    terms: HashMap<String, Option<String>>,
+}
+
+impl RawTerms {
+    fn new(document: &serde_json::Value) -> Self {
+        let mut terms = HashMap::new();
+        if let Some(context) = document.get("@context") {
+            collect_raw_terms(context, &mut terms);
+        }
+        Self { terms }
+    }
+
+    fn is_id(&self, key: &str) -> bool {
+        key == "@id"
+            || self
+                .terms
+                .get(key)
+                .is_some_and(|iri| iri.as_deref() == Some("@id"))
+    }
+
+    fn is_graph(&self, key: &str) -> bool {
+        key == "@graph"
+            || self
+                .terms
+                .get(key)
+                .is_some_and(|iri| iri.as_deref() == Some("@graph"))
+    }
+
+    fn expands_to(&self, key: &str, values: &[&str]) -> bool {
+        match self.terms.get(key) {
+            Some(Some(iri)) => values.contains(&iri.as_str()),
+            Some(None) => false,
+            None => values.contains(&key),
+        }
+    }
+
+    fn term_matches(&self, term: &str, values: &[&str]) -> bool {
+        match self.terms.get(term) {
+            Some(Some(iri)) => values.contains(&iri.as_str()),
+            Some(None) => false,
+            None => true,
+        }
+    }
+}
+
+fn collect_raw_terms(context: &serde_json::Value, terms: &mut HashMap<String, Option<String>>) {
+    match context {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_raw_terms(value, terms);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (term, definition) in values {
+                let iri = match definition {
+                    serde_json::Value::String(iri) => Some(iri.as_str()),
+                    serde_json::Value::Object(definition) => {
+                        definition.get("@id").and_then(serde_json::Value::as_str)
+                    }
+                    _ => None,
+                };
+                terms.insert(term.clone(), iri.map(str::to_string));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn raw_entity_id(entity: &serde_json::Value, terms: &RawTerms) -> Option<String> {
     let id = entity
         .as_object()?
-        .get("@id")
-        .or_else(|| entity.as_object()?.get("id"))?
-        .as_str()?;
+        .iter()
+        .find_map(|(key, value)| terms.is_id(key).then(|| value.as_str()).flatten())?;
     Some(
         if id == "ro-crate-metadata.json"
             || id.starts_with("./")
@@ -255,46 +327,78 @@ fn raw_entity_id(entity: &serde_json::Value) -> Option<String> {
     )
 }
 
-fn link_raw_entity(graph: &mut [serde_json::Value], entity_id: &str) -> Result<(), MetadataError> {
+fn link_raw_entity(
+    graph: &mut [serde_json::Value],
+    entity_id: &str,
+    terms: &RawTerms,
+) -> Result<(), MetadataError> {
     let root_id = graph
         .iter()
-        .find(|entry| raw_entity_id(entry).as_deref() == Some("ro-crate-metadata.json"))
+        .find(|entry| raw_entity_id(entry, terms).as_deref() == Some("ro-crate-metadata.json"))
         .and_then(serde_json::Value::as_object)
-        .and_then(|descriptor| descriptor.get("about"))
-        .and_then(raw_entity_id)
+        .and_then(|descriptor| {
+            descriptor.iter().find_map(|(key, value)| {
+                terms
+                    .expands_to(
+                        key,
+                        &[
+                            "about",
+                            "schema:about",
+                            "http://schema.org/about",
+                            "https://schema.org/about",
+                        ],
+                    )
+                    .then(|| raw_entity_id(value, terms))
+                    .flatten()
+            })
+        })
         .unwrap_or_else(|| "./".to_string());
     let root = graph
         .iter_mut()
-        .find(|entry| raw_entity_id(entry).as_deref() == Some(root_id.as_str()))
+        .find(|entry| raw_entity_id(entry, terms).as_deref() == Some(root_id.as_str()))
         .and_then(serde_json::Value::as_object_mut)
         .ok_or_else(|| MetadataError::InvalidInput("RO-Crate root is missing".to_string()))?;
-    let has_part = if root.contains_key("hasPart") {
-        "hasPart"
-    } else if root.contains_key("schema:hasPart") {
-        "schema:hasPart"
-    } else if root.contains_key("http://schema.org/hasPart") {
-        "http://schema.org/hasPart"
-    } else if root.contains_key("https://schema.org/hasPart") {
-        "https://schema.org/hasPart"
-    } else {
-        "hasPart"
-    };
+    let has_part = root
+        .keys()
+        .find(|key| {
+            terms.expands_to(
+                key,
+                &[
+                    "hasPart",
+                    "schema:hasPart",
+                    "http://schema.org/hasPart",
+                    "https://schema.org/hasPart",
+                ],
+            )
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            if terms.term_matches(
+                "hasPart",
+                &[
+                    "schema:hasPart",
+                    "http://schema.org/hasPart",
+                    "https://schema.org/hasPart",
+                ],
+            ) {
+                "hasPart".to_string()
+            } else {
+                "https://schema.org/hasPart".to_string()
+            }
+        });
     let reference = serde_json::json!({ "@id": entity_id });
-    match root.get_mut(has_part) {
+    match root.get_mut(&has_part) {
         Some(serde_json::Value::Array(values))
             if values
                 .iter()
-                .any(|value| raw_entity_id(value).as_deref() == Some(entity_id)) => {}
+                .any(|value| raw_entity_id(value, terms).as_deref() == Some(entity_id)) => {}
         Some(serde_json::Value::Array(values)) => values.push(reference),
-        Some(value) if raw_entity_id(value).as_deref() == Some(entity_id) => {}
+        Some(value) if raw_entity_id(value, terms).as_deref() == Some(entity_id) => {}
         Some(value) => {
             *value = serde_json::Value::Array(vec![value.clone(), reference]);
         }
         None => {
-            root.insert(
-                has_part.to_string(),
-                serde_json::Value::Array(vec![reference]),
-            );
+            root.insert(has_part, serde_json::Value::Array(vec![reference]));
         }
     }
     Ok(())
@@ -757,8 +861,8 @@ mod tests {
     use super::{
         MetadataClockRelation, MetadataCreateEventPayload, MetadataCreateEventRecord,
         MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
-        MetadataGraphLifecycleRecord, MetadataQueryResults, compare_metadata_clocks,
-        resolve_raw_revision,
+        MetadataGraphLifecycleRecord, MetadataQueryResults, apply_raw_upsert,
+        compare_metadata_clocks, resolve_raw_revision,
     };
     use crate::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use crate::{NodeId, UserId};
@@ -992,6 +1096,82 @@ mod tests {
             *blake3::hash(br#"[ "https://w3id.org/ro/crate/1.2/context" ]"#).as_bytes()
         );
         assert!(revision.dataset_digest.is_some());
+    }
+
+    #[test]
+    fn raw_aliases_apply() {
+        let mut document = serde_json::json!({
+            "@context": [
+                "https://w3id.org/ro/crate/1.2/context",
+                {
+                    "items": "@graph",
+                    "node": "@id",
+                    "relation": "http://schema.org/about",
+                    "parts": "http://schema.org/hasPart"
+                }
+            ],
+            "items": [
+                {
+                    "node": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "relation": {"node": "./"}
+                },
+                {
+                    "node": "./",
+                    "@type": "Dataset",
+                    "parts": []
+                }
+            ]
+        });
+        let entity = serde_json::json!({
+            "node": "data/a.txt",
+            "@type": "File",
+            "name": "a"
+        })
+        .to_string();
+
+        apply_raw_upsert(&mut document, &entity, true).unwrap();
+
+        assert_eq!(document["items"][2]["node"], "data/a.txt");
+        assert_eq!(document["items"][1]["parts"][0]["@id"], "./data/a.txt");
+    }
+
+    #[test]
+    fn raw_overrides_preserved() {
+        let mut document = serde_json::json!({
+            "@context": [
+                "https://w3id.org/ro/crate/1.2/context",
+                {
+                    "about": "https://example.test/about",
+                    "hasPart": "https://example.test/hasPart"
+                }
+            ],
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "http://schema.org/about": {"@id": "./"}
+                },
+                {
+                    "@id": "./",
+                    "@type": "Dataset",
+                    "hasPart": "preserved"
+                }
+            ]
+        });
+        let entity = serde_json::json!({
+            "@id": "data/a.txt",
+            "@type": "File"
+        })
+        .to_string();
+
+        apply_raw_upsert(&mut document, &entity, true).unwrap();
+
+        assert_eq!(document["@graph"][1]["hasPart"], "preserved");
+        assert_eq!(
+            document["@graph"][1]["https://schema.org/hasPart"][0]["@id"],
+            "./data/a.txt"
+        );
     }
 
     #[test]

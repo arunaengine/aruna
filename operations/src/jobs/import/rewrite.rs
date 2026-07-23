@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use aruna_core::metadata::MetadataValidationViolation;
 use craqle::{CrateViolation, RoCrateError, UpdateError};
 use oxrdf::{NamedOrBlankNode, Term};
 use oxttl::NQuadsParser;
@@ -7,23 +8,18 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 use url::Url;
 
+use crate::jobs::rocrate_jsonld::JsonLdKeywords;
+
 const JSONLD_BASE_IRI: &str = "https://craqle.invalid/";
 const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const SCHEMA_MEDIA_IRI: &str = "http://schema.org/MediaObject";
+const SCHEMA_CONTENT_IRI: &str = "http://schema.org/contentUrl";
 const LOCAL_PATH_IRI: &str = "https://w3id.org/ro/terms#localPath";
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ValidationIssue {
-    pub code: String,
-    pub message: String,
-    pub pointer: String,
-    pub entity_id: Option<String>,
-}
 
 #[derive(Debug, Error)]
 pub enum CrateValidationError {
     #[error("RO-Crate validation failed")]
-    Violations(Vec<ValidationIssue>),
+    Violations(Vec<MetadataValidationViolation>),
     #[error("RO-Crate validation failed: {0}")]
     Invalid(String),
 }
@@ -48,12 +44,13 @@ pub struct RewriteOutcome {
 }
 
 pub fn validate_document(jsonld: &str) -> Result<ValidatedDocument, CrateValidationError> {
-    let canonical = craqle::canonicalize_jsonld(jsonld).map_err(map_validation_error)?;
+    let canonical = craqle::validate_rocrate_jsonld(jsonld).map_err(map_validation_error)?;
     let file_subjects = file_subjects(&canonical.nquads)?;
     let value: Value = serde_json::from_str(jsonld)
         .map_err(|error| CrateValidationError::Invalid(error.to_string()))?;
+    let keywords = JsonLdKeywords::new(&value);
     let mut file_ids = Vec::new();
-    collect_file_ids(&value, &file_subjects, &mut file_ids)?;
+    collect_file_ids(&value, &file_subjects, &keywords, &mut file_ids)?;
     Ok(ValidatedDocument { value, file_ids })
 }
 
@@ -61,9 +58,26 @@ pub fn rewrite_document(
     mut value: Value,
     targets: &HashMap<String, RewriteTarget>,
 ) -> Result<RewriteOutcome, CrateValidationError> {
+    let keywords = JsonLdKeywords::new(&value);
+    let compact_content = keywords.term_matches(
+        "contentUrl",
+        &[
+            SCHEMA_CONTENT_IRI,
+            "https://schema.org/contentUrl",
+            "schema:contentUrl",
+        ],
+    );
+    let compact_path = keywords.term_matches("localPath", &[LOCAL_PATH_IRI]);
     let mut warnings = HashSet::new();
-    rewrite_value(&mut value, targets, &mut warnings);
-    if uses_v11(&value) && !targets.is_empty() {
+    rewrite_value(
+        &mut value,
+        targets,
+        &keywords,
+        compact_content,
+        compact_path,
+        &mut warnings,
+    );
+    if uses_v11(&value) && compact_path && !targets.is_empty() {
         ensure_local_context(&mut value)?;
     }
     let jsonld = serde_json::to_string(&value)
@@ -93,17 +107,18 @@ fn file_subjects(nquads: &str) -> Result<HashSet<String>, CrateValidationError> 
 fn collect_file_ids(
     value: &Value,
     subjects: &HashSet<String>,
+    keywords: &JsonLdKeywords,
     file_ids: &mut Vec<String>,
 ) -> Result<(), CrateValidationError> {
     match value {
         Value::Array(values) => {
             for value in values {
-                collect_file_ids(value, subjects, file_ids)?;
+                collect_file_ids(value, subjects, keywords, file_ids)?;
             }
         }
         Value::Object(object) => {
             if object.len() > 1
-                && let Some(id) = object.get("@id").and_then(Value::as_str)
+                && let Some((_, id)) = keywords.object_id(object)
                 && subjects.contains(&expanded_id(id)?)
             {
                 if file_ids.iter().any(|existing| existing == id) {
@@ -114,7 +129,7 @@ fn collect_file_ids(
                 file_ids.push(id.to_string());
             }
             for value in object.values() {
-                collect_file_ids(value, subjects, file_ids)?;
+                collect_file_ids(value, subjects, keywords, file_ids)?;
             }
         }
         _ => {}
@@ -136,6 +151,9 @@ fn expanded_id(id: &str) -> Result<String, CrateValidationError> {
 fn rewrite_value(
     value: &mut Value,
     targets: &HashMap<String, RewriteTarget>,
+    keywords: &JsonLdKeywords,
+    compact_content: bool,
+    compact_path: bool,
     warnings: &mut HashSet<String>,
 ) {
     match value {
@@ -146,36 +164,64 @@ fn rewrite_value(
                 {
                     warnings.insert(raw.clone());
                 }
-                rewrite_value(value, targets, warnings);
+                rewrite_value(
+                    value,
+                    targets,
+                    keywords,
+                    compact_content,
+                    compact_path,
+                    warnings,
+                );
             }
         }
         Value::Object(object) => {
-            let original_id = object
-                .get("@id")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            if let Some(target) = original_id
-                .as_deref()
-                .and_then(|id| targets.get(id))
-                .cloned()
+            let original_id = keywords
+                .object_id(object)
+                .map(|(key, id)| (key.to_string(), id.to_string()));
+            if let Some((id_key, target)) = original_id
+                .as_ref()
+                .and_then(|(key, id)| targets.get(id).cloned().map(|target| (key, target)))
             {
-                object.insert("@id".to_string(), Value::String(target.w3id.clone()));
+                object.insert(id_key.clone(), Value::String(target.w3id.clone()));
                 if object.len() > 1 {
-                    prepend_value(object, "localPath", Value::String(target.local_path));
-                    prepend_value(object, "contentUrl", Value::String(target.hash_w3id));
+                    prepend_value(
+                        object,
+                        if compact_path {
+                            "localPath"
+                        } else {
+                            LOCAL_PATH_IRI
+                        },
+                        Value::String(target.local_path),
+                    );
+                    prepend_value(
+                        object,
+                        if compact_content {
+                            "contentUrl"
+                        } else {
+                            SCHEMA_CONTENT_IRI
+                        },
+                        Value::String(target.hash_w3id),
+                    );
                 }
             }
             for (key, value) in object {
-                if key == "localPath" {
+                if keywords.expands_to(key, &["localPath", LOCAL_PATH_IRI]) {
                     continue;
                 }
-                if key != "@id"
+                if !keywords.is_id(key)
                     && let Value::String(raw) = value
                     && targets.contains_key(raw)
                 {
                     warnings.insert(raw.clone());
                 }
-                rewrite_value(value, targets, warnings);
+                rewrite_value(
+                    value,
+                    targets,
+                    keywords,
+                    compact_content,
+                    compact_path,
+                    warnings,
+                );
             }
         }
         _ => {}
@@ -262,8 +308,8 @@ fn map_validation_error(error: RoCrateError) -> CrateValidationError {
     }
 }
 
-fn validation_issue(violation: CrateViolation) -> ValidationIssue {
-    ValidationIssue {
+fn validation_issue(violation: CrateViolation) -> MetadataValidationViolation {
+    MetadataValidationViolation {
         code: violation.code.to_string(),
         message: violation.message,
         pointer: violation.pointer,
@@ -307,6 +353,71 @@ mod tests {
     fn finds_file_types() {
         let validated = validate_document(&crate_json("1.2")).unwrap();
         assert_eq!(validated.file_ids, vec!["data/a.txt"]);
+    }
+
+    #[test]
+    fn finds_keyword_aliases() {
+        let document = json!({
+            "@context": [
+                "https://w3id.org/ro/crate/1.2/context",
+                {"graphItems": "@graph", "idAlias": "@id"}
+            ],
+            "graphItems": [
+                {
+                    "idAlias": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "about": {"idAlias": "./"},
+                    "conformsTo": {"idAlias": "https://w3id.org/ro/crate/1.2"}
+                },
+                {
+                    "idAlias": "./",
+                    "@type": "Dataset",
+                    "name": "test",
+                    "description": "test crate",
+                    "datePublished": "2026-07-23",
+                    "hasPart": {"idAlias": "data/a.txt"}
+                },
+                {
+                    "idAlias": "data/a.txt",
+                    "@type": "File",
+                    "name": "a"
+                }
+            ]
+        })
+        .to_string();
+
+        let validated = validate_document(&document).unwrap();
+        let target = RewriteTarget {
+            w3id: "https://w3id.org/aruna/data/arn:example".to_string(),
+            hash_w3id: format!("https://w3id.org/aruna/data/{}", "a".repeat(64)),
+            local_path: "data/a.txt".to_string(),
+        };
+        let rewritten = rewrite_document(
+            validated.value,
+            &HashMap::from([("data/a.txt".to_string(), target)]),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&rewritten.jsonld).unwrap();
+
+        assert_eq!(
+            value["graphItems"][1]["hasPart"]["idAlias"],
+            "https://w3id.org/aruna/data/arn:example"
+        );
+        assert_eq!(
+            value["graphItems"][2]["idAlias"],
+            "https://w3id.org/aruna/data/arn:example"
+        );
+    }
+
+    #[test]
+    fn rejects_crate_version() {
+        let mut document: Value = serde_json::from_str(&crate_json("1.2")).unwrap();
+        document["@graph"][0]["conformsTo"]["@id"] = json!("https://w3id.org/ro/crate/9.9");
+        assert!(matches!(
+            validate_document(&document.to_string()),
+            Err(CrateValidationError::Violations(violations))
+                if violations[0].code == "unsupported_crate_version"
+        ));
     }
 
     #[test]

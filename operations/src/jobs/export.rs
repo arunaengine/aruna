@@ -7,6 +7,7 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, ROCRATE_JOB_STATE_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
+use aruna_core::metadata::MetadataValidationViolation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     ArtifactRef, ArunaArn, ArunaArnType, BackendLocation, BlobVersion, BucketInfo,
@@ -22,12 +23,16 @@ use bytes::Bytes;
 use byteview::ByteView;
 use futures_util::StreamExt;
 use futures_util::io::AsyncWriteExt;
+use oxrdf::{NamedOrBlankNode, Term};
+use oxttl::NQuadsParser;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use ulid::Ulid;
 use unicode_normalization::UnicodeNormalization;
+use url::Url;
 
 use super::executor::{JobContext, JobRunOutcome};
+use super::rocrate_jsonld::JsonLdKeywords;
 use super::store::{put_job_entry, put_rocrate_checkpoint};
 use crate::blob::hidden::delete_hidden;
 use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
@@ -43,6 +48,24 @@ use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget
 const METADATA_PATH: &str = "ro-crate-metadata.json";
 const REPORT_PATH: &str = "aruna-export-report.json";
 const REMOTE_ATTEMPTS: usize = 8;
+const JSONLD_BASE_IRI: &str = "https://craqle.invalid/";
+const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+const SCHEMA_MEDIA_IRI: &str = "http://schema.org/MediaObject";
+const SCHEMA_MEDIA_HTTPS_IRI: &str = "https://schema.org/MediaObject";
+const SCHEMA_CONTENT_IRI: &str = "http://schema.org/contentUrl";
+const SCHEMA_CONTENT_HTTPS_IRI: &str = "https://schema.org/contentUrl";
+const SCHEMA_ABOUT_IRI: &str = "http://schema.org/about";
+const SCHEMA_ABOUT_HTTPS_IRI: &str = "https://schema.org/about";
+const SCHEMA_HAS_PART_IRI: &str = "http://schema.org/hasPart";
+const SCHEMA_HAS_PART_HTTPS_IRI: &str = "https://schema.org/hasPart";
+const SCHEMA_SUBJECT_IRI: &str = "http://schema.org/subjectOf";
+const SCHEMA_SUBJECT_HTTPS_IRI: &str = "https://schema.org/subjectOf";
+const SCHEMA_ENCODING_IRI: &str = "http://schema.org/encodingFormat";
+const SCHEMA_ENCODING_HTTPS_IRI: &str = "https://schema.org/encodingFormat";
+const SCHEMA_NAME_IRI: &str = "http://schema.org/name";
+const SCHEMA_NAME_HTTPS_IRI: &str = "https://schema.org/name";
+const LOCAL_PATH_IRI: &str = "https://w3id.org/ro/terms#localPath";
+const LOCAL_PATH_HTTP_IRI: &str = "http://w3id.org/ro/terms#localPath";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ExportPhase {
@@ -147,6 +170,7 @@ struct PlannedEntry {
 enum ExportFailure {
     Permanent(String),
     Retryable(String),
+    Validation(Vec<MetadataValidationViolation>),
     Candidate {
         entity_index: usize,
         candidate_index: usize,
@@ -226,11 +250,11 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
                     match open_sources(ctx, spec, &mut checkpoint, &candidate_failures).await {
                         Ok(entries) => {
                             if let Err(error) = plan_export(spec, &mut checkpoint, &entries) {
-                                return failure_outcome(error);
+                                return finish_export(ctx, &mut checkpoint, error).await;
                             }
                             opened = Some(entries);
                         }
-                        Err(error) => return failure_outcome(error),
+                        Err(error) => return finish_export(ctx, &mut checkpoint, error).await,
                     }
                 }
                 let Some(entries) = opened.take() else {
@@ -267,8 +291,7 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
             }
         };
         if let Err(error) = result {
-            discard_artifact(ctx, &mut checkpoint, false).await;
-            return failure_outcome(error);
+            return finish_export(ctx, &mut checkpoint, error).await;
         }
         if let Err(error) = persist_checkpoint(ctx, &checkpoint).await {
             discard_artifact(ctx, &mut checkpoint, false).await;
@@ -312,11 +335,11 @@ async fn snapshot_export(
             spec.limits.metadata_bytes
         )));
     }
-    let canonical = craqle::canonicalize_jsonld(&raw.revision.jsonld)
-        .map_err(|error| ExportFailure::Permanent(crate_error(error)))?;
+    let canonical =
+        craqle::validate_rocrate_jsonld(&raw.revision.jsonld).map_err(map_crate_error)?;
     let document: JsonValue = serde_json::from_str(&raw.revision.jsonld)
         .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
-    let entities = recognize_entities(&document, spec.auth_context.realm_id)?;
+    let entities = recognize_entities(&document, &canonical.nquads, spec.auth_context.realm_id)?;
     if entities.len() as u64 > spec.limits.max_entries {
         return Err(ExportFailure::Permanent(format!(
             "RO-Crate has more than {} File entities",
@@ -417,11 +440,9 @@ async fn resolve_entries(
             let aliases = drive(ResolveBlobPermissionPathsOperation::new(hash), &ctx.driver)
                 .await
                 .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
-            let alias_limit = REMOTE_ATTEMPTS.saturating_sub(candidates.len());
             for alias in aliases
                 .into_iter()
                 .filter(|alias| alias.realm_id == spec.auth_context.realm_id)
-                .take(alias_limit)
             {
                 match resolve_alias(ctx, spec, &alias).await? {
                     ResolveResult::Candidate(candidate) => {
@@ -441,7 +462,11 @@ async fn resolve_entries(
             .await
             {
                 Ok(holders) => {
-                    let holder_limit = REMOTE_ATTEMPTS.saturating_sub(candidates.len());
+                    let remote_count = candidates
+                        .iter()
+                        .filter(|candidate| !matches!(candidate.source, CandidateSource::Local(_)))
+                        .count();
+                    let holder_limit = REMOTE_ATTEMPTS.saturating_sub(remote_count);
                     for node_id in holders.into_iter().take(holder_limit) {
                         let candidate = ExportCandidate {
                             source: CandidateSource::RemoteHash { node_id, hash },
@@ -665,8 +690,7 @@ async fn open_sources(
                 OpenStatus::Corrupt => corrupt = true,
             }
         }
-        for (candidate_index, candidate) in candidates.into_iter().enumerate().take(REMOTE_ATTEMPTS)
-        {
+        for (candidate_index, candidate) in candidates.into_iter().enumerate() {
             if failed.is_some_and(|failed| failed.contains_key(&candidate_index)) {
                 continue;
             }
@@ -923,12 +947,18 @@ fn plan_export(
             spec.limits.metadata_bytes
         )));
     }
-    craqle::canonicalize_jsonld(
+    craqle::validate_rocrate_jsonld(
         std::str::from_utf8(&rewritten)
             .map_err(|error| ExportFailure::Permanent(error.to_string()))?,
     )
-    .map_err(|error| ExportFailure::Permanent(crate_error(error)))?;
-    precheck_size(spec, &rewritten, checkpoint.report_json.as_deref(), opened)?;
+    .map_err(map_crate_error)?;
+    precheck_size(
+        spec,
+        &rewritten,
+        checkpoint.report_json.as_deref(),
+        opened,
+        &checkpoint.entities,
+    )?;
     checkpoint.rewritten_jsonld = Some(rewritten);
     checkpoint.phase = ExportPhase::Assemble;
     Ok(())
@@ -936,20 +966,53 @@ fn plan_export(
 
 fn recognize_entities(
     document: &JsonValue,
+    nquads: &str,
     realm_id: RealmId,
 ) -> Result<Vec<ExportEntity>, ExportFailure> {
-    let graph = document
-        .get("@graph")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| ExportFailure::Permanent("RO-Crate @graph is missing".to_string()))?;
+    let keywords = JsonLdKeywords::new(document);
+    let raw_ids = raw_entity_ids(document, &keywords)?;
+    let mut files = BTreeSet::new();
+    let mut content_urls = BTreeMap::<String, Vec<String>>::new();
+    let mut local_paths = BTreeMap::<String, String>::new();
+    for quad in NQuadsParser::new().for_slice(nquads) {
+        let quad = quad.map_err(|error| ExportFailure::Permanent(error.to_string()))?;
+        let NamedOrBlankNode::NamedNode(subject) = quad.subject else {
+            continue;
+        };
+        let subject = subject.as_str().to_string();
+        match quad.predicate.as_str() {
+            RDF_TYPE_IRI
+                if matches!(
+                    &quad.object,
+                    Term::NamedNode(node)
+                        if matches!(node.as_str(), SCHEMA_MEDIA_IRI | SCHEMA_MEDIA_HTTPS_IRI)
+                ) =>
+            {
+                files.insert(subject);
+            }
+            SCHEMA_CONTENT_IRI | SCHEMA_CONTENT_HTTPS_IRI => {
+                if let Some(value) = term_value(&quad.object) {
+                    content_urls.entry(subject).or_default().push(value);
+                }
+            }
+            LOCAL_PATH_IRI | LOCAL_PATH_HTTP_IRI => {
+                if let Some(value) = term_value(&quad.object) {
+                    local_paths.entry(subject).or_insert(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
     let mut entities = Vec::new();
-    for entity in graph.iter().filter(|entity| is_file(entity)) {
-        let entity_id = entity
-            .get("@id")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| ExportFailure::Permanent("File entity @id is missing".to_string()))?
-            .to_string();
-        let identity = entity_identity(entity);
+    for (subject, entity_id) in raw_ids {
+        if !files.remove(&subject) {
+            continue;
+        }
+        let identity = entity_identity(
+            &entity_id,
+            content_urls.get(&subject).map_or(&[], Vec::as_slice),
+        );
         let external = identity.exact.is_none() && identity.hash.is_none();
         let hash_realm = identity.hash_realm;
         let supported_exact = identity
@@ -961,7 +1024,7 @@ fn recognize_entities(
         let unsupported_realm = !external && !supported_exact && !supported_hash;
         entities.push(ExportEntity {
             entity_id,
-            local_path: entity_local_path(entity),
+            local_path: local_paths.remove(&subject),
             exact: identity.exact,
             hash: identity.hash,
             hash_realm,
@@ -986,27 +1049,84 @@ fn recognize_entities(
             path_synthesized: false,
         });
     }
+    if let Some(subject) = files.into_iter().next() {
+        return Err(ExportFailure::Permanent(format!(
+            "expanded File entity `{subject}` has no raw JSON-LD definition"
+        )));
+    }
     Ok(entities)
 }
 
-fn entity_identity(entity: &JsonValue) -> EntityIdentity {
+fn raw_entity_ids(
+    document: &JsonValue,
+    keywords: &JsonLdKeywords,
+) -> Result<Vec<(String, String)>, ExportFailure> {
+    fn collect(
+        value: &JsonValue,
+        keywords: &JsonLdKeywords,
+        entities: &mut Vec<(String, String)>,
+    ) -> Result<(), ExportFailure> {
+        match value {
+            JsonValue::Array(values) => {
+                for value in values {
+                    collect(value, keywords, entities)?;
+                }
+            }
+            JsonValue::Object(object) => {
+                if object.len() > 1
+                    && let Some((_, id)) = keywords.object_id(object)
+                {
+                    let expanded = expanded_id(id)?;
+                    if let Some((_, existing_id)) =
+                        entities.iter().find(|(existing, _)| existing == &expanded)
+                    {
+                        if existing_id != id {
+                            return Err(ExportFailure::Permanent(format!(
+                                "JSON-LD entity `{expanded}` uses ambiguous identifiers"
+                            )));
+                        }
+                    } else {
+                        entities.push((expanded, id.to_string()));
+                    }
+                }
+                for value in object.values() {
+                    collect(value, keywords, entities)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    let mut entities = Vec::new();
+    collect(document, keywords, &mut entities)?;
+    Ok(entities)
+}
+
+fn expanded_id(id: &str) -> Result<String, ExportFailure> {
+    if let Ok(url) = Url::parse(id) {
+        return Ok(url.to_string());
+    }
+    Url::parse(JSONLD_BASE_IRI)
+        .expect("static JSON-LD base is valid")
+        .join(id)
+        .map(String::from)
+        .map_err(|error| ExportFailure::Permanent(error.to_string()))
+}
+
+fn term_value(term: &Term) -> Option<String> {
+    match term {
+        Term::NamedNode(value) => Some(value.as_str().to_string()),
+        Term::Literal(value) => Some(value.value().to_string()),
+        _ => None,
+    }
+}
+
+fn entity_identity(entity_id: &str, content_urls: &[String]) -> EntityIdentity {
     let mut exact = None;
     let mut hash = None;
     let mut hash_realm = None;
-    let mut values = Vec::new();
-    if let Some(entity_id) = entity.get("@id").and_then(JsonValue::as_str) {
-        values.push(entity_id);
-    }
-    for key in [
-        "contentUrl",
-        "http://schema.org/contentUrl",
-        "https://schema.org/contentUrl",
-    ] {
-        if let Some(value) = entity.get(key) {
-            collect_strings(value, &mut values);
-        }
-    }
-    for value in values {
+    for value in std::iter::once(entity_id).chain(content_urls.iter().map(String::as_str)) {
         if let Ok(identifier) = W3idDataIdentifier::parse(value) {
             match identifier {
                 W3idDataIdentifier::ContentHash(value) => hash = Some(value),
@@ -1033,23 +1153,6 @@ fn entity_identity(entity: &JsonValue) -> EntityIdentity {
     }
 }
 
-fn collect_strings<'a>(value: &'a JsonValue, output: &mut Vec<&'a str>) {
-    match value {
-        JsonValue::String(value) => output.push(value),
-        JsonValue::Array(values) => {
-            for value in values {
-                collect_strings(value, output);
-            }
-        }
-        JsonValue::Object(value) => {
-            if let Some(value) = value.get("@id").and_then(JsonValue::as_str) {
-                output.push(value);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn parse_hash(value: &str) -> Option<[u8; 32]> {
     let value = value.strip_prefix("blake3/").unwrap_or(value);
     if value.len() != 64
@@ -1062,60 +1165,6 @@ fn parse_hash(value: &str) -> Option<[u8; 32]> {
     let mut hash = [0; 32];
     hex::decode_to_slice(value, &mut hash).ok()?;
     Some(hash)
-}
-
-fn entity_local_path(entity: &JsonValue) -> Option<String> {
-    [
-        "localPath",
-        "https://w3id.org/ro/terms#localPath",
-        "http://w3id.org/ro/terms#localPath",
-    ]
-    .into_iter()
-    .find_map(|key| {
-        let value = entity.get(key)?;
-        match value {
-            JsonValue::String(value) => Some(value.clone()),
-            JsonValue::Array(values) => values
-                .iter()
-                .find_map(JsonValue::as_str)
-                .map(str::to_string),
-            _ => None,
-        }
-    })
-}
-
-fn is_file(entity: &JsonValue) -> bool {
-    let Some(value) = entity.get("@type") else {
-        return false;
-    };
-    let mut types = Vec::new();
-    collect_strings(value, &mut types);
-    types.into_iter().any(|value| {
-        matches!(
-            value,
-            "File"
-                | "schema:MediaObject"
-                | "http://schema.org/MediaObject"
-                | "https://schema.org/MediaObject"
-        )
-    })
-}
-
-fn is_dataset(entity: &JsonValue) -> bool {
-    let Some(value) = entity.get("@type") else {
-        return false;
-    };
-    let mut types = Vec::new();
-    collect_strings(value, &mut types);
-    types.into_iter().any(|value| {
-        matches!(
-            value,
-            "Dataset"
-                | "schema:Dataset"
-                | "http://schema.org/Dataset"
-                | "https://schema.org/Dataset"
-        )
-    })
 }
 
 fn safe_zip_path(value: &str) -> Option<String> {
@@ -1156,47 +1205,61 @@ fn scan_unrewritten(
         value: &JsonValue,
         key: Option<&str>,
         replacements: &BTreeMap<String, String>,
+        keywords: &JsonLdKeywords,
         found: &mut BTreeSet<String>,
     ) {
         match value {
             JsonValue::String(value)
-                if key != Some("@id") && replacements.contains_key(value.as_str()) =>
+                if !key.is_some_and(|key| keywords.is_id(key))
+                    && replacements.contains_key(value.as_str()) =>
             {
                 found.insert(value.clone());
             }
             JsonValue::Array(values) => {
                 for value in values {
-                    scan(value, key, replacements, found);
+                    scan(value, key, replacements, keywords, found);
                 }
             }
             JsonValue::Object(values) => {
                 for (key, value) in values {
-                    scan(value, Some(key), replacements, found);
+                    scan(value, Some(key), replacements, keywords, found);
                 }
             }
             _ => {}
         }
     }
+    let keywords = JsonLdKeywords::new(document);
     let mut found = BTreeSet::new();
-    scan(document, None, replacements, &mut found);
+    scan(document, None, replacements, &keywords, &mut found);
     found
 }
 
 fn rewrite_ids(value: &mut JsonValue, replacements: &BTreeMap<String, String>) {
+    let keywords = JsonLdKeywords::new(value);
+    rewrite_id_values(value, replacements, &keywords);
+}
+
+fn rewrite_id_values(
+    value: &mut JsonValue,
+    replacements: &BTreeMap<String, String>,
+    keywords: &JsonLdKeywords,
+) {
     match value {
         JsonValue::Array(values) => {
             for value in values {
-                rewrite_ids(value, replacements);
+                rewrite_id_values(value, replacements, keywords);
             }
         }
         JsonValue::Object(values) => {
-            if let Some(JsonValue::String(value)) = values.get_mut("@id")
+            let id_key = keywords.object_id(values).map(|(key, _)| key.to_string());
+            if let Some(JsonValue::String(value)) =
+                id_key.as_deref().and_then(|key| values.get_mut(key))
                 && let Some(replacement) = replacements.get(value)
             {
                 *value = replacement.clone();
             }
             for value in values.values_mut() {
-                rewrite_ids(value, replacements);
+                rewrite_id_values(value, replacements, keywords);
             }
         }
         _ => {}
@@ -1216,6 +1279,7 @@ fn build_rows(entities: &[ExportEntity], unrewritten: &BTreeSet<String>) -> Vec<
                 zip_path: entity.zip_path.clone(),
                 source: entity.report_source,
                 resolved_version: entity.resolved_version,
+                validation: None,
             },
         });
         if entity.path_synthesized {
@@ -1228,6 +1292,7 @@ fn build_rows(entities: &[ExportEntity], unrewritten: &BTreeSet<String>) -> Vec<
                     zip_path: entity.zip_path.clone(),
                     source: entity.report_source,
                     resolved_version: entity.resolved_version,
+                    validation: None,
                 },
             });
         }
@@ -1243,6 +1308,7 @@ fn build_rows(entities: &[ExportEntity], unrewritten: &BTreeSet<String>) -> Vec<
                     zip_path: entity.zip_path.clone(),
                     source: entity.report_source,
                     resolved_version: entity.resolved_version,
+                    validation: None,
                 },
             });
         }
@@ -1290,43 +1356,131 @@ fn build_report(checkpoint: &ExportCheckpoint) -> Result<JsonValue, ExportFailur
 }
 
 fn add_report(document: &mut JsonValue) -> Result<(), ExportFailure> {
-    let graph = document
-        .get_mut("@graph")
-        .and_then(JsonValue::as_array_mut)
+    let keywords = JsonLdKeywords::new(document);
+    let graph = keywords
+        .graph_mut(document)
         .ok_or_else(|| ExportFailure::Permanent("RO-Crate @graph is missing".to_string()))?;
+    if graph.iter().any(|entity| {
+        entity
+            .as_object()
+            .and_then(|entity| keywords.object_id(entity))
+            .is_some_and(|(_, id)| id == REPORT_PATH || id == "#aruna-export-report")
+    }) {
+        return Err(ExportFailure::Permanent(
+            "RO-Crate uses a reserved export report identifier".to_string(),
+        ));
+    }
     let root = graph
         .iter_mut()
         .find(|entity| {
-            entity.get("@id").and_then(JsonValue::as_str) == Some("./") && is_dataset(entity)
+            entity
+                .as_object()
+                .and_then(|entity| keywords.object_id(entity))
+                .is_some_and(|(_, id)| id == "./")
         })
         .and_then(JsonValue::as_object_mut)
         .ok_or_else(|| ExportFailure::Permanent("RO-Crate root Dataset is missing".to_string()))?;
-    match root.get_mut("subjectOf") {
+    let subject_key = property_key(
+        root,
+        &keywords,
+        &[
+            "subjectOf",
+            "schema:subjectOf",
+            SCHEMA_SUBJECT_IRI,
+            SCHEMA_SUBJECT_HTTPS_IRI,
+        ],
+        "subjectOf",
+        SCHEMA_SUBJECT_HTTPS_IRI,
+    );
+    match root.get_mut(&subject_key) {
         Some(JsonValue::Array(values)) => values.push(json!({"@id": "#aruna-export-report"})),
         Some(value) => {
             let previous = std::mem::take(value);
             *value = json!([previous, {"@id": "#aruna-export-report"}]);
         }
         None => {
-            root.insert(
-                "subjectOf".to_string(),
-                json!({"@id": "#aruna-export-report"}),
-            );
+            root.insert(subject_key, json!({"@id": "#aruna-export-report"}));
         }
     }
-    graph.push(json!({
-        "@id": REPORT_PATH,
-        "@type": "File",
-        "encodingFormat": "application/json",
-        "about": {"@id": "#aruna-export-report"}
-    }));
-    graph.push(json!({
-        "@id": "#aruna-export-report",
-        "@type": "CreativeWork",
-        "name": "Aruna RO-Crate export completeness report",
-        "about": {"@id": "./"}
-    }));
+    let part_key = property_key(
+        root,
+        &keywords,
+        &[
+            "hasPart",
+            "schema:hasPart",
+            SCHEMA_HAS_PART_IRI,
+            SCHEMA_HAS_PART_HTTPS_IRI,
+        ],
+        "hasPart",
+        SCHEMA_HAS_PART_HTTPS_IRI,
+    );
+    match root.get_mut(&part_key) {
+        Some(JsonValue::Array(values)) => values.push(json!({"@id": REPORT_PATH})),
+        Some(value) => {
+            let previous = std::mem::take(value);
+            *value = json!([previous, {"@id": REPORT_PATH}]);
+        }
+        None => {
+            root.insert(part_key, json!({"@id": REPORT_PATH}));
+        }
+    }
+    let encoding_key = safe_term(
+        &keywords,
+        "encodingFormat",
+        &[
+            SCHEMA_ENCODING_IRI,
+            SCHEMA_ENCODING_HTTPS_IRI,
+            "schema:encodingFormat",
+        ],
+        SCHEMA_ENCODING_HTTPS_IRI,
+    );
+    let about_key = safe_term(
+        &keywords,
+        "about",
+        &[SCHEMA_ABOUT_IRI, SCHEMA_ABOUT_HTTPS_IRI, "schema:about"],
+        SCHEMA_ABOUT_HTTPS_IRI,
+    );
+    let name_key = safe_term(
+        &keywords,
+        "name",
+        &[SCHEMA_NAME_IRI, SCHEMA_NAME_HTTPS_IRI, "schema:name"],
+        SCHEMA_NAME_HTTPS_IRI,
+    );
+    graph.push(JsonValue::Object(serde_json::Map::from_iter([
+        ("@id".to_string(), json!(REPORT_PATH)),
+        ("@type".to_string(), json!(SCHEMA_MEDIA_IRI)),
+        (encoding_key, json!("application/json")),
+        (about_key.clone(), json!({"@id": "#aruna-export-report"})),
+    ])));
+    graph.push(JsonValue::Object(serde_json::Map::from_iter([
+        ("@id".to_string(), json!("#aruna-export-report")),
+        ("@type".to_string(), json!("http://schema.org/CreativeWork")),
+        (name_key, json!("Aruna RO-Crate export completeness report")),
+        (about_key, json!({"@id": "./"})),
+    ])));
     Ok(())
+}
+
+fn property_key(
+    object: &serde_json::Map<String, JsonValue>,
+    keywords: &JsonLdKeywords,
+    values: &[&str],
+    compact: &str,
+    absolute: &str,
+) -> String {
+    object
+        .keys()
+        .find(|key| keywords.expands_to(key, values))
+        .cloned()
+        .unwrap_or_else(|| safe_term(keywords, compact, values, absolute))
+}
+
+fn safe_term(keywords: &JsonLdKeywords, compact: &str, values: &[&str], absolute: &str) -> String {
+    if keywords.term_matches(compact, values) {
+        compact.to_string()
+    } else {
+        absolute.to_string()
+    }
 }
 
 fn precheck_size(
@@ -1334,24 +1488,32 @@ fn precheck_size(
     metadata: &[u8],
     report: Option<&[u8]>,
     opened: &[OpenedEntry],
+    entities: &[ExportEntity],
 ) -> Result<(), ExportFailure> {
-    let mut size = metadata.len() as u64;
+    let mut size = (metadata.len() as u64)
+        .checked_add(256 + 2 * METADATA_PATH.len() as u64)
+        .ok_or_else(|| ExportFailure::Permanent("export size overflow".to_string()))?;
     let mut entries = 1u64;
     if let Some(report) = report {
         size = size
             .checked_add(report.len() as u64)
+            .and_then(|size| size.checked_add(256 + 2 * REPORT_PATH.len() as u64))
             .ok_or_else(|| ExportFailure::Permanent("export size overflow".to_string()))?;
         entries += 1;
     }
     for entry in opened {
+        let path = entities
+            .get(entry.entity_index)
+            .and_then(|entity| entity.zip_path.as_deref())
+            .ok_or_else(|| ExportFailure::Permanent("planned ZIP path is missing".to_string()))?;
         size = size
             .checked_add(entry.size)
+            .and_then(|size| size.checked_add(256 + 2 * path.len() as u64))
             .ok_or_else(|| ExportFailure::Permanent("export size overflow".to_string()))?;
         entries += 1;
     }
     size = size
-        .checked_add(entries.saturating_mul(512))
-        .and_then(|size| size.checked_add(256))
+        .checked_add(256)
         .ok_or_else(|| ExportFailure::Permanent("export size overflow".to_string()))?;
     if entries > spec.limits.max_entries.saturating_add(2) {
         return Err(ExportFailure::Permanent(format!(
@@ -1640,36 +1802,95 @@ async fn persist_checkpoint(ctx: &JobContext, checkpoint: &ExportCheckpoint) -> 
     .map_err(|error| error.to_string())
 }
 
-fn crate_error(error: craqle::RoCrateError) -> String {
+fn map_crate_error(error: craqle::RoCrateError) -> ExportFailure {
     match error {
         craqle::RoCrateError::Update(craqle::UpdateError::ValidationFailed(violations)) => {
-            serde_json::to_string(
-                &violations
-                    .iter()
-                    .map(|violation| {
-                        json!({
-                            "code": violation.code,
-                            "message": &violation.message,
-                            "pointer": &violation.pointer,
-                            "entity_id": &violation.entity_id,
-                        })
+            ExportFailure::Validation(
+                violations
+                    .into_iter()
+                    .map(|violation| MetadataValidationViolation {
+                        code: violation.code.to_string(),
+                        message: violation.message,
+                        pointer: violation.pointer,
+                        entity_id: violation.entity_id,
                     })
-                    .collect::<Vec<_>>(),
+                    .collect(),
             )
-            .unwrap_or_else(|_| "RO-Crate validation failed".to_string())
         }
-        error => error.to_string(),
+        error => ExportFailure::Permanent(error.to_string()),
     }
+}
+
+async fn finish_export(
+    ctx: &JobContext,
+    checkpoint: &mut ExportCheckpoint,
+    error: ExportFailure,
+) -> JobRunOutcome {
+    discard_artifact(ctx, checkpoint, false).await;
+    if let ExportFailure::Validation(violations) = &error
+        && let Err(message) = write_validation_rows(ctx, violations).await
+    {
+        return retryable(message);
+    }
+    failure_outcome(error)
+}
+
+async fn write_validation_rows(
+    ctx: &JobContext,
+    violations: &[MetadataValidationViolation],
+) -> Result<(), String> {
+    for (index, violation) in violations.iter().enumerate() {
+        let row = ExportReportRow {
+            entry_key: format!("validation/{index:08}"),
+            code: if violation.code == "unsupported_crate_version" {
+                ReasonCode::UnsupportedCrateVersion
+            } else {
+                ReasonCode::Failed
+            },
+            message: Some(violation.message.clone()),
+            detail: ExportReportDetail {
+                entity_id: violation.entity_id.clone().unwrap_or_default(),
+                zip_path: None,
+                source: None,
+                resolved_version: None,
+                validation: Some(violation.clone()),
+            },
+        };
+        put_job_entry(
+            &ctx.driver.storage_handle,
+            ctx.job_id,
+            ctx.claim_token,
+            row.entry_key.as_bytes(),
+            &row,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn failure_outcome(error: ExportFailure) -> JobRunOutcome {
     match error {
         ExportFailure::Permanent(message) => permanent(message),
         ExportFailure::Retryable(message) => retryable(message),
+        ExportFailure::Validation(violations) => permanent(validation_message(&violations)),
         ExportFailure::Candidate { message, .. } => retryable(message),
         ExportFailure::Cancelled => JobRunOutcome::Cancelled,
         ExportFailure::Interrupted => JobRunOutcome::Interrupted,
     }
+}
+
+fn validation_message(violations: &[MetadataValidationViolation]) -> String {
+    violations
+        .iter()
+        .map(|violation| {
+            format!(
+                "{} at {}: {}",
+                violation.code, violation.pointer, violation.message
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn retryable(message: impl Into<String>) -> JobRunOutcome {
@@ -1706,6 +1927,15 @@ mod tests {
         BackendStream::new(futures_util::stream::iter([Ok::<Bytes, std::io::Error>(
             Bytes::from_static(bytes),
         )]))
+    }
+
+    fn recognized_entities(
+        document: &JsonValue,
+        realm_id: RealmId,
+    ) -> Result<Vec<ExportEntity>, ExportFailure> {
+        let jsonld = serde_json::to_string(document).unwrap();
+        let canonical = craqle::canonicalize_jsonld(&jsonld).unwrap();
+        recognize_entities(document, &canonical.nquads, realm_id)
     }
 
     async fn sample_archive() -> Vec<u8> {
@@ -1762,13 +1992,148 @@ mod tests {
             ]
         });
 
-        let entities = recognize_entities(&document, realm_id).unwrap();
+        let entities = recognized_entities(&document, realm_id).unwrap();
 
         assert_eq!(entities[0].exact.as_ref(), Some(&arn));
         assert_eq!(entities[0].hash, Some([0x11; 32]));
         assert_eq!(entities[1].omission, None);
         assert_eq!(entities[2].omission, Some(ReasonCode::Unsupported));
         assert_eq!(entities[3].omission, Some(ReasonCode::External));
+    }
+
+    #[test]
+    fn recognizes_context_aliases() {
+        let realm_id = RealmId::from_bytes([2; 32]);
+        let document = json!({
+            "@context": [
+                "https://w3id.org/ro/crate/1.2/context",
+                {
+                    "graphItems": "@graph",
+                    "idAlias": "@id",
+                    "typeAlias": "@type",
+                    "downloadAlias": "http://schema.org/contentUrl",
+                    "pathAlias": LOCAL_PATH_IRI
+                }
+            ],
+            "graphItems": [{
+                "idAlias": "data/a.txt",
+                "typeAlias": "File",
+                "downloadAlias": format!(
+                    "{}{}",
+                    aruna_core::structs::ARUNA_DATA_PREFIX,
+                    "11".repeat(32)
+                ),
+                "pathAlias": "data/a.txt"
+            }]
+        });
+
+        let entities = recognized_entities(&document, realm_id).unwrap();
+
+        assert_eq!(entities[0].hash, Some([0x11; 32]));
+        assert_eq!(entities[0].local_path.as_deref(), Some("data/a.txt"));
+    }
+
+    #[test]
+    fn reports_keyword_aliases() {
+        let mut document = json!({
+            "@context": [
+                "https://w3id.org/ro/crate/1.2/context",
+                {"graphItems": "@graph", "idAlias": "@id"}
+            ],
+            "graphItems": [
+                {"idAlias": "./", "@type": "Dataset"},
+                {
+                    "idAlias": METADATA_PATH,
+                    "@type": "CreativeWork",
+                    "about": {"idAlias": "./"}
+                }
+            ]
+        });
+
+        add_report(&mut document).unwrap();
+
+        assert_eq!(
+            document["graphItems"][0]["subjectOf"]["@id"],
+            JsonValue::String("#aruna-export-report".to_string())
+        );
+        assert_eq!(document["graphItems"][2]["@id"], REPORT_PATH);
+    }
+
+    #[test]
+    fn reports_context_overrides() {
+        let mut document = json!({
+            "@context": [
+                "https://w3id.org/ro/crate/1.2/context",
+                {
+                    "subjectOf": "https://example.test/subject",
+                    "hasPart": "https://example.test/part",
+                    "about": "https://example.test/about",
+                    "encodingFormat": "https://example.test/format",
+                    "name": "https://example.test/name"
+                }
+            ],
+            "@graph": [
+                {
+                    "@id": "./",
+                    "@type": "Dataset",
+                    "hasPart": "preserved"
+                },
+                {
+                    "@id": METADATA_PATH,
+                    "@type": "CreativeWork",
+                    "http://schema.org/about": {"@id": "./"}
+                }
+            ]
+        });
+
+        add_report(&mut document).unwrap();
+
+        assert_eq!(document["@graph"][0]["hasPart"], "preserved");
+        assert_eq!(
+            document["@graph"][0][SCHEMA_SUBJECT_HTTPS_IRI]["@id"],
+            "#aruna-export-report"
+        );
+        assert_eq!(
+            document["@graph"][0][SCHEMA_HAS_PART_HTTPS_IRI]["@id"],
+            REPORT_PATH
+        );
+        assert_eq!(
+            document["@graph"][2][SCHEMA_ENCODING_HTTPS_IRI],
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn scan_ignores_aliases() {
+        let document = json!({
+            "@context": {"node": "@id"},
+            "@graph": [
+                {"node": "old"},
+                {"name": "old"}
+            ]
+        });
+        let found = scan_unrewritten(
+            &document,
+            &BTreeMap::from([("old".to_string(), "new".to_string())]),
+        );
+
+        assert_eq!(found, BTreeSet::from(["old".to_string()]));
+    }
+
+    #[test]
+    fn rejects_report_collision() {
+        let mut document = json!({
+            "@graph": [
+                {"@id": "./", "@type": "Dataset"},
+                {"@id": REPORT_PATH, "@type": "File"}
+            ]
+        });
+
+        assert!(matches!(
+            add_report(&mut document),
+            Err(ExportFailure::Permanent(message))
+                if message.contains("reserved export report")
+        ));
     }
 
     #[test]
@@ -1787,8 +2152,20 @@ mod tests {
         let mut document = json!({
             "@context": "https://w3id.org/ro/crate/1.2/context",
             "@graph": [
-                {"@id": "./", "@type": "Dataset", "hasPart": {"@id": "old"}},
-                {"@id": METADATA_PATH, "@type": "CreativeWork", "about": {"@id": "./"}},
+                {
+                    "@id": "./",
+                    "@type": "Dataset",
+                    "name": "test",
+                    "description": "test crate",
+                    "datePublished": "2026-07-23",
+                    "hasPart": {"@id": "old"}
+                },
+                {
+                    "@id": METADATA_PATH,
+                    "@type": "CreativeWork",
+                    "about": {"@id": "./"},
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"}
+                },
                 {"@id": "old", "@type": "File"}
             ]
         });
@@ -1806,6 +2183,7 @@ mod tests {
             document["@graph"][0]["subjectOf"]["@id"],
             JsonValue::String("#aruna-export-report".to_string())
         );
+        craqle::validate_rocrate_jsonld(&document.to_string()).unwrap();
     }
 
     #[test]
@@ -1818,7 +2196,7 @@ mod tests {
                 file_entity("included", None),
             ]
         });
-        let mut entities = recognize_entities(&document, realm_id).unwrap();
+        let mut entities = recognized_entities(&document, realm_id).unwrap();
         entities[1].omission = Some(ReasonCode::Denied);
         let rows = build_rows(&entities, &BTreeSet::new());
 

@@ -406,6 +406,7 @@ pub struct ImportReportDetail {
     pub size: Option<u64>,
     pub arn: Option<String>,
     pub w3id: Option<String>,
+    pub validation: Option<crate::metadata::MetadataValidationViolation>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -422,6 +423,7 @@ pub struct ExportReportDetail {
     pub zip_path: Option<String>,
     pub source: Option<ExportReportSource>,
     pub resolved_version: Option<Ulid>,
+    pub validation: Option<crate::metadata::MetadataValidationViolation>,
 }
 
 pub type ImportReportRow = JobReportRow<ImportReportDetail>;
@@ -600,11 +602,19 @@ impl JobPayload {
         }
     }
 
-    /// Canonical plan digest: BLAKE3 over the postcard encoding of the payload.
+    /// Canonical plan digest: BLAKE3 over the logical postcard payload.
     /// The same idempotency identity with a matching digest is an idempotent
     /// create; a differing digest is a `JobPlanConflict`.
     pub fn plan_digest(&self) -> [u8; 32] {
-        let bytes = postcard::to_allocvec(self).expect("payload postcard is infallible");
+        let bytes = match self {
+            JobPayload::ImportRoCrate(spec) => {
+                let mut spec = spec.clone();
+                spec.document_id = Ulid::nil();
+                postcard::to_allocvec(&JobPayload::ImportRoCrate(spec))
+            }
+            _ => postcard::to_allocvec(self),
+        }
+        .expect("payload postcard is infallible");
         *blake3::hash(&bytes).as_bytes()
     }
 }

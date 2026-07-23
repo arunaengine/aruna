@@ -1857,7 +1857,7 @@ dependencies = [
 [[package]]
 name = "craqle"
 version = "0.1.1"
-source = "git+https://github.com/arunaengine/craqle?branch=feat%2Frocrate-fidelity#aeb25642416a9f97736ea6c642dbe58ff9e1d95c"
+source = "git+https://github.com/arunaengine/craqle?branch=feat%2Frocrate-fidelity#c7a0e66db2a8d8b63f0edb353204a0952ee3f835"
 dependencies = [
  "blake3",
  "chrono",
@@ -2239,7 +2239,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.119",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -5595,7 +5595,7 @@ dependencies = [
  "oxilangtag",
  "oxiri",
  "oxsdatatypes",
- "rand 0.9.5",
+ "rand 0.8.7",
  "serde",
  "thiserror 2.0.18",
 ]
@@ -7441,7 +7441,7 @@ dependencies = [
  "oxiri",
  "oxrdf",
  "oxsdatatypes",
- "rand 0.9.5",
+ "rand 0.8.7",
  "regex",
  "rustc-hash",
  "sha1 0.10.7",
@@ -7462,7 +7462,7 @@ dependencies = [
  "oxiri",
  "oxrdf",
  "peg",
- "rand 0.9.5",
+ "rand 0.8.7",
  "thiserror 2.0.18",
 ]
 
@@ -7473,7 +7473,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aed7a854b8ea67618f8ce69aabb0e904d7704226060e9d5a2930eb3136c3fa3b"
 dependencies = [
  "oxrdf",
- "rand 0.9.5",
+ "rand 0.8.7",
  "spargebra",
 ]
 
@@ -9077,7 +9077,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
