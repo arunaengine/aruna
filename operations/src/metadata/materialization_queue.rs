@@ -1795,22 +1795,22 @@ fn graph_materialization_effect(
     }
     .normalized();
     let deterministic_actor = Some(deterministic_materialization_actor(event.event_id));
-    if let Some(raw_revision) = raw_revision {
-        if matches!(
+    if let Some(raw_revision) = raw_revision
+        && matches!(
             &event.payload,
             MetadataCreateEventPayload::UpsertDataEntity { .. }
                 | MetadataCreateEventPayload::UpsertContextualEntity { .. }
-        ) {
-            return Effect::Metadata(MetadataEffect::ApplyRoCrate {
-                request: MetadataApplyRoCrateRequest {
-                    graph_iri: event.record.graph_iri.clone(),
-                    jsonld: raw_revision.jsonld.clone(),
-                    policy,
-                    durability: MetadataRequestDurability::WalAlreadyDurable,
-                    deterministic_actor,
-                },
-            });
-        }
+        )
+    {
+        return Effect::Metadata(MetadataEffect::ApplyRoCrate {
+            request: MetadataApplyRoCrateRequest {
+                graph_iri: event.record.graph_iri.clone(),
+                jsonld: raw_revision.jsonld.clone(),
+                policy,
+                durability: MetadataRequestDurability::WalAlreadyDurable,
+                deterministic_actor,
+            },
+        });
     }
     match &event.payload {
         MetadataCreateEventPayload::Scaffold {

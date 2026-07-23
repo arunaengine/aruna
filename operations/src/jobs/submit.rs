@@ -484,8 +484,10 @@ mod tests {
 
     fn rocrate_spec(limit: u32, dedup_key: Option<Vec<u8>>) -> SubmitJobSpec {
         let base = spec(dedup_key);
-        let mut limits = RoCrateLimits::default();
-        limits.max_active_jobs = limit;
+        let limits = RoCrateLimits {
+            max_active_jobs: limit,
+            ..RoCrateLimits::default()
+        };
         SubmitJobSpec {
             payload: JobPayload::ImportRoCrate(ImportRoCrateSpec {
                 auth_context: AuthContext {

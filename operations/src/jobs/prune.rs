@@ -346,8 +346,10 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let job_id = JobId::from_bytes([6u8; 16]);
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
-        let mut limits = RoCrateLimits::default();
-        limits.artifact_retention_ms = 1;
+        let limits = RoCrateLimits {
+            artifact_retention_ms: 1,
+            ..RoCrateLimits::default()
+        };
         let retention_ms = limits.artifact_retention_ms;
         let mut record = JobRecord::new(
             job_id,

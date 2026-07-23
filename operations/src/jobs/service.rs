@@ -29,6 +29,7 @@ use crate::metadata::repository::StorageReadError;
 /// Submit a container execution job on behalf of `created_by`. The drain claims it
 /// and drives the fenced external attempt lifecycle. The idempotency key is
 /// namespaced per user, disjoint from internal obligation keys.
+#[allow(clippy::too_many_arguments)]
 pub async fn submit_execution_job(
     context: &DriverContext,
     spec: ExecutionSpec,

@@ -149,6 +149,7 @@ pub struct WrappingService {
 
 impl S3Server {
     #[tracing::instrument(level = "trace", skip(address, hostname, driver_ctx, metrics))]
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         address: impl Into<String> + Copy,
         hostname: impl Into<String>,
