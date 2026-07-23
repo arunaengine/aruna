@@ -193,6 +193,23 @@ impl BlobHandler {
                             self.read_blob_range(location, range).await
                         }
                         BlobEffect::Delete { location } => self.delete_blob(location).await,
+                        BlobEffect::SpoolHidden {
+                            namespace,
+                            name,
+                            created_by,
+                            max_bytes,
+                            blob,
+                        } => {
+                            self.spool_hidden_blob(namespace, &name, created_by, max_bytes, blob)
+                                .await
+                        }
+                        BlobEffect::ReadHiddenRange { location, range } => {
+                            self.read_hidden_range(location, range).await
+                        }
+                        BlobEffect::DeleteHidden { key } => self.delete_hidden_blob(key).await,
+                        BlobEffect::ListHidden { namespace } => {
+                            self.list_hidden_blobs(namespace).await
+                        }
                         BlobEffect::OpenConnection { node_id } => {
                             self.open_connection(node_id).await
                         }
