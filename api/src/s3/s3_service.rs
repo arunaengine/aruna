@@ -20,10 +20,10 @@ use aruna_core::NodeId;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
-    ArunaArn, AuthContext, BlobHeadKey, BucketInfo, Permission, RealmId, RoCrateLimits, SyncMode,
-    SyncRelationship, SyncState, SyncStatusSnapshot, UserAccess, WatchEvent, WatchEventDetail,
-    WatchEventKind, blob_bucket_permission_path, blob_object_permission_path,
-    data_watch_resource_path,
+    ArunaArn, AuthContext, BlobHeadKey, BucketInfo, OBJECT_CONTENT_TYPE_KEY, Permission, RealmId,
+    RoCrateLimits, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot, UserAccess,
+    WatchEvent, WatchEventDetail, WatchEventKind, blob_bucket_permission_path,
+    blob_object_permission_path, data_watch_resource_path,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
@@ -156,6 +156,19 @@ fn object_range_request(range: s3s::dto::Range) -> ObjectRangeRequest {
         },
         s3s::dto::Range::Suffix { length } => ObjectRangeRequest::Suffix { length },
     }
+}
+
+fn object_metadata(
+    mut metadata: std::collections::HashMap<String, String>,
+    content_type: Option<&str>,
+) -> std::collections::HashMap<String, String> {
+    if let Some(content_type) = content_type {
+        metadata.insert(
+            OBJECT_CONTENT_TYPE_KEY.to_string(),
+            content_type.to_string(),
+        );
+    }
+    metadata
 }
 
 fn etag_condition_value(condition: &ETagCondition) -> String {
@@ -808,6 +821,7 @@ impl ArunaS3Service {
         version_created_at: Option<SystemTime>,
     ) -> ObjectResponseFields {
         let mut response_metadata = metadata.cloned().unwrap_or_default();
+        let content_type = response_metadata.remove(OBJECT_CONTENT_TYPE_KEY);
         if let Some(source_headers) = source_metadata
             .and_then(|metadata| self.source_metadata_headers(metadata, last_refresh))
         {
@@ -818,7 +832,9 @@ impl ArunaS3Service {
             content_length: location
                 .map(|location| location.blob_size as i64)
                 .or_else(|| source_metadata.map(|metadata| metadata.content_length as i64)),
-            content_type: source_metadata.and_then(|metadata| metadata.content_type.clone()),
+            content_type: source_metadata
+                .and_then(|metadata| metadata.content_type.clone())
+                .or(content_type),
             e_tag: location
                 .and_then(|location| {
                     location
@@ -1553,7 +1569,10 @@ impl S3 for ArunaS3Service {
                 move || headers.read(Clone::clone),
             ));
         }
-        let metadata = req.input.metadata.clone().unwrap_or_default();
+        let metadata = object_metadata(
+            req.input.metadata.clone().unwrap_or_default(),
+            req.input.content_type.as_deref(),
+        );
         let input = convert_input(req.input)?;
         let operation = PutObjectOperation::new(PutObjectConfig {
             user_id: user_access.user_identity,
@@ -1719,7 +1738,12 @@ impl S3 for ArunaS3Service {
                 node_id: self.node_id,
                 quota_ceiling,
                 conditions,
-                metadata: metadata_replace.then(|| req.input.metadata.clone().unwrap_or_default()),
+                metadata: metadata_replace.then(|| {
+                    object_metadata(
+                        req.input.metadata.clone().unwrap_or_default(),
+                        req.input.content_type.as_deref(),
+                    )
+                }),
             },
         )
         .await
@@ -1799,7 +1823,10 @@ impl S3 for ArunaS3Service {
             created_by: user_access.user_identity,
             checksum_hint: checksum_hint.clone(),
         })
-        .with_metadata(req.input.metadata.clone().unwrap_or_default());
+        .with_metadata(object_metadata(
+            req.input.metadata.clone().unwrap_or_default(),
+            req.input.content_type.as_deref(),
+        ));
 
         let result = drive(operation, &self.state)
             .await
@@ -3363,6 +3390,28 @@ mod tests {
                 rocrate_limits: RoCrateLimits::default(),
             },
         )
+    }
+
+    #[test]
+    fn tracks_content_type() {
+        let realm_id = RealmId([1u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let (_dir, service) = parser_service(realm_id, node_id);
+        let metadata = object_metadata(
+            HashMap::from([("user".to_string(), "value".to_string())]),
+            Some("application/vnd.eln+zip"),
+        );
+
+        let fields = service.build_object_response_fields(None, Some(&metadata), None, None, None);
+
+        assert_eq!(
+            fields.content_type.as_deref(),
+            Some("application/vnd.eln+zip")
+        );
+        assert_eq!(
+            fields.metadata,
+            Some(HashMap::from([("user".to_string(), "value".to_string())]))
+        );
     }
 
     fn replication_config(bucket: String) -> ReplicationConfiguration {

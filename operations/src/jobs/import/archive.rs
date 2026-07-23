@@ -274,7 +274,15 @@ fn normalize_entry_path(value: &str) -> Result<String, String> {
     if value.is_empty() {
         return Err("archive contains an empty path".to_string());
     }
-    validate_relative_path(value)?;
+    if value.starts_with('/') {
+        return Err(format!("unsafe relative path `{value}`"));
+    }
+    let value = value
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    validate_relative_path(&value)?;
     Ok(value.nfc().collect())
 }
 
@@ -399,6 +407,16 @@ mod tests {
             assert!(normalize_entry_path(path).is_err(), "{path}");
         }
         assert!(file_id_candidates("data%2Fsecret").is_err());
+    }
+
+    #[test]
+    fn path_collapses_slashes() {
+        assert_eq!(
+            normalize_entry_path("wrapper/data//file.txt").unwrap(),
+            "wrapper/data/file.txt"
+        );
+        assert!(normalize_entry_path("//server/file.txt").is_err());
+        assert!(normalize_entry_path("data//../file.txt").is_err());
     }
 
     #[test]

@@ -14,6 +14,7 @@ use ulid::Ulid;
 
 const ACCESS_KEY_MAX_LEN: usize = 128;
 pub const HIDDEN_BLOB_PREFIX: &str = "_jobs";
+pub const OBJECT_CONTENT_TYPE_KEY: &str = "aruna.internal.content-type";
 
 pub fn ensure_confined_relative_path(path: &Path) -> Result<(), ConversionError> {
     for component in path.components() {

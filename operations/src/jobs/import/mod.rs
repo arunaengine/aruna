@@ -1,7 +1,18 @@
 mod archive;
+#[cfg(test)]
+mod consortium;
 mod reader;
 mod rewrite;
 mod upload;
+
+#[cfg(test)]
+pub(crate) mod fixture {
+    pub(crate) use super::archive::{
+        file_id_candidates, inspect_archive, open_archive, payload_entries, read_metadata,
+        signature_entry,
+    };
+    pub(crate) use super::rewrite::{RewriteTarget, rewrite_document, validate_document};
+}
 
 pub use upload::{
     UploadClaimError, claim_rocrate_upload, delete_rocrate_upload, read_rocrate_upload,
@@ -14,7 +25,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use aruna_core::effects::{BlobEffect, StorageEffect};
-use aruna_core::errors::BlobError;
+use aruna_core::errors::{BlobError, SourceConnectorResolutionError, StagingSourceError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::ROCRATE_JOB_STATE_KEYSPACE;
 use aruna_core::metadata::MetadataValidationViolation;
@@ -23,8 +34,9 @@ use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::{
     ARUNA_DATA_PREFIX, Actor, AuthContext, BackendLocation, BucketInfo, ImportReportDetail,
     ImportReportRow, ImportRoCrateResult, ImportRoCrateSource, ImportRoCrateSpec, JobError,
-    JobResultPayload, MetadataRegistryRecord, Permission, ReasonCode, RoCrateCheckpointRefs,
-    RoCrateMediaType, VersionedObjectArn, blob_bucket_permission_path, blob_object_permission_path,
+    JobResultPayload, MetadataRegistryRecord, OBJECT_CONTENT_TYPE_KEY, Permission, ReasonCode,
+    RoCrateCheckpointRefs, RoCrateMediaType, VersionedObjectArn, blob_bucket_permission_path,
+    blob_object_permission_path,
 };
 use aruna_core::types::Value;
 use bytes::Bytes;
@@ -57,9 +69,11 @@ use crate::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
 };
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-use crate::s3::get_object::{GetObjectInput, GetObjectOperation};
+use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-use crate::staging::read_source::{ReadStagingSourceInput, ReadStagingSourceOperation};
+use crate::staging::read_source::{
+    ReadStagingSourceError, ReadStagingSourceInput, ReadStagingSourceOperation,
+};
 
 const PAYLOAD_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -195,7 +209,11 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
                     return retryable_error(error);
                 }
             }
-            Err(ImportFailure::Retryable(error)) => return retryable_error(error),
+            Err(ImportFailure::Retryable(error))
+                if !ctx.final_attempt || checkpoint.phase == ImportPhase::Cleanup =>
+            {
+                return retryable_error(error);
+            }
             Err(ImportFailure::Cancelled) => {
                 checkpoint.cancelled = true;
                 if let Err(error) = mark_not_attempted(ctx, &mut checkpoint).await {
@@ -217,7 +235,7 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
                     return retryable_error(error);
                 }
             }
-            Err(ImportFailure::Permanent(error)) => {
+            Err(ImportFailure::Retryable(error) | ImportFailure::Permanent(error)) => {
                 if let Err(report_error) = write_phase_error(ctx, checkpoint.phase, &error).await {
                     return retryable_error(report_error);
                 }
@@ -294,7 +312,7 @@ async fn acquire_source(
             )
             .await
             .and_then(|result| result.transpose())
-            .map_err(|error| ImportFailure::Retryable(error.to_string()))?
+            .map_err(classify_get)?
             .ok_or_else(|| ImportFailure::Permanent("source object not found".to_string()))?;
             let expected_size = result
                 .location
@@ -306,11 +324,21 @@ async fn acquire_source(
                         .as_ref()
                         .map(|metadata| metadata.content_length)
                 });
+            let content_type = result
+                .source_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.content_type.as_deref())
+                .or_else(|| {
+                    result
+                        .metadata
+                        .get(OBJECT_CONTENT_TYPE_KEY)
+                        .map(String::as_str)
+                });
             spool_source(
                 ctx,
                 result.blob,
                 expected_size,
-                key_uses_eln(key),
+                source_uses_eln(key, content_type),
                 None,
                 spec.limits.import_source_bytes,
                 spec.auth_context.user_id,
@@ -345,12 +373,12 @@ async fn acquire_source(
                 &ctx.driver,
             )
             .await
-            .map_err(|error| ImportFailure::Retryable(error.to_string()))?;
+            .map_err(classify_read)?;
             spool_source(
                 ctx,
                 result.stream,
                 Some(result.metadata.content_length),
-                key_uses_eln(path),
+                source_uses_eln(path, result.metadata.content_type.as_deref()),
                 None,
                 spec.limits.import_source_bytes,
                 spec.auth_context.user_id,
@@ -411,16 +439,13 @@ async fn spool_source(
                 eln,
             })
         }
-        Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { limit })) => Err(
-            ImportFailure::Permanent(format!("import source exceeds limit {limit}")),
-        ),
         Event::Blob(BlobEvent::Error(_)) if ctx.cancel.is_cancelled() => {
             Err(ImportFailure::Cancelled)
         }
         Event::Blob(BlobEvent::Error(_)) if ctx.shutdown.is_cancelled() => {
             Err(ImportFailure::Interrupted)
         }
-        Event::Blob(BlobEvent::Error(error)) => Err(ImportFailure::Retryable(error.to_string())),
+        Event::Blob(BlobEvent::Error(error)) => Err(classify_blob(error)),
         other => Err(ImportFailure::Retryable(format!(
             "unexpected hidden spool event: {other:?}"
         ))),
@@ -1292,10 +1317,13 @@ fn source_permission_path(
     }
 }
 
-fn key_uses_eln(path: &str) -> bool {
+fn source_uses_eln(path: &str, content_type: Option<&str>) -> bool {
     path.rsplit(['/', '\\'])
         .next()
         .is_some_and(|name| name.to_ascii_lowercase().ends_with(".eln"))
+        || content_type
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/vnd.eln+zip"))
 }
 
 fn validation_failure(error: CrateValidationError) -> ImportFailure {
@@ -1333,6 +1361,66 @@ fn classify_put(error: PutObjectError) -> ImportFailure {
         }
         _ => ImportFailure::Permanent(error.to_string()),
     }
+}
+
+fn classify_get(error: GetObjectError) -> ImportFailure {
+    let permanent = match &error {
+        GetObjectError::ConversionError(_)
+        | GetObjectError::NoSuchKey
+        | GetObjectError::NoSuchVersion
+        | GetObjectError::DeleteMarker
+        | GetObjectError::InvalidRange => true,
+        GetObjectError::ResolveReferenceError(error) => permanent_resolve(error),
+        GetObjectError::StagingSourceError(error) => permanent_staging(error),
+        _ => false,
+    };
+    if permanent {
+        ImportFailure::Permanent(error.to_string())
+    } else {
+        ImportFailure::Retryable(error.to_string())
+    }
+}
+
+fn classify_read(error: ReadStagingSourceError) -> ImportFailure {
+    let permanent = match &error {
+        ReadStagingSourceError::Resolve(error) => permanent_resolve(error),
+        ReadStagingSourceError::Staging(error) => permanent_staging(error),
+        _ => false,
+    };
+    if permanent {
+        ImportFailure::Permanent(error.to_string())
+    } else {
+        ImportFailure::Retryable(error.to_string())
+    }
+}
+
+fn classify_blob(error: BlobError) -> ImportFailure {
+    match error {
+        BlobError::SizeLimitExceeded { limit } => {
+            ImportFailure::Permanent(format!("import source exceeds limit {limit}"))
+        }
+        error @ BlobError::StreamFailed(_) => ImportFailure::Permanent(error.to_string()),
+        error => ImportFailure::Retryable(error.to_string()),
+    }
+}
+
+fn permanent_resolve(error: &SourceConnectorResolutionError) -> bool {
+    matches!(
+        error,
+        SourceConnectorResolutionError::ConversionError(_)
+            | SourceConnectorResolutionError::NotFound
+            | SourceConnectorResolutionError::UnsupportedConnectorKind(_)
+            | SourceConnectorResolutionError::InvalidSourcePath
+    )
+}
+
+fn permanent_staging(error: &StagingSourceError) -> bool {
+    matches!(
+        error,
+        StagingSourceError::NotFound
+            | StagingSourceError::AccessDenied
+            | StagingSourceError::UnsupportedKind(_)
+    )
 }
 
 fn metadata_is_transient(error: &MetadataWriteError) -> bool {
@@ -1427,8 +1515,43 @@ mod tests {
     }
 
     #[test]
-    fn detects_eln_name() {
-        assert!(key_uses_eln("exports/Experiment.ELN"));
-        assert!(!key_uses_eln("exports/experiment.zip"));
+    fn detects_eln_source() {
+        assert!(source_uses_eln("exports/Experiment.ELN", None));
+        assert!(source_uses_eln(
+            "exports/experiment.zip",
+            Some("Application/Vnd.Eln+Zip; version=1")
+        ));
+        assert!(!source_uses_eln(
+            "exports/experiment.zip",
+            Some("application/zip")
+        ));
+    }
+
+    #[test]
+    fn classifies_source_errors() {
+        assert!(matches!(
+            classify_get(GetObjectError::NoSuchKey),
+            ImportFailure::Permanent(_)
+        ));
+        assert!(matches!(
+            classify_get(GetObjectError::StorageError(
+                aruna_core::errors::StorageError::Timeout
+            )),
+            ImportFailure::Retryable(_)
+        ));
+        assert!(matches!(
+            classify_read(ReadStagingSourceError::Resolve(
+                SourceConnectorResolutionError::NotFound
+            )),
+            ImportFailure::Permanent(_)
+        ));
+        assert!(matches!(
+            classify_blob(BlobError::StreamFailed("source read failed".to_string())),
+            ImportFailure::Permanent(_)
+        ));
+        assert!(matches!(
+            classify_blob(BlobError::WriteError("backend failed".to_string())),
+            ImportFailure::Retryable(_)
+        ));
     }
 }

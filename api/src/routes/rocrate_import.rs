@@ -9,13 +9,13 @@ use aruna_core::events::{BlobEvent, Event};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
     AuthContext, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget,
-    MetadataRegistryRecord, Permission, RoCrateMediaType, RoCrateUploadRecord,
+    JobPayload, MetadataRegistryRecord, Permission, RoCrateMediaType, RoCrateUploadRecord,
     blob_bucket_permission_path, blob_object_permission_path, user_dedup_key,
 };
 use aruna_operations::blob::hidden::delete_hidden;
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::import::{read_rocrate_upload, write_rocrate_upload};
-use aruna_operations::jobs::service::{read_owned_job, submit_rocrate_import};
+use aruna_operations::jobs::service::{lookup_job_dedup, read_owned_job, submit_rocrate_import};
 use aruna_operations::list_metadata_documents::ListMetadataDocumentsOperation;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
@@ -246,15 +246,9 @@ pub async fn submit_import(
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let document_id = Ulid::generate();
-    let source = fast_source_check(
-        &state,
-        &auth,
-        request.source,
-        request.idempotency_key.as_deref(),
-    )
-    .await?;
-    let target = fast_target_check(&state, &auth, request.target).await?;
-    let metadata = fast_metadata_check(&state, &auth, request.metadata, document_id).await?;
+    let source = parse_import_source(request.source)?;
+    let target = parse_import_target(request.target, state.rocrate_limits().key_bytes)?;
+    let metadata = parse_import_metadata(request.metadata, state.rocrate_limits().key_bytes)?;
     let spec = ImportRoCrateSpec {
         auth_context: auth,
         source,
@@ -263,14 +257,39 @@ pub async fn submit_import(
         limits: state.rocrate_limits().clone(),
         document_id,
     };
-    let result = submit_rocrate_import(
-        &state.get_ctx(),
-        spec,
-        state.get_node_id(),
-        request.idempotency_key,
-    )
-    .await
-    .map_err(map_submit_error)?;
+    let replay = if let Some(idempotency_key) = request.idempotency_key.as_deref() {
+        lookup_job_dedup(
+            &state.get_ctx(),
+            spec.auth_context.user_id,
+            idempotency_key,
+            JobPayload::ImportRoCrate(spec.clone()).plan_digest(),
+        )
+        .await
+        .map_err(map_submit_error)?
+    } else {
+        None
+    };
+    let result = if let Some(result) = replay {
+        result
+    } else {
+        fast_source_check(
+            &state,
+            &spec.auth_context,
+            &spec.source,
+            request.idempotency_key.as_deref(),
+        )
+        .await?;
+        fast_target_check(&state, &spec.auth_context, &spec.target).await?;
+        fast_metadata_check(&state, &spec.auth_context, &spec.metadata, document_id).await?;
+        submit_rocrate_import(
+            &state.get_ctx(),
+            spec,
+            state.get_node_id(),
+            request.idempotency_key,
+        )
+        .await
+        .map_err(map_submit_error)?
+    };
     let urls = job_urls(&state, result.job_id).await?;
     Ok((
         StatusCode::ACCEPTED,
@@ -284,26 +303,93 @@ pub async fn submit_import(
     ))
 }
 
+fn parse_import_source(source: ImportSourceRequest) -> ServerResult<ImportRoCrateSource> {
+    match source {
+        ImportSourceRequest::Upload { upload_id } => Ok(ImportRoCrateSource::Upload {
+            upload_id: parse_ulid(&upload_id)?,
+        }),
+        ImportSourceRequest::Object {
+            bucket,
+            key,
+            version,
+        } => {
+            if bucket.is_empty() || key.is_empty() {
+                return Err(ServerError::BadRequest);
+            }
+            Ok(ImportRoCrateSource::Object {
+                bucket,
+                key,
+                version: version.as_deref().map(parse_ulid).transpose()?,
+            })
+        }
+        ImportSourceRequest::Connector {
+            group_id,
+            connector_id,
+            path,
+        } => {
+            validate_source_path(&path)?;
+            Ok(ImportRoCrateSource::Connector {
+                group_id: parse_ulid(&group_id)?,
+                connector_id: parse_ulid(&connector_id)?,
+                path,
+            })
+        }
+    }
+}
+
+fn parse_import_target(
+    target: ImportTargetRequest,
+    key_limit: u64,
+) -> ServerResult<ImportRoCrateTarget> {
+    let prefix = target.prefix.trim_matches('/').to_string();
+    if target.bucket.is_empty()
+        || prefix.len() as u64 > key_limit
+        || prefix.contains('\\')
+        || prefix.chars().any(char::is_control)
+        || (!prefix.is_empty()
+            && prefix
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == ".."))
+    {
+        return Err(ServerError::BadRequest);
+    }
+    Ok(ImportRoCrateTarget {
+        bucket: target.bucket,
+        prefix,
+    })
+}
+
+fn parse_import_metadata(
+    metadata: ImportMetadataRequest,
+    key_limit: u64,
+) -> ServerResult<ImportMetadataTarget> {
+    let path = MetadataRegistryRecord::normalize_document_path(&metadata.path);
+    if path.is_empty() || path.len() as u64 > key_limit {
+        return Err(ServerError::BadRequest);
+    }
+    Ok(ImportMetadataTarget {
+        group_id: parse_ulid(&metadata.group_id)?,
+        path,
+        public: metadata.public,
+    })
+}
+
 async fn fast_source_check(
     state: &ServerState,
     auth: &AuthContext,
-    source: ImportSourceRequest,
+    source: &ImportRoCrateSource,
     idempotency_key: Option<&str>,
-) -> ServerResult<ImportRoCrateSource> {
+) -> ServerResult<()> {
     match source {
-        ImportSourceRequest::Upload { upload_id } => {
-            let upload_id = parse_ulid(&upload_id)?;
-            let record = read_rocrate_upload(&state.get_ctx().storage_handle, upload_id)
+        ImportRoCrateSource::Upload { upload_id } => {
+            let record = read_rocrate_upload(&state.get_ctx().storage_handle, *upload_id)
                 .await
                 .map_err(ServerError::InternalError)?
                 .ok_or(ServerError::NotFound)?;
             if record.owner != auth.user_id {
                 return Err(ServerError::Forbidden);
             }
-            if record.expires_at_ms <= aruna_core::util::unix_timestamp_millis() {
-                return Err(ServerError::BadRequestReason("upload expired".to_string()));
-            }
-            if let Some(job_id) = record.claimed_by {
+            let reclaimed = if let Some(job_id) = record.claimed_by {
                 let dedup_key = idempotency_key.map(|key| user_dedup_key(auth.user_id, key));
                 let claimed = read_owned_job(&state.get_ctx(), auth.user_id, job_id)
                     .await
@@ -320,24 +406,26 @@ async fn fast_source_check(
                         "upload is already claimed by job {job_id}"
                     )));
                 }
+                true
+            } else {
+                false
+            };
+            if !reclaimed && record.expires_at_ms <= aruna_core::util::unix_timestamp_millis() {
+                return Err(ServerError::BadRequestReason("upload expired".to_string()));
             }
             if record.size > state.rocrate_limits().import_source_bytes {
                 return Err(ServerError::BadRequestReason(
                     "upload exceeds the import source cap".to_string(),
                 ));
             }
-            Ok(ImportRoCrateSource::Upload { upload_id })
+            Ok(())
         }
-        ImportSourceRequest::Object {
+        ImportRoCrateSource::Object {
             bucket,
             key,
             version,
         } => {
-            if bucket.is_empty() || key.is_empty() {
-                return Err(ServerError::BadRequest);
-            }
-            let version = version.as_deref().map(parse_ulid).transpose()?;
-            let bucket_info = load_bucket(state, &bucket).await?;
+            let bucket_info = load_bucket(state, bucket).await?;
             ensure_permission(
                 state,
                 auth,
@@ -345,8 +433,8 @@ async fn fast_source_check(
                     state.get_realm_id(),
                     bucket_info.group_id,
                     state.get_node_id(),
-                    &bucket,
-                    &key,
+                    bucket,
+                    key,
                 ),
                 Permission::READ,
             )
@@ -355,7 +443,7 @@ async fn fast_source_check(
                 HeadObjectOperation::new(HeadObjectInput {
                     bucket: bucket.clone(),
                     key: key.clone(),
-                    version_id: version,
+                    version_id: *version,
                 }),
                 &state.get_ctx(),
             )
@@ -381,31 +469,24 @@ async fn fast_source_check(
                     "object exceeds the import source cap".to_string(),
                 ));
             }
-            Ok(ImportRoCrateSource::Object {
-                bucket,
-                key,
-                version,
-            })
+            Ok(())
         }
-        ImportSourceRequest::Connector {
+        ImportRoCrateSource::Connector {
             group_id,
             connector_id,
             path,
         } => {
-            let group_id = parse_ulid(&group_id)?;
-            let connector_id = parse_ulid(&connector_id)?;
-            validate_source_path(&path)?;
             ensure_permission(
                 state,
                 auth,
-                source_permission_path(state, group_id, connector_id, &path),
+                source_permission_path(state, *group_id, *connector_id, path),
                 Permission::READ,
             )
             .await?;
             let result = drive(
                 HeadStagingSourceOperation::new(HeadStagingSourceInput {
-                    group_id,
-                    connector_id,
+                    group_id: *group_id,
+                    connector_id: *connector_id,
                     source_path: path.clone(),
                 }),
                 &state.get_ctx(),
@@ -417,11 +498,7 @@ async fn fast_source_check(
                     "connector source exceeds the import source cap".to_string(),
                 ));
             }
-            Ok(ImportRoCrateSource::Connector {
-                group_id,
-                connector_id,
-                path,
-            })
+            Ok(())
         }
     }
 }
@@ -429,20 +506,8 @@ async fn fast_source_check(
 async fn fast_target_check(
     state: &ServerState,
     auth: &AuthContext,
-    target: ImportTargetRequest,
-) -> ServerResult<ImportRoCrateTarget> {
-    let prefix = target.prefix.trim_matches('/').to_string();
-    if target.bucket.is_empty()
-        || prefix.len() as u64 > state.rocrate_limits().key_bytes
-        || prefix.contains('\\')
-        || prefix.chars().any(char::is_control)
-        || (!prefix.is_empty()
-            && prefix
-                .split('/')
-                .any(|part| part.is_empty() || part == "." || part == ".."))
-    {
-        return Err(ServerError::BadRequest);
-    }
+    target: &ImportRoCrateTarget,
+) -> ServerResult<()> {
     let bucket_info = load_bucket(state, &target.bucket).await?;
     ensure_permission(
         state,
@@ -456,54 +521,43 @@ async fn fast_target_check(
         Permission::WRITE,
     )
     .await?;
-    Ok(ImportRoCrateTarget {
-        bucket: target.bucket,
-        prefix,
-    })
+    Ok(())
 }
 
 async fn fast_metadata_check(
     state: &ServerState,
     auth: &AuthContext,
-    metadata: ImportMetadataRequest,
+    metadata: &ImportMetadataTarget,
     document_id: Ulid,
-) -> ServerResult<ImportMetadataTarget> {
-    let group_id = parse_ulid(&metadata.group_id)?;
-    let path = MetadataRegistryRecord::normalize_document_path(&metadata.path);
-    if path.is_empty() || path.len() as u64 > state.rocrate_limits().key_bytes {
-        return Err(ServerError::BadRequest);
-    }
+) -> ServerResult<()> {
     ensure_permission(
         state,
         auth,
         MetadataRegistryRecord::permission_path_for(
             &state.get_realm_id(),
-            group_id,
-            &path,
+            metadata.group_id,
+            &metadata.path,
             document_id,
         ),
         Permission::WRITE,
     )
     .await?;
     let records = drive(
-        ListMetadataDocumentsOperation::new(group_id),
+        ListMetadataDocumentsOperation::new(metadata.group_id),
         &state.get_ctx(),
     )
     .await
     .map_err(|error| ServerError::InternalError(error.to_string()))?;
     if records
         .iter()
-        .any(|record| record.document_path == path && record.document_id != document_id)
+        .any(|record| record.document_path == metadata.path && record.document_id != document_id)
     {
         return Err(ServerError::Conflict(format!(
-            "metadata path `{path}` already exists"
+            "metadata path `{}` already exists",
+            metadata.path
         )));
     }
-    Ok(ImportMetadataTarget {
-        group_id,
-        path,
-        public: metadata.public,
-    })
+    Ok(())
 }
 
 async fn load_bucket(
