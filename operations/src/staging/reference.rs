@@ -796,6 +796,7 @@ mod tests {
                 checksum_type: None,
                 exists: false,
                 version_source: None,
+                preassigned_version_id: None,
                 quota_ceiling: None,
             }),
             context,

@@ -65,6 +65,7 @@ pub const SOURCE_CONNECTOR_SECRET_KEYSPACE: &str = "source_connector_secret";
 pub const JOB_KEYSPACE: &str = "jobs";
 pub const JOB_SCHEDULE_INDEX_KEYSPACE: &str = "job_schedule_index";
 pub const JOB_OWNER_INDEX_KEYSPACE: &str = "job_owner_index";
+pub const JOB_ACTIVE_USER_KEYSPACE: &str = "job_active_user";
 pub const JOB_DEDUP_INDEX_KEYSPACE: &str = "job_dedup_index";
 pub const JOB_RUN_CRATE_KEYSPACE: &str = "job_run_crate";
 pub const JOB_ATTEMPT_CONTROL_KEYSPACE: &str = "job_attempt_control";

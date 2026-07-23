@@ -12,6 +12,7 @@ use aruna_core::onboarding::{
 use aruna_core::structs::{
     BlobTimeoutConfig, DynamicDiscoveryMethod, KIND_LABEL_KEY, NodeCapabilities,
     OidcProviderConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
+    RoCrateLimits,
 };
 use aruna_core::util::unix_timestamp_secs;
 use aruna_net::{
@@ -82,6 +83,7 @@ pub struct Config {
     pub s3_host: String,
     pub api_public_url: Option<String>,
     pub s3_public_url: Option<String>,
+    pub rocrate_limits: RoCrateLimits,
     pub s3_address: String,
     pub onboarding_secret: Option<String>,
     pub oidc_providers: Vec<OidcProviderConfig>,
@@ -298,6 +300,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     let s3_host = dotenvy::var("S3_HOST")?;
     let api_public_url = optional_public_url_env("API_PUBLIC_URL")?;
     let s3_public_url = optional_public_url_env("S3_PUBLIC_URL")?;
+    let rocrate_limits = rocrate_limits_env()?;
     let s3_address = dotenvy::var("S3_ADDRESS")?;
     SocketAddr::from_str(&s3_address)?;
     let node_labels = parse_node_labels_env()?;
@@ -435,6 +438,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             s3_host,
             api_public_url,
             s3_public_url,
+            rocrate_limits,
             s3_address,
             onboarding_secret,
             oidc_providers,
@@ -492,6 +496,87 @@ fn fjall_persist_policy_env() -> Result<FjallPersistPolicy, SetupError> {
     value
         .parse::<FjallPersistPolicy>()
         .map_err(|message| invalid_config_value(KEY, value, message))
+}
+
+fn positive_u64_env(key: &'static str, default: u64) -> Result<u64, SetupError> {
+    let Some(value) = optional_nonempty_env(key)? else {
+        return Ok(default);
+    };
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|error| invalid_config_value(key, &value, error))?;
+    if parsed == 0 {
+        return Err(invalid_config_value(
+            key,
+            value,
+            "must be greater than zero",
+        ));
+    }
+    Ok(parsed)
+}
+
+fn positive_u32_env(key: &'static str, default: u32) -> Result<u32, SetupError> {
+    let Some(value) = optional_nonempty_env(key)? else {
+        return Ok(default);
+    };
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|error| invalid_config_value(key, &value, error))?;
+    if parsed == 0 {
+        return Err(invalid_config_value(
+            key,
+            value,
+            "must be greater than zero",
+        ));
+    }
+    Ok(parsed)
+}
+
+fn rocrate_limits_env() -> Result<RoCrateLimits, SetupError> {
+    let defaults = RoCrateLimits::default();
+    let limits = RoCrateLimits {
+        direct_upload_bytes: positive_u64_env(
+            "ROCRATE_DIRECT_UPLOAD_BYTES",
+            defaults.direct_upload_bytes,
+        )?,
+        import_source_bytes: positive_u64_env(
+            "ROCRATE_IMPORT_SOURCE_BYTES",
+            defaults.import_source_bytes,
+        )?,
+        expanded_import_bytes: positive_u64_env(
+            "ROCRATE_EXPANDED_IMPORT_BYTES",
+            defaults.expanded_import_bytes,
+        )?,
+        export_artifact_bytes: positive_u64_env(
+            "ROCRATE_EXPORT_ARTIFACT_BYTES",
+            defaults.export_artifact_bytes,
+        )?,
+        max_entries: positive_u64_env("ROCRATE_MAX_ENTRIES", defaults.max_entries)?,
+        metadata_bytes: positive_u64_env("ROCRATE_METADATA_BYTES", defaults.metadata_bytes)?,
+        key_bytes: positive_u64_env("ROCRATE_KEY_BYTES", defaults.key_bytes)?,
+        upload_retention_ms: positive_u64_env(
+            "ROCRATE_UPLOAD_RETENTION_MS",
+            defaults.upload_retention_ms,
+        )?,
+        artifact_retention_ms: positive_u64_env(
+            "ROCRATE_JOB_RETENTION_MS",
+            defaults.artifact_retention_ms,
+        )?,
+        max_active_jobs: positive_u32_env("ROCRATE_MAX_ACTIVE_JOBS", defaults.max_active_jobs)?,
+        holder_ttl_ms: positive_u64_env("ROCRATE_HOLDER_TTL_MS", defaults.holder_ttl_ms)?,
+        holder_refresh_ms: positive_u64_env(
+            "ROCRATE_HOLDER_REFRESH_MS",
+            defaults.holder_refresh_ms,
+        )?,
+    };
+    if limits.holder_refresh_ms >= limits.holder_ttl_ms {
+        return Err(invalid_config_value(
+            "ROCRATE_HOLDER_REFRESH_MS",
+            limits.holder_refresh_ms.to_string(),
+            "must be less than ROCRATE_HOLDER_TTL_MS",
+        ));
+    }
+    Ok(limits)
 }
 
 fn portal_config_env() -> Result<PortalConfig, SetupError> {
@@ -1313,11 +1398,11 @@ mod tests {
     use super::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, PortalConfig,
         fjall_persist_policy_env, load, load_oidc_providers_from_env, parse_node_labels_env,
-        persist_node_state, portal_config_env, validate_public_url,
+        persist_node_state, portal_config_env, rocrate_limits_env, validate_public_url,
     };
     use aruna_core::structs::{
         DynamicDiscoveryMethod, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
-        StaticRealmEndpoint,
+        RoCrateLimits, StaticRealmEndpoint,
     };
     use aruna_net::{DiscoveryMethod, RelayMethod, endpoint_addr_to_config_string};
     use aruna_storage::{FjallPersistPolicy, FjallStorage};
@@ -1353,6 +1438,121 @@ mod tests {
         for key in portal_env_keys() {
             unsafe { std::env::remove_var(key) };
         }
+    }
+
+    fn rocrate_env_keys() -> [&'static str; 12] {
+        [
+            "ROCRATE_DIRECT_UPLOAD_BYTES",
+            "ROCRATE_IMPORT_SOURCE_BYTES",
+            "ROCRATE_EXPANDED_IMPORT_BYTES",
+            "ROCRATE_EXPORT_ARTIFACT_BYTES",
+            "ROCRATE_MAX_ENTRIES",
+            "ROCRATE_METADATA_BYTES",
+            "ROCRATE_KEY_BYTES",
+            "ROCRATE_UPLOAD_RETENTION_MS",
+            "ROCRATE_JOB_RETENTION_MS",
+            "ROCRATE_MAX_ACTIVE_JOBS",
+            "ROCRATE_HOLDER_TTL_MS",
+            "ROCRATE_HOLDER_REFRESH_MS",
+        ]
+    }
+
+    fn clear_rocrate_env() {
+        for key in rocrate_env_keys() {
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
+    #[tokio::test]
+    async fn rocrate_defaults() {
+        let _guard = env_lock().lock().await;
+        let previous = rocrate_env_keys()
+            .into_iter()
+            .map(|key| (key.to_string(), std::env::var(key).ok()))
+            .collect();
+        clear_rocrate_env();
+
+        assert_eq!(rocrate_limits_env().unwrap(), RoCrateLimits::default());
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn rocrate_overrides() {
+        let _guard = env_lock().lock().await;
+        let previous = rocrate_env_keys()
+            .into_iter()
+            .map(|key| (key.to_string(), std::env::var(key).ok()))
+            .collect();
+        let values = [1_u64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 11];
+        for (key, value) in rocrate_env_keys().into_iter().zip(values) {
+            unsafe { std::env::set_var(key, value.to_string()) };
+        }
+
+        assert_eq!(
+            rocrate_limits_env().unwrap(),
+            RoCrateLimits {
+                direct_upload_bytes: 1,
+                import_source_bytes: 2,
+                expanded_import_bytes: 3,
+                export_artifact_bytes: 4,
+                max_entries: 5,
+                metadata_bytes: 6,
+                key_bytes: 7,
+                upload_retention_ms: 8,
+                artifact_retention_ms: 9,
+                max_active_jobs: 10,
+                holder_ttl_ms: 12,
+                holder_refresh_ms: 11,
+            }
+        );
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn rocrate_rejects_zero() {
+        let _guard = env_lock().lock().await;
+        let previous = rocrate_env_keys()
+            .into_iter()
+            .map(|key| (key.to_string(), std::env::var(key).ok()))
+            .collect();
+        clear_rocrate_env();
+        unsafe { std::env::set_var("ROCRATE_MAX_ENTRIES", "0") };
+
+        assert!(matches!(
+            rocrate_limits_env(),
+            Err(super::SetupError::InvalidConfigValue {
+                key: "ROCRATE_MAX_ENTRIES",
+                ..
+            })
+        ));
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn rocrate_rejects_refresh() {
+        let _guard = env_lock().lock().await;
+        let previous = rocrate_env_keys()
+            .into_iter()
+            .map(|key| (key.to_string(), std::env::var(key).ok()))
+            .collect();
+        clear_rocrate_env();
+        unsafe {
+            std::env::set_var("ROCRATE_HOLDER_TTL_MS", "5");
+            std::env::set_var("ROCRATE_HOLDER_REFRESH_MS", "5");
+        }
+
+        assert!(matches!(
+            rocrate_limits_env(),
+            Err(super::SetupError::InvalidConfigValue {
+                key: "ROCRATE_HOLDER_REFRESH_MS",
+                ..
+            })
+        ));
+
+        restore_env(previous);
     }
 
     #[test]

@@ -1557,6 +1557,7 @@ impl S3 for ArunaS3Service {
             expected_checksums: checksum_request.expected.clone(),
             checksum_type: Some(checksum_request.checksum_type.as_str().to_string()),
             version_source: None,
+            preassigned_version_id: None,
             exists: false,
             quota_ceiling,
         })

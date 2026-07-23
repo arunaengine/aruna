@@ -3,21 +3,23 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    JOB_ATTEMPT_CONTROL_KEYSPACE, JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE,
-    JOB_RUN_CRATE_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE, STAGING_JOB_STATE_KEYSPACE,
+    JOB_ACTIVE_USER_KEYSPACE, JOB_ATTEMPT_CONTROL_KEYSPACE, JOB_DEDUP_INDEX_KEYSPACE,
+    JOB_ENTRY_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE, JOB_RUN_CRATE_KEYSPACE,
+    JOB_SCHEDULE_INDEX_KEYSPACE, ROCRATE_JOB_STATE_KEYSPACE, STAGING_JOB_STATE_KEYSPACE,
 };
 use aruna_core::structs::{
     AttemptControl, AttemptIntent, JobClaim, JobError, JobExecutionClass, JobId, JobPayload,
     JobProgress, JobRecord, JobResultPayload, JobState, JobTransitionError, RunCrateStatus,
     UserAccess, attempt_control_key, cleanup_dedup_key, cleanup_job_id, crate_job_id,
-    encode_job_dedup_value, job_due_index_key, job_lease_index_key, job_owner_cursor,
-    job_owner_index_key, job_owner_index_prefix, job_prune_index_key, job_record_key,
-    job_run_crate_key, parse_job_dedup_value, parse_job_owner_index_key, run_crate_dedup_key,
-    validate_transition, workspace_credential_id,
+    encode_job_dedup_value, job_active_key, job_due_index_key, job_entry_key, job_entry_prefix,
+    job_lease_index_key, job_owner_cursor, job_owner_index_key, job_owner_index_prefix,
+    job_prune_index_key, job_record_key, job_run_crate_key, parse_entry_key, parse_job_dedup_value,
+    parse_job_owner_index_key, run_crate_dedup_key, validate_transition, workspace_credential_id,
 };
 use aruna_core::types::{Key, KeySpace, NodeId, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
+use serde::Serialize;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -47,6 +49,8 @@ pub enum JobMutationError {
     GenerationExhausted,
     #[error("attempt control record is missing")]
     MissingControl,
+    #[error("job report is frozen")]
+    ReportFrozen,
     #[error("attempt control epoch mismatch")]
     EpochMismatch,
     #[error(transparent)]
@@ -74,7 +78,12 @@ fn schedule_index_key_for(record: &JobRecord) -> Key {
         }
         JobState::Succeeded | JobState::Failed | JobState::Cancelled => {
             let finished = record.finished_at_ms.unwrap_or(record.updated_at_ms);
-            job_prune_index_key(finished.saturating_add(JOB_RETENTION_MS), record.job_id)
+            let retention_ms = record
+                .payload
+                .rocrate_limits()
+                .map(|limits| limits.artifact_retention_ms)
+                .unwrap_or(JOB_RETENTION_MS);
+            job_prune_index_key(finished.saturating_add(retention_ms), record.job_id)
         }
     }
 }
@@ -89,7 +98,7 @@ fn empty_value() -> Value {
     ByteView::from(Vec::new())
 }
 
-/// Writes creating a fresh job (<=4 keys); composable into a producer transaction.
+/// Writes creating a fresh job (<=5 keys); composable into a producer transaction.
 pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionError> {
     let mut writes = vec![
         (
@@ -107,6 +116,13 @@ pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionErr
         writes.push((
             JOB_OWNER_INDEX_KEYSPACE.to_string(),
             job_owner_index_key(record.created_by, record.created_at_ms, record.job_id),
+            empty_value(),
+        ));
+    }
+    if record.payload.is_rocrate() && !record.state.is_terminal() {
+        writes.push((
+            JOB_ACTIVE_USER_KEYSPACE.to_string(),
+            job_active_key(record.created_by, record.job_id),
             empty_value(),
         ));
     }
@@ -143,7 +159,17 @@ pub fn job_prune_delete_entries(record: &JobRecord) -> JobDeletes {
             STAGING_JOB_STATE_KEYSPACE.to_string(),
             ByteView::from(record.job_id.to_bytes().to_vec()),
         ),
+        (
+            ROCRATE_JOB_STATE_KEYSPACE.to_string(),
+            ByteView::from(record.job_id.to_bytes().to_vec()),
+        ),
     ];
+    if record.payload.is_rocrate() {
+        deletes.push((
+            JOB_ACTIVE_USER_KEYSPACE.to_string(),
+            job_active_key(record.created_by, record.job_id),
+        ));
+    }
     // Epochs are handed out from 1; every used epoch left a control row.
     for epoch in 1..record.next_attempt_epoch {
         deletes.push((
@@ -175,6 +201,12 @@ fn index_deltas(
         new_schedule,
         empty_value(),
     ));
+    if old.payload.is_rocrate() && !old.state.is_terminal() && new.state.is_terminal() {
+        deletes.push((
+            JOB_ACTIVE_USER_KEYSPACE.to_string(),
+            job_active_key(new.created_by, new.job_id),
+        ));
+    }
 
     // Dedup removal is guarded by job id in cleanup_dedup_entry, not here.
     Ok((writes, deletes))
@@ -282,6 +314,64 @@ pub async fn put_staging_checkpoint(
     ))
 }
 
+pub async fn put_job_entry<T: Serialize>(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    entry_key: &[u8],
+    row: &T,
+) -> Result<(), JobMutationError> {
+    let value = postcard::to_allocvec(row)
+        .map(ByteView::from)
+        .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
+        let txn_id = start_write_txn(storage)
+            .await
+            .map_err(JobMutationError::Storage)?;
+        let result = async {
+            let record = read_job_record(storage, job_id, Some(txn_id))
+                .await
+                .map_err(JobMutationError::Storage)?
+                .ok_or(JobMutationError::NotFound)?;
+            if record.state.is_terminal() {
+                return Err(JobMutationError::ReportFrozen);
+            }
+            guard_token(&record, token)?;
+            batch_write(
+                storage,
+                vec![(
+                    JOB_ENTRY_KEYSPACE.to_string(),
+                    job_entry_key(job_id, entry_key),
+                    value.clone(),
+                )],
+                Some(txn_id),
+            )
+            .await
+            .map_err(JobMutationError::Storage)
+        }
+        .await;
+        match result {
+            Ok(()) => match commit_txn(storage, txn_id).await {
+                CommitResult::Committed => return Ok(()),
+                CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => continue,
+                CommitResult::Conflict => {
+                    return Err(JobMutationError::Storage(
+                        "job entry write exhausted conflict retries".to_string(),
+                    ));
+                }
+                CommitResult::Failed(error) => return Err(JobMutationError::Storage(error)),
+            },
+            Err(error) => {
+                abort_txn(storage, txn_id).await;
+                return Err(error);
+            }
+        }
+    }
+    Err(JobMutationError::Storage(
+        "job entry write exhausted conflict retries".to_string(),
+    ))
+}
+
 async fn mutate_in_txn<F>(
     storage: &StorageHandle,
     txn_id: TxnId,
@@ -304,6 +394,20 @@ where
             if old.state != record.state {
                 validate_transition(old.execution_class, old.state, record.state)?;
             }
+            if !old.state.is_terminal() && record.state.is_terminal() && record.payload.is_rocrate()
+            {
+                let digest = report_digest(storage, txn_id, record.job_id).await?;
+                record.report_digest = Some(digest);
+                match record.result.as_mut() {
+                    Some(JobResultPayload::ImportRoCrate(result)) => {
+                        result.report_digest = digest;
+                    }
+                    Some(JobResultPayload::ExportRoCrate(result)) => {
+                        result.report_digest = digest;
+                    }
+                    _ => {}
+                }
+            }
             let (writes, deletes) = index_deltas(&old, &record)
                 .map_err(|error| JobMutationError::Storage(error.to_string()))?;
             batch_write(storage, writes, Some(txn_id))
@@ -320,6 +424,35 @@ where
             cleanup_dedup_entry(storage, txn_id, &old, &record).await?;
             Ok(record)
         }
+    }
+}
+
+async fn report_digest(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    job_id: JobId,
+) -> Result<[u8; 32], JobMutationError> {
+    let prefix = job_entry_prefix(job_id);
+    let mut start_after = None;
+    let mut hasher = blake3::Hasher::new();
+    loop {
+        let (values, next) = iter_prefix_page(
+            storage,
+            JOB_ENTRY_KEYSPACE,
+            Some(prefix.clone()),
+            start_after,
+            512,
+            Some(txn_id),
+        )
+        .await
+        .map_err(JobMutationError::Storage)?;
+        for (_, value) in values {
+            hasher.update(value.as_ref());
+        }
+        let Some(next) = next else {
+            return Ok(*hasher.finalize().as_bytes());
+        };
+        start_after = Some(next);
     }
 }
 
@@ -1551,6 +1684,56 @@ pub async fn list_jobs_for_user(
     }
 }
 
+pub async fn list_job_entries(
+    storage: &StorageHandle,
+    job_id: JobId,
+    last_key: Option<Vec<u8>>,
+    limit: usize,
+) -> Result<(Vec<(Vec<u8>, Value)>, Option<Vec<u8>>), String> {
+    let (values, next) = iter_prefix_page(
+        storage,
+        JOB_ENTRY_KEYSPACE,
+        Some(job_entry_prefix(job_id)),
+        last_key.map(|key| job_entry_key(job_id, &key)),
+        limit,
+        None,
+    )
+    .await?;
+    let rows = values
+        .into_iter()
+        .map(|(key, value)| Ok((parse_entry_key(job_id, key.as_ref())?, value)))
+        .collect::<Result<Vec<_>, ConversionError>>()
+        .map_err(|error| error.to_string())?;
+    let next = next
+        .map(|key| parse_entry_key(job_id, key.as_ref()))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    Ok((rows, next))
+}
+
+pub(crate) async fn job_entry_deletes(
+    storage: &StorageHandle,
+    job_id: JobId,
+    limit: usize,
+) -> Result<(JobDeletes, bool), String> {
+    let (values, next) = iter_prefix_page(
+        storage,
+        JOB_ENTRY_KEYSPACE,
+        Some(job_entry_prefix(job_id)),
+        None,
+        limit,
+        None,
+    )
+    .await?;
+    Ok((
+        values
+            .into_iter()
+            .map(|(key, _)| (JOB_ENTRY_KEYSPACE.to_string(), key))
+            .collect(),
+        next.is_some(),
+    ))
+}
+
 pub async fn find_dedup_job(
     storage: &StorageHandle,
     created_by: UserId,
@@ -1757,8 +1940,10 @@ async fn delete_raw(
 mod tests {
     use super::*;
     use aruna_core::structs::{
-        ComputeResources, ExecutionSpec, JOB_LEASE_INDEX_PREFIX, JobPayload, RealmId,
-        parse_job_schedule_index_key,
+        AuthContext, ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportReportDetail,
+        ImportReportRow, ImportRoCrateResult, ImportRoCrateSource, ImportRoCrateSpec,
+        ImportRoCrateTarget, JOB_LEASE_INDEX_PREFIX, JobPayload, RealmId, ReasonCode,
+        RoCrateLimits, parse_job_schedule_index_key,
     };
     use aruna_core::types::UserId;
     use aruna_storage::FjallStorage;
@@ -1793,6 +1978,56 @@ mod tests {
             1_000,
             None,
         )
+    }
+
+    fn rocrate_record(job_id: JobId) -> JobRecord {
+        let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        JobRecord::new(
+            job_id,
+            JobPayload::ImportRoCrate(ImportRoCrateSpec {
+                auth_context: AuthContext {
+                    user_id: owner,
+                    realm_id: RealmId([1u8; 32]),
+                    path_restrictions: None,
+                },
+                source: ImportRoCrateSource::Upload {
+                    upload_id: Ulid::from_bytes([3u8; 16]),
+                },
+                target: ImportRoCrateTarget {
+                    bucket: "target".to_string(),
+                    prefix: "crate".to_string(),
+                },
+                metadata: ImportMetadataTarget {
+                    group_id: Ulid::from_bytes([4u8; 16]),
+                    path: "crate".to_string(),
+                    public: false,
+                },
+                limits: RoCrateLimits::default(),
+                document_id: Ulid::from_bytes([5u8; 16]),
+            }),
+            owner,
+            node_id(7),
+            1_000,
+            1_000,
+            None,
+        )
+    }
+
+    fn report_row(entry_key: &str) -> ImportReportRow {
+        ImportReportRow {
+            entry_key: entry_key.to_string(),
+            code: ReasonCode::Imported,
+            message: None,
+            detail: ImportReportDetail {
+                archive_path: entry_key.to_string(),
+                target_key: Some(entry_key.to_string()),
+                version_id: None,
+                blake3: None,
+                size: None,
+                arn: None,
+                w3id: None,
+            },
+        }
     }
 
     async fn schedule_keys(storage: &StorageHandle) -> Vec<Key> {
@@ -1948,6 +2183,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(storage.snapshot_metrics().requests_total - before, 5);
+    }
+
+    #[tokio::test]
+    async fn report_freezes() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0x42; 16]);
+        insert_job(&storage, &rocrate_record(job_id)).await.unwrap();
+        let ClaimOutcome::Claimed(claimed) = claim_job(&storage, job_id, node_id(3), 2_000)
+            .await
+            .unwrap()
+        else {
+            panic!("job must be claimed");
+        };
+        let token = claimed.claim.unwrap().claim_token;
+        let row_b = report_row("b");
+        let row_a = report_row("a");
+        put_job_entry(&storage, job_id, token, b"b", &row_b)
+            .await
+            .unwrap();
+        put_job_entry(&storage, job_id, token, b"a", &row_a)
+            .await
+            .unwrap();
+        transition_to_running(&storage, job_id, token, 3_000)
+            .await
+            .unwrap();
+
+        let terminal = complete_job(
+            &storage,
+            job_id,
+            token,
+            JobResultPayload::ImportRoCrate(ImportRoCrateResult {
+                document_id: None,
+                entries_total: 2,
+                imported: 2,
+                unlisted: 0,
+                failed: 0,
+                report_digest: [0; 32],
+            }),
+            JobProgress {
+                current: 2,
+                total: Some(2),
+                unit: "items".to_string(),
+            },
+            4_000,
+        )
+        .await
+        .unwrap();
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&postcard::to_allocvec(&row_a).unwrap());
+        hasher.update(&postcard::to_allocvec(&row_b).unwrap());
+        let digest = *hasher.finalize().as_bytes();
+        assert_eq!(terminal.report_digest, Some(digest));
+        let JobResultPayload::ImportRoCrate(result) = terminal.result.unwrap() else {
+            panic!("import result expected");
+        };
+        assert_eq!(result.report_digest, digest);
+
+        let (first, cursor) = list_job_entries(&storage, job_id, None, 1).await.unwrap();
+        assert_eq!(first[0].0, b"a");
+        let (second, cursor) = list_job_entries(&storage, job_id, cursor, 1).await.unwrap();
+        assert_eq!(second[0].0, b"b");
+        assert!(cursor.is_none());
+        assert_eq!(
+            put_job_entry(&storage, job_id, token, b"c", &report_row("c")).await,
+            Err(JobMutationError::ReportFrozen)
+        );
     }
 
     // The framework is opt-in: a write to any other keyspace never touches a job one.

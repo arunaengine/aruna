@@ -579,6 +579,21 @@ impl JobPayload {
         )
     }
 
+    pub fn is_rocrate(&self) -> bool {
+        matches!(
+            self,
+            JobPayload::ImportRoCrate(_) | JobPayload::ExportRoCrate(_)
+        )
+    }
+
+    pub fn rocrate_limits(&self) -> Option<&RoCrateLimits> {
+        match self {
+            JobPayload::ImportRoCrate(spec) => Some(&spec.limits),
+            JobPayload::ExportRoCrate(spec) => Some(&spec.limits),
+            _ => None,
+        }
+    }
+
     /// Canonical plan digest: BLAKE3 over the postcard encoding of the payload.
     /// The same idempotency identity with a matching digest is an idempotent
     /// create; a differing digest is a `JobPlanConflict`.
@@ -921,6 +936,7 @@ pub struct JobRecord {
     pub workspace_bucket: Option<String>,
     #[serde(default)]
     pub workspace_mode: WorkspaceMode,
+    pub report_digest: Option<[u8; 32]>,
 }
 
 impl JobRecord {
@@ -962,6 +978,7 @@ impl JobRecord {
             attempt_intent: None,
             workspace_bucket: None,
             workspace_mode: WorkspaceMode::default(),
+            report_digest: None,
         }
     }
 
@@ -978,8 +995,14 @@ impl JobRecord {
         match postcard::from_bytes(bytes) {
             Ok(record) => Ok(record),
             Err(postcard::Error::DeserializeUnexpectedEnd) => {
+                let mut previous = bytes.to_vec();
+                previous.extend(postcard::to_allocvec(&Option::<[u8; 32]>::None)?);
+                if let Ok(record) = postcard::from_bytes(&previous) {
+                    return Ok(record);
+                }
                 let mut legacy = bytes.to_vec();
                 legacy.extend(postcard::to_allocvec(&WorkspaceMode::default())?);
+                legacy.extend(postcard::to_allocvec(&Option::<[u8; 32]>::None)?);
                 Ok(postcard::from_bytes(&legacy)?)
             }
             Err(error) => Err(error.into()),
@@ -1188,6 +1211,36 @@ pub fn job_owner_index_key(created_by: UserId, created_at_ms: u64, job_id: JobId
 
 pub fn job_owner_index_prefix(created_by: UserId) -> Key {
     ByteView::from(created_by.to_storage_key())
+}
+
+pub fn job_active_key(created_by: UserId, job_id: JobId) -> Key {
+    let mut bytes = created_by.to_storage_key();
+    bytes.extend_from_slice(&job_id.to_bytes());
+    ByteView::from(bytes)
+}
+
+pub fn job_active_prefix(created_by: UserId) -> Key {
+    ByteView::from(created_by.to_storage_key())
+}
+
+pub fn job_entry_key(job_id: JobId, entry_key: &[u8]) -> Key {
+    let mut bytes = Vec::with_capacity(16 + entry_key.len());
+    bytes.extend_from_slice(&job_id.to_bytes());
+    bytes.extend_from_slice(entry_key);
+    ByteView::from(bytes)
+}
+
+pub fn job_entry_prefix(job_id: JobId) -> Key {
+    ByteView::from(job_id.to_bytes().to_vec())
+}
+
+pub fn parse_entry_key(job_id: JobId, key: &[u8]) -> Result<Vec<u8>, ConversionError> {
+    if key.len() < 16 || key[..16] != job_id.to_bytes() {
+        return Err(ConversionError::InvalidLength(
+            "job entry key does not match its job prefix".to_string(),
+        ));
+    }
+    Ok(key[16..].to_vec())
 }
 
 pub fn job_owner_cursor(created_at_ms: u64, job_id: JobId) -> Vec<u8> {
@@ -1480,6 +1533,8 @@ mod tests {
     fn legacy_record_defaults() {
         let record = probe_record(JobId::from_bytes([6u8; 16]), 1_700_000_000_000);
         let mut bytes = record.to_bytes().unwrap();
+        let digest = postcard::to_allocvec(&Option::<[u8; 32]>::None).unwrap();
+        bytes.truncate(bytes.len() - digest.len());
         let mode = postcard::to_allocvec(&WorkspaceMode::Kept).unwrap();
         bytes.truncate(bytes.len() - mode.len());
 
@@ -1487,6 +1542,7 @@ mod tests {
 
         assert_eq!(decoded.workspace_mode, WorkspaceMode::Kept);
         assert_eq!(decoded.workspace_bucket, record.workspace_bucket);
+        assert_eq!(decoded.report_digest, None);
     }
 
     #[test]

@@ -388,6 +388,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await
         .with_metrics(metrics.clone())
+        .with_rocrate_limits(config.rocrate_limits.clone())
         .with_s3_mounts(s3_mounts_available),
     );
     portal::initialize(config.portal.clone(), state.clone()).await;
