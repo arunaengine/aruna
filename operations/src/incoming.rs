@@ -31,7 +31,8 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::structs::{
-    ReplicationItemKind, WatchEvent, WatchEventDetail, WatchEventKind, data_watch_resource_path,
+    ReplicationItemKind, RoCrateLimits, WatchEvent, WatchEventDetail, WatchEventKind,
+    data_watch_resource_path,
 };
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
@@ -49,15 +50,17 @@ const METADATA_DOCUMENT_SYNC_MAINTENANCE_JITTER_SECS: u64 = 15;
 struct OperationsInboundHandler {
     context: Arc<DriverContext>,
     document_sync_reconcile: Arc<DocumentSyncReconcileCoalescer>,
+    rocrate_limits: RoCrateLimits,
 }
 
 impl OperationsInboundHandler {
-    fn new(context: Arc<DriverContext>) -> Self {
+    fn new(context: Arc<DriverContext>, rocrate_limits: RoCrateLimits) -> Self {
         let document_sync_reconcile = Arc::new(DocumentSyncReconcileCoalescer::default());
         spawn_reconcile_queue_gauge(Arc::downgrade(&document_sync_reconcile));
         Self {
             context,
             document_sync_reconcile,
+            rocrate_limits,
         }
     }
 }
@@ -264,12 +267,19 @@ async fn reconcile_inbound_document_sync_topics(
 }
 
 pub fn initialize_net_incoming(context: Arc<DriverContext>) {
+    initialize_net_holder(context, RoCrateLimits::default());
+}
+
+pub fn initialize_net_holder(context: Arc<DriverContext>, rocrate_limits: RoCrateLimits) {
     let Some(net_handle) = context.net_handle.clone() else {
         warn!("Cannot initialize inbound handling without net handle");
         return;
     };
     let metadata_handle = context.metadata_handle.clone();
-    let inbound_handler = Arc::new(OperationsInboundHandler::new(context.clone()));
+    let inbound_handler = Arc::new(OperationsInboundHandler::new(
+        context.clone(),
+        rocrate_limits,
+    ));
 
     net_handle.set_inbound_handler(inbound_handler.clone());
     if let Some(metadata_handle) = metadata_handle {
@@ -332,7 +342,8 @@ impl InboundEventHandler for OperationsInboundHandler {
                                             net_handle.node_id(),
                                             *net_handle.realm_id(),
                                             manifest,
-                                        );
+                                        )
+                                        .with_rocrate_limits(self.rocrate_limits.clone());
                                         match drive(op, self.context.as_ref()).await {
                                             Ok(Ok(result)) => {
                                                 emit_replication_watch(
@@ -683,14 +694,17 @@ mod tests {
         )
         .await
         .unwrap();
-        let handler = OperationsInboundHandler::new(Arc::new(DriverContext {
-            storage_handle: storage_b,
-            net_handle: Some(net_b.clone()),
-            blob_handle: Some(blob_handle),
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        }));
+        let handler = OperationsInboundHandler::new(
+            Arc::new(DriverContext {
+                storage_handle: storage_b,
+                net_handle: Some(net_b.clone()),
+                blob_handle: Some(blob_handle),
+                metadata_handle: None,
+                task_handle: None,
+                compute_handle: None,
+            }),
+            RoCrateLimits::default(),
+        );
 
         let mut outbound = net_a.open_stream(net_b.node_id(), Alpn::Bao).await.unwrap();
         outbound.0.write_u32(8).await.unwrap();

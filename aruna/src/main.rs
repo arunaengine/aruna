@@ -29,7 +29,7 @@ use aruna_operations::announce_realm_presence::{
 use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
-use aruna_operations::incoming::initialize_net_incoming;
+use aruna_operations::incoming::initialize_net_holder;
 use aruna_operations::jobs::JOB_SHUTDOWN_GRACE;
 use aruna_operations::jobs::drain::restore_job_queue_timer;
 use aruna_operations::jobs::runtime::JobsRuntime;
@@ -37,7 +37,7 @@ use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_metadata_warmup};
 use aruna_operations::replication::migration::migrate_legacy_sync;
 use aruna_operations::startup::restore_shard_subscriptions;
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::task_incoming::initialize_task_holder;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use std::collections::HashMap;
@@ -154,11 +154,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Task initialization binds the compute reconciler before startup recovery.
     let jobs_runtime = JobsRuntime::new_paused();
-    initialize_net_incoming(driver_ctx.clone());
-    initialize_task_incoming(
+    initialize_net_holder(driver_ctx.clone(), config.rocrate_limits.clone());
+    initialize_task_holder(
         driver_ctx.clone(),
         task_handle.clone(),
         jobs_runtime.clone(),
+        config.rocrate_limits.clone(),
     )
     .await;
 
@@ -409,6 +410,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         driver_ctx.clone(),
         config.realm_id,
         config.node_id,
+        config.rocrate_limits.clone(),
         cors,
         metrics.clone(),
     )

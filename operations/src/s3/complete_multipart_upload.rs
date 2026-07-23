@@ -3,12 +3,13 @@ use crate::blob::blob_keyspace_helper::{
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::replication::queue::write_live_replication_obligation_effect;
+use crate::replication::util::dht_registration_effect;
 use crate::usage_stats::{
     QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError,
     schedule_usage_snapshot_publish_effect,
 };
 use aruna_blob::hash::Hasher;
-use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
+use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::{
@@ -22,7 +23,7 @@ use aruna_core::structs::{
     AuthContext, BackendLocation, BlobHeadKey, BlobVersion, CurrentVersionPointer,
     MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
     MultipartUpload, MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus, RealmId,
-    UsageDelta, VersionKey,
+    RoCrateLimits, UsageDelta, VersionKey,
 };
 use aruna_core::types::{Effects, NodeId, TxnId, UserId};
 use smallvec::smallvec;
@@ -170,6 +171,7 @@ pub struct CompleteMultipartUploadOperation {
     cleanup_part_index: usize,
     pending_error: Option<CompleteMultipartUploadError>,
     output: Option<Result<CompleteMultipartUploadResult, CompleteMultipartUploadError>>,
+    rocrate_limits: RoCrateLimits,
 }
 
 impl CompleteMultipartUploadOperation {
@@ -194,7 +196,13 @@ impl CompleteMultipartUploadOperation {
             cleanup_part_index: 0,
             pending_error: None,
             output: None,
+            rocrate_limits: RoCrateLimits::default(),
         }
+    }
+
+    pub fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
+        self.rocrate_limits = limits;
+        self
     }
 
     fn emit_error(&mut self, error: CompleteMultipartUploadError) -> Effects {
@@ -1016,18 +1024,16 @@ impl CompleteMultipartUploadOperation {
         let Some(blake3_hash) = location.get_blake3() else {
             return self.begin_cleanup_part_blobs();
         };
-        let key = match blake3_hash.try_into() {
-            Ok(key) => aruna_core::id::DhtKeyId::from_bytes(key),
-            Err(_) => return self.begin_cleanup_part_blobs(),
-        };
-
         self.state = CompleteMultipartUploadState::RegisterBlobInDht;
-        smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Put {
-            key,
-            realm_id: self.input.realm_id,
-            value: self.input.node_id.as_bytes().to_vec(),
-            ttl: Default::default(),
-        }))]
+        match dht_registration_effect(
+            blake3_hash,
+            self.input.realm_id,
+            self.input.node_id,
+            &self.rocrate_limits,
+        ) {
+            Ok(effect) => smallvec![effect],
+            Err(_) => self.begin_cleanup_part_blobs(),
+        }
     }
 
     fn handle_blob_registered_in_dht(&mut self, event: Event) -> Effects {

@@ -962,6 +962,7 @@ async fn spawn_s3_server(
         context,
         realm_id,
         node_id,
+        Default::default(),
         test_cors_config(),
         metrics,
     )

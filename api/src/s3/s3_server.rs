@@ -9,7 +9,7 @@ use crate::error::S3ServerError;
 use crate::telemetry::{emit_request_completed, make_request_span};
 use aruna_core::NodeId;
 use aruna_core::metrics::{NodeMetrics, RequestLabels, RouteLabels, method_label};
-use aruna_core::structs::{BucketCorsConfiguration, RealmId};
+use aruna_core::structs::{BucketCorsConfiguration, RealmId, RoCrateLimits};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use futures_core::future::BoxFuture;
@@ -155,10 +155,13 @@ impl S3Server {
         driver_ctx: Arc<DriverContext>,
         realm_id: RealmId,
         node_id: NodeId,
+        rocrate_limits: RoCrateLimits,
         cors: CorsConfig,
         metrics: Arc<NodeMetrics>,
     ) -> Result<Self, S3ServerError> {
-        let s3service = ArunaS3Service::new(driver_ctx.clone(), realm_id, node_id).await;
+        let s3service = ArunaS3Service::new(driver_ctx.clone(), realm_id, node_id)
+            .await
+            .with_rocrate_limits(rocrate_limits);
         let hostname = hostname.into();
 
         let auth = AuthProvider {
