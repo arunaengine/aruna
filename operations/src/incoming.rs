@@ -17,6 +17,7 @@ use crate::notifications::watch::emit::emit_resource_watch_event;
 use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
 use crate::process_placements::process_shard_placements;
 use crate::queue_backoff::queue_retry_after_ms;
+use crate::replication::bao_read::IncomingBaoReadOperation;
 use crate::replication::incoming_version_replication::{
     IncomingVersionReplicationOperation, IncomingVersionReplicationResult,
 };
@@ -357,6 +358,25 @@ impl InboundEventHandler for OperationsInboundHandler {
                                             Ok(Err(err)) | Err(err) => {
                                                 error!(error = ?err, "Failed to process inbound version replication stream");
                                             }
+                                        }
+                                    }
+                                    Ok(VersionReplicationMessage::BaoReadRequest(request)) => {
+                                        let op = IncomingBaoReadOperation::new(
+                                            node_id,
+                                            net_handle.node_id(),
+                                            *net_handle.realm_id(),
+                                            stream_id,
+                                            request,
+                                        );
+                                        if let Err(error) =
+                                            drive(op, self.context.as_ref()).await
+                                        {
+                                            error!(
+                                                peer = %node_id,
+                                                stream_id = %stream_id,
+                                                error = ?error,
+                                                "Failed to process inbound bao read"
+                                            );
                                         }
                                     }
                                     _ => {

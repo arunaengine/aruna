@@ -237,6 +237,16 @@ impl BlobHandler {
                             self.handle_incoming_replication(replication_id, stream_id, keep_alive)
                                 .await
                         }
+                        BlobEffect::ServeRead {
+                            stream_id,
+                            location,
+                            expected_blake3,
+                        } => self.serve_read(stream_id, location, expected_blake3).await,
+                        BlobEffect::ReceiveRead {
+                            stream_id,
+                            size,
+                            expected_blake3,
+                        } => self.receive_read(stream_id, size, expected_blake3).await,
                     };
                     response_tx.send(event);
                 }

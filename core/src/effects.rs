@@ -103,6 +103,16 @@ pub enum BlobEffect {
         stream_id: Ulid,
         keep_alive: bool,
     },
+    ServeRead {
+        stream_id: Ulid,
+        location: BackendLocation,
+        expected_blake3: [u8; 32],
+    },
+    ReceiveRead {
+        stream_id: Ulid,
+        size: u64,
+        expected_blake3: [u8; 32],
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
