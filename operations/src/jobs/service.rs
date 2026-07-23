@@ -16,8 +16,8 @@ use tracing::warn;
 
 use super::runtime::JobsRuntime;
 use super::store::{
-    CancelRequestOutcome, JobMutationError, list_job_entries, list_jobs_for_user, read_job_record,
-    read_run_crate_status, set_cancel_requested,
+    CancelRequestOutcome, JobMutationError, list_job_entries, list_jobs_for_user,
+    read_artifact_tombstone, read_job_record, read_run_crate_status, set_cancel_requested,
 };
 use super::submit::{
     SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, schedule_job_drain_effect,
@@ -279,7 +279,12 @@ pub async fn read_owned_artifact(
     now_ms: u64,
 ) -> Result<ArtifactLookup, String> {
     let Some(record) = read_owned_job(context, user_id, job_id).await? else {
-        return Ok(ArtifactLookup::NotFound);
+        return Ok(
+            match read_artifact_tombstone(&context.storage_handle, job_id).await? {
+                Some(owner) if owner == user_id => ArtifactLookup::Gone,
+                _ => ArtifactLookup::NotFound,
+            },
+        );
     };
     let JobPayload::ExportRoCrate(spec) = &record.payload else {
         return Ok(ArtifactLookup::NotFound);
@@ -395,7 +400,7 @@ async fn kick_drain(context: &DriverContext) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::store::{insert_job, read_job_record};
+    use super::super::store::{insert_job, preserve_artifact_tombstone, read_job_record};
     use super::*;
     use aruna_core::structs::{JobState, RealmId};
     use aruna_storage::FjallStorage;
@@ -416,6 +421,40 @@ mod tests {
             ),
             "experiment.zip"
         );
+    }
+
+    #[tokio::test]
+    async fn tombstone_preserves_gone() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        let job_id = JobId::from_bytes([3u8; 16]);
+        preserve_artifact_tombstone(&storage, job_id, owner)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            read_owned_artifact(&context, owner, job_id, u64::MAX).await,
+            Ok(ArtifactLookup::Gone)
+        ));
+        assert!(matches!(
+            read_owned_artifact(
+                &context,
+                UserId::new(Ulid::from_bytes([4u8; 16]), RealmId([1u8; 32])),
+                job_id,
+                u64::MAX,
+            )
+            .await,
+            Ok(ArtifactLookup::NotFound)
+        ));
     }
 
     #[tokio::test]

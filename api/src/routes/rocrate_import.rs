@@ -121,8 +121,10 @@ pub struct SubmitImportResponse {
     path = "/metadata/rocrate/uploads",
     tag = "rocrate-import",
     request_body(
-        content = String,
-        content_type = "application/zip",
+        content(
+            (String = "application/zip"),
+            (String = "application/vnd.eln+zip")
+        ),
         description = "Streamed application/zip or application/vnd.eln+zip body"
     ),
     responses(
@@ -638,6 +640,15 @@ mod tests {
             parse_media_type(&headers),
             Ok(RoCrateMediaType::Eln)
         ));
+    }
+
+    #[test]
+    fn upload_openapi_types() {
+        let openapi = serde_json::to_value(RoCrateImportApiDoc::openapi()).unwrap();
+        let content =
+            &openapi["paths"]["/metadata/rocrate/uploads"]["post"]["requestBody"]["content"];
+        assert!(content.get(ZIP_MEDIA_TYPE).is_some());
+        assert!(content.get(ELN_MEDIA_TYPE).is_some());
     }
 
     #[test]

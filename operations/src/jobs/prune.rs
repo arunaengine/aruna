@@ -19,7 +19,7 @@ use tracing::warn;
 use super::JOB_PRUNE_SCAN_PAGE_SIZE;
 use super::store::{
     batch_delete, first_schedule_entry, iter_prefix_page, job_entry_deletes,
-    job_prune_delete_entries, read_job_record,
+    job_prune_delete_entries, preserve_artifact_tombstone, read_job_record,
 };
 use crate::driver::DriverContext;
 
@@ -93,6 +93,14 @@ pub(crate) async fn process_job_prune_batch_with_page_size(
                     if entries_more {
                         has_more = true;
                         break 'scan;
+                    }
+                    if matches!(
+                        &record.result,
+                        Some(JobResultPayload::ExportRoCrate(result))
+                            if result.artifact.is_some()
+                    ) {
+                        preserve_artifact_tombstone(storage, record.job_id, record.created_by)
+                            .await?;
                     }
                     delete_job_artifact(context, &record).await?;
                     deletes.extend(job_prune_delete_entries(&record));

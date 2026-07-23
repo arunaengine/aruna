@@ -33,6 +33,8 @@ pub enum ServerError {
     #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
+    JobPlanConflict(String),
+    #[error("{0}")]
     PayloadTooLarge(String),
     #[error("Bad request")]
     BadRequest,
@@ -243,7 +245,7 @@ impl ServerError {
             ServerError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServerError::Forbidden => StatusCode::FORBIDDEN,
             ServerError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            ServerError::Conflict(_) => StatusCode::CONFLICT,
+            ServerError::Conflict(_) | ServerError::JobPlanConflict(_) => StatusCode::CONFLICT,
             ServerError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             ServerError::BadRequest
             | ServerError::BadRequestReason(_)
@@ -264,6 +266,7 @@ impl ServerError {
             ServerError::Forbidden => "Forbidden".to_string(),
             ServerError::InternalError(_) => "Internal error".to_string(),
             ServerError::Conflict(_) => "Conflict".to_string(),
+            ServerError::JobPlanConflict(_) => "JobPlanConflict".to_string(),
             ServerError::PayloadTooLarge(_) => "Payload too large".to_string(),
             ServerError::BadRequest
             | ServerError::BadRequestReason(_)
@@ -320,5 +323,17 @@ mod tests {
         let violations = body.violations.unwrap();
         assert_eq!(violations[0].code, "missing_root_data_entity");
         assert_eq!(violations[0].pointer, "/@graph");
+    }
+
+    #[tokio::test]
+    async fn plan_conflict_typed() {
+        let response =
+            ServerError::JobPlanConflict("idempotency key conflict".to_string()).into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: ErrorResponse =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body.code.as_deref(), Some("JobPlanConflict"));
     }
 }

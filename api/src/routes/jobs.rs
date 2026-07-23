@@ -194,6 +194,13 @@ pub struct ReportPendingResponse {
     pub state: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum ReportUnavailableResponse {
+    Pending(ReportPendingResponse),
+    NotFound(ErrorResponse),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReportCursor {
     job_id: JobId,
@@ -350,9 +357,9 @@ pub(crate) fn map_submit_error(
 ) -> ServerError {
     use aruna_operations::jobs::submit::SubmitJobError;
     match error {
-        SubmitJobError::JobPlanConflict { existing_job_id } => ServerError::Conflict(format!(
-            "idempotency key already bound to job {existing_job_id}"
-        )),
+        SubmitJobError::JobPlanConflict { existing_job_id } => ServerError::JobPlanConflict(
+            format!("idempotency key already bound to job {existing_job_id}"),
+        ),
         SubmitJobError::ActiveJobLimit { limit } => {
             ServerError::Conflict(format!("active RO-Crate job limit of {limit} reached"))
         }
@@ -715,7 +722,7 @@ fn decode_report_row(
     responses(
         (status = 200, description = "Immutable terminal report page", body = JobReportResponse),
         (status = 400, description = "Invalid cursor", body = ErrorResponse),
-        (status = 404, description = "Job not found or report pending", body = ReportPendingResponse),
+        (status = 404, description = "Job not found or report pending", body = ReportUnavailableResponse),
         (status = 409, description = "Cursor does not match this frozen report", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1447,6 +1454,43 @@ mod tests {
         let body: ReportPendingResponse = response_json(response).await;
         assert_eq!(body.code, "report_pending");
         assert_eq!(body.state, "queued");
+    }
+
+    #[test]
+    fn submit_conflict_typed() {
+        let existing_job_id = JobId::from_bytes([15u8; 16]);
+        let error = map_submit_error(
+            aruna_operations::jobs::submit::SubmitJobError::JobPlanConflict { existing_job_id },
+        );
+        assert!(matches!(
+            error,
+            ServerError::JobPlanConflict(message)
+                if message.contains(&existing_job_id.to_string())
+        ));
+    }
+
+    #[test]
+    fn report_openapi_union() {
+        let openapi = serde_json::to_value(JobsApiDoc::openapi()).unwrap();
+        let schema = &openapi["paths"]["/jobs/{job_id}/report"]["get"]["responses"]["404"]["content"]
+            ["application/json"]["schema"];
+        assert_eq!(
+            schema["$ref"],
+            "#/components/schemas/ReportUnavailableResponse"
+        );
+        let variants = openapi["components"]["schemas"]["ReportUnavailableResponse"]["oneOf"]
+            .as_array()
+            .unwrap();
+        assert!(
+            variants
+                .iter()
+                .any(|variant| variant["$ref"] == "#/components/schemas/ReportPendingResponse")
+        );
+        assert!(
+            variants
+                .iter()
+                .any(|variant| variant["$ref"] == "#/components/schemas/ErrorResponse")
+        );
     }
 
     #[tokio::test]

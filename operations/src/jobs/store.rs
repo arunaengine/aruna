@@ -3,9 +3,10 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    JOB_ACTIVE_USER_KEYSPACE, JOB_ATTEMPT_CONTROL_KEYSPACE, JOB_DEDUP_INDEX_KEYSPACE,
-    JOB_ENTRY_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE, JOB_RUN_CRATE_KEYSPACE,
-    JOB_SCHEDULE_INDEX_KEYSPACE, ROCRATE_JOB_STATE_KEYSPACE, STAGING_JOB_STATE_KEYSPACE,
+    JOB_ACTIVE_USER_KEYSPACE, JOB_ARTIFACT_TOMBSTONE_KEYSPACE, JOB_ATTEMPT_CONTROL_KEYSPACE,
+    JOB_DEDUP_INDEX_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE,
+    JOB_RUN_CRATE_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE, ROCRATE_JOB_STATE_KEYSPACE,
+    STAGING_JOB_STATE_KEYSPACE,
 };
 use aruna_core::structs::{
     AttemptControl, AttemptIntent, JobClaim, JobError, JobExecutionClass, JobId, JobPayload,
@@ -641,6 +642,38 @@ pub async fn read_job_record(
         },
         None => Ok(None),
     }
+}
+
+pub(crate) async fn preserve_artifact_tombstone(
+    storage: &StorageHandle,
+    job_id: JobId,
+    owner: UserId,
+) -> Result<(), String> {
+    batch_write(
+        storage,
+        vec![(
+            JOB_ARTIFACT_TOMBSTONE_KEYSPACE.to_string(),
+            ByteView::from(job_id.to_bytes().to_vec()),
+            ByteView::from(owner.to_storage_key()),
+        )],
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn read_artifact_tombstone(
+    storage: &StorageHandle,
+    job_id: JobId,
+) -> Result<Option<UserId>, String> {
+    read_raw(
+        storage,
+        JOB_ARTIFACT_TOMBSTONE_KEYSPACE,
+        ByteView::from(job_id.to_bytes().to_vec()),
+        None,
+    )
+    .await?
+    .map(|value| UserId::from_storage_key(value.as_ref()).map_err(|error| error.to_string()))
+    .transpose()
 }
 
 // --- claim / lease / transition operations -------------------------------------
