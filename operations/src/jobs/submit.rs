@@ -512,6 +512,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn import_fence_ignored() {
+        let mut first = rocrate_spec(4, Some(b"key".to_vec()));
+        let mut second = first.clone();
+        let JobPayload::ImportRoCrate(first_spec) = &mut first.payload else {
+            panic!("expected import payload");
+        };
+        let JobPayload::ImportRoCrate(second_spec) = &mut second.payload else {
+            panic!("expected import payload");
+        };
+        first_spec.document_id = Ulid::from_bytes([5; 16]);
+        second_spec.document_id = Ulid::from_bytes([6; 16]);
+
+        assert_eq!(first.payload.plan_digest(), second.payload.plan_digest());
+    }
+
     async fn count_keyspace(storage: &StorageHandle, key_space: &str) -> usize {
         crate::jobs::store::iter_prefix_page(storage, key_space, None, None, 64, None)
             .await

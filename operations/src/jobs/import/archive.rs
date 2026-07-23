@@ -72,6 +72,9 @@ pub async fn inspect_archive(
             .dir()
             .map_err(|error| format!("invalid archive entry: {error}"))?;
         let path = normalize_entry_path(filename)?;
+        if path.len() as u64 > limits.key_bytes {
+            return Err(format!("archive path exceeds limit {}", limits.key_bytes));
+        }
         if !normalized.insert(path.clone()) {
             return Err(format!("duplicate normalized archive path `{path}`"));
         }

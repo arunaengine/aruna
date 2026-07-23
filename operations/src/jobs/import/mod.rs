@@ -17,6 +17,7 @@ use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::ROCRATE_JOB_STATE_KEYSPACE;
+use aruna_core::metadata::MetadataValidationViolation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::{
@@ -28,7 +29,7 @@ use aruna_core::structs::{
 use aruna_core::types::Value;
 use bytes::Bytes;
 use byteview::ByteView;
-use futures_util::stream;
+use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
@@ -132,6 +133,9 @@ impl Default for ImportCheckpoint {
 enum ImportFailure {
     Permanent(String),
     Retryable(String),
+    Validation(Vec<MetadataValidationViolation>),
+    Cancelled,
+    Interrupted,
 }
 
 pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> JobRunOutcome {
@@ -192,6 +196,27 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
                 }
             }
             Err(ImportFailure::Retryable(error)) => return retryable_error(error),
+            Err(ImportFailure::Cancelled) => {
+                checkpoint.cancelled = true;
+                if let Err(error) = mark_not_attempted(ctx, &mut checkpoint).await {
+                    return retryable_error(error);
+                }
+                checkpoint.phase = ImportPhase::Cleanup;
+                if let Err(error) = persist_checkpoint(ctx, &checkpoint).await {
+                    return retryable_error(error);
+                }
+            }
+            Err(ImportFailure::Interrupted) => return JobRunOutcome::Interrupted,
+            Err(ImportFailure::Validation(violations)) => {
+                if let Err(error) = write_validation_rows(ctx, &violations).await {
+                    return retryable_error(error);
+                }
+                checkpoint.failure = Some(validation_message(&violations));
+                checkpoint.phase = ImportPhase::Cleanup;
+                if let Err(error) = persist_checkpoint(ctx, &checkpoint).await {
+                    return retryable_error(error);
+                }
+            }
             Err(ImportFailure::Permanent(error)) => {
                 if let Err(report_error) = write_phase_error(ctx, checkpoint.phase, &error).await {
                     return retryable_error(report_error);
@@ -354,7 +379,8 @@ async fn spool_source(
             "import needs a blob handle".to_string(),
         ));
     };
-    match blob_handle
+    let blob = cancel_source_stream(blob, ctx.cancel.clone(), ctx.shutdown.clone());
+    let event = blob_handle
         .send_blob_effect(BlobEffect::SpoolHidden {
             namespace: ctx.job_id.0,
             name: "input".to_string(),
@@ -362,27 +388,79 @@ async fn spool_source(
             max_bytes: Some(limit),
             blob,
         })
-        .await
-    {
+        .await;
+    match event {
         Event::Blob(BlobEvent::HiddenSpooled {
             location,
             blake3,
             size,
-        }) => Ok(ImportInput {
-            location,
-            size,
-            blake3,
-            upload_id,
-            eln,
-        }),
+        }) => {
+            if ctx.cancel.is_cancelled() || ctx.shutdown.is_cancelled() {
+                let _ = crate::blob::hidden::delete_hidden(&ctx.driver, &location).await;
+                return Err(if ctx.cancel.is_cancelled() {
+                    ImportFailure::Cancelled
+                } else {
+                    ImportFailure::Interrupted
+                });
+            }
+            Ok(ImportInput {
+                location,
+                size,
+                blake3,
+                upload_id,
+                eln,
+            })
+        }
         Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { limit })) => Err(
             ImportFailure::Permanent(format!("import source exceeds limit {limit}")),
         ),
+        Event::Blob(BlobEvent::Error(_)) if ctx.cancel.is_cancelled() => {
+            Err(ImportFailure::Cancelled)
+        }
+        Event::Blob(BlobEvent::Error(_)) if ctx.shutdown.is_cancelled() => {
+            Err(ImportFailure::Interrupted)
+        }
         Event::Blob(BlobEvent::Error(error)) => Err(ImportFailure::Retryable(error.to_string())),
         other => Err(ImportFailure::Retryable(format!(
             "unexpected hidden spool event: {other:?}"
         ))),
     }
+}
+
+fn cancel_source_stream(
+    mut blob: BackendStream<Result<Bytes, aruna_core::stream::StreamError>>,
+    cancel: tokio_util::sync::CancellationToken,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> BackendStream<Result<Bytes, aruna_core::stream::StreamError>> {
+    let (sender, receiver) = mpsc::channel::<Result<Bytes, io::Error>>(8);
+    tokio::spawn(async move {
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    Some(Err(io::Error::new(io::ErrorKind::Interrupted, "RO-Crate import cancelled")))
+                }
+                _ = shutdown.cancelled() => {
+                    Some(Err(io::Error::new(io::ErrorKind::Interrupted, "RO-Crate import interrupted")))
+                }
+                next = blob.next() => next.map(|result| {
+                    result.map_err(|error| io::Error::other(error.to_string()))
+                }),
+            };
+            let Some(next) = next else {
+                break;
+            };
+            let failed = next.is_err();
+            if sender.send(next).await.is_err() || failed {
+                break;
+            }
+        }
+    });
+    let receiver = Arc::new(Mutex::new(receiver));
+    BackendStream::new(stream::poll_fn(move |cx| {
+        let mut receiver = receiver.lock().expect("source receiver mutex poisoned");
+        Pin::new(&mut *receiver).poll_recv(cx)
+    }))
 }
 
 async fn inspect_source(
@@ -519,6 +597,7 @@ async fn validate_source(
                 size: None,
                 arn: None,
                 w3id: None,
+                validation: None,
             },
         };
         write_report(ctx, &row).await?;
@@ -572,6 +651,8 @@ async fn write_next(
         input.size,
         entry.archive_index,
         expected_size,
+        ctx.cancel.clone(),
+        ctx.shutdown.clone(),
     )
     .await?;
     let quota = drive(
@@ -609,12 +690,18 @@ async fn write_next(
             preassigned_version_id: Some(version_id),
             quota_ceiling: quota,
         })
-        .with_bucket_guard(bucket_info),
+        .with_bucket_guard(bucket_info)
+        .with_rocrate_limits(spec.limits.clone()),
         &ctx.driver,
     )
     .await
-    .and_then(|result| result.transpose())
-    .map_err(classify_put)?
+    .and_then(|result| result.transpose());
+    let result = match result {
+        Ok(result) => result,
+        Err(_) if ctx.cancel.is_cancelled() => return Err(ImportFailure::Cancelled),
+        Err(_) if ctx.shutdown.is_cancelled() => return Err(ImportFailure::Interrupted),
+        Err(error) => return Err(classify_put(error)),
+    }
     .ok_or_else(|| ImportFailure::Retryable("object write returned no result".to_string()))?;
     let hash: [u8; 32] = result
         .location
@@ -641,6 +728,7 @@ async fn write_next(
             size: Some(result.location.blob_size),
             arn: Some(arn.to_string()),
             w3id: Some(arn.to_w3id()),
+            validation: None,
         },
     };
     write_report(ctx, &row).await?;
@@ -716,6 +804,7 @@ async fn rewrite_crate(
                 size: None,
                 arn: None,
                 w3id: None,
+                validation: None,
             },
         };
         write_report(ctx, &row).await?;
@@ -886,6 +975,8 @@ async fn payload_stream(
     size: u64,
     entry_index: usize,
     expected_size: u64,
+    cancel: tokio_util::sync::CancellationToken,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<BackendStream<Result<Bytes, aruna_core::stream::StreamError>>, ImportFailure> {
     let handle = ctx
         .driver
@@ -906,7 +997,25 @@ async fn payload_stream(
         let mut buffer = vec![0; PAYLOAD_CHUNK_BYTES];
         let mut expanded = 0u64;
         loop {
-            match reader.read(&mut buffer).await {
+            let read = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    let _ = sender.send(Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "RO-Crate import cancelled",
+                    ))).await;
+                    break;
+                }
+                _ = shutdown.cancelled() => {
+                    let _ = sender.send(Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "RO-Crate import interrupted",
+                    ))).await;
+                    break;
+                }
+                read = reader.read(&mut buffer) => read,
+            };
+            match read {
                 Ok(0) => break,
                 Ok(read) => {
                     expanded = expanded.saturating_add(read as u64);
@@ -1002,6 +1111,7 @@ async fn mark_write_failure(
                 size: entry.size,
                 arn: None,
                 w3id: None,
+                validation: None,
             },
         };
         write_report(ctx, &row).await.map_err(failure_message)?;
@@ -1030,6 +1140,7 @@ async fn mark_not_attempted(
                 size: entry.size,
                 arn: None,
                 w3id: None,
+                validation: None,
             },
         };
         write_report(ctx, &row).await.map_err(failure_message)?;
@@ -1059,9 +1170,39 @@ async fn write_phase_error(
             size: None,
             arn: None,
             w3id: None,
+            validation: None,
         },
     };
     write_report(ctx, &row).await.map_err(failure_message)
+}
+
+async fn write_validation_rows(
+    ctx: &JobContext,
+    violations: &[MetadataValidationViolation],
+) -> Result<(), String> {
+    for (index, violation) in violations.iter().enumerate() {
+        let row = ImportReportRow {
+            entry_key: format!("validation/{index:08}"),
+            code: if violation.code == "unsupported_crate_version" {
+                ReasonCode::UnsupportedCrateVersion
+            } else {
+                ReasonCode::Failed
+            },
+            message: Some(violation.message.clone()),
+            detail: ImportReportDetail {
+                archive_path: "ro-crate-metadata.json".to_string(),
+                target_key: None,
+                version_id: None,
+                blake3: None,
+                size: None,
+                arn: None,
+                w3id: None,
+                validation: Some(violation.clone()),
+            },
+        };
+        write_report(ctx, &row).await.map_err(failure_message)?;
+    }
+    Ok(())
 }
 
 async fn write_report(ctx: &JobContext, row: &ImportReportRow) -> Result<(), ImportFailure> {
@@ -1159,32 +1300,33 @@ fn key_uses_eln(path: &str) -> bool {
 
 fn validation_failure(error: CrateValidationError) -> ImportFailure {
     match error {
-        CrateValidationError::Violations(violations) => {
-            let message = violations
-                .into_iter()
-                .map(|violation| {
-                    let entity = violation
-                        .entity_id
-                        .as_deref()
-                        .map(|entity| format!(" for `{entity}`"))
-                        .unwrap_or_default();
-                    format!(
-                        "{} at {}{entity}: {}",
-                        violation.code, violation.pointer, violation.message
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            ImportFailure::Permanent(message)
-        }
+        CrateValidationError::Violations(violations) => ImportFailure::Validation(violations),
         CrateValidationError::Invalid(message) => ImportFailure::Permanent(message),
     }
+}
+
+fn validation_message(violations: &[MetadataValidationViolation]) -> String {
+    violations
+        .iter()
+        .map(|violation| {
+            let entity = violation
+                .entity_id
+                .as_deref()
+                .map(|entity| format!(" for `{entity}`"))
+                .unwrap_or_default();
+            format!(
+                "{} at {}{entity}: {}",
+                violation.code, violation.pointer, violation.message
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn classify_put(error: PutObjectError) -> ImportFailure {
     match error {
         PutObjectError::StorageError(_) => ImportFailure::Retryable(error.to_string()),
-        PutObjectError::BlobWriteFailed(ref message) | PutObjectError::WriteFailed(ref message)
+        PutObjectError::BlobWriteFailed(ref message)
             if !message.contains("checksum") && !message.contains("Content-Length") =>
         {
             ImportFailure::Retryable(error.to_string())
@@ -1258,6 +1400,9 @@ fn import_outcome(checkpoint: &ImportCheckpoint, spec: &ImportRoCrateSpec) -> Jo
 fn failure_message(error: ImportFailure) -> String {
     match error {
         ImportFailure::Permanent(message) | ImportFailure::Retryable(message) => message,
+        ImportFailure::Validation(violations) => validation_message(&violations),
+        ImportFailure::Cancelled => "import cancelled".to_string(),
+        ImportFailure::Interrupted => "import interrupted".to_string(),
     }
 }
 

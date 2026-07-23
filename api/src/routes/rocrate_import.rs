@@ -37,7 +37,7 @@ use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 
 use super::jobs::{job_urls, map_submit_error};
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::{ensure_permission, require_unrestricted_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 
@@ -140,7 +140,7 @@ pub async fn upload_rocrate(
     headers: HeaderMap,
     body: Body,
 ) -> ServerResult<(StatusCode, Json<UploadRoCrateResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
     let media_type = parse_media_type(&headers)?;
     let limit = state.rocrate_limits().direct_upload_bytes;
     if headers
@@ -153,6 +153,14 @@ pub async fn upload_rocrate(
             "upload exceeds limit {limit}"
         )));
     }
+    let expires_at_ms = aruna_core::util::unix_timestamp_millis()
+        .checked_add(state.rocrate_limits().upload_retention_ms)
+        .ok_or_else(|| ServerError::InternalError("upload expiry overflow".to_string()))?;
+    let timestamp = i64::try_from(expires_at_ms)
+        .ok()
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .ok_or_else(|| ServerError::InternalError("upload expiry is invalid".to_string()))?;
+    let owner_node_url = owner_node_url(&state).await?;
     let upload_id = Ulid::generate();
     let Some(blob_handle) = state.get_ctx().blob_handle.as_ref().cloned() else {
         return Err(ServerError::ServiceUnavailableReason(
@@ -188,9 +196,6 @@ pub async fn upload_rocrate(
             )));
         }
     };
-    let expires_at_ms = aruna_core::util::unix_timestamp_millis()
-        .checked_add(state.rocrate_limits().upload_retention_ms)
-        .ok_or_else(|| ServerError::InternalError("upload expiry overflow".to_string()))?;
     let record = RoCrateUploadRecord {
         upload_id,
         owner: auth.user_id,
@@ -205,10 +210,6 @@ pub async fn upload_rocrate(
         let _ = delete_hidden(&state.get_ctx(), &location).await;
         return Err(ServerError::InternalError(error));
     }
-    let timestamp = i64::try_from(expires_at_ms)
-        .ok()
-        .and_then(DateTime::<Utc>::from_timestamp_millis)
-        .ok_or_else(|| ServerError::InternalError("upload expiry is invalid".to_string()))?;
     Ok((
         StatusCode::CREATED,
         Json(UploadRoCrateResponse {
@@ -216,7 +217,7 @@ pub async fn upload_rocrate(
             blake3: hex::encode(blake3),
             size,
             expires_at: timestamp.to_rfc3339(),
-            owner_node_url: owner_node_url(&state).await?,
+            owner_node_url,
         }),
     ))
 }
@@ -241,8 +242,8 @@ pub async fn submit_import(
     Extension(auth): Extension<Option<AuthContext>>,
     Json(request): Json<SubmitImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
-    let document_id = import_document_id(&auth, request.idempotency_key.as_deref());
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let document_id = Ulid::generate();
     let source = fast_source_check(
         &state,
         &auth,
@@ -592,19 +593,6 @@ fn map_source_error(error: HeadStagingSourceError) -> ServerError {
     }
 }
 
-fn import_document_id(auth: &AuthContext, idempotency_key: Option<&str>) -> Ulid {
-    let Some(idempotency_key) = idempotency_key else {
-        return Ulid::generate();
-    };
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"aruna/rocrate-import-document/v1");
-    hasher.update(&auth.user_id.to_bytes());
-    hasher.update(idempotency_key.as_bytes());
-    let mut document_id = [0; 16];
-    document_id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
-    Ulid::from_bytes(document_id)
-}
-
 fn source_permission_path(
     state: &ServerState,
     group_id: Ulid,
@@ -632,8 +620,6 @@ async fn owner_node_url(state: &ServerState) -> ServerResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::RealmId;
-    use aruna_core::types::UserId;
     use axum::http::HeaderValue;
 
     #[test]
@@ -662,24 +648,6 @@ mod tests {
             HeaderValue::from_static("application/octet-stream"),
         );
         assert!(parse_media_type(&headers).is_err());
-    }
-
-    #[test]
-    fn document_id_stable() {
-        let auth = AuthContext {
-            user_id: UserId::new(Ulid::from_bytes([1; 16]), RealmId([2; 32])),
-            realm_id: RealmId([2; 32]),
-            path_restrictions: None,
-        };
-
-        assert_eq!(
-            import_document_id(&auth, Some("key")),
-            import_document_id(&auth, Some("key"))
-        );
-        assert_ne!(
-            import_document_id(&auth, Some("key")),
-            import_document_id(&auth, Some("other"))
-        );
     }
 
     #[test]

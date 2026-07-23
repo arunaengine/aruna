@@ -1,4 +1,7 @@
-use crate::auth::{ValidatedArunaBearerTokenCarrier, parse_group_id, require_realm_auth};
+use crate::auth::{
+    ValidatedArunaBearerTokenCarrier, parse_group_id, require_realm_auth,
+    require_unrestricted_realm_auth,
+};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::errors::AuthorizationError;
@@ -893,7 +896,7 @@ pub async fn submit_rocrate_export(
     Path(document_id): Path<String>,
     Json(request): Json<SubmitRoCrateExportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitRoCrateExportResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let record = load_metadata_record_by_document(&state, document_id).await?;
     ensure_permission(

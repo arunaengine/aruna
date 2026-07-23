@@ -1201,6 +1201,7 @@ mod tests {
                 size: None,
                 arn: None,
                 w3id: None,
+                validation: None,
             },
         }
     }
