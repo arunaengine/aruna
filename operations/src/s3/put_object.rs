@@ -23,6 +23,7 @@ use aruna_core::structs::{
 use aruna_core::types::{Effects, GroupId, NodeId, UserId};
 use bytes::Bytes;
 use smallvec::smallvec;
+use std::collections::HashMap;
 use std::time::{Duration, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
@@ -135,6 +136,7 @@ pub struct PutObjectOperation {
     pending_error: Option<PutObjectError>,
     output: Option<Result<BackendLocation, PutObjectError>>,
     expected_bucket: Option<BucketInfo>,
+    metadata: HashMap<String, String>,
 }
 
 impl PutObjectOperation {
@@ -154,11 +156,17 @@ impl PutObjectOperation {
             pending_error: None,
             output: None,
             expected_bucket: None,
+            metadata: HashMap::new(),
         }
     }
 
     pub fn with_bucket_guard(mut self, bucket: BucketInfo) -> Self {
         self.expected_bucket = Some(bucket);
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
+        self.metadata = metadata;
         self
     }
 
@@ -488,7 +496,8 @@ impl PutObjectOperation {
                 version_created_at,
                 output.created_by,
                 self.config.version_source.clone(),
-            );
+            )
+            .with_metadata(self.metadata.clone());
             let version_key = VersionKey::new(
                 self.config.request.bucket.clone(),
                 self.config.request.key.clone(),

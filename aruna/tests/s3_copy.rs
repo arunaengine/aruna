@@ -146,29 +146,170 @@ async fn copy_object_with_version_id_source_copies_old_version() -> TestResult<(
 }
 
 #[tokio::test]
-async fn copy_object_metadata_replace_is_rejected_until_metadata_is_persisted() -> TestResult<()> {
+async fn metadata_roundtrip() -> TestResult<()> {
     let (seed, client) = s3_setup("s3-copy-metadata-replace").await?;
 
     let result = async {
         let bucket = "s3-copy-metadata-replace";
+        let mtime = "1753272000.123456789";
+        let md5 = "XUFAKrxLKna5cZ2REBfFkg==";
         client.create_bucket().bucket(bucket).send().await?;
         client
             .put_object()
             .bucket(bucket)
             .key("source.txt")
+            .metadata("mtime", mtime)
+            .metadata("md5chksum", md5)
             .body(ByteStream::from_static(b"metadata replacement source"))
             .send()
             .await?;
 
-        let copy = client
+        let head = client
+            .head_object()
+            .bucket(bucket)
+            .key("source.txt")
+            .send()
+            .await?;
+        assert_eq!(
+            head.metadata()
+                .and_then(|metadata| metadata.get("mtime"))
+                .map(String::as_str),
+            Some(mtime)
+        );
+        assert_eq!(
+            head.metadata()
+                .and_then(|metadata| metadata.get("md5chksum"))
+                .map(String::as_str),
+            Some(md5)
+        );
+
+        let get = client
+            .get_object()
+            .bucket(bucket)
+            .key("source.txt")
+            .send()
+            .await?;
+        assert_eq!(
+            get.metadata()
+                .and_then(|metadata| metadata.get("mtime"))
+                .map(String::as_str),
+            Some(mtime)
+        );
+
+        client
             .copy_object()
             .bucket(bucket)
             .key("dest.txt")
             .copy_source(format!("{bucket}/source.txt"))
-            .metadata_directive(MetadataDirective::Replace)
             .send()
-            .await;
-        assert_eq!(service_error_code(&copy).as_deref(), Some("NotImplemented"));
+            .await?;
+        let copied = client
+            .head_object()
+            .bucket(bucket)
+            .key("dest.txt")
+            .send()
+            .await?;
+        assert_eq!(
+            copied
+                .metadata()
+                .and_then(|metadata| metadata.get("mtime"))
+                .map(String::as_str),
+            Some(mtime)
+        );
+        assert_eq!(
+            copied
+                .metadata()
+                .and_then(|metadata| metadata.get("md5chksum"))
+                .map(String::as_str),
+            Some(md5)
+        );
+
+        let updated_mtime = "1753273000.987654321";
+        client
+            .copy_object()
+            .bucket(bucket)
+            .key("dest.txt")
+            .copy_source(format!("{bucket}/dest.txt"))
+            .metadata_directive(MetadataDirective::Replace)
+            .metadata("mtime", updated_mtime)
+            .send()
+            .await?;
+        let replaced = client
+            .head_object()
+            .bucket(bucket)
+            .key("dest.txt")
+            .send()
+            .await?;
+        assert_eq!(
+            replaced
+                .metadata()
+                .and_then(|metadata| metadata.get("mtime"))
+                .map(String::as_str),
+            Some(updated_mtime)
+        );
+        assert!(
+            replaced
+                .metadata()
+                .is_none_or(|metadata| !metadata.contains_key("md5chksum"))
+        );
+
+        let multipart = client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key("multipart.txt")
+            .metadata("mtime", mtime)
+            .metadata("md5chksum", md5)
+            .send()
+            .await?;
+        let upload_id = multipart
+            .upload_id()
+            .ok_or_else(|| std::io::Error::other("multipart upload missing upload id"))?;
+        let part = client
+            .upload_part()
+            .bucket(bucket)
+            .key("multipart.txt")
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from_static(b"multipart metadata"))
+            .send()
+            .await?;
+        client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key("multipart.txt")
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .part_number(1)
+                            .e_tag(part.e_tag().unwrap_or_default())
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await?;
+        let multipart_head = client
+            .head_object()
+            .bucket(bucket)
+            .key("multipart.txt")
+            .send()
+            .await?;
+        assert_eq!(
+            multipart_head
+                .metadata()
+                .and_then(|metadata| metadata.get("mtime"))
+                .map(String::as_str),
+            Some(mtime)
+        );
+        assert_eq!(
+            multipart_head
+                .metadata()
+                .and_then(|metadata| metadata.get("md5chksum"))
+                .map(String::as_str),
+            Some(md5)
+        );
 
         Ok(())
     }

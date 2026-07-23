@@ -336,6 +336,7 @@ pub async fn refresh_reference_metadata_with_context(
                 created_at,
                 created_by,
                 state,
+                metadata,
             } = version;
             let BlobVersionState::Reference {
                 source,
@@ -357,6 +358,7 @@ pub async fn refresh_reference_metadata_with_context(
                         created_by,
                         refresh.refreshed_at,
                     )
+                    .with_metadata(metadata)
                     .to_bytes()
                     {
                         Ok(value) => value,
@@ -943,7 +945,11 @@ mod tests {
             SystemTime::UNIX_EPOCH,
             test.created_by,
             last_refresh,
-        );
+        )
+        .with_metadata(std::collections::HashMap::from([(
+            "mtime".to_string(),
+            "1753272000.123456789".to_string(),
+        )]));
         match test
             .context
             .storage_handle
@@ -986,6 +992,10 @@ mod tests {
             panic!("unexpected version read event");
         };
         let version = BlobVersion::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(
+            version.metadata.get("mtime").map(String::as_str),
+            Some("1753272000.123456789")
+        );
         let BlobVersionState::Reference {
             cached_metadata,
             last_refresh,

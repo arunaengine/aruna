@@ -6,6 +6,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::{MultipartUpload, MultipartUploadChecksumHint, MultipartUploadStatus};
 use aruna_core::types::{Effects, GroupId, TxnId, UserId};
 use smallvec::smallvec;
+use std::collections::HashMap;
 use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
@@ -58,6 +59,7 @@ pub struct CreateMultipartUploadOperation {
     state: CreateMultipartUploadState,
     txn_id: Option<TxnId>,
     record: Option<MultipartUpload>,
+    metadata: HashMap<String, String>,
     output: Option<Result<CreateMultipartUploadResult, CreateMultipartUploadError>>,
 }
 
@@ -68,8 +70,14 @@ impl CreateMultipartUploadOperation {
             state: CreateMultipartUploadState::Init,
             txn_id: None,
             record: None,
+            metadata: HashMap::new(),
             output: None,
         }
+    }
+
+    pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
+        self.metadata = metadata;
+        self
     }
 
     fn emit_error(&mut self, error: CreateMultipartUploadError) -> Effects {
@@ -103,6 +111,7 @@ impl CreateMultipartUploadOperation {
             created_at: SystemTime::now(),
             status: MultipartUploadStatus::Open,
             checksum_hint: self.input.checksum_hint.clone(),
+            metadata: self.metadata.clone(),
         };
         let value = match record.to_bytes() {
             Ok(value) => value,

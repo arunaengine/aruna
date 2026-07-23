@@ -81,6 +81,7 @@ pub struct HeadObjectInput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeadObjectResult {
     pub location: Option<BackendLocation>,
+    pub metadata: HashMap<String, String>,
     pub source_metadata: Option<SourceMetadata>,
     pub last_refresh: Option<SystemTime>,
     pub version_created_at: Option<SystemTime>,
@@ -97,6 +98,7 @@ pub struct HeadObjectOperation {
     state: HeadObjectState,
     txn_id: Option<Ulid>,
     location: Option<BackendLocation>,
+    metadata: HashMap<String, String>,
     source_metadata: Option<SourceMetadata>,
     last_refresh: Option<SystemTime>,
     version_created_at: Option<SystemTime>,
@@ -115,6 +117,7 @@ impl HeadObjectOperation {
             state: HeadObjectState::Init,
             txn_id: None,
             location: None,
+            metadata: HashMap::new(),
             source_metadata: None,
             last_refresh: None,
             version_created_at: None,
@@ -254,6 +257,7 @@ impl HeadObjectOperation {
         explicit_version_request: bool,
     ) -> Effects {
         self.resolved_version_id = Some(version_id);
+        self.metadata = version.metadata.clone();
 
         match version.state {
             BlobVersionState::Materialized { blob_hash, .. } => {
@@ -384,6 +388,7 @@ impl HeadObjectOperation {
         self.state = HeadObjectState::CommitTransaction;
         self.output = Some(Ok(HeadObjectResult {
             location: self.location.clone(),
+            metadata: self.metadata.clone(),
             source_metadata: self.source_metadata.clone(),
             last_refresh: self.last_refresh,
             version_created_at: self.version_created_at,
@@ -444,6 +449,7 @@ impl HeadObjectOperation {
                 self.state = HeadObjectState::Finish;
                 self.output = Some(Ok(HeadObjectResult {
                     location: None,
+                    metadata: self.metadata.clone(),
                     source_metadata: self.source_metadata.clone(),
                     last_refresh: self.last_refresh,
                     version_created_at: None,

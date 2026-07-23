@@ -1760,6 +1760,7 @@ mod tests {
             created_at: SystemTime::UNIX_EPOCH,
             status: MultipartUploadStatus::Open,
             checksum_hint: None,
+            metadata: HashMap::new(),
         };
 
         let decoded = decode_entry(

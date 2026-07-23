@@ -284,6 +284,7 @@ mod test {
             created_at: SystemTime::now(),
             status: MultipartUploadStatus::Open,
             checksum_hint: None,
+            metadata: HashMap::new(),
         };
         let event = context
             .storage_handle

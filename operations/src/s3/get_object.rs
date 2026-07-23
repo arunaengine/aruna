@@ -144,6 +144,7 @@ pub struct GetObjectInput {
 pub struct GetObjectResult {
     pub blob: BackendStream<Result<Bytes, StreamError>>,
     pub location: Option<BackendLocation>,
+    pub metadata: HashMap<String, String>,
     pub source_metadata: Option<SourceMetadata>,
     pub source_binding: Option<VersionSourceBinding>,
     pub last_refresh: Option<SystemTime>,
@@ -164,6 +165,7 @@ pub struct GetObjectOperation {
     location: Option<BackendLocation>,
     reference_access: Option<ResolvedSourceAccess>,
     reference_stream: Option<BackendStream<Result<Bytes, StreamError>>>,
+    metadata: HashMap<String, String>,
     source_metadata: Option<SourceMetadata>,
     source_binding: Option<VersionSourceBinding>,
     last_refresh: Option<SystemTime>,
@@ -185,6 +187,7 @@ impl GetObjectOperation {
             location: None,
             reference_access: None,
             reference_stream: None,
+            metadata: HashMap::new(),
             source_metadata: None,
             source_binding: None,
             last_refresh: None,
@@ -326,6 +329,7 @@ impl GetObjectOperation {
         explicit_version_request: bool,
     ) -> Effects {
         self.resolved_version_id = Some(version_id);
+        self.metadata = version.metadata.clone();
 
         match version.state {
             BlobVersionState::Materialized { blob_hash, source } => {
@@ -573,6 +577,7 @@ impl GetObjectOperation {
             self.output = Some(Ok(GetObjectResult {
                 blob,
                 location: Some(location),
+                metadata: self.metadata.clone(),
                 source_metadata: None,
                 source_binding: self.source_binding.clone(),
                 last_refresh: None,
@@ -632,6 +637,7 @@ impl GetObjectOperation {
         self.output = Some(Ok(GetObjectResult {
             blob,
             location: None,
+            metadata: self.metadata.clone(),
             source_metadata: Some(source_metadata),
             source_binding: self.source_binding.clone(),
             last_refresh: self.last_refresh,
