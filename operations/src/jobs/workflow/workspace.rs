@@ -1043,7 +1043,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_outputs_remain() {
-        let (storage_handle, _receiver) = aruna_storage::StorageHandle::new();
+        let (storage_handle, _receivers) = aruna_storage::StorageHandle::new();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

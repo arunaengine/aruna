@@ -529,8 +529,8 @@ mod tests {
     async fn healthz_fails_dead() {
         // A dropped receiver latches the storage channel-closed flag once an
         // effect is dispatched; liveness must then fail so k8s restarts the pod.
-        let (storage, receiver) = StorageHandle::new();
-        drop(receiver);
+        let (storage, receivers) = StorageHandle::new();
+        drop(receivers);
         let _ = storage
             .send_storage_effect(StorageEffect::Read {
                 key_space: NODE_STATE_KEYSPACE.to_string(),
@@ -569,8 +569,8 @@ mod tests {
 
     #[tokio::test]
     async fn readyz_reports_storage_failure() {
-        let (storage, receiver) = StorageHandle::new();
-        drop(receiver);
+        let (storage, receivers) = StorageHandle::new();
+        drop(receivers);
         let readiness = Readiness::new();
         readiness.set_ready();
         let ops = OpsState::new(

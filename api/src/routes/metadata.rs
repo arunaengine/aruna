@@ -5326,8 +5326,8 @@ mod tests {
     }
 
     async fn setup_state_with_closed_storage() -> Arc<ServerState> {
-        let (storage_handle, receiver) = storage::StorageHandle::new();
-        drop(receiver);
+        let (storage_handle, receivers) = storage::StorageHandle::new();
+        drop(receivers);
 
         let realm_id = test_realm_id(3);
         let node_id = iroh::SecretKey::from_bytes(&[14u8; 32]).public();

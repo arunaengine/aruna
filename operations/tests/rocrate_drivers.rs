@@ -896,7 +896,8 @@ fn storage_proxy(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let (storage, receiver) = StorageHandle::new();
+    let (storage, receivers) = StorageHandle::new();
+    let receiver = receivers.foreground;
     let (hit_sender, hit) = oneshot::channel();
     let (release, release_receiver) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));

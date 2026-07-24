@@ -192,6 +192,15 @@ pub enum StorageEffect {
     },
 }
 
+/// Dispatch lane for a storage effect. Foreground is always served before Bulk,
+/// so sync traffic is never starved by background materialization work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StoragePriority {
+    #[default]
+    Foreground,
+    Bulk,
+}
+
 /// Lower bound for a [`StorageEffect::Iter`] scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IterStart {

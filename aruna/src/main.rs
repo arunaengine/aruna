@@ -899,7 +899,8 @@ mod tests {
         let readiness = Readiness::new();
         readiness.set_ready();
         let observed_readiness = readiness.clone();
-        let (storage_handle, receiver) = StorageHandle::new();
+        let (storage_handle, receivers) = StorageHandle::new();
+        let receiver = receivers.foreground;
         let worker = thread::spawn(move || {
             let (effect, response_tx, _span, _queued_at, _in_flight) = receiver
                 .recv()
@@ -952,7 +953,8 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_usage_counters_returns_probe_errors() {
-        let (storage_handle, receiver) = StorageHandle::new();
+        let (storage_handle, receivers) = StorageHandle::new();
+        let receiver = receivers.foreground;
         let worker = thread::spawn(move || {
             let (effect, response_tx, _span, _queued_at, _in_flight) = receiver
                 .recv()
@@ -975,7 +977,8 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_usage_counters_rejects_unexpected_probe_events() {
-        let (storage_handle, receiver) = StorageHandle::new();
+        let (storage_handle, receivers) = StorageHandle::new();
+        let receiver = receivers.foreground;
         let worker = thread::spawn(move || {
             let (effect, response_tx, _span, _queued_at, _in_flight) = receiver
                 .recv()

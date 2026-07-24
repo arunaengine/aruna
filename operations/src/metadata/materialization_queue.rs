@@ -2585,7 +2585,8 @@ mod tests {
     async fn older_check_local() {
         // Predecessor lookups read the status then one document-local sidecar
         // scan; they never fall back to a full global keyspace scan.
-        let (storage, receiver) = StorageHandle::new();
+        let (storage, receivers) = StorageHandle::new();
+        let receiver = receivers.foreground;
         let document_id = Ulid::from_bytes([11u8; 16]);
         let event_id = Ulid::from_parts(11, 2);
         let scripted = thread::spawn(move || {
@@ -2710,7 +2711,8 @@ mod tests {
 
     #[tokio::test]
     async fn retry_reschedule_is_atomic() {
-        let (storage, receiver) = StorageHandle::new();
+        let (storage, receivers) = StorageHandle::new();
+        let receiver = receivers.foreground;
         let txn_id = Ulid::from_parts(5, 1);
         let document_id = Ulid::from_bytes([4u8; 16]);
         let event_id = Ulid::from_parts(5, 2);
