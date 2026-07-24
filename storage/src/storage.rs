@@ -89,9 +89,11 @@ fn storage_effect_key_space(effect: &StorageEffect) -> Option<&str> {
 const MAX_GROUP_COMMIT: usize = 256;
 const READ_POOL_THREADS: usize = 4;
 const BULK_READ_POOL_THREADS: usize = 2;
-// Foreground batches served before one bulk item is admitted. Bounds bulk queue
-// latency under sustained ingest so background drains cannot stall indefinitely.
-const MAX_FOREGROUND_STREAK: usize = 8;
+// Foreground effects served per admitted bulk effect. Counting effects rather
+// than batches keeps the bulk share constant under load: a batch may carry up to
+// MAX_GROUP_COMMIT effects, so per-batch credit would shrink the share to
+// nothing exactly when the queue is deepest.
+const FOREGROUND_PER_BULK: usize = 8;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FjallPersistPolicy {
@@ -618,7 +620,8 @@ impl FjallStorage {
             };
             match priority {
                 StoragePriority::Foreground => {
-                    self.serve_foreground_batch(&receivers, first, &mut slow_queue)
+                    let served = self.serve_foreground_batch(&receivers, first, &mut slow_queue);
+                    lanes.record_foreground(served);
                 }
                 StoragePriority::Bulk => {
                     if is_poolable_read(&first.0) {
@@ -631,12 +634,14 @@ impl FjallStorage {
         }
     }
 
+    /// Returns how many foreground effects were served, which is what the lane
+    /// scheduler credits the bulk lane against.
     fn serve_foreground_batch(
         &mut self,
         receivers: &StorageReceivers,
         first: EffectHandle,
         slow_queue: &mut SlowQueueAggregator,
-    ) {
+    ) -> usize {
         let mut pending = Vec::with_capacity(8);
         pending.push(first);
         while pending.len() < MAX_GROUP_COMMIT {
@@ -645,6 +650,7 @@ impl FjallStorage {
                 Err(_) => break,
             }
         }
+        let served = pending.len();
 
         let mut group: Vec<EffectHandle> = Vec::new();
         let mut group_index: Option<PendingWriteIndex> = None;
@@ -673,6 +679,7 @@ impl FjallStorage {
             self.process_single(item, slow_queue);
         }
         self.flush_write_group(&mut group, slow_queue);
+        served
     }
 
     fn forward_to_read_pool(
@@ -1646,34 +1653,37 @@ fn iter_may_include_key(
     }
 }
 
-/// Lane picker for the write actor: foreground is preferred, but a bulk item is
-/// admitted after [`MAX_FOREGROUND_STREAK`] foreground batches so background work
-/// keeps draining while ingest saturates the foreground lane.
+/// Lane picker for the write actor. Foreground is preferred, and every
+/// [`FOREGROUND_PER_BULK`] foreground effects earn one bulk effect, so the drain
+/// keeps a fixed share of the actor no matter how deep the foreground queue is.
 #[derive(Debug, Default)]
 struct LaneScheduler {
-    foreground_streak: usize,
+    credit: usize,
 }
 
 impl LaneScheduler {
+    fn record_foreground(&mut self, served: usize) {
+        self.credit = self.credit.saturating_add(served);
+    }
+
     fn next(
         &mut self,
         receivers: &StorageReceivers,
     ) -> Result<(EffectHandle, StoragePriority), RecvError> {
         loop {
-            if self.foreground_streak >= MAX_FOREGROUND_STREAK
+            if self.credit >= FOREGROUND_PER_BULK
                 && let Ok(item) = receivers.bulk.try_recv()
             {
-                self.foreground_streak = 0;
+                self.credit = self.credit.saturating_sub(FOREGROUND_PER_BULK);
                 return Ok((item, StoragePriority::Bulk));
             }
             let foreground = receivers.foreground.try_recv();
             if let Ok(item) = foreground {
-                self.foreground_streak = self.foreground_streak.saturating_add(1);
                 return Ok((item, StoragePriority::Foreground));
             }
             let bulk = receivers.bulk.try_recv();
             if let Ok(item) = bulk {
-                self.foreground_streak = 0;
+                self.credit = 0;
                 return Ok((item, StoragePriority::Bulk));
             }
             match (foreground, bulk) {
@@ -1681,14 +1691,14 @@ impl LaneScheduler {
                     return Err(RecvError);
                 }
                 (Err(TryRecvError::Disconnected), _) => {
-                    self.foreground_streak = 0;
+                    self.credit = 0;
                     return receivers
                         .bulk
                         .recv()
                         .map(|item| (item, StoragePriority::Bulk));
                 }
                 (_, Err(TryRecvError::Disconnected)) => {
-                    self.foreground_streak = 0;
+                    self.credit = 0;
                     return receivers
                         .foreground
                         .recv()
@@ -1698,7 +1708,7 @@ impl LaneScheduler {
             }
             // Both lanes are open but empty: block on a biased select so an idle
             // node sleeps with zero wakeups and foreground stays preferred.
-            self.foreground_streak = 0;
+            self.credit = 0;
             let mut select = Select::new_bias();
             select.add(&receivers.foreground);
             select.add(&receivers.bulk);
@@ -1714,9 +1724,6 @@ impl LaneScheduler {
                 Err(RecvError) => return Err(RecvError),
             };
             if let Ok(pair) = received {
-                if matches!(pair.1, StoragePriority::Foreground) {
-                    self.foreground_streak = 1;
-                }
                 return Ok(pair);
             }
         }
@@ -2146,9 +2153,10 @@ mod tests {
     }
 
     #[test]
-    fn bulk_survives_foreground() {
-        // A foreground lane that never runs dry must still yield the bulk lane a
-        // slot, otherwise background drains stall until the node goes idle.
+    fn bulk_keeps_share() {
+        // Credit is earned per foreground effect, not per batch: one batch may
+        // swallow the whole foreground queue, and it must still buy the bulk
+        // lane its proportional slots or a deep queue starves the drain.
         let (handle, receivers) = StorageHandle::new();
         let read = |key_space: &str| StorageEffect::Read {
             key_space: key_space.to_string(),
@@ -2169,24 +2177,31 @@ mod tests {
             );
             keep.push(rx);
         };
-        for _ in 0..(super::MAX_FOREGROUND_STREAK * 2) {
+        let batch = super::MAX_GROUP_COMMIT;
+        let expected_bulk = batch / super::FOREGROUND_PER_BULK;
+        for _ in 0..batch {
             enqueue(&handle.write_channel, "fg");
         }
-        enqueue(&handle.bulk_channel, "bulk");
+        for _ in 0..expected_bulk {
+            enqueue(&handle.bulk_channel, "bulk");
+        }
 
         let mut lanes = super::LaneScheduler::default();
-        let mut served = Vec::new();
-        for _ in 0..(super::MAX_FOREGROUND_STREAK + 1) {
+        let (_, priority) = lanes.next(&receivers).expect("first item");
+        assert_eq!(priority, StoragePriority::Foreground);
+        // The actor drains the rest of the foreground queue as one batch.
+        lanes.record_foreground(batch);
+
+        let mut bulk_served = 0usize;
+        for _ in 0..expected_bulk {
             let (_, priority) = lanes.next(&receivers).expect("item");
-            served.push(priority);
+            if priority == StoragePriority::Bulk {
+                bulk_served += 1;
+            }
         }
         assert_eq!(
-            served
-                .iter()
-                .filter(|p| **p == StoragePriority::Bulk)
-                .count(),
-            1,
-            "bulk served within one streak: {served:?}"
+            bulk_served, expected_bulk,
+            "a full foreground batch buys {expected_bulk} bulk slots"
         );
         drop(keep);
     }
