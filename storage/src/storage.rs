@@ -13,7 +13,8 @@ use aruna_core::telemetry::{LatencyAggregator, duration_ms, record_stage};
 use aruna_core::util::prefix_upper_bound;
 use async_trait::async_trait;
 use byteview::ByteView;
-use crossfire::{RecvError, RecvTimeoutError, TryRecvError, TrySendError, mpsc, oneshot};
+use crossfire::select::Select;
+use crossfire::{RecvError, TryRecvError, TrySendError, mpsc, oneshot};
 use fjall::{
     KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PersistMode, Readable,
 };
@@ -1647,25 +1648,43 @@ fn recv_prioritized(
         if let Ok(item) = foreground {
             return Ok((item, StoragePriority::Foreground));
         }
-        match receivers.bulk.try_recv() {
-            Ok(item) => return Ok((item, StoragePriority::Bulk)),
-            Err(TryRecvError::Disconnected)
-                if matches!(foreground, Err(TryRecvError::Disconnected)) =>
-            {
+        let bulk = receivers.bulk.try_recv();
+        if let Ok(item) = bulk {
+            return Ok((item, StoragePriority::Bulk));
+        }
+        match (foreground, bulk) {
+            (Err(TryRecvError::Disconnected), Err(TryRecvError::Disconnected)) => {
                 return Err(RecvError);
             }
-            Err(_) => {}
-        }
-        if matches!(foreground, Err(TryRecvError::Disconnected)) {
-            match receivers.bulk.recv_timeout(Duration::from_millis(1)) {
-                Ok(item) => return Ok((item, StoragePriority::Bulk)),
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => return Err(RecvError),
+            (Err(TryRecvError::Disconnected), _) => {
+                return receivers.bulk.recv().map(|item| (item, StoragePriority::Bulk));
             }
+            (_, Err(TryRecvError::Disconnected)) => {
+                return receivers
+                    .foreground
+                    .recv()
+                    .map(|item| (item, StoragePriority::Foreground));
+            }
+            _ => {}
         }
-        match receivers.foreground.recv_timeout(Duration::from_millis(1)) {
-            Ok(item) => return Ok((item, StoragePriority::Foreground)),
-            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => continue,
+        // Both lanes are open but empty: block on a biased select so an idle
+        // node sleeps with zero wakeups and foreground stays preferred.
+        let mut select = Select::new_bias();
+        select.add(&receivers.foreground);
+        select.add(&receivers.bulk);
+        let received = match select.select() {
+            Ok(result) if result == receivers.foreground => receivers
+                .foreground
+                .read_select(result)
+                .map(|item| (item, StoragePriority::Foreground)),
+            Ok(result) => receivers
+                .bulk
+                .read_select(result)
+                .map(|item| (item, StoragePriority::Bulk)),
+            Err(RecvError) => return Err(RecvError),
+        };
+        if let Ok(pair) = received {
+            return Ok(pair);
         }
     }
 }
