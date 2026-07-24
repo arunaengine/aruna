@@ -60,7 +60,7 @@ const DEAD_LETTER_REQUEUE_MAX_MS: u64 = 3_600_000;
 const DEAD_LETTER_REQUEUE_PAGE_SIZE: usize = 256;
 // Jobs per finish transaction. Small enough that a failed commit costs little,
 // large enough that a full batch commits in a handful of transactions.
-const MATERIALIZATION_FINISH_CHUNK: usize = 64;
+const MATERIALIZATION_FINISH_CHUNK: usize = 256;
 
 pub const METADATA_MATERIALIZATION_POLL_AFTER: Duration = Duration::from_secs(5);
 pub const METADATA_MATERIALIZATION_RETRY_AFTER: Duration = Duration::from_secs(1);
@@ -3463,12 +3463,12 @@ mod tests {
     // Rescheduled jobs for `count` distinct documents, rows already persisted.
     async fn reschedule_batch(
         storage: &StorageHandle,
-        count: u8,
+        count: usize,
     ) -> Vec<FinishedMaterializationJob> {
         let mut finished = Vec::new();
         for seed in 0..count {
-            let document_id = Ulid::from_bytes([120 + seed; 16]);
-            let event_id = Ulid::from_parts(1, u128::from(seed));
+            let document_id = Ulid::from_parts(900, seed as u128);
+            let event_id = Ulid::from_parts(1, seed as u128);
             let event = create_event(document_id, event_id, "chunk");
             let job = MetadataMaterializationJobRecord {
                 document_id,
@@ -3502,7 +3502,7 @@ mod tests {
         // so in several transactions so a late failure cannot undo early work.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let count = u8::try_from(MATERIALIZATION_FINISH_CHUNK + 3).unwrap();
+        let count = MATERIALIZATION_FINISH_CHUNK + 3;
         let finished = reschedule_batch(&storage, count).await;
 
         let before = storage.snapshot_metrics().requests_total;
@@ -3514,7 +3514,7 @@ mod tests {
         // Two chunks, each a handful of requests: far below one transaction per
         // job, and each chunk commits on its own.
         assert!(delta <= 16, "finish issued {delta} storage requests");
-        assert_eq!(index_job_keys(&storage).await.len(), usize::from(count));
+        assert_eq!(index_job_keys(&storage).await.len(), count);
         assert_eq!(storage.snapshot_metrics().conflicts_total, 0);
     }
 
