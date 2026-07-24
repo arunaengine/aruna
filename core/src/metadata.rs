@@ -872,6 +872,10 @@ pub enum MetadataError {
     Validation(Vec<MetadataValidationViolation>),
     #[error("metadata graph not found")]
     GraphNotFound,
+    /// Durability failure while persisting backend state. Infrastructure, not the
+    /// document: retrying it is always valid.
+    #[error("metadata persist failed: {0}")]
+    Persist(String),
     #[error("metadata backend error: {0}")]
     Backend(String),
 }

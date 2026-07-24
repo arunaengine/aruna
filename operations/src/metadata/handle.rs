@@ -2995,7 +2995,7 @@ fn flush_document_sync_journal(
         }
         Err(error) => {
             record_error(&span, &error.to_string());
-            Err(MetadataError::Backend(format!(
+            Err(MetadataError::Persist(format!(
                 "failed to flush document sync journal: {error}"
             )))
         }
@@ -3010,7 +3010,7 @@ fn flush_metadata_persistence(
     inner
         .node
         .persist_fjall()
-        .map_err(metadata_error_from_craqle)?;
+        .map_err(|error| MetadataError::Persist(error.to_string()))?;
     flush_document_sync_journal(inner, effect_name, graph_iri)
 }
 

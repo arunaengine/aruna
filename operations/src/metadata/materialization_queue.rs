@@ -41,6 +41,7 @@ use crate::driver::DriverContext;
 
 use crate::queue_backoff::queue_retry_after_ms;
 
+use super::iri_index::MetadataIriIndexError;
 use super::queue_storage::{
     MetadataQueueStorageError, abort_storage_transaction_best_effort, commit_storage_transaction,
     start_write_transaction,
@@ -145,6 +146,8 @@ pub enum MetadataMaterializationQueueError {
     MetadataCreateEventMissing { document_id: Ulid, event_id: Ulid },
     #[error("unexpected event while processing metadata materialization queue: {0}")]
     UnexpectedEvent(String),
+    #[error("inconsistent metadata raw event log: {0}")]
+    InconsistentLog(String),
 }
 
 impl From<MetadataQueueStorageError> for MetadataMaterializationQueueError {
@@ -163,6 +166,17 @@ impl From<MetadataRawReadError> for MetadataMaterializationQueueError {
             MetadataRawReadError::Conversion(error) => Self::Conversion(error),
             MetadataRawReadError::Metadata(error) => Self::Metadata(error),
             MetadataRawReadError::UnexpectedEvent(event) => Self::UnexpectedEvent(event),
+            MetadataRawReadError::InconsistentLog(message) => Self::InconsistentLog(message),
+        }
+    }
+}
+
+impl From<MetadataIriIndexError> for MetadataMaterializationQueueError {
+    fn from(error: MetadataIriIndexError) -> Self {
+        match error {
+            MetadataIriIndexError::Storage(error) => Self::Storage(error),
+            MetadataIriIndexError::Conversion(error) => Self::Conversion(error),
+            MetadataIriIndexError::UnexpectedEvent(event) => Self::UnexpectedEvent(event),
         }
     }
 }
@@ -598,6 +612,24 @@ async fn plan_finish_chunk(
                 status,
             } => {
                 let current = guard_status(&snapshot, &planned, job.document_id);
+                let job_deletes = [
+                    (
+                        METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                        ByteView::from(job_key),
+                    ),
+                    (
+                        METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+                        metadata_materialization_document_job_key(job.document_id, job.event_id),
+                    ),
+                ];
+                // An already-superseded job must not leave a dead letter behind:
+                // requeueing it later would resurrect an obsolete event.
+                if current
+                    .is_some_and(|current| materialization_retry_already_advanced(current, &job))
+                {
+                    plan.deletes.extend(job_deletes);
+                    continue;
+                }
                 if should_write_final_materialization_status(current, &status) {
                     plan.writes
                         .push(metadata_materialization_status_write_entry(&status)?);
@@ -605,14 +637,7 @@ async fn plan_finish_chunk(
                 let previous = parked.get(&(job.document_id, job.event_id));
                 let dead_letter = parked_dead_letter(&job, &status, previous);
                 plan.writes.push(dead_letter_entry(&dead_letter)?);
-                plan.deletes.push((
-                    METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
-                    ByteView::from(job_key),
-                ));
-                plan.deletes.push((
-                    METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
-                    metadata_materialization_document_job_key(job.document_id, job.event_id),
-                ));
+                plan.deletes.extend(job_deletes);
                 warn!(
                     event = "materialization.job.parked",
                     document_id = %job.document_id,
@@ -803,9 +828,9 @@ async fn read_dead_letter(
     }
 }
 
-/// Returns due dead letters to the queue with a fresh failure budget and clears
-/// their terminal status, so a node converges once the cause clears. Returns the
-/// number of jobs requeued.
+/// Returns due dead letters to the queue and clears their terminal status, so a
+/// node converges once the cause clears. Dead letters the document has moved
+/// past are dropped instead. Returns the number of jobs requeued.
 pub async fn requeue_dead_letters(
     storage: &StorageHandle,
 ) -> Result<usize, MetadataMaterializationQueueError> {
@@ -846,8 +871,9 @@ pub async fn requeue_dead_letters(
             if dead_letter.requeue_at_ms > now_ms {
                 continue;
             }
-            requeue_dead_letter(storage, &dead_letter).await?;
-            requeued = requeued.saturating_add(1);
+            if requeue_dead_letter(storage, &dead_letter).await? {
+                requeued = requeued.saturating_add(1);
+            }
         }
 
         match next_start_after {
@@ -865,31 +891,64 @@ pub async fn requeue_dead_letters(
     Ok(requeued)
 }
 
+// The parked job's own status is Failed at its own event, so only a final status
+// beyond that means the document moved on and requeueing would regress it.
+fn dead_letter_superseded(
+    status: &MetadataMaterializationStatusRecord,
+    job: &MetadataMaterializationJobRecord,
+) -> bool {
+    materialization_status_obsoletes_job(status, job)
+        && (status.event_id > job.event_id
+            || status.state == MetadataMaterializationState::Materialized)
+}
+
 // The parked status is terminal for this event, so it must be cleared with the
-// job rows or the requeued job is pruned as obsolete on the next scan.
+// job rows or the requeued job is pruned as obsolete on the next scan. The
+// requeued job keeps one failure of budget so a poison document re-parks fast.
 async fn requeue_dead_letter(
     storage: &StorageHandle,
     dead_letter: &MetadataMaterializationDeadLetterRecord,
-) -> Result<(), MetadataMaterializationQueueError> {
+) -> Result<bool, MetadataMaterializationQueueError> {
     let job = MetadataMaterializationJobRecord {
         document_id: dead_letter.job.document_id,
         event_id: dead_letter.job.event_id,
         due_at_ms: unix_timestamp_millis(),
         attempts: 0,
-        failures: 0,
+        failures: MATERIALIZATION_MAX_FAILURES.saturating_sub(1),
     };
+    if let Some(status) = read_materialization_status(storage, job.document_id, None).await?
+        && dead_letter_superseded(&status, &job)
+    {
+        info!(
+            event = "materialization.deadletter.superseded",
+            document_id = %job.document_id,
+            event_id = %job.event_id,
+            status_event_id = %status.event_id,
+            "Dropping superseded metadata materialization dead letter"
+        );
+        delete_dead_letter(
+            storage,
+            dead_letter_key(job.document_id, job.event_id).to_vec(),
+        )
+        .await?;
+        return Ok(false);
+    }
     let event = match read_create_event(storage, job.document_id, job.event_id).await {
         Ok(event) => event,
         Err(MetadataMaterializationQueueError::MetadataCreateEventMissing { .. }) => {
-            return delete_dead_letter(
+            delete_dead_letter(
                 storage,
                 dead_letter_key(job.document_id, job.event_id).to_vec(),
             )
-            .await;
+            .await?;
+            return Ok(false);
         }
         Err(error) => return Err(error),
     };
-    let status = new_pending_materialization_status(&event, unix_timestamp_millis());
+    let status = MetadataMaterializationStatusRecord {
+        failures: job.failures,
+        ..new_pending_materialization_status(&event, unix_timestamp_millis())
+    };
     let txn_id = start_write_transaction(storage).await?;
     let result = async {
         transactional_batch_write(
@@ -916,7 +975,7 @@ async fn requeue_dead_letter(
     match result {
         Ok(()) => {
             commit_storage_transaction(storage, txn_id).await?;
-            Ok(())
+            Ok(true)
         }
         Err(error) => {
             abort_storage_transaction_best_effort(
@@ -2052,16 +2111,15 @@ fn materialization_failure_kind(
         MetadataMaterializationQueueError::Metadata(
             MetadataError::InvalidInput(_) | MetadataError::Validation(_),
         ) => MaterializationFailureKind::Terminal,
-        MetadataMaterializationQueueError::Storage(
-            StorageError::Timeout
-            | StorageError::QueueFull
-            | StorageError::ChannelClosed
-            | StorageError::PersistError(_),
-        )
+        // A storage failure or an off-contract adapter event is never the
+        // document's fault, so it must not spend the budget that parks a job.
+        MetadataMaterializationQueueError::Storage(_)
+        | MetadataMaterializationQueueError::UnexpectedEvent(_)
         | MetadataMaterializationQueueError::Metadata(
             MetadataError::ChannelClosed
             | MetadataError::TaskJoin(_)
-            | MetadataError::HandleMissing,
+            | MetadataError::HandleMissing
+            | MetadataError::Persist(_),
         )
         | MetadataMaterializationQueueError::MetadataHandleMissing => {
             MaterializationFailureKind::Transient
@@ -2886,11 +2944,47 @@ mod tests {
             failures: MATERIALIZATION_MAX_FAILURES - 1,
         };
         let key = metadata_materialization_job_key(&job);
-        let timeout = MetadataMaterializationQueueError::Storage(StorageError::Timeout);
-        match defer_materialization_job(key.as_ref(), &job, &event, &timeout) {
+        let errors = [
+            MetadataMaterializationQueueError::Storage(StorageError::Timeout),
+            MetadataMaterializationQueueError::Storage(StorageError::TransactionConflict),
+            // A failed durability flush runs after every apply; charging it would
+            // park documents whenever the disk is the bottleneck.
+            MetadataMaterializationQueueError::Metadata(MetadataError::Persist(
+                "journal".to_string(),
+            )),
+        ];
+        for error in errors {
+            match defer_materialization_job(key.as_ref(), &job, &event, &error) {
+                FinishedMaterializationJob::Rescheduled { status, .. } => {
+                    assert_eq!(status.failures, job.failures);
+                    assert_eq!(status.attempts, job.attempts + 1);
+                }
+                other => panic!("expected reschedule, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn iri_failure_transient() {
+        // A bulk-lane QueueFull surfaced through the IRI index keeps its storage
+        // cause, so it defers without spending the failure budget.
+        let document_id = Ulid::from_bytes([51u8; 16]);
+        let event_id = Ulid::from_parts(5, 1);
+        let event = create_event(document_id, event_id, "indexed");
+        let job = MetadataMaterializationJobRecord {
+            document_id,
+            event_id,
+            due_at_ms: 1,
+            attempts: 0,
+            failures: MATERIALIZATION_MAX_FAILURES - 1,
+        };
+        let key = metadata_materialization_job_key(&job);
+        let error = MetadataMaterializationQueueError::from(MetadataIriIndexError::Storage(
+            StorageError::QueueFull,
+        ));
+        match defer_materialization_job(key.as_ref(), &job, &event, &error) {
             FinishedMaterializationJob::Rescheduled { status, .. } => {
                 assert_eq!(status.failures, job.failures);
-                assert_eq!(status.attempts, job.attempts + 1);
             }
             other => panic!("expected reschedule, got {other:?}"),
         }
@@ -2898,8 +2992,8 @@ mod tests {
 
     #[tokio::test]
     async fn deadletters_requeue_due() {
-        // A due dead letter returns to the queue with a fresh budget and a
-        // pending status; one that is not due yet stays parked.
+        // A due dead letter returns to the queue with one failure of budget left
+        // and a pending status; one that is not due yet stays parked.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let document_id = Ulid::from_bytes([48u8; 16]);
@@ -2946,7 +3040,7 @@ mod tests {
             .await
             .unwrap()
             .expect("job is requeued");
-        assert_eq!(requeued.failures, 0);
+        assert_eq!(requeued.failures, MATERIALIZATION_MAX_FAILURES - 1);
         assert_eq!(requeued.attempts, 0);
         let status = read_materialization_status(&storage, document_id, None)
             .await
@@ -2954,6 +3048,174 @@ mod tests {
             .expect("status is reset");
         assert_eq!(status.state, MetadataMaterializationState::Pending);
         assert!(metadata_materialization_jobs_exist(&storage).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn requeued_parks_fast() {
+        // A requeued dead letter carries one failure of budget, so a document
+        // that is still poisonous re-parks after a single apply.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let document_id = Ulid::from_bytes([53u8; 16]);
+        let event_id = Ulid::from_parts(6, 1);
+        let event = create_event(document_id, event_id, "poison");
+        let parked = MetadataMaterializationJobRecord {
+            document_id,
+            event_id,
+            due_at_ms: 1,
+            attempts: MATERIALIZATION_MAX_FAILURES,
+            failures: MATERIALIZATION_MAX_FAILURES,
+        };
+        let due = MetadataMaterializationDeadLetterRecord {
+            job: parked,
+            last_error: "boom".to_string(),
+            parked_at_ms: 1,
+            parks: 1,
+            requeue_at_ms: 1,
+        };
+        write_entries(
+            &storage,
+            vec![
+                metadata_create_event_write_entry(&event).unwrap(),
+                dead_letter_entry(&due).unwrap(),
+            ],
+        )
+        .await;
+        assert_eq!(requeue_dead_letters(&storage).await.unwrap(), 1);
+
+        let requeued = read_document_job(&storage, document_id, event_id)
+            .await
+            .unwrap()
+            .expect("job is requeued");
+        let key = metadata_materialization_job_key(&requeued);
+        assert!(matches!(
+            defer_materialization_job(key.as_ref(), &requeued, &event, &application_failure()),
+            FinishedMaterializationJob::Parked { .. }
+        ));
+    }
+
+    // A status that already materialized `event_id`, as a newer event would.
+    fn materialized_status(
+        document_id: Ulid,
+        event: &MetadataCreateEventRecord,
+    ) -> MetadataMaterializationStatusRecord {
+        let job = MetadataMaterializationJobRecord {
+            document_id,
+            event_id: event.event_id,
+            due_at_ms: 1,
+            attempts: 0,
+            failures: 0,
+        };
+        materialization_success_status(&job, event, None)
+    }
+
+    #[tokio::test]
+    async fn deadletter_drops_superseded() {
+        // Requeueing a dead letter whose document has since materialized a newer
+        // event would regress the projection, so the dead letter is dropped.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let document_id = Ulid::from_bytes([54u8; 16]);
+        let old_event_id = Ulid::from_parts(1, 1);
+        let newer_event_id = Ulid::from_parts(2, 1);
+        let old_event = create_event(document_id, old_event_id, "old");
+        let newer_event = create_event(document_id, newer_event_id, "newer");
+        let newer_status = materialized_status(document_id, &newer_event);
+        let due = MetadataMaterializationDeadLetterRecord {
+            job: MetadataMaterializationJobRecord {
+                document_id,
+                event_id: old_event_id,
+                due_at_ms: 1,
+                attempts: MATERIALIZATION_MAX_FAILURES,
+                failures: MATERIALIZATION_MAX_FAILURES,
+            },
+            last_error: "boom".to_string(),
+            parked_at_ms: 1,
+            parks: 1,
+            requeue_at_ms: 1,
+        };
+        write_entries(
+            &storage,
+            vec![
+                metadata_create_event_write_entry(&old_event).unwrap(),
+                metadata_create_event_write_entry(&newer_event).unwrap(),
+                metadata_materialization_status_write_entry(&newer_status).unwrap(),
+                dead_letter_entry(&due).unwrap(),
+            ],
+        )
+        .await;
+
+        assert_eq!(requeue_dead_letters(&storage).await.unwrap(), 0);
+
+        assert!(
+            read_dead_letter(&storage, document_id, old_event_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let status = read_materialization_status(&storage, document_id, None)
+            .await
+            .unwrap()
+            .expect("status survives");
+        assert_eq!(status.event_id, newer_event_id);
+        assert_eq!(status.state, MetadataMaterializationState::Materialized);
+        assert!(
+            read_document_job(&storage, document_id, old_event_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn park_skips_superseded() {
+        // Parking a job the document has already moved past must not leave a
+        // dead letter that a later sweep could resurrect.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let document_id = Ulid::from_bytes([55u8; 16]);
+        let old_event_id = Ulid::from_parts(1, 1);
+        let newer_event_id = Ulid::from_parts(2, 1);
+        let old_event = create_event(document_id, old_event_id, "old");
+        let newer_event = create_event(document_id, newer_event_id, "newer");
+        let newer_status = materialized_status(document_id, &newer_event);
+        let job = MetadataMaterializationJobRecord {
+            document_id,
+            event_id: old_event_id,
+            due_at_ms: 1,
+            attempts: MATERIALIZATION_MAX_FAILURES - 1,
+            failures: MATERIALIZATION_MAX_FAILURES - 1,
+        };
+        let job_key = metadata_materialization_job_key(&job);
+        write_entries(
+            &storage,
+            vec![
+                metadata_materialization_status_write_entry(&newer_status).unwrap(),
+                metadata_materialization_job_write_entry(&job).unwrap(),
+                metadata_materialization_document_job_write_entry(&job).unwrap(),
+            ],
+        )
+        .await;
+
+        let parked =
+            defer_materialization_job(job_key.as_ref(), &job, &old_event, &application_failure());
+        assert!(matches!(parked, FinishedMaterializationJob::Parked { .. }));
+        let plan = plan_finish_chunk(&storage, vec![parked]).await.unwrap();
+
+        assert!(
+            !plan
+                .writes
+                .iter()
+                .any(|(key_space, _, _)| key_space == METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE)
+        );
+        assert!(plan.deletes.contains(&(
+            METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+            job_key.clone()
+        )));
+        assert!(plan.deletes.contains(&(
+            METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+            metadata_materialization_document_job_key(document_id, old_event_id)
+        )));
     }
 
     #[test]
