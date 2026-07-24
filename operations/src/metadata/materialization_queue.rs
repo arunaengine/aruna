@@ -1051,9 +1051,9 @@ async fn read_document_job(
 }
 
 // The due index is due-ordered and its rows are valid only when the sidecar row
-// exists with a matching due time. A page resolves its sidecars, events and
-// statuses in three batch reads and prunes dead rows in one delete, so the scan
-// costs O(pages) requests rather than O(due jobs).
+// exists with a matching due time. Rows resolve in slices of the outstanding
+// limit, each slice costing three batch reads, and a page prunes its dead rows
+// in one delete: a full batch costs O(slices) requests, not O(due jobs).
 async fn scan_due_materialization_jobs(
     storage: &StorageHandle,
     now_ms: u64,
@@ -1112,56 +1112,25 @@ async fn scan_due_materialization_jobs(
             candidates.push((key, due_at_ms, document_id, event_id));
         }
 
-        let sidecars = read_document_jobs(
-            storage,
-            &candidates
-                .iter()
-                .map(|(_, _, document_id, event_id)| (*document_id, *event_id))
-                .collect::<Vec<_>>(),
-        )
-        .await?;
-        let mut due = Vec::new();
-        for ((key, due_at_ms, document_id, event_id), sidecar) in
-            candidates.into_iter().zip(sidecars)
-        {
-            match sidecar {
-                Some(job) if job.due_at_ms == due_at_ms => due.push((key, job)),
-                Some(_) | None => {
-                    // The sidecar is authoritative: an index row it does not
-                    // match is stale. A malformed sidecar is dropped with it.
-                    stale.push((
-                        METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
-                        ByteView::from(key),
-                    ));
-                    if sidecar.is_none() {
-                        stale.push((
-                            METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
-                            metadata_materialization_document_job_key(document_id, event_id),
-                        ));
-                    }
+        // Resolved in slices of the outstanding limit so a probe for a single
+        // due job does not read a whole page of sidecars, events and statuses.
+        let mut cursor = 0usize;
+        while cursor < candidates.len() {
+            let remaining = limit.saturating_sub(jobs.len()).max(1);
+            let end = candidates.len().min(cursor.saturating_add(remaining));
+            let (live, dead) = resolve_due_jobs(storage, &candidates[cursor..end]).await?;
+            cursor = end;
+            stale.extend(dead);
+            for (_, job) in live {
+                jobs.push((metadata_materialization_job_key(&job).to_vec(), job));
+                if jobs.len() >= limit {
+                    delete_materialization_entries(storage, stale).await?;
+                    return Ok((jobs, true, None));
                 }
             }
         }
-
-        let (live, dead) = filter_live_jobs(storage, due).await?;
-        for (key, job) in dead {
-            stale.push((
-                METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
-                ByteView::from(key),
-            ));
-            stale.push((
-                METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
-                metadata_materialization_document_job_key(job.document_id, job.event_id),
-            ));
-        }
         delete_materialization_entries(storage, stale).await?;
 
-        for (_, job) in live {
-            jobs.push((metadata_materialization_job_key(&job).to_vec(), job));
-            if jobs.len() >= limit {
-                return Ok((jobs, true, None));
-            }
-        }
         if let Some(due_at_ms) = next_due_at_ms {
             return Ok((jobs, false, Some(due_at_ms)));
         }
@@ -1171,6 +1140,57 @@ async fn scan_due_materialization_jobs(
             None => return Ok((jobs, false, None)),
         }
     }
+}
+
+/// One index row seen by the scan: its key, the due time encoded in it and the
+/// sidecar it points at.
+type DueCandidate = (Vec<u8>, u64, Ulid, Ulid);
+
+// Resolves a slice of index rows against their sidecars and liveness, returning
+// the live jobs and the rows the caller should prune.
+async fn resolve_due_jobs(
+    storage: &StorageHandle,
+    candidates: &[DueCandidate],
+) -> Result<(ScannedJobs, Vec<(String, ByteView)>), MetadataMaterializationQueueError> {
+    let targets: Vec<(Ulid, Ulid)> = candidates
+        .iter()
+        .map(|(_, _, document_id, event_id)| (*document_id, *event_id))
+        .collect();
+    let sidecars = read_document_jobs(storage, &targets).await?;
+    let mut due = Vec::with_capacity(candidates.len());
+    let mut stale = Vec::new();
+    for ((key, due_at_ms, document_id, event_id), sidecar) in candidates.iter().zip(sidecars) {
+        match sidecar {
+            Some(job) if job.due_at_ms == *due_at_ms => due.push((key.clone(), job)),
+            // The sidecar is authoritative: an index row it does not match is
+            // stale. A missing or malformed sidecar is dropped with it.
+            sidecar => {
+                stale.push((
+                    METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                    ByteView::from(key.clone()),
+                ));
+                if sidecar.is_none() {
+                    stale.push((
+                        METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+                        metadata_materialization_document_job_key(*document_id, *event_id),
+                    ));
+                }
+            }
+        }
+    }
+
+    let (live, dead) = filter_live_jobs(storage, due).await?;
+    for (key, job) in dead {
+        stale.push((
+            METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+            ByteView::from(key),
+        ));
+        stale.push((
+            METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+            metadata_materialization_document_job_key(job.document_id, job.event_id),
+        ));
+    }
+    Ok((live, stale))
 }
 
 async fn read_document_jobs(
@@ -2607,6 +2627,40 @@ mod tests {
 
         assert_eq!(jobs.len(), 64);
         assert!(delta <= 8, "scan issued {delta} storage requests");
+    }
+
+    #[tokio::test]
+    async fn probe_reads_one() {
+        // The timer probe asks for a single due job, so it must not resolve the
+        // whole page of index rows behind it.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let mut writes = Vec::new();
+        for index in 0..64u8 {
+            let document_id = Ulid::from_bytes([100 + index; 16]);
+            let event_id = Ulid::from_parts(1, u128::from(index));
+            let event = create_event(document_id, event_id, "probe");
+            let job = MetadataMaterializationJobRecord {
+                document_id,
+                event_id,
+                due_at_ms: 1,
+                attempts: 0,
+                failures: 0,
+            };
+            writes.push(metadata_create_event_write_entry(&event).unwrap());
+            writes.push(metadata_materialization_job_write_entry(&job).unwrap());
+            writes.push(metadata_materialization_document_job_write_entry(&job).unwrap());
+        }
+        write_entries(&storage, writes).await;
+
+        let before = storage.snapshot_metrics().requests_total;
+        let after = next_metadata_materialization_timer_after(&storage)
+            .await
+            .unwrap();
+        let delta = storage.snapshot_metrics().requests_total - before;
+
+        assert_eq!(after, Some(Duration::ZERO));
+        assert!(delta <= 6, "probe issued {delta} storage requests");
     }
 
     #[tokio::test]
