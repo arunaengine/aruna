@@ -1171,8 +1171,17 @@ impl OperationsTaskHandler {
         }
     }
 
+    /// A context whose storage effects dispatch on the bulk lane, so background
+    /// queue draining never starves foreground sync traffic.
+    fn bulk_context(&self) -> DriverContext {
+        let mut context = self.context.as_ref().clone();
+        context.storage_handle = context.storage_handle.bulk();
+        context
+    }
+
     async fn drain_metadata_materialization_queue(&self) {
-        match process_metadata_materialization_batch(&self.context).await {
+        let bulk = self.bulk_context();
+        match process_metadata_materialization_batch(&bulk).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(
                     TaskKey::DrainMetadataMaterializationQueue,
@@ -1190,7 +1199,7 @@ impl OperationsTaskHandler {
                 .await;
             }
             Ok(_) => {
-                match metadata_materialization_jobs_exist(&self.context.storage_handle).await {
+                match metadata_materialization_jobs_exist(&bulk.storage_handle).await {
                     Ok(false) => {}
                     Ok(true) => {
                         self.reschedule_timer(
@@ -1221,7 +1230,8 @@ impl OperationsTaskHandler {
     }
 
     async fn drain_metadata_graph_prune_queue(&self) {
-        match process_metadata_graph_prune_batch(&self.context).await {
+        let bulk = self.bulk_context();
+        match process_metadata_graph_prune_batch(&bulk).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(
                     TaskKey::DrainMetadataGraphPruneQueue,
@@ -1238,7 +1248,7 @@ impl OperationsTaskHandler {
                 )
                 .await;
             }
-            Ok(_) => match metadata_graph_prune_jobs_exist(&self.context.storage_handle).await {
+            Ok(_) => match metadata_graph_prune_jobs_exist(&bulk.storage_handle).await {
                 Ok(false) => {}
                 Ok(true) => {
                     self.reschedule_timer(
@@ -1784,7 +1794,7 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
         )
         .await;
         restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
-        restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
+        restore_metadata_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
         restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
         restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
         restore_job_queue_timer(&context.storage_handle, &task_handle).await;
@@ -1858,7 +1868,7 @@ async fn initialize_task_handler(
     crate::node_info::restore_node_info_publish_timer(&context.storage_handle, &task_handle).await;
     restore_notification_outbox_timer(&context.storage_handle, &task_handle, Duration::ZERO).await;
     restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
-    restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
+    restore_metadata_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
     restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
     restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
     restore_blob_replication_timer(&context.storage_handle, &task_handle).await;

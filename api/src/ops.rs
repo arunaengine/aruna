@@ -401,7 +401,7 @@ impl QueueMetrics {
     }
 
     async fn refresh(&self, ctx: &DriverContext, reporter: &mut QueueLagReporter) {
-        let sample = reporter.sample(&ctx.storage_handle).await;
+        let sample = reporter.sample(&ctx.storage_handle.bulk()).await;
         self.apply(DOCUMENT_SYNC_OUTBOX_QUEUE, sample.document_sync_outbox);
         self.apply(
             METADATA_MATERIALIZATION_QUEUE,
