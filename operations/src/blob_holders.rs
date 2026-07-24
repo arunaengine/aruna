@@ -309,7 +309,7 @@ mod tests {
         DhtEntry {
             node_id,
             realm_id,
-            value: node_id.as_bytes().to_vec(),
+            value: Vec::new(),
             expires_at: 100,
         }
     }
@@ -328,8 +328,9 @@ mod tests {
             effect,
             Effect::Net(NetEffect::Dht(DhtEffect::Put {
                 ttl,
+                value,
                 ..
-            })) if ttl == Duration::from_secs(90)
+            })) if ttl == Duration::from_secs(90) && value.is_empty()
         ));
     }
 

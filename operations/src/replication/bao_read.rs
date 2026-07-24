@@ -519,7 +519,7 @@ impl IncomingBaoReadOperation {
             Ok(document) => document,
             Err(_) => return self.send_refusal(BaoReadRefusal::BackendFailure),
         };
-        if ensure_realm_peer(&document, self.peer, self.request.realm_id, false).is_err() {
+        if ensure_realm_peer(&document, self.peer, self.request.realm_id, true).is_err() {
             return self.send_refusal(BaoReadRefusal::RealmPeerDenied);
         }
         match &self.request.target {
@@ -974,6 +974,29 @@ mod tests {
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: Vec::<u8>::new().into(),
             value: Some(realm_value(configured_peer)),
+        }));
+
+        assert_eq!(refusal_from(&effects), BaoReadRefusal::RealmPeerDenied);
+    }
+
+    #[test]
+    fn rejects_user_peer() {
+        let local_node = node_from_seed(1);
+        let peer = node_from_seed(2);
+        let mut config = RealmConfigDocument::default_for_realm(test_realm(), Vec::new());
+        config.ensure_node(peer, RealmNodeKind::User);
+        let mut operation = IncomingBaoReadOperation::new(
+            peer,
+            local_node,
+            test_realm(),
+            Ulid::from(9u128),
+            read_request(local_node, [4u8; 32]),
+        );
+
+        operation.start();
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: Some(postcard::to_allocvec(&config).unwrap().into()),
         }));
 
         assert_eq!(refusal_from(&effects), BaoReadRefusal::RealmPeerDenied);

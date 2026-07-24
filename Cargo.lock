@@ -474,6 +474,7 @@ dependencies = [
  "aruna-storage",
  "aruna-tasks",
  "astral_async_zip",
+ "async-compression",
  "async-trait",
  "axum",
  "base64",
@@ -604,6 +605,7 @@ dependencies = [
  "compression-core",
  "futures-io",
  "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]

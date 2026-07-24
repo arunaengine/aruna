@@ -2,6 +2,14 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
+pub(super) const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+pub(super) const SCHEMA_MEDIA_IRI: &str = "http://schema.org/MediaObject";
+pub(super) const SCHEMA_MEDIA_HTTPS_IRI: &str = "https://schema.org/MediaObject";
+
+pub(super) fn is_file_type(value: &str) -> bool {
+    matches!(value, SCHEMA_MEDIA_IRI | SCHEMA_MEDIA_HTTPS_IRI)
+}
+
 pub(super) struct JsonLdKeywords {
     terms: HashMap<String, Option<String>>,
 }
@@ -64,6 +72,13 @@ impl JsonLdKeywords {
             .iter_mut()
             .find_map(|(key, value)| self.is_graph(key).then(|| value.as_array_mut()).flatten())
     }
+
+    pub(super) fn graph<'a>(&self, document: &'a Value) -> Option<&'a Vec<Value>> {
+        document
+            .as_object()?
+            .iter()
+            .find_map(|(key, value)| self.is_graph(key).then(|| value.as_array()).flatten())
+    }
 }
 
 fn collect_terms(context: &Value, terms: &mut HashMap<String, Option<String>>) {
@@ -84,5 +99,17 @@ fn collect_terms(context: &Value, terms: &mut HashMap<String, Option<String>>) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_file_iris() {
+        assert!(is_file_type(SCHEMA_MEDIA_IRI));
+        assert!(is_file_type(SCHEMA_MEDIA_HTTPS_IRI));
+        assert!(!is_file_type("https://schema.org/Dataset"));
     }
 }

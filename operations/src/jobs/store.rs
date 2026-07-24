@@ -15,12 +15,13 @@ use aruna_core::structs::{
     encode_job_dedup_value, job_active_key, job_due_index_key, job_entry_key, job_entry_prefix,
     job_lease_index_key, job_owner_cursor, job_owner_index_key, job_owner_index_prefix,
     job_prune_index_key, job_record_key, job_run_crate_key, parse_entry_key, parse_job_dedup_value,
-    parse_job_owner_index_key, run_crate_dedup_key, validate_transition, workspace_credential_id,
+    parse_job_owner_index_key, rocrate_plan_key, run_crate_dedup_key, validate_transition,
+    workspace_credential_id,
 };
 use aruna_core::types::{Key, KeySpace, NodeId, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -30,6 +31,12 @@ use crate::queue_backoff::queue_retry_after_ms;
 
 type JobWrites = Vec<(KeySpace, Key, Value)>;
 type JobDeletes = Vec<(KeySpace, Key)>;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ArtifactTombstone {
+    owner: UserId,
+    expires_at_ms: u64,
+}
 
 /// Single decode chokepoint; wrappable in a version envelope later (#286).
 pub fn decode_job_record(bytes: &[u8]) -> Result<JobRecord, ConversionError> {
@@ -159,6 +166,10 @@ pub fn job_prune_delete_entries(record: &JobRecord) -> JobDeletes {
             ROCRATE_JOB_STATE_KEYSPACE.to_string(),
             ByteView::from(record.job_id.to_bytes().to_vec()),
         ),
+        (
+            ROCRATE_JOB_STATE_KEYSPACE.to_string(),
+            rocrate_plan_key(record.job_id),
+        ),
     ];
     if record.payload.is_rocrate() {
         deletes.push((
@@ -271,7 +282,15 @@ pub async fn put_staging_checkpoint(
     token: Ulid,
     value: Value,
 ) -> Result<(), JobMutationError> {
-    put_job_checkpoint(storage, job_id, token, STAGING_JOB_STATE_KEYSPACE, value).await
+    put_job_checkpoint(
+        storage,
+        job_id,
+        token,
+        STAGING_JOB_STATE_KEYSPACE,
+        ByteView::from(job_id.to_bytes().to_vec()),
+        value,
+    )
+    .await
 }
 
 pub async fn put_rocrate_checkpoint(
@@ -280,7 +299,32 @@ pub async fn put_rocrate_checkpoint(
     token: Ulid,
     value: Value,
 ) -> Result<(), JobMutationError> {
-    put_job_checkpoint(storage, job_id, token, ROCRATE_JOB_STATE_KEYSPACE, value).await
+    put_job_checkpoint(
+        storage,
+        job_id,
+        token,
+        ROCRATE_JOB_STATE_KEYSPACE,
+        ByteView::from(job_id.to_bytes().to_vec()),
+        value,
+    )
+    .await
+}
+
+pub async fn put_rocrate_plan(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    value: Value,
+) -> Result<(), JobMutationError> {
+    put_job_checkpoint(
+        storage,
+        job_id,
+        token,
+        ROCRATE_JOB_STATE_KEYSPACE,
+        rocrate_plan_key(job_id),
+        value,
+    )
+    .await
 }
 
 async fn put_job_checkpoint(
@@ -288,6 +332,7 @@ async fn put_job_checkpoint(
     job_id: JobId,
     token: Ulid,
     key_space: &str,
+    key: Key,
     value: Value,
 ) -> Result<(), JobMutationError> {
     for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
@@ -302,11 +347,7 @@ async fn put_job_checkpoint(
             guard_token(&record, token)?;
             batch_write(
                 storage,
-                vec![(
-                    key_space.to_string(),
-                    ByteView::from(job_id.to_bytes().to_vec()),
-                    value.clone(),
-                )],
+                vec![(key_space.to_string(), key.clone(), value.clone())],
                 Some(txn_id),
             )
             .await
@@ -474,13 +515,18 @@ async fn report_digest(
         .await
         .map_err(JobMutationError::Storage)?;
         for (_, value) in values {
-            hasher.update(value.as_ref());
+            hash_report_value(&mut hasher, value.as_ref());
         }
         let Some(next) = next else {
             return Ok(*hasher.finalize().as_bytes());
         };
         start_after = Some(next);
     }
+}
+
+fn hash_report_value(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_be_bytes());
+    hasher.update(value);
 }
 
 async fn insert_cleanup_obligation(
@@ -654,32 +700,58 @@ pub(crate) async fn preserve_artifact_tombstone(
     storage: &StorageHandle,
     job_id: JobId,
     owner: UserId,
+    expires_at_ms: u64,
 ) -> Result<(), String> {
+    let tombstone = ArtifactTombstone {
+        owner,
+        expires_at_ms,
+    };
     batch_write(
         storage,
-        vec![(
-            JOB_ARTIFACT_TOMBSTONE_KEYSPACE.to_string(),
-            ByteView::from(job_id.to_bytes().to_vec()),
-            ByteView::from(owner.to_storage_key()),
-        )],
+        vec![
+            (
+                JOB_ARTIFACT_TOMBSTONE_KEYSPACE.to_string(),
+                artifact_tombstone_key(job_id),
+                ByteView::from(
+                    postcard::to_allocvec(&tombstone).map_err(|error| error.to_string())?,
+                ),
+            ),
+            (
+                JOB_SCHEDULE_INDEX_KEYSPACE.to_string(),
+                job_prune_index_key(expires_at_ms, job_id),
+                empty_value(),
+            ),
+        ],
         None,
     )
     .await
 }
 
+pub(crate) fn artifact_tombstone_key(job_id: JobId) -> Key {
+    ByteView::from(job_id.to_bytes().to_vec())
+}
+
 pub(crate) async fn read_artifact_tombstone(
     storage: &StorageHandle,
     job_id: JobId,
+    now_ms: u64,
 ) -> Result<Option<UserId>, String> {
     read_raw(
         storage,
         JOB_ARTIFACT_TOMBSTONE_KEYSPACE,
-        ByteView::from(job_id.to_bytes().to_vec()),
+        artifact_tombstone_key(job_id),
         None,
     )
     .await?
-    .map(|value| UserId::from_storage_key(value.as_ref()).map_err(|error| error.to_string()))
+    .map(|value| {
+        postcard::from_bytes::<ArtifactTombstone>(value.as_ref()).map_err(|error| error.to_string())
+    })
     .transpose()
+    .map(|tombstone| {
+        tombstone
+            .filter(|tombstone| tombstone.expires_at_ms > now_ms)
+            .map(|tombstone| tombstone.owner)
+    })
 }
 
 // --- claim / lease / transition operations -------------------------------------
@@ -954,10 +1026,7 @@ pub async fn requeue_job(
         record.updated_at_ms = now_ms;
         record.claim = None;
         if record.attempts >= JOB_MAX_ATTEMPTS
-            && !matches!(
-                &record.payload,
-                JobPayload::TerminalCleanup { .. } | JobPayload::ImportRoCrate(_)
-            )
+            && !matches!(&record.payload, JobPayload::TerminalCleanup { .. })
         {
             record.state = JobState::Failed;
             record.finished_at_ms = Some(now_ms);
@@ -2104,6 +2173,27 @@ mod tests {
         }
     }
 
+    fn digest_values(values: &[Vec<u8>]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        for value in values {
+            hash_report_value(&mut hasher, value);
+        }
+        *hasher.finalize().as_bytes()
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn digest_is_stable(
+            first in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+            second in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+        ) {
+            let framed = digest_values(&[first.clone(), second.clone()]);
+            let mut concatenated = first;
+            concatenated.extend_from_slice(&second);
+            proptest::prop_assert_ne!(framed, digest_values(&[concatenated]));
+        }
+    }
+
     async fn schedule_keys(storage: &StorageHandle) -> Vec<Key> {
         let (values, _) =
             iter_prefix_page(storage, JOB_SCHEDULE_INDEX_KEYSPACE, None, None, 64, None)
@@ -2333,8 +2423,8 @@ mod tests {
         .unwrap();
 
         let mut hasher = blake3::Hasher::new();
-        hasher.update(&postcard::to_allocvec(&row_a).unwrap());
-        hasher.update(&postcard::to_allocvec(&row_b).unwrap());
+        hash_report_value(&mut hasher, &postcard::to_allocvec(&row_a).unwrap());
+        hash_report_value(&mut hasher, &postcard::to_allocvec(&row_b).unwrap());
         let digest = *hasher.finalize().as_bytes();
         assert_eq!(terminal.report_digest, Some(digest));
         let JobResultPayload::ImportRoCrate(result) = terminal.result.unwrap() else {
@@ -2566,7 +2656,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn import_retries_cleanup() {
+    async fn import_exhausts() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([0xC7; 16]);
         let mut record = rocrate_record(job_id);
@@ -2579,15 +2669,14 @@ mod tests {
         });
         insert_job(&storage, &record).await.unwrap();
 
-        let RequeueOutcome::Requeued(requeued) =
-            requeue_job(&storage, job_id, None, 6_000, None, None)
-                .await
-                .unwrap()
+        let RequeueOutcome::Failed(failed) = requeue_job(&storage, job_id, None, 6_000, None, None)
+            .await
+            .unwrap()
         else {
-            panic!("import cleanup must remain retryable");
+            panic!("import must fail after exhausting attempts");
         };
-        assert_eq!(requeued.state, JobState::Queued);
-        assert_eq!(requeued.attempts, JOB_MAX_ATTEMPTS);
+        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(failed.attempts, JOB_MAX_ATTEMPTS);
     }
 
     #[tokio::test]

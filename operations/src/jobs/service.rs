@@ -317,7 +317,7 @@ pub async fn read_owned_artifact(
 ) -> Result<ArtifactLookup, String> {
     let Some(record) = read_owned_job(context, user_id, job_id).await? else {
         return Ok(
-            match read_artifact_tombstone(&context.storage_handle, job_id).await? {
+            match read_artifact_tombstone(&context.storage_handle, job_id, now_ms).await? {
                 Some(owner) if owner == user_id => ArtifactLookup::Gone,
                 _ => ArtifactLookup::NotFound,
             },
@@ -523,12 +523,12 @@ mod tests {
         };
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
         let job_id = JobId::from_bytes([3u8; 16]);
-        preserve_artifact_tombstone(&storage, job_id, owner)
+        preserve_artifact_tombstone(&storage, job_id, owner, 10)
             .await
             .unwrap();
 
         assert!(matches!(
-            read_owned_artifact(&context, owner, job_id, u64::MAX).await,
+            read_owned_artifact(&context, owner, job_id, 9).await,
             Ok(ArtifactLookup::Gone)
         ));
         assert!(matches!(
@@ -536,9 +536,13 @@ mod tests {
                 &context,
                 UserId::new(Ulid::from_bytes([4u8; 16]), RealmId([1u8; 32])),
                 job_id,
-                u64::MAX,
+                9,
             )
             .await,
+            Ok(ArtifactLookup::NotFound)
+        ));
+        assert!(matches!(
+            read_owned_artifact(&context, owner, job_id, 10).await,
             Ok(ArtifactLookup::NotFound)
         ));
     }

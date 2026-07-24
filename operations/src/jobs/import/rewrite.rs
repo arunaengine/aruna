@@ -8,11 +8,9 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 use url::Url;
 
-use crate::jobs::rocrate_jsonld::JsonLdKeywords;
+use crate::jobs::rocrate_jsonld::{JsonLdKeywords, RDF_TYPE_IRI, is_file_type};
 
 const JSONLD_BASE_IRI: &str = "https://craqle.invalid/";
-const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-const SCHEMA_MEDIA_IRI: &str = "http://schema.org/MediaObject";
 const SCHEMA_CONTENT_IRI: &str = "http://schema.org/contentUrl";
 const LOCAL_PATH_IRI: &str = "https://w3id.org/ro/terms#localPath";
 
@@ -97,12 +95,17 @@ fn file_subjects(nquads: &str) -> Result<HashSet<String>, CrateValidationError> 
     for quad in NQuadsParser::new().for_slice(nquads) {
         let quad = quad.map_err(|error| CrateValidationError::Invalid(error.to_string()))?;
         if quad.predicate.as_str() != RDF_TYPE_IRI
-            || !matches!(&quad.object, Term::NamedNode(node) if node.as_str() == SCHEMA_MEDIA_IRI)
+            || !matches!(&quad.object, Term::NamedNode(node) if is_file_type(node.as_str()))
         {
             continue;
         }
         if let NamedOrBlankNode::NamedNode(subject) = quad.subject {
-            subjects.insert(subject.as_str().to_string());
+            let subject = subject.as_str();
+            subjects.insert(
+                Url::parse(subject)
+                    .map(|url| url.to_string())
+                    .unwrap_or_else(|_| subject.to_string()),
+            );
         }
     }
     Ok(subjects)
@@ -159,7 +162,7 @@ fn expanded_id(id: &str) -> Result<String, CrateValidationError> {
         return Ok(url.to_string());
     }
     Url::parse(JSONLD_BASE_IRI)
-        .expect("static JSON-LD base is valid")
+        .map_err(|error| CrateValidationError::Invalid(error.to_string()))?
         .join(id)
         .map(|url| url.to_string())
         .map_err(|error| CrateValidationError::Invalid(error.to_string()))

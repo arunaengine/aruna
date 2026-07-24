@@ -232,7 +232,6 @@ fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::RealmId;
     use aruna_storage::FjallStorage;
     use aruna_tasks::InboundTaskHandler;
     use async_trait::async_trait;
@@ -257,9 +256,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
             .expect("storage opens");
-        let realm_id = RealmId::from_bytes([1u8; 32]);
-        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
-        let key = TaskKey::SyncPlacements { realm_id, node_id };
+        let key = TaskKey::RefreshBlobHolders;
 
         persist_task_effect(
             &storage,

@@ -81,7 +81,9 @@ impl AsyncRead for HiddenRangeReader {
             if self.pending.is_none() {
                 self.begin_fetch();
             }
-            let pending = self.pending.as_mut().expect("range fetch initialized");
+            let Some(pending) = self.pending.as_mut() else {
+                return Poll::Ready(Err(io::Error::other("range fetch was not initialized")));
+            };
             match pending.as_mut().poll(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => {
@@ -172,6 +174,14 @@ fn fetch_range(handle: BlobHandle, location: BackendLocation, range: Range<u64>)
         }
         Ok(bytes.freeze())
     })
+}
+
+pub(super) async fn read_hidden_range(
+    handle: BlobHandle,
+    location: BackendLocation,
+    range: Range<u64>,
+) -> io::Result<Bytes> {
+    fetch_range(handle, location, range).await
 }
 
 #[cfg(test)]

@@ -507,15 +507,8 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
     let entries = decode_entries(dht_value.as_ref()).expect("decode DHT entries");
     assert!(entries.iter().any(|entry| {
         entry.realm_id == realm_id
-            && entry.value
-                == context
-                    .driver
-                    .net_handle
-                    .as_ref()
-                    .unwrap()
-                    .node_id()
-                    .as_bytes()
-                    .to_vec()
+            && entry.publisher == context.driver.net_handle.as_ref().unwrap().node_id()
+            && entry.value.is_empty()
     }));
 }
 

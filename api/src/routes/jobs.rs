@@ -6,8 +6,9 @@ use std::sync::Arc;
 use aruna_core::compute::normalize_container_path;
 use aruna_core::structs::{
     AuthContext, ComputeResources, ExecutionSpec, ExportReportRow, ImportReportRow, InputMode,
-    InputSelection, InputSource, JobId, JobPayload, JobRecord, JobState, Permission, WorkspaceMode,
-    WorkspaceOutput, blob_bucket_permission_path, blob_group_permission_path,
+    InputSelection, InputSource, JOB_SYSTEM_ENTRY_PREFIX, JobId, JobPayload, JobRecord, JobState,
+    Permission, WorkspaceMode, WorkspaceOutput, blob_bucket_permission_path,
+    blob_group_permission_path,
 };
 use aruna_operations::jobs::service::{
     ArtifactLookup, CancelJobOutcome, JobReportLookup, OwnedArtifact, cancel_owned_job,
@@ -688,7 +689,10 @@ fn decode_report_row(
         JobPayload::ImportRoCrate(_) => {
             let row: ImportReportRow = postcard::from_bytes(value)
                 .map_err(|error| ServerError::InternalError(error.to_string()))?;
-            if row.entry_key.as_bytes() != entry_key {
+            let visible_key = entry_key
+                .strip_prefix(&[JOB_SYSTEM_ENTRY_PREFIX])
+                .unwrap_or(entry_key);
+            if row.entry_key.as_bytes() != visible_key {
                 return Err(ServerError::InternalError(
                     "stored import report entry key does not match its row".to_string(),
                 ));
@@ -835,6 +839,19 @@ fn range_request(headers: &HeaderMap) -> Result<Option<ObjectRangeRequest>, ()> 
     }
 }
 
+fn ascii_filename(filename: &str) -> String {
+    filename
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn artifact_headers(owned: &OwnedArtifact) -> ServerResult<HeaderMap> {
     let location_hash: [u8; 32] = owned
         .artifact
@@ -861,10 +878,11 @@ fn artifact_headers(owned: &OwnedArtifact) -> ServerResult<HeaderMap> {
             .map_err(|error| ServerError::InternalError(error.to_string()))?,
     );
     let encoded = utf8_percent_encode(&owned.filename, NON_ALPHANUMERIC);
+    let fallback = ascii_filename(&owned.filename);
     headers.insert(
         CONTENT_DISPOSITION,
         HeaderValue::from_str(&format!(
-            "attachment; filename=\"rocrate.zip\"; filename*=UTF-8''{encoded}"
+            "attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
         ))
         .map_err(|error| ServerError::InternalError(error.to_string()))?,
     );
@@ -1213,6 +1231,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn decodes_system_key() {
+        let owner = user(2);
+        let payload = import_job(JobId::from_bytes([9u8; 16]), owner).payload;
+        for entry_key in [
+            "signature/ro-crate-metadata.json.minisig",
+            "warning/00000000",
+            "failure/write",
+        ] {
+            let row = report_row(entry_key);
+            let value = postcard::to_allocvec(&row).unwrap();
+            let mut stored_key = vec![JOB_SYSTEM_ENTRY_PREFIX];
+            stored_key.extend_from_slice(entry_key.as_bytes());
+            let decoded = decode_report_row(&payload, &stored_key, &value).unwrap();
+            assert_eq!(decoded["entry_key"], entry_key);
+        }
+    }
+
     fn export_job(job_id: JobId, owner: UserId, expires_at_ms: u64) -> JobRecord {
         let document_id = Ulid::from_bytes([6u8; 16]);
         let blake3 = [7u8; 32];
@@ -1524,12 +1560,10 @@ mod tests {
             response.headers()[ETAG].to_str().unwrap(),
             format!("\"{}\"", hex::encode([7u8; 32]))
         );
-        assert!(
-            response.headers()[CONTENT_DISPOSITION]
-                .to_str()
-                .unwrap()
-                .contains(".zip")
-        );
+        let document_id = Ulid::from_bytes([6u8; 16]);
+        let disposition = response.headers()[CONTENT_DISPOSITION].to_str().unwrap();
+        assert!(disposition.contains(&format!("filename=\"{document_id}.zip\"")));
+        assert!(disposition.contains(&format!("filename*=UTF-8''{document_id}%2Ezip")));
 
         let foreign = head_job_artifact(
             State(state),

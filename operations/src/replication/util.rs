@@ -8,7 +8,7 @@ use std::time::Duration;
 pub(crate) fn dht_registration_effect(
     blake3: &[u8],
     local_realm_id: RealmId,
-    local_node_id: NodeId,
+    _local_node_id: NodeId,
     limits: &RoCrateLimits,
 ) -> Result<Effect, ConversionError> {
     let key = DhtKeyId::from_bytes(blake3.try_into()?);
@@ -16,7 +16,7 @@ pub(crate) fn dht_registration_effect(
     Ok(Effect::Net(NetEffect::Dht(DhtEffect::Put {
         key,
         realm_id: local_realm_id,
-        value: local_node_id.as_bytes().to_vec(),
+        value: Vec::new(),
         ttl: Duration::from_millis(limits.holder_ttl_ms),
     })))
 }

@@ -33,7 +33,9 @@ use unicode_normalization::UnicodeNormalization;
 use url::Url;
 
 use super::executor::{JobContext, JobRunOutcome};
-use super::rocrate_jsonld::JsonLdKeywords;
+use super::rocrate_jsonld::{
+    JsonLdKeywords, RDF_TYPE_IRI, SCHEMA_MEDIA_HTTPS_IRI, SCHEMA_MEDIA_IRI, is_file_type,
+};
 use super::store::{put_job_entry, put_rocrate_checkpoint};
 use crate::blob::hidden::delete_hidden;
 use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
@@ -50,9 +52,6 @@ const METADATA_PATH: &str = "ro-crate-metadata.json";
 const REPORT_PATH: &str = "aruna-export-report.json";
 const REMOTE_ATTEMPTS: usize = 8;
 const JSONLD_BASE_IRI: &str = "https://craqle.invalid/";
-const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-const SCHEMA_MEDIA_IRI: &str = "http://schema.org/MediaObject";
-const SCHEMA_MEDIA_HTTPS_IRI: &str = "https://schema.org/MediaObject";
 const SCHEMA_CONTENT_IRI: &str = "http://schema.org/contentUrl";
 const SCHEMA_CONTENT_HTTPS_IRI: &str = "https://schema.org/contentUrl";
 const SCHEMA_ABOUT_IRI: &str = "http://schema.org/about";
@@ -1079,7 +1078,7 @@ fn recognize_entities(
                 if matches!(
                     &quad.object,
                     Term::NamedNode(node)
-                        if matches!(node.as_str(), SCHEMA_MEDIA_IRI | SCHEMA_MEDIA_HTTPS_IRI)
+                        if is_file_type(node.as_str())
                 ) =>
             {
                 files.insert(subject);
@@ -1490,7 +1489,7 @@ fn build_report(checkpoint: &ExportCheckpoint) -> Result<JsonValue, ExportFailur
 fn add_report(document: &mut JsonValue) -> Result<(), ExportFailure> {
     let keywords = JsonLdKeywords::new(document);
     let graph = keywords
-        .graph_mut(document)
+        .graph(document)
         .ok_or_else(|| ExportFailure::Permanent("RO-Crate @graph is missing".to_string()))?;
     if graph.iter().any(|entity| {
         entity
@@ -1502,13 +1501,19 @@ fn add_report(document: &mut JsonValue) -> Result<(), ExportFailure> {
             "RO-Crate uses a reserved export report identifier".to_string(),
         ));
     }
+    let root_id = report_root_id(graph, &keywords).ok_or_else(|| {
+        ExportFailure::Permanent("RO-Crate metadata descriptor has no root".to_string())
+    })?;
+    let graph = keywords
+        .graph_mut(document)
+        .ok_or_else(|| ExportFailure::Permanent("RO-Crate @graph is missing".to_string()))?;
     let root = graph
         .iter_mut()
         .find(|entity| {
             entity
                 .as_object()
                 .and_then(|entity| keywords.object_id(entity))
-                .is_some_and(|(_, id)| id == "./")
+                .is_some_and(|(_, id)| id == root_id)
         })
         .and_then(JsonValue::as_object_mut)
         .ok_or_else(|| ExportFailure::Permanent("RO-Crate root Dataset is missing".to_string()))?;
@@ -1578,9 +1583,21 @@ fn add_report(document: &mut JsonValue) -> Result<(), ExportFailure> {
         &[SCHEMA_NAME_IRI, SCHEMA_NAME_HTTPS_IRI, "schema:name"],
         SCHEMA_NAME_HTTPS_IRI,
     );
+    let file_type = if keywords.term_matches(
+        "File",
+        &[
+            SCHEMA_MEDIA_IRI,
+            SCHEMA_MEDIA_HTTPS_IRI,
+            "schema:MediaObject",
+        ],
+    ) {
+        "File"
+    } else {
+        SCHEMA_MEDIA_HTTPS_IRI
+    };
     graph.push(JsonValue::Object(serde_json::Map::from_iter([
         ("@id".to_string(), json!(REPORT_PATH)),
-        ("@type".to_string(), json!(SCHEMA_MEDIA_IRI)),
+        ("@type".to_string(), json!(file_type)),
         (encoding_key, json!("application/json")),
         (about_key.clone(), json!({"@id": "#aruna-export-report"})),
     ])));
@@ -1588,9 +1605,44 @@ fn add_report(document: &mut JsonValue) -> Result<(), ExportFailure> {
         ("@id".to_string(), json!("#aruna-export-report")),
         ("@type".to_string(), json!("http://schema.org/CreativeWork")),
         (name_key, json!("Aruna RO-Crate export completeness report")),
-        (about_key, json!({"@id": "./"})),
+        (about_key, json!({"@id": root_id})),
     ])));
     Ok(())
+}
+
+fn report_root_id(graph: &[JsonValue], keywords: &JsonLdKeywords) -> Option<String> {
+    graph.iter().find_map(|entity| {
+        let entity = entity.as_object()?;
+        let (_, id) = keywords.object_id(entity)?;
+        if id.trim_start_matches("./") != METADATA_PATH {
+            return None;
+        }
+        entity.iter().find_map(|(key, value)| {
+            keywords
+                .expands_to(
+                    key,
+                    &[
+                        "about",
+                        "schema:about",
+                        SCHEMA_ABOUT_IRI,
+                        SCHEMA_ABOUT_HTTPS_IRI,
+                    ],
+                )
+                .then(|| reference_id(value, keywords).map(str::to_string))
+                .flatten()
+        })
+    })
+}
+
+fn reference_id<'a>(value: &'a JsonValue, keywords: &JsonLdKeywords) -> Option<&'a str> {
+    match value {
+        JsonValue::String(value) => Some(value),
+        JsonValue::Object(value) => keywords.object_id(value).map(|(_, id)| id),
+        JsonValue::Array(values) => values
+            .iter()
+            .find_map(|value| reference_id(value, keywords)),
+        _ => None,
+    }
 }
 
 fn property_key(
@@ -2099,20 +2151,31 @@ fn permanent(message: impl Into<String>) -> JobRunOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::incoming::initialize_net_incoming;
+    use crate::jobs::executor::ProgressReporter;
     use crate::jobs::import::fixture::{
         RewriteTarget, file_id_candidates, inspect_archive, open_archive, payload_entries,
         read_metadata, rewrite_document, signature_entry, validate_document,
     };
     use crate::staging::test_utils::setup_driver_context;
-    use aruna_blob::blob::BlobHandle;
+    use aruna_blob::blob::{BlobHandle, BlobHandler};
     use aruna_core::UserId;
-    use aruna_core::structs::{AuthContext, RoCrateLimits};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    };
+    use aruna_core::structs::{
+        Actor, AuthContext, Backend, BackendConfig, GroupAuthorizationDocument,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind, RoCrateLimits,
+    };
+    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_storage::FjallStorage;
     use std::collections::HashMap;
     use std::io::{Read, Seek, Write};
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Context, Poll};
+    use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
 
     const FIXTURE_BYTES: &[u8] = b"duplicate fixture payload";
@@ -2120,6 +2183,12 @@ mod tests {
     struct SparseWriter {
         file: std::fs::File,
         enabled: Arc<AtomicBool>,
+    }
+
+    struct BaoNode {
+        _tempdir: TempDir,
+        net: NetHandle,
+        driver: Arc<DriverContext>,
     }
 
     impl futures_util::io::AsyncWrite for SparseWriter {
@@ -2153,6 +2222,159 @@ mod tests {
         ) -> Poll<std::io::Result<()>> {
             Poll::Ready(std::io::Write::flush(&mut self.file))
         }
+    }
+
+    async fn bao_node(realm_id: RealmId) -> BaoNode {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().to_str().unwrap();
+        let blob_root = tempdir.path().join("blobstore");
+        std::fs::create_dir_all(&blob_root).unwrap();
+        let storage = FjallStorage::open(root).unwrap();
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .unwrap();
+        let blob = BlobHandler::new(
+            BackendConfig {
+                backend_type: Backend::FileSystem,
+                root: blob_root.to_str().unwrap().to_string(),
+                service_config: HashMap::new(),
+                bucket_prefix: Some("aruna-export-".to_string()),
+                max_bucket_size: Some(100),
+                multipart_bucket: Some("multipart".to_string()),
+                timeouts: Default::default(),
+            },
+            storage.clone(),
+            net.clone(),
+        )
+        .await
+        .unwrap();
+        let driver = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: Some(net.clone()),
+            blob_handle: Some(blob),
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        initialize_net_incoming(driver.clone());
+        BaoNode {
+            _tempdir: tempdir,
+            net,
+            driver,
+        }
+    }
+
+    fn remote_spec(realm_id: RealmId, user_id: UserId) -> ExportRoCrateSpec {
+        ExportRoCrateSpec {
+            auth_context: AuthContext {
+                user_id,
+                realm_id,
+                path_restrictions: None,
+            },
+            document_id: Ulid::from_bytes([91; 16]),
+            limits: RoCrateLimits::default(),
+        }
+    }
+
+    async fn seed_bao(
+        source: &BaoNode,
+        peer: NodeId,
+        owner: UserId,
+        group_id: Ulid,
+        version_id: Ulid,
+        location: &BackendLocation,
+    ) {
+        let realm_id = owner.realm_id;
+        let actor = Actor {
+            node_id: source.net.node_id(),
+            user_id: owner,
+            realm_id,
+        };
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.ensure_node(source.net.node_id(), RealmNodeKind::Server);
+        config.ensure_node(peer, RealmNodeKind::Server);
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let bucket = BucketInfo {
+            group_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: owner,
+            cors_configuration: None,
+        };
+        let hash: [u8; 32] = location.get_blake3().unwrap().try_into().unwrap();
+        let version =
+            BlobVersion::materialized(hash, std::time::SystemTime::UNIX_EPOCH, owner, None);
+        let version_key = VersionKey::new("remote", "payload", version_id);
+        let writes = vec![
+            (
+                REALM_CONFIG_KEYSPACE.to_string(),
+                realm_id.as_bytes().to_vec().into(),
+                config.to_bytes(&actor).unwrap().into(),
+            ),
+            (
+                AUTH_KEYSPACE.to_string(),
+                realm_id.as_bytes().to_vec().into(),
+                realm_auth.to_bytes(&actor).unwrap().into(),
+            ),
+            (
+                AUTH_KEYSPACE.to_string(),
+                group_id.to_bytes().to_vec().into(),
+                group_auth.to_bytes(&actor).unwrap().into(),
+            ),
+            (
+                S3_BUCKET_KEYSPACE.to_string(),
+                b"remote".to_vec().into(),
+                bucket.to_bytes().unwrap().into(),
+            ),
+            (
+                BLOB_VERSIONS_KEYSPACE.to_string(),
+                version_key.to_bytes().unwrap().into(),
+                version.to_bytes().unwrap().into(),
+            ),
+            (
+                BLOB_LOCATIONS_KEYSPACE.to_string(),
+                hash.to_vec().into(),
+                location.to_bytes().unwrap().into(),
+            ),
+        ];
+        assert!(matches!(
+            source
+                .driver
+                .storage_handle
+                .send_storage_effect(StorageEffect::BatchWrite {
+                    writes,
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+    }
+
+    async fn keyspace_len(driver: &DriverContext, key_space: &str) -> usize {
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = driver
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: key_space.to_string(),
+                prefix: None,
+                start: None,
+                limit: 10,
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("keyspace iteration failed")
+        };
+        values.len()
     }
 
     fn file_entity(id: &str, local_path: Option<&str>) -> JsonValue {
@@ -2539,6 +2761,126 @@ mod tests {
         assert_roundtrip(handle, true, "1.1", 40).await;
     }
 
+    #[tokio::test]
+    async fn stale_holder_offline() {
+        let realm_id = RealmId::from_bytes([61; 32]);
+        let node = bao_node(realm_id).await;
+        node.net.shutdown().await;
+        let hash = [62; 32];
+        let candidate = ExportCandidate {
+            source: CandidateSource::RemoteHash {
+                node_id: iroh::SecretKey::from_bytes(&[63; 32]).public(),
+                hash,
+            },
+            report_source: ExportReportSource::Hash,
+            resolved_version: None,
+            expected_blake3: Some(hash),
+        };
+
+        assert!(matches!(
+            open_candidate(
+                node.driver.as_ref(),
+                &remote_spec(realm_id, UserId::nil(realm_id)),
+                &candidate,
+                true,
+            )
+            .await
+            .unwrap(),
+            CandidateOpen::Status(OpenStatus::Offline)
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_read_ephemeral() {
+        let realm_id = RealmId::from_bytes([71; 32]);
+        let owner = UserId::local(Ulid::from_bytes([72; 16]), realm_id);
+        let group_id = Ulid::from_bytes([73; 16]);
+        let version_id = Ulid::from_bytes([74; 16]);
+        let client = bao_node(realm_id).await;
+        let source = bao_node(realm_id).await;
+        client.net.add_peer_addr(source.net.endpoint_addr()).await;
+        source.net.add_peer_addr(client.net.endpoint_addr()).await;
+        let Event::Blob(BlobEvent::WriteFinished { location }) = source
+            .driver
+            .blob_handle
+            .as_ref()
+            .unwrap()
+            .send_blob_effect(BlobEffect::Write {
+                bucket: "remote".to_string(),
+                key: "payload".to_string(),
+                created_by: owner,
+                blob: byte_stream(FIXTURE_BYTES),
+            })
+            .await
+        else {
+            panic!("source blob write failed")
+        };
+        let hash: [u8; 32] = location.get_blake3().unwrap().try_into().unwrap();
+        seed_bao(
+            &source,
+            client.net.node_id(),
+            owner,
+            group_id,
+            version_id,
+            &location,
+        )
+        .await;
+        let key_spaces = [
+            BLOB_HEAD_KEYSPACE,
+            BLOB_LOCATIONS_KEYSPACE,
+            BLOB_VERSIONS_KEYSPACE,
+            HASH_PATHS_INDEX_KEYSPACE,
+        ];
+        for key_space in key_spaces {
+            assert_eq!(keyspace_len(client.driver.as_ref(), key_space).await, 0);
+        }
+        let exact = VersionedObjectArn::new(
+            realm_id,
+            source.net.node_id(),
+            "remote",
+            "payload",
+            version_id,
+        )
+        .unwrap();
+        let candidate = ExportCandidate {
+            source: CandidateSource::RemoteExact {
+                node_id: source.net.node_id(),
+                target: exact,
+            },
+            report_source: ExportReportSource::Remote,
+            resolved_version: Some(version_id),
+            expected_blake3: Some(hash),
+        };
+
+        let CandidateOpen::Opened(BaoReadOutput::Stream {
+            mut blob,
+            size,
+            blake3,
+        }) = open_candidate(
+            client.driver.as_ref(),
+            &remote_spec(realm_id, owner),
+            &candidate,
+            false,
+        )
+        .await
+        .unwrap()
+        else {
+            panic!("remote Bao read did not open")
+        };
+        let mut received = Vec::new();
+        while let Some(chunk) = blob.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(received, FIXTURE_BYTES);
+        assert_eq!(size, FIXTURE_BYTES.len() as u64);
+        assert_eq!(blake3, hash);
+        for key_space in key_spaces {
+            assert_eq!(keyspace_len(client.driver.as_ref(), key_space).await, 0);
+        }
+        client.net.shutdown().await;
+        source.net.shutdown().await;
+    }
+
     #[test]
     fn learns_probe_hash() {
         let realm_id = RealmId::from_bytes([2; 32]);
@@ -2706,11 +3048,11 @@ mod tests {
                 {"graphItems": "@graph", "idAlias": "@id"}
             ],
             "graphItems": [
-                {"idAlias": "./", "@type": "Dataset"},
+                {"idAlias": "urn:dataset:run-42", "@type": "Dataset"},
                 {
                     "idAlias": METADATA_PATH,
                     "@type": "CreativeWork",
-                    "about": {"idAlias": "./"}
+                    "about": {"idAlias": "urn:dataset:run-42"}
                 }
             ]
         });
@@ -2722,6 +3064,10 @@ mod tests {
             JsonValue::String("#aruna-export-report".to_string())
         );
         assert_eq!(document["graphItems"][2]["@id"], REPORT_PATH);
+        assert_eq!(
+            document["graphItems"][3]["about"]["@id"],
+            "urn:dataset:run-42"
+        );
     }
 
     #[test]
@@ -2811,6 +3157,41 @@ mod tests {
             synthesized_path([7; 32], "one"),
             synthesized_path([7; 32], "two")
         );
+    }
+
+    #[test]
+    fn plan_rejects_oversize() {
+        let realm_id = RealmId::from_bytes([8; 32]);
+        let mut spec = remote_spec(realm_id, UserId::nil(realm_id));
+        spec.limits.export_artifact_bytes = 512;
+        let entities = [ExportEntity {
+            entity_id: "payload".to_string(),
+            local_path: Some("data/payload".to_string()),
+            exact: None,
+            hash: None,
+            hash_realm: None,
+            candidates: Vec::new(),
+            omission: None,
+            message: None,
+            zip_path: Some("data/payload".to_string()),
+            report_source: None,
+            resolved_version: None,
+            path_synthesized: false,
+        }];
+        let opened = [ProbedEntry {
+            entity_index: 0,
+            candidate_index: 0,
+            size: 513,
+            hash: [0; 32],
+            report_source: ExportReportSource::Local,
+            resolved_version: None,
+        }];
+
+        assert!(matches!(
+            precheck_size(&spec, b"{}", None, &opened, &entities),
+            Err(ExportFailure::Permanent(message))
+                if message == "planned ZIP exceeds the 512 byte artifact limit"
+        ));
     }
 
     #[test]
@@ -2905,6 +3286,64 @@ mod tests {
     #[tokio::test]
     async fn archives_are_deterministic() {
         assert_eq!(sample_archive().await, sample_archive().await);
+    }
+
+    #[tokio::test]
+    async fn corrupt_source_retries() {
+        let fixture = setup_driver_context().await;
+        let realm_id = RealmId::from_bytes([81; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[82; 32]).public();
+        let hash = [83; 32];
+        let candidate = ExportCandidate {
+            source: CandidateSource::RemoteHash { node_id, hash },
+            report_source: ExportReportSource::Hash,
+            resolved_version: None,
+            expected_blake3: Some(hash),
+        };
+        let mut checkpoint = ExportCheckpoint {
+            entities: vec![ExportEntity {
+                entity_id: "data/corrupt".to_string(),
+                local_path: None,
+                exact: None,
+                hash: Some(hash),
+                hash_realm: Some(realm_id),
+                candidates: vec![candidate],
+                omission: None,
+                message: None,
+                zip_path: None,
+                report_source: None,
+                resolved_version: None,
+                path_synthesized: false,
+            }],
+            ..Default::default()
+        };
+        let failures = BTreeMap::from([(0, BTreeMap::from([(0, OpenStatus::Corrupt)]))]);
+        let ctx = JobContext {
+            driver: Arc::new(fixture.driver_context.clone()),
+            job_id: JobId::from_bytes([84; 16]),
+            owner_node_id: node_id,
+            claim_token: Ulid::from_bytes([85; 16]),
+            final_attempt: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            progress: ProgressReporter::from_progress(&aruna_core::structs::JobProgress {
+                current: 0,
+                total: None,
+                unit: "entries".to_string(),
+            }),
+        };
+
+        assert!(matches!(
+            probe_sources(
+                &ctx,
+                &remote_spec(realm_id, UserId::nil(realm_id)),
+                &mut checkpoint,
+                &failures,
+            )
+            .await,
+            Err(ExportFailure::Retryable(message))
+                if message == "payload integrity check failed"
+        ));
     }
 
     #[tokio::test]

@@ -19,6 +19,8 @@ pub const JOB_RECORD_KEY_PREFIX: &[u8] = b"jobs-v1/";
 pub const JOB_DUE_INDEX_PREFIX: &[u8] = b"due/";
 pub const JOB_LEASE_INDEX_PREFIX: &[u8] = b"lease/";
 pub const JOB_PRUNE_INDEX_PREFIX: &[u8] = b"prune/";
+/// Invalid UTF-8 byte separating generated report rows from user paths.
+pub const JOB_SYSTEM_ENTRY_PREFIX: u8 = u8::MAX;
 pub const DEFAULT_JOB_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// Creation-ordered job identifier.
@@ -1253,6 +1255,13 @@ pub fn job_entry_key(job_id: JobId, entry_key: &[u8]) -> Key {
 
 pub fn job_entry_prefix(job_id: JobId) -> Key {
     ByteView::from(job_id.to_bytes().to_vec())
+}
+
+pub fn rocrate_plan_key(job_id: JobId) -> Key {
+    let mut bytes = Vec::with_capacity(17);
+    bytes.extend_from_slice(&job_id.to_bytes());
+    bytes.push(b'p');
+    ByteView::from(bytes)
 }
 
 pub fn parse_entry_key(job_id: JobId, key: &[u8]) -> Result<Vec<u8>, ConversionError> {

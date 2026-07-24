@@ -37,6 +37,10 @@ aruna-tasks = { path = "tasks" }
 
 # Third-party crates
 ahash = "0.8.12"
+async-compression = { version = "0.4.42", default-features = false, features = [
+    "tokio",
+    "deflate",
+] }
 async-trait = "0.1.89"
 async_zip = { package = "astral_async_zip", version = "0.0.20", features = [
     "tokio",

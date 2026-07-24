@@ -14,6 +14,7 @@ aruna-storage = { workspace = true }
 aruna-net = { workspace = true }
 aruna-tasks = { workspace = true }
 craqle = { workspace = true }
+async-compression = { workspace = true }
 async-trait = { workspace = true }
 async_zip = { workspace = true }
 base64 = { workspace = true }

@@ -18,8 +18,8 @@ use tracing::warn;
 
 use super::JOB_PRUNE_SCAN_PAGE_SIZE;
 use super::store::{
-    batch_delete, first_schedule_entry, iter_prefix_page, job_entry_deletes,
-    job_prune_delete_entries, preserve_artifact_tombstone, read_job_record,
+    artifact_tombstone_key, batch_delete, first_schedule_entry, iter_prefix_page,
+    job_entry_deletes, job_prune_delete_entries, preserve_artifact_tombstone, read_job_record,
 };
 use crate::driver::DriverContext;
 
@@ -94,18 +94,27 @@ pub(crate) async fn process_job_prune_batch_with_page_size(
                         has_more = true;
                         break 'scan;
                     }
-                    if matches!(
-                        &record.result,
-                        Some(JobResultPayload::ExportRoCrate(result))
-                            if result.artifact.is_some()
-                    ) {
-                        preserve_artifact_tombstone(storage, record.job_id, record.created_by)
-                            .await?;
+                    if let Some(JobResultPayload::ExportRoCrate(result)) = &record.result
+                        && let Some(artifact) = &result.artifact
+                    {
+                        preserve_artifact_tombstone(
+                            storage,
+                            record.job_id,
+                            record.created_by,
+                            artifact.expires_at_ms.saturating_add(record.retention_ms),
+                        )
+                        .await?;
                     }
                     delete_job_artifact(context, &record).await?;
                     deletes.extend(job_prune_delete_entries(&record));
                 }
-                None => deletes.push((JOB_SCHEDULE_INDEX_KEYSPACE.to_string(), key)),
+                None => {
+                    deletes.push((JOB_SCHEDULE_INDEX_KEYSPACE.to_string(), key));
+                    deletes.push((
+                        aruna_core::keyspaces::JOB_ARTIFACT_TOMBSTONE_KEYSPACE.to_string(),
+                        artifact_tombstone_key(job_id),
+                    ));
+                }
             }
             pruned = pruned.saturating_add(1);
             processed = processed.saturating_add(1);
@@ -196,7 +205,9 @@ mod tests {
     use crate::jobs::store::{
         ClaimOutcome, claim_job, complete_job, insert_job, put_job_entry, transition_to_running,
     };
-    use aruna_core::keyspaces::{JOB_ENTRY_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE};
+    use aruna_core::keyspaces::{
+        JOB_ARTIFACT_TOMBSTONE_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE,
+    };
     use aruna_core::structs::{
         AuthContext, ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateResult,
         ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobId, JobPayload,
@@ -338,6 +349,30 @@ mod tests {
         assert_eq!(outcome.pruned, 0);
         assert!(outcome.next_due_after.is_some());
         assert_eq!(count(&storage, JOB_KEYSPACE).await, 1);
+    }
+
+    #[tokio::test]
+    async fn expired_tombstone_pruned() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let job_id = JobId::from_bytes([8u8; 16]);
+        let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        preserve_artifact_tombstone(
+            &storage,
+            job_id,
+            owner,
+            unix_timestamp_millis().saturating_sub(1),
+        )
+        .await
+        .unwrap();
+
+        let outcome = process_job_prune_batch(&context(storage.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.pruned, 1);
+        assert_eq!(count(&storage, JOB_ARTIFACT_TOMBSTONE_KEYSPACE).await, 0);
+        assert_eq!(count(&storage, JOB_SCHEDULE_INDEX_KEYSPACE).await, 0);
     }
 
     #[tokio::test]
