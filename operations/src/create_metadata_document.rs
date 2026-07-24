@@ -162,6 +162,21 @@ impl CreateMetadataDocumentOperation {
         &self.config
     }
 
+    /// A pristine operation with the same inputs, for a conflict retry.
+    fn fresh_copy(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            skip_existing_check: self.skip_existing_check,
+            forwarded: self.forwarded,
+            conflict_recheck: false,
+            txn_id: None,
+            state: CreateMetadataDocumentState::Init,
+            record: None,
+            create_event: None,
+            output: None,
+        }
+    }
+
     fn graph_iri(&self) -> String {
         MetadataRegistryRecord::graph_iri_for(self.config.document_id)
     }
@@ -518,11 +533,26 @@ impl CreateMetadataDocumentOperation {
     }
 }
 
+const CREATE_CONFLICT_RETRIES: usize = 3;
+
 pub async fn create_metadata_document(
-    operation: CreateMetadataDocumentOperation,
+    template: CreateMetadataDocumentOperation,
     context: Arc<DriverContext>,
 ) -> Result<CreateMetadataDocumentResult, CreateMetadataDocumentError> {
-    let created = drive(operation, context.as_ref()).await?;
+    let mut attempt = 0usize;
+    let created = loop {
+        match drive(template.fresh_copy(), context.as_ref()).await {
+            Ok(created) => break created,
+            Err(CreateMetadataDocumentError::StorageError(StorageError::TransactionConflict))
+                if attempt < CREATE_CONFLICT_RETRIES =>
+            {
+                let backoff = crate::queue_backoff::retry_after_ms(attempt as u32, 25, 250);
+                tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    };
     schedule_pending_metadata_projection_drain(context.as_ref(), std::time::Duration::ZERO)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
@@ -951,6 +981,31 @@ mod tests {
             operation.finalize(),
             Err(CreateMetadataDocumentError::DocumentAlreadyExists)
         );
+    }
+
+    #[test]
+    fn fresh_copy_resets() {
+        let realm_id = RealmId([41u8; 32]);
+        let actor = actor(realm_id, 11);
+        let group_id = GroupId::generate();
+        let document_id = Ulid::from_bytes([41; 16]);
+        let mut operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
+            actor.clone(),
+            group_id,
+            document_id,
+        ));
+
+        operation.start();
+        let effects = operation.step(validation_result(document_id));
+        begin_transaction(&mut operation, effects.as_slice());
+        operation.conflict_recheck = true;
+
+        let expected = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
+            actor,
+            group_id,
+            document_id,
+        ));
+        assert_eq!(operation.fresh_copy(), expected);
     }
 
     fn config(actor: Actor, group_id: GroupId, document_id: Ulid) -> CreateMetadataDocumentConfig {
