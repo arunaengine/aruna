@@ -89,6 +89,9 @@ fn storage_effect_key_space(effect: &StorageEffect) -> Option<&str> {
 const MAX_GROUP_COMMIT: usize = 256;
 const READ_POOL_THREADS: usize = 4;
 const BULK_READ_POOL_THREADS: usize = 2;
+// Foreground batches served before one bulk item is admitted. Bounds bulk queue
+// latency under sustained ingest so background drains cannot stall indefinitely.
+const MAX_FOREGROUND_STREAK: usize = 8;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FjallPersistPolicy {
@@ -602,8 +605,9 @@ impl FjallStorage {
     #[tracing::instrument(name = "storage.receive_loop", level = "debug", skip(self, receivers))]
     pub fn receive_loop(&mut self, receivers: StorageReceivers) {
         let mut slow_queue = SlowQueueAggregator::default();
+        let mut lanes = LaneScheduler::default();
         loop {
-            let (first, priority) = match recv_prioritized(&receivers) {
+            let (first, priority) = match lanes.next(&receivers) {
                 Ok(pair) => pair,
                 Err(_) => {
                     tracing::warn!(
@@ -1642,58 +1646,79 @@ fn iter_may_include_key(
     }
 }
 
-// Foreground before bulk: return an immediately available foreground item, else
-// an available bulk item, else block briefly on foreground so an idle actor
-// still wakes to serve bulk work. The 1ms poll is the documented alternative to
-// a blocking two-channel select and keeps the same lane-priority contract.
-fn recv_prioritized(
-    receivers: &StorageReceivers,
-) -> Result<(EffectHandle, StoragePriority), RecvError> {
-    loop {
-        let foreground = receivers.foreground.try_recv();
-        if let Ok(item) = foreground {
-            return Ok((item, StoragePriority::Foreground));
-        }
-        let bulk = receivers.bulk.try_recv();
-        if let Ok(item) = bulk {
-            return Ok((item, StoragePriority::Bulk));
-        }
-        match (foreground, bulk) {
-            (Err(TryRecvError::Disconnected), Err(TryRecvError::Disconnected)) => {
-                return Err(RecvError);
+/// Lane picker for the write actor: foreground is preferred, but a bulk item is
+/// admitted after [`MAX_FOREGROUND_STREAK`] foreground batches so background work
+/// keeps draining while ingest saturates the foreground lane.
+#[derive(Debug, Default)]
+struct LaneScheduler {
+    foreground_streak: usize,
+}
+
+impl LaneScheduler {
+    fn next(
+        &mut self,
+        receivers: &StorageReceivers,
+    ) -> Result<(EffectHandle, StoragePriority), RecvError> {
+        loop {
+            if self.foreground_streak >= MAX_FOREGROUND_STREAK
+                && let Ok(item) = receivers.bulk.try_recv()
+            {
+                self.foreground_streak = 0;
+                return Ok((item, StoragePriority::Bulk));
             }
-            (Err(TryRecvError::Disconnected), _) => {
-                return receivers
-                    .bulk
-                    .recv()
-                    .map(|item| (item, StoragePriority::Bulk));
+            let foreground = receivers.foreground.try_recv();
+            if let Ok(item) = foreground {
+                self.foreground_streak = self.foreground_streak.saturating_add(1);
+                return Ok((item, StoragePriority::Foreground));
             }
-            (_, Err(TryRecvError::Disconnected)) => {
-                return receivers
+            let bulk = receivers.bulk.try_recv();
+            if let Ok(item) = bulk {
+                self.foreground_streak = 0;
+                return Ok((item, StoragePriority::Bulk));
+            }
+            match (foreground, bulk) {
+                (Err(TryRecvError::Disconnected), Err(TryRecvError::Disconnected)) => {
+                    return Err(RecvError);
+                }
+                (Err(TryRecvError::Disconnected), _) => {
+                    self.foreground_streak = 0;
+                    return receivers
+                        .bulk
+                        .recv()
+                        .map(|item| (item, StoragePriority::Bulk));
+                }
+                (_, Err(TryRecvError::Disconnected)) => {
+                    self.foreground_streak = 0;
+                    return receivers
+                        .foreground
+                        .recv()
+                        .map(|item| (item, StoragePriority::Foreground));
+                }
+                _ => {}
+            }
+            // Both lanes are open but empty: block on a biased select so an idle
+            // node sleeps with zero wakeups and foreground stays preferred.
+            self.foreground_streak = 0;
+            let mut select = Select::new_bias();
+            select.add(&receivers.foreground);
+            select.add(&receivers.bulk);
+            let received = match select.select() {
+                Ok(result) if result == receivers.foreground => receivers
                     .foreground
-                    .recv()
-                    .map(|item| (item, StoragePriority::Foreground));
+                    .read_select(result)
+                    .map(|item| (item, StoragePriority::Foreground)),
+                Ok(result) => receivers
+                    .bulk
+                    .read_select(result)
+                    .map(|item| (item, StoragePriority::Bulk)),
+                Err(RecvError) => return Err(RecvError),
+            };
+            if let Ok(pair) = received {
+                if matches!(pair.1, StoragePriority::Foreground) {
+                    self.foreground_streak = 1;
+                }
+                return Ok(pair);
             }
-            _ => {}
-        }
-        // Both lanes are open but empty: block on a biased select so an idle
-        // node sleeps with zero wakeups and foreground stays preferred.
-        let mut select = Select::new_bias();
-        select.add(&receivers.foreground);
-        select.add(&receivers.bulk);
-        let received = match select.select() {
-            Ok(result) if result == receivers.foreground => receivers
-                .foreground
-                .read_select(result)
-                .map(|item| (item, StoragePriority::Foreground)),
-            Ok(result) => receivers
-                .bulk
-                .read_select(result)
-                .map(|item| (item, StoragePriority::Bulk)),
-            Err(RecvError) => return Err(RecvError),
-        };
-        if let Ok(pair) = received {
-            return Ok(pair);
         }
     }
 }
@@ -2109,13 +2134,60 @@ mod tests {
         );
         keep.push(rx);
 
-        let (first, priority) = super::recv_prioritized(&receivers).expect("first item");
+        let mut lanes = super::LaneScheduler::default();
+        let (first, priority) = lanes.next(&receivers).expect("first item");
         assert_eq!(priority, StoragePriority::Foreground);
         assert_eq!(super::storage_effect_key_space(&first.0), Some("fg"));
         for _ in 0..3 {
-            let (_, priority) = super::recv_prioritized(&receivers).expect("bulk item");
+            let (_, priority) = lanes.next(&receivers).expect("bulk item");
             assert_eq!(priority, StoragePriority::Bulk);
         }
+        drop(keep);
+    }
+
+    #[test]
+    fn bulk_survives_foreground() {
+        // A foreground lane that never runs dry must still yield the bulk lane a
+        // slot, otherwise background drains stall until the node goes idle.
+        let (handle, receivers) = StorageHandle::new();
+        let read = |key_space: &str| StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key: b"k".to_vec().into(),
+            txn_id: None,
+        };
+        let mut keep = Vec::new();
+        let mut enqueue = |channel: &super::EffectSender, key_space: &str| {
+            let (tx, rx) = crossfire::oneshot::oneshot();
+            let effect = read(key_space);
+            let span = super::storage_effect_span(&effect);
+            let in_flight = super::InFlightGuard::acquire(&handle.metrics);
+            assert!(
+                channel
+                    .try_send((effect, tx, span, Instant::now(), in_flight))
+                    .is_ok(),
+                "enqueue {key_space}"
+            );
+            keep.push(rx);
+        };
+        for _ in 0..(super::MAX_FOREGROUND_STREAK * 2) {
+            enqueue(&handle.write_channel, "fg");
+        }
+        enqueue(&handle.bulk_channel, "bulk");
+
+        let mut lanes = super::LaneScheduler::default();
+        let mut served = Vec::new();
+        for _ in 0..(super::MAX_FOREGROUND_STREAK + 1) {
+            let (_, priority) = lanes.next(&receivers).expect("item");
+            served.push(priority);
+        }
+        assert_eq!(
+            served
+                .iter()
+                .filter(|p| **p == StoragePriority::Bulk)
+                .count(),
+            1,
+            "bulk served within one streak: {served:?}"
+        );
         drop(keep);
     }
 
