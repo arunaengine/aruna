@@ -48,6 +48,9 @@ use super::raw::{MetadataRawReadError, RawStateCache};
 
 const MATERIALIZATION_SCAN_PAGE_SIZE: usize = 512;
 const MATERIALIZATION_BATCH_SIZE: usize = 128;
+// Backoff reaches its 30s cap by attempt 7, so ten attempts is about two
+// minutes of retries before a job is parked as Failed and both rows deleted.
+const MATERIALIZATION_MAX_ATTEMPTS: u32 = 10;
 
 pub const METADATA_MATERIALIZATION_POLL_AFTER: Duration = Duration::from_secs(5);
 pub const METADATA_MATERIALIZATION_RETRY_AFTER: Duration = Duration::from_secs(1);
@@ -1445,6 +1448,35 @@ async fn reschedule_materialization_job_in_txn(
     }
 
     let attempts = job.attempts.saturating_add(1);
+    if attempts > MATERIALIZATION_MAX_ATTEMPTS {
+        let status = materialization_failure_status(job, event, error.clone(), true);
+        let mut writes = Vec::new();
+        if should_write_final_materialization_status(current.as_ref(), &status) {
+            writes.push(metadata_materialization_status_write_entry(&status)?);
+        }
+        transactional_batch_write(storage, txn_id, writes).await?;
+        transactional_batch_delete(
+            storage,
+            txn_id,
+            vec![
+                old_global_job_delete,
+                (
+                    METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+                    metadata_materialization_document_job_key(job.document_id, job.event_id),
+                ),
+            ],
+        )
+        .await?;
+        warn!(
+            event = "materialization.job.parked",
+            document_id = %job.document_id,
+            event_id = %job.event_id,
+            attempts,
+            error = %error,
+            "Parked metadata materialization job after exceeding attempt cap"
+        );
+        return Ok(());
+    }
     let status = materialization_failure_status(job, event, error, false);
     let retry_delay_ms = queue_retry_after_ms(attempts);
     let next_job = MetadataMaterializationJobRecord {
@@ -2062,6 +2094,62 @@ mod tests {
 
         assert!(older);
         assert!(delta <= 10, "older check issued {delta} storage requests");
+    }
+
+    #[tokio::test]
+    async fn attempts_cap_parks() {
+        // A job at the attempt cap is parked as Failed with both rows removed.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let document_id = Ulid::from_bytes([45u8; 16]);
+        let event_id = Ulid::from_parts(1, 1);
+        let event = create_event(document_id, event_id, "capped");
+        let job = MetadataMaterializationJobRecord {
+            document_id,
+            event_id,
+            due_at_ms: 1,
+            attempts: MATERIALIZATION_MAX_ATTEMPTS,
+        };
+        let index_key = metadata_materialization_job_key(&job);
+        let sidecar_key = metadata_materialization_document_job_key(document_id, event_id);
+        write_entries(
+            &storage,
+            vec![
+                metadata_create_event_write_entry(&event).unwrap(),
+                metadata_materialization_job_write_entry(&job).unwrap(),
+                metadata_materialization_document_job_write_entry(&job).unwrap(),
+            ],
+        )
+        .await;
+
+        reschedule_materialization_job(&storage, index_key.as_ref(), &job, &event, "boom".into())
+            .await
+            .unwrap();
+
+        assert!(
+            !storage_key_exists(
+                &storage,
+                METADATA_MATERIALIZATION_JOB_KEYSPACE,
+                index_key.to_vec()
+            )
+            .await
+        );
+        assert!(
+            !storage_key_exists(
+                &storage,
+                METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
+                sidecar_key.to_vec()
+            )
+            .await
+        );
+        let status = read_materialization_status(&storage, document_id, None)
+            .await
+            .unwrap()
+            .expect("failed status is written");
+        assert_eq!(status.state, MetadataMaterializationState::Failed);
+        assert_eq!(status.attempts, MATERIALIZATION_MAX_ATTEMPTS + 1);
+        assert_eq!(status.last_error.as_deref(), Some("boom"));
+        assert!(!metadata_materialization_jobs_exist(&storage).await.unwrap());
     }
 
     #[test]
