@@ -1198,26 +1198,24 @@ impl OperationsTaskHandler {
                 )
                 .await;
             }
-            Ok(_) => {
-                match metadata_materialization_jobs_exist(&bulk.storage_handle).await {
-                    Ok(false) => {}
-                    Ok(true) => {
-                        self.reschedule_timer(
-                            TaskKey::DrainMetadataMaterializationQueue,
-                            METADATA_MATERIALIZATION_POLL_AFTER,
-                        )
-                        .await;
-                    }
-                    Err(error) => {
-                        warn!(task_id = ?TaskKey::DrainMetadataMaterializationQueue, error = ?error, "Failed to probe metadata materialization jobs");
-                        self.reschedule_timer(
-                            TaskKey::DrainMetadataMaterializationQueue,
-                            METADATA_MATERIALIZATION_RETRY_AFTER,
-                        )
-                        .await;
-                    }
+            Ok(_) => match metadata_materialization_jobs_exist(&bulk.storage_handle).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    self.reschedule_timer(
+                        TaskKey::DrainMetadataMaterializationQueue,
+                        METADATA_MATERIALIZATION_POLL_AFTER,
+                    )
+                    .await;
                 }
-            }
+                Err(error) => {
+                    warn!(task_id = ?TaskKey::DrainMetadataMaterializationQueue, error = ?error, "Failed to probe metadata materialization jobs");
+                    self.reschedule_timer(
+                        TaskKey::DrainMetadataMaterializationQueue,
+                        METADATA_MATERIALIZATION_RETRY_AFTER,
+                    )
+                    .await;
+                }
+            },
             Err(error) => {
                 warn!(task_id = ?TaskKey::DrainMetadataMaterializationQueue, error = ?error, "Failed to drain metadata materialization queue");
                 self.reschedule_timer(

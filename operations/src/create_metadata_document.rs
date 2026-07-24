@@ -864,9 +864,11 @@ mod tests {
             panic!("expected transactional create append");
         };
         assert_eq!(*write_txn, txn_id);
-        assert!(!writes.iter().any(|(key_space, _, _)| {
-            key_space == REALM_CONFIG_KEYSPACE
-        }));
+        assert!(
+            !writes
+                .iter()
+                .any(|(key_space, _, _)| { key_space == REALM_CONFIG_KEYSPACE })
+        );
         assert!(
             writes
                 .iter()

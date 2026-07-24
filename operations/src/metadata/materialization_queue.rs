@@ -368,7 +368,8 @@ async fn process_materialization_job_groups(
     }
     let finish_started = Instant::now();
     let syncs = dedupe_graph_syncs(&finished);
-    if let Err(error) = finish_completed_materialization_jobs(&context.storage_handle, finished).await
+    if let Err(error) =
+        finish_completed_materialization_jobs(&context.storage_handle, finished).await
         && first_error.is_none()
     {
         first_error = Some(error);
@@ -383,7 +384,9 @@ async fn process_materialization_job_groups(
 
 // One SyncGraphBestEffort per graph, keeping the last peers seen, so a batch
 // carrying many events for one document schedules a single sync.
-fn dedupe_graph_syncs(finished: &[FinishedMaterializationJob]) -> Vec<CompletedMaterializationSync> {
+fn dedupe_graph_syncs(
+    finished: &[FinishedMaterializationJob],
+) -> Vec<CompletedMaterializationSync> {
     let mut by_graph: BTreeMap<String, CompletedMaterializationSync> = BTreeMap::new();
     for job in finished {
         if let FinishedMaterializationJob::Completed(job) = job
@@ -520,7 +523,9 @@ async fn finish_completed_materialization_jobs_in_txn(
                     writes.push(metadata_materialization_status_write_entry(&status)?);
                 }
                 writes.push(metadata_materialization_job_write_entry(&next_job)?);
-                writes.push(metadata_materialization_document_job_write_entry(&next_job)?);
+                writes.push(metadata_materialization_document_job_write_entry(
+                    &next_job,
+                )?);
                 deletes.push(old_index_delete);
             }
             FinishedMaterializationJob::Parked {
@@ -2092,9 +2097,10 @@ mod tests {
         write_entries(&storage, writes).await;
 
         let before = storage.snapshot_metrics().requests_total;
-        let older = older_materialization_job_exists(&storage, document_id, middle, &BTreeSet::new())
-            .await
-            .unwrap();
+        let older =
+            older_materialization_job_exists(&storage, document_id, middle, &BTreeSet::new())
+                .await
+                .unwrap();
         let delta = storage.snapshot_metrics().requests_total - before;
 
         assert!(older);
@@ -2748,10 +2754,11 @@ mod tests {
                 defer_materialization_job(index_key.as_ref(), job, event, "transient".into())
             })
             .collect();
-        assert!(finished.iter().all(|finished| matches!(
-            finished,
-            FinishedMaterializationJob::Rescheduled { .. }
-        )));
+        assert!(
+            finished
+                .iter()
+                .all(|finished| matches!(finished, FinishedMaterializationJob::Rescheduled { .. }))
+        );
 
         let before = storage.snapshot_metrics().requests_total;
         finish_completed_materialization_jobs(&storage, finished)
