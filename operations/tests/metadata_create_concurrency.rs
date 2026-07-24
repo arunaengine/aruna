@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use aruna_core::UserId;
-use aruna_core::structs::{Actor, RealmId};
+use aruna_core::effects::StorageEffect;
+use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::structs::{Actor, RealmConfigDocument, RealmId};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     create_metadata_document,
@@ -58,6 +60,23 @@ async fn concurrent_creates_succeed() -> Result<(), BoxError> {
 
     let realm_id = RealmId([61u8; 32]);
     let group_id = Ulid::generate();
+    // The realm config must exist: the conflict this guards against came from
+    // creates writing it back, which only happened when the row was present.
+    let seed_actor = Actor {
+        node_id,
+        user_id: UserId::local(Ulid::generate(), realm_id),
+        realm_id,
+    };
+    let realm_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: (*realm_id.as_bytes()).into(),
+            value: realm_config.to_bytes(&seed_actor)?.into(),
+            txn_id: None,
+        })
+        .await;
+
     let mut handles = Vec::with_capacity(CONCURRENT_CREATES);
     for index in 0..CONCURRENT_CREATES {
         let context = context.clone();
