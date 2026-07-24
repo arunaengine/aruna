@@ -3,10 +3,11 @@ use std::time::Duration;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE};
+use aruna_core::keyspaces::{JOB_ACTIVE_USER_KEYSPACE, JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    JobId, JobPayload, JobRecord, WorkspaceMode, job_record_key, parse_job_dedup_value,
+    JobId, JobPayload, JobRecord, WorkspaceMode, job_active_prefix, job_record_key,
+    parse_job_dedup_value,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, NodeId, TxnId, UserId};
@@ -31,6 +32,7 @@ pub struct SubmitJobSpec {
     pub owner_node_id: NodeId,
     pub dedup_key: Option<Vec<u8>>,
     pub now_ms: u64,
+    pub retention_ms: u64,
     pub workspace_mode: WorkspaceMode,
     pub workspace_bucket: Option<String>,
 }
@@ -38,7 +40,7 @@ pub struct SubmitJobSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmitJobResult {
     pub job_id: JobId,
-    /// `false` when a live job with the same `dedup_key` already existed.
+    /// `false` when a job with the same `dedup_key` already existed.
     pub created: bool,
 }
 
@@ -52,6 +54,8 @@ pub enum SubmitJobError {
     JobPlanConflict { existing_job_id: JobId },
     #[error("invalid workspace: {0}")]
     InvalidWorkspace(String),
+    #[error("active RO-Crate job limit reached ({limit})")]
+    ActiveJobLimit { limit: u32 },
     #[error("unexpected event while submitting job: {0}")]
     UnexpectedEvent(String),
 }
@@ -67,6 +71,9 @@ enum SubmitState {
         txn_id: TxnId,
         job_id: JobId,
         digest_matches: bool,
+    },
+    CheckActive {
+        txn_id: TxnId,
     },
     WriteJob {
         txn_id: Option<TxnId>,
@@ -91,12 +98,17 @@ enum SubmitState {
 #[derive(Debug, PartialEq)]
 pub struct SubmitJobOperation {
     record: JobRecord,
+    active_cap: Option<u32>,
     state: SubmitState,
     output: Option<Result<SubmitJobResult, SubmitJobError>>,
 }
 
 impl SubmitJobOperation {
     pub fn new(spec: SubmitJobSpec) -> Self {
+        let active_cap = spec
+            .payload
+            .rocrate_limits()
+            .map(|limits| limits.max_active_jobs);
         let mut record = JobRecord::new(
             JobId::new(),
             spec.payload,
@@ -106,6 +118,7 @@ impl SubmitJobOperation {
             spec.now_ms,
             spec.dedup_key,
         );
+        record.retention_ms = spec.retention_ms;
         if matches!(&record.payload, JobPayload::Execution(_)) {
             record.workspace_mode = spec.workspace_mode;
             record.workspace_bucket = match spec.workspace_mode {
@@ -123,6 +136,7 @@ impl SubmitJobOperation {
         }
         Self {
             record,
+            active_cap,
             state: SubmitState::Init,
             output: None,
         }
@@ -132,6 +146,7 @@ impl SubmitJobOperation {
         let txn_id = match self.state {
             SubmitState::ReadDedup { txn_id }
             | SubmitState::VerifyDedup { txn_id, .. }
+            | SubmitState::CheckActive { txn_id }
             | SubmitState::CommitTransaction { txn_id } => Some(txn_id),
             SubmitState::WriteJob { txn_id } => txn_id,
             _ => None,
@@ -151,15 +166,16 @@ impl SubmitJobOperation {
     }
 
     fn begin(&mut self) -> Effects {
-        match self.record.dedup_key.clone() {
-            Some(_) => self.start_transaction(),
-            None => self.write_job(None),
+        if self.record.dedup_key.is_some() || self.active_cap.is_some() {
+            self.start_transaction()
+        } else {
+            self.write_job(None)
         }
     }
 
     fn read_dedup(&mut self, txn_id: TxnId) -> Effects {
         let Some(dedup_key) = self.record.dedup_key.clone() else {
-            return self.write_job(Some(txn_id));
+            return self.check_active(txn_id);
         };
         self.state = SubmitState::ReadDedup { txn_id };
         // Must match the key `job_insert_entries` writes, owner prefix included, or the
@@ -167,6 +183,23 @@ impl SubmitJobOperation {
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: JOB_DEDUP_INDEX_KEYSPACE.to_string(),
             key: job_dedup_index_key(self.record.created_by, &dedup_key),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn check_active(&mut self, txn_id: TxnId) -> Effects {
+        let Some(limit) = self.active_cap else {
+            return self.write_job(Some(txn_id));
+        };
+        self.state = SubmitState::CheckActive { txn_id };
+        if limit == 0 {
+            return self.fail(SubmitJobError::ActiveJobLimit { limit });
+        }
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: JOB_ACTIVE_USER_KEYSPACE.to_string(),
+            prefix: Some(job_active_prefix(self.record.created_by)),
+            start: None,
+            limit: limit as usize,
             txn_id: Some(txn_id),
         })]
     }
@@ -271,10 +304,10 @@ impl Operation for SubmitJobOperation {
                             self.record.plan_digest.unwrap_or_default() == existing_digest;
                         self.verify_dedup(txn_id, existing_job_id, digest_matches)
                     }
-                    Err(_) => self.write_job(Some(txn_id)),
+                    Err(_) => self.check_active(txn_id),
                 },
                 Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-                    self.write_job(Some(txn_id))
+                    self.check_active(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
@@ -293,12 +326,24 @@ impl Operation for SubmitJobOperation {
                     }),
                     Err(error) => {
                         warn!(job_id = %job_id, error = %error, "Dedup entry points at an undecodable job; creating fresh");
-                        self.write_job(Some(txn_id))
+                        self.check_active(txn_id)
                     }
                 },
                 Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
                     warn!(job_id = %job_id, "Dedup entry points at a missing job; creating fresh");
-                    self.write_job(Some(txn_id))
+                    self.check_active(txn_id)
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+            },
+            SubmitState::CheckActive { txn_id } => match event {
+                Event::Storage(StorageEvent::IterResult { values, .. }) => {
+                    let limit = self.active_cap.unwrap_or_default();
+                    if values.len() >= limit as usize {
+                        self.fail(SubmitJobError::ActiveJobLimit { limit })
+                    } else {
+                        self.write_job(Some(txn_id))
+                    }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
@@ -351,6 +396,7 @@ impl Operation for SubmitJobOperation {
         let txn_id = match self.state {
             SubmitState::ReadDedup { txn_id }
             | SubmitState::VerifyDedup { txn_id, .. }
+            | SubmitState::CheckActive { txn_id }
             | SubmitState::CommitTransaction { txn_id } => Some(txn_id),
             SubmitState::WriteJob { txn_id } => txn_id,
             _ => None,
@@ -370,7 +416,9 @@ mod tests {
         JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
     };
     use aruna_core::structs::{
-        ComputeResources, ExecutionSpec, JobState, RealmId, encode_job_dedup_value,
+        AuthContext, ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource,
+        ImportRoCrateSpec, ImportRoCrateTarget, JobState, RealmId, RoCrateLimits,
+        encode_job_dedup_value,
     };
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
@@ -408,6 +456,7 @@ mod tests {
             owner_node_id: node_id(7),
             dedup_key,
             now_ms: 1_000,
+            retention_ms: aruna_core::structs::DEFAULT_JOB_RETENTION_MS,
             workspace_mode: WorkspaceMode::Kept,
             workspace_bucket: None,
         }
@@ -431,6 +480,54 @@ mod tests {
             workspace_outputs: Vec::new(),
             output_prefixes: Vec::new(),
         })
+    }
+
+    fn rocrate_spec(limit: u32, dedup_key: Option<Vec<u8>>) -> SubmitJobSpec {
+        let base = spec(dedup_key);
+        let limits = RoCrateLimits {
+            max_active_jobs: limit,
+            ..RoCrateLimits::default()
+        };
+        SubmitJobSpec {
+            payload: JobPayload::ImportRoCrate(ImportRoCrateSpec {
+                auth_context: AuthContext {
+                    user_id: base.created_by,
+                    realm_id: RealmId([1u8; 32]),
+                    path_restrictions: None,
+                },
+                source: ImportRoCrateSource::Upload {
+                    upload_id: Ulid::from_bytes([3u8; 16]),
+                },
+                target: ImportRoCrateTarget {
+                    bucket: "target".to_string(),
+                    prefix: "crate".to_string(),
+                },
+                metadata: ImportMetadataTarget {
+                    group_id: Ulid::from_bytes([4u8; 16]),
+                    path: "crate".to_string(),
+                    public: false,
+                },
+                limits,
+                document_id: Ulid::from_bytes([5u8; 16]),
+            }),
+            ..base
+        }
+    }
+
+    #[test]
+    fn import_fence_ignored() {
+        let mut first = rocrate_spec(4, Some(b"key".to_vec()));
+        let mut second = first.clone();
+        let JobPayload::ImportRoCrate(first_spec) = &mut first.payload else {
+            panic!("expected import payload");
+        };
+        let JobPayload::ImportRoCrate(second_spec) = &mut second.payload else {
+            panic!("expected import payload");
+        };
+        first_spec.document_id = Ulid::from_bytes([5; 16]);
+        second_spec.document_id = Ulid::from_bytes([6; 16]);
+
+        assert_eq!(first.payload.plan_digest(), second.payload.plan_digest());
     }
 
     async fn count_keyspace(storage: &StorageHandle, key_space: &str) -> usize {
@@ -463,6 +560,25 @@ mod tests {
 
         assert_eq!(record.workspace_mode, WorkspaceMode::Existing);
         assert_eq!(record.workspace_bucket.as_deref(), Some("shared-workspace"));
+    }
+
+    #[tokio::test]
+    async fn retention_is_stored() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = context(storage.clone());
+        let mut submission = spec(None);
+        submission.retention_ms = 42;
+
+        let result = drive(SubmitJobOperation::new(submission), &ctx)
+            .await
+            .unwrap();
+        let record = read_job_record(&storage, result.job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(record.retention_ms, 42);
     }
 
     #[tokio::test]
@@ -548,6 +664,82 @@ mod tests {
         assert_eq!(second.job_id, first.job_id);
         // No duplicate record created.
         assert_eq!(count_keyspace(&storage, JOB_KEYSPACE).await, 1);
+    }
+
+    #[tokio::test]
+    async fn rocrate_cap_enforced() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = context(storage.clone());
+        let first = drive(SubmitJobOperation::new(rocrate_spec(1, None)), &ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            drive(SubmitJobOperation::new(rocrate_spec(1, None)), &ctx).await,
+            Err(SubmitJobError::ActiveJobLimit { limit: 1 })
+        );
+
+        let crate::jobs::store::ClaimOutcome::Claimed(claimed) =
+            crate::jobs::store::claim_job(&storage, first.job_id, node_id(3), 2_000)
+                .await
+                .unwrap()
+        else {
+            panic!("job must be claimed");
+        };
+        let token = claimed.claim.unwrap().claim_token;
+        crate::jobs::store::transition_to_running(&storage, first.job_id, token, 2_100)
+            .await
+            .unwrap();
+        crate::jobs::store::cancel_running_job(&storage, first.job_id, token, 2_200)
+            .await
+            .unwrap();
+
+        assert!(
+            drive(SubmitJobOperation::new(rocrate_spec(1, None)), &ctx)
+                .await
+                .unwrap()
+                .created
+        );
+    }
+
+    #[tokio::test]
+    async fn rocrate_dedup_first() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = context(storage.clone());
+        let submission = rocrate_spec(1, Some(b"import".to_vec()));
+        let first = drive(SubmitJobOperation::new(submission.clone()), &ctx)
+            .await
+            .unwrap();
+        let second = drive(SubmitJobOperation::new(submission.clone()), &ctx)
+            .await
+            .unwrap();
+
+        assert!(first.created);
+        assert!(!second.created);
+        assert_eq!(second.job_id, first.job_id);
+
+        let crate::jobs::store::ClaimOutcome::Claimed(claimed) =
+            crate::jobs::store::claim_job(&storage, first.job_id, node_id(3), 2_000)
+                .await
+                .unwrap()
+        else {
+            panic!("job must be claimed");
+        };
+        let token = claimed.claim.unwrap().claim_token;
+        crate::jobs::store::transition_to_running(&storage, first.job_id, token, 2_100)
+            .await
+            .unwrap();
+        crate::jobs::store::cancel_running_job(&storage, first.job_id, token, 2_200)
+            .await
+            .unwrap();
+
+        let terminal = drive(SubmitJobOperation::new(submission), &ctx)
+            .await
+            .unwrap();
+        assert!(!terminal.created);
+        assert_eq!(terminal.job_id, first.job_id);
     }
 
     // Equal logical keys from different owners must not share a dedup row.

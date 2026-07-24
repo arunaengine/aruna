@@ -23,6 +23,8 @@ pub enum TaskKey {
     DrainJobQueue,
     PruneJobs,
     DrainSyncMirrorRepair,
+    SweepHiddenBlobs,
+    RefreshBlobHolders,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

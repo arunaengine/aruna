@@ -1,27 +1,39 @@
 use super::BlobHandler;
-use super::backend::{build_backend_path, build_multipart_part_path};
+use super::backend::{build_backend_path, build_hidden_path, build_multipart_part_path};
 use crate::hash::Hasher;
 use crate::opendal::{abort_partial_writer, init_backend_operator};
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::BackendStream;
 use aruna_core::stream::StreamError;
-use aruna_core::structs::BackendLocation;
+use aruna_core::structs::{BackendLocation, HIDDEN_BLOB_PREFIX, HiddenBlobEntry, HiddenBlobKey};
 use aruna_core::types::UserId;
 use bytes::Bytes;
-use futures::{StreamExt, stream};
-use opendal::Operator;
+use futures::{StreamExt, TryStreamExt, stream};
+use opendal::{EntryMode, ErrorKind, Operator};
 use std::collections::HashMap;
 use std::ops::RangeBounds;
-use std::time::SystemTime;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ulid::Ulid;
 
 impl BlobHandler {
     pub(super) async fn write_stream_to_location(
         &self,
+        location: BackendLocation,
+        operator: Operator,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    ) -> BlobEvent {
+        self.write_stream_limit(location, operator, blob, None)
+            .await
+    }
+
+    async fn write_stream_limit(
+        &self,
         mut location: BackendLocation,
         operator: Operator,
         mut blob: BackendStream<Result<Bytes, StreamError>>,
+        max_bytes: Option<u64>,
     ) -> BlobEvent {
         let storage_path = match location.get_storage_path() {
             Ok(storage_path) => storage_path,
@@ -43,12 +55,24 @@ impl BlobHandler {
                     return BlobEvent::Error(BlobError::StreamFailed(err.to_string()));
                 }
             };
+            let Some(next_size) = bytes_written.checked_add(bytes.len() as u64) else {
+                abort_partial_writer(&mut writer, &operator, &storage_path).await;
+                return BlobEvent::Error(BlobError::SizeLimitExceeded {
+                    limit: max_bytes.unwrap_or(u64::MAX),
+                });
+            };
+            if let Some(limit) = max_bytes
+                && next_size > limit
+            {
+                abort_partial_writer(&mut writer, &operator, &storage_path).await;
+                return BlobEvent::Error(BlobError::SizeLimitExceeded { limit });
+            }
             hasher.update(&bytes);
             if let Err(err) = writer.write(bytes.to_vec()).await {
                 abort_partial_writer(&mut writer, &operator, &storage_path).await;
                 return BlobEvent::Error(BlobError::WriteError(err.to_string()));
             }
-            bytes_written += bytes.len() as u64;
+            bytes_written = next_size;
         }
 
         if let Err(err) = writer.close().await {
@@ -58,6 +82,82 @@ impl BlobHandler {
         location.blob_size = bytes_written;
         location.hashes = hasher.to_map();
         BlobEvent::WriteFinished { location }
+    }
+
+    pub async fn spool_hidden_blob(
+        &self,
+        namespace: Ulid,
+        name: &str,
+        created_by: UserId,
+        max_bytes: Option<u64>,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    ) -> BlobEvent {
+        let backend_bucket = match self.eval_backend_bucket().await {
+            Ok(bucket) => bucket,
+            Err(err) => return BlobEvent::Error(err),
+        };
+        let ulid = Ulid::generate();
+        let backend_path = match build_hidden_path(namespace, name, ulid) {
+            Ok(path) => path,
+            Err(err) => return BlobEvent::Error(BlobError::ConversionError(err)),
+        };
+        let location = BackendLocation {
+            root: self.backend_config.root.clone(),
+            storage_bucket: backend_bucket.clone(),
+            backend_path,
+            ulid,
+            compressed: false,
+            encrypted: false,
+            created_by,
+            created_at: SystemTime::now(),
+            staging: false,
+            partial: false,
+            blob_size: 0,
+            hashes: HashMap::new(),
+        };
+        let operator = match init_backend_operator(self.backend_config.clone(), backend_bucket) {
+            Ok(operator) => operator,
+            Err(err) => return BlobEvent::Error(err),
+        };
+        let location = match self
+            .write_stream_limit(location, operator, blob, max_bytes)
+            .await
+        {
+            BlobEvent::WriteFinished { location } => location,
+            other => return other,
+        };
+        let Some(hash) = location.get_blake3() else {
+            let _ = self.discard_hidden(&location).await;
+            return BlobEvent::Error(BlobError::IntegrityCheckFailed(
+                "hidden blob hash is missing".to_string(),
+            ));
+        };
+        let Ok(blake3) = hash.try_into() else {
+            let _ = self.discard_hidden(&location).await;
+            return BlobEvent::Error(BlobError::IntegrityCheckFailed(
+                "hidden blob hash has an invalid length".to_string(),
+            ));
+        };
+        if let Err(err) = self.increment_bucket_load(&location.storage_bucket).await {
+            if let Err(cleanup) = self.discard_hidden(&location).await {
+                return BlobEvent::Error(cleanup);
+            }
+            return BlobEvent::Error(err);
+        }
+        BlobEvent::HiddenSpooled {
+            size: location.blob_size,
+            location,
+            blake3,
+        }
+    }
+
+    async fn discard_hidden(&self, location: &BackendLocation) -> Result<(), BlobError> {
+        let operator = self.operator_from_location(location)?;
+        let storage_path = location.get_storage_path()?;
+        operator
+            .delete(&storage_path)
+            .await
+            .map_err(|error| BlobError::DeleteError(error.to_string()))
     }
 
     pub async fn write_blob(
@@ -360,6 +460,122 @@ impl BlobHandler {
         }
     }
 
+    pub async fn read_hidden_range(
+        &self,
+        location: BackendLocation,
+        range: std::ops::Range<u64>,
+    ) -> BlobEvent {
+        if let Err(error) = HiddenBlobKey::try_from(&location) {
+            return BlobEvent::Error(BlobError::ConversionError(error));
+        }
+        if range.start > range.end || range.end > location.blob_size {
+            return BlobEvent::Error(BlobError::ReadError(
+                "hidden blob range is outside the stored size".to_string(),
+            ));
+        }
+        let stream_size = range.end - range.start;
+        match self.read_blob_range(location, range).await {
+            BlobEvent::ReadFinished { blob, .. } => BlobEvent::HiddenRead { blob, stream_size },
+            other => other,
+        }
+    }
+
+    pub async fn delete_hidden_blob(&self, key: HiddenBlobKey) -> BlobEvent {
+        let operator = match self.operator_from_hidden(&key) {
+            Ok(operator) => operator,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        let storage_path = match key.get_storage_path() {
+            Ok(path) => path,
+            Err(error) => return BlobEvent::Error(BlobError::ConversionError(error)),
+        };
+        match operator.stat(&storage_path).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return BlobEvent::HiddenDeleted;
+            }
+            Err(error) => return BlobEvent::Error(BlobError::DeleteError(error.to_string())),
+        }
+        if let Err(error) = operator.delete(&storage_path).await {
+            return BlobEvent::Error(BlobError::DeleteError(error.to_string()));
+        }
+        if let Err(error) = self.decrement_bucket_load(&key.storage_bucket).await {
+            return BlobEvent::Error(error);
+        }
+        BlobEvent::HiddenDeleted
+    }
+
+    pub async fn list_hidden_blobs(&self, namespace: Option<Ulid>) -> BlobEvent {
+        let buckets = match self.hidden_buckets().await {
+            Ok(buckets) => buckets,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        let prefix = hidden_prefix(namespace);
+        let mut entries = Vec::new();
+        for bucket in buckets {
+            let operator = match init_backend_operator(self.backend_config.clone(), bucket.clone())
+            {
+                Ok(operator) => operator,
+                Err(error) => return BlobEvent::Error(error),
+            };
+            let storage_prefix = PathBuf::from(&bucket).join(&prefix);
+            let Some(storage_prefix) = storage_prefix.to_str() else {
+                return BlobEvent::Error(BlobError::ListError(
+                    "hidden blob prefix is not valid utf-8".to_string(),
+                ));
+            };
+            let mut lister = match operator.lister_with(storage_prefix).recursive(true).await {
+                Ok(lister) => lister,
+                Err(error) => return BlobEvent::Error(BlobError::ListError(error.to_string())),
+            };
+            loop {
+                let entry = match lister.try_next().await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    Err(error) => {
+                        return BlobEvent::Error(BlobError::ListError(error.to_string()));
+                    }
+                };
+                if entry.metadata().mode() != EntryMode::FILE {
+                    continue;
+                }
+                let listed_path = PathBuf::from(entry.path());
+                let backend_path = match listed_path.strip_prefix(&bucket) {
+                    Ok(path) => match path.to_str() {
+                        Some(path) => path.to_string(),
+                        None => {
+                            return BlobEvent::Error(BlobError::ListError(
+                                "hidden blob path is not valid utf-8".to_string(),
+                            ));
+                        }
+                    },
+                    Err(error) => {
+                        return BlobEvent::Error(BlobError::ListError(error.to_string()));
+                    }
+                };
+                let key = match HiddenBlobKey::new(
+                    self.backend_config.root.clone(),
+                    bucket.clone(),
+                    backend_path,
+                ) {
+                    Ok(key) => key,
+                    Err(error) => return BlobEvent::Error(BlobError::ConversionError(error)),
+                };
+                let modified_at = entry
+                    .metadata()
+                    .last_modified()
+                    .map(Into::into)
+                    .or_else(|| hidden_timestamp(&key.backend_path));
+                entries.push(HiddenBlobEntry { key, modified_at });
+            }
+        }
+        entries.sort_by(|left, right| {
+            (&left.key.storage_bucket, &left.key.backend_path)
+                .cmp(&(&right.key.storage_bucket, &right.key.backend_path))
+        });
+        BlobEvent::HiddenListed { entries }
+    }
+
     pub async fn delete_blob(&self, location: BackendLocation) -> BlobEvent {
         let operator = match self.operator_from_location(&location) {
             Ok(op) => op,
@@ -381,4 +597,17 @@ impl BlobHandler {
         }
         BlobEvent::DeleteFinished
     }
+}
+
+fn hidden_prefix(namespace: Option<Ulid>) -> String {
+    match namespace {
+        Some(namespace) => format!("{HIDDEN_BLOB_PREFIX}/{namespace}/"),
+        None => format!("{HIDDEN_BLOB_PREFIX}/"),
+    }
+}
+
+fn hidden_timestamp(path: &str) -> Option<SystemTime> {
+    let suffix = Path::new(path).file_name()?.to_str()?.rsplit_once('_')?.1;
+    let ulid = Ulid::from_string(suffix).ok()?;
+    UNIX_EPOCH.checked_add(Duration::from_millis(ulid.timestamp_ms()))
 }

@@ -7,6 +7,7 @@ pub mod projector;
 mod protocol;
 pub mod prune_queue;
 mod queue_storage;
+pub mod raw;
 pub mod repository;
 mod search_cursor;
 mod search_enrichment;

@@ -56,8 +56,12 @@ pub enum BlobError {
     /// Client-sourced body stream fault; the request, not the node, is at fault.
     #[error("Stream failed: {0}")]
     StreamFailed(String),
+    #[error("Blob exceeds the {limit} byte limit")]
+    SizeLimitExceeded { limit: u64 },
     #[error("Read error: {0}")]
     ReadError(String),
+    #[error("List error: {0}")]
+    ListError(String),
     #[error("Delete error: {0}")]
     DeleteError(String),
     #[error("Integrity check failed: {0}")]

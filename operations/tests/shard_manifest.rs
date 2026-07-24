@@ -60,7 +60,7 @@ async fn document_manifest_row_lands_on_origin_and_receiver_with_matching_digest
                 name: "Manifest Canary".to_string(),
                 description: "manifest maintenance test".to_string(),
                 date_published: "2026-07-07".to_string(),
-                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             },
         }),
         nodes[0].context.as_ref(),

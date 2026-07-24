@@ -5,7 +5,7 @@ use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::{
     ArunaArn, AuthContext, BackendLocation, MultipartChecksumType, MultipartObjectPart,
     MultipartObjectSummary, ReplicationItemKind, ReplicationNegotiationResult, SourceMetadata,
-    VersionSourceBinding,
+    VersionSourceBinding, VersionedObjectArn,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
@@ -49,6 +49,31 @@ pub struct MaterializedBlobInfo {
     pub compressed: bool,
     pub encrypted: bool,
     pub location: BackendLocation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BaoReadTarget {
+    ExactVersion(VersionedObjectArn),
+    Blake3([u8; 32]),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BaoReadRequest {
+    pub auth_context: AuthContext,
+    pub realm_id: aruna_core::structs::RealmId,
+    pub target: BaoReadTarget,
+    pub expected_blake3: Option<[u8; 32]>,
+    pub metadata_only: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BaoReadRefusal {
+    RealmPeerDenied,
+    InvalidTarget,
+    NotFound,
+    ReadDenied,
+    HashMismatch,
+    BackendFailure,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -122,6 +147,9 @@ pub enum VersionReplicationMessage {
     VersionNegotiationResponse(ReplicationNegotiationResult),
     VersionApplyComplete,
     VersionApplyRejected(String),
+    BaoReadRequest(BaoReadRequest),
+    BaoReadAccepted { size: u64, blake3: [u8; 32] },
+    BaoReadRefused(BaoReadRefusal),
 }
 
 impl VersionReplicationMessage {
@@ -215,8 +243,9 @@ pub struct VersionReplicationRequest {
 #[cfg(test)]
 mod tests {
     use super::{
-        MaterializedBlobInfo, MultipartObjectReplicationMetadata, SyncOrigin,
-        VERSION_REPLICATION_MAGIC, VersionReplicationManifest, VersionReplicationMessage,
+        BaoReadRefusal, BaoReadRequest, BaoReadTarget, MaterializedBlobInfo,
+        MultipartObjectReplicationMetadata, SyncOrigin, VERSION_REPLICATION_MAGIC,
+        VersionReplicationManifest, VersionReplicationMessage,
     };
     use aruna_blob::hash::Hasher;
     use aruna_core::UserId;
@@ -299,6 +328,33 @@ mod tests {
             writer_auth_context: None,
             reference_metadata: None,
             metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn bao_frames_roundtrip() {
+        let request = VersionReplicationMessage::BaoReadRequest(BaoReadRequest {
+            auth_context: AuthContext {
+                user_id: test_user_id(),
+                realm_id: test_realm_id(),
+                path_restrictions: None,
+            },
+            realm_id: test_realm_id(),
+            target: BaoReadTarget::Blake3([8u8; 32]),
+            expected_blake3: Some([8u8; 32]),
+            metadata_only: false,
+        });
+        let accepted = VersionReplicationMessage::BaoReadAccepted {
+            size: 42,
+            blake3: [8u8; 32],
+        };
+        let refused = VersionReplicationMessage::BaoReadRefused(BaoReadRefusal::ReadDenied);
+
+        for message in [request, accepted, refused] {
+            assert_eq!(
+                VersionReplicationMessage::from_bytes(&message.to_bytes().unwrap()).unwrap(),
+                message
+            );
         }
     }
 

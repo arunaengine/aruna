@@ -24,7 +24,7 @@ use crate::driver::DriverContext;
 const IRI_INDEX_PAGE_SIZE: usize = 128;
 const IRI_INDEX_WRITE_BATCH_SIZE: usize = 128;
 
-pub(crate) const SCHEMA_CONFORMS_TO_IRI: &str = "http://schema.org/conformsTo";
+pub(crate) const DCTERMS_CONFORMS_TO_IRI: &str = "http://purl.org/dc/terms/conformsTo";
 
 pub(crate) fn project_metadata_iri_references(
     document_id: Ulid,
@@ -510,17 +510,17 @@ mod tests {
             vec![
                 (
                     "https://example.test/subject-b".to_string(),
-                    SCHEMA_CONFORMS_TO_IRI.to_string(),
+                    DCTERMS_CONFORMS_TO_IRI.to_string(),
                     "https://example.test/profile".to_string(),
                 ),
                 (
                     "https://example.test/subject-a".to_string(),
-                    SCHEMA_CONFORMS_TO_IRI.to_string(),
+                    DCTERMS_CONFORMS_TO_IRI.to_string(),
                     "https://example.test/profile".to_string(),
                 ),
                 (
                     "https://example.test/subject-a".to_string(),
-                    SCHEMA_CONFORMS_TO_IRI.to_string(),
+                    DCTERMS_CONFORMS_TO_IRI.to_string(),
                     "https://example.test/profile".to_string(),
                 ),
             ],
@@ -548,14 +548,14 @@ mod tests {
             MetadataIriReferenceIndexRecord {
                 document_id: current_document_id,
                 document_cursor: cursor,
-                predicate_iri: SCHEMA_CONFORMS_TO_IRI.to_string(),
+                predicate_iri: DCTERMS_CONFORMS_TO_IRI.to_string(),
                 object_iri: profile.to_string(),
                 subject_iris: vec!["https://example.test/current".to_string()],
             },
             MetadataIriReferenceIndexRecord {
                 document_id: stale_document_id,
                 document_cursor: Ulid::from_parts(2, 0),
-                predicate_iri: SCHEMA_CONFORMS_TO_IRI.to_string(),
+                predicate_iri: DCTERMS_CONFORMS_TO_IRI.to_string(),
                 object_iri: profile.to_string(),
                 subject_iris: vec!["https://example.test/stale".to_string()],
             },
@@ -575,7 +575,7 @@ mod tests {
         let matches = collect_matching_iri_references(
             records,
             &registry_records,
-            SCHEMA_CONFORMS_TO_IRI,
+            DCTERMS_CONFORMS_TO_IRI,
             profile,
         );
 

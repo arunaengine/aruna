@@ -6,7 +6,7 @@ use crate::id::{DhtKeyId, NodeId};
 use crate::metadata::MetadataEffect;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
-use crate::structs::{BackendLocation, RealmId, ResolvedSourceAccess};
+use crate::structs::{BackendLocation, HiddenBlobKey, RealmId, ResolvedSourceAccess};
 use crate::task::TaskEffect;
 use crate::types::UserId;
 use crate::types::{Key, KeySpace, TxnId, Value};
@@ -61,6 +61,23 @@ pub enum BlobEffect {
     Delete {
         location: BackendLocation,
     },
+    SpoolHidden {
+        namespace: Ulid,
+        name: String,
+        created_by: UserId,
+        max_bytes: Option<u64>,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    },
+    ReadHiddenRange {
+        location: BackendLocation,
+        range: Range<u64>,
+    },
+    DeleteHidden {
+        key: HiddenBlobKey,
+    },
+    ListHidden {
+        namespace: Option<Ulid>,
+    },
     // ----- Replication -----
     OpenConnection {
         node_id: NodeId,
@@ -85,6 +102,16 @@ pub enum BlobEffect {
         replication_id: Option<Ulid>,
         stream_id: Ulid,
         keep_alive: bool,
+    },
+    ServeRead {
+        stream_id: Ulid,
+        location: BackendLocation,
+        expected_blake3: [u8; 32],
+    },
+    ReceiveRead {
+        stream_id: Ulid,
+        size: u64,
+        expected_blake3: [u8; 32],
     },
 }
 

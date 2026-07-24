@@ -2,7 +2,7 @@ use crate::errors::{BlobError, SourceConnectorResolutionError, StagingSourceErro
 use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::{
-    BackendLocation, RealmId, ReplicationSuboperationResult, ResolvedSourceAccess,
+    BackendLocation, HiddenBlobEntry, RealmId, ReplicationSuboperationResult, ResolvedSourceAccess,
     ResolvedSourceConnector, SourceEntry, SourceMetadata,
 };
 use crate::{
@@ -73,6 +73,19 @@ pub enum BlobEvent {
         stream_size: u64,
     },
     DeleteFinished,
+    HiddenSpooled {
+        location: BackendLocation,
+        blake3: [u8; 32],
+        size: u64,
+    },
+    HiddenRead {
+        blob: BackendStream<Result<Bytes, BackendStreamError>>,
+        stream_size: u64,
+    },
+    HiddenDeleted,
+    HiddenListed {
+        entries: Vec<HiddenBlobEntry>,
+    },
     ConnectionEstablished {
         stream_id: Ulid,
     },
@@ -88,6 +101,9 @@ pub enum BlobEvent {
     },
     ReplicationFinished {
         location: BackendLocation,
+    },
+    ReadServed {
+        stream_id: Ulid,
     },
     Error(BlobError),
 }

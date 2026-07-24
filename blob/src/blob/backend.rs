@@ -7,7 +7,10 @@ use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::BUCKET_STATS_DB;
-use aruna_core::structs::{Backend, BackendBucket, BackendLocation, ensure_confined_relative_path};
+use aruna_core::structs::{
+    Backend, BackendBucket, BackendLocation, HIDDEN_BLOB_PREFIX, HiddenBlobKey,
+    ensure_confined_relative_path,
+};
 use opendal::Operator;
 use std::path::PathBuf;
 use ulid::Ulid;
@@ -58,6 +61,7 @@ impl BlobHandler {
             make_bucket(&bucket_name, &self.backend_config.service_config).await?;
         }
 
+        self.write_bucket_load(&bucket_name, 0).await?;
         Ok(bucket_name)
     }
 
@@ -186,6 +190,29 @@ impl BlobHandler {
 
         init_operator(self.backend_config.backend_type.clone(), config)
     }
+
+    pub(super) fn operator_from_hidden(&self, key: &HiddenBlobKey) -> Result<Operator, BlobError> {
+        let mut config = self.backend_config.service_config.clone();
+        config.insert("root".to_string(), key.root.clone());
+        if Backend::S3 == self.backend_config.backend_type {
+            config.insert("bucket".to_string(), key.storage_bucket.clone());
+        }
+
+        init_operator(self.backend_config.backend_type.clone(), config)
+    }
+
+    pub(super) async fn hidden_buckets(&self) -> Result<Vec<String>, BlobError> {
+        if let Some(bucket) = self.backend_config.service_config.get("bucket") {
+            return Ok(vec![bucket.clone()]);
+        }
+        Ok(self
+            .fetch_bucket_stats()
+            .await
+            .map_err(BlobError::ConversionError)?
+            .into_iter()
+            .map(|bucket| bucket.name)
+            .collect())
+    }
 }
 
 pub(super) fn generate_bucket_name(prefix: Option<&str>) -> String {
@@ -199,6 +226,34 @@ pub(super) fn build_backend_path(
     ulid: Ulid,
 ) -> Result<String, ConversionError> {
     let path = PathBuf::from(bucket).join(format!("{}_{}", key, ulid));
+    ensure_confined_relative_path(&path)?;
+    let first = path.components().find_map(|component| match component {
+        std::path::Component::Normal(part) => part.to_str(),
+        _ => None,
+    });
+    if first == Some(HIDDEN_BLOB_PREFIX) {
+        return Err(ConversionError::UnsafePath(
+            "bucket collides with the hidden blob namespace".to_string(),
+        ));
+    }
+    path.into_os_string()
+        .into_string()
+        .map_err(|_| ConversionError::OsStringError)
+}
+
+pub(super) fn build_hidden_path(
+    namespace: Ulid,
+    name: &str,
+    ulid: Ulid,
+) -> Result<String, ConversionError> {
+    if name.is_empty() {
+        return Err(ConversionError::UnsafePath(
+            "hidden blob name must not be empty".to_string(),
+        ));
+    }
+    let path = PathBuf::from(HIDDEN_BLOB_PREFIX)
+        .join(namespace.to_string())
+        .join(format!("{name}_{ulid}"));
     ensure_confined_relative_path(&path)?;
     path.into_os_string()
         .into_string()

@@ -236,7 +236,9 @@ async fn wait_run_crate(
 ) -> Option<RunCrateStatus> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(Some(status)) = read_run_crate_status(&ctx.storage_handle, job_id).await {
+        if let Ok(Some(status)) = read_run_crate_status(&ctx.storage_handle, job_id).await
+            && status != RunCrateStatus::Pending
+        {
             return Some(status);
         }
         if Instant::now() >= deadline {

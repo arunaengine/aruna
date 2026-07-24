@@ -1,4 +1,7 @@
-use crate::auth::{ValidatedArunaBearerTokenCarrier, parse_group_id, require_realm_auth};
+use crate::auth::{
+    ValidatedArunaBearerTokenCarrier, parse_group_id, require_realm_auth,
+    require_unrestricted_realm_auth,
+};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::errors::AuthorizationError;
@@ -6,8 +9,8 @@ use aruna_core::metadata::{
     MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
 use aruna_core::structs::{
-    Actor, AuthContext, MetadataRegistryRecord, Permission, WatchEvent, WatchEventDetail,
-    WatchEventKind,
+    Actor, AuthContext, ExportRoCrateSpec, MetadataRegistryRecord, Permission, WatchEvent,
+    WatchEventDetail, WatchEventKind,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -17,6 +20,7 @@ use aruna_operations::create_metadata_document::{
 };
 use aruna_operations::driver::drive;
 use aruna_operations::get_metadata_document::load_metadata_record_by_document as load_metadata_record_by_document_from_operations;
+use aruna_operations::jobs::service::submit_export_job;
 use aruna_operations::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
     ListVisibleMetadataDocumentsRequest, MetadataApiError, MetadataApiQueryMode,
@@ -53,6 +57,8 @@ use ulid::Ulid;
 use url::form_urlencoded::Serializer;
 use utoipa::{OpenApi, ToSchema};
 
+use super::jobs::{job_urls, map_submit_error};
+
 #[cfg(test)]
 use aruna_operations::metadata::MetadataAuthToken;
 #[cfg(test)]
@@ -76,6 +82,7 @@ use std::time::Duration;
         search_metadata,
         metadata_references,
         export_metadata_rocrate,
+        submit_rocrate_export,
         replace_metadata_rocrate,
         add_metadata_data_entity,
         add_metadata_contextual_entity,
@@ -102,6 +109,10 @@ pub fn router() -> Router<Arc<ServerState>> {
         .route(
             "/metadata/{document_id}/rocrate",
             get(export_metadata_rocrate).put(replace_metadata_rocrate),
+        )
+        .route(
+            "/metadata/{document_id}/rocrate/exports",
+            post(submit_rocrate_export),
         )
         .route(
             "/metadata/{document_id}/rocrate/data-entities",
@@ -142,7 +153,8 @@ pub struct CreateMetadataScaffoldRequest {
     pub name: String,
     pub description: String,
     pub date_published: String,
-    pub license: String,
+    #[serde(default)]
+    pub license: Option<String>,
     #[serde(default)]
     pub public: bool,
 }
@@ -221,13 +233,32 @@ pub struct ReplaceMetadataRoCrateRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct MetadataRoCrateResponse {
+#[serde(untagged)]
+pub enum MetadataRoCrateResponse {
+    Projected(ProjectedRoCrateResponse),
+    Raw(MetadataRawRoCrateResponse),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProjectedRoCrateResponse {
     #[schema(value_type = Object)]
     pub rocrate: Value,
     pub total_data_entities: Option<usize>,
     pub returned_data_entities: Option<usize>,
     pub next_offset: Option<usize>,
     pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataRawRoCrateResponse {
+    #[schema(value_type = Object)]
+    pub raw: Value,
+    pub winning_event_id: String,
+    pub projection_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projected_event_id: Option<String>,
+    pub context_digest: String,
+    pub dataset_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -240,6 +271,7 @@ pub enum MetadataRoCrateView {
     Full,
     Summary,
     Page,
+    Raw,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
@@ -252,6 +284,23 @@ pub struct MetadataRoCrateExportParams {
     pub offset: Option<usize>,
     #[serde(default)]
     pub after: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitRoCrateExportRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SubmitRoCrateExportResponse {
+    pub job_id: String,
+    pub created: bool,
+    pub owner_node_url: String,
+    pub status_url: String,
+    pub report_url: String,
+    pub artifact_url: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
@@ -742,7 +791,7 @@ pub async fn delete_metadata_document(
     tag = "metadata",
     params(
         ("document_id" = String, Path, description = "Metadata document id"),
-        ("view" = Option<MetadataRoCrateView>, Query, description = "Export view: full, summary, or page"),
+        ("view" = Option<MetadataRoCrateView>, Query, description = "Export view: full, summary, page, or raw"),
         ("limit" = Option<usize>, Query, description = "Maximum number of root-linked data entities for page view"),
         ("offset" = Option<usize>, Query, description = "Offset cursor for page view"),
         ("after" = Option<String>, Query, description = "Entity id cursor for page view")
@@ -794,7 +843,8 @@ pub async fn delete_metadata_document(
         (status = 400, description = "Invalid id", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Not found", body = ErrorResponse)
+        (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 503, description = "Requested view is not available", body = ErrorResponse)
     )
 )]
 pub async fn export_metadata_rocrate(
@@ -822,6 +872,64 @@ pub async fn export_metadata_rocrate(
     .map_err(map_metadata_api_error)?;
     let response = map_rocrate_export_response(export, &params, view)?;
     Ok((StatusCode::OK, Json(response)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/metadata/{document_id}/rocrate/exports",
+    tag = "metadata",
+    params(("document_id" = String, Path, description = "Metadata document id")),
+    request_body = SubmitRoCrateExportRequest,
+    responses(
+        (status = 202, description = "RO-Crate export job accepted", body = SubmitRoCrateExportResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Metadata READ denied", body = ErrorResponse),
+        (status = 404, description = "Metadata document not found", body = ErrorResponse),
+        (status = 409, description = "Idempotency key conflict or active-job limit", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn submit_rocrate_export(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(document_id): Path<String>,
+    Json(request): Json<SubmitRoCrateExportRequest>,
+) -> ServerResult<(StatusCode, Json<SubmitRoCrateExportResponse>)> {
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let document_id = parse_document_id(&document_id)?;
+    let record = load_metadata_record_by_document(&state, document_id).await?;
+    ensure_permission(
+        &state,
+        auth.clone(),
+        record.permission_path,
+        Permission::READ,
+    )
+    .await?;
+    let result = submit_export_job(
+        &state.get_ctx(),
+        ExportRoCrateSpec {
+            auth_context: auth,
+            document_id,
+            limits: state.rocrate_limits().clone(),
+        },
+        state.get_node_id(),
+        request.idempotency_key,
+    )
+    .await
+    .map_err(map_submit_error)?;
+    let urls = job_urls(&state, result.job_id).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SubmitRoCrateExportResponse {
+            job_id: result.job_id.to_string(),
+            created: result.created,
+            owner_node_url: urls.owner_node_url,
+            status_url: urls.status_url,
+            report_url: urls.report_url,
+            artifact_url: urls.artifact_url,
+        }),
+    ))
 }
 
 #[utoipa::path(
@@ -1242,7 +1350,7 @@ pub async fn query_all_metadata(
     tag = "metadata",
     params(
         ("q" = Option<String>, Query, description = "Search query; optional when conforms_to is set"),
-        ("conforms_to" = Option<String>, Query, description = "Exact schema.org conformsTo profile IRI"),
+        ("conforms_to" = Option<String>, Query, description = "Exact RO-Crate conformsTo profile IRI"),
         ("group_id" = Option<String>, Query, description = "Restrict hits to a single group id"),
         ("limit" = Option<usize>, Query, description = "Page size (default 25, silently clamped to a maximum of 100). Hits are ordered by descending score"),
         ("cursor" = Option<String>, Query, description = "Opaque continuation token from a previous response's next_cursor. Bound to the original query; replaying it with a changed query returns 400. Paging is best-effort: results may shift under concurrent metadata churn or node failures"),
@@ -1489,6 +1597,7 @@ fn forwarded_auth_token(
 fn map_metadata_error(error: MetadataError) -> ServerError {
     match error {
         MetadataError::InvalidInput(_) => ServerError::BadRequest,
+        MetadataError::Validation(violations) => ServerError::MetadataValidation(violations),
         MetadataError::GraphNotFound => ServerError::ServiceUnavailable,
         other => ServerError::InternalError(other.to_string()),
     }
@@ -1601,6 +1710,7 @@ fn map_rocrate_export_view(view: &MetadataRoCrateView) -> OperationMetadataRoCra
         MetadataRoCrateView::Full => OperationMetadataRoCrateExportView::Full,
         MetadataRoCrateView::Summary => OperationMetadataRoCrateExportView::Summary,
         MetadataRoCrateView::Page => OperationMetadataRoCrateExportView::Page,
+        MetadataRoCrateView::Raw => OperationMetadataRoCrateExportView::Raw,
     }
 }
 
@@ -1610,29 +1720,50 @@ fn map_rocrate_export_response(
     view: MetadataRoCrateView,
 ) -> ServerResult<MetadataRoCrateResponse> {
     match export {
-        ExportMetadataRoCrateResult::Full { jsonld, .. } => Ok(MetadataRoCrateResponse {
-            rocrate: parse_jsonld(jsonld)?,
-            total_data_entities: None,
-            returned_data_entities: None,
-            next_offset: None,
-            next_cursor: None,
-        }),
-        ExportMetadataRoCrateResult::Summary { record, jsonld } => Ok(MetadataRoCrateResponse {
-            rocrate: rewrite_view_jsonld(
-                parse_jsonld(jsonld)?,
-                &record.graph_iri,
-                &build_view_id(&record.graph_iri, params, view),
-            )?,
-            total_data_entities: None,
-            returned_data_entities: None,
-            next_offset: None,
-            next_cursor: None,
-        }),
+        ExportMetadataRoCrateResult::Full { jsonld, .. } => Ok(MetadataRoCrateResponse::Projected(
+            ProjectedRoCrateResponse {
+                rocrate: parse_jsonld(jsonld)?,
+                total_data_entities: None,
+                returned_data_entities: None,
+                next_offset: None,
+                next_cursor: None,
+            },
+        )),
+        ExportMetadataRoCrateResult::Summary { record, jsonld } => Ok(
+            MetadataRoCrateResponse::Projected(ProjectedRoCrateResponse {
+                rocrate: rewrite_view_jsonld(
+                    parse_jsonld(jsonld)?,
+                    &record.graph_iri,
+                    &build_view_id(&record.graph_iri, params, view),
+                )?,
+                total_data_entities: None,
+                returned_data_entities: None,
+                next_offset: None,
+                next_cursor: None,
+            }),
+        ),
         ExportMetadataRoCrateResult::Page { record, page } => map_page_response(
             page,
             &record.graph_iri,
             &build_view_id(&record.graph_iri, params, view),
         ),
+        ExportMetadataRoCrateResult::Raw {
+            raw,
+            dataset_digest,
+            ..
+        } => Ok(MetadataRoCrateResponse::Raw(MetadataRawRoCrateResponse {
+            raw: parse_jsonld(raw.revision.jsonld)?,
+            winning_event_id: raw.revision.winning_event_id.to_string(),
+            projection_state: match raw.projection_state {
+                aruna_core::metadata::MetadataMaterializationState::Pending => "pending",
+                aruna_core::metadata::MetadataMaterializationState::Materialized => "materialized",
+                aruna_core::metadata::MetadataMaterializationState::Failed => "failed",
+            }
+            .to_string(),
+            projected_event_id: raw.projected_event_id.map(|event_id| event_id.to_string()),
+            context_digest: hex::encode(raw.revision.context_digest),
+            dataset_digest: dataset_digest.map(hex::encode),
+        })),
     }
 }
 
@@ -1641,13 +1772,15 @@ fn map_page_response(
     graph_iri: &str,
     view_id: &str,
 ) -> ServerResult<MetadataRoCrateResponse> {
-    Ok(MetadataRoCrateResponse {
-        rocrate: rewrite_view_jsonld(parse_jsonld(page.jsonld)?, graph_iri, view_id)?,
-        total_data_entities: Some(page.total_data_entities),
-        returned_data_entities: Some(page.returned_data_entities),
-        next_offset: page.next_offset,
-        next_cursor: page.next_cursor,
-    })
+    Ok(MetadataRoCrateResponse::Projected(
+        ProjectedRoCrateResponse {
+            rocrate: rewrite_view_jsonld(parse_jsonld(page.jsonld)?, graph_iri, view_id)?,
+            total_data_entities: Some(page.total_data_entities),
+            returned_data_entities: Some(page.returned_data_entities),
+            next_offset: page.next_offset,
+            next_cursor: page.next_cursor,
+        },
+    ))
 }
 
 fn build_view_id(
@@ -1660,6 +1793,7 @@ fn build_view_id(
         MetadataRoCrateView::Full => "full",
         MetadataRoCrateView::Summary => "summary",
         MetadataRoCrateView::Page => "page",
+        MetadataRoCrateView::Raw => "raw",
     };
     serializer.append_pair("view", view);
     if let Some(limit) = params.limit {
@@ -1781,9 +1915,13 @@ mod tests {
         AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, TASK_TIMER_KEYSPACE,
     };
     use aruna_core::metadata::{
-        MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
+        MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
+        MetadataGraphLifecycleRecord, MetadataMaterializationState,
+        MetadataMaterializationStatusRecord,
     };
-    use aruna_core::storage_entries::metadata_registry_delete_entries;
+    use aruna_core::storage_entries::{
+        metadata_materialization_status_write_entry, metadata_registry_delete_entries,
+    };
     use aruna_core::structs::{
         Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
         RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
@@ -1825,6 +1963,31 @@ mod tests {
         state: Arc<ServerState>,
     }
 
+    fn projected(response: MetadataRoCrateResponse) -> ProjectedRoCrateResponse {
+        match response {
+            MetadataRoCrateResponse::Projected(response) => response,
+            MetadataRoCrateResponse::Raw(_) => panic!("expected projected RO-Crate response"),
+        }
+    }
+
+    async fn write_status(state: &ServerState, status: &MetadataMaterializationStatusRecord) {
+        let (key_space, key, value) = metadata_materialization_status_write_entry(status).unwrap();
+        match state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected status write: {other:?}"),
+        }
+    }
+
     fn installed_metadata_handle(context: &DriverContext) -> &MetadataHandle {
         let DriverContext {
             metadata_handle, ..
@@ -1847,7 +2010,7 @@ mod tests {
                     name: "Public Dataset".to_string(),
                     description: "Visible metadata".to_string(),
                     date_published: "2026-01-01".to_string(),
-                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    license: None,
                     public: true,
                 },
             )),
@@ -1886,6 +2049,20 @@ mod tests {
         .unwrap();
         assert_eq!(listed.documents.len(), 1);
         assert_eq!(listed.documents[0].document_id, created.summary.document_id);
+
+        let raw = export_metadata_rocrate(
+            State(test.state.clone()),
+            Extension(None),
+            Path(document_id.clone()),
+            Query(MetadataRoCrateExportParams {
+                view: Some(MetadataRoCrateView::Raw),
+                limit: None,
+                offset: None,
+                after: None,
+            }),
+        )
+        .await;
+        assert!(matches!(raw, Err(ServerError::NotFound)));
 
         let paged_jsonld = format!(
             r#"{{
@@ -1941,7 +2118,99 @@ mod tests {
         )
         .await
         .unwrap();
+
+        let (_, Json(raw)) = export_metadata_rocrate(
+            State(test.state.clone()),
+            Extension(None),
+            Path(document_id.clone()),
+            Query(MetadataRoCrateExportParams {
+                view: Some(MetadataRoCrateView::Raw),
+                limit: None,
+                offset: None,
+                after: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let MetadataRoCrateResponse::Raw(raw) = raw else {
+            panic!("expected raw RO-Crate response");
+        };
+        assert_eq!(raw.projection_state, "pending");
+        assert!(raw.raw.to_string().contains("file-2.txt"));
+        assert_eq!(raw.context_digest.len(), 64);
+        assert_eq!(raw.dataset_digest.as_deref().map(str::len), Some(64));
+        assert!(raw.projected_event_id.is_none());
+        let projected_jsonld = installed_metadata_handle(test.state.get_ctx().as_ref())
+            .export_rocrate_jsonld(created.summary.graph_iri.clone())
+            .await
+            .unwrap();
+        assert!(!projected_jsonld.contains("file-2.txt"));
+        let failed_event_id = Ulid::from_string(&raw.winning_event_id).unwrap();
+        let mut failed_status = MetadataMaterializationStatusRecord {
+            document_id: Ulid::from_string(&document_id).unwrap(),
+            event_id: failed_event_id,
+            graph_iri: created.summary.graph_iri.clone(),
+            context_digest: Some(
+                hex::decode(&raw.context_digest)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ),
+            dataset_digest: raw
+                .dataset_digest
+                .as_deref()
+                .map(hex::decode)
+                .transpose()
+                .unwrap()
+                .map(|digest| digest.try_into().unwrap()),
+            state: MetadataMaterializationState::Failed,
+            attempts: 1,
+            last_error: Some("projection failed".to_string()),
+            updated_at_ms: 1,
+        };
+        write_status(test.state.as_ref(), &failed_status).await;
+        let (_, Json(failed)) = export_metadata_rocrate(
+            State(test.state.clone()),
+            Extension(None),
+            Path(document_id.clone()),
+            Query(MetadataRoCrateExportParams {
+                view: Some(MetadataRoCrateView::Raw),
+                limit: None,
+                offset: None,
+                after: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let MetadataRoCrateResponse::Raw(failed) = failed else {
+            panic!("expected failed raw RO-Crate response");
+        };
+        assert_eq!(failed.projection_state, "failed");
+        assert!(failed.projected_event_id.is_none());
+        failed_status.state = MetadataMaterializationState::Pending;
+        failed_status.attempts = 0;
+        failed_status.last_error = None;
+        write_status(test.state.as_ref(), &failed_status).await;
+
         drain_metadata_background(test.state.as_ref()).await;
+
+        let (_, Json(bound)) = export_metadata_rocrate(
+            State(test.state.clone()),
+            Extension(None),
+            Path(document_id.clone()),
+            Query(MetadataRoCrateExportParams {
+                view: Some(MetadataRoCrateView::Raw),
+                limit: None,
+                offset: None,
+                after: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let MetadataRoCrateResponse::Raw(bound) = bound else {
+            panic!("expected materialized raw RO-Crate response");
+        };
+        assert_eq!(bound.projected_event_id, Some(bound.winning_event_id));
 
         let (_, Json(response)) = export_metadata_rocrate(
             State(test.state.clone()),
@@ -1951,6 +2220,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let response = projected(response);
         assert!(
             response
                 .rocrate
@@ -1971,6 +2241,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let summary = projected(summary);
         assert!(summary.rocrate.to_string().contains(&format!(
             "https://w3id.org/aruna/{document_id}?view=summary"
         )));
@@ -1989,6 +2260,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let page = projected(page);
         assert!(page.rocrate.to_string().contains(&format!(
             "https://w3id.org/aruna/{document_id}?view=page&limit=2&offset=0"
         )));
@@ -2250,6 +2522,7 @@ mod tests {
         .await
         .unwrap();
 
+        let exported = projected(exported);
         let json = exported.rocrate.to_string();
         assert!(json.contains(&format!("https://w3id.org/aruna/{document_id}")));
         assert!(json.contains("Created From RO-Crate"));
@@ -2274,7 +2547,7 @@ mod tests {
                     name: "Cache Served Dataset".to_string(),
                     description: "Served from the handle registry cache".to_string(),
                     date_published: "2026-01-01".to_string(),
-                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public: true,
                 },
             )),
@@ -2334,7 +2607,7 @@ mod tests {
                     name: "Inbound Tombstone Dataset".to_string(),
                     description: "Deleted by document lifecycle only".to_string(),
                     date_published: "2026-01-01".to_string(),
-                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public: true,
                 },
             )),
@@ -2448,7 +2721,7 @@ mod tests {
                     name: "Private Dataset".to_string(),
                     description: "Private metadata".to_string(),
                     date_published: "2026-01-01".to_string(),
-                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public: false,
                 },
             )),
@@ -2614,7 +2887,7 @@ mod tests {
                     name: "Pending Dataset".to_string(),
                     description: "Not yet materialized".to_string(),
                     date_published: "2026-01-01".to_string(),
-                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public: true,
                 },
             )),
@@ -2674,7 +2947,7 @@ mod tests {
                     name: "Pending Summary".to_string(),
                     description: "Summary projection in flight".to_string(),
                     date_published: "2026-01-01".to_string(),
-                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public: true,
                 },
             )),
@@ -2734,6 +3007,9 @@ mod tests {
             view_param["schema"]["$ref"],
             json!("#/components/schemas/MetadataRoCrateView")
         );
+        let export_submit = &openapi["paths"]["/metadata/{document_id}/rocrate/exports"]["post"];
+        assert!(export_submit["responses"].get("202").is_some());
+        assert_eq!(export_submit["security"][0]["bearer_auth"], json!([]));
 
         let create_examples = openapi["paths"]["/metadata"]["post"]["requestBody"]["content"]
             ["application/json"]["examples"]
@@ -2944,7 +3220,7 @@ mod tests {
                     name: "Local Partition Dataset".to_string(),
                     description: "Coordinator partition".to_string(),
                     date_published: "2026-01-01".to_string(),
-                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public: true,
                 },
             )),
@@ -3000,7 +3276,7 @@ mod tests {
                         name: name.to_string(),
                         description: "Lazy visibility".to_string(),
                         date_published: "2026-01-01".to_string(),
-                        license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                        license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                         public,
                     },
                 )),
@@ -3483,7 +3759,7 @@ mod tests {
                     name: "Discovery Partial Dataset".to_string(),
                     description: "discovery failure fixture".to_string(),
                     date_published: "2026-01-01".to_string(),
-                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public: true,
                 },
             )),
@@ -3541,7 +3817,7 @@ mod tests {
                     name: "Alpha Widget".to_string(),
                     description: "cursor fixture".to_string(),
                     date_published: "2026-01-01".to_string(),
-                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public: true,
                 },
             )),
@@ -3634,7 +3910,7 @@ mod tests {
                         name: format!("Widget {index}"),
                         description: "churn fixture".to_string(),
                         date_published: "2026-01-01".to_string(),
-                        license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                        license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                         public: true,
                     },
                 )),
@@ -3678,7 +3954,7 @@ mod tests {
                     name: "Widget Extra".to_string(),
                     description: "churn fixture".to_string(),
                     date_published: "2026-01-01".to_string(),
-                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public: true,
                 },
             )),
@@ -3742,7 +4018,7 @@ mod tests {
                     name: "Placeholder Dataset".to_string(),
                     description: "placeholder".to_string(),
                     date_published: "2026-01-01".to_string(),
-                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public: true,
                 },
             )),
@@ -3991,7 +4267,7 @@ mod tests {
                     name: "Pending Dataset".to_string(),
                     description: "pending fixture".to_string(),
                     date_published: "2026-01-01".to_string(),
-                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public: true,
                 },
             )),
@@ -4652,7 +4928,7 @@ mod tests {
                     name: name.to_string(),
                     description: "Remote metadata access fixture".to_string(),
                     date_published: "2026-01-01".to_string(),
-                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                     public,
                 },
             )),

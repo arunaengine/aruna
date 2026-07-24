@@ -254,6 +254,7 @@ dependencies = [
  "axum",
  "base64",
  "blake3",
+ "bytes",
  "byteview",
  "chrono",
  "crypto_box",
@@ -376,6 +377,7 @@ dependencies = [
  "irokle",
  "nix",
  "oxrdf",
+ "percent-encoding",
  "postcard",
  "prometheus-client",
  "proptest",
@@ -471,6 +473,8 @@ dependencies = [
  "aruna-net",
  "aruna-storage",
  "aruna-tasks",
+ "astral_async_zip",
+ "async-compression",
  "async-trait",
  "axum",
  "base64",
@@ -490,6 +494,8 @@ dependencies = [
  "lru 0.18.1",
  "opentelemetry",
  "oxrdf",
+ "oxttl",
+ "percent-encoding",
  "postcard",
  "proptest",
  "rand 0.10.2",
@@ -507,6 +513,9 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "ulid 3.0.0",
+ "unicode-normalization",
+ "url",
+ "zip 8.6.0",
 ]
 
 [[package]]
@@ -534,6 +543,21 @@ dependencies = [
  "iroh",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "astral_async_zip"
+version = "0.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd939d79959c3f49a648a1d7857d63cc62548725a6b060b8dbf0ea5c92470b63"
+dependencies = [
+ "async-compression",
+ "crc32fast",
+ "futures-lite",
+ "pin-project",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -569,6 +593,19 @@ dependencies = [
  "event-listener-strategy",
  "futures-core",
  "pin-project-lite",
+]
+
+[[package]]
+name = "async-compression"
+version = "0.4.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e79b3f8a79cccc2898f31920fc69f304859b3bd567490f75ebf51ae1c792a9ac"
+dependencies = [
+ "compression-codecs",
+ "compression-core",
+ "futures-io",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
@@ -1694,6 +1731,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea0095f6103c2a8b44acd6fd15960c801dafebf02e21940360833e0673f48ba7"
 
 [[package]]
+name = "compression-codecs"
+version = "0.4.38"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce2548391e9c1929c21bf6aa2680af86fe4c1b33e6cea9ac1cfeec0bd11218cf"
+dependencies = [
+ "compression-core",
+ "flate2",
+]
+
+[[package]]
+name = "compression-core"
+version = "0.4.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc14f565cf027a105f7a44ccf9e5b424348421a1d8952a8fc9d499d313107789"
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1806,13 +1859,14 @@ dependencies = [
 [[package]]
 name = "craqle"
 version = "0.1.1"
-source = "git+https://github.com/arunaengine/craqle?branch=main#0aae6511d8b91c746024fe35b2a0159901907396"
+source = "git+https://github.com/arunaengine/craqle?branch=main#4015ae493ca4d3ace613fa193e15e69a2cefc226"
 dependencies = [
  "blake3",
  "chrono",
  "fjall",
  "globset",
  "irokle",
+ "oxjsonld",
  "oxrdf",
  "postcard",
  "ro-crate-rs",
@@ -8010,7 +8064,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -8203,6 +8257,7 @@ checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
 dependencies = [
  "bytes",
  "futures-core",
+ "futures-io",
  "futures-sink",
  "futures-util",
  "pin-project-lite",

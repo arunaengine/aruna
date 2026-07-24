@@ -507,15 +507,8 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
     let entries = decode_entries(dht_value.as_ref()).expect("decode DHT entries");
     assert!(entries.iter().any(|entry| {
         entry.realm_id == realm_id
-            && entry.value
-                == context
-                    .driver
-                    .net_handle
-                    .as_ref()
-                    .unwrap()
-                    .node_id()
-                    .as_bytes()
-                    .to_vec()
+            && entry.publisher == context.driver.net_handle.as_ref().unwrap().node_id()
+            && entry.value.is_empty()
     }));
 }
 
@@ -674,6 +667,7 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
             checksum_type: None,
             exists: false,
             version_source: None,
+            preassigned_version_id: None,
             quota_ceiling: None,
         }),
         &context.driver,
@@ -969,6 +963,7 @@ async fn multipart_completion_deduplicates_against_existing_put_object() {
             checksum_type: None,
             exists: false,
             version_source: None,
+            preassigned_version_id: None,
             quota_ceiling: None,
         }),
         &context.driver,

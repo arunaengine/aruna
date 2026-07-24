@@ -9,8 +9,8 @@ use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::JOB_SCHEDULE_INDEX_KEYSPACE;
 use aruna_core::structs::{
-    JOB_LEASE_INDEX_PREFIX, JobError, JobErrorKind, JobExecutionClass, JobId, JobRecord, JobState,
-    parse_job_schedule_index_key,
+    JOB_LEASE_INDEX_PREFIX, JobError, JobErrorKind, JobExecutionClass, JobId, JobPayload,
+    JobRecord, JobState, parse_job_schedule_index_key,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::util::unix_timestamp_millis;
@@ -574,8 +574,9 @@ async fn run_job(
 
     let storage = &context.storage_handle;
     let job_id = record.job_id;
+    let import_cleanup = matches!(&record.payload, JobPayload::ImportRoCrate(_));
 
-    if record.cancel_requested {
+    if record.cancel_requested && !import_cleanup {
         run_cleanup(&record.payload);
         terminal_or_none(
             retry_terminal(|| cancel_running_job(storage, job_id, token, unix_timestamp_millis()))
@@ -584,20 +585,28 @@ async fn run_job(
         );
         return;
     }
+    if record.cancel_requested {
+        cancel.cancel();
+    }
 
     match transition_to_running(storage, job_id, token, unix_timestamp_millis()).await {
-        Ok(fresh_record) if fresh_record.cancel_requested => {
-            run_cleanup(&record.payload);
-            terminal_or_none(
-                retry_terminal(|| {
-                    cancel_running_job(storage, job_id, token, unix_timestamp_millis())
-                })
-                .await,
-                job_id,
-            );
-            return;
+        Ok(fresh_record) => {
+            if fresh_record.cancel_requested {
+                if import_cleanup {
+                    cancel.cancel();
+                } else {
+                    run_cleanup(&record.payload);
+                    terminal_or_none(
+                        retry_terminal(|| {
+                            cancel_running_job(storage, job_id, token, unix_timestamp_millis())
+                        })
+                        .await,
+                        job_id,
+                    );
+                    return;
+                }
+            }
         }
-        Ok(_) => {}
         Err(JobMutationError::TokenMismatch) => {
             warn!(job_id = %job_id, "Lost claim before running; aborting");
             return;
@@ -612,7 +621,9 @@ async fn run_job(
     let ctx = JobContext {
         driver: context.clone(),
         job_id,
+        owner_node_id: record.owner_node_id,
         claim_token: token,
+        final_attempt: record.attempts.saturating_add(1) >= super::JOB_MAX_ATTEMPTS,
         cancel: cancel.clone(),
         shutdown,
         progress: progress.clone(),
@@ -753,26 +764,35 @@ async fn supervise(
     ));
     tokio::pin!(heartbeat);
 
-    let payload = AssertUnwindSafe(dispatch_payload(ctx, &record.payload)).catch_unwind();
+    let payload = async {
+        match AssertUnwindSafe(dispatch_payload(ctx, &record.payload))
+            .catch_unwind()
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(_panic) => handle_panic(ctx, record).await,
+        }
+    };
     tokio::pin!(payload);
 
     tokio::select! {
         outcome = &mut payload => {
             stop.cancel();
             let _ = (&mut heartbeat).await;
-            match outcome {
-                Ok(outcome) => SuperviseResult::Outcome(outcome),
-                Err(_panic) => {
-                    warn!(job_id = %job_id, "Job payload panicked; failing the attempt");
-                    SuperviseResult::Outcome(JobRunOutcome::Failed(JobError::retryable(
-                        "job payload panicked",
-                    )))
-                }
-            }
+            SuperviseResult::Outcome(outcome)
         }
         // The heartbeat only returns before the payload when it loses the claim: another
         // execution has taken over, so abandon this one without writing a terminal state.
         _ = &mut heartbeat => SuperviseResult::Zombie,
+    }
+}
+
+async fn handle_panic(ctx: &JobContext, record: &JobRecord) -> JobRunOutcome {
+    warn!(job_id = %ctx.job_id, "Job payload panicked; failing the attempt");
+    if ctx.final_attempt && matches!(&record.payload, JobPayload::ImportRoCrate(_)) {
+        crate::jobs::import::cleanup_after_panic(ctx).await
+    } else {
+        JobRunOutcome::Failed(JobError::retryable("job payload panicked"))
     }
 }
 
@@ -817,9 +837,15 @@ mod tests {
     use super::*;
     use crate::jobs::JOB_MAX_ATTEMPTS;
     use crate::jobs::store::{
-        ClaimOutcome, claim_job, complete_job, insert_job, set_cancel_requested,
+        ClaimOutcome, claim_job, complete_job, insert_job, list_job_entries, set_cancel_requested,
     };
-    use aruna_core::structs::{AttemptIntent, JobClaim, JobPayload, JobResultPayload, RealmId};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::ROCRATE_JOB_STATE_KEYSPACE;
+    use aruna_core::structs::{
+        AttemptIntent, AuthContext, ImportMetadataTarget, ImportReportRow, ImportRoCrateSource,
+        ImportRoCrateSpec, ImportRoCrateTarget, JobClaim, JobPayload, JobResultPayload, RealmId,
+        RoCrateLimits,
+    };
     use aruna_core::types::{NodeId, UserId};
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
@@ -854,6 +880,39 @@ mod tests {
                 cleanup_marker: marker,
             },
             UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
+            node_id(7),
+            1,
+            1,
+            None,
+        )
+    }
+
+    fn import_record(job_id: JobId) -> JobRecord {
+        let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        JobRecord::new(
+            job_id,
+            JobPayload::ImportRoCrate(ImportRoCrateSpec {
+                auth_context: AuthContext {
+                    user_id: owner,
+                    realm_id: RealmId([1u8; 32]),
+                    path_restrictions: None,
+                },
+                source: ImportRoCrateSource::Upload {
+                    upload_id: Ulid::from_bytes([3u8; 16]),
+                },
+                target: ImportRoCrateTarget {
+                    bucket: "target".to_string(),
+                    prefix: "crate".to_string(),
+                },
+                metadata: ImportMetadataTarget {
+                    group_id: Ulid::from_bytes([4u8; 16]),
+                    path: "crate".to_string(),
+                    public: false,
+                },
+                limits: RoCrateLimits::default(),
+                document_id: Ulid::from_bytes([5u8; 16]),
+            }),
+            owner,
             node_id(7),
             1,
             1,
@@ -977,6 +1036,43 @@ mod tests {
             .unwrap();
         assert_eq!(state, JobState::Cancelled);
         assert!(!marker.exists(), "cleanup removes partial state on reclaim");
+    }
+
+    #[tokio::test]
+    async fn cancel_runs_import() {
+        let (_dir, storage) = temp_storage();
+        let ctx = context(storage.clone());
+        let job_id = JobId::from_bytes([0x3B; 16]);
+        let mut record = import_record(job_id);
+        record.cancel_requested = true;
+        record.has_run = true;
+        let claimed = claim(&storage, record).await;
+        let token = claimed.claim.as_ref().unwrap().claim_token;
+
+        run_job(
+            ctx,
+            claimed,
+            token,
+            CancellationToken::new(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Cancelled);
+        assert!(matches!(
+            storage
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: ROCRATE_JOB_STATE_KEYSPACE.to_string(),
+                    key: ByteView::from(job_id.to_bytes().to_vec()),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(aruna_core::events::StorageEvent::ReadResult { value: Some(_), .. })
+        ));
     }
 
     // A cancel committed after claim must beat payload execution from the stale snapshot.
@@ -1433,6 +1529,51 @@ mod tests {
             JobState::Succeeded,
             "runtime still drains after a panic"
         );
+    }
+
+    #[tokio::test]
+    async fn panic_routes_cleanup() {
+        let (_dir, storage) = temp_storage();
+        let driver = context(storage.clone());
+        let job_id = JobId::from_bytes([0x4B; 16]);
+        let token = Ulid::generate();
+        let mut record = import_record(job_id);
+        record.state = JobState::Running;
+        record.attempts = JOB_MAX_ATTEMPTS - 1;
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id(3),
+            claim_token: token,
+            lease_expires_at_ms: 60_000,
+        });
+        insert_job(&storage, &record).await.unwrap();
+        let ctx = JobContext {
+            driver,
+            job_id,
+            owner_node_id: record.owner_node_id,
+            claim_token: token,
+            final_attempt: true,
+            cancel: CancellationToken::new(),
+            shutdown: CancellationToken::new(),
+            progress: ProgressReporter::from_progress(&record.progress),
+        };
+
+        let JobRunOutcome::Failed(error) = handle_panic(&ctx, &record).await else {
+            panic!("panic outcome must fail");
+        };
+        assert_eq!(error.kind, JobErrorKind::Permanent);
+        let (rows, _) = list_job_entries(&storage, job_id, None, 10).await.unwrap();
+        let row: ImportReportRow = postcard::from_bytes(rows[0].1.as_ref()).unwrap();
+        assert_eq!(row.entry_key, "failure/acquire");
+        assert!(matches!(
+            storage
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: ROCRATE_JOB_STATE_KEYSPACE.to_string(),
+                    key: ByteView::from(job_id.to_bytes().to_vec()),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(aruna_core::events::StorageEvent::ReadResult { value: Some(_), .. })
+        ));
     }
 
     // A zombie execution's finish must not evict the newer execution that replaced it.

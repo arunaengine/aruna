@@ -158,6 +158,10 @@ For a ready-made multi-node onboarding flow, use `just test-deploy` instead of w
 
 The setting does not change replication, authorization, or RO-Crate semantics. Metadata requests marked `MetadataRequestDurability::WalAlreadyDurable` have already been accepted by the metadata event-log phase, so document-sync projection flushes may be deferred. The event-log write and later projection flush still use the configured Fjall mode; `buffer` does not become fsync-durable because a request is WAL-first.
 
+Object-backed RO-Crate imports copy the archive into a hidden seekable spool. Until that spool is
+deleted at the end of the import, the importing node can temporarily use roughly twice the archive's
+stored bytes; operators should reserve capacity accordingly.
+
 ## License
 
 The API is licensed under either of

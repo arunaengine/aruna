@@ -18,12 +18,12 @@ use aruna_core::metadata::{
     MetadataBatch, MetadataCreateCrateRequest, MetadataDot, MetadataEffect, MetadataError,
     MetadataEvent, MetadataGraphLifecycleRecord, MetadataGraphPolicy, MetadataQuadOp,
     MetadataQueryResults, MetadataRequestDurability, MetadataRoCratePage, MetadataSearchHit,
-    MetadataUpsertEntityRequest,
+    MetadataUpsertEntityRequest, MetadataValidationViolation,
 };
 use aruna_core::storage_entries::metadata_graph_lifecycle_key;
 use aruna_core::structs::{
     AuthContext, BucketInfo, MetadataRegistryRecord, Permission, RealmConfigDocument, RealmId,
-    RealmNodeKind, SyncRelationship, blob_bucket_permission_path,
+    SyncRelationship, blob_bucket_permission_path,
 };
 use aruna_core::telemetry::{duration_ms, record_duration_ms, record_elapsed_ms};
 use aruna_core::types::{GroupId, UserId};
@@ -36,12 +36,13 @@ use craqle::{
     Action as CraqleAction, ActorId, AllowAllAuthorizer, AuthorizationError as CraqleAuthError,
     Authorizer as CraqleAuthorizer, Batch, CraqleError, CraqleFjallPersistMode,
     CraqleIrokleOptions, CraqleNode, CraqleOptions, CraqleRequestDurability, CreateCrateRequest,
-    CreateEntityRequest, GraphId, GraphPolicy, RoCrateError, SearchStorage, vocab,
+    CreateEntityRequest, GraphId, GraphPolicy, PatchEntityRequest, RoCrateError, SearchStorage,
+    vocab,
 };
 use jsonwebtoken::DecodingKey;
 use oxrdf::{BlankNode, Dataset, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use serde::de::DeserializeOwned;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use spareval::{CancellationToken, QueryEvaluator};
 use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExpression};
 use spargebra::{Query, SparqlParser};
@@ -63,6 +64,7 @@ use crate::auth::{
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::list_groups::ListGroupOperation;
+use crate::realm_peer::{RealmPeerError, ensure_realm_peer};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, SearchBucketsOperation};
@@ -2017,33 +2019,20 @@ async fn ensure_remote_metadata_peer_is_configured_for_realm(
         }) => {
             let document = RealmConfigDocument::from_bytes(&bytes)
                 .map_err(|error| MetadataError::Backend(error.to_string()))?;
-            if document.realm_id != realm_id {
-                return Err(MetadataError::InvalidInput(format!(
-                    "realm config `{}` does not match remote metadata realm `{realm_id}`",
-                    document.realm_id
-                )));
-            }
-            let peer_id = peer.to_string();
-            let node = document
-                .nodes
-                .iter()
-                .find(|node| node.node_id == peer_id)
-                .ok_or_else(|| {
-                    MetadataError::InvalidInput(format!(
-                        "remote metadata peer `{peer}` is not configured in realm `{realm_id}`"
-                    ))
-                })?;
-            if require_internal_trust
-                && !matches!(
-                    &node.kind,
-                    RealmNodeKind::Management | RealmNodeKind::Server
-                )
-            {
-                return Err(MetadataError::InvalidInput(format!(
-                    "remote metadata peer `{peer}` is not trusted for internal auth in realm `{realm_id}`"
-                )));
-            }
-            Ok(())
+            ensure_realm_peer(&document, peer, realm_id, require_internal_trust)
+                .map_err(|error| {
+                    MetadataError::InvalidInput(match error {
+                        RealmPeerError::RealmMismatch { configured, .. } => format!(
+                            "realm config `{configured}` does not match remote metadata realm `{realm_id}`"
+                        ),
+                        RealmPeerError::NotConfigured { .. } => format!(
+                            "remote metadata peer `{peer}` is not configured in realm `{realm_id}`"
+                        ),
+                        RealmPeerError::NotTrusted { .. } => format!(
+                            "remote metadata peer `{peer}` is not trusted for internal auth in realm `{realm_id}`"
+                        ),
+                    })
+                })
         }
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
             Err(MetadataError::InvalidInput(format!(
@@ -3169,18 +3158,15 @@ fn upsert_data_entity(
     request: MetadataUpsertEntityRequest,
 ) -> Result<MetadataBatch, CraqleError> {
     let graph = GraphId::new(&request.graph_iri);
-    if request.durability == MetadataRequestDurability::WalAlreadyDurable {
-        return upsert_entity_via_rocrate_document(
-            node,
-            auth,
-            graph,
-            request,
-            EntityUpsertKind::Data,
-        );
-    }
-    let entity_request = craqle_entity_request(&graph, &request.jsonld)?;
-    node.add_data_entity_with(auth, entity_request)
-        .map(metadata_batch_from_craqle)
+    let actor = request.deterministic_actor.map(ActorId::from_bytes);
+    let entity_request = craqle_patch_request(&graph, &request.jsonld)?;
+    node.patch_data_with(
+        auth,
+        entity_request,
+        craqle_request_durability(request.durability),
+        actor,
+    )
+    .map(metadata_batch_from_craqle)
 }
 
 fn upsert_contextual_entity(
@@ -3189,283 +3175,18 @@ fn upsert_contextual_entity(
     request: MetadataUpsertEntityRequest,
 ) -> Result<MetadataBatch, CraqleError> {
     let graph = GraphId::new(&request.graph_iri);
-    if request.durability == MetadataRequestDurability::WalAlreadyDurable {
-        return upsert_entity_via_rocrate_document(
-            node,
-            auth,
-            graph,
-            request,
-            EntityUpsertKind::Contextual,
-        );
-    }
-    let entity_request = craqle_entity_request(&graph, &request.jsonld)?;
-    node.add_contextual_entity_with(auth, entity_request)
-        .map(metadata_batch_from_craqle)
-}
-
-#[derive(Clone, Copy)]
-enum EntityUpsertKind {
-    Data,
-    Contextual,
-}
-
-fn upsert_entity_via_rocrate_document(
-    node: &CraqleNode,
-    auth: &AllowAllAuthorizer,
-    graph: GraphId,
-    request: MetadataUpsertEntityRequest,
-    kind: EntityUpsertKind,
-) -> Result<MetadataBatch, CraqleError> {
     let actor = request.deterministic_actor.map(ActorId::from_bytes);
-    let entity_request = craqle_entity_request(&graph, &request.jsonld)?;
-    let jsonld = graph_snapshot_jsonld(node, &graph)?;
-    let merged_jsonld = merge_entity_into_rocrate_jsonld(
-        &graph,
-        &jsonld,
-        &request.jsonld,
-        &entity_request.entity_id,
-        kind,
-    )?;
-    let policy = node.graph_policy(&graph)?;
-    node.apply_rocrate_document_prevalidated_with_policy_and_durability_as(
+    let entity_request = craqle_patch_request(&graph, &request.jsonld)?;
+    node.patch_contextual_with(
         auth,
-        graph,
-        &merged_jsonld,
-        policy,
+        entity_request,
         craqle_request_durability(request.durability),
         actor,
     )
     .map(metadata_batch_from_craqle)
 }
 
-fn graph_snapshot_jsonld(node: &CraqleNode, graph: &GraphId) -> Result<String, CraqleError> {
-    let snapshot = node.graph_snapshot(graph)?;
-    let mut by_subject = BTreeMap::<String, Map<String, Value>>::new();
-    for quad in snapshot.quads {
-        let subject_id = encoded_subject_id(&quad.subject)?;
-        let predicate = quad.predicate.to_named_node().ok_or_else(|| {
-            CraqleError::RoCrate(RoCrateError::UnsupportedTerm(quad.predicate.0.clone()))
-        })?;
-        let object = encoded_object_value(&quad.object)?;
-        let entry = by_subject.entry(subject_id.clone()).or_insert_with(|| {
-            Map::from_iter([("@id".to_string(), Value::String(subject_id.clone()))])
-        });
-        insert_jsonld_property(entry, predicate.as_str().to_string(), object);
-    }
-
-    let mut document = Map::new();
-    document.insert(
-        "@graph".to_string(),
-        Value::Array(by_subject.into_values().map(Value::Object).collect()),
-    );
-    serde_json::to_string(&Value::Object(document))
-        .map_err(|error| CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(error.to_string())))
-}
-
-fn encoded_subject_id(term: &craqle::EncodedTerm) -> Result<String, CraqleError> {
-    match term.to_term() {
-        Some(Term::NamedNode(node)) => Ok(node.as_str().to_string()),
-        Some(Term::BlankNode(node)) => Ok(format!("_:{}", node.as_str())),
-        _ => Err(CraqleError::RoCrate(RoCrateError::UnsupportedTerm(
-            term.0.clone(),
-        ))),
-    }
-}
-
-fn encoded_object_value(term: &craqle::EncodedTerm) -> Result<Value, CraqleError> {
-    match term.to_term() {
-        Some(Term::NamedNode(node)) => Ok(entity_reference_value(node.as_str())),
-        Some(Term::BlankNode(node)) => Ok(entity_reference_value(&format!("_:{}", node.as_str()))),
-        Some(Term::Literal(literal)) => Ok(literal_value(literal)),
-        _ => Err(CraqleError::RoCrate(RoCrateError::UnsupportedTerm(
-            term.0.clone(),
-        ))),
-    }
-}
-
-fn literal_value(literal: Literal) -> Value {
-    if let Some(language) = literal.language() {
-        return Value::Object(Map::from_iter([
-            (
-                "@value".to_string(),
-                Value::String(literal.value().to_string()),
-            ),
-            ("@language".to_string(), Value::String(language.to_string())),
-        ]));
-    }
-    let datatype = literal.datatype();
-    if datatype.as_str() != "http://www.w3.org/2001/XMLSchema#string" {
-        return Value::Object(Map::from_iter([
-            (
-                "@value".to_string(),
-                Value::String(literal.value().to_string()),
-            ),
-            (
-                "@type".to_string(),
-                Value::String(datatype.as_str().to_string()),
-            ),
-        ]));
-    }
-    Value::String(literal.value().to_string())
-}
-
-fn insert_jsonld_property(entry: &mut Map<String, Value>, key: String, value: Value) {
-    match entry.get_mut(&key) {
-        Some(existing) if existing == &value => {}
-        Some(Value::Array(values)) => {
-            if !values.contains(&value) {
-                values.push(value);
-            }
-        }
-        Some(existing) => {
-            let old = existing.clone();
-            *existing = Value::Array(vec![old, value]);
-        }
-        None => {
-            entry.insert(key, value);
-        }
-    }
-}
-
-fn merge_entity_into_rocrate_jsonld(
-    graph: &GraphId,
-    rocrate_jsonld: &str,
-    entity_jsonld: &str,
-    entity_id: &str,
-    kind: EntityUpsertKind,
-) -> Result<String, CraqleError> {
-    let mut rocrate: Value = serde_json::from_str(rocrate_jsonld).map_err(|error| {
-        CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(error.to_string()))
-    })?;
-    let entity: Value = serde_json::from_str(entity_jsonld).map_err(|error| {
-        CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(error.to_string()))
-    })?;
-    if !entity.is_object() {
-        return Err(CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(
-            "entity payload must be a JSON object".to_string(),
-        )));
-    }
-
-    let graph_entries = rocrate_graph_entries_mut(&mut rocrate)?;
-    match graph_entries
-        .iter()
-        .position(|entry| graph_entry_id(entry).as_deref() == Some(entity_id))
-    {
-        Some(index) => graph_entries[index] = entity,
-        None => graph_entries.push(entity),
-    }
-    if matches!(kind, EntityUpsertKind::Data) {
-        ensure_root_has_part(graph_entries, graph, entity_id)?;
-    }
-
-    serde_json::to_string(&rocrate)
-        .map_err(|error| CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(error.to_string())))
-}
-
-fn rocrate_graph_entries_mut(rocrate: &mut Value) -> Result<&mut Vec<Value>, CraqleError> {
-    let object = rocrate.as_object_mut().ok_or_else(|| {
-        CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(
-            "top-level JSON-LD document must be an object".to_string(),
-        ))
-    })?;
-    let graph_key = if object.contains_key("@graph") {
-        "@graph"
-    } else {
-        "graph"
-    };
-    object
-        .get_mut(graph_key)
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| {
-            CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(
-                "RO-Crate import requires a top-level `@graph` array".to_string(),
-            ))
-        })
-}
-
-fn graph_entry_id(entry: &Value) -> Option<String> {
-    entry
-        .as_object()?
-        .get("@id")
-        .or_else(|| entry.as_object()?.get("id"))
-        .and_then(Value::as_str)
-        .map(normalize_entity_id)
-}
-
-fn ensure_root_has_part(
-    graph_entries: &mut [Value],
-    graph: &GraphId,
-    entity_id: &str,
-) -> Result<(), CraqleError> {
-    let root_id = graph.as_str();
-    let Some(root) = graph_entries
-        .iter_mut()
-        .find(|entry| graph_entry_id(entry).as_deref() == Some(root_id))
-        .and_then(Value::as_object_mut)
-    else {
-        return Err(CraqleError::RoCrate(RoCrateError::InvalidGraph(format!(
-            "root entity missing for graph `{root_id}`"
-        ))));
-    };
-    let has_part_key = has_part_key(root);
-    let reference = entity_reference_value(entity_id);
-    match root.get_mut(has_part_key) {
-        Some(value) if entity_reference_contains(value, entity_id) => {}
-        Some(Value::Array(values)) => values.push(reference),
-        Some(value) => {
-            let existing = value.clone();
-            *value = Value::Array(vec![existing, reference]);
-        }
-        None => {
-            root.insert(has_part_key.to_string(), Value::Array(vec![reference]));
-        }
-    }
-    Ok(())
-}
-
-fn has_part_key(root: &Map<String, Value>) -> &'static str {
-    if root.contains_key("hasPart") {
-        "hasPart"
-    } else if root.contains_key("schema:hasPart") {
-        "schema:hasPart"
-    } else if root.contains_key("http://schema.org/hasPart") {
-        "http://schema.org/hasPart"
-    } else if root.contains_key("https://schema.org/hasPart") {
-        "https://schema.org/hasPart"
-    } else {
-        "hasPart"
-    }
-}
-
-fn entity_reference_value(entity_id: &str) -> Value {
-    Value::Object(Map::from_iter([(
-        "@id".to_string(),
-        Value::String(entity_id.to_string()),
-    )]))
-}
-
-fn entity_reference_contains(value: &Value, entity_id: &str) -> bool {
-    match value {
-        Value::Array(values) => values
-            .iter()
-            .any(|value| entity_reference_contains(value, entity_id)),
-        Value::Object(object) => {
-            object
-                .get("@id")
-                .or_else(|| object.get("id"))
-                .and_then(Value::as_str)
-                .map(normalize_entity_id)
-                .as_deref()
-                == Some(entity_id)
-        }
-        _ => false,
-    }
-}
-
-fn craqle_entity_request(
-    graph: &GraphId,
-    jsonld: &str,
-) -> Result<CreateEntityRequest, CraqleError> {
+fn craqle_patch_request(graph: &GraphId, jsonld: &str) -> Result<PatchEntityRequest, CraqleError> {
     let value: Value = serde_json::from_str(jsonld).map_err(|error| {
         CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(error.to_string()))
     })?;
@@ -3486,6 +3207,7 @@ fn craqle_entity_request(
     let entity_type = entity_types.remove(0);
     let name = entity_name(object)?;
     let mut additional_triples = Vec::new();
+    let mut replaced_predicates = Vec::new();
     for extra_type in entity_types {
         additional_triples.push((vocab::rdf_type(), class_term(&extra_type)?));
     }
@@ -3499,17 +3221,21 @@ fn craqle_entity_request(
         }
         let property = normalize_property(property);
         let predicate = property_named_node(&property)?;
+        replaced_predicates.push(predicate.clone());
         for object in property_value_terms(&property, property_value)? {
             additional_triples.push((predicate.clone(), object));
         }
     }
 
-    Ok(CreateEntityRequest {
-        graph: graph.clone(),
-        entity_id,
-        entity_type,
-        name,
-        additional_triples,
+    Ok(PatchEntityRequest {
+        entity: CreateEntityRequest {
+            graph: graph.clone(),
+            entity_id,
+            entity_type,
+            name,
+            additional_triples,
+        },
+        replaced_predicates,
     })
 }
 
@@ -3583,7 +3309,9 @@ fn property_named_node(property: &str) -> Result<NamedNode, CraqleError> {
         "datePublished" => Ok(vocab::schema_date_published()),
         "license" => Ok(vocab::schema_license()),
         "about" => Ok(vocab::schema_about()),
-        "conformsTo" => Ok(vocab::schema_conforms_to()),
+        "conformsTo" => Ok(NamedNode::new_unchecked(
+            super::iri_index::DCTERMS_CONFORMS_TO_IRI,
+        )),
         other if other.contains("://") => Ok(NamedNode::new_unchecked(other)),
         other if other.contains(':') => expand_known_compact_iri(other),
         other => Ok(NamedNode::new_unchecked(format!(
@@ -3846,6 +3574,12 @@ fn looks_like_identifier(value: &str) -> bool {
 fn metadata_error_from_craqle(error: CraqleError) -> MetadataError {
     match error {
         CraqleError::RoCrate(rocrate_error) => match rocrate_error {
+            RoCrateError::Update(craqle::UpdateError::ValidationFailed(violations)) => {
+                metadata_violations(violations)
+            }
+            RoCrateError::Json(_) | RoCrateError::JsonLd(_) => {
+                MetadataError::InvalidInput(rocrate_error.to_string())
+            }
             RoCrateError::InvalidGraph(_)
             | RoCrateError::EntityNotFound(_)
             | RoCrateError::UnsupportedJsonLd(_)
@@ -3860,10 +3594,24 @@ fn metadata_error_from_craqle(error: CraqleError) -> MetadataError {
             MetadataError::InvalidInput("unsupported update across multiple graphs".to_string())
         }
         CraqleError::Update(craqle::UpdateError::ValidationFailed(violations)) => {
-            MetadataError::InvalidInput(format!("validation failed: {violations:?}"))
+            metadata_violations(violations)
         }
         other => MetadataError::Backend(other.to_string()),
     }
+}
+
+fn metadata_violations(violations: Vec<craqle::CrateViolation>) -> MetadataError {
+    MetadataError::Validation(
+        violations
+            .into_iter()
+            .map(|violation| MetadataValidationViolation {
+                code: violation.code.to_string(),
+                message: violation.message,
+                pointer: violation.pointer,
+                entity_id: violation.entity_id,
+            })
+            .collect(),
+    )
 }
 
 fn record_error(span: &Span, error: &str) {
@@ -5657,6 +5405,25 @@ mod tests {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde::Serialize;
     use tempfile::{TempDir, tempdir};
+
+    #[test]
+    fn maps_violations() {
+        let error = metadata_error_from_craqle(CraqleError::Update(
+            craqle::UpdateError::ValidationFailed(vec![craqle::CrateViolation {
+                code: "missing_root_data_entity",
+                message: "missing root".to_string(),
+                pointer: "/@graph".to_string(),
+                entity_id: Some("./".to_string()),
+            }]),
+        ));
+
+        let MetadataError::Validation(violations) = error else {
+            panic!("expected structured metadata validation error");
+        };
+        assert_eq!(violations[0].code, "missing_root_data_entity");
+        assert_eq!(violations[0].pointer, "/@graph");
+        assert_eq!(violations[0].entity_id.as_deref(), Some("./"));
+    }
 
     #[test]
     fn workspace_delete_allowed() {

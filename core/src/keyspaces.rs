@@ -14,6 +14,7 @@ pub const METADATA_DOCUMENT_LIFECYCLE_KEYSPACE: &str = "metadata_document_lifecy
 pub const METADATA_GRAPH_LIFECYCLE_KEYSPACE: &str = "metadata_graph_lifecycle";
 pub const METADATA_GRAPH_PRUNE_JOB_KEYSPACE: &str = "metadata_graph_prune_jobs";
 pub const METADATA_MATERIALIZATION_STATUS_KEYSPACE: &str = "metadata_materialization_status";
+pub const METADATA_RAW_REVISION_KEYSPACE: &str = "metadata_raw_revisions";
 pub const METADATA_MATERIALIZATION_JOB_KEYSPACE: &str = "metadata_materialization_jobs";
 pub const METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE: &str =
     "metadata_materialization_document_jobs";
@@ -65,9 +66,14 @@ pub const SOURCE_CONNECTOR_SECRET_KEYSPACE: &str = "source_connector_secret";
 pub const JOB_KEYSPACE: &str = "jobs";
 pub const JOB_SCHEDULE_INDEX_KEYSPACE: &str = "job_schedule_index";
 pub const JOB_OWNER_INDEX_KEYSPACE: &str = "job_owner_index";
+pub const JOB_ACTIVE_USER_KEYSPACE: &str = "job_active_user";
 pub const JOB_DEDUP_INDEX_KEYSPACE: &str = "job_dedup_index";
 pub const JOB_RUN_CRATE_KEYSPACE: &str = "job_run_crate";
 pub const JOB_ATTEMPT_CONTROL_KEYSPACE: &str = "job_attempt_control";
+pub const JOB_ENTRY_KEYSPACE: &str = "job_entries";
+pub const JOB_ARTIFACT_TOMBSTONE_KEYSPACE: &str = "job_artifact_tombstones";
+pub const ROCRATE_JOB_STATE_KEYSPACE: &str = "rocrate_job_state";
+pub const ROCRATE_UPLOAD_KEYSPACE: &str = "rocrate_uploads";
 pub const STAGING_JOB_STATE_KEYSPACE: &str = "staging_job_state";
 
 pub const BUCKET_STATS_DB: &str = "bucket_stats";

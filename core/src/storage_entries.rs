@@ -28,8 +28,8 @@ use crate::metadata::{
     MetadataMaterializationStatusRecord,
 };
 use crate::structs::{
-    MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, PlacementRef, User,
-    WatchSubscription, notification_inbox_key, notification_outbox_key,
+    MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, PlacementRef, RealmId,
+    User, WatchSubscription, notification_inbox_key, notification_outbox_key,
     notification_prune_index_key, watch_subscription_key,
 };
 use crate::types::{GroupId, Key, KeySpace, UserId, Value};
@@ -135,6 +135,16 @@ pub fn metadata_create_acceptance_key(document_id: Ulid) -> Key {
     metadata_document_key(document_id)
 }
 
+pub fn metadata_path_key(realm_id: &RealmId, group_id: GroupId, document_path: &str) -> Key {
+    let document_path = MetadataRegistryRecord::normalize_document_path(document_path);
+    let mut bytes = Vec::with_capacity(53 + document_path.len());
+    bytes.extend_from_slice(b"path/");
+    bytes.extend_from_slice(realm_id.as_bytes());
+    bytes.extend_from_slice(&group_id.to_bytes());
+    bytes.extend_from_slice(document_path.as_bytes());
+    ByteView::from(bytes)
+}
+
 pub fn metadata_graph_lifecycle_key(graph_iri: &str) -> Key {
     ByteView::from(blake3::hash(graph_iri.as_bytes()).as_bytes().to_vec())
 }
@@ -188,6 +198,10 @@ fn document_sync_target_sidecar_key(target: &DocumentSyncTarget) -> Key {
 }
 
 pub fn metadata_materialization_status_key(document_id: Ulid) -> Key {
+    ByteView::from(document_id.to_bytes().to_vec())
+}
+
+pub fn raw_revision_key(document_id: Ulid) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
 }
 
@@ -280,6 +294,20 @@ pub fn metadata_create_acceptance_write_entry(
     Ok((
         METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
         metadata_create_acceptance_key(event.record.document_id),
+        postcard::to_allocvec(event)?.into(),
+    ))
+}
+
+pub fn metadata_path_write(
+    event: &MetadataCreateEventRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+        metadata_path_key(
+            &event.record.realm_id,
+            event.record.group_id,
+            &event.record.document_path,
+        ),
         postcard::to_allocvec(event)?.into(),
     ))
 }

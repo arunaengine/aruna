@@ -9,7 +9,9 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::structs::{JobExecutionClass, NotificationRecord, RealmConfigDocument, RealmId};
+use aruna_core::structs::{
+    JobExecutionClass, NotificationRecord, RealmConfigDocument, RealmId, RoCrateLimits,
+};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::util::unix_timestamp_millis;
@@ -22,6 +24,10 @@ use tracing::{debug, error, info, warn};
 use crate::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation, REALM_PRESENCE_REFRESH_AFTER,
 };
+use crate::blob::hidden::{
+    HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, process_hidden_sweep, restore_hidden_sweep,
+};
+use crate::blob_holders::RefreshBlobHoldersOperation;
 use crate::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::document_sync_outbox::{
     OUTBOX_DRAIN_BATCH_SIZE, delete_outbox_records, read_outbox_records,
@@ -110,6 +116,7 @@ type DrainRecord = (
 struct OperationsTaskHandler {
     context: Arc<DriverContext>,
     jobs_runtime: Arc<JobsRuntime>,
+    rocrate_limits: RoCrateLimits,
     // In-memory retry-attempt counters keyed by timer. Loss on restart is fine:
     // a restarted node simply retries from the base interval.
     retry_backoff: std::sync::Mutex<HashMap<TaskKey, u32>>,
@@ -353,7 +360,38 @@ impl OperationsTaskHandler {
         Self {
             context,
             jobs_runtime,
+            rocrate_limits: RoCrateLimits::default(),
             retry_backoff: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
+        self.rocrate_limits = limits;
+        self
+    }
+
+    async fn refresh_blob_holders(&self) {
+        let Some(net_handle) = self.context.net_handle.as_ref() else {
+            warn!(task_id = ?TaskKey::RefreshBlobHolders, "Cannot refresh blob holders without net handle");
+            self.reschedule_timer(
+                TaskKey::RefreshBlobHolders,
+                Duration::from_millis(self.rocrate_limits.holder_refresh_ms),
+            )
+            .await;
+            return;
+        };
+        let operation = RefreshBlobHoldersOperation::new(
+            *net_handle.realm_id(),
+            net_handle.node_id(),
+            self.rocrate_limits.clone(),
+        );
+        if let Err(error) = drive(operation, self.context.as_ref()).await {
+            warn!(task_id = ?TaskKey::RefreshBlobHolders, error = %error, "Failed to refresh blob holders");
+            self.reschedule_timer(
+                TaskKey::RefreshBlobHolders,
+                Duration::from_millis(self.rocrate_limits.holder_refresh_ms),
+            )
+            .await;
         }
     }
 
@@ -1702,6 +1740,18 @@ impl OperationsTaskHandler {
         };
         self.reschedule_timer(TaskKey::PruneJobs, after).await;
     }
+
+    async fn sweep_hidden_blobs(&self) {
+        let after = match process_hidden_sweep(&self.context).await {
+            Ok(_) => HIDDEN_SWEEP_AFTER,
+            Err(error) => {
+                warn!(task_id = ?TaskKey::SweepHiddenBlobs, error = %error, "Failed to sweep hidden blobs");
+                HIDDEN_SWEEP_RETRY
+            }
+        };
+        self.reschedule_timer(TaskKey::SweepHiddenBlobs, after)
+            .await;
+    }
 }
 
 fn spawn_durable_queue_rearm(context: &Arc<DriverContext>, task_handle: &TaskHandle) {
@@ -1748,6 +1798,32 @@ pub async fn initialize_task_incoming(
     task_handle: TaskHandle,
     jobs_runtime: Arc<JobsRuntime>,
 ) {
+    initialize_task_handler(
+        context,
+        task_handle,
+        jobs_runtime,
+        RoCrateLimits::default(),
+        false,
+    )
+    .await;
+}
+
+pub async fn initialize_task_holder(
+    context: Arc<DriverContext>,
+    task_handle: TaskHandle,
+    jobs_runtime: Arc<JobsRuntime>,
+    rocrate_limits: RoCrateLimits,
+) {
+    initialize_task_handler(context, task_handle, jobs_runtime, rocrate_limits, true).await;
+}
+
+async fn initialize_task_handler(
+    context: Arc<DriverContext>,
+    task_handle: TaskHandle,
+    jobs_runtime: Arc<JobsRuntime>,
+    rocrate_limits: RoCrateLimits,
+    refresh_holders: bool,
+) {
     let handler_context = context.clone();
     if context.compute_handle.is_some() {
         jobs_runtime.set_reconciler(crate::jobs::workflow::reconcile::ComputeReconciler::new(
@@ -1763,12 +1839,11 @@ pub async fn initialize_task_incoming(
     {
         warn!(task_id = ?TaskKey::DrainJobQueue, error = %error, "Failed to recover stale jobs at startup");
     }
-    task_handle
-        .set_inbound_handler(Arc::new(OperationsTaskHandler::new(
-            handler_context,
-            jobs_runtime,
-        )))
-        .await;
+    let handler = Arc::new(
+        OperationsTaskHandler::new(handler_context, jobs_runtime)
+            .with_rocrate_limits(rocrate_limits),
+    );
+    task_handle.set_inbound_handler(handler.clone()).await;
     // Prime the origin-side watch interest cache from any digests already in
     // local storage so matching works before the first reconcile.
     if let Some(net_handle) = context.net_handle.as_ref() {
@@ -1793,6 +1868,14 @@ pub async fn initialize_task_incoming(
     }
     restore_job_prune_timer(&context.storage_handle, &task_handle).await;
     restore_mirror_timer(&context.storage_handle, &task_handle).await;
+    if context.blob_handle.is_some() {
+        restore_hidden_sweep(&context.storage_handle, &task_handle).await;
+    }
+    if refresh_holders {
+        handler
+            .reschedule_timer(TaskKey::RefreshBlobHolders, Duration::ZERO)
+            .await;
+    }
 }
 
 /// Runs one document sync outbox drain pass synchronously against `context`.
@@ -1882,6 +1965,12 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::DrainSyncMirrorRepair => {
                 self.drain_mirror_repair().await;
+            }
+            TaskKey::SweepHiddenBlobs => {
+                self.sweep_hidden_blobs().await;
+            }
+            TaskKey::RefreshBlobHolders => {
+                self.refresh_blob_holders().await;
             }
         }
     }

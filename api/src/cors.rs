@@ -93,6 +93,7 @@ impl CorsConfig {
                     Method::OPTIONS,
                 ])
                 .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+                .expose_headers([header::CONTENT_DISPOSITION])
                 .max_age(CORS_MAX_AGE),
         )
     }
@@ -192,6 +193,35 @@ pub(crate) fn append_vary_headers(headers: &mut HeaderMap, values: &[HeaderName]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rest_exposes_disposition() {
+        use axum::{Router, body::Body, http::Request, routing::get};
+        use tower::ServiceExt;
+
+        let config = CorsConfig::new(vec!["http://portal.test".to_string()]);
+        let app = Router::new()
+            .route("/", get(|| async {}))
+            .layer(config.rest_layer().unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::ORIGIN, "http://portal.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+                .unwrap(),
+            "content-disposition"
+        );
+    }
 
     #[test]
     fn empty_config_denies_everything() {

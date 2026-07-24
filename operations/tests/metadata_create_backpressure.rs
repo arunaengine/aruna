@@ -78,7 +78,7 @@ fn scaffold_payload(writer: usize, index: usize) -> CreateMetadataDocumentPayloa
         name: format!("Probe Dataset {writer}-{index}"),
         description: "Create backpressure probe".to_string(),
         date_published: "2026-06-11".to_string(),
-        license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+        license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
     }
 }
 

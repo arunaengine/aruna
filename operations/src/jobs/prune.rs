@@ -1,11 +1,12 @@
 use std::time::Duration;
 
-use aruna_core::effects::Effect;
-use aruna_core::events::Event;
+use aruna_core::effects::{BlobEffect, Effect};
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::JOB_SCHEDULE_INDEX_KEYSPACE;
 use aruna_core::structs::{
-    JOB_PRUNE_INDEX_PREFIX, JobPayload, JobRecord, cleanup_job_id, parse_job_schedule_index_key,
+    HiddenBlobKey, JOB_PRUNE_INDEX_PREFIX, JobPayload, JobRecord, JobResultPayload, cleanup_job_id,
+    parse_job_schedule_index_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, KeySpace};
@@ -17,7 +18,8 @@ use tracing::warn;
 
 use super::JOB_PRUNE_SCAN_PAGE_SIZE;
 use super::store::{
-    batch_delete, first_schedule_entry, iter_prefix_page, job_prune_delete_entries, read_job_record,
+    artifact_tombstone_key, batch_delete, first_schedule_entry, iter_prefix_page,
+    job_entry_deletes, job_prune_delete_entries, preserve_artifact_tombstone, read_job_record,
 };
 use crate::driver::DriverContext;
 
@@ -60,6 +62,10 @@ pub(crate) async fn process_job_prune_batch_with_page_size(
             break;
         }
         for (key, _) in values {
+            if deletes.len() >= deletion_cap {
+                has_more = true;
+                break 'scan;
+            }
             let (expiry_ms, job_id) = match parse_job_schedule_index_key(key.as_ref()) {
                 Ok(parsed) => parsed,
                 Err(error) => {
@@ -80,9 +86,35 @@ pub(crate) async fn process_job_prune_batch_with_page_size(
                     if cleanup_pending(storage, &record).await? {
                         continue;
                     }
+                    let remaining = deletion_cap.saturating_sub(deletes.len()).max(1);
+                    let (entry_deletes, entries_more) =
+                        job_entry_deletes(storage, job_id, remaining).await?;
+                    deletes.extend(entry_deletes);
+                    if entries_more {
+                        has_more = true;
+                        break 'scan;
+                    }
+                    if let Some(JobResultPayload::ExportRoCrate(result)) = &record.result
+                        && let Some(artifact) = &result.artifact
+                    {
+                        preserve_artifact_tombstone(
+                            storage,
+                            record.job_id,
+                            record.created_by,
+                            artifact.expires_at_ms.saturating_add(record.retention_ms),
+                        )
+                        .await?;
+                    }
+                    delete_job_artifact(context, &record).await?;
                     deletes.extend(job_prune_delete_entries(&record));
                 }
-                None => deletes.push((JOB_SCHEDULE_INDEX_KEYSPACE.to_string(), key)),
+                None => {
+                    deletes.push((JOB_SCHEDULE_INDEX_KEYSPACE.to_string(), key));
+                    deletes.push((
+                        aruna_core::keyspaces::JOB_ARTIFACT_TOMBSTONE_KEYSPACE.to_string(),
+                        artifact_tombstone_key(job_id),
+                    ));
+                }
             }
             pruned = pruned.saturating_add(1);
             processed = processed.saturating_add(1);
@@ -103,6 +135,30 @@ pub(crate) async fn process_job_prune_batch_with_page_size(
         has_more,
         next_due_after,
     })
+}
+
+async fn delete_job_artifact(context: &DriverContext, record: &JobRecord) -> Result<(), String> {
+    let Some(JobResultPayload::ExportRoCrate(result)) = &record.result else {
+        return Ok(());
+    };
+    let Some(artifact) = &result.artifact else {
+        return Ok(());
+    };
+    let key = HiddenBlobKey::try_from(&artifact.location).map_err(|error| error.to_string())?;
+    let blob_handle = context
+        .blob_handle
+        .as_ref()
+        .ok_or_else(|| "blob handle unavailable while pruning job artifact".to_string())?;
+    match blob_handle
+        .send_blob_effect(BlobEffect::DeleteHidden { key })
+        .await
+    {
+        Event::Blob(BlobEvent::HiddenDeleted) => Ok(()),
+        Event::Blob(BlobEvent::Error(error)) => Err(error.to_string()),
+        event => Err(format!(
+            "unexpected hidden artifact delete event: {event:?}"
+        )),
+    }
 }
 
 /// Whether an execution job still owes a terminal cleanup. Only `Execution` takes a
@@ -146,10 +202,16 @@ pub async fn restore_job_prune_timer(storage: &StorageHandle, task_handle: &Task
 mod tests {
     use super::*;
     use crate::jobs::JOB_RETENTION_MS;
-    use crate::jobs::store::insert_job;
-    use aruna_core::keyspaces::{JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE};
+    use crate::jobs::store::{
+        ClaimOutcome, claim_job, complete_job, insert_job, put_job_entry, transition_to_running,
+    };
+    use aruna_core::keyspaces::{
+        JOB_ARTIFACT_TOMBSTONE_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE,
+    };
     use aruna_core::structs::{
-        ComputeResources, ExecutionSpec, JobId, JobPayload, JobRecord, JobState, RealmId,
+        AuthContext, ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateResult,
+        ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobId, JobPayload,
+        JobProgress, JobRecord, JobResultPayload, JobState, RealmId, RoCrateLimits,
     };
     use aruna_core::types::{NodeId, UserId};
     use aruna_storage::FjallStorage;
@@ -287,6 +349,115 @@ mod tests {
         assert_eq!(outcome.pruned, 0);
         assert!(outcome.next_due_after.is_some());
         assert_eq!(count(&storage, JOB_KEYSPACE).await, 1);
+    }
+
+    #[tokio::test]
+    async fn expired_tombstone_pruned() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let job_id = JobId::from_bytes([8u8; 16]);
+        let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        preserve_artifact_tombstone(
+            &storage,
+            job_id,
+            owner,
+            unix_timestamp_millis().saturating_sub(1),
+        )
+        .await
+        .unwrap();
+
+        let outcome = process_job_prune_batch(&context(storage.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.pruned, 1);
+        assert_eq!(count(&storage, JOB_ARTIFACT_TOMBSTONE_KEYSPACE).await, 0);
+        assert_eq!(count(&storage, JOB_SCHEDULE_INDEX_KEYSPACE).await, 0);
+    }
+
+    #[tokio::test]
+    async fn rocrate_retention_prunes() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let job_id = JobId::from_bytes([6u8; 16]);
+        let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        let limits = RoCrateLimits {
+            artifact_retention_ms: 1,
+            ..RoCrateLimits::default()
+        };
+        let retention_ms = limits.artifact_retention_ms;
+        let mut record = JobRecord::new(
+            job_id,
+            JobPayload::ImportRoCrate(ImportRoCrateSpec {
+                auth_context: AuthContext {
+                    user_id: owner,
+                    realm_id: RealmId([1u8; 32]),
+                    path_restrictions: None,
+                },
+                source: ImportRoCrateSource::Upload {
+                    upload_id: Ulid::from_bytes([3u8; 16]),
+                },
+                target: ImportRoCrateTarget {
+                    bucket: "target".to_string(),
+                    prefix: "crate".to_string(),
+                },
+                metadata: ImportMetadataTarget {
+                    group_id: Ulid::from_bytes([4u8; 16]),
+                    path: "crate".to_string(),
+                    public: false,
+                },
+                limits,
+                document_id: Ulid::from_bytes([5u8; 16]),
+            }),
+            owner,
+            node_id(7),
+            1,
+            1,
+            None,
+        );
+        record.retention_ms = retention_ms;
+        insert_job(&storage, &record).await.unwrap();
+        let ClaimOutcome::Claimed(claimed) =
+            claim_job(&storage, job_id, node_id(7), 2).await.unwrap()
+        else {
+            panic!("job must be claimed")
+        };
+        let token = claimed.claim.unwrap().claim_token;
+        put_job_entry(&storage, job_id, token, b"entry", &"row")
+            .await
+            .unwrap();
+        transition_to_running(&storage, job_id, token, 3)
+            .await
+            .unwrap();
+        complete_job(
+            &storage,
+            job_id,
+            token,
+            JobResultPayload::ImportRoCrate(ImportRoCrateResult {
+                document_id: None,
+                entries_total: 1,
+                imported: 1,
+                unlisted: 0,
+                failed: 0,
+                report_digest: [0u8; 32],
+            }),
+            JobProgress {
+                current: 1,
+                total: Some(1),
+                unit: "entries".to_string(),
+            },
+            unix_timestamp_millis().saturating_sub(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count(&storage, JOB_ENTRY_KEYSPACE).await, 1);
+
+        let outcome = process_job_prune_batch(&context(storage.clone()))
+            .await
+            .unwrap();
+        assert_eq!(outcome.pruned, 1);
+        assert_eq!(count(&storage, JOB_KEYSPACE).await, 0);
+        assert_eq!(count(&storage, JOB_ENTRY_KEYSPACE).await, 0);
     }
 
     #[tokio::test]

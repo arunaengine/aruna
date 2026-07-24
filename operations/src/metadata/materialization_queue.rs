@@ -15,8 +15,8 @@ use aruna_core::metadata::{
     MetadataApplyRoCrateRequest, MetadataCreateCrateRequest, MetadataCreateEventPayload,
     MetadataCreateEventRecord, MetadataEffect, MetadataError, MetadataEvent,
     MetadataGraphLifecycleRecord, MetadataGraphPolicy, MetadataMaterializationJobRecord,
-    MetadataMaterializationState, MetadataMaterializationStatusRecord, MetadataRequestDurability,
-    deterministic_materialization_actor,
+    MetadataMaterializationState, MetadataMaterializationStatusRecord, MetadataRawRevision,
+    MetadataRequestDurability, deterministic_materialization_actor,
 };
 use aruna_core::storage_entries::{
     metadata_event_log_key, metadata_graph_lifecycle_key,
@@ -44,6 +44,7 @@ use super::queue_storage::{
     MetadataQueueStorageError, abort_storage_transaction_best_effort, commit_storage_transaction,
     start_write_transaction,
 };
+use super::raw::{MetadataRawReadError, RawStateCache};
 
 const MATERIALIZATION_SCAN_PAGE_SIZE: usize = 512;
 const MATERIALIZATION_BATCH_SIZE: usize = 128;
@@ -64,6 +65,7 @@ struct CompletedMaterializationJob {
     document_job_key: Option<Vec<u8>>,
     status: Option<MetadataMaterializationStatusRecord>,
     iri_index_writes: Vec<(String, ByteView, ByteView)>,
+    raw_state_write: Option<(String, ByteView, ByteView)>,
     sync: Option<CompletedMaterializationSync>,
 }
 
@@ -117,6 +119,17 @@ impl From<MetadataQueueStorageError> for MetadataMaterializationQueueError {
         match error {
             MetadataQueueStorageError::Storage(error) => Self::Storage(error),
             MetadataQueueStorageError::UnexpectedEvent(event) => Self::UnexpectedEvent(event),
+        }
+    }
+}
+
+impl From<MetadataRawReadError> for MetadataMaterializationQueueError {
+    fn from(error: MetadataRawReadError) -> Self {
+        match error {
+            MetadataRawReadError::Storage(error) => Self::Storage(error),
+            MetadataRawReadError::Conversion(error) => Self::Conversion(error),
+            MetadataRawReadError::Metadata(error) => Self::Metadata(error),
+            MetadataRawReadError::UnexpectedEvent(event) => Self::UnexpectedEvent(event),
         }
     }
 }
@@ -268,6 +281,7 @@ fn completed_stale_materialization_job(job_key: Vec<u8>) -> CompletedMaterializa
         document_job_key: None,
         status: None,
         iri_index_writes: Vec::new(),
+        raw_state_write: None,
         sync: None,
     }
 }
@@ -338,9 +352,17 @@ async fn process_materialization_job_groups(
         tasks.spawn(async move {
             let mut outcome = MaterializationGroupOutcome::default();
             let mut advanced_event_ids = BTreeSet::new();
+            let mut raw_state_cache = RawStateCache::default();
             for (job_key, job) in jobs {
                 let event_id = job.event_id;
-                match process_materialization_job(&context, job_key, job, &advanced_event_ids).await
+                match process_materialization_job(
+                    &context,
+                    job_key,
+                    job,
+                    &advanced_event_ids,
+                    &mut raw_state_cache,
+                )
+                .await
                 {
                     Ok(processed_job) => {
                         outcome.craqle_elapsed = outcome
@@ -460,6 +482,9 @@ async fn finish_completed_materialization_jobs_in_txn(
             if should_write_final_materialization_status(current.as_ref(), &status) {
                 superseding.insert(status.document_id, status.event_id);
                 writes.extend(job.iri_index_writes);
+                if let Some(raw_state_write) = job.raw_state_write {
+                    writes.push(raw_state_write);
+                }
                 writes.push(metadata_materialization_status_write_entry(&status)?);
             }
         }
@@ -779,6 +804,7 @@ async fn process_materialization_job(
     job_key: Vec<u8>,
     job: MetadataMaterializationJobRecord,
     advanced_event_ids: &BTreeSet<Ulid>,
+    raw_state_cache: &mut RawStateCache,
 ) -> Result<ProcessedMaterializationJob, MetadataMaterializationQueueError> {
     if older_materialization_job_exists(
         &context.storage_handle,
@@ -806,6 +832,7 @@ async fn process_materialization_job(
                     document_job_key: Some(document_job_key),
                     status: None,
                     iri_index_writes: Vec::new(),
+                    raw_state_write: None,
                     sync: None,
                 },
                 Duration::ZERO,
@@ -836,6 +863,7 @@ async fn process_materialization_job(
                     document_job_key: Some(document_job_key),
                     status: None,
                     iri_index_writes: Vec::new(),
+                    raw_state_write: None,
                     sync: None,
                 },
                 Duration::ZERO,
@@ -855,6 +883,7 @@ async fn process_materialization_job(
                     true,
                 )),
                 iri_index_writes: Vec::new(),
+                raw_state_write: None,
                 sync: None,
             },
             Duration::ZERO,
@@ -862,10 +891,11 @@ async fn process_materialization_job(
     }
 
     let apply_started = Instant::now();
-    let apply_result = materialize_create_event(context, &event).await;
+    let apply_result = materialize_create_event(context, &event, raw_state_cache).await;
     let craqle_elapsed = apply_started.elapsed();
     match apply_result {
-        Ok(()) => {
+        Ok(materialized) => {
+            let raw_revision = materialized.raw_revision;
             let iri_index_writes = match project_materialized_iri_references(context, &event).await
             {
                 Ok(writes) => writes,
@@ -885,8 +915,13 @@ async fn process_materialization_job(
                 CompletedMaterializationJob {
                     job_key,
                     document_job_key: Some(document_job_key),
-                    status: Some(materialization_success_status(&job, &event)),
+                    status: Some(materialization_success_status(
+                        &job,
+                        &event,
+                        raw_revision.as_ref(),
+                    )),
                     iri_index_writes,
+                    raw_state_write: Some(materialized.raw_state_write),
                     sync: Some(CompletedMaterializationSync {
                         graph_iri: event.record.graph_iri.clone(),
                         peers: event.record.holder_node_ids.clone(),
@@ -907,6 +942,7 @@ async fn process_materialization_job(
                         true,
                     )),
                     iri_index_writes: Vec::new(),
+                    raw_state_write: None,
                     sync: None,
                 },
                 craqle_elapsed,
@@ -1690,21 +1726,38 @@ async fn metadata_graph_deleted(
     }
 }
 
+struct MaterializedCreateEvent {
+    raw_revision: Option<MetadataRawRevision>,
+    raw_state_write: (String, ByteView, ByteView),
+}
+
 async fn materialize_create_event(
     context: &DriverContext,
     event: &MetadataCreateEventRecord,
-) -> Result<(), MetadataMaterializationQueueError> {
+    raw_state_cache: &mut RawStateCache,
+) -> Result<MaterializedCreateEvent, MetadataMaterializationQueueError> {
+    let raw_plan = crate::metadata::raw::prepare_raw_event(context, event, raw_state_cache).await?;
     let metadata_handle = context
         .metadata_handle
         .as_ref()
         .ok_or(MetadataMaterializationQueueError::MetadataHandleMissing)?;
     match metadata_handle
-        .send_effect(graph_materialization_effect(event))
+        .send_effect(graph_materialization_effect(
+            event,
+            raw_plan.revision.as_ref(),
+            raw_plan.rebuild,
+        ))
         .await
     {
         Event::Metadata(MetadataEvent::CreateCrateResult { .. })
         | Event::Metadata(MetadataEvent::ApplyRoCrateResult { .. })
-        | Event::Metadata(MetadataEvent::EntityUpsertResult { .. }) => Ok(()),
+        | Event::Metadata(MetadataEvent::EntityUpsertResult { .. }) => {
+            raw_plan.cache(raw_state_cache);
+            Ok(MaterializedCreateEvent {
+                raw_revision: raw_plan.revision,
+                raw_state_write: raw_plan.state_write,
+            })
+        }
         Event::Metadata(MetadataEvent::Error { error, .. }) => Err(error.into()),
         other => Err(MetadataMaterializationQueueError::UnexpectedEvent(format!(
             "{other:?}"
@@ -1732,13 +1785,28 @@ async fn project_materialized_iri_references(
         .map_err(MetadataMaterializationQueueError::from)
 }
 
-fn graph_materialization_effect(event: &MetadataCreateEventRecord) -> Effect {
+fn graph_materialization_effect(
+    event: &MetadataCreateEventRecord,
+    raw_revision: Option<&MetadataRawRevision>,
+    rebuild: bool,
+) -> Effect {
     let policy = MetadataGraphPolicy {
         public: event.record.public,
         permission_paths: vec![event.record.permission_path.clone()],
     }
     .normalized();
     let deterministic_actor = Some(deterministic_materialization_actor(event.event_id));
+    if rebuild && let Some(raw_revision) = raw_revision {
+        return Effect::Metadata(MetadataEffect::ApplyRoCrate {
+            request: MetadataApplyRoCrateRequest {
+                graph_iri: event.record.graph_iri.clone(),
+                jsonld: raw_revision.jsonld.clone(),
+                policy,
+                durability: MetadataRequestDurability::WalAlreadyDurable,
+                deterministic_actor,
+            },
+        });
+    }
     match &event.payload {
         MetadataCreateEventPayload::Scaffold {
             name,
@@ -1795,11 +1863,14 @@ fn graph_materialization_effect(event: &MetadataCreateEventRecord) -> Effect {
 fn materialization_success_status(
     job: &MetadataMaterializationJobRecord,
     event: &MetadataCreateEventRecord,
+    raw_revision: Option<&MetadataRawRevision>,
 ) -> MetadataMaterializationStatusRecord {
     MetadataMaterializationStatusRecord {
         document_id: event.record.document_id,
         event_id: event.event_id,
         graph_iri: event.record.graph_iri.clone(),
+        context_digest: raw_revision.map(|revision| revision.context_digest),
+        dataset_digest: raw_revision.and_then(|revision| revision.dataset_digest),
         state: MetadataMaterializationState::Materialized,
         attempts: job.attempts.saturating_add(1),
         last_error: None,
@@ -1817,6 +1888,8 @@ fn materialization_failure_status(
         document_id: event.record.document_id,
         event_id: event.event_id,
         graph_iri: event.record.graph_iri.clone(),
+        context_digest: None,
+        dataset_digest: None,
         state: if terminal {
             MetadataMaterializationState::Failed
         } else {
@@ -2054,8 +2127,10 @@ async fn materialization_job_is_live(
 mod tests {
     use super::*;
     use aruna_core::NodeId;
-    use aruna_core::keyspaces::METADATA_IRI_REFERENCE_INDEX_KEYSPACE;
-    use aruna_core::storage_entries::metadata_create_event_write_entry;
+    use aruna_core::keyspaces::{
+        METADATA_IRI_REFERENCE_INDEX_KEYSPACE, METADATA_RAW_REVISION_KEYSPACE,
+    };
+    use aruna_core::storage_entries::{metadata_create_event_write_entry, raw_revision_key};
     use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use aruna_storage::{FjallStorage, StorageHandle};
     use std::collections::BTreeSet;
@@ -2098,7 +2173,7 @@ mod tests {
                 name: name.to_string(),
                 description: "Materialization test".to_string(),
                 date_published: "2026-01-01".to_string(),
-                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             },
             occurred_at_ms: 1,
         }
@@ -2570,6 +2645,8 @@ mod tests {
             document_id,
             event_id,
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            context_digest: None,
+            dataset_digest: None,
             state: MetadataMaterializationState::Pending,
             attempts: 1,
             last_error: Some("transient".to_string()),
@@ -2941,7 +3018,7 @@ mod tests {
         let event = create_event(document_id, event_id, "deterministic");
         let deterministic_actor = Some(deterministic_materialization_actor(event_id));
 
-        match graph_materialization_effect(&event) {
+        match graph_materialization_effect(&event, None, false) {
             Effect::Metadata(MetadataEffect::CreateCrate { request }) => {
                 assert_eq!(
                     request.durability,
@@ -2958,7 +3035,7 @@ mod tests {
                 jsonld: "{}".to_string(),
             },
         );
-        match graph_materialization_effect(&rocrate) {
+        match graph_materialization_effect(&rocrate, None, false) {
             Effect::Metadata(MetadataEffect::ApplyRoCrate { request }) => {
                 assert_eq!(
                     request.durability,
@@ -2975,7 +3052,7 @@ mod tests {
                 jsonld: r#"{"@id":"./file.txt","@type":"File","name":"file"}"#.to_string(),
             },
         );
-        match graph_materialization_effect(&data) {
+        match graph_materialization_effect(&data, None, false) {
             Effect::Metadata(MetadataEffect::UpsertDataEntity { request }) => {
                 assert_eq!(
                     request.durability,
@@ -2992,7 +3069,7 @@ mod tests {
                 jsonld: r##"{"@id":"#lab","@type":"Organization","name":"lab"}"##.to_string(),
             },
         );
-        match graph_materialization_effect(&contextual) {
+        match graph_materialization_effect(&contextual, None, false) {
             Effect::Metadata(MetadataEffect::UpsertContextualEntity { request }) => {
                 assert_eq!(
                     request.durability,
@@ -3002,6 +3079,29 @@ mod tests {
             }
             other => panic!("unexpected materialization effect: {other:?}"),
         }
+
+        let raw_revision = MetadataRawRevision {
+            jsonld: r#"{"@context":"https://w3id.org/ro/crate/1.2/context","@graph":[]}"#
+                .to_string(),
+            winning_event_id: event_id,
+            context_digest: [1; 32],
+            dataset_digest: Some([2; 32]),
+        };
+        match graph_materialization_effect(&contextual, Some(&raw_revision), true) {
+            Effect::Metadata(MetadataEffect::ApplyRoCrate { request }) => {
+                assert_eq!(request.jsonld, raw_revision.jsonld);
+                assert_eq!(
+                    request.durability,
+                    MetadataRequestDurability::WalAlreadyDurable
+                );
+                assert_eq!(request.deterministic_actor, deterministic_actor);
+            }
+            other => panic!("unexpected materialization effect: {other:?}"),
+        }
+        assert!(matches!(
+            graph_materialization_effect(&contextual, Some(&raw_revision), false),
+            Effect::Metadata(MetadataEffect::UpsertContextualEntity { .. })
+        ));
     }
 
     #[test]
@@ -3018,8 +3118,8 @@ mod tests {
 
         for event in [event, data] {
             assert_eq!(
-                graph_materialization_effect(&event),
-                graph_materialization_effect(&event)
+                graph_materialization_effect(&event, None, false),
+                graph_materialization_effect(&event, None, false)
             );
         }
     }
@@ -3039,6 +3139,8 @@ mod tests {
             document_id,
             event_id: newer_event_id,
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            context_digest: None,
+            dataset_digest: None,
             state: MetadataMaterializationState::Pending,
             attempts: 0,
             last_error: None,
@@ -3068,6 +3170,8 @@ mod tests {
             document_id,
             event_id: older_event_id,
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            context_digest: None,
+            dataset_digest: None,
             state: MetadataMaterializationState::Pending,
             attempts: 1,
             last_error: Some("transient".to_string()),
@@ -3077,6 +3181,8 @@ mod tests {
             document_id,
             event_id: newer_event_id,
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            context_digest: None,
+            dataset_digest: None,
             state: MetadataMaterializationState::Pending,
             attempts: 0,
             last_error: None,
@@ -3098,6 +3204,8 @@ mod tests {
             document_id,
             event_id,
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            context_digest: None,
+            dataset_digest: None,
             state: MetadataMaterializationState::Pending,
             attempts: 1,
             last_error: Some("transient".to_string()),
@@ -3142,6 +3250,8 @@ mod tests {
             document_id,
             event_id: newer_event_id,
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            context_digest: None,
+            dataset_digest: None,
             state: MetadataMaterializationState::Pending,
             attempts: 7,
             last_error: Some("newer pending".to_string()),
@@ -3149,6 +3259,7 @@ mod tests {
         };
         let (_, old_job_key, _) = metadata_materialization_job_write_entry(&old_job).unwrap();
         let stale_index_key = vec![9u8; 16];
+        let raw_state_key = raw_revision_key(document_id);
         write_entries(
             &storage,
             vec![
@@ -3170,12 +3281,17 @@ mod tests {
                     )
                     .to_vec(),
                 ),
-                status: Some(materialization_success_status(&old_job, &old_event)),
+                status: Some(materialization_success_status(&old_job, &old_event, None)),
                 iri_index_writes: vec![(
                     METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
                     ByteView::from(stale_index_key.clone()),
                     ByteView::from(vec![1]),
                 )],
+                raw_state_write: Some((
+                    METADATA_RAW_REVISION_KEYSPACE.to_string(),
+                    raw_state_key.clone(),
+                    ByteView::from(vec![1]),
+                )),
                 sync: None,
             }],
         )
@@ -3193,6 +3309,14 @@ mod tests {
                 &storage,
                 METADATA_IRI_REFERENCE_INDEX_KEYSPACE,
                 stale_index_key,
+            )
+            .await
+        );
+        assert!(
+            !storage_key_exists(
+                &storage,
+                METADATA_RAW_REVISION_KEYSPACE,
+                raw_state_key.to_vec(),
             )
             .await
         );
@@ -3246,7 +3370,7 @@ mod tests {
                 document_job_key: Some(
                     metadata_materialization_document_job_key(document_id, event_id).to_vec(),
                 ),
-                status: Some(materialization_success_status(&job, &event)),
+                status: Some(materialization_success_status(&job, &event, None)),
                 iri_index_writes: vec![(
                     METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
                     aruna_core::storage_entries::metadata_iri_reference_key(
@@ -3257,6 +3381,11 @@ mod tests {
                     ),
                     ByteView::from(vec![1u8]),
                 )],
+                raw_state_write: Some((
+                    METADATA_RAW_REVISION_KEYSPACE.to_string(),
+                    raw_revision_key(document_id),
+                    ByteView::from(event_id.to_bytes().to_vec()),
+                )),
                 sync: None,
             }
         };
@@ -3293,6 +3422,19 @@ mod tests {
             .await,
             "current cursor rows must remain"
         );
+        match storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: METADATA_RAW_REVISION_KEYSPACE.to_string(),
+                key: raw_revision_key(document_id),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult {
+                value: Some(value), ..
+            }) => assert_eq!(value.as_ref(), second.to_bytes()),
+            other => panic!("unexpected storage event: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3393,6 +3535,8 @@ mod tests {
             document_id,
             event_id: newer_event_id,
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            context_digest: None,
+            dataset_digest: None,
             state: MetadataMaterializationState::Pending,
             attempts: 0,
             last_error: None,

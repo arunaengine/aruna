@@ -4,10 +4,13 @@ use super::control_plane::{
     parse_replication_init, read_replication_message_with_timeout,
     send_replication_message_with_timeout, validate_replication_init_ack,
 };
-use crate::bao_tree::{OpenDalReader, OpenDalWriter, RecvStreamWrapper, SendStreamWrapper};
+use crate::bao_tree::{
+    BaoReadWriter, OpenDalReader, OpenDalWriter, RecvStreamWrapper, SendStreamWrapper,
+};
 use crate::messages::{MessageType, ReplicationMessage};
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
+use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::BackendLocation;
 use bao_tree::io::fsm::{CreateOutboard, decode_ranges, encode_ranges_validated};
 use bao_tree::io::outboard::PreOrderOutboard;
@@ -20,6 +23,125 @@ use ulid::Ulid;
 use super::BAO_BLOCK_SIZE;
 
 impl BlobHandler {
+    pub async fn serve_read(
+        &mut self,
+        stream_id: Ulid,
+        location: BackendLocation,
+        expected_blake3: [u8; 32],
+    ) -> BlobEvent {
+        if location.get_blake3() != Some(expected_blake3.as_slice()) {
+            return BlobEvent::Error(BlobError::IntegrityCheckFailed(
+                "bao read location hash mismatch".to_string(),
+            ));
+        }
+        let operator = match self.operator_from_location(&location) {
+            Ok(operator) => operator,
+            Err(error) => {
+                return BlobEvent::Error(BlobError::OperatorCreationFailed(error.to_string()));
+            }
+        };
+        let storage_path = match location.get_storage_path() {
+            Ok(path) => path,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        let mut reader = match OpenDalReader::new(
+            &operator,
+            &storage_path,
+            location.blob_size,
+            self.transfer_idle_timeout(),
+        )
+        .await
+        {
+            Ok(reader) => reader,
+            Err(error) => {
+                return BlobEvent::Error(BlobError::OperatorCreationFailed(error.to_string()));
+            }
+        };
+        let mut outboard =
+            match PreOrderOutboard::<BytesMut>::create(&mut reader, BAO_BLOCK_SIZE).await {
+                Ok(outboard) if outboard.root.as_bytes() == &expected_blake3 => outboard,
+                Ok(_) => {
+                    return BlobEvent::Error(BlobError::IntegrityCheckFailed(
+                        "bao read source hash mismatch".to_string(),
+                    ));
+                }
+                Err(error) => {
+                    return BlobEvent::Error(BlobError::OutboardCreationFailed(error.to_string()));
+                }
+            };
+        let stream = match self.connection_handle(stream_id).await {
+            Ok(stream) => stream,
+            Err(event) => return event,
+        };
+        let mut stream = stream.lock().await;
+        let ranges = round_up_to_chunks(&ByteRanges::from(0..location.blob_size));
+        let mut sender = SendStreamWrapper::new(&mut stream.0, self.transfer_idle_timeout());
+        let result = encode_ranges_validated(reader, &mut outboard, &ranges, &mut sender).await;
+        _ = stream.0.finish();
+        _ = stream.1.stop(0u32.into());
+        drop(stream);
+        self.connections.lock().await.remove(&stream_id);
+
+        match result {
+            Ok(()) => BlobEvent::ReadServed { stream_id },
+            Err(error) => BlobEvent::Error(BlobError::ReplicationFailed(error.to_string())),
+        }
+    }
+
+    pub async fn receive_read(
+        &mut self,
+        stream_id: Ulid,
+        size: u64,
+        expected_blake3: [u8; 32],
+    ) -> BlobEvent {
+        let Some(connection) = self.connections.lock().await.remove(&stream_id) else {
+            return BlobEvent::Error(BlobError::ReplicationRejected(
+                "Stream not available".to_string(),
+            ));
+        };
+        let (writer, reader) = tokio::io::duplex(64 * 1024);
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let transfer_timeout = self.transfer_idle_timeout();
+
+        tokio::spawn(async move {
+            let result: Result<(), BlobError> = async {
+                let mut stream = connection.stream.lock().await;
+                let receiver = RecvStreamWrapper::new(&mut stream.1, transfer_timeout);
+                let mut writer = BaoReadWriter::new(writer);
+                let mut outboard = PreOrderOutboard {
+                    tree: BaoTree::new(size, BAO_BLOCK_SIZE),
+                    root: expected_blake3.into(),
+                    data: BytesMut::new(),
+                };
+                let ranges = round_up_to_chunks(&ByteRanges::from(0..size));
+                decode_ranges(receiver, ranges, &mut writer, &mut outboard)
+                    .await
+                    .map_err(|error| BlobError::ReplicationFailed(error.to_string()))?;
+                writer
+                    .finish(size, expected_blake3)
+                    .map_err(|error| BlobError::IntegrityCheckFailed(error.to_string()))?;
+                _ = stream.0.finish();
+                _ = stream.1.stop(0u32.into());
+                Ok(())
+            }
+            .await;
+            _ = completion_tx.send(result);
+        });
+
+        let blob = BackendStream::new(tokio_util::io::ReaderStream::new(reader)).on_success_async(
+            move || async move {
+                completion_rx
+                    .await
+                    .map_err(|_| StreamError(Box::new(BlobError::ChannelClosed)))?
+                    .map_err(|error| StreamError(Box::new(error)))
+            },
+        );
+        BlobEvent::ReadFinished {
+            blob,
+            stream_size: size,
+        }
+    }
+
     pub async fn replicate_blob(
         &mut self,
         replication_id: Ulid,

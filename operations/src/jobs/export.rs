@@ -1,0 +1,3487 @@
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::{Component, Path};
+
+use aruna_core::effects::{BlobEffect, StorageEffect};
+use aruna_core::errors::BlobError;
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::keyspaces::{
+    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, ROCRATE_JOB_STATE_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
+use aruna_core::metadata::MetadataValidationViolation;
+use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::{
+    ArtifactRef, ArunaArn, ArunaArnType, BackendLocation, BlobVersion, BucketInfo,
+    ExportOmissionCounts, ExportReportDetail, ExportReportRow, ExportReportSource,
+    ExportRoCrateResult, ExportRoCrateSpec, HashPathIndexKey, JobError, JobId, JobResultPayload,
+    Permission, RealmId, ReasonCode, RoCrateCheckpointRefs, VersionKey, VersionedObjectArn,
+    W3idDataIdentifier, blob_object_permission_path, ensure_confined_relative_path,
+};
+use aruna_core::types::{Key, NodeId, Value};
+use aruna_core::util::unix_timestamp_millis;
+use async_zip::{Compression, ZipEntryBuilder};
+#[cfg(test)]
+use bytes::Bytes;
+use byteview::ByteView;
+use futures_util::StreamExt;
+use futures_util::io::AsyncWriteExt;
+use oxrdf::{NamedOrBlankNode, Term};
+use oxttl::NQuadsParser;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value as JsonValue, json};
+use ulid::Ulid;
+use unicode_normalization::UnicodeNormalization;
+use url::Url;
+
+use super::executor::{JobContext, JobRunOutcome};
+use super::rocrate_jsonld::{
+    JsonLdKeywords, RDF_TYPE_IRI, SCHEMA_MEDIA_HTTPS_IRI, SCHEMA_MEDIA_IRI, is_file_type,
+};
+use super::store::{put_job_entry, put_rocrate_checkpoint};
+use crate::blob::hidden::delete_hidden;
+use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
+use crate::blob_holders::GetBlobHoldersOperation;
+use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::driver::{DriverContext, drive};
+use crate::get_metadata_document::load_metadata_record_by_document;
+use crate::metadata::raw::load_raw_view;
+use crate::metadata::repository::StorageReadError;
+use crate::replication::bao_read::{BaoReadError, BaoReadOperation, BaoReadOutput};
+use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
+
+const METADATA_PATH: &str = "ro-crate-metadata.json";
+const REPORT_PATH: &str = "aruna-export-report.json";
+const REMOTE_ATTEMPTS: usize = 8;
+const JSONLD_BASE_IRI: &str = "https://craqle.invalid/";
+const SCHEMA_CONTENT_IRI: &str = "http://schema.org/contentUrl";
+const SCHEMA_CONTENT_HTTPS_IRI: &str = "https://schema.org/contentUrl";
+const SCHEMA_ABOUT_IRI: &str = "http://schema.org/about";
+const SCHEMA_ABOUT_HTTPS_IRI: &str = "https://schema.org/about";
+const SCHEMA_HAS_PART_IRI: &str = "http://schema.org/hasPart";
+const SCHEMA_HAS_PART_HTTPS_IRI: &str = "https://schema.org/hasPart";
+const SCHEMA_SUBJECT_IRI: &str = "http://schema.org/subjectOf";
+const SCHEMA_SUBJECT_HTTPS_IRI: &str = "https://schema.org/subjectOf";
+const SCHEMA_ENCODING_IRI: &str = "http://schema.org/encodingFormat";
+const SCHEMA_ENCODING_HTTPS_IRI: &str = "https://schema.org/encodingFormat";
+const SCHEMA_NAME_IRI: &str = "http://schema.org/name";
+const SCHEMA_NAME_HTTPS_IRI: &str = "https://schema.org/name";
+const LOCAL_PATH_IRI: &str = "https://w3id.org/ro/terms#localPath";
+const LOCAL_PATH_HTTP_IRI: &str = "http://w3id.org/ro/terms#localPath";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum ExportPhase {
+    Snapshot,
+    Resolve,
+    Plan,
+    Assemble,
+    Publish,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ExportCheckpoint {
+    refs: RoCrateCheckpointRefs,
+    phase: ExportPhase,
+    winning_event_id: Option<Ulid>,
+    context_digest: Option<[u8; 32]>,
+    dataset_digest: Option<[u8; 32]>,
+    raw_jsonld: Option<String>,
+    entities: Vec<ExportEntity>,
+    rewritten_jsonld: Option<Vec<u8>>,
+    report_json: Option<Vec<u8>>,
+    report: Vec<ExportReportRow>,
+    artifact: Option<ArtifactRef>,
+}
+
+impl Default for ExportCheckpoint {
+    fn default() -> Self {
+        Self {
+            refs: RoCrateCheckpointRefs::default(),
+            phase: ExportPhase::Snapshot,
+            winning_event_id: None,
+            context_digest: None,
+            dataset_digest: None,
+            raw_jsonld: None,
+            entities: Vec::new(),
+            rewritten_jsonld: None,
+            report_json: None,
+            report: Vec::new(),
+            artifact: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ExportEntity {
+    entity_id: String,
+    local_path: Option<String>,
+    exact: Option<VersionedObjectArn>,
+    hash: Option<[u8; 32]>,
+    hash_realm: Option<RealmId>,
+    candidates: Vec<ExportCandidate>,
+    omission: Option<ReasonCode>,
+    message: Option<String>,
+    zip_path: Option<String>,
+    report_source: Option<ExportReportSource>,
+    resolved_version: Option<Ulid>,
+    path_synthesized: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ExportCandidate {
+    source: CandidateSource,
+    report_source: ExportReportSource,
+    resolved_version: Option<Ulid>,
+    expected_blake3: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum CandidateSource {
+    Local(BackendLocation),
+    RemoteExact {
+        node_id: NodeId,
+        target: VersionedObjectArn,
+    },
+    RemoteHash {
+        node_id: NodeId,
+        hash: [u8; 32],
+    },
+}
+
+#[derive(Debug)]
+struct ProbedEntry {
+    entity_index: usize,
+    candidate_index: usize,
+    size: u64,
+    hash: [u8; 32],
+    report_source: ExportReportSource,
+    resolved_version: Option<Ulid>,
+}
+
+#[derive(Debug)]
+struct PlannedEntry {
+    entity_index: usize,
+    candidate_index: usize,
+    path: String,
+    source: PlannedSource,
+    expected_blake3: [u8; 32],
+}
+
+#[derive(Debug)]
+enum PlannedSource {
+    Candidate {
+        driver: std::sync::Arc<DriverContext>,
+        spec: std::sync::Arc<ExportRoCrateSpec>,
+        candidate: ExportCandidate,
+    },
+    #[cfg(test)]
+    Ready(BackendStream<Result<Bytes, StreamError>>),
+}
+
+#[derive(Debug)]
+enum ExportFailure {
+    Permanent(String),
+    Retryable(String),
+    Validation(Vec<MetadataValidationViolation>),
+    Candidate {
+        entity_index: usize,
+        candidate_index: usize,
+        status: OpenStatus,
+        message: String,
+    },
+    Cancelled,
+    Interrupted,
+}
+
+enum ResolveResult {
+    Candidate(ExportCandidate),
+    Denied,
+    Missing { hash: Option<[u8; 32]> },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum OpenStatus {
+    Denied,
+    Missing,
+    Offline,
+    Corrupt,
+}
+
+enum CandidateOpen {
+    Opened(BaoReadOutput),
+    Status(OpenStatus),
+}
+
+struct EntityIdentity {
+    exact: Option<VersionedObjectArn>,
+    hash: Option<[u8; 32]>,
+    hash_realm: Option<RealmId>,
+}
+
+pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRunOutcome {
+    let mut checkpoint = match read_export_checkpoint(ctx, ctx.job_id).await {
+        Ok(Some(checkpoint)) => checkpoint,
+        Ok(None) => ExportCheckpoint::default(),
+        Err(error) => return retryable(error),
+    };
+    if !checkpoint.entities.is_empty() {
+        let total = checkpoint.entities.len() as u64;
+        ctx.progress.set_total(total);
+        ctx.progress.set_current(match checkpoint.phase {
+            ExportPhase::Snapshot | ExportPhase::Resolve => 0,
+            ExportPhase::Plan | ExportPhase::Assemble | ExportPhase::Publish => total,
+        });
+    }
+    let mut probed = None;
+    let mut candidate_failures = BTreeMap::<usize, BTreeMap<usize, OpenStatus>>::new();
+
+    loop {
+        if ctx.cancel.is_cancelled() {
+            discard_artifact(ctx, &mut checkpoint, true).await;
+            return JobRunOutcome::Cancelled;
+        }
+        if ctx.shutdown.is_cancelled() {
+            return JobRunOutcome::Interrupted;
+        }
+
+        let result = match checkpoint.phase {
+            ExportPhase::Snapshot => snapshot_export(ctx, spec, &mut checkpoint).await,
+            ExportPhase::Resolve => resolve_entries(ctx, spec, &mut checkpoint).await,
+            ExportPhase::Plan => {
+                match Box::pin(probe_sources(
+                    ctx,
+                    spec,
+                    &mut checkpoint,
+                    &candidate_failures,
+                ))
+                .await
+                {
+                    Ok(entries) => {
+                        let result = plan_export(spec, &mut checkpoint, &entries);
+                        probed = Some(entries);
+                        result
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            ExportPhase::Assemble => {
+                if probed.is_none() {
+                    match Box::pin(probe_sources(
+                        ctx,
+                        spec,
+                        &mut checkpoint,
+                        &candidate_failures,
+                    ))
+                    .await
+                    {
+                        Ok(entries) => {
+                            if let Err(error) = plan_export(spec, &mut checkpoint, &entries) {
+                                return finish_export(ctx, &mut checkpoint, error).await;
+                            }
+                            probed = Some(entries);
+                        }
+                        Err(error) => return finish_export(ctx, &mut checkpoint, error).await,
+                    }
+                }
+                let Some(entries) = probed.take() else {
+                    return permanent("planned export sources are missing");
+                };
+                match Box::pin(assemble_export(ctx, spec, &checkpoint, entries)).await {
+                    Ok(artifact) => {
+                        checkpoint.refs.hidden_locations = vec![artifact.location.clone()];
+                        checkpoint.artifact = Some(artifact);
+                        checkpoint.phase = ExportPhase::Publish;
+                        Ok(())
+                    }
+                    Err(ExportFailure::Candidate {
+                        entity_index,
+                        candidate_index,
+                        status,
+                        ..
+                    }) => {
+                        candidate_failures
+                            .entry(entity_index)
+                            .or_default()
+                            .insert(candidate_index, status);
+                        continue;
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            ExportPhase::Publish => {
+                let outcome = publish_export(ctx, &checkpoint).await;
+                if matches!(&outcome, JobRunOutcome::Cancelled) {
+                    discard_artifact(ctx, &mut checkpoint, true).await;
+                }
+                return outcome;
+            }
+        };
+        if let Err(error) = result {
+            return finish_export(ctx, &mut checkpoint, error).await;
+        }
+        if let Err(error) = persist_checkpoint(ctx, &checkpoint).await {
+            discard_artifact(ctx, &mut checkpoint, false).await;
+            return retryable(error);
+        }
+    }
+}
+
+async fn snapshot_export(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    checkpoint: &mut ExportCheckpoint,
+) -> Result<(), ExportFailure> {
+    let record = load_metadata_record_by_document(&ctx.driver, spec.document_id)
+        .await
+        .map_err(|error| match error {
+            StorageReadError::Storage(error) => ExportFailure::Retryable(error.to_string()),
+            StorageReadError::Conversion(error) => ExportFailure::Retryable(error.to_string()),
+        })?
+        .ok_or_else(|| ExportFailure::Permanent("metadata document not found".to_string()))?;
+    if record.permission_path.is_empty() {
+        return Err(ExportFailure::Permanent(
+            "metadata document has no permission path".to_string(),
+        ));
+    }
+    if !check_read(ctx, spec, record.permission_path).await? {
+        return Err(ExportFailure::Permanent(
+            "metadata document READ permission denied".to_string(),
+        ));
+    }
+
+    let raw = load_raw_view(&ctx.driver, spec.document_id)
+        .await
+        .map_err(|error| ExportFailure::Permanent(error.to_string()))?
+        .ok_or_else(|| {
+            ExportFailure::Permanent("metadata document has no raw RO-Crate revision".to_string())
+        })?;
+    if raw.revision.jsonld.len() as u64 > spec.limits.metadata_bytes {
+        return Err(ExportFailure::Permanent(format!(
+            "RO-Crate metadata exceeds the {} byte limit",
+            spec.limits.metadata_bytes
+        )));
+    }
+    let canonical =
+        craqle::validate_rocrate_jsonld(&raw.revision.jsonld).map_err(map_crate_error)?;
+    let document: JsonValue = serde_json::from_str(&raw.revision.jsonld)
+        .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
+    let entities = recognize_entities(&document, &canonical.nquads, spec.auth_context.realm_id)?;
+    if entities.len() as u64 > spec.limits.max_entries {
+        return Err(ExportFailure::Permanent(format!(
+            "RO-Crate has more than {} File entities",
+            spec.limits.max_entries
+        )));
+    }
+
+    checkpoint.winning_event_id = Some(raw.revision.winning_event_id);
+    checkpoint.context_digest = Some(raw.revision.context_digest);
+    checkpoint.dataset_digest = Some(canonical.digest);
+    checkpoint.raw_jsonld = Some(raw.revision.jsonld);
+    checkpoint.entities = entities;
+    checkpoint.phase = ExportPhase::Resolve;
+    ctx.progress.set_total(checkpoint.entities.len() as u64);
+    Ok(())
+}
+
+async fn resolve_entries(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    checkpoint: &mut ExportCheckpoint,
+) -> Result<(), ExportFailure> {
+    for index in 0..checkpoint.entities.len() {
+        if ctx.cancel.is_cancelled() {
+            return Err(ExportFailure::Cancelled);
+        }
+        if ctx.shutdown.is_cancelled() {
+            return Err(ExportFailure::Interrupted);
+        }
+        let entity = &checkpoint.entities[index];
+        if entity.omission.is_some() {
+            ctx.progress.advance(1);
+            continue;
+        }
+        let mut candidates = Vec::new();
+        let mut denied = false;
+        let mut hash = entity.hash.filter(|_| {
+            entity
+                .hash_realm
+                .is_none_or(|realm_id| realm_id == spec.auth_context.realm_id)
+        });
+        let exact_version = entity
+            .exact
+            .as_ref()
+            .filter(|exact| exact.realm_id == spec.auth_context.realm_id)
+            .map(|exact| exact.version);
+        let mut mismatched = false;
+
+        if let Some(exact) = entity
+            .exact
+            .as_ref()
+            .filter(|exact| exact.realm_id == spec.auth_context.realm_id)
+        {
+            if exact.node_id == ctx.owner_node_id {
+                match resolve_exact(ctx, spec, exact).await? {
+                    ResolveResult::Candidate(candidate) => {
+                        if hash.is_some_and(|hash| Some(hash) != candidate.expected_blake3) {
+                            mismatched = true;
+                        } else {
+                            candidates.push(candidate);
+                        }
+                    }
+                    ResolveResult::Denied => denied = true,
+                    ResolveResult::Missing {
+                        hash: discovered_hash,
+                    } => {
+                        if let (Some(expected), Some(discovered)) = (hash, discovered_hash)
+                            && expected != discovered
+                        {
+                            mismatched = true;
+                        } else if hash.is_none() {
+                            hash = discovered_hash;
+                        }
+                    }
+                }
+            } else {
+                candidates.push(ExportCandidate {
+                    source: CandidateSource::RemoteExact {
+                        node_id: exact.node_id,
+                        target: exact.clone(),
+                    },
+                    report_source: ExportReportSource::Remote,
+                    resolved_version: Some(exact.version),
+                    expected_blake3: hash,
+                });
+            }
+        }
+
+        if mismatched {
+            checkpoint.entities[index].omission = Some(ReasonCode::Unsupported);
+            checkpoint.entities[index].message =
+                Some("versioned ARN and content hash disagree".to_string());
+            ctx.progress.advance(1);
+            continue;
+        }
+
+        if let Some(hash) = hash {
+            let unavailable = extend_hash_candidates(
+                ctx,
+                spec,
+                hash,
+                exact_version,
+                &mut candidates,
+                &mut denied,
+            )
+            .await?;
+            if unavailable && candidates.is_empty() {
+                checkpoint.entities[index].omission = Some(ReasonCode::Offline);
+                checkpoint.entities[index].message =
+                    Some("blob holder discovery is unavailable".to_string());
+                ctx.progress.advance(1);
+                continue;
+            }
+        }
+
+        let target = &mut checkpoint.entities[index];
+        target.candidates = candidates;
+        if target.candidates.is_empty() {
+            target.omission = Some(if denied {
+                ReasonCode::Denied
+            } else {
+                ReasonCode::Missing
+            });
+            target.message = Some(
+                match target.omission {
+                    Some(ReasonCode::Denied) => "payload READ permission denied",
+                    Some(ReasonCode::Offline) => "payload is currently unreachable",
+                    _ => "no readable payload version was found",
+                }
+                .to_string(),
+            );
+        }
+        ctx.progress.advance(1);
+    }
+    checkpoint.phase = ExportPhase::Plan;
+    Ok(())
+}
+
+async fn extend_hash_candidates(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    hash: [u8; 32],
+    resolved_version: Option<Ulid>,
+    candidates: &mut Vec<ExportCandidate>,
+    denied: &mut bool,
+) -> Result<bool, ExportFailure> {
+    let aliases = drive(ResolveBlobPermissionPathsOperation::new(hash), &ctx.driver)
+        .await
+        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    for alias in aliases
+        .into_iter()
+        .filter(|alias| alias.realm_id == spec.auth_context.realm_id)
+    {
+        match resolve_alias(ctx, spec, &alias).await? {
+            ResolveResult::Candidate(candidate) => {
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
+            }
+            ResolveResult::Denied => *denied = true,
+            ResolveResult::Missing { .. } => {}
+        }
+    }
+
+    let holders = match drive(
+        GetBlobHoldersOperation::new(hash, spec.auth_context.realm_id, ctx.owner_node_id),
+        &ctx.driver,
+    )
+    .await
+    {
+        Ok(holders) => holders,
+        Err(_) => return Ok(true),
+    };
+    let remote_count = candidates
+        .iter()
+        .filter(|candidate| !matches!(candidate.source, CandidateSource::Local(_)))
+        .count();
+    let holder_limit = REMOTE_ATTEMPTS.saturating_sub(remote_count);
+    for node_id in holders.into_iter().take(holder_limit) {
+        let candidate = ExportCandidate {
+            source: CandidateSource::RemoteHash { node_id, hash },
+            report_source: ExportReportSource::Hash,
+            resolved_version,
+            expected_blake3: Some(hash),
+        };
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    Ok(false)
+}
+
+async fn resolve_exact(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    exact: &VersionedObjectArn,
+) -> Result<ResolveResult, ExportFailure> {
+    let Some(bucket) = storage_value(
+        ctx,
+        S3_BUCKET_KEYSPACE,
+        exact.bucket.as_bytes().to_vec().into(),
+    )
+    .await?
+    else {
+        return Ok(ResolveResult::Missing { hash: None });
+    };
+    let bucket = BucketInfo::from_bytes(bucket.as_ref())
+        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    let permission_path = blob_object_permission_path(
+        spec.auth_context.realm_id,
+        bucket.group_id,
+        exact.node_id,
+        &exact.bucket,
+        &exact.key,
+    );
+    if !check_read(ctx, spec, permission_path).await? {
+        return Ok(ResolveResult::Denied);
+    }
+    let key = VersionKey::new(exact.bucket.clone(), exact.key.clone(), exact.version)
+        .to_bytes()
+        .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
+    let Some(value) = storage_value(ctx, BLOB_VERSIONS_KEYSPACE, key.into()).await? else {
+        return Ok(ResolveResult::Missing { hash: None });
+    };
+    let version = BlobVersion::from_bytes(value.as_ref())
+        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    let Some(hash) = version.blob_hash().copied() else {
+        return Ok(ResolveResult::Missing { hash: None });
+    };
+    let Some(location) = storage_value(ctx, BLOB_LOCATIONS_KEYSPACE, hash.to_vec().into()).await?
+    else {
+        return Ok(ResolveResult::Missing { hash: Some(hash) });
+    };
+    let location = BackendLocation::from_bytes(location.as_ref())
+        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    if location.get_blake3() != Some(hash.as_slice()) {
+        return Ok(ResolveResult::Missing { hash: Some(hash) });
+    }
+    Ok(ResolveResult::Candidate(ExportCandidate {
+        source: CandidateSource::Local(location),
+        report_source: ExportReportSource::Local,
+        resolved_version: Some(exact.version),
+        expected_blake3: Some(hash),
+    }))
+}
+
+async fn resolve_alias(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    alias: &HashPathIndexKey,
+) -> Result<ResolveResult, ExportFailure> {
+    if !check_read(ctx, spec, alias.permission_path()).await? {
+        return Ok(ResolveResult::Denied);
+    }
+    let key = VersionKey::new(alias.bucket.clone(), alias.key.clone(), alias.version_id)
+        .to_bytes()
+        .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
+    let Some(value) = storage_value(ctx, BLOB_VERSIONS_KEYSPACE, key.into()).await? else {
+        return Ok(ResolveResult::Missing { hash: None });
+    };
+    let version = BlobVersion::from_bytes(value.as_ref())
+        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    if version.blob_hash() != Some(&alias.blake3_hash) {
+        return Ok(ResolveResult::Missing { hash: None });
+    }
+    let Some(location) = storage_value(
+        ctx,
+        BLOB_LOCATIONS_KEYSPACE,
+        alias.blake3_hash.to_vec().into(),
+    )
+    .await?
+    else {
+        return Ok(ResolveResult::Missing { hash: None });
+    };
+    let location = BackendLocation::from_bytes(location.as_ref())
+        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    if location.get_blake3() != Some(alias.blake3_hash.as_slice()) {
+        return Ok(ResolveResult::Missing { hash: None });
+    }
+    Ok(ResolveResult::Candidate(ExportCandidate {
+        source: CandidateSource::Local(location),
+        report_source: ExportReportSource::Hash,
+        resolved_version: Some(alias.version_id),
+        expected_blake3: Some(alias.blake3_hash),
+    }))
+}
+
+async fn check_read(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    path: String,
+) -> Result<bool, ExportFailure> {
+    drive(
+        CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: spec.auth_context.clone(),
+            path,
+            required_permission: Permission::READ,
+        }),
+        &ctx.driver,
+    )
+    .await
+    .map_err(|error| ExportFailure::Retryable(error.to_string()))
+}
+
+async fn storage_value(
+    ctx: &JobContext,
+    key_space: &str,
+    key: Key,
+) -> Result<Option<Value>, ExportFailure> {
+    match ctx
+        .driver
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(ExportFailure::Retryable(error.to_string()))
+        }
+        event => Err(ExportFailure::Retryable(format!(
+            "unexpected storage read event: {event:?}"
+        ))),
+    }
+}
+
+fn learn_probe_hash(entity: &mut ExportEntity, candidate_index: usize, hash: [u8; 32]) -> bool {
+    let Some(candidate) = entity.candidates.get_mut(candidate_index) else {
+        return false;
+    };
+    let (node_id, realm_id, resolved_version) = match &candidate.source {
+        CandidateSource::RemoteExact { node_id, target } if candidate.expected_blake3.is_none() => {
+            (*node_id, target.realm_id, candidate.resolved_version)
+        }
+        _ => return false,
+    };
+    candidate.expected_blake3 = Some(hash);
+    entity.hash = Some(hash);
+    entity.hash_realm = Some(realm_id);
+    let fallback = ExportCandidate {
+        source: CandidateSource::RemoteHash { node_id, hash },
+        report_source: ExportReportSource::Hash,
+        resolved_version,
+        expected_blake3: Some(hash),
+    };
+    if !entity.candidates.contains(&fallback) {
+        entity.candidates.push(fallback);
+    }
+    true
+}
+
+async fn probe_sources(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    checkpoint: &mut ExportCheckpoint,
+    candidate_failures: &BTreeMap<usize, BTreeMap<usize, OpenStatus>>,
+) -> Result<Vec<ProbedEntry>, ExportFailure> {
+    let mut probed = Vec::new();
+    for index in 0..checkpoint.entities.len() {
+        if ctx.cancel.is_cancelled() {
+            return Err(ExportFailure::Cancelled);
+        }
+        if ctx.shutdown.is_cancelled() {
+            return Err(ExportFailure::Interrupted);
+        }
+        if checkpoint.entities[index].omission.is_some() {
+            continue;
+        }
+        let candidates = checkpoint.entities[index].candidates.clone();
+        let mut denied = false;
+        let mut missing = false;
+        let mut offline = false;
+        let mut corrupt = false;
+        let mut selected = None;
+        let failed = candidate_failures.get(&index);
+        for status in failed.into_iter().flat_map(|failed| failed.values()) {
+            match status {
+                OpenStatus::Denied => denied = true,
+                OpenStatus::Missing => missing = true,
+                OpenStatus::Offline => offline = true,
+                OpenStatus::Corrupt => corrupt = true,
+            }
+        }
+        for (candidate_index, candidate) in candidates.into_iter().enumerate() {
+            if failed.is_some_and(|failed| failed.contains_key(&candidate_index)) {
+                continue;
+            }
+            if ctx.cancel.is_cancelled() {
+                return Err(ExportFailure::Cancelled);
+            }
+            if ctx.shutdown.is_cancelled() {
+                return Err(ExportFailure::Interrupted);
+            }
+            match Box::pin(open_candidate(&ctx.driver, spec, &candidate, true)).await? {
+                CandidateOpen::Opened(BaoReadOutput::Metadata { size, blake3 }) => {
+                    if learn_probe_hash(&mut checkpoint.entities[index], candidate_index, blake3) {
+                        extend_hash_candidates(
+                            ctx,
+                            spec,
+                            blake3,
+                            candidate.resolved_version,
+                            &mut checkpoint.entities[index].candidates,
+                            &mut denied,
+                        )
+                        .await?;
+                    }
+                    selected = Some(ProbedEntry {
+                        entity_index: index,
+                        candidate_index,
+                        size,
+                        hash: blake3,
+                        report_source: candidate.report_source,
+                        resolved_version: candidate.resolved_version,
+                    });
+                    break;
+                }
+                CandidateOpen::Opened(BaoReadOutput::Stream { .. }) => {
+                    return Err(ExportFailure::Retryable(
+                        "source probe unexpectedly opened a stream".to_string(),
+                    ));
+                }
+                CandidateOpen::Status(OpenStatus::Denied) => denied = true,
+                CandidateOpen::Status(OpenStatus::Missing) => missing = true,
+                CandidateOpen::Status(OpenStatus::Offline) => offline = true,
+                CandidateOpen::Status(OpenStatus::Corrupt) => corrupt = true,
+            }
+        }
+        if let Some(selected) = selected {
+            probed.push(selected);
+            continue;
+        }
+        if corrupt {
+            return Err(ExportFailure::Retryable(
+                "payload integrity check failed".to_string(),
+            ));
+        }
+
+        let entity = &mut checkpoint.entities[index];
+        entity.zip_path = None;
+        entity.report_source = None;
+        entity.resolved_version = None;
+        entity.path_synthesized = false;
+        entity.omission = Some(if denied {
+            ReasonCode::Denied
+        } else if offline {
+            ReasonCode::Offline
+        } else {
+            ReasonCode::Missing
+        });
+        entity.message = Some(
+            if denied {
+                "all payload candidates denied READ"
+            } else if offline {
+                "all payload candidates are offline"
+            } else if missing {
+                "all payload candidates are missing"
+            } else {
+                "no payload candidate is available"
+            }
+            .to_string(),
+        );
+    }
+    Ok(probed)
+}
+
+async fn open_candidate(
+    driver: &DriverContext,
+    spec: &ExportRoCrateSpec,
+    candidate: &ExportCandidate,
+    metadata_only: bool,
+) -> Result<CandidateOpen, ExportFailure> {
+    match &candidate.source {
+        CandidateSource::Local(location) => {
+            let Some(blake3) = candidate.expected_blake3 else {
+                return Err(ExportFailure::Permanent(
+                    "local export candidate has no BLAKE3 hash".to_string(),
+                ));
+            };
+            let Some(blob_handle) = driver.blob_handle.as_ref() else {
+                return Err(ExportFailure::Retryable(
+                    "blob handle unavailable".to_string(),
+                ));
+            };
+            match blob_handle
+                .send_blob_effect(BlobEffect::Read {
+                    location: location.clone(),
+                })
+                .await
+            {
+                Event::Blob(BlobEvent::ReadFinished { blob, stream_size }) => {
+                    Ok(CandidateOpen::Opened(if metadata_only {
+                        BaoReadOutput::Metadata {
+                            size: stream_size,
+                            blake3,
+                        }
+                    } else {
+                        BaoReadOutput::Stream {
+                            blob,
+                            size: stream_size,
+                            blake3,
+                        }
+                    }))
+                }
+                Event::Blob(BlobEvent::Error(BlobError::IntegrityCheckFailed(_))) => {
+                    Ok(CandidateOpen::Status(OpenStatus::Corrupt))
+                }
+                Event::Blob(BlobEvent::Error(_)) => Ok(CandidateOpen::Status(OpenStatus::Offline)),
+                event => Err(ExportFailure::Retryable(format!(
+                    "unexpected local blob read event: {event:?}"
+                ))),
+            }
+        }
+        CandidateSource::RemoteExact { node_id, target } => {
+            open_remote(
+                driver,
+                spec,
+                *node_id,
+                BaoReadTarget::ExactVersion(target.clone()),
+                candidate.expected_blake3,
+                metadata_only,
+            )
+            .await
+        }
+        CandidateSource::RemoteHash { node_id, hash } => {
+            open_remote(
+                driver,
+                spec,
+                *node_id,
+                BaoReadTarget::Blake3(*hash),
+                candidate.expected_blake3,
+                metadata_only,
+            )
+            .await
+        }
+    }
+}
+
+async fn open_remote(
+    driver: &DriverContext,
+    spec: &ExportRoCrateSpec,
+    node_id: NodeId,
+    target: BaoReadTarget,
+    expected_blake3: Option<[u8; 32]>,
+    metadata_only: bool,
+) -> Result<CandidateOpen, ExportFailure> {
+    match drive(
+        BaoReadOperation::new(
+            node_id,
+            BaoReadRequest {
+                auth_context: spec.auth_context.clone(),
+                realm_id: spec.auth_context.realm_id,
+                target,
+                expected_blake3,
+                metadata_only,
+            },
+        ),
+        driver,
+    )
+    .await
+    {
+        Ok(output) => Ok(CandidateOpen::Opened(output)),
+        Err(BaoReadError::Refused(
+            BaoReadRefusal::ReadDenied | BaoReadRefusal::RealmPeerDenied,
+        )) => Ok(CandidateOpen::Status(OpenStatus::Denied)),
+        Err(BaoReadError::Refused(BaoReadRefusal::NotFound | BaoReadRefusal::InvalidTarget)) => {
+            Ok(CandidateOpen::Status(OpenStatus::Missing))
+        }
+        Err(BaoReadError::Refused(BaoReadRefusal::HashMismatch)) => {
+            Ok(CandidateOpen::Status(OpenStatus::Corrupt))
+        }
+        Err(
+            BaoReadError::Refused(BaoReadRefusal::BackendFailure)
+            | BaoReadError::Blob(BlobError::ConnectionFailed(_))
+            | BaoReadError::Blob(BlobError::ChannelClosed),
+        ) => Ok(CandidateOpen::Status(OpenStatus::Offline)),
+        Err(BaoReadError::Blob(BlobError::IntegrityCheckFailed(_))) => {
+            Ok(CandidateOpen::Status(OpenStatus::Corrupt))
+        }
+        Err(
+            BaoReadError::Blob(BlobError::ReadError(_))
+            | BaoReadError::Blob(BlobError::OperatorCreationFailed(_))
+            | BaoReadError::Blob(BlobError::HandleMissing)
+            | BaoReadError::Blob(BlobError::SendError)
+            | BaoReadError::Blob(BlobError::ReplicationFailed(_))
+            | BaoReadError::Blob(BlobError::ReplicationRejected(_)),
+        ) => Ok(CandidateOpen::Status(OpenStatus::Offline)),
+        Err(error) => Err(ExportFailure::Retryable(error.to_string())),
+    }
+}
+
+fn plan_export(
+    spec: &ExportRoCrateSpec,
+    checkpoint: &mut ExportCheckpoint,
+    opened: &[ProbedEntry],
+) -> Result<(), ExportFailure> {
+    let mut paths = HashSet::new();
+    for entry in opened {
+        let entity = &mut checkpoint.entities[entry.entity_index];
+        entity.report_source = Some(entry.report_source);
+        entity.resolved_version = entry.resolved_version;
+        let explicit = entity
+            .local_path
+            .as_deref()
+            .and_then(safe_zip_path)
+            .filter(|path| path != METADATA_PATH && path != REPORT_PATH);
+        let path = match explicit {
+            Some(path) => path,
+            None => {
+                entity.path_synthesized = true;
+                synthesized_path(entry.hash, &entity.entity_id)
+            }
+        };
+        if path.len() as u64 > spec.limits.key_bytes {
+            return Err(ExportFailure::Permanent(format!(
+                "ZIP path exceeds the {} byte limit",
+                spec.limits.key_bytes
+            )));
+        }
+        if !paths.insert(path.clone()) {
+            return Err(ExportFailure::Permanent(format!(
+                "multiple File entities resolve to ZIP path `{path}`"
+            )));
+        }
+        entity.zip_path = Some(path);
+    }
+
+    let raw = checkpoint
+        .raw_jsonld
+        .as_deref()
+        .ok_or_else(|| ExportFailure::Permanent("raw RO-Crate snapshot is missing".to_string()))?;
+    let mut document: JsonValue =
+        serde_json::from_str(raw).map_err(|error| ExportFailure::Permanent(error.to_string()))?;
+    let replacements = checkpoint
+        .entities
+        .iter()
+        .filter_map(|entity| {
+            entity
+                .zip_path
+                .as_ref()
+                .map(|path| (entity.entity_id.clone(), jsonld_path(path)))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let unrewritten = scan_unrewritten(&document, &replacements);
+    rewrite_ids(&mut document, &replacements);
+    checkpoint.report = build_rows(&checkpoint.entities, &unrewritten);
+    let has_omissions = checkpoint.report.iter().any(|row| {
+        matches!(
+            row.code,
+            ReasonCode::External
+                | ReasonCode::Denied
+                | ReasonCode::Missing
+                | ReasonCode::Offline
+                | ReasonCode::Unsupported
+        )
+    });
+    checkpoint.report_json = if has_omissions {
+        let report = build_report(checkpoint)?;
+        add_report(&mut document)?;
+        Some(
+            serde_json::to_vec(&report)
+                .map_err(|error| ExportFailure::Permanent(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let rewritten = serde_json::to_vec(&document)
+        .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
+    if rewritten.len() as u64 > spec.limits.metadata_bytes {
+        return Err(ExportFailure::Permanent(format!(
+            "rewritten RO-Crate metadata exceeds the {} byte limit",
+            spec.limits.metadata_bytes
+        )));
+    }
+    craqle::validate_rocrate_jsonld(
+        std::str::from_utf8(&rewritten)
+            .map_err(|error| ExportFailure::Permanent(error.to_string()))?,
+    )
+    .map_err(map_crate_error)?;
+    precheck_size(
+        spec,
+        &rewritten,
+        checkpoint.report_json.as_deref(),
+        opened,
+        &checkpoint.entities,
+    )?;
+    checkpoint.rewritten_jsonld = Some(rewritten);
+    checkpoint.phase = ExportPhase::Assemble;
+    Ok(())
+}
+
+fn recognize_entities(
+    document: &JsonValue,
+    nquads: &str,
+    realm_id: RealmId,
+) -> Result<Vec<ExportEntity>, ExportFailure> {
+    let keywords = JsonLdKeywords::new(document);
+    let raw_ids = raw_entity_ids(document, &keywords)?;
+    let mut files = BTreeSet::new();
+    let mut content_urls = BTreeMap::<String, Vec<String>>::new();
+    let mut local_paths = BTreeMap::<String, Vec<String>>::new();
+    for quad in NQuadsParser::new().for_slice(nquads) {
+        let quad = quad.map_err(|error| ExportFailure::Permanent(error.to_string()))?;
+        let NamedOrBlankNode::NamedNode(subject) = quad.subject else {
+            continue;
+        };
+        let subject = subject.as_str().to_string();
+        match quad.predicate.as_str() {
+            RDF_TYPE_IRI
+                if matches!(
+                    &quad.object,
+                    Term::NamedNode(node)
+                        if is_file_type(node.as_str())
+                ) =>
+            {
+                files.insert(subject);
+            }
+            SCHEMA_CONTENT_IRI | SCHEMA_CONTENT_HTTPS_IRI => {
+                if let Some(value) = term_value(&quad.object) {
+                    content_urls.entry(subject).or_default().push(value);
+                }
+            }
+            LOCAL_PATH_IRI | LOCAL_PATH_HTTP_IRI => {
+                if let Some(value) = term_value(&quad.object) {
+                    local_paths.entry(subject).or_default().push(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut entities = Vec::new();
+    for (subject, entity_id, raw_path) in raw_ids {
+        if !files.remove(&subject) {
+            continue;
+        }
+        let identity = entity_identity(
+            &entity_id,
+            content_urls.get(&subject).map_or(&[], Vec::as_slice),
+        );
+        let external = identity.exact.is_none() && identity.hash.is_none();
+        let hash_realm = identity.hash_realm;
+        let supported_exact = identity
+            .exact
+            .as_ref()
+            .is_some_and(|exact| exact.realm_id == realm_id);
+        let supported_hash =
+            identity.hash.is_some() && hash_realm.is_none_or(|hash_realm| hash_realm == realm_id);
+        let unsupported_realm = !external && !supported_exact && !supported_hash;
+        let paths = local_paths.remove(&subject).unwrap_or_default();
+        let local_path = raw_path
+            .filter(|raw_path| paths.contains(raw_path))
+            .or_else(|| paths.into_iter().next());
+        entities.push(ExportEntity {
+            entity_id,
+            local_path,
+            exact: identity.exact,
+            hash: identity.hash,
+            hash_realm,
+            candidates: Vec::new(),
+            omission: if external {
+                Some(ReasonCode::External)
+            } else if unsupported_realm {
+                Some(ReasonCode::Unsupported)
+            } else {
+                None
+            },
+            message: if external {
+                Some("external File entity was not fetched".to_string())
+            } else if unsupported_realm {
+                Some("Aruna identifier belongs to another realm".to_string())
+            } else {
+                None
+            },
+            zip_path: None,
+            report_source: None,
+            resolved_version: None,
+            path_synthesized: false,
+        });
+    }
+    if let Some(subject) = files.into_iter().next() {
+        return Err(ExportFailure::Permanent(format!(
+            "expanded File entity `{subject}` has no raw JSON-LD definition"
+        )));
+    }
+    Ok(entities)
+}
+
+fn raw_entity_ids(
+    document: &JsonValue,
+    keywords: &JsonLdKeywords,
+) -> Result<Vec<(String, String, Option<String>)>, ExportFailure> {
+    fn collect(
+        value: &JsonValue,
+        keywords: &JsonLdKeywords,
+        entities: &mut Vec<(String, String, Option<String>)>,
+    ) -> Result<(), ExportFailure> {
+        match value {
+            JsonValue::Array(values) => {
+                for value in values {
+                    collect(value, keywords, entities)?;
+                }
+            }
+            JsonValue::Object(object) => {
+                if object.len() > 1
+                    && let Some((_, id)) = keywords.object_id(object)
+                {
+                    let expanded = expanded_id(id)?;
+                    if let Some((_, existing_id, _)) = entities
+                        .iter()
+                        .find(|(existing, _, _)| existing == &expanded)
+                    {
+                        if existing_id != id {
+                            return Err(ExportFailure::Permanent(format!(
+                                "JSON-LD entity `{expanded}` uses ambiguous identifiers"
+                            )));
+                        }
+                    } else {
+                        entities.push((expanded, id.to_string(), raw_local_path(object, keywords)));
+                    }
+                }
+                for value in object.values() {
+                    collect(value, keywords, entities)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    let mut entities = Vec::new();
+    collect(document, keywords, &mut entities)?;
+    Ok(entities)
+}
+
+fn raw_local_path(
+    object: &serde_json::Map<String, JsonValue>,
+    keywords: &JsonLdKeywords,
+) -> Option<String> {
+    object.iter().find_map(|(key, value)| {
+        keywords
+            .expands_to(key, &["localPath", LOCAL_PATH_IRI, LOCAL_PATH_HTTP_IRI])
+            .then(|| match value {
+                JsonValue::String(value) => Some(value.clone()),
+                JsonValue::Array(values) => values
+                    .iter()
+                    .find_map(JsonValue::as_str)
+                    .map(str::to_string),
+                _ => None,
+            })
+            .flatten()
+    })
+}
+
+fn expanded_id(id: &str) -> Result<String, ExportFailure> {
+    if let Ok(url) = Url::parse(id) {
+        return Ok(url.to_string());
+    }
+    Url::parse(JSONLD_BASE_IRI)
+        .expect("static JSON-LD base is valid")
+        .join(id)
+        .map(String::from)
+        .map_err(|error| ExportFailure::Permanent(error.to_string()))
+}
+
+fn term_value(term: &Term) -> Option<String> {
+    match term {
+        Term::NamedNode(value) => Some(value.as_str().to_string()),
+        Term::Literal(value) => Some(value.value().to_string()),
+        _ => None,
+    }
+}
+
+fn entity_identity(entity_id: &str, content_urls: &[String]) -> EntityIdentity {
+    let mut exact = None;
+    let mut hash = None;
+    let mut hash_realm = None;
+    for value in std::iter::once(entity_id).chain(content_urls.iter().map(String::as_str)) {
+        if let Ok(identifier) = W3idDataIdentifier::parse(value) {
+            match identifier {
+                W3idDataIdentifier::ContentHash(value) => hash = Some(value),
+                W3idDataIdentifier::VersionedObject(value) => exact = Some(value),
+            }
+            continue;
+        }
+        if let Ok(value) = VersionedObjectArn::parse(value) {
+            exact = Some(value);
+            continue;
+        }
+        if let Ok(value) = ArunaArn::parse(value)
+            && value.resource_type == ArunaArnType::ContentHash
+            && let Some(value_hash) = parse_hash(&value.path)
+        {
+            hash = Some(value_hash);
+            hash_realm = Some(value.realm_id);
+        }
+    }
+    EntityIdentity {
+        exact,
+        hash,
+        hash_realm,
+    }
+}
+
+fn parse_hash(value: &str) -> Option<[u8; 32]> {
+    let value = value.strip_prefix("blake3/").unwrap_or(value);
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return None;
+    }
+    let mut hash = [0; 32];
+    hex::decode_to_slice(value, &mut hash).ok()?;
+    Some(hash)
+}
+
+fn safe_zip_path(value: &str) -> Option<String> {
+    let mut value = value;
+    while let Some(stripped) = value.strip_prefix("./") {
+        value = stripped;
+    }
+    let normalized = value.nfc().collect::<String>();
+    let lower = normalized.to_ascii_lowercase();
+    if normalized.is_empty()
+        || normalized.ends_with('/')
+        || normalized.contains('\\')
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+        || normalized
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || ensure_confined_relative_path(Path::new(&normalized)).is_err()
+        || Path::new(&normalized)
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn jsonld_path(path: &str) -> String {
+    let mut url = Url::parse(JSONLD_BASE_IRI).expect("static JSON-LD base is valid");
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .expect("static JSON-LD base supports path segments");
+        segments.clear();
+        for segment in path.split('/') {
+            segments.push(segment);
+        }
+    }
+    url.path().trim_start_matches('/').to_string()
+}
+
+fn synthesized_path(hash: [u8; 32], entity_id: &str) -> String {
+    let suffix = blake3::hash(entity_id.as_bytes()).to_hex();
+    format!("data/{}-{}", hex::encode(hash), &suffix[..12])
+}
+
+fn scan_unrewritten(
+    document: &JsonValue,
+    replacements: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    fn scan(
+        value: &JsonValue,
+        key: Option<&str>,
+        replacements: &BTreeMap<String, String>,
+        keywords: &JsonLdKeywords,
+        found: &mut BTreeSet<String>,
+    ) {
+        match value {
+            JsonValue::String(value)
+                if !key.is_some_and(|key| keywords.is_id(key))
+                    && replacements.contains_key(value.as_str()) =>
+            {
+                found.insert(value.clone());
+            }
+            JsonValue::Array(values) => {
+                for value in values {
+                    scan(value, key, replacements, keywords, found);
+                }
+            }
+            JsonValue::Object(values) => {
+                for (key, value) in values {
+                    scan(value, Some(key), replacements, keywords, found);
+                }
+            }
+            _ => {}
+        }
+    }
+    let keywords = JsonLdKeywords::new(document);
+    let mut found = BTreeSet::new();
+    scan(document, None, replacements, &keywords, &mut found);
+    found
+}
+
+fn rewrite_ids(value: &mut JsonValue, replacements: &BTreeMap<String, String>) {
+    let keywords = JsonLdKeywords::new(value);
+    rewrite_id_values(value, replacements, &keywords);
+}
+
+fn rewrite_id_values(
+    value: &mut JsonValue,
+    replacements: &BTreeMap<String, String>,
+    keywords: &JsonLdKeywords,
+) {
+    match value {
+        JsonValue::Array(values) => {
+            for value in values {
+                rewrite_id_values(value, replacements, keywords);
+            }
+        }
+        JsonValue::Object(values) => {
+            let id_key = keywords.object_id(values).map(|(key, _)| key.to_string());
+            if let Some(JsonValue::String(value)) =
+                id_key.as_deref().and_then(|key| values.get_mut(key))
+                && let Some(replacement) = replacements.get(value)
+            {
+                *value = replacement.clone();
+            }
+            for value in values.values_mut() {
+                rewrite_id_values(value, replacements, keywords);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn build_rows(entities: &[ExportEntity], unrewritten: &BTreeSet<String>) -> Vec<ExportReportRow> {
+    let mut rows = Vec::new();
+    for (index, entity) in entities.iter().enumerate() {
+        let main_code = entity.omission.unwrap_or(ReasonCode::Included);
+        rows.push(ExportReportRow {
+            entry_key: format!("{index:016x}:main"),
+            code: main_code,
+            message: entity.message.clone(),
+            detail: ExportReportDetail {
+                entity_id: entity.entity_id.clone(),
+                zip_path: entity.zip_path.clone(),
+                source: entity.report_source,
+                resolved_version: entity.resolved_version,
+                validation: None,
+            },
+        });
+        if entity.path_synthesized {
+            rows.push(ExportReportRow {
+                entry_key: format!("{index:016x}:path"),
+                code: ReasonCode::PathSynthesized,
+                message: Some("unsafe, absent, or reserved localPath was synthesized".to_string()),
+                detail: ExportReportDetail {
+                    entity_id: entity.entity_id.clone(),
+                    zip_path: entity.zip_path.clone(),
+                    source: entity.report_source,
+                    resolved_version: entity.resolved_version,
+                    validation: None,
+                },
+            });
+        }
+        if unrewritten.contains(&entity.entity_id) {
+            rows.push(ExportReportRow {
+                entry_key: format!("{index:016x}:reference"),
+                code: ReasonCode::UnrewrittenReference,
+                message: Some(
+                    "a string-form reference outside an @id field was preserved".to_string(),
+                ),
+                detail: ExportReportDetail {
+                    entity_id: entity.entity_id.clone(),
+                    zip_path: entity.zip_path.clone(),
+                    source: entity.report_source,
+                    resolved_version: entity.resolved_version,
+                    validation: None,
+                },
+            });
+        }
+    }
+    rows
+}
+
+fn build_report(checkpoint: &ExportCheckpoint) -> Result<JsonValue, ExportFailure> {
+    let event_id = checkpoint
+        .winning_event_id
+        .ok_or_else(|| ExportFailure::Permanent("snapshot event cursor is missing".to_string()))?;
+    let context_digest = checkpoint.context_digest.ok_or_else(|| {
+        ExportFailure::Permanent("snapshot context digest is missing".to_string())
+    })?;
+    let dataset_digest = checkpoint.dataset_digest.ok_or_else(|| {
+        ExportFailure::Permanent("snapshot dataset digest is missing".to_string())
+    })?;
+    let omissions = checkpoint
+        .report
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.code,
+                ReasonCode::External
+                    | ReasonCode::Denied
+                    | ReasonCode::Missing
+                    | ReasonCode::Offline
+                    | ReasonCode::Unsupported
+            )
+        })
+        .map(|row| {
+            json!({
+                "entity_id": &row.detail.entity_id,
+                "code": row.code,
+                "message": &row.message,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "winning_event_id": event_id,
+        "context_digest": hex::encode(context_digest),
+        "dataset_digest": hex::encode(dataset_digest),
+        "omissions": omissions,
+    }))
+}
+
+fn add_report(document: &mut JsonValue) -> Result<(), ExportFailure> {
+    let keywords = JsonLdKeywords::new(document);
+    let graph = keywords
+        .graph(document)
+        .ok_or_else(|| ExportFailure::Permanent("RO-Crate @graph is missing".to_string()))?;
+    if graph.iter().any(|entity| {
+        entity
+            .as_object()
+            .and_then(|entity| keywords.object_id(entity))
+            .is_some_and(|(_, id)| id == REPORT_PATH || id == "#aruna-export-report")
+    }) {
+        return Err(ExportFailure::Permanent(
+            "RO-Crate uses a reserved export report identifier".to_string(),
+        ));
+    }
+    let root_id = report_root_id(graph, &keywords).ok_or_else(|| {
+        ExportFailure::Permanent("RO-Crate metadata descriptor has no root".to_string())
+    })?;
+    let graph = keywords
+        .graph_mut(document)
+        .ok_or_else(|| ExportFailure::Permanent("RO-Crate @graph is missing".to_string()))?;
+    let root = graph
+        .iter_mut()
+        .find(|entity| {
+            entity
+                .as_object()
+                .and_then(|entity| keywords.object_id(entity))
+                .is_some_and(|(_, id)| id == root_id)
+        })
+        .and_then(JsonValue::as_object_mut)
+        .ok_or_else(|| ExportFailure::Permanent("RO-Crate root Dataset is missing".to_string()))?;
+    let subject_key = property_key(
+        root,
+        &keywords,
+        &[
+            "subjectOf",
+            "schema:subjectOf",
+            SCHEMA_SUBJECT_IRI,
+            SCHEMA_SUBJECT_HTTPS_IRI,
+        ],
+        "subjectOf",
+        SCHEMA_SUBJECT_HTTPS_IRI,
+    );
+    match root.get_mut(&subject_key) {
+        Some(JsonValue::Array(values)) => values.push(json!({"@id": "#aruna-export-report"})),
+        Some(value) => {
+            let previous = std::mem::take(value);
+            *value = json!([previous, {"@id": "#aruna-export-report"}]);
+        }
+        None => {
+            root.insert(subject_key, json!({"@id": "#aruna-export-report"}));
+        }
+    }
+    let part_key = property_key(
+        root,
+        &keywords,
+        &[
+            "hasPart",
+            "schema:hasPart",
+            SCHEMA_HAS_PART_IRI,
+            SCHEMA_HAS_PART_HTTPS_IRI,
+        ],
+        "hasPart",
+        SCHEMA_HAS_PART_HTTPS_IRI,
+    );
+    match root.get_mut(&part_key) {
+        Some(JsonValue::Array(values)) => values.push(json!({"@id": REPORT_PATH})),
+        Some(value) => {
+            let previous = std::mem::take(value);
+            *value = json!([previous, {"@id": REPORT_PATH}]);
+        }
+        None => {
+            root.insert(part_key, json!({"@id": REPORT_PATH}));
+        }
+    }
+    let encoding_key = safe_term(
+        &keywords,
+        "encodingFormat",
+        &[
+            SCHEMA_ENCODING_IRI,
+            SCHEMA_ENCODING_HTTPS_IRI,
+            "schema:encodingFormat",
+        ],
+        SCHEMA_ENCODING_HTTPS_IRI,
+    );
+    let about_key = safe_term(
+        &keywords,
+        "about",
+        &[SCHEMA_ABOUT_IRI, SCHEMA_ABOUT_HTTPS_IRI, "schema:about"],
+        SCHEMA_ABOUT_HTTPS_IRI,
+    );
+    let name_key = safe_term(
+        &keywords,
+        "name",
+        &[SCHEMA_NAME_IRI, SCHEMA_NAME_HTTPS_IRI, "schema:name"],
+        SCHEMA_NAME_HTTPS_IRI,
+    );
+    let file_type = if keywords.term_matches(
+        "File",
+        &[
+            SCHEMA_MEDIA_IRI,
+            SCHEMA_MEDIA_HTTPS_IRI,
+            "schema:MediaObject",
+        ],
+    ) {
+        "File"
+    } else {
+        SCHEMA_MEDIA_HTTPS_IRI
+    };
+    graph.push(JsonValue::Object(serde_json::Map::from_iter([
+        ("@id".to_string(), json!(REPORT_PATH)),
+        ("@type".to_string(), json!(file_type)),
+        (encoding_key, json!("application/json")),
+        (about_key.clone(), json!({"@id": "#aruna-export-report"})),
+    ])));
+    graph.push(JsonValue::Object(serde_json::Map::from_iter([
+        ("@id".to_string(), json!("#aruna-export-report")),
+        ("@type".to_string(), json!("http://schema.org/CreativeWork")),
+        (name_key, json!("Aruna RO-Crate export completeness report")),
+        (about_key, json!({"@id": root_id})),
+    ])));
+    Ok(())
+}
+
+fn report_root_id(graph: &[JsonValue], keywords: &JsonLdKeywords) -> Option<String> {
+    graph.iter().find_map(|entity| {
+        let entity = entity.as_object()?;
+        let (_, id) = keywords.object_id(entity)?;
+        if id.trim_start_matches("./") != METADATA_PATH {
+            return None;
+        }
+        entity.iter().find_map(|(key, value)| {
+            keywords
+                .expands_to(
+                    key,
+                    &[
+                        "about",
+                        "schema:about",
+                        SCHEMA_ABOUT_IRI,
+                        SCHEMA_ABOUT_HTTPS_IRI,
+                    ],
+                )
+                .then(|| reference_id(value, keywords).map(str::to_string))
+                .flatten()
+        })
+    })
+}
+
+fn reference_id<'a>(value: &'a JsonValue, keywords: &JsonLdKeywords) -> Option<&'a str> {
+    match value {
+        JsonValue::String(value) => Some(value),
+        JsonValue::Object(value) => keywords.object_id(value).map(|(_, id)| id),
+        JsonValue::Array(values) => values
+            .iter()
+            .find_map(|value| reference_id(value, keywords)),
+        _ => None,
+    }
+}
+
+fn property_key(
+    object: &serde_json::Map<String, JsonValue>,
+    keywords: &JsonLdKeywords,
+    values: &[&str],
+    compact: &str,
+    absolute: &str,
+) -> String {
+    object
+        .keys()
+        .find(|key| keywords.expands_to(key, values))
+        .cloned()
+        .unwrap_or_else(|| safe_term(keywords, compact, values, absolute))
+}
+
+fn safe_term(keywords: &JsonLdKeywords, compact: &str, values: &[&str], absolute: &str) -> String {
+    if keywords.term_matches(compact, values) {
+        compact.to_string()
+    } else {
+        absolute.to_string()
+    }
+}
+
+fn precheck_size(
+    spec: &ExportRoCrateSpec,
+    metadata: &[u8],
+    report: Option<&[u8]>,
+    opened: &[ProbedEntry],
+    entities: &[ExportEntity],
+) -> Result<(), ExportFailure> {
+    let mut size = (metadata.len() as u64)
+        .checked_add(256 + 2 * METADATA_PATH.len() as u64)
+        .ok_or_else(|| ExportFailure::Permanent("export size overflow".to_string()))?;
+    let mut entries = 1u64;
+    if let Some(report) = report {
+        size = size
+            .checked_add(report.len() as u64)
+            .and_then(|size| size.checked_add(256 + 2 * REPORT_PATH.len() as u64))
+            .ok_or_else(|| ExportFailure::Permanent("export size overflow".to_string()))?;
+        entries += 1;
+    }
+    for entry in opened {
+        let path = entities
+            .get(entry.entity_index)
+            .and_then(|entity| entity.zip_path.as_deref())
+            .ok_or_else(|| ExportFailure::Permanent("planned ZIP path is missing".to_string()))?;
+        size = size
+            .checked_add(entry.size)
+            .and_then(|size| size.checked_add(256 + 2 * path.len() as u64))
+            .ok_or_else(|| ExportFailure::Permanent("export size overflow".to_string()))?;
+        entries += 1;
+    }
+    size = size
+        .checked_add(256)
+        .ok_or_else(|| ExportFailure::Permanent("export size overflow".to_string()))?;
+    if entries > spec.limits.max_entries.saturating_add(2) {
+        return Err(ExportFailure::Permanent(format!(
+            "export has more than {} payload entries",
+            spec.limits.max_entries
+        )));
+    }
+    if size > spec.limits.export_artifact_bytes {
+        return Err(ExportFailure::Permanent(format!(
+            "planned ZIP exceeds the {} byte artifact limit",
+            spec.limits.export_artifact_bytes
+        )));
+    }
+    Ok(())
+}
+
+async fn assemble_export(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    checkpoint: &ExportCheckpoint,
+    opened: Vec<ProbedEntry>,
+) -> Result<ArtifactRef, ExportFailure> {
+    let metadata = checkpoint
+        .rewritten_jsonld
+        .clone()
+        .ok_or_else(|| ExportFailure::Permanent("rewritten metadata is missing".to_string()))?;
+    let mut entries = Vec::with_capacity(opened.len());
+    let source_spec = std::sync::Arc::new(spec.clone());
+    for entry in opened {
+        let entity = &checkpoint.entities[entry.entity_index];
+        let path = entity
+            .zip_path
+            .clone()
+            .ok_or_else(|| ExportFailure::Permanent("planned ZIP path is missing".to_string()))?;
+        let mut candidate = entity
+            .candidates
+            .get(entry.candidate_index)
+            .cloned()
+            .ok_or_else(|| {
+                ExportFailure::Permanent("planned export candidate is missing".to_string())
+            })?;
+        candidate.expected_blake3 = Some(entry.hash);
+        entries.push(PlannedEntry {
+            entity_index: entry.entity_index,
+            candidate_index: entry.candidate_index,
+            path,
+            source: PlannedSource::Candidate {
+                driver: ctx.driver.clone(),
+                spec: source_spec.clone(),
+                candidate,
+            },
+            expected_blake3: entry.hash,
+        });
+    }
+    let report = checkpoint.report_json.clone();
+    let Some(blob_handle) = ctx.driver.blob_handle.as_ref() else {
+        return Err(ExportFailure::Retryable(
+            "blob handle unavailable".to_string(),
+        ));
+    };
+    let (writer, reader) = tokio::io::duplex(128 * 1024);
+    let cancel = ctx.cancel.clone();
+    let shutdown = ctx.shutdown.clone();
+    let writer_task = tokio::spawn(Box::pin(write_archive(
+        writer, metadata, entries, report, cancel, shutdown,
+    )));
+    let event = blob_handle
+        .send_blob_effect(BlobEffect::SpoolHidden {
+            namespace: ctx.job_id.0,
+            name: "rocrate.zip".to_string(),
+            created_by: spec.auth_context.user_id,
+            max_bytes: Some(spec.limits.export_artifact_bytes),
+            blob: BackendStream::new(tokio_util::io::ReaderStream::new(reader)),
+        })
+        .await;
+    let write_result = match writer_task.await {
+        Ok(result) => result,
+        Err(error) => Err(ExportFailure::Retryable(error.to_string())),
+    };
+    match (event, write_result) {
+        (
+            Event::Blob(BlobEvent::HiddenSpooled {
+                location,
+                blake3,
+                size,
+            }),
+            Ok(()),
+        ) => Ok(ArtifactRef {
+            location,
+            blake3,
+            size,
+            expires_at_ms: unix_timestamp_millis()
+                .saturating_add(spec.limits.artifact_retention_ms),
+        }),
+        (Event::Blob(BlobEvent::HiddenSpooled { location, .. }), Err(error)) => {
+            let _ = delete_hidden(&ctx.driver, &location).await;
+            Err(error)
+        }
+        (Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { limit })), _) => {
+            Err(ExportFailure::Permanent(format!(
+                "assembled ZIP exceeds the {limit} byte artifact limit"
+            )))
+        }
+        (Event::Blob(BlobEvent::Error(_)), Err(ExportFailure::Cancelled)) => {
+            Err(ExportFailure::Cancelled)
+        }
+        (Event::Blob(BlobEvent::Error(_)), Err(ExportFailure::Interrupted)) => {
+            Err(ExportFailure::Interrupted)
+        }
+        (Event::Blob(BlobEvent::Error(error)), _) => {
+            Err(ExportFailure::Retryable(error.to_string()))
+        }
+        (event, _) => Err(ExportFailure::Retryable(format!(
+            "unexpected hidden artifact event: {event:?}"
+        ))),
+    }
+}
+
+async fn write_archive(
+    writer: tokio::io::DuplexStream,
+    metadata: Vec<u8>,
+    mut entries: Vec<PlannedEntry>,
+    report: Option<Vec<u8>>,
+    cancel: tokio_util::sync::CancellationToken,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(), ExportFailure> {
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut archive = async_zip::base::write::ZipFileWriter::with_tokio(writer);
+    archive
+        .write_entry_whole(zip_entry(METADATA_PATH), &metadata)
+        .await
+        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    for entry in entries {
+        let PlannedEntry {
+            entity_index,
+            candidate_index,
+            path,
+            source,
+            expected_blake3,
+        } = entry;
+        let opened = match source {
+            PlannedSource::Candidate {
+                driver,
+                spec,
+                candidate,
+            } => Box::pin(open_candidate(&driver, &spec, &candidate, false)).await?,
+            #[cfg(test)]
+            PlannedSource::Ready(blob) => CandidateOpen::Opened(BaoReadOutput::Stream {
+                blob,
+                size: 0,
+                blake3: expected_blake3,
+            }),
+        };
+        let mut blob = match opened {
+            CandidateOpen::Opened(BaoReadOutput::Stream { blob, blake3, .. })
+                if blake3 == expected_blake3 =>
+            {
+                blob
+            }
+            CandidateOpen::Opened(BaoReadOutput::Stream { .. })
+            | CandidateOpen::Status(OpenStatus::Corrupt) => {
+                return Err(ExportFailure::Candidate {
+                    entity_index,
+                    candidate_index,
+                    status: OpenStatus::Corrupt,
+                    message: format!("payload integrity check failed for `{path}`"),
+                });
+            }
+            CandidateOpen::Opened(BaoReadOutput::Metadata { .. }) => {
+                return Err(ExportFailure::Retryable(
+                    "source open unexpectedly returned metadata".to_string(),
+                ));
+            }
+            CandidateOpen::Status(status) => {
+                return Err(ExportFailure::Candidate {
+                    entity_index,
+                    candidate_index,
+                    status,
+                    message: format!("payload source became unavailable for `{path}`"),
+                });
+            }
+        };
+        let mut writer = archive
+            .write_entry_stream(zip_entry(&path))
+            .await
+            .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+        let mut hasher = blake3::Hasher::new();
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(ExportFailure::Cancelled),
+                _ = shutdown.cancelled() => return Err(ExportFailure::Interrupted),
+                next = blob.next() => next,
+            };
+            match next {
+                Some(Ok(bytes)) => {
+                    hasher.update(&bytes);
+                    writer
+                        .write_all(&bytes)
+                        .await
+                        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+                }
+                Some(Err(error)) => {
+                    return Err(ExportFailure::Candidate {
+                        entity_index,
+                        candidate_index,
+                        status: stream_status(&error),
+                        message: error.to_string(),
+                    });
+                }
+                None => break,
+            }
+        }
+        if hasher.finalize().as_bytes() != &expected_blake3 {
+            return Err(ExportFailure::Candidate {
+                entity_index,
+                candidate_index,
+                status: OpenStatus::Corrupt,
+                message: format!("payload integrity check failed for `{path}`"),
+            });
+        }
+        writer
+            .close()
+            .await
+            .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    }
+    if let Some(report) = report {
+        archive
+            .write_entry_whole(zip_entry(REPORT_PATH), &report)
+            .await
+            .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    }
+    archive
+        .close()
+        .await
+        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    Ok(())
+}
+
+fn zip_entry(path: &str) -> ZipEntryBuilder {
+    ZipEntryBuilder::new(path.to_string().into(), Compression::Stored)
+}
+
+fn stream_status(error: &StreamError) -> OpenStatus {
+    if matches!(
+        error.0.downcast_ref::<BlobError>(),
+        Some(BlobError::IntegrityCheckFailed(_))
+    ) {
+        OpenStatus::Corrupt
+    } else {
+        OpenStatus::Offline
+    }
+}
+
+async fn publish_export(ctx: &JobContext, checkpoint: &ExportCheckpoint) -> JobRunOutcome {
+    let Some(artifact) = checkpoint.artifact.clone() else {
+        return permanent("export artifact is missing");
+    };
+    for row in &checkpoint.report {
+        if ctx.cancel.is_cancelled() {
+            return JobRunOutcome::Cancelled;
+        }
+        if ctx.shutdown.is_cancelled() {
+            return JobRunOutcome::Interrupted;
+        }
+        if let Err(error) = put_job_entry(
+            &ctx.driver.storage_handle,
+            ctx.job_id,
+            ctx.claim_token,
+            row.entry_key.as_bytes(),
+            row,
+        )
+        .await
+        {
+            return retryable(error.to_string());
+        }
+    }
+    let (included, omitted) = report_counts(&checkpoint.report);
+    JobRunOutcome::Succeeded(JobResultPayload::ExportRoCrate(ExportRoCrateResult {
+        artifact: Some(artifact),
+        included,
+        omitted,
+        report_digest: [0; 32],
+    }))
+}
+
+fn report_counts(rows: &[ExportReportRow]) -> (u64, ExportOmissionCounts) {
+    let mut included = 0u64;
+    let mut omitted = ExportOmissionCounts::default();
+    for row in rows {
+        match row.code {
+            ReasonCode::Included => included = included.saturating_add(1),
+            ReasonCode::External => omitted.external = omitted.external.saturating_add(1),
+            ReasonCode::Denied => omitted.denied = omitted.denied.saturating_add(1),
+            ReasonCode::Missing => omitted.missing = omitted.missing.saturating_add(1),
+            ReasonCode::Offline => omitted.offline = omitted.offline.saturating_add(1),
+            ReasonCode::Unsupported => omitted.unsupported = omitted.unsupported.saturating_add(1),
+            _ => {}
+        }
+    }
+    (included, omitted)
+}
+
+async fn discard_artifact(ctx: &JobContext, checkpoint: &mut ExportCheckpoint, persist: bool) {
+    if let Some(artifact) = checkpoint.artifact.as_ref() {
+        let _ = delete_hidden(&ctx.driver, &artifact.location).await;
+    }
+    checkpoint.artifact = None;
+    checkpoint.refs.hidden_locations.clear();
+    if persist {
+        let _ = persist_checkpoint(ctx, checkpoint).await;
+    }
+}
+
+async fn read_export_checkpoint(
+    ctx: &JobContext,
+    job_id: JobId,
+) -> Result<Option<ExportCheckpoint>, String> {
+    match ctx
+        .driver
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: ROCRATE_JOB_STATE_KEYSPACE.to_string(),
+            key: ByteView::from(job_id.to_bytes().to_vec()),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => postcard::from_bytes(value.as_ref())
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        event => Err(format!("unexpected export checkpoint event: {event:?}")),
+    }
+}
+
+async fn persist_checkpoint(ctx: &JobContext, checkpoint: &ExportCheckpoint) -> Result<(), String> {
+    let value = postcard::to_allocvec(checkpoint).map_err(|error| error.to_string())?;
+    put_rocrate_checkpoint(
+        &ctx.driver.storage_handle,
+        ctx.job_id,
+        ctx.claim_token,
+        Value::from(value),
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+fn map_crate_error(error: craqle::RoCrateError) -> ExportFailure {
+    match error {
+        craqle::RoCrateError::Update(craqle::UpdateError::ValidationFailed(violations)) => {
+            ExportFailure::Validation(
+                violations
+                    .into_iter()
+                    .map(|violation| MetadataValidationViolation {
+                        code: violation.code.to_string(),
+                        message: violation.message,
+                        pointer: violation.pointer,
+                        entity_id: violation.entity_id,
+                    })
+                    .collect(),
+            )
+        }
+        error => ExportFailure::Permanent(error.to_string()),
+    }
+}
+
+async fn finish_export(
+    ctx: &JobContext,
+    checkpoint: &mut ExportCheckpoint,
+    error: ExportFailure,
+) -> JobRunOutcome {
+    discard_artifact(ctx, checkpoint, false).await;
+    if let ExportFailure::Validation(violations) = &error
+        && let Err(message) = write_validation_rows(ctx, violations).await
+    {
+        return retryable(message);
+    }
+    failure_outcome(error)
+}
+
+async fn write_validation_rows(
+    ctx: &JobContext,
+    violations: &[MetadataValidationViolation],
+) -> Result<(), String> {
+    for (index, violation) in violations.iter().enumerate() {
+        let row = ExportReportRow {
+            entry_key: format!("validation/{index:08}"),
+            code: if violation.code == "unsupported_crate_version" {
+                ReasonCode::UnsupportedCrateVersion
+            } else {
+                ReasonCode::Failed
+            },
+            message: Some(violation.message.clone()),
+            detail: ExportReportDetail {
+                entity_id: violation.entity_id.clone().unwrap_or_default(),
+                zip_path: None,
+                source: None,
+                resolved_version: None,
+                validation: Some(violation.clone()),
+            },
+        };
+        put_job_entry(
+            &ctx.driver.storage_handle,
+            ctx.job_id,
+            ctx.claim_token,
+            row.entry_key.as_bytes(),
+            &row,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn failure_outcome(error: ExportFailure) -> JobRunOutcome {
+    match error {
+        ExportFailure::Permanent(message) => permanent(message),
+        ExportFailure::Retryable(message) => retryable(message),
+        ExportFailure::Validation(violations) => permanent(validation_message(&violations)),
+        ExportFailure::Candidate { message, .. } => retryable(message),
+        ExportFailure::Cancelled => JobRunOutcome::Cancelled,
+        ExportFailure::Interrupted => JobRunOutcome::Interrupted,
+    }
+}
+
+fn validation_message(violations: &[MetadataValidationViolation]) -> String {
+    violations
+        .iter()
+        .map(|violation| {
+            format!(
+                "{} at {}: {}",
+                violation.code, violation.pointer, violation.message
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn retryable(message: impl Into<String>) -> JobRunOutcome {
+    JobRunOutcome::Failed(JobError::retryable(message.into()))
+}
+
+fn permanent(message: impl Into<String>) -> JobRunOutcome {
+    JobRunOutcome::Failed(JobError::permanent(message.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::incoming::initialize_net_incoming;
+    use crate::jobs::executor::ProgressReporter;
+    use crate::jobs::import::fixture::{
+        RewriteTarget, file_id_candidates, inspect_archive, open_archive, payload_entries,
+        read_metadata, rewrite_document, signature_entry, validate_document,
+    };
+    use crate::staging::test_utils::setup_driver_context;
+    use aruna_blob::blob::{BlobHandle, BlobHandler};
+    use aruna_core::UserId;
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    };
+    use aruna_core::structs::{
+        Actor, AuthContext, Backend, BackendConfig, GroupAuthorizationDocument,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind, RoCrateLimits,
+    };
+    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_storage::FjallStorage;
+    use std::collections::HashMap;
+    use std::io::{Read, Seek, Write};
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+    use tempfile::TempDir;
+    use tokio::io::AsyncReadExt;
+
+    const FIXTURE_BYTES: &[u8] = b"duplicate fixture payload";
+
+    struct SparseWriter {
+        file: std::fs::File,
+        enabled: Arc<AtomicBool>,
+    }
+
+    struct BaoNode {
+        _tempdir: TempDir,
+        net: NetHandle,
+        driver: Arc<DriverContext>,
+    }
+
+    impl futures_util::io::AsyncWrite for SparseWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let result = if self.enabled.load(Ordering::Relaxed) {
+                std::io::Seek::seek(
+                    &mut self.file,
+                    std::io::SeekFrom::Current(bytes.len() as i64),
+                )
+                .map(|_| bytes.len())
+            } else {
+                std::io::Write::write(&mut self.file, bytes)
+            };
+            Poll::Ready(result)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(std::io::Write::flush(&mut self.file))
+        }
+
+        fn poll_close(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(std::io::Write::flush(&mut self.file))
+        }
+    }
+
+    async fn bao_node(realm_id: RealmId) -> BaoNode {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().to_str().unwrap();
+        let blob_root = tempdir.path().join("blobstore");
+        std::fs::create_dir_all(&blob_root).unwrap();
+        let storage = FjallStorage::open(root).unwrap();
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .unwrap();
+        let blob = BlobHandler::new(
+            BackendConfig {
+                backend_type: Backend::FileSystem,
+                root: blob_root.to_str().unwrap().to_string(),
+                service_config: HashMap::new(),
+                bucket_prefix: Some("aruna-export-".to_string()),
+                max_bucket_size: Some(100),
+                multipart_bucket: Some("multipart".to_string()),
+                timeouts: Default::default(),
+            },
+            storage.clone(),
+            net.clone(),
+        )
+        .await
+        .unwrap();
+        let driver = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: Some(net.clone()),
+            blob_handle: Some(blob),
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        initialize_net_incoming(driver.clone());
+        BaoNode {
+            _tempdir: tempdir,
+            net,
+            driver,
+        }
+    }
+
+    fn remote_spec(realm_id: RealmId, user_id: UserId) -> ExportRoCrateSpec {
+        ExportRoCrateSpec {
+            auth_context: AuthContext {
+                user_id,
+                realm_id,
+                path_restrictions: None,
+            },
+            document_id: Ulid::from_bytes([91; 16]),
+            limits: RoCrateLimits::default(),
+        }
+    }
+
+    async fn seed_bao(
+        source: &BaoNode,
+        peer: NodeId,
+        owner: UserId,
+        group_id: Ulid,
+        version_id: Ulid,
+        location: &BackendLocation,
+    ) {
+        let realm_id = owner.realm_id;
+        let actor = Actor {
+            node_id: source.net.node_id(),
+            user_id: owner,
+            realm_id,
+        };
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.ensure_node(source.net.node_id(), RealmNodeKind::Server);
+        config.ensure_node(peer, RealmNodeKind::Server);
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let bucket = BucketInfo {
+            group_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: owner,
+            cors_configuration: None,
+        };
+        let hash: [u8; 32] = location.get_blake3().unwrap().try_into().unwrap();
+        let version =
+            BlobVersion::materialized(hash, std::time::SystemTime::UNIX_EPOCH, owner, None);
+        let version_key = VersionKey::new("remote", "payload", version_id);
+        let writes = vec![
+            (
+                REALM_CONFIG_KEYSPACE.to_string(),
+                realm_id.as_bytes().to_vec().into(),
+                config.to_bytes(&actor).unwrap().into(),
+            ),
+            (
+                AUTH_KEYSPACE.to_string(),
+                realm_id.as_bytes().to_vec().into(),
+                realm_auth.to_bytes(&actor).unwrap().into(),
+            ),
+            (
+                AUTH_KEYSPACE.to_string(),
+                group_id.to_bytes().to_vec().into(),
+                group_auth.to_bytes(&actor).unwrap().into(),
+            ),
+            (
+                S3_BUCKET_KEYSPACE.to_string(),
+                b"remote".to_vec().into(),
+                bucket.to_bytes().unwrap().into(),
+            ),
+            (
+                BLOB_VERSIONS_KEYSPACE.to_string(),
+                version_key.to_bytes().unwrap().into(),
+                version.to_bytes().unwrap().into(),
+            ),
+            (
+                BLOB_LOCATIONS_KEYSPACE.to_string(),
+                hash.to_vec().into(),
+                location.to_bytes().unwrap().into(),
+            ),
+        ];
+        assert!(matches!(
+            source
+                .driver
+                .storage_handle
+                .send_storage_effect(StorageEffect::BatchWrite {
+                    writes,
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+    }
+
+    async fn keyspace_len(driver: &DriverContext, key_space: &str) -> usize {
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = driver
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: key_space.to_string(),
+                prefix: None,
+                start: None,
+                limit: 10,
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("keyspace iteration failed")
+        };
+        values.len()
+    }
+
+    fn file_entity(id: &str, local_path: Option<&str>) -> JsonValue {
+        let mut entity = json!({
+            "@id": id,
+            "@type": "File",
+            "contentUrl": format!(
+                "{}{}",
+                aruna_core::structs::ARUNA_DATA_PREFIX,
+                "11".repeat(32)
+            ),
+        });
+        if let Some(local_path) = local_path {
+            entity["localPath"] = json!(local_path);
+        }
+        entity
+    }
+
+    fn byte_stream(bytes: &'static [u8]) -> BackendStream<Result<Bytes, StreamError>> {
+        BackendStream::new(futures_util::stream::iter([Ok::<Bytes, std::io::Error>(
+            Bytes::from_static(bytes),
+        )]))
+    }
+
+    fn recognized_entities(
+        document: &JsonValue,
+        realm_id: RealmId,
+    ) -> Result<Vec<ExportEntity>, ExportFailure> {
+        let jsonld = serde_json::to_string(document).unwrap();
+        let canonical = craqle::canonicalize_jsonld(&jsonld).unwrap();
+        recognize_entities(document, &canonical.nquads, realm_id)
+    }
+
+    fn fixture_stream(bytes: Vec<u8>) -> BackendStream<Result<Bytes, StreamError>> {
+        BackendStream::new(tokio_util::io::ReaderStream::new(std::io::Cursor::new(
+            bytes,
+        )))
+    }
+
+    fn fixture_json(version: &str) -> String {
+        json!({
+            "@context": [
+                format!("https://w3id.org/ro/crate/{version}/context"),
+                {"custom": "https://example.test/custom"}
+            ],
+            "@graph": [
+                {
+                    "@id": METADATA_PATH,
+                    "@type": "CreativeWork",
+                    "about": {"@id": "./"},
+                    "conformsTo": {"@id": format!("https://w3id.org/ro/crate/{version}")}
+                },
+                {
+                    "@id": "./",
+                    "@type": "Dataset",
+                    "name": "Round-trip fixture",
+                    "description": "Generated attached crate",
+                    "datePublished": "2026-07-23",
+                    "hasPart": [
+                        {"@id": "data/a%20file.txt"},
+                        {"@id": "data/copy.txt"}
+                    ],
+                    "custom": ["root-one", "root-two"]
+                },
+                {
+                    "@id": "data/a%20file.txt",
+                    "@type": "File",
+                    "name": "Original",
+                    "alternateName": ["A file", "Alpha file"],
+                    "custom": ["file-one", "file-two"]
+                },
+                {
+                    "@id": "data/copy.txt",
+                    "@type": "File",
+                    "name": "Copy",
+                    "alternateName": "Copied file",
+                    "custom": {"@id": "#note"}
+                },
+                {
+                    "@id": "#note",
+                    "@type": "CreativeWork",
+                    "name": "Contextual note"
+                }
+            ]
+        })
+        .to_string()
+    }
+
+    async fn fixture_archive(jsonld: &str, eln: bool) -> Vec<u8> {
+        let prefix = if eln { "experiment/" } else { "" };
+        let mut writer = async_zip::base::write::ZipFileWriter::new(Vec::<u8>::new());
+        for (path, bytes) in [
+            (METADATA_PATH, jsonld.as_bytes()),
+            ("data/a file.txt", FIXTURE_BYTES),
+            ("data/copy.txt", FIXTURE_BYTES),
+            ("notes/unlisted.txt", b"unlisted payload".as_slice()),
+        ] {
+            writer
+                .write_entry_whole(zip_entry(&format!("{prefix}{path}")), bytes)
+                .await
+                .unwrap();
+        }
+        if eln {
+            writer
+                .write_entry_whole(
+                    zip_entry(&format!("{prefix}ro-crate-metadata.json.minisig")),
+                    b"untrusted fixture signature",
+                )
+                .await
+                .unwrap();
+        }
+        writer.close().await.unwrap()
+    }
+
+    async fn spool_fixture(
+        handle: &BlobHandle,
+        bytes: Vec<u8>,
+        seed: u8,
+    ) -> (BackendLocation, u64) {
+        let expected_size = bytes.len() as u64;
+        let expected_hash = *blake3::hash(&bytes).as_bytes();
+        let Event::Blob(BlobEvent::HiddenSpooled {
+            location,
+            blake3,
+            size,
+        }) = handle
+            .send_blob_effect(BlobEffect::SpoolHidden {
+                namespace: Ulid::from_bytes([seed; 16]),
+                name: "fixture".to_string(),
+                created_by: UserId::nil(RealmId::from_bytes([seed; 32])),
+                max_bytes: Some(1024 * 1024),
+                blob: fixture_stream(bytes),
+            })
+            .await
+        else {
+            panic!("fixture spool failed")
+        };
+        assert_eq!(size, expected_size);
+        assert_eq!(blake3, expected_hash);
+        (location, size)
+    }
+
+    fn read_entry<R: Read + Seek>(archive: &mut zip::ZipArchive<R>, path: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        archive
+            .by_name(path)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    async fn assert_roundtrip(handle: &BlobHandle, eln: bool, version: &str, seed: u8) {
+        let limits = RoCrateLimits::default();
+        let source_json = fixture_json(version);
+        let source_bytes = fixture_archive(&source_json, eln).await;
+        let (source_location, source_size) =
+            spool_fixture(handle, source_bytes, seed.saturating_add(1)).await;
+        let inspection = inspect_archive(
+            handle.clone(),
+            source_location.clone(),
+            source_size,
+            eln,
+            &limits,
+        )
+        .await
+        .unwrap();
+        assert_eq!(inspection.wrapper.as_deref(), eln.then_some("experiment"));
+        assert_eq!(signature_entry(&inspection).is_some(), eln);
+
+        let mut reader = open_archive(handle.clone(), source_location, source_size)
+            .await
+            .unwrap();
+        let metadata = read_metadata(
+            &mut reader,
+            inspection.metadata_index,
+            limits.metadata_bytes,
+        )
+        .await
+        .unwrap();
+        let validated = validate_document(&metadata).unwrap();
+        let payload = payload_entries(&inspection);
+        let mut described = BTreeMap::new();
+        for file_id in &validated.file_ids {
+            let candidates = file_id_candidates(file_id).unwrap().unwrap();
+            let matches = candidates
+                .into_iter()
+                .filter(|path| payload.contains_key(path))
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1, "{file_id}");
+            described.insert(file_id.clone(), matches[0].clone());
+        }
+        assert_eq!(
+            payload
+                .keys()
+                .filter(|path| !described.values().any(|value| value == *path))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["notes/unlisted.txt".to_string()]
+        );
+
+        let realm_id = RealmId::from_bytes([seed; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[seed.saturating_add(1); 32]).public();
+        let payload_hash = *blake3::hash(FIXTURE_BYTES).as_bytes();
+        let targets = described
+            .iter()
+            .enumerate()
+            .map(|(index, (file_id, path))| {
+                let version = Ulid::from_bytes(
+                    [seed.saturating_add(u8::try_from(index).unwrap())
+                        .saturating_add(2); 16],
+                );
+                let arn =
+                    VersionedObjectArn::new(realm_id, node_id, "fixture", path, version).unwrap();
+                (
+                    file_id.clone(),
+                    RewriteTarget {
+                        w3id: arn.to_w3id(),
+                        hash_w3id: format!(
+                            "{}{}",
+                            aruna_core::structs::ARUNA_DATA_PREFIX,
+                            hex::encode(payload_hash)
+                        ),
+                        local_path: path.clone(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let rewritten = rewrite_document(validated.value, &targets).unwrap();
+        assert!(rewritten.warnings.is_empty());
+        let imported: JsonValue = serde_json::from_str(&rewritten.jsonld).unwrap();
+        let source: JsonValue = serde_json::from_str(&source_json).unwrap();
+        assert!(imported["@graph"][1].get("license").is_none());
+        assert_eq!(
+            imported["@graph"][1]["custom"],
+            source["@graph"][1]["custom"]
+        );
+        assert_eq!(
+            imported["@graph"][2]["alternateName"],
+            source["@graph"][2]["alternateName"]
+        );
+
+        let entities = recognized_entities(&imported, realm_id).unwrap();
+        assert_eq!(entities.len(), 2);
+        assert!(entities.iter().all(|entity| {
+            entity.exact.is_some()
+                && entity.hash == Some(payload_hash)
+                && entity
+                    .local_path
+                    .as_ref()
+                    .is_some_and(|path| described.values().any(|value| value == path))
+        }));
+        let spec = ExportRoCrateSpec {
+            auth_context: AuthContext {
+                user_id: UserId::nil(realm_id),
+                realm_id,
+                path_restrictions: None,
+            },
+            document_id: Ulid::from_bytes([seed.saturating_add(8); 16]),
+            limits: limits.clone(),
+        };
+        let opened = entities
+            .iter()
+            .enumerate()
+            .map(|(entity_index, entity)| ProbedEntry {
+                entity_index,
+                candidate_index: 0,
+                size: FIXTURE_BYTES.len() as u64,
+                hash: payload_hash,
+                report_source: ExportReportSource::Local,
+                resolved_version: entity.exact.as_ref().map(|exact| exact.version),
+            })
+            .collect::<Vec<_>>();
+        let mut checkpoint = ExportCheckpoint {
+            raw_jsonld: Some(rewritten.jsonld.clone()),
+            entities,
+            ..ExportCheckpoint::default()
+        };
+        plan_export(&spec, &mut checkpoint, &opened).unwrap();
+        assert!(checkpoint.report_json.is_none());
+        assert!(
+            checkpoint
+                .entities
+                .iter()
+                .all(|entity| !entity.path_synthesized)
+        );
+
+        let entries = checkpoint
+            .entities
+            .iter()
+            .enumerate()
+            .map(|(entity_index, entity)| PlannedEntry {
+                entity_index,
+                candidate_index: 0,
+                path: entity.zip_path.clone().unwrap(),
+                source: PlannedSource::Ready(byte_stream(FIXTURE_BYTES)),
+                expected_blake3: payload_hash,
+            })
+            .collect();
+        let (writer, mut reader) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(write_archive(
+            writer,
+            checkpoint.rewritten_jsonld.clone().unwrap(),
+            entries,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        let mut exported = Vec::new();
+        reader.read_to_end(&mut exported).await.unwrap();
+        task.await.unwrap().unwrap();
+
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&exported)).unwrap();
+        let names = (0..archive.len())
+            .map(|index| archive.by_index(index).unwrap().name().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                METADATA_PATH.to_string(),
+                "data/a file.txt".to_string(),
+                "data/copy.txt".to_string(),
+            ]
+        );
+        assert_eq!(read_entry(&mut archive, "data/a file.txt"), FIXTURE_BYTES);
+        assert_eq!(read_entry(&mut archive, "data/copy.txt"), FIXTURE_BYTES);
+        drop(archive);
+
+        let (export_location, export_size) =
+            spool_fixture(handle, exported, seed.saturating_add(9)).await;
+        let exported_inspection = inspect_archive(
+            handle.clone(),
+            export_location.clone(),
+            export_size,
+            false,
+            &limits,
+        )
+        .await
+        .unwrap();
+        assert!(exported_inspection.wrapper.is_none());
+        let mut reader = open_archive(handle.clone(), export_location, export_size)
+            .await
+            .unwrap();
+        let metadata = read_metadata(
+            &mut reader,
+            exported_inspection.metadata_index,
+            limits.metadata_bytes,
+        )
+        .await
+        .unwrap();
+        let validated = validate_document(&metadata).unwrap();
+        assert_eq!(
+            validated.file_ids,
+            vec!["data/a%20file.txt".to_string(), "data/copy.txt".to_string()]
+        );
+        let payload = payload_entries(&exported_inspection);
+        let by_path = targets
+            .values()
+            .map(|target| (target.local_path.clone(), target.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut targets = HashMap::new();
+        for file_id in &validated.file_ids {
+            let candidates = file_id_candidates(file_id).unwrap().unwrap();
+            let matches = candidates
+                .into_iter()
+                .filter(|path| payload.contains_key(path))
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1, "{file_id}");
+            targets.insert(file_id.clone(), by_path[&matches[0]].clone());
+        }
+        let reimported = rewrite_document(validated.value, &targets).unwrap();
+        assert!(reimported.warnings.is_empty());
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&reimported.jsonld).unwrap(),
+            imported
+        );
+    }
+
+    #[tokio::test]
+    async fn fixture_roundtrip() {
+        let fixture = setup_driver_context().await;
+        let handle = fixture.driver_context.blob_handle.as_ref().unwrap();
+        assert_roundtrip(handle, false, "1.2", 20).await;
+        assert_roundtrip(handle, true, "1.1", 40).await;
+    }
+
+    #[tokio::test]
+    async fn stale_holder_offline() {
+        let realm_id = RealmId::from_bytes([61; 32]);
+        let node = bao_node(realm_id).await;
+        node.net.shutdown().await;
+        let hash = [62; 32];
+        let candidate = ExportCandidate {
+            source: CandidateSource::RemoteHash {
+                node_id: iroh::SecretKey::from_bytes(&[63; 32]).public(),
+                hash,
+            },
+            report_source: ExportReportSource::Hash,
+            resolved_version: None,
+            expected_blake3: Some(hash),
+        };
+
+        assert!(matches!(
+            open_candidate(
+                node.driver.as_ref(),
+                &remote_spec(realm_id, UserId::nil(realm_id)),
+                &candidate,
+                true,
+            )
+            .await
+            .unwrap(),
+            CandidateOpen::Status(OpenStatus::Offline)
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_read_ephemeral() {
+        let realm_id = RealmId::from_bytes([71; 32]);
+        let owner = UserId::local(Ulid::from_bytes([72; 16]), realm_id);
+        let group_id = Ulid::from_bytes([73; 16]);
+        let version_id = Ulid::from_bytes([74; 16]);
+        let client = bao_node(realm_id).await;
+        let source = bao_node(realm_id).await;
+        client.net.add_peer_addr(source.net.endpoint_addr()).await;
+        source.net.add_peer_addr(client.net.endpoint_addr()).await;
+        let Event::Blob(BlobEvent::WriteFinished { location }) = source
+            .driver
+            .blob_handle
+            .as_ref()
+            .unwrap()
+            .send_blob_effect(BlobEffect::Write {
+                bucket: "remote".to_string(),
+                key: "payload".to_string(),
+                created_by: owner,
+                blob: byte_stream(FIXTURE_BYTES),
+            })
+            .await
+        else {
+            panic!("source blob write failed")
+        };
+        let hash: [u8; 32] = location.get_blake3().unwrap().try_into().unwrap();
+        seed_bao(
+            &source,
+            client.net.node_id(),
+            owner,
+            group_id,
+            version_id,
+            &location,
+        )
+        .await;
+        let key_spaces = [
+            BLOB_HEAD_KEYSPACE,
+            BLOB_LOCATIONS_KEYSPACE,
+            BLOB_VERSIONS_KEYSPACE,
+            HASH_PATHS_INDEX_KEYSPACE,
+        ];
+        for key_space in key_spaces {
+            assert_eq!(keyspace_len(client.driver.as_ref(), key_space).await, 0);
+        }
+        let exact = VersionedObjectArn::new(
+            realm_id,
+            source.net.node_id(),
+            "remote",
+            "payload",
+            version_id,
+        )
+        .unwrap();
+        let candidate = ExportCandidate {
+            source: CandidateSource::RemoteExact {
+                node_id: source.net.node_id(),
+                target: exact,
+            },
+            report_source: ExportReportSource::Remote,
+            resolved_version: Some(version_id),
+            expected_blake3: Some(hash),
+        };
+
+        let CandidateOpen::Opened(BaoReadOutput::Stream {
+            mut blob,
+            size,
+            blake3,
+        }) = open_candidate(
+            client.driver.as_ref(),
+            &remote_spec(realm_id, owner),
+            &candidate,
+            false,
+        )
+        .await
+        .unwrap()
+        else {
+            panic!("remote Bao read did not open")
+        };
+        let mut received = Vec::new();
+        while let Some(chunk) = blob.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(received, FIXTURE_BYTES);
+        assert_eq!(size, FIXTURE_BYTES.len() as u64);
+        assert_eq!(blake3, hash);
+        for key_space in key_spaces {
+            assert_eq!(keyspace_len(client.driver.as_ref(), key_space).await, 0);
+        }
+        client.net.shutdown().await;
+        source.net.shutdown().await;
+    }
+
+    #[test]
+    fn learns_probe_hash() {
+        let realm_id = RealmId::from_bytes([2; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let version = Ulid::from_bytes([4; 16]);
+        let exact = VersionedObjectArn::new(realm_id, node_id, "bucket", "key", version).unwrap();
+        let document = json!({"@graph": [{"@id": exact.to_w3id(), "@type": "File"}]});
+        let mut entity = recognized_entities(&document, realm_id).unwrap().remove(0);
+        entity.candidates.push(ExportCandidate {
+            source: CandidateSource::RemoteExact {
+                node_id,
+                target: exact,
+            },
+            report_source: ExportReportSource::Remote,
+            resolved_version: Some(version),
+            expected_blake3: None,
+        });
+        let hash = [7; 32];
+
+        assert!(learn_probe_hash(&mut entity, 0, hash));
+        assert_eq!(entity.hash, Some(hash));
+        assert_eq!(entity.hash_realm, Some(realm_id));
+        assert_eq!(entity.candidates[0].expected_blake3, Some(hash));
+        assert!(matches!(
+            &entity.candidates[1],
+            ExportCandidate {
+                source: CandidateSource::RemoteHash {
+                    node_id: holder,
+                    hash: candidate_hash,
+                },
+                report_source: ExportReportSource::Hash,
+                resolved_version: Some(candidate_version),
+                expected_blake3: Some(expected),
+            } if *holder == node_id
+                && *candidate_hash == hash
+                && *candidate_version == version
+                && *expected == hash
+        ));
+        assert!(!learn_probe_hash(&mut entity, 0, hash));
+        assert_eq!(entity.candidates.len(), 2);
+    }
+
+    async fn sample_archive() -> Vec<u8> {
+        let (writer, mut reader) = tokio::io::duplex(4096);
+        let task = tokio::spawn(write_archive(
+            writer,
+            b"metadata".to_vec(),
+            vec![
+                PlannedEntry {
+                    entity_index: 0,
+                    candidate_index: 0,
+                    path: "data/b".to_string(),
+                    source: PlannedSource::Ready(byte_stream(b"b")),
+                    expected_blake3: *blake3::hash(b"b").as_bytes(),
+                },
+                PlannedEntry {
+                    entity_index: 1,
+                    candidate_index: 0,
+                    path: "data/a".to_string(),
+                    source: PlannedSource::Ready(byte_stream(b"a")),
+                    expected_blake3: *blake3::hash(b"a").as_bytes(),
+                },
+            ],
+            Some(b"report".to_vec()),
+            tokio_util::sync::CancellationToken::new(),
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        task.await.unwrap().unwrap();
+        bytes
+    }
+
+    #[test]
+    fn recognizes_identifiers() {
+        let realm_id = RealmId::from_bytes([2; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let version = Ulid::from_bytes([4; 16]);
+        let arn = VersionedObjectArn::new(realm_id, node_id, "bucket", "a b", version).unwrap();
+        let foreign = VersionedObjectArn::new(
+            RealmId::from_bytes([9; 32]),
+            node_id,
+            "bucket",
+            "foreign",
+            version,
+        )
+        .unwrap();
+        let document = json!({
+            "@graph": [
+                file_entity(&arn.to_w3id(), Some("a b")),
+                file_entity(&foreign.to_w3id(), None),
+                {"@id": foreign.to_string(), "@type": "File"},
+                {"@id": "https://example.org/external", "@type": "File"},
+            ]
+        });
+
+        let entities = recognized_entities(&document, realm_id).unwrap();
+
+        assert_eq!(entities[0].exact.as_ref(), Some(&arn));
+        assert_eq!(entities[0].hash, Some([0x11; 32]));
+        assert_eq!(entities[1].omission, None);
+        assert_eq!(entities[2].omission, Some(ReasonCode::Unsupported));
+        assert_eq!(entities[3].omission, Some(ReasonCode::External));
+    }
+
+    #[test]
+    fn recognizes_context_aliases() {
+        let realm_id = RealmId::from_bytes([2; 32]);
+        let document = json!({
+            "@context": [
+                "https://w3id.org/ro/crate/1.2/context",
+                {
+                    "graphItems": "@graph",
+                    "idAlias": "@id",
+                    "typeAlias": "@type",
+                    "downloadAlias": "http://schema.org/contentUrl",
+                    "pathAlias": LOCAL_PATH_IRI
+                }
+            ],
+            "graphItems": [{
+                "idAlias": "data/a.txt",
+                "typeAlias": "File",
+                "downloadAlias": format!(
+                    "{}{}",
+                    aruna_core::structs::ARUNA_DATA_PREFIX,
+                    "11".repeat(32)
+                ),
+                "pathAlias": "data/a.txt"
+            }]
+        });
+
+        let entities = recognized_entities(&document, realm_id).unwrap();
+
+        assert_eq!(entities[0].hash, Some([0x11; 32]));
+        assert_eq!(entities[0].local_path.as_deref(), Some("data/a.txt"));
+    }
+
+    #[test]
+    fn keeps_import_path() {
+        let realm_id = RealmId::from_bytes([2; 32]);
+        let mut entity = file_entity(
+            &format!(
+                "{}{}",
+                aruna_core::structs::ARUNA_DATA_PREFIX,
+                "11".repeat(32)
+            ),
+            None,
+        );
+        entity["localPath"] = json!(["data/canonical.txt", "aaa-original.txt"]);
+        let document = json!({"@graph": [entity]});
+
+        let entities = recognized_entities(&document, realm_id).unwrap();
+
+        assert_eq!(
+            entities[0].local_path.as_deref(),
+            Some("data/canonical.txt")
+        );
+    }
+
+    #[test]
+    fn reports_keyword_aliases() {
+        let mut document = json!({
+            "@context": [
+                "https://w3id.org/ro/crate/1.2/context",
+                {"graphItems": "@graph", "idAlias": "@id"}
+            ],
+            "graphItems": [
+                {"idAlias": "urn:dataset:run-42", "@type": "Dataset"},
+                {
+                    "idAlias": METADATA_PATH,
+                    "@type": "CreativeWork",
+                    "about": {"idAlias": "urn:dataset:run-42"}
+                }
+            ]
+        });
+
+        add_report(&mut document).unwrap();
+
+        assert_eq!(
+            document["graphItems"][0]["subjectOf"]["@id"],
+            JsonValue::String("#aruna-export-report".to_string())
+        );
+        assert_eq!(document["graphItems"][2]["@id"], REPORT_PATH);
+        assert_eq!(
+            document["graphItems"][3]["about"]["@id"],
+            "urn:dataset:run-42"
+        );
+    }
+
+    #[test]
+    fn reports_context_overrides() {
+        let mut document = json!({
+            "@context": [
+                "https://w3id.org/ro/crate/1.2/context",
+                {
+                    "subjectOf": "https://example.test/subject",
+                    "hasPart": "https://example.test/part",
+                    "about": "https://example.test/about",
+                    "encodingFormat": "https://example.test/format",
+                    "name": "https://example.test/name"
+                }
+            ],
+            "@graph": [
+                {
+                    "@id": "./",
+                    "@type": "Dataset",
+                    "hasPart": "preserved"
+                },
+                {
+                    "@id": METADATA_PATH,
+                    "@type": "CreativeWork",
+                    "http://schema.org/about": {"@id": "./"}
+                }
+            ]
+        });
+
+        add_report(&mut document).unwrap();
+
+        assert_eq!(document["@graph"][0]["hasPart"], "preserved");
+        assert_eq!(
+            document["@graph"][0][SCHEMA_SUBJECT_HTTPS_IRI]["@id"],
+            "#aruna-export-report"
+        );
+        assert_eq!(
+            document["@graph"][0][SCHEMA_HAS_PART_HTTPS_IRI]["@id"],
+            REPORT_PATH
+        );
+        assert_eq!(
+            document["@graph"][2][SCHEMA_ENCODING_HTTPS_IRI],
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn scan_ignores_aliases() {
+        let document = json!({
+            "@context": {"node": "@id"},
+            "@graph": [
+                {"node": "old"},
+                {"name": "old"}
+            ]
+        });
+        let found = scan_unrewritten(
+            &document,
+            &BTreeMap::from([("old".to_string(), "new".to_string())]),
+        );
+
+        assert_eq!(found, BTreeSet::from(["old".to_string()]));
+    }
+
+    #[test]
+    fn rejects_report_collision() {
+        let mut document = json!({
+            "@graph": [
+                {"@id": "./", "@type": "Dataset"},
+                {"@id": REPORT_PATH, "@type": "File"}
+            ]
+        });
+
+        assert!(matches!(
+            add_report(&mut document),
+            Err(ExportFailure::Permanent(message))
+                if message.contains("reserved export report")
+        ));
+    }
+
+    #[test]
+    fn plans_ordered_paths() {
+        assert_eq!(safe_zip_path("./a/b.txt").as_deref(), Some("a/b.txt"));
+        assert_eq!(safe_zip_path("../escape"), None);
+        assert_eq!(safe_zip_path("a%2fb"), None);
+        assert_eq!(jsonld_path("data/a file.txt"), "data/a%20file.txt");
+        assert_ne!(
+            synthesized_path([7; 32], "one"),
+            synthesized_path([7; 32], "two")
+        );
+    }
+
+    #[test]
+    fn plan_rejects_oversize() {
+        let realm_id = RealmId::from_bytes([8; 32]);
+        let mut spec = remote_spec(realm_id, UserId::nil(realm_id));
+        spec.limits.export_artifact_bytes = 512;
+        let entities = [ExportEntity {
+            entity_id: "payload".to_string(),
+            local_path: Some("data/payload".to_string()),
+            exact: None,
+            hash: None,
+            hash_realm: None,
+            candidates: Vec::new(),
+            omission: None,
+            message: None,
+            zip_path: Some("data/payload".to_string()),
+            report_source: None,
+            resolved_version: None,
+            path_synthesized: false,
+        }];
+        let opened = [ProbedEntry {
+            entity_index: 0,
+            candidate_index: 0,
+            size: 513,
+            hash: [0; 32],
+            report_source: ExportReportSource::Local,
+            resolved_version: None,
+        }];
+
+        assert!(matches!(
+            precheck_size(&spec, b"{}", None, &opened, &entities),
+            Err(ExportFailure::Permanent(message))
+                if message == "planned ZIP exceeds the 512 byte artifact limit"
+        ));
+    }
+
+    #[test]
+    fn rewrites_report_links() {
+        let mut document = json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {
+                    "@id": "./",
+                    "@type": "Dataset",
+                    "name": "test",
+                    "description": "test crate",
+                    "datePublished": "2026-07-23",
+                    "hasPart": {"@id": "old"}
+                },
+                {
+                    "@id": METADATA_PATH,
+                    "@type": "CreativeWork",
+                    "about": {"@id": "./"},
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"}
+                },
+                {"@id": "old", "@type": "File"}
+            ]
+        });
+        rewrite_ids(
+            &mut document,
+            &BTreeMap::from([("old".to_string(), "data/file".to_string())]),
+        );
+        add_report(&mut document).unwrap();
+
+        assert_eq!(
+            document["@graph"][0]["hasPart"][0]["@id"],
+            JsonValue::String("data/file".to_string())
+        );
+        assert_eq!(
+            document["@graph"][0]["subjectOf"]["@id"],
+            JsonValue::String("#aruna-export-report".to_string())
+        );
+        craqle::validate_rocrate_jsonld(&document.to_string()).unwrap();
+    }
+
+    #[test]
+    fn counts_omission_rows() {
+        let realm_id = RealmId::from_bytes([2; 32]);
+        let document = json!({
+            "@graph": [
+                {"@id": "https://example.org/external", "@type": "File"},
+                file_entity("denied", None),
+                file_entity("included", None),
+            ]
+        });
+        let mut entities = recognized_entities(&document, realm_id).unwrap();
+        entities[1].omission = Some(ReasonCode::Denied);
+        let rows = build_rows(&entities, &BTreeSet::new());
+
+        let (included, omitted) = report_counts(&rows);
+
+        assert_eq!(included, 1);
+        assert_eq!(omitted.external, 1);
+        assert_eq!(omitted.denied, 1);
+        assert_eq!(omitted.missing, 0);
+    }
+
+    #[test]
+    fn checkpoint_prefix_decodes() {
+        let bytes = postcard::to_allocvec(&ExportCheckpoint::default()).unwrap();
+        let (refs, remaining) = postcard::take_from_bytes::<RoCrateCheckpointRefs>(&bytes).unwrap();
+
+        assert_eq!(refs, RoCrateCheckpointRefs::default());
+        assert!(!remaining.is_empty());
+    }
+
+    #[tokio::test]
+    async fn orders_zip_entries() {
+        let bytes = sample_archive().await;
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let names = (0..archive.len())
+            .map(|index| archive.by_index(index).unwrap().name().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                METADATA_PATH.to_string(),
+                "data/a".to_string(),
+                "data/b".to_string(),
+                REPORT_PATH.to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn archives_are_deterministic() {
+        assert_eq!(sample_archive().await, sample_archive().await);
+    }
+
+    #[tokio::test]
+    async fn corrupt_source_retries() {
+        let fixture = setup_driver_context().await;
+        let realm_id = RealmId::from_bytes([81; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[82; 32]).public();
+        let hash = [83; 32];
+        let candidate = ExportCandidate {
+            source: CandidateSource::RemoteHash { node_id, hash },
+            report_source: ExportReportSource::Hash,
+            resolved_version: None,
+            expected_blake3: Some(hash),
+        };
+        let mut checkpoint = ExportCheckpoint {
+            entities: vec![ExportEntity {
+                entity_id: "data/corrupt".to_string(),
+                local_path: None,
+                exact: None,
+                hash: Some(hash),
+                hash_realm: Some(realm_id),
+                candidates: vec![candidate],
+                omission: None,
+                message: None,
+                zip_path: None,
+                report_source: None,
+                resolved_version: None,
+                path_synthesized: false,
+            }],
+            ..Default::default()
+        };
+        let failures = BTreeMap::from([(0, BTreeMap::from([(0, OpenStatus::Corrupt)]))]);
+        let ctx = JobContext {
+            driver: Arc::new(fixture.driver_context.clone()),
+            job_id: JobId::from_bytes([84; 16]),
+            owner_node_id: node_id,
+            claim_token: Ulid::from_bytes([85; 16]),
+            final_attempt: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            progress: ProgressReporter::from_progress(&aruna_core::structs::JobProgress {
+                current: 0,
+                total: None,
+                unit: "entries".to_string(),
+            }),
+        };
+
+        assert!(matches!(
+            probe_sources(
+                &ctx,
+                &remote_spec(realm_id, UserId::nil(realm_id)),
+                &mut checkpoint,
+                &failures,
+            )
+            .await,
+            Err(ExportFailure::Retryable(message))
+                if message == "payload integrity check failed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn signals_corrupt_candidate() {
+        let (writer, mut reader) = tokio::io::duplex(4096);
+        let task = tokio::spawn(write_archive(
+            writer,
+            b"metadata".to_vec(),
+            vec![PlannedEntry {
+                entity_index: 4,
+                candidate_index: 2,
+                path: "data/corrupt".to_string(),
+                source: PlannedSource::Ready(byte_stream(b"wrong")),
+                expected_blake3: [0; 32],
+            }],
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(ExportFailure::Candidate {
+                entity_index: 4,
+                candidate_index: 2,
+                status: OpenStatus::Corrupt,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancels_streaming_archive() {
+        let (writer, mut reader) = tokio::io::duplex(4096);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let task = tokio::spawn(write_archive(
+            writer,
+            b"metadata".to_vec(),
+            vec![PlannedEntry {
+                entity_index: 0,
+                candidate_index: 0,
+                path: "data/pending".to_string(),
+                source: PlannedSource::Ready(BackendStream::new(futures_util::stream::pending::<
+                    Result<Bytes, std::io::Error>,
+                >())),
+                expected_blake3: [0; 32],
+            }],
+            None,
+            cancel,
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+
+        assert!(matches!(task.await.unwrap(), Err(ExportFailure::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn zip64_interoperates() {
+        let mut writer = async_zip::base::write::ZipFileWriter::new(Vec::<u8>::new());
+        for index in 0..70_000u32 {
+            writer
+                .write_entry_whole(zip_entry(&format!("data/{index:08}")), &[])
+                .await
+                .unwrap();
+        }
+        let bytes = writer.close().await.unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
+        assert_eq!(archive.len(), 70_000);
+        let mut last = String::new();
+        archive
+            .by_index(69_999)
+            .unwrap()
+            .read_to_string(&mut last)
+            .unwrap();
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file_mut().write_all(&bytes).unwrap();
+        file.as_file_mut().flush().unwrap();
+        if let Ok(status) = std::process::Command::new("unzip")
+            .arg("-t")
+            .arg(file.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            assert!(status.success());
+        }
+    }
+
+    #[tokio::test]
+    async fn zip64_large_entry() {
+        const ENTRY_SIZE: u64 = u32::MAX as u64 + 2;
+        const CHUNK_SIZE: usize = 1024 * 1024;
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let sparse = Arc::new(AtomicBool::new(false));
+        let mut writer = async_zip::base::write::ZipFileWriter::new(SparseWriter {
+            file: file.reopen().unwrap(),
+            enabled: Arc::clone(&sparse),
+        });
+        let mut entry = writer
+            .write_entry_stream(zip_entry("data/large"))
+            .await
+            .unwrap();
+        let zeros = vec![0; CHUNK_SIZE];
+        sparse.store(true, Ordering::Relaxed);
+        for _ in 0..ENTRY_SIZE / CHUNK_SIZE as u64 {
+            entry.write_all(&zeros).await.unwrap();
+        }
+        entry
+            .write_all(&zeros[..(ENTRY_SIZE % CHUNK_SIZE as u64) as usize])
+            .await
+            .unwrap();
+        sparse.store(false, Ordering::Relaxed);
+        entry.close().await.unwrap();
+        drop(writer.close().await.unwrap());
+
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(file.path()).unwrap()).unwrap();
+        assert_eq!(archive.len(), 1);
+        let archived = archive.by_name("data/large").unwrap();
+        assert_eq!(archived.size(), ENTRY_SIZE);
+        assert_eq!(archived.compressed_size(), ENTRY_SIZE);
+        assert_eq!(archived.compression(), zip::CompressionMethod::Stored);
+        drop(archived);
+        drop(archive);
+
+        if let Ok(status) = std::process::Command::new("unzip")
+            .arg("-t")
+            .arg(file.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            assert!(status.success());
+        }
+    }
+}

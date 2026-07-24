@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aruna_core::structs::{JobError, JobId, JobPayload, JobProgress, JobResultPayload};
+use aruna_core::types::NodeId;
 use tokio_util::sync::CancellationToken;
 
 use crate::driver::DriverContext;
@@ -54,7 +55,9 @@ impl ProgressReporter {
 pub struct JobContext {
     pub driver: Arc<DriverContext>,
     pub job_id: JobId,
+    pub owner_node_id: NodeId,
     pub claim_token: ulid::Ulid,
+    pub final_attempt: bool,
     /// User-initiated cancel: terminal `Cancelled` plus cleanup.
     pub cancel: CancellationToken,
     /// Node shutdown: stop where you are, the lease is handed back and the job re-runs.
@@ -108,6 +111,8 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
             .await
         }
         JobPayload::Staging(spec) => crate::jobs::staging::run_staging_job(ctx, spec).await,
+        JobPayload::ExportRoCrate(spec) => crate::jobs::export::run_export_job(ctx, spec).await,
+        JobPayload::ImportRoCrate(spec) => crate::jobs::import::run_rocrate_import(ctx, spec).await,
         // Guard: an execution job must run through the external attempt path.
         JobPayload::Execution(_) => JobRunOutcome::Failed(JobError::permanent(
             "execution payload dispatched through the in-process seam",
@@ -126,6 +131,8 @@ pub fn run_cleanup(payload: &JobPayload) {
         }
         JobPayload::Execution(_)
         | JobPayload::Staging(_)
+        | JobPayload::ImportRoCrate(_)
+        | JobPayload::ExportRoCrate(_)
         | JobPayload::WriteRunCrate { .. }
         | JobPayload::TerminalCleanup { .. } => {}
     }

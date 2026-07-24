@@ -23,21 +23,7 @@ use ulid::Ulid;
 impl Handle for BlobHandle {
     async fn send_effect(&self, effect: Effect) -> Event {
         match effect {
-            Effect::Blob(blob_effect) => {
-                let (response_tx, response_rx) = oneshot::oneshot();
-                if self
-                    .write_channel
-                    .send((blob_effect, response_tx))
-                    .await
-                    .is_err()
-                {
-                    return Event::Blob(BlobEvent::Error(BlobError::ChannelClosed));
-                }
-                match response_rx.await {
-                    Ok(event) => Event::Blob(event),
-                    Err(_) => Event::Blob(BlobEvent::Error(BlobError::ChannelClosed)),
-                }
-            }
+            Effect::Blob(blob_effect) => self.send_blob_effect(blob_effect).await,
             Effect::StagingSource(staging_source_effect) => {
                 self.send_staging_source_effect(staging_source_effect).await
             }
@@ -59,6 +45,30 @@ impl BlobHandle {
     }
 
     pub async fn send_blob_effect(&self, effect: BlobEffect) -> Event {
+        // Hidden spools may consume streams that request further blob effects.
+        let effect = match effect {
+            BlobEffect::SpoolHidden {
+                namespace,
+                name,
+                created_by,
+                max_bytes,
+                blob,
+            } => {
+                return Event::Blob(
+                    Box::pin(
+                        self.handler
+                            .spool_hidden_blob(namespace, &name, created_by, max_bytes, blob),
+                    )
+                    .await,
+                );
+            }
+            BlobEffect::ReadHiddenRange { location, range } => {
+                return Event::Blob(
+                    Box::pin(self.handler.read_hidden_range(location, range)).await,
+                );
+            }
+            effect => effect,
+        };
         let blob_event = {
             let (response_tx, response_rx) = oneshot::oneshot();
             if self
@@ -193,6 +203,23 @@ impl BlobHandler {
                             self.read_blob_range(location, range).await
                         }
                         BlobEffect::Delete { location } => self.delete_blob(location).await,
+                        BlobEffect::SpoolHidden {
+                            namespace,
+                            name,
+                            created_by,
+                            max_bytes,
+                            blob,
+                        } => {
+                            self.spool_hidden_blob(namespace, &name, created_by, max_bytes, blob)
+                                .await
+                        }
+                        BlobEffect::ReadHiddenRange { location, range } => {
+                            self.read_hidden_range(location, range).await
+                        }
+                        BlobEffect::DeleteHidden { key } => self.delete_hidden_blob(key).await,
+                        BlobEffect::ListHidden { namespace } => {
+                            self.list_hidden_blobs(namespace).await
+                        }
                         BlobEffect::OpenConnection { node_id } => {
                             self.open_connection(node_id).await
                         }
@@ -220,6 +247,16 @@ impl BlobHandler {
                             self.handle_incoming_replication(replication_id, stream_id, keep_alive)
                                 .await
                         }
+                        BlobEffect::ServeRead {
+                            stream_id,
+                            location,
+                            expected_blake3,
+                        } => self.serve_read(stream_id, location, expected_blake3).await,
+                        BlobEffect::ReceiveRead {
+                            stream_id,
+                            size,
+                            expected_blake3,
+                        } => self.receive_read(stream_id, size, expected_blake3).await,
                     };
                     response_tx.send(event);
                 }

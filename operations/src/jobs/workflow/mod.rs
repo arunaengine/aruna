@@ -2113,7 +2113,9 @@ mod tests {
         let ctx = JobContext {
             driver: context(storage.clone()),
             job_id,
+            owner_node_id: record.owner_node_id,
             claim_token: token,
+            final_attempt: false,
             cancel: CancellationToken::new(),
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&record.progress),

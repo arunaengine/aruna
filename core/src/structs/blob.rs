@@ -13,6 +13,8 @@ use std::time::{Duration, SystemTime};
 use ulid::Ulid;
 
 const ACCESS_KEY_MAX_LEN: usize = 128;
+pub const HIDDEN_BLOB_PREFIX: &str = "_jobs";
+pub const OBJECT_CONTENT_TYPE_KEY: &str = "aruna.internal.content-type";
 
 pub fn ensure_confined_relative_path(path: &Path) -> Result<(), ConversionError> {
     for component in path.components() {
@@ -196,6 +198,81 @@ impl BackendLocation {
     pub fn get_blake3(&self) -> Option<&[u8]> {
         self.hashes.get(HASH_BLAKE3).map(|h| h.as_slice())
     }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct HiddenBlobKey {
+    pub root: String,
+    pub storage_bucket: String,
+    pub backend_path: String,
+}
+
+impl HiddenBlobKey {
+    pub fn new(
+        root: String,
+        storage_bucket: String,
+        backend_path: String,
+    ) -> Result<Self, ConversionError> {
+        let key = Self {
+            root,
+            storage_bucket,
+            backend_path,
+        };
+        key.namespace()?;
+        Ok(key)
+    }
+
+    pub fn namespace(&self) -> Result<Ulid, ConversionError> {
+        let path = Path::new(&self.backend_path);
+        ensure_confined_relative_path(path)?;
+        let mut components = path.components().filter_map(|component| match component {
+            Component::Normal(part) => part.to_str(),
+            _ => None,
+        });
+        if components.next() != Some(HIDDEN_BLOB_PREFIX) {
+            return Err(ConversionError::UnsafePath(
+                "path is outside the hidden blob namespace".to_string(),
+            ));
+        }
+        let namespace = components.next().ok_or_else(|| {
+            ConversionError::UnsafePath("hidden blob namespace is missing an id".to_string())
+        })?;
+        if components.next().is_none() {
+            return Err(ConversionError::UnsafePath(
+                "hidden blob namespace is missing a blob path".to_string(),
+            ));
+        }
+        namespace.parse().map_err(|_| {
+            ConversionError::UnsafePath("hidden blob namespace id is invalid".to_string())
+        })
+    }
+
+    pub fn get_storage_path(&self) -> Result<String, ConversionError> {
+        let path = PathBuf::from(&self.storage_bucket).join(&self.backend_path);
+        ensure_confined_relative_path(&path)?;
+        self.namespace()?;
+        path.into_os_string()
+            .into_string()
+            .map_err(|_| ConversionError::OsStringError)
+    }
+}
+
+impl TryFrom<&BackendLocation> for HiddenBlobKey {
+    type Error = ConversionError;
+
+    fn try_from(location: &BackendLocation) -> Result<Self, Self::Error> {
+        Self::new(
+            location.root.clone(),
+            location.storage_bucket.clone(),
+            location.backend_path.clone(),
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HiddenBlobEntry {
+    pub key: HiddenBlobKey,
+    pub modified_at: Option<SystemTime>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -642,7 +719,7 @@ impl UserAccess {
 mod tests {
     use super::{
         BlobHeadKey, BlobVersion, BucketCorsConfiguration, BucketCorsRule, CurrentVersionPointer,
-        HashPathIndexKey, blob_bucket_permission_path, blob_group_permission_path,
+        HashPathIndexKey, HiddenBlobKey, blob_bucket_permission_path, blob_group_permission_path,
         blob_object_permission_path,
     };
     use crate::NodeId;
@@ -905,6 +982,38 @@ mod tests {
             location.get_full_path(),
             Err(ConversionError::UnsafePath(_))
         ));
+    }
+
+    #[test]
+    fn hidden_key_validates() {
+        let namespace = Ulid::from_bytes([4u8; 16]);
+        let key = HiddenBlobKey::new(
+            "/data".to_string(),
+            "storage".to_string(),
+            format!("_jobs/{namespace}/input_01"),
+        )
+        .unwrap();
+
+        assert_eq!(key.namespace().unwrap(), namespace);
+        assert_eq!(
+            key.get_storage_path().unwrap(),
+            format!("storage/_jobs/{namespace}/input_01")
+        );
+    }
+
+    #[test]
+    fn hidden_key_rejects() {
+        for path in [
+            "bucket/object",
+            "_jobs/not-a-ulid/input",
+            "_jobs/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "_jobs/01ARZ3NDEKTSV4RRFFQ69G5FAV/../escape",
+        ] {
+            assert!(
+                HiddenBlobKey::new("/data".to_string(), "storage".to_string(), path.to_string(),)
+                    .is_err()
+            );
+        }
     }
 
     #[test]

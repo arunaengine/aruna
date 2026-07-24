@@ -3,9 +3,11 @@ use crate::error::ServerError;
 use crate::server_state::ServerState;
 use aruna_core::structs::{
     ArunaArn, ArunaArnType, AuthContext, BackendLocation, Permission, SourceMetadata,
+    VersionedObjectArn, W3idDataIdentifier, blob_object_permission_path,
 };
 use aruna_operations::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
 use aruna_operations::driver::drive;
+use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use axum::body::Body;
@@ -160,6 +162,7 @@ enum RequestedObjectId {
         node_id: aruna_core::NodeId,
         hash: [u8; 32],
     },
+    VersionedObject(VersionedObjectArn),
 }
 
 struct ResolvedObject {
@@ -215,7 +218,7 @@ pub async fn get_service_info(
     options,
     path = "/ga4gh/drs/v1/objects/{object_id}",
     tag = "drs",
-    params(("object_id" = String, Path, description = "Canonical w3id content id or content-hash ch ARN locator")),
+    params(("object_id" = String, Path, description = "Aruna data W3ID, content-hash ch ARN, or versioned s3 ARN locator")),
     responses(
         (status = 200, body = DrsAuthorizationsResponse),
         (status = 400, body = DrsErrorPayload),
@@ -248,7 +251,7 @@ pub async fn get_authorizations(
     get,
     path = "/ga4gh/drs/v1/objects/{object_id}",
     tag = "drs",
-    params(("object_id" = String, Path, description = "Canonical w3id content id or content-hash ch ARN locator")),
+    params(("object_id" = String, Path, description = "Aruna data W3ID, content-hash ch ARN, or versioned s3 ARN locator")),
     responses(
         (status = 200, body = DrsObjectResponse),
         (status = 400, body = DrsErrorPayload),
@@ -326,7 +329,7 @@ pub async fn post_objects(
     get,
     path = "/ga4gh/drs/v1/download",
     tag = "drs",
-    params(("object_id" = String, Query, description = "Canonical w3id content id or content-hash ch ARN locator")),
+    params(("object_id" = String, Query, description = "Aruna data W3ID, content-hash ch ARN, or versioned s3 ARN locator")),
     responses(
         (status = 200, description = "Object bytes"),
         (status = 400, body = DrsErrorPayload),
@@ -493,7 +496,88 @@ async fn resolve_object(
             node_id,
             hash,
         } => resolve_content_hash(state, auth, object_id, Some((realm_id, node_id)), &hash).await,
+        RequestedObjectId::VersionedObject(arn) => {
+            resolve_versioned(state, auth, object_id, &arn).await
+        }
     }
+}
+
+async fn resolve_versioned(
+    state: &ServerState,
+    auth: &AuthContext,
+    requested_id: &str,
+    arn: &VersionedObjectArn,
+) -> Result<ResolveOutcome, DrsError> {
+    if arn.realm_id != state.get_realm_id() || arn.node_id != state.get_node_id() {
+        return Ok(ResolveOutcome::NotFound);
+    }
+
+    let bucket_info = match drive(
+        GetBucketInfoOperation::new(arn.bucket.clone()),
+        &state.get_ctx(),
+    )
+    .await
+    {
+        Ok(Some(Ok(info))) => info,
+        Ok(Some(Err(GetBucketInfoError::NotFound)))
+        | Err(GetBucketInfoError::NotFound)
+        | Ok(None) => return Ok(ResolveOutcome::NotFound),
+        Ok(Some(Err(error))) | Err(error) => {
+            return Err(DrsError::internal(error.to_string()));
+        }
+    };
+
+    let head = match drive(
+        HeadObjectOperation::new(HeadObjectInput {
+            bucket: arn.bucket.clone(),
+            key: arn.key.clone(),
+            version_id: Some(arn.version),
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    {
+        Ok(Some(Ok(result))) => result,
+        Ok(Some(Err(
+            HeadObjectError::NoSuchKey
+            | HeadObjectError::NoSuchVersion
+            | HeadObjectError::DeleteMarker,
+        )))
+        | Err(
+            HeadObjectError::NoSuchKey
+            | HeadObjectError::NoSuchVersion
+            | HeadObjectError::DeleteMarker,
+        )
+        | Ok(None) => return Ok(ResolveOutcome::NotFound),
+        Ok(Some(Err(error))) | Err(error) => {
+            return Err(DrsError::internal(error.to_string()));
+        }
+    };
+    let Some(location) = head.location else {
+        return Ok(ResolveOutcome::NotFound);
+    };
+
+    let path = blob_object_permission_path(
+        arn.realm_id,
+        bucket_info.group_id,
+        arn.node_id,
+        &arn.bucket,
+        &arn.key,
+    );
+    if !can_read_permission_path(state, auth, &path).await? {
+        return Ok(ResolveOutcome::Denied);
+    }
+
+    Ok(ResolveOutcome::Found(ResolvedObject {
+        bucket: arn.bucket.clone(),
+        key: arn.key.clone(),
+        group_id: bucket_info.group_id,
+        version_id: arn.version,
+        canonical_w3id: arn.to_w3id(),
+        requested_id: requested_id.to_string(),
+        location,
+        source_metadata: head.source_metadata,
+    }))
 }
 
 async fn resolve_content_hash(
@@ -606,18 +690,22 @@ async fn can_read_permission_path(
 }
 
 fn parse_requested_object_id(object_id: &str) -> Result<RequestedObjectId, DrsError> {
-    if let Some(hash_hex) = object_id.strip_prefix(W3ID_DATA_PREFIX) {
-        let hash = decode_blake3_hex(hash_hex)?;
-        return Ok(RequestedObjectId::CanonicalW3id(hash));
+    if object_id.starts_with(W3ID_DATA_PREFIX) {
+        return match W3idDataIdentifier::parse(object_id)
+            .map_err(|error| DrsError::bad_request(error.to_string()))?
+        {
+            W3idDataIdentifier::ContentHash(hash) => Ok(RequestedObjectId::CanonicalW3id(hash)),
+            W3idDataIdentifier::VersionedObject(arn) => Ok(RequestedObjectId::VersionedObject(arn)),
+        };
     }
 
     let arn =
         ArunaArn::parse(object_id).map_err(|error| DrsError::bad_request(error.to_string()))?;
     debug!(?arn);
     if arn.resource_type == ArunaArnType::S3 {
-        return Err(DrsError::bad_request(
-            "DRS does not support s3 ARN locators; use a canonical w3id id or content-hash ch ARN",
-        ));
+        return VersionedObjectArn::parse(object_id)
+            .map(RequestedObjectId::VersionedObject)
+            .map_err(|error| DrsError::bad_request(error.to_string()));
     }
     let hash = decode_blake3_hex(&arn.path)?;
 
@@ -719,16 +807,33 @@ impl IntoResponse for DrsError {
 #[cfg(test)]
 mod tests {
     use super::{
-        RequestedObjectId, ResolvedObject, W3ID_DATA_PREFIX, build_object_response,
-        drs_denied_error, encode_component, parse_requested_object_id,
+        RequestedObjectId, ResolveOutcome, ResolvedObject, W3ID_DATA_PREFIX, build_object_response,
+        drs_denied_error, encode_component, get_object, parse_requested_object_id, resolve_object,
     };
     use crate::openapi::ApiDoc;
-    use aruna_core::structs::{BackendLocation, RealmId, SourceMetadata};
+    use crate::server_state::ServerState;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
+    };
+    use aruna_core::structs::{
+        Actor, AuthContext, BackendLocation, BlobVersion, BucketInfo, GroupAuthorizationDocument,
+        NodeCapabilities, RealmAuthorizationDocument, RealmId, SourceMetadata, VersionKey,
+        VersionedObjectArn,
+    };
     use aruna_core::{NodeId, UserId};
-    use axum::http::{HeaderMap, HeaderValue};
+    use aruna_operations::driver::DriverContext;
+    use aruna_storage::storage::FjallStorage;
+    use axum::Extension;
+    use axum::body::to_bytes;
+    use axum::extract::{Path, State};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use std::collections::HashMap;
     use std::str::FromStr;
+    use std::sync::Arc;
     use std::time::SystemTime;
+    use tempfile::TempDir;
     use ulid::Ulid;
 
     fn forwarded_headers() -> HeaderMap {
@@ -762,12 +867,140 @@ mod tests {
     }
 
     fn test_realm_id() -> RealmId {
-        RealmId::from_bytes([7u8; 32])
+        RealmId::from_bytes(
+            *ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+                .verifying_key()
+                .as_bytes(),
+        )
     }
 
     fn test_node_id() -> NodeId {
         NodeId::from_str("ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6")
             .unwrap()
+    }
+
+    async fn test_state() -> (TempDir, Arc<ServerState>) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let ctx = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let state = ServerState::new(
+            ctx,
+            test_realm_id(),
+            test_node_id(),
+            NodeCapabilities::local_node(test_realm_id()).expect("capabilities"),
+            false,
+            None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
+        )
+        .await;
+        (dir, Arc::new(state))
+    }
+
+    async fn write_fixture(state: &ServerState, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
+        match state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key: key.into(),
+                value: value.into(),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected fixture write event: {other:?}"),
+        }
+    }
+
+    async fn seed_version(state: &ServerState) -> (AuthContext, AuthContext, VersionedObjectArn) {
+        let realm_id = state.get_realm_id();
+        let node_id = state.get_node_id();
+        let group_id = Ulid::from_bytes([4u8; 16]);
+        let owner = UserId::new(Ulid::from_bytes([5u8; 16]), realm_id);
+        let denied = UserId::new(Ulid::from_bytes([6u8; 16]), realm_id);
+        let actor = Actor {
+            node_id,
+            user_id: owner,
+            realm_id,
+        };
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        write_fixture(
+            state,
+            AUTH_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            realm_auth.to_bytes(&actor).expect("realm auth serializes"),
+        )
+        .await;
+        write_fixture(
+            state,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            group_auth.to_bytes(&actor).expect("group auth serializes"),
+        )
+        .await;
+
+        let bucket = "mybucket";
+        let key = "path/file @ 1.txt";
+        let version = Ulid::from_bytes([7u8; 16]);
+        let hash = [0x33u8; 32];
+        let location = materialized_location(hash);
+        let bucket_info = BucketInfo {
+            group_id,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: owner,
+            cors_configuration: None,
+        };
+        write_fixture(
+            state,
+            S3_BUCKET_KEYSPACE,
+            bucket.as_bytes().to_vec(),
+            bucket_info.to_bytes().expect("bucket serializes"),
+        )
+        .await;
+        write_fixture(
+            state,
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new(bucket, key, version)
+                .to_bytes()
+                .expect("version key serializes"),
+            BlobVersion::materialized(hash, SystemTime::UNIX_EPOCH, owner, None)
+                .to_bytes()
+                .expect("version serializes"),
+        )
+        .await;
+        write_fixture(
+            state,
+            BLOB_LOCATIONS_KEYSPACE,
+            hash.to_vec(),
+            location.to_bytes().expect("location serializes"),
+        )
+        .await;
+
+        (
+            AuthContext {
+                user_id: owner,
+                realm_id,
+                path_restrictions: None,
+            },
+            AuthContext {
+                user_id: denied,
+                realm_id,
+                path_restrictions: None,
+            },
+            VersionedObjectArn::new(realm_id, node_id, bucket, key, version)
+                .expect("versioned ARN"),
+        )
     }
 
     #[test]
@@ -796,6 +1029,7 @@ mod tests {
         match parsed {
             RequestedObjectId::CanonicalW3id(hash) => assert_eq!(hash, expected_hash),
             RequestedObjectId::ContentHashArn { .. } => panic!("expected canonical w3id id"),
+            RequestedObjectId::VersionedObject(_) => panic!("expected canonical w3id id"),
         }
     }
 
@@ -827,26 +1061,139 @@ mod tests {
                 );
             }
             RequestedObjectId::CanonicalW3id(_) => panic!("expected content-hash arn"),
+            RequestedObjectId::VersionedObject(_) => panic!("expected content-hash arn"),
         }
     }
 
     #[test]
-    fn rejects_s3_arn_locator_with_updated_error_message() {
+    fn rejects_malformed_version() {
         let realm_id = test_realm_id();
         let node_id = test_node_id();
-        let arn = format!(
-            "arn:aruna:{realm_id}:{node_id}:s3/mybucket/path/file.txt@01ARZ3NDEKTSV4RRFFQ69G5FAV"
-        );
+        let bare = format!("arn:aruna:{realm_id}:{node_id}:s3/mybucket/path/file.txt@invalid");
 
-        let error = parse_requested_object_id(&arn)
-            .err()
-            .expect("s3 ARN locators should be rejected");
+        for object_id in [bare.clone(), format!("{W3ID_DATA_PREFIX}{bare}")] {
+            let error = parse_requested_object_id(&object_id)
+                .err()
+                .expect("malformed version should be rejected");
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            assert!(
+                error
+                    .message
+                    .contains("versioned object ARN has an invalid ULID")
+            );
+        }
+    }
 
-        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
-        assert_eq!(
-            error.message,
-            "DRS does not support s3 ARN locators; use a canonical w3id id or content-hash ch ARN"
+    #[tokio::test]
+    async fn resolves_versioned_ids() {
+        let (_dir, state) = test_state().await;
+        let (auth, _, arn) = seed_version(state.as_ref()).await;
+
+        for object_id in [arn.to_string(), arn.to_w3id()] {
+            let outcome = resolve_object(state.as_ref(), &auth, &object_id)
+                .await
+                .expect("version resolves");
+            let ResolveOutcome::Found(resolved) = outcome else {
+                panic!("expected resolved version");
+            };
+            assert_eq!(resolved.bucket, arn.bucket);
+            assert_eq!(resolved.key, arn.key);
+            assert_eq!(resolved.version_id, arn.version);
+            assert_eq!(resolved.group_id, Ulid::from_bytes([4u8; 16]));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_nonlocal_version() {
+        let (_dir, state) = test_state().await;
+        let auth = AuthContext {
+            user_id: UserId::new(Ulid::from_bytes([5u8; 16]), state.get_realm_id()),
+            realm_id: state.get_realm_id(),
+            path_restrictions: None,
+        };
+        let other_node = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+        let other_realm = RealmId::from_bytes(
+            *ed25519_dalek::SigningKey::from_bytes(&[9u8; 32])
+                .verifying_key()
+                .as_bytes(),
         );
+        let version = Ulid::from_bytes([7u8; 16]);
+        let arns = [
+            VersionedObjectArn::new(
+                state.get_realm_id(),
+                other_node,
+                "mybucket",
+                "path/file.txt",
+                version,
+            )
+            .unwrap(),
+            VersionedObjectArn::new(
+                other_realm,
+                state.get_node_id(),
+                "mybucket",
+                "path/file.txt",
+                version,
+            )
+            .unwrap(),
+        ];
+
+        for arn in arns {
+            let response = get_object(
+                State(state.clone()),
+                Extension(Some(auth.clone())),
+                HeaderMap::new(),
+                Path(arn.to_string()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body");
+            let payload: serde_json::Value =
+                serde_json::from_slice(&body).expect("typed error body");
+            assert_eq!(payload["status_code"], 404);
+            assert_eq!(payload["msg"], "DRS object not found");
+        }
+    }
+
+    #[tokio::test]
+    async fn enforces_version_auth() {
+        let (_dir, state) = test_state().await;
+        let (_, denied, arn) = seed_version(state.as_ref()).await;
+
+        let outcome = resolve_object(state.as_ref(), &denied, &arn.to_string())
+            .await
+            .expect("authorization resolves");
+        assert!(matches!(outcome, ResolveOutcome::Denied));
+    }
+
+    #[tokio::test]
+    async fn returns_missing_version() {
+        let (_dir, state) = test_state().await;
+        let (auth, _, arn) = seed_version(state.as_ref()).await;
+        let missing = VersionedObjectArn::new(
+            arn.realm_id,
+            arn.node_id,
+            arn.bucket,
+            arn.key,
+            Ulid::from_bytes([8u8; 16]),
+        )
+        .unwrap();
+
+        let response = get_object(
+            State(state),
+            Extension(Some(auth)),
+            HeaderMap::new(),
+            Path(missing.to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("typed error body");
+        assert_eq!(payload["status_code"], 404);
+        assert_eq!(payload["msg"], "DRS object not found");
     }
 
     #[test]

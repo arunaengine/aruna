@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use craqle::VectorClock;
 use serde::{Deserialize, Serialize};
@@ -46,7 +46,7 @@ pub struct MetadataCreateCrateRequest {
     pub name: String,
     pub description: String,
     pub date_published: String,
-    pub license: String,
+    pub license: Option<String>,
     pub policy: MetadataGraphPolicy,
     #[serde(default)]
     pub durability: MetadataRequestDurability,
@@ -60,7 +60,7 @@ pub enum MetadataCreateEventPayload {
         name: String,
         description: String,
         date_published: String,
-        license: String,
+        license: Option<String>,
     },
     RoCrate {
         jsonld: String,
@@ -117,6 +117,301 @@ pub struct MetadataCreateEventRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataRawRevision {
+    pub jsonld: String,
+    pub winning_event_id: Ulid,
+    pub context_digest: [u8; 32],
+    pub dataset_digest: Option<[u8; 32]>,
+}
+
+#[derive(Deserialize)]
+struct MetadataRawContext<'a> {
+    #[serde(borrow, rename = "@context")]
+    context: &'a serde_json::value::RawValue,
+}
+
+pub fn resolve_raw_revision(
+    events: &[MetadataCreateEventRecord],
+) -> Result<Option<MetadataRawRevision>, MetadataError> {
+    let Some(base) = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.payload,
+                MetadataCreateEventPayload::RoCrate { .. }
+                    | MetadataCreateEventPayload::ReplaceRoCrate { .. }
+            )
+        })
+        .max_by_key(|event| (event.record.updated_at_ms, event.event_id))
+    else {
+        return Ok(None);
+    };
+    let jsonld = match &base.payload {
+        MetadataCreateEventPayload::RoCrate { jsonld }
+        | MetadataCreateEventPayload::ReplaceRoCrate { jsonld } => jsonld,
+        _ => unreachable!(),
+    };
+    let raw_context: MetadataRawContext = serde_json::from_str(jsonld)
+        .map_err(|error| MetadataError::InvalidInput(error.to_string()))?;
+    let context_digest = *blake3::hash(raw_context.context.get().as_bytes()).as_bytes();
+    let mut document: serde_json::Value = serde_json::from_str(jsonld)
+        .map_err(|error| MetadataError::InvalidInput(error.to_string()))?;
+    let mut updates = events
+        .iter()
+        .filter(|event| {
+            event.event_id > base.event_id
+                && matches!(
+                    event.payload,
+                    MetadataCreateEventPayload::UpsertDataEntity { .. }
+                        | MetadataCreateEventPayload::UpsertContextualEntity { .. }
+                )
+        })
+        .collect::<Vec<_>>();
+    updates.sort_by_key(|event| event.event_id);
+    let mut winning_event_id = base.event_id;
+    for event in updates {
+        let (jsonld, link_root) = match &event.payload {
+            MetadataCreateEventPayload::UpsertDataEntity { jsonld } => (jsonld, true),
+            MetadataCreateEventPayload::UpsertContextualEntity { jsonld } => (jsonld, false),
+            _ => unreachable!(),
+        };
+        apply_raw_upsert(&mut document, jsonld, link_root)?;
+        winning_event_id = event.event_id;
+    }
+    let jsonld = serde_json::to_string(&document)
+        .map_err(|error| MetadataError::InvalidInput(error.to_string()))?;
+    let dataset_digest = craqle::canonicalize_jsonld(&jsonld)
+        .ok()
+        .map(|canonical| canonical.digest);
+    Ok(Some(MetadataRawRevision {
+        jsonld,
+        winning_event_id,
+        context_digest,
+        dataset_digest,
+    }))
+}
+
+pub fn apply_raw_upsert(
+    document: &mut serde_json::Value,
+    jsonld: &str,
+    link_root: bool,
+) -> Result<(), MetadataError> {
+    let mut entity: serde_json::Value = serde_json::from_str(jsonld)
+        .map_err(|error| MetadataError::InvalidInput(error.to_string()))?;
+    let terms = RawTerms::new(document);
+    let entity_id = raw_entity_id(&entity, &terms)
+        .ok_or_else(|| MetadataError::InvalidInput("entity @id is missing".to_string()))?;
+    if let Some(value) = entity.as_object_mut().and_then(|entity| {
+        entity
+            .iter_mut()
+            .find_map(|(key, value)| terms.is_id(key).then_some(value))
+    }) {
+        *value = serde_json::Value::String(entity_id.clone());
+    }
+    let graph = document
+        .as_object_mut()
+        .and_then(|object| {
+            object
+                .iter_mut()
+                .find_map(|(key, value)| terms.is_graph(key).then_some(value))
+        })
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| {
+            MetadataError::InvalidInput("RO-Crate @graph array is missing".to_string())
+        })?;
+    if let Some(existing) = graph
+        .iter_mut()
+        .find(|entry| raw_entity_id(entry, &terms).as_deref() == Some(entity_id.as_str()))
+    {
+        let existing = existing.as_object_mut().ok_or_else(|| {
+            MetadataError::InvalidInput("RO-Crate entity must be an object".to_string())
+        })?;
+        let update = entity.as_object().ok_or_else(|| {
+            MetadataError::InvalidInput("entity payload must be an object".to_string())
+        })?;
+        for (property, value) in update {
+            if terms.is_id(property) {
+                existing.retain(|key, _| !terms.is_id(key));
+            }
+            existing.insert(property.clone(), value.clone());
+        }
+    } else {
+        graph.push(entity);
+    }
+    if link_root {
+        link_raw_entity(graph, &entity_id, &terms)?;
+    }
+    Ok(())
+}
+
+struct RawTerms {
+    terms: HashMap<String, Option<String>>,
+}
+
+impl RawTerms {
+    fn new(document: &serde_json::Value) -> Self {
+        let mut terms = HashMap::new();
+        if let Some(context) = document.get("@context") {
+            collect_raw_terms(context, &mut terms);
+        }
+        Self { terms }
+    }
+
+    fn is_id(&self, key: &str) -> bool {
+        key == "@id"
+            || self
+                .terms
+                .get(key)
+                .is_some_and(|iri| iri.as_deref() == Some("@id"))
+    }
+
+    fn is_graph(&self, key: &str) -> bool {
+        key == "@graph"
+            || self
+                .terms
+                .get(key)
+                .is_some_and(|iri| iri.as_deref() == Some("@graph"))
+    }
+
+    fn expands_to(&self, key: &str, values: &[&str]) -> bool {
+        match self.terms.get(key) {
+            Some(Some(iri)) => values.contains(&iri.as_str()),
+            Some(None) => false,
+            None => values.contains(&key),
+        }
+    }
+
+    fn term_matches(&self, term: &str, values: &[&str]) -> bool {
+        match self.terms.get(term) {
+            Some(Some(iri)) => values.contains(&iri.as_str()),
+            Some(None) => false,
+            None => true,
+        }
+    }
+}
+
+fn collect_raw_terms(context: &serde_json::Value, terms: &mut HashMap<String, Option<String>>) {
+    match context {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_raw_terms(value, terms);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (term, definition) in values {
+                let iri = match definition {
+                    serde_json::Value::String(iri) => Some(iri.as_str()),
+                    serde_json::Value::Object(definition) => {
+                        definition.get("@id").and_then(serde_json::Value::as_str)
+                    }
+                    _ => None,
+                };
+                terms.insert(term.clone(), iri.map(str::to_string));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn raw_entity_id(entity: &serde_json::Value, terms: &RawTerms) -> Option<String> {
+    let id = entity
+        .as_object()?
+        .iter()
+        .find_map(|(key, value)| terms.is_id(key).then(|| value.as_str()).flatten())?;
+    Some(
+        if id == "ro-crate-metadata.json"
+            || id.starts_with("./")
+            || id.starts_with("../")
+            || id.starts_with('#')
+            || id.starts_with("_:")
+            || id.contains("://")
+            || (id.contains(':') && !id.contains('/'))
+        {
+            id.to_string()
+        } else {
+            format!("./{id}")
+        },
+    )
+}
+
+fn link_raw_entity(
+    graph: &mut [serde_json::Value],
+    entity_id: &str,
+    terms: &RawTerms,
+) -> Result<(), MetadataError> {
+    let root_id = graph
+        .iter()
+        .find(|entry| raw_entity_id(entry, terms).as_deref() == Some("ro-crate-metadata.json"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|descriptor| {
+            descriptor.iter().find_map(|(key, value)| {
+                terms
+                    .expands_to(
+                        key,
+                        &[
+                            "about",
+                            "schema:about",
+                            "http://schema.org/about",
+                            "https://schema.org/about",
+                        ],
+                    )
+                    .then(|| raw_entity_id(value, terms))
+                    .flatten()
+            })
+        })
+        .unwrap_or_else(|| "./".to_string());
+    let root = graph
+        .iter_mut()
+        .find(|entry| raw_entity_id(entry, terms).as_deref() == Some(root_id.as_str()))
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| MetadataError::InvalidInput("RO-Crate root is missing".to_string()))?;
+    let has_part = root
+        .keys()
+        .find(|key| {
+            terms.expands_to(
+                key,
+                &[
+                    "hasPart",
+                    "schema:hasPart",
+                    "http://schema.org/hasPart",
+                    "https://schema.org/hasPart",
+                ],
+            )
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            if terms.term_matches(
+                "hasPart",
+                &[
+                    "schema:hasPart",
+                    "http://schema.org/hasPart",
+                    "https://schema.org/hasPart",
+                ],
+            ) {
+                "hasPart".to_string()
+            } else {
+                "https://schema.org/hasPart".to_string()
+            }
+        });
+    let reference = serde_json::json!({ "@id": entity_id });
+    match root.get_mut(&has_part) {
+        Some(serde_json::Value::Array(values))
+            if values
+                .iter()
+                .any(|value| raw_entity_id(value, terms).as_deref() == Some(entity_id)) => {}
+        Some(serde_json::Value::Array(values)) => values.push(reference),
+        Some(value) if raw_entity_id(value, terms).as_deref() == Some(entity_id) => {}
+        Some(value) => {
+            *value = serde_json::Value::Array(vec![value.clone(), reference]);
+        }
+        None => {
+            root.insert(has_part, serde_json::Value::Array(vec![reference]));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetadataDocumentLifecycleRecord {
     Upsert {
         event: Box<MetadataCreateEventRecord>,
@@ -170,6 +465,8 @@ pub struct MetadataMaterializationStatusRecord {
     pub document_id: Ulid,
     pub event_id: Ulid,
     pub graph_iri: String,
+    pub context_digest: Option<[u8; 32]>,
+    pub dataset_digest: Option<[u8; 32]>,
     pub state: MetadataMaterializationState,
     pub attempts: u32,
     pub last_error: Option<String>,
@@ -191,6 +488,8 @@ impl MetadataMaterializationStatusRecord {
             document_id: event.record.document_id,
             event_id: event.event_id,
             graph_iri: event.record.graph_iri.clone(),
+            context_digest: None,
+            dataset_digest: None,
             state: MetadataMaterializationState::Pending,
             attempts: 0,
             last_error: None,
@@ -548,10 +847,20 @@ pub enum MetadataError {
     TaskJoin(String),
     #[error("invalid metadata input: {0}")]
     InvalidInput(String),
+    #[error("metadata validation failed: {0:?}")]
+    Validation(Vec<MetadataValidationViolation>),
     #[error("metadata graph not found")]
     GraphNotFound,
     #[error("metadata backend error: {0}")]
     Backend(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataValidationViolation {
+    pub code: String,
+    pub message: String,
+    pub pointer: String,
+    pub entity_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -559,7 +868,8 @@ mod tests {
     use super::{
         MetadataClockRelation, MetadataCreateEventPayload, MetadataCreateEventRecord,
         MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
-        MetadataGraphLifecycleRecord, MetadataQueryResults, compare_metadata_clocks,
+        MetadataGraphLifecycleRecord, MetadataQueryResults, apply_raw_upsert,
+        compare_metadata_clocks, resolve_raw_revision,
     };
     use crate::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use crate::{NodeId, UserId};
@@ -638,10 +948,237 @@ mod tests {
                 name: "Lifecycle".to_string(),
                 description: "Lifecycle envelope".to_string(),
                 date_published: "2026-01-01".to_string(),
-                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             },
             occurred_at_ms: 1,
         }
+    }
+
+    fn raw_event(
+        document_id: Ulid,
+        event_id: Ulid,
+        updated_at_ms: u64,
+        payload: MetadataCreateEventPayload,
+    ) -> MetadataCreateEventRecord {
+        let mut event = create_event(document_id, event_id);
+        event.record.updated_at_ms = updated_at_ms;
+        event.record.last_event_id = event_id;
+        event.occurred_at_ms = updated_at_ms;
+        event.payload = payload;
+        event
+    }
+
+    #[test]
+    fn raw_revision_replays() {
+        let document_id = Ulid::generate();
+        let base_id = Ulid::from_parts(2, 0);
+        let context_id = Ulid::from_parts(3, 0);
+        let data_id = Ulid::from_parts(4, 0);
+        let base = serde_json::json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "about": { "@id": "./" }
+                },
+                {
+                    "@id": "./",
+                    "@type": "Dataset",
+                    "name": "crate"
+                },
+                {
+                    "@id": "#person",
+                    "@type": "Person",
+                    "name": "before",
+                    "affiliation": { "@id": "#org" }
+                }
+            ]
+        });
+        let events = vec![
+            raw_event(
+                document_id,
+                base_id,
+                2,
+                MetadataCreateEventPayload::RoCrate {
+                    jsonld: base.to_string(),
+                },
+            ),
+            raw_event(
+                document_id,
+                context_id,
+                3,
+                MetadataCreateEventPayload::UpsertContextualEntity {
+                    jsonld: serde_json::json!({
+                        "@id": "#person",
+                        "@type": "Person",
+                        "name": "after"
+                    })
+                    .to_string(),
+                },
+            ),
+            raw_event(
+                document_id,
+                data_id,
+                4,
+                MetadataCreateEventPayload::UpsertDataEntity {
+                    jsonld: serde_json::json!({
+                        "@id": "data/file.txt",
+                        "@type": "File",
+                        "name": "file"
+                    })
+                    .to_string(),
+                },
+            ),
+        ];
+
+        let revision = resolve_raw_revision(&events).unwrap().unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&revision.jsonld).unwrap();
+        let graph = raw["@graph"].as_array().unwrap();
+        let person = graph
+            .iter()
+            .find(|entry| entry["@id"] == "#person")
+            .unwrap();
+        assert_eq!(person["name"], "after");
+        assert_eq!(person["affiliation"]["@id"], "#org");
+        let root = graph.iter().find(|entry| entry["@id"] == "./").unwrap();
+        assert_eq!(root["hasPart"][0]["@id"], "./data/file.txt");
+        assert_eq!(revision.winning_event_id, data_id);
+    }
+
+    #[test]
+    fn raw_uses_lww() {
+        let document_id = Ulid::generate();
+        let newer_id = Ulid::from_parts(2, 0);
+        let later_id = Ulid::from_parts(3, 0);
+        let document = |name: &str| {
+            serde_json::json!({
+                "@context": "https://w3id.org/ro/crate/1.2/context",
+                "@graph": [{ "@id": "./", "@type": "Dataset", "name": name }]
+            })
+            .to_string()
+        };
+        let events = vec![
+            raw_event(
+                document_id,
+                newer_id,
+                10,
+                MetadataCreateEventPayload::RoCrate {
+                    jsonld: document("winner"),
+                },
+            ),
+            raw_event(
+                document_id,
+                later_id,
+                9,
+                MetadataCreateEventPayload::ReplaceRoCrate {
+                    jsonld: document("later event"),
+                },
+            ),
+        ];
+
+        let revision = resolve_raw_revision(&events).unwrap().unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&revision.jsonld).unwrap();
+        assert_eq!(raw["@graph"][0]["name"], "winner");
+        assert_eq!(revision.winning_event_id, newer_id);
+    }
+
+    #[test]
+    fn raw_context_digest() {
+        let document_id = Ulid::generate();
+        let event_id = Ulid::from_parts(2, 0);
+        let jsonld = r#"{"@context":[ "https://w3id.org/ro/crate/1.2/context" ],"@graph":[]}"#;
+        let events = vec![raw_event(
+            document_id,
+            event_id,
+            1,
+            MetadataCreateEventPayload::RoCrate {
+                jsonld: jsonld.to_string(),
+            },
+        )];
+
+        let revision = resolve_raw_revision(&events).unwrap().unwrap();
+        assert_eq!(
+            revision.context_digest,
+            *blake3::hash(br#"[ "https://w3id.org/ro/crate/1.2/context" ]"#).as_bytes()
+        );
+        assert!(revision.dataset_digest.is_some());
+    }
+
+    #[test]
+    fn raw_aliases_apply() {
+        let mut document = serde_json::json!({
+            "@context": [
+                "https://w3id.org/ro/crate/1.2/context",
+                {
+                    "items": "@graph",
+                    "node": "@id",
+                    "relation": "http://schema.org/about",
+                    "parts": "http://schema.org/hasPart"
+                }
+            ],
+            "items": [
+                {
+                    "node": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "relation": {"node": "./"}
+                },
+                {
+                    "node": "./",
+                    "@type": "Dataset",
+                    "parts": []
+                }
+            ]
+        });
+        let entity = serde_json::json!({
+            "node": "data/a.txt",
+            "@type": "File",
+            "name": "a"
+        })
+        .to_string();
+
+        apply_raw_upsert(&mut document, &entity, true).unwrap();
+
+        assert_eq!(document["items"][2]["node"], "./data/a.txt");
+        assert_eq!(document["items"][1]["parts"][0]["@id"], "./data/a.txt");
+    }
+
+    #[test]
+    fn raw_overrides_preserved() {
+        let mut document = serde_json::json!({
+            "@context": [
+                "https://w3id.org/ro/crate/1.2/context",
+                {
+                    "about": "https://example.test/about",
+                    "hasPart": "https://example.test/hasPart"
+                }
+            ],
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "http://schema.org/about": {"@id": "./"}
+                },
+                {
+                    "@id": "./",
+                    "@type": "Dataset",
+                    "hasPart": "preserved"
+                }
+            ]
+        });
+        let entity = serde_json::json!({
+            "@id": "data/a.txt",
+            "@type": "File"
+        })
+        .to_string();
+
+        apply_raw_upsert(&mut document, &entity, true).unwrap();
+
+        assert_eq!(document["@graph"][1]["hasPart"], "preserved");
+        assert_eq!(
+            document["@graph"][1]["https://schema.org/hasPart"][0]["@id"],
+            "./data/a.txt"
+        );
     }
 
     #[test]

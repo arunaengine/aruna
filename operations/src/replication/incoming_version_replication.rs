@@ -26,7 +26,7 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
     CurrentVersionPointer, MultipartObjectMetadataKey, Permission, RealmConfigDocument, RealmId,
-    ReplicationItemKind, ReplicationNegotiationResult, UsageDelta, VersionKey,
+    ReplicationItemKind, ReplicationNegotiationResult, RoCrateLimits, UsageDelta, VersionKey,
     blob_bucket_permission_path, blob_object_permission_path,
 };
 use aruna_core::task::TaskEvent;
@@ -167,6 +167,7 @@ pub struct IncomingVersionReplicationOperation {
     cleanup_blob_location: Option<BackendLocation>,
     apply_committed: bool,
     output: Option<Result<IncomingVersionReplicationResult, IncomingVersionReplicationError>>,
+    rocrate_limits: RoCrateLimits,
 }
 
 impl IncomingVersionReplicationOperation {
@@ -203,7 +204,13 @@ impl IncomingVersionReplicationOperation {
             cleanup_blob_location: None,
             apply_committed: false,
             output: None,
+            rocrate_limits: RoCrateLimits::default(),
         }
+    }
+
+    pub fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
+        self.rocrate_limits = limits;
+        self
     }
 
     fn state_name(&self) -> &'static str {
@@ -1097,11 +1104,15 @@ impl IncomingVersionReplicationOperation {
         };
 
         self.state = IncomingVersionReplicationState::RegisterBlobInDht;
-        let effect =
-            match dht_registration_effect(blake3_hash, self.local_realm_id, self.local_node_id) {
-                Ok(effect) => effect,
-                Err(_) => return self.send_apply_complete(),
-            };
+        let effect = match dht_registration_effect(
+            blake3_hash,
+            self.local_realm_id,
+            self.local_node_id,
+            &self.rocrate_limits,
+        ) {
+            Ok(effect) => effect,
+            Err(_) => return self.send_apply_complete(),
+        };
         smallvec![effect]
     }
 

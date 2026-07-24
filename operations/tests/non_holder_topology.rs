@@ -358,7 +358,7 @@ fn document_config(
             name: "Topology Dataset".to_string(),
             description: "Written on a realm above the replication factor".to_string(),
             date_published: "2026-01-01".to_string(),
-            license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
         },
     }
 }
