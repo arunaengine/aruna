@@ -3280,6 +3280,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finish_keeps_newer() {
+        // A newer job enqueued after the guard snapshot has its status
+        // overwritten by the older completion; it must still be scanned as due
+        // rather than pruned, so the overwrite is self-healing.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let document_id = Ulid::from_bytes([77u8; 16]);
+        let old_event_id = Ulid::from_parts(1, 1);
+        let newer_event_id = Ulid::from_parts(2, 1);
+        let old_event = create_event(document_id, old_event_id, "old");
+        let newer_event = create_event(document_id, newer_event_id, "newer");
+        let old_job = MetadataMaterializationJobRecord {
+            document_id,
+            event_id: old_event_id,
+            due_at_ms: 1,
+            attempts: 0,
+            failures: 0,
+        };
+        let (_, old_job_key, _) = metadata_materialization_job_write_entry(&old_job).unwrap();
+        write_entries(
+            &storage,
+            vec![
+                metadata_create_event_write_entry(&old_event).unwrap(),
+                metadata_materialization_job_write_entry(&old_job).unwrap(),
+                metadata_materialization_document_job_write_entry(&old_job).unwrap(),
+            ],
+        )
+        .await;
+        let finished = vec![FinishedMaterializationJob::Completed(
+            CompletedMaterializationJob {
+                job_key: old_job_key.to_vec(),
+                document_job_key: Some(
+                    metadata_materialization_document_job_key(document_id, old_event_id).to_vec(),
+                ),
+                status: Some(materialization_success_status(&old_job, &old_event, None)),
+                iri_index_writes: Vec::new(),
+                raw_state_write: None,
+                sync: None,
+            },
+        )];
+        let plan = plan_finish_chunk(&storage, finished).await.unwrap();
+
+        // The newer event lands after the snapshot was taken.
+        let newer_job = MetadataMaterializationJobRecord {
+            document_id,
+            event_id: newer_event_id,
+            due_at_ms: 1,
+            attempts: 0,
+            failures: 0,
+        };
+        write_entries(
+            &storage,
+            vec![
+                metadata_create_event_write_entry(&newer_event).unwrap(),
+                metadata_materialization_status_write_entry(&new_pending_materialization_status(
+                    &newer_event,
+                    2,
+                ))
+                .unwrap(),
+                metadata_materialization_job_write_entry(&newer_job).unwrap(),
+                metadata_materialization_document_job_write_entry(&newer_job).unwrap(),
+            ],
+        )
+        .await;
+
+        let txn_id = start_write_transaction(&storage).await.unwrap();
+        transactional_batch_write(&storage, txn_id, plan.writes)
+            .await
+            .unwrap();
+        transactional_batch_delete(&storage, txn_id, plan.deletes)
+            .await
+            .unwrap();
+        commit_storage_transaction(&storage, txn_id).await.unwrap();
+
+        let (jobs, _, _) = scan_due_materialization_jobs(
+            &storage,
+            unix_timestamp_millis(),
+            MATERIALIZATION_BATCH_SIZE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            jobs.iter().map(|(_, job)| job.event_id).collect::<Vec<_>>(),
+            vec![newer_event_id],
+            "the newer job survives the older completion"
+        );
+    }
+
+    #[tokio::test]
     async fn finish_does_not_regress_newer_status() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
