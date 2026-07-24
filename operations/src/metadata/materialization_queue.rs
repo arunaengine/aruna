@@ -54,8 +54,9 @@ const MATERIALIZATION_MAX_ATTEMPTS: u32 = 10;
 
 pub const METADATA_MATERIALIZATION_POLL_AFTER: Duration = Duration::from_secs(5);
 pub const METADATA_MATERIALIZATION_RETRY_AFTER: Duration = Duration::from_secs(1);
-// Small gap between full batches so the timer runtime, other timers, and the
-// storage lanes get scheduled and a healthy drain cannot monopolize the system.
+// Best-effort gap between full batches; enqueue ResetTimer(ZERO) and refire on
+// completion can bypass it under continuous refill, so real fairness is enforced
+// by the bulk storage lane, not this constant.
 pub const METADATA_MATERIALIZATION_NEXT_BATCH_AFTER: Duration = Duration::from_millis(25);
 
 #[derive(Debug)]
