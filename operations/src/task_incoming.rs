@@ -103,6 +103,8 @@ pub static UNDELIVERABLE_RECORD_COUNT: std::sync::atomic::AtomicU64 =
 
 const DRAIN_SUBBATCH_RECORDS: usize = 512;
 const DURABLE_QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
+/// Rearm ticks between dead-letter sweeps, i.e. one sweep a minute.
+const DEAD_LETTER_SWEEP_TICKS: usize = 12;
 /// How long a record may wait for its shard topic's genesis before the drain
 /// stops treating the wait as normal and says so at error level.
 const OUTBOX_STUCK_AFTER: Duration = Duration::from_secs(300);
@@ -1778,11 +1780,13 @@ fn spawn_durable_queue_rearm(context: &Arc<DriverContext>, task_handle: &TaskHan
 }
 
 async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: TaskHandle) {
+    let mut ticks = 0usize;
     loop {
         tokio::time::sleep(DURABLE_QUEUE_REARM_AFTER).await;
         let Some(context) = context.upgrade() else {
             return;
         };
+        ticks = ticks.saturating_add(1);
         restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
         restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
@@ -1797,7 +1801,11 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
         )
         .await;
         restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
-        sweep_dead_letters(&context.storage_handle).await;
+        // Dead letters retry on a minute-scale backoff, so sweeping every rearm
+        // tick would scan the keyspace far more often than it can yield work.
+        if ticks.is_multiple_of(DEAD_LETTER_SWEEP_TICKS) {
+            sweep_dead_letters(&context.storage_handle).await;
+        }
         restore_metadata_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
         restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
         restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
