@@ -40,9 +40,9 @@ use crate::jobs::runtime::JobsRuntime;
 use crate::jobs::store::release_job;
 use crate::jobs::{JOB_DRAIN_RETRY_AFTER, JOB_PRUNE_POLL_AFTER, JOB_PRUNE_RETRY_AFTER};
 use crate::metadata::materialization_queue::{
-    METADATA_MATERIALIZATION_POLL_AFTER, METADATA_MATERIALIZATION_RETRY_AFTER,
-    metadata_materialization_jobs_exist, process_metadata_materialization_batch,
-    restore_metadata_materialization_timer,
+    METADATA_MATERIALIZATION_NEXT_BATCH_AFTER, METADATA_MATERIALIZATION_POLL_AFTER,
+    METADATA_MATERIALIZATION_RETRY_AFTER, metadata_materialization_jobs_exist,
+    process_metadata_materialization_batch, restore_metadata_materialization_timer,
 };
 use crate::metadata::projector::{
     METADATA_PROJECTION_RETRY_AFTER, drain_pending_metadata_projection_queue,
@@ -1176,7 +1176,7 @@ impl OperationsTaskHandler {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(
                     TaskKey::DrainMetadataMaterializationQueue,
-                    std::time::Duration::ZERO,
+                    METADATA_MATERIALIZATION_NEXT_BATCH_AFTER,
                 )
                 .await;
             }
