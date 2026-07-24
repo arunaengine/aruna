@@ -340,10 +340,13 @@ impl StorageHandle {
         let active_txn_id = active_txn_id_for_effect(&effect);
         let span = storage_effect_span(&effect);
         let in_flight = InFlightGuard::acquire(&self.metrics);
-        match self
-            .channel_for(&effect)
-            .try_send((effect, response_tx, span, Instant::now(), in_flight))
-        {
+        match self.channel_for(&effect).try_send((
+            effect,
+            response_tx,
+            span,
+            Instant::now(),
+            in_flight,
+        )) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 if let Some(txn_id) = active_txn_id {
@@ -388,10 +391,13 @@ impl StorageHandle {
         let effect = StorageEffect::AbortTransaction { txn_id };
         let span = storage_effect_span(&effect);
         let in_flight = InFlightGuard::acquire(&self.metrics);
-        match self
-            .channel_for(&effect)
-            .try_send((effect, response_tx, span, Instant::now(), in_flight))
-        {
+        match self.channel_for(&effect).try_send((
+            effect,
+            response_tx,
+            span,
+            Instant::now(),
+            in_flight,
+        )) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => warn!(
                 event = "storage.transaction.abort_enqueue_full",
@@ -1657,7 +1663,10 @@ fn recv_prioritized(
                 return Err(RecvError);
             }
             (Err(TryRecvError::Disconnected), _) => {
-                return receivers.bulk.recv().map(|item| (item, StoragePriority::Bulk));
+                return receivers
+                    .bulk
+                    .recv()
+                    .map(|item| (item, StoragePriority::Bulk));
             }
             (_, Err(TryRecvError::Disconnected)) => {
                 return receivers
@@ -2146,7 +2155,10 @@ mod tests {
             effect,
             StorageEffect::AbortTransaction { txn_id: got } if got == txn_id
         ));
-        assert!(receivers.bulk.try_recv().is_ok(), "bulk lane still saturated");
+        assert!(
+            receivers.bulk.try_recv().is_ok(),
+            "bulk lane still saturated"
+        );
         drop(keep);
     }
 

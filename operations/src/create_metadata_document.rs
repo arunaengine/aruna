@@ -1389,9 +1389,9 @@ mod tests {
                             (Key::from(vec![2u8]), None),
                         ],
                     },
-                    StorageEffect::BatchWrite { .. } => {
-                        StorageEvent::BatchWriteResult { entries: Vec::new() }
-                    }
+                    StorageEffect::BatchWrite { .. } => StorageEvent::BatchWriteResult {
+                        entries: Vec::new(),
+                    },
                     StorageEffect::CommitTransaction { txn_id } => {
                         commits += 1;
                         if commits <= conflict_commits {
@@ -1418,9 +1418,15 @@ mod tests {
         let node_id = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
         let metadata_storage =
             FjallStorage::open(temp.join("meta-store").to_str().unwrap()).unwrap();
-        let metadata_handle =
-            MetadataHandle::new(temp.join("meta"), node_id, metadata_storage, None, None, None)
-                .unwrap();
+        let metadata_handle = MetadataHandle::new(
+            temp.join("meta"),
+            node_id,
+            metadata_storage,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
