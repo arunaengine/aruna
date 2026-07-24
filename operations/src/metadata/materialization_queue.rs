@@ -335,12 +335,23 @@ async fn process_materialization_job_groups(
             let mut outcome = MaterializationGroupOutcome::default();
             let mut advanced_event_ids = BTreeSet::new();
             let mut raw_state_cache = RawStateCache::default();
+            let Some(document_id) = jobs.first().map(|(_, job)| job.document_id) else {
+                return outcome;
+            };
+            let group = match load_group_jobs(&context.storage_handle, document_id).await {
+                Ok(group) => group,
+                Err(error) => {
+                    outcome.error = Some(error);
+                    return outcome;
+                }
+            };
             for (job_key, job) in jobs {
                 let event_id = job.event_id;
                 match process_materialization_job(
                     &context,
                     job_key,
                     job,
+                    &group,
                     &advanced_event_ids,
                     &mut raw_state_cache,
                 )
@@ -503,7 +514,8 @@ async fn plan_finish_chunk(
     storage: &StorageHandle,
     finished: Vec<FinishedMaterializationJob>,
 ) -> Result<FinishPlan, MetadataMaterializationQueueError> {
-    let snapshot = read_statuses(storage, &finished).await?;
+    let snapshot =
+        read_status_map(storage, finished.iter().map(finished_document_id).collect()).await?;
     let parked = read_dead_letters(storage, &finished).await?;
     let mut plan = FinishPlan {
         deletes: Vec::with_capacity(finished.len().saturating_mul(2)),
@@ -654,11 +666,10 @@ fn finished_document_id(finished: &FinishedMaterializationJob) -> Ulid {
     }
 }
 
-async fn read_statuses(
+async fn read_status_map(
     storage: &StorageHandle,
-    finished: &[FinishedMaterializationJob],
+    document_ids: BTreeSet<Ulid>,
 ) -> Result<HashMap<Ulid, MetadataMaterializationStatusRecord>, MetadataMaterializationQueueError> {
-    let document_ids: BTreeSet<Ulid> = finished.iter().map(finished_document_id).collect();
     if document_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -1040,8 +1051,9 @@ async fn read_document_job(
 }
 
 // The due index is due-ordered and its rows are valid only when the sidecar row
-// exists with a matching due time; stale or dead rows are deleted lazily so a
-// scan costs O(due jobs) rather than a full-keyspace pass.
+// exists with a matching due time. A page resolves its sidecars, events and
+// statuses in three batch reads and prunes dead rows in one delete, so the scan
+// costs O(pages) requests rather than O(due jobs).
 async fn scan_due_materialization_jobs(
     storage: &StorageHandle,
     now_ms: u64,
@@ -1079,33 +1091,79 @@ async fn scan_due_materialization_jobs(
             }
         };
 
+        let mut stale = Vec::new();
+        let mut candidates = Vec::new();
+        let mut next_due_at_ms = None;
         for (key, _value) in values {
             let key = key.to_vec();
             let Some((due_at_ms, document_id, event_id)) = materialization_job_key_parts(&key)
             else {
                 warn!(key = ?key, "Deleting malformed metadata materialization index row");
-                delete_materialization_global_job(storage, key).await?;
+                stale.push((
+                    METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                    ByteView::from(key),
+                ));
                 continue;
             };
             if due_at_ms > now_ms {
-                return Ok((jobs, false, Some(due_at_ms)));
+                next_due_at_ms = Some(due_at_ms);
+                break;
             }
-            let Some(job) = read_document_job(storage, document_id, event_id).await? else {
-                delete_materialization_global_job(storage, key).await?;
-                continue;
-            };
-            if job.due_at_ms != due_at_ms {
-                delete_materialization_global_job(storage, key).await?;
-                continue;
+            candidates.push((key, due_at_ms, document_id, event_id));
+        }
+
+        let sidecars = read_document_jobs(
+            storage,
+            &candidates
+                .iter()
+                .map(|(_, _, document_id, event_id)| (*document_id, *event_id))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        let mut due = Vec::new();
+        for ((key, due_at_ms, document_id, event_id), sidecar) in
+            candidates.into_iter().zip(sidecars)
+        {
+            match sidecar {
+                Some(job) if job.due_at_ms == due_at_ms => due.push((key, job)),
+                Some(_) | None => {
+                    // The sidecar is authoritative: an index row it does not
+                    // match is stale. A malformed sidecar is dropped with it.
+                    stale.push((
+                        METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                        ByteView::from(key),
+                    ));
+                    if sidecar.is_none() {
+                        stale.push((
+                            METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+                            metadata_materialization_document_job_key(document_id, event_id),
+                        ));
+                    }
+                }
             }
-            if !materialization_job_is_live(storage, &job).await? {
-                delete_materialization_job(storage, key).await?;
-                continue;
-            }
+        }
+
+        let (live, dead) = filter_live_jobs(storage, due).await?;
+        for (key, job) in dead {
+            stale.push((
+                METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                ByteView::from(key),
+            ));
+            stale.push((
+                METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+                metadata_materialization_document_job_key(job.document_id, job.event_id),
+            ));
+        }
+        delete_materialization_entries(storage, stale).await?;
+
+        for (_, job) in live {
             jobs.push((metadata_materialization_job_key(&job).to_vec(), job));
             if jobs.len() >= limit {
                 return Ok((jobs, true, None));
             }
+        }
+        if let Some(due_at_ms) = next_due_at_ms {
+            return Ok((jobs, false, Some(due_at_ms)));
         }
 
         match next_start_after {
@@ -1113,6 +1171,70 @@ async fn scan_due_materialization_jobs(
             None => return Ok((jobs, false, None)),
         }
     }
+}
+
+async fn read_document_jobs(
+    storage: &StorageHandle,
+    targets: &[(Ulid, Ulid)],
+) -> Result<Vec<Option<MetadataMaterializationJobRecord>>, MetadataMaterializationQueueError> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let reads = targets
+        .iter()
+        .map(|(document_id, event_id)| {
+            (
+                METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+                metadata_materialization_document_job_key(*document_id, *event_id),
+            )
+        })
+        .collect();
+    Ok(batch_read_values(storage, reads)
+        .await?
+        .into_iter()
+        .map(|value| value.and_then(|value| postcard::from_bytes(&value).ok()))
+        .collect())
+}
+
+// Live means the create event still exists and no status has advanced past the
+// job. Dead jobs are returned so the caller can prune both of their rows.
+type ScannedJobs = Vec<(Vec<u8>, MetadataMaterializationJobRecord)>;
+
+async fn filter_live_jobs(
+    storage: &StorageHandle,
+    jobs: ScannedJobs,
+) -> Result<(ScannedJobs, ScannedJobs), MetadataMaterializationQueueError> {
+    if jobs.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let statuses = read_status_map(
+        storage,
+        jobs.iter().map(|(_, job)| job.document_id).collect(),
+    )
+    .await?;
+    let event_reads = jobs
+        .iter()
+        .map(|(_, job)| {
+            (
+                METADATA_EVENT_LOG_KEYSPACE.to_string(),
+                metadata_event_log_key(job.document_id, job.event_id),
+            )
+        })
+        .collect();
+    let events = batch_read_values(storage, event_reads).await?;
+    let mut live = Vec::with_capacity(jobs.len());
+    let mut dead = Vec::new();
+    for ((key, job), event) in jobs.into_iter().zip(events) {
+        let advanced = statuses
+            .get(&job.document_id)
+            .is_some_and(|status| materialization_retry_already_advanced(status, &job));
+        if event.is_none() || advanced {
+            dead.push((key, job));
+        } else {
+            live.push((key, job));
+        }
+    }
+    Ok((live, dead))
 }
 
 fn due_after(now_ms: u64, due_at_ms: u64) -> Duration {
@@ -1192,27 +1314,19 @@ async fn process_materialization_job(
     context: &DriverContext,
     job_key: Vec<u8>,
     job: MetadataMaterializationJobRecord,
+    group: &GroupJobs,
     advanced_event_ids: &BTreeSet<Ulid>,
     raw_state_cache: &mut RawStateCache,
 ) -> Result<ProcessedMaterializationJob, MetadataMaterializationQueueError> {
-    if older_materialization_job_exists(
-        &context.storage_handle,
-        job.document_id,
-        job.event_id,
-        advanced_event_ids,
-    )
-    .await?
-    {
+    if older_job_exists(&context.storage_handle, group, &job, advanced_event_ids).await? {
         return Ok(ProcessedMaterializationJob::blocked());
     }
     let document_job_key =
         metadata_materialization_document_job_key(job.document_id, job.event_id).to_vec();
 
-    let (obsolescence, event) = tokio::join!(
-        materialization_job_obsolescence(&context.storage_handle, &job),
-        read_create_event(&context.storage_handle, job.document_id, job.event_id),
-    );
-    match obsolescence? {
+    let obsolescence = job_obsolescence(group.status.as_ref(), &job);
+    let event = read_create_event(&context.storage_handle, job.document_id, job.event_id).await;
+    match obsolescence {
         MaterializationJobObsolescence::Live => {}
         MaterializationJobObsolescence::Final => {
             return Ok(ProcessedMaterializationJob::completed(
@@ -1331,18 +1445,24 @@ async fn process_materialization_job(
     }
 }
 
-// The sidecar keyspace is per-document and event-ordered, so the predecessor
-// check costs O(pending jobs for this document): iterate below the target event
-// and stop at the first key that is not an unadvanced, live, older job.
-async fn older_materialization_job_exists(
+/// Everything a document's group needs to order its own events: its queued jobs
+/// and its status, loaded once instead of once per event.
+#[derive(Debug, Default)]
+struct GroupJobs {
+    pending: Vec<MetadataMaterializationJobRecord>,
+    status: Option<MetadataMaterializationStatusRecord>,
+}
+
+// The sidecar keyspace is per-document and event-ordered, so this costs one
+// prefix scan plus one status read for the whole group.
+async fn load_group_jobs(
     storage: &StorageHandle,
     document_id: Ulid,
-    event_id: Ulid,
-    advanced_event_ids: &BTreeSet<Ulid>,
-) -> Result<bool, MetadataMaterializationQueueError> {
+) -> Result<GroupJobs, MetadataMaterializationQueueError> {
     let status = read_materialization_status(storage, document_id, None).await?;
     let prefix = metadata_materialization_document_job_prefix(document_id);
-    let stop_key = metadata_materialization_document_job_key(document_id, event_id);
+    let mut pending = Vec::new();
+    let mut malformed = Vec::new();
     let mut start_after = None;
     loop {
         let event = storage
@@ -1368,44 +1488,56 @@ async fn older_materialization_job_exists(
         };
 
         for (key, value) in values {
-            let key = key.to_vec();
-            if key.as_slice() >= stop_key.as_ref() {
-                return Ok(false);
-            }
-            let job = match postcard::from_bytes::<MetadataMaterializationJobRecord>(&value) {
-                Ok(job) => job,
+            match postcard::from_bytes::<MetadataMaterializationJobRecord>(&value) {
+                Ok(job) if job.document_id == document_id => pending.push(job),
+                Ok(_) => {}
                 Err(error) => {
-                    warn!(error = %error, key = ?key, "Deleting malformed metadata materialization document job while checking predecessors");
-                    delete_materialization_document_job(storage, key).await?;
-                    continue;
+                    warn!(error = %error, key = ?key.to_vec(), "Deleting malformed metadata materialization document job");
+                    malformed.push((
+                        METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+                        key,
+                    ));
                 }
-            };
-            if job.document_id != document_id
-                || job.event_id >= event_id
-                || advanced_event_ids.contains(&job.event_id)
-                || status
-                    .as_ref()
-                    .is_some_and(|status| materialization_status_obsoletes_job(status, &job))
-            {
-                continue;
             }
-            if !materialization_event_exists(storage, &job).await? {
-                warn!(document_id = %job.document_id, event_id = %job.event_id, "Deleting orphan metadata materialization document job while checking predecessors");
-                delete_materialization_job(
-                    storage,
-                    metadata_materialization_job_key(&job).to_vec(),
-                )
-                .await?;
-                continue;
-            }
-            return Ok(true);
         }
 
         match next_start_after {
             Some(next) => start_after = Some(next),
-            None => return Ok(false),
+            None => break,
         }
     }
+    delete_materialization_entries(storage, malformed).await?;
+    pending.sort_by_key(|job| job.event_id);
+    Ok(GroupJobs { pending, status })
+}
+
+// An unadvanced, live job for an earlier event of the same document must run
+// first, so this one waits for the next batch.
+async fn older_job_exists(
+    storage: &StorageHandle,
+    group: &GroupJobs,
+    job: &MetadataMaterializationJobRecord,
+    advanced_event_ids: &BTreeSet<Ulid>,
+) -> Result<bool, MetadataMaterializationQueueError> {
+    for pending in &group.pending {
+        if pending.event_id >= job.event_id
+            || advanced_event_ids.contains(&pending.event_id)
+            || group
+                .status
+                .as_ref()
+                .is_some_and(|status| materialization_status_obsoletes_job(status, pending))
+        {
+            continue;
+        }
+        if !materialization_event_exists(storage, pending).await? {
+            warn!(document_id = %pending.document_id, event_id = %pending.event_id, "Deleting orphan metadata materialization job");
+            delete_materialization_job(storage, metadata_materialization_job_key(pending).to_vec())
+                .await?;
+            continue;
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 async fn read_create_event(
@@ -1446,20 +1578,20 @@ async fn read_create_event(
     }
 }
 
-async fn materialization_job_obsolescence(
-    storage: &StorageHandle,
+fn job_obsolescence(
+    status: Option<&MetadataMaterializationStatusRecord>,
     job: &MetadataMaterializationJobRecord,
-) -> Result<MaterializationJobObsolescence, MetadataMaterializationQueueError> {
-    let Some(status) = read_materialization_status(storage, job.document_id, None).await? else {
-        return Ok(MaterializationJobObsolescence::Live);
+) -> MaterializationJobObsolescence {
+    let Some(status) = status else {
+        return MaterializationJobObsolescence::Live;
     };
-    if materialization_status_obsoletes_job(&status, job) {
-        return Ok(MaterializationJobObsolescence::Final);
+    if materialization_status_obsoletes_job(status, job) {
+        return MaterializationJobObsolescence::Final;
     }
     if status.event_id == job.event_id && status.attempts > job.attempts {
-        return Ok(MaterializationJobObsolescence::RetryAdvanced);
+        return MaterializationJobObsolescence::RetryAdvanced;
     }
-    Ok(MaterializationJobObsolescence::Live)
+    MaterializationJobObsolescence::Live
 }
 
 async fn read_materialization_status(
@@ -2065,6 +2197,25 @@ mod tests {
         }
     }
 
+    // Loads the document's group first, exactly as the drain does before it
+    // checks a job's predecessors.
+    async fn older_exists(
+        storage: &StorageHandle,
+        document_id: Ulid,
+        event_id: Ulid,
+        advanced: &BTreeSet<Ulid>,
+    ) -> Result<bool, MetadataMaterializationQueueError> {
+        let group = load_group_jobs(storage, document_id).await?;
+        let job = MetadataMaterializationJobRecord {
+            document_id,
+            event_id,
+            due_at_ms: 0,
+            attempts: 0,
+            failures: 0,
+        };
+        older_job_exists(storage, &group, &job, advanced).await
+    }
+
     async fn index_job_keys(storage: &StorageHandle) -> Vec<(u64, Ulid, Ulid)> {
         match storage
             .send_storage_effect(StorageEffect::Iter {
@@ -2209,14 +2360,9 @@ mod tests {
             .await
         );
         assert!(
-            !older_materialization_job_exists(
-                &storage,
-                document_id,
-                newer_event_id,
-                &BTreeSet::new()
-            )
-            .await
-            .unwrap()
+            !older_exists(&storage, document_id, newer_event_id, &BTreeSet::new())
+                .await
+                .unwrap()
         );
     }
 
@@ -2239,14 +2385,9 @@ mod tests {
         .await;
 
         assert!(
-            !older_materialization_job_exists(
-                &storage,
-                document_id,
-                newer_event_id,
-                &BTreeSet::new()
-            )
-            .await
-            .unwrap()
+            !older_exists(&storage, document_id, newer_event_id, &BTreeSet::new())
+                .await
+                .unwrap()
         );
         assert!(
             !storage_key_exists(
@@ -2280,14 +2421,9 @@ mod tests {
         .await;
 
         assert!(
-            !older_materialization_job_exists(
-                &storage,
-                document_id,
-                newer_event_id,
-                &BTreeSet::new()
-            )
-            .await
-            .unwrap()
+            !older_exists(&storage, document_id, newer_event_id, &BTreeSet::new())
+                .await
+                .unwrap()
         );
         assert!(
             !storage_key_exists(
@@ -2373,7 +2509,7 @@ mod tests {
         .await;
 
         assert!(
-            !older_materialization_job_exists(&storage, document_id, event_id, &BTreeSet::new())
+            !older_exists(&storage, document_id, event_id, &BTreeSet::new())
                 .await
                 .unwrap()
         );
@@ -2435,6 +2571,42 @@ mod tests {
         assert!(!has_more_due);
         assert!(next_due_at_ms.is_some());
         assert!(delta <= 10, "scan issued {delta} storage requests");
+    }
+
+    #[tokio::test]
+    async fn scan_batches_reads() {
+        // A page of due jobs resolves in a handful of batch reads instead of a
+        // sidecar, event and status read per row.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let now_ms = unix_timestamp_millis();
+        let mut writes = Vec::new();
+        for index in 0..64u8 {
+            let document_id = Ulid::from_bytes([index; 16]);
+            let event_id = Ulid::from_parts(1, u128::from(index));
+            let event = create_event(document_id, event_id, "batched");
+            let job = MetadataMaterializationJobRecord {
+                document_id,
+                event_id,
+                due_at_ms: 1,
+                attempts: 0,
+                failures: 0,
+            };
+            writes.push(metadata_create_event_write_entry(&event).unwrap());
+            writes.push(metadata_materialization_job_write_entry(&job).unwrap());
+            writes.push(metadata_materialization_document_job_write_entry(&job).unwrap());
+        }
+        write_entries(&storage, writes).await;
+
+        let before = storage.snapshot_metrics().requests_total;
+        let (jobs, _, _) =
+            scan_due_materialization_jobs(&storage, now_ms, MATERIALIZATION_BATCH_SIZE)
+                .await
+                .unwrap();
+        let delta = storage.snapshot_metrics().requests_total - before;
+
+        assert_eq!(jobs.len(), 64);
+        assert!(delta <= 8, "scan issued {delta} storage requests");
     }
 
     #[tokio::test]
@@ -2536,10 +2708,9 @@ mod tests {
         write_entries(&storage, writes).await;
 
         let before = storage.snapshot_metrics().requests_total;
-        let older =
-            older_materialization_job_exists(&storage, document_id, middle, &BTreeSet::new())
-                .await
-                .unwrap();
+        let older = older_exists(&storage, document_id, middle, &BTreeSet::new())
+            .await
+            .unwrap();
         let delta = storage.snapshot_metrics().requests_total - before;
 
         assert!(older);
@@ -3330,7 +3501,7 @@ mod tests {
         });
 
         assert!(
-            !older_materialization_job_exists(&storage, document_id, event_id, &BTreeSet::new())
+            !older_exists(&storage, document_id, event_id, &BTreeSet::new())
                 .await
                 .unwrap()
         );
@@ -3381,20 +3552,15 @@ mod tests {
         .await;
 
         assert!(
-            older_materialization_job_exists(
-                &storage,
-                document_id,
-                newer_event_id,
-                &BTreeSet::new()
-            )
-            .await
-            .unwrap()
+            older_exists(&storage, document_id, newer_event_id, &BTreeSet::new())
+                .await
+                .unwrap()
         );
 
         let mut advanced = BTreeSet::new();
         advanced.insert(older_event_id);
         assert!(
-            !older_materialization_job_exists(&storage, document_id, newer_event_id, &advanced)
+            !older_exists(&storage, document_id, newer_event_id, &advanced)
                 .await
                 .unwrap()
         );
