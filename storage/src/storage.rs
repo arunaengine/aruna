@@ -2182,6 +2182,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bulk_full_rejects() {
+        // A saturated bulk read pool rejects with QueueFull instead of running
+        // the read inline on the write actor thread.
+        let dir = tempdir().unwrap();
+        let db = fjall::OptimisticTxDatabase::builder(dir.path())
+            .manual_journal_persist(true)
+            .open()
+            .unwrap();
+        let (bulk_sender, _bulk_receiver) = crossfire::mpsc::bounded_blocking(1);
+        let mut storage = super::FjallStorage {
+            store: super::Store::new(db),
+            persist_policy: FjallPersistPolicy::default(),
+            txns: std::collections::HashMap::new(),
+            read_pool: Vec::new(),
+            next_reader: 0,
+            bulk_read_pool: vec![bulk_sender],
+            next_bulk_reader: 0,
+        };
+        let metrics = std::sync::Arc::new(super::StorageMetrics::default());
+        let read_effect = || StorageEffect::Read {
+            key_space: "node_state".to_string(),
+            key: b"missing".to_vec().into(),
+            txn_id: None,
+        };
+
+        let filler = read_effect();
+        let span = super::storage_effect_span(&filler);
+        let guard = super::InFlightGuard::acquire(&metrics);
+        let (filler_tx, _filler_rx) = crossfire::oneshot::oneshot();
+        assert!(
+            storage.bulk_read_pool[0]
+                .try_send((filler, filler_tx, span, Instant::now(), guard))
+                .is_ok(),
+            "saturate bulk read pool"
+        );
+
+        let target = read_effect();
+        let span = super::storage_effect_span(&target);
+        let guard = super::InFlightGuard::acquire(&metrics);
+        let (target_tx, mut target_rx) = crossfire::oneshot::oneshot();
+        let mut slow = super::SlowQueueAggregator::default();
+        storage.forward_to_read_pool(
+            (target, target_tx, span, Instant::now(), guard),
+            StoragePriority::Bulk,
+            &mut slow,
+        );
+
+        match target_rx.try_recv() {
+            Ok(StorageEvent::Error {
+                error: StorageError::QueueFull,
+            }) => {}
+            other => panic!("expected QueueFull rejection, got {other:?}"),
+        }
+    }
+
     fn assert_write_result(event: Event, expected_key: &[u8]) {
         match event {
             Event::Storage(StorageEvent::WriteResult { key }) => {
