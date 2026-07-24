@@ -523,10 +523,16 @@ impl FjallStorage {
 
         let (sender, receivers) = StorageHandle::new();
         let store = Store::new(db);
-        let read_pool =
-            spawn_read_pool(store.clone(), READ_POOL_THREADS, STORAGE_EFFECT_QUEUE_CAPACITY);
-        let bulk_read_pool =
-            spawn_read_pool(store.clone(), BULK_READ_POOL_THREADS, BULK_EFFECT_QUEUE_CAPACITY);
+        let read_pool = spawn_read_pool(
+            store.clone(),
+            READ_POOL_THREADS,
+            STORAGE_EFFECT_QUEUE_CAPACITY,
+        );
+        let bulk_read_pool = spawn_read_pool(
+            store.clone(),
+            BULK_READ_POOL_THREADS,
+            BULK_EFFECT_QUEUE_CAPACITY,
+        );
         let channel_closed = sender.metrics.channel_closed.clone();
 
         thread::spawn(move || {
@@ -678,9 +684,7 @@ impl FjallStorage {
                     // A full bulk read queue backpressures rather than stealing
                     // the write actor thread from foreground sync traffic.
                     Err(TrySendError::Full(item)) => reject_bulk_read(item),
-                    Err(TrySendError::Disconnected(item)) => {
-                        self.process_single(item, slow_queue)
-                    }
+                    Err(TrySendError::Disconnected(item)) => self.process_single(item, slow_queue),
                 }
             }
         }
@@ -2050,22 +2054,26 @@ mod tests {
             let effect = read(key_space);
             let span = super::storage_effect_span(&effect);
             let in_flight = super::InFlightGuard::acquire(&handle.metrics);
-            handle
-                .bulk_channel
-                .try_send((effect, tx, span, Instant::now(), in_flight))
-                .ok()
-                .expect("bulk enqueue");
+            assert!(
+                handle
+                    .bulk_channel
+                    .try_send((effect, tx, span, Instant::now(), in_flight))
+                    .is_ok(),
+                "bulk enqueue"
+            );
             keep.push(rx);
         }
         let (tx, rx) = crossfire::oneshot::oneshot();
         let effect = read("fg");
         let span = super::storage_effect_span(&effect);
         let in_flight = super::InFlightGuard::acquire(&handle.metrics);
-        handle
-            .write_channel
-            .try_send((effect, tx, span, Instant::now(), in_flight))
-            .ok()
-            .expect("foreground enqueue");
+        assert!(
+            handle
+                .write_channel
+                .try_send((effect, tx, span, Instant::now(), in_flight))
+                .is_ok(),
+            "foreground enqueue"
+        );
         keep.push(rx);
 
         let (first, priority) = super::recv_prioritized(&receivers).expect("first item");
