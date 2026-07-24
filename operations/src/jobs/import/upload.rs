@@ -664,4 +664,127 @@ mod tests {
             Err(UploadClaimError::AlreadyClaimed)
         ));
     }
+
+    fn upload_record(owner: UserId, upload_id: Ulid, expires_at_ms: u64) -> RoCrateUploadRecord {
+        RoCrateUploadRecord {
+            upload_id,
+            owner,
+            location: BackendLocation {
+                root: "/data".to_string(),
+                storage_bucket: "storage".to_string(),
+                backend_path: "_jobs/input".to_string(),
+                ulid: Ulid::from_bytes([4u8; 16]),
+                compressed: false,
+                encrypted: false,
+                created_by: owner,
+                created_at: SystemTime::UNIX_EPOCH,
+                staging: false,
+                partial: false,
+                blob_size: 1,
+                hashes: HashMap::new(),
+            },
+            blake3: [5u8; 32],
+            size: 1,
+            media_type: RoCrateMediaType::Zip,
+            expires_at_ms,
+            claimed_by: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_missing_upload() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let upload_id = Ulid::from_bytes([2u8; 16]);
+        assert!(
+            read_rocrate_upload(&storage, upload_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let owner = UserId::nil(RealmId::from_bytes([1u8; 32]));
+        write_rocrate_upload(&storage, &upload_record(owner, upload_id, 10))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_rocrate_upload(&storage, upload_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .owner,
+            owner
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_rejects_owner() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let owner = UserId::nil(realm_id);
+        let upload_id = Ulid::from_bytes([2u8; 16]);
+        let job_id = JobId::from_bytes([3u8; 16]);
+        assert!(matches!(
+            claim_rocrate_upload(&storage, upload_id, owner, job_id, 5).await,
+            Err(UploadClaimError::NotFound)
+        ));
+        write_rocrate_upload(&storage, &upload_record(owner, upload_id, 100))
+            .await
+            .unwrap();
+        let intruder = UserId::new(Ulid::from_bytes([7u8; 16]), realm_id);
+        assert!(matches!(
+            claim_rocrate_upload(&storage, upload_id, intruder, job_id, 5).await,
+            Err(UploadClaimError::WrongOwner)
+        ));
+    }
+
+    #[tokio::test]
+    async fn claim_rejects_expired() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let owner = UserId::nil(RealmId::from_bytes([1u8; 32]));
+        let upload_id = Ulid::from_bytes([2u8; 16]);
+        let job_id = JobId::from_bytes([3u8; 16]);
+        write_rocrate_upload(&storage, &upload_record(owner, upload_id, 10))
+            .await
+            .unwrap();
+        assert!(matches!(
+            claim_rocrate_upload(&storage, upload_id, owner, job_id, 10).await,
+            Err(UploadClaimError::Expired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn deletes_claimed_upload() {
+        // Cleanup deletes only when the claiming job matches; an absent upload is a no-op.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let owner = UserId::nil(RealmId::from_bytes([1u8; 32]));
+        let upload_id = Ulid::from_bytes([2u8; 16]);
+        let job_id = JobId::from_bytes([3u8; 16]);
+        delete_rocrate_upload(&storage, upload_id, job_id)
+            .await
+            .unwrap();
+        write_rocrate_upload(&storage, &upload_record(owner, upload_id, 100))
+            .await
+            .unwrap();
+        claim_rocrate_upload(&storage, upload_id, owner, job_id, 5)
+            .await
+            .unwrap();
+        let intruder = JobId::from_bytes([8u8; 16]);
+        assert!(
+            delete_rocrate_upload(&storage, upload_id, intruder)
+                .await
+                .is_err()
+        );
+        delete_rocrate_upload(&storage, upload_id, job_id)
+            .await
+            .unwrap();
+        assert!(
+            read_rocrate_upload(&storage, upload_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 }
