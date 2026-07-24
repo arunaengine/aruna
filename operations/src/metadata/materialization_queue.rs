@@ -268,56 +268,6 @@ fn collect_group_outcome(
     }
 }
 
-fn materialization_job_preferred(
-    candidate: &MetadataMaterializationJobRecord,
-    current: &MetadataMaterializationJobRecord,
-) -> bool {
-    (candidate.attempts, candidate.due_at_ms) > (current.attempts, current.due_at_ms)
-}
-
-fn completed_stale_materialization_job(job_key: Vec<u8>) -> CompletedMaterializationJob {
-    CompletedMaterializationJob {
-        job_key,
-        document_job_key: None,
-        status: None,
-        iri_index_writes: Vec::new(),
-        raw_state_write: None,
-        sync: None,
-    }
-}
-
-fn deduplicate_materialization_jobs(
-    jobs: Vec<(Vec<u8>, MetadataMaterializationJobRecord)>,
-) -> (
-    Vec<(Vec<u8>, MetadataMaterializationJobRecord)>,
-    Vec<CompletedMaterializationJob>,
-) {
-    let mut selected: BTreeMap<Ulid, (Vec<u8>, MetadataMaterializationJobRecord)> = BTreeMap::new();
-    let mut stale = Vec::new();
-    for (job_key, job) in jobs {
-        match selected.get_mut(&job.event_id) {
-            Some((selected_key, selected_job))
-                if materialization_job_preferred(&job, selected_job) =>
-            {
-                let previous_key = std::mem::replace(selected_key, job_key);
-                *selected_job = job;
-                if previous_key.as_slice() != selected_key.as_slice() {
-                    stale.push(completed_stale_materialization_job(previous_key));
-                }
-            }
-            Some((selected_key, _)) => {
-                if selected_key.as_slice() != job_key.as_slice() {
-                    stale.push(completed_stale_materialization_job(job_key));
-                }
-            }
-            None => {
-                selected.insert(job.event_id, (job_key, job));
-            }
-        }
-    }
-    (selected.into_values().collect(), stale)
-}
-
 async fn process_materialization_job_groups(
     context: &DriverContext,
     jobs: Vec<(Vec<u8>, MetadataMaterializationJobRecord)>,
@@ -340,8 +290,7 @@ async fn process_materialization_job_groups(
     };
     let mut first_error = None;
     for (_, jobs) in groups {
-        let (mut jobs, stale_jobs) = deduplicate_materialization_jobs(jobs);
-        completed.extend(stale_jobs);
+        let mut jobs = jobs;
         jobs.sort_by_key(|(_, job)| job.event_id);
         if tasks.len() >= concurrency
             && let Some(result) = tasks.join_next().await
@@ -585,6 +534,41 @@ pub async fn enqueue_metadata_materialization_job(
     Ok(())
 }
 
+async fn read_document_job(
+    storage: &StorageHandle,
+    document_id: Ulid,
+    event_id: Ulid,
+) -> Result<Option<MetadataMaterializationJobRecord>, MetadataMaterializationQueueError> {
+    let key = metadata_materialization_document_job_key(document_id, event_id);
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+            key: key.clone(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => match postcard::from_bytes::<MetadataMaterializationJobRecord>(&value) {
+            Ok(job) => Ok(Some(job)),
+            Err(error) => {
+                warn!(error = %error, document_id = %document_id, event_id = %event_id, "Deleting malformed metadata materialization document job");
+                delete_materialization_document_job(storage, key.to_vec()).await?;
+                Ok(None)
+            }
+        },
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataMaterializationQueueError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
+    }
+}
+
+// The due index is due-ordered and its rows are valid only when the sidecar row
+// exists with a matching due time; stale or dead rows are deleted lazily so a
+// scan costs O(due jobs) rather than a full-keyspace pass.
 async fn scan_due_materialization_jobs(
     storage: &StorageHandle,
     now_ms: u64,
@@ -599,7 +583,6 @@ async fn scan_due_materialization_jobs(
 > {
     let mut start_after = None;
     let mut jobs = Vec::new();
-    let mut next_due_at_ms = None;
     loop {
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
@@ -623,139 +606,40 @@ async fn scan_due_materialization_jobs(
             }
         };
 
-        for (key, value) in values {
+        for (key, _value) in values {
             let key = key.to_vec();
-            let job = match postcard::from_bytes::<MetadataMaterializationJobRecord>(&value) {
-                Ok(job) => job,
-                Err(error) => {
-                    warn!(error = %error, key = ?key, "Repairing or deleting malformed metadata materialization job");
-                    if let Some(job) =
-                        repair_or_delete_malformed_materialization_job(storage, key).await?
-                    {
-                        if job.due_at_ms > now_ms {
-                            next_due_at_ms = min_due_at(next_due_at_ms, job.due_at_ms);
-                            continue;
-                        }
-                        jobs.push((metadata_materialization_job_key(&job).to_vec(), job));
-                        if jobs.len() >= limit {
-                            return Ok((jobs, true, next_due_at_ms));
-                        }
-                    }
-                    continue;
-                }
-            };
-            if !materialization_job_key_matches(&key, &job) {
-                warn!(key = ?key, "Repairing metadata materialization job stored under non-canonical key");
-                if let Some(existing_job) = find_decoded_global_materialization_job(
-                    storage,
-                    job.document_id,
-                    job.event_id,
-                    Some(key.as_slice()),
-                )
-                .await?
-                {
-                    delete_materialization_global_job(storage, key).await?;
-                    if existing_job.due_at_ms > now_ms {
-                        next_due_at_ms = min_due_at(next_due_at_ms, existing_job.due_at_ms);
-                        continue;
-                    }
-                    jobs.push((
-                        metadata_materialization_job_key(&existing_job).to_vec(),
-                        existing_job,
-                    ));
-                    if jobs.len() >= limit {
-                        return Ok((jobs, true, next_due_at_ms));
-                    }
-                    continue;
-                }
-                if !materialization_job_is_live(storage, &job).await? {
-                    delete_materialization_global_job(storage, key).await?;
-                    continue;
-                }
-                repair_materialization_job_key(storage, key, &job).await?;
-                if job.due_at_ms > now_ms {
-                    next_due_at_ms = min_due_at(next_due_at_ms, job.due_at_ms);
-                    continue;
-                }
-                jobs.push((metadata_materialization_job_key(&job).to_vec(), job));
-                if jobs.len() >= limit {
-                    return Ok((jobs, true, next_due_at_ms));
-                }
-                continue;
-            }
-            if let Some(existing_job) = find_decoded_global_materialization_job(
-                storage,
-                job.document_id,
-                job.event_id,
-                Some(key.as_slice()),
-            )
-            .await?
-                && materialization_job_preferred(&existing_job, &job)
-            {
-                write_materialization_document_job(storage, &existing_job).await?;
+            let Some((due_at_ms, document_id, event_id)) = materialization_job_key_parts(&key)
+            else {
+                warn!(key = ?key, "Deleting malformed metadata materialization index row");
                 delete_materialization_global_job(storage, key).await?;
-                if existing_job.due_at_ms > now_ms {
-                    next_due_at_ms = min_due_at(next_due_at_ms, existing_job.due_at_ms);
-                    continue;
-                }
-                jobs.push((
-                    metadata_materialization_job_key(&existing_job).to_vec(),
-                    existing_job,
-                ));
-                if jobs.len() >= limit {
-                    return Ok((jobs, true, next_due_at_ms));
-                }
+                continue;
+            };
+            if due_at_ms > now_ms {
+                return Ok((jobs, false, Some(due_at_ms)));
+            }
+            let Some(job) = read_document_job(storage, document_id, event_id).await? else {
+                delete_materialization_global_job(storage, key).await?;
+                continue;
+            };
+            if job.due_at_ms != due_at_ms {
+                delete_materialization_global_job(storage, key).await?;
                 continue;
             }
             if !materialization_job_is_live(storage, &job).await? {
-                match materialization_job_obsolescence(storage, &job).await? {
-                    MaterializationJobObsolescence::Final if job.due_at_ms <= now_ms => {
-                        jobs.push((key, job));
-                        if jobs.len() >= limit {
-                            return Ok((jobs, true, next_due_at_ms));
-                        }
-                    }
-                    MaterializationJobObsolescence::Final => {
-                        delete_materialization_job(storage, key).await?;
-                    }
-                    MaterializationJobObsolescence::RetryAdvanced => {
-                        if let Some(preferred) = find_decoded_global_materialization_job(
-                            storage,
-                            job.document_id,
-                            job.event_id,
-                            Some(key.as_slice()),
-                        )
-                        .await?
-                        {
-                            write_materialization_document_job(storage, &preferred).await?;
-                        }
-                        delete_materialization_global_job(storage, key).await?;
-                    }
-                    MaterializationJobObsolescence::Live => {
-                        delete_materialization_job(storage, key).await?;
-                    }
-                }
+                delete_materialization_job(storage, key).await?;
                 continue;
             }
-            if job.due_at_ms > now_ms {
-                next_due_at_ms = min_due_at(next_due_at_ms, job.due_at_ms);
-                continue;
-            }
-            jobs.push((key, job));
+            jobs.push((metadata_materialization_job_key(&job).to_vec(), job));
             if jobs.len() >= limit {
-                return Ok((jobs, true, next_due_at_ms));
+                return Ok((jobs, true, None));
             }
         }
 
         match next_start_after {
             Some(next) => start_after = Some(next),
-            None => return Ok((jobs, false, next_due_at_ms)),
+            None => return Ok((jobs, false, None)),
         }
     }
-}
-
-fn min_due_at(current: Option<u64>, due_at_ms: u64) -> Option<u64> {
-    Some(current.map_or(due_at_ms, |current| current.min(due_at_ms)))
 }
 
 fn due_after(now_ms: u64, due_at_ms: u64) -> Duration {
@@ -839,16 +723,6 @@ async fn process_materialization_job(
             ));
         }
         MaterializationJobObsolescence::RetryAdvanced => {
-            if let Some(preferred) = find_decoded_global_materialization_job(
-                &context.storage_handle,
-                job.document_id,
-                job.event_id,
-                Some(job_key.as_slice()),
-            )
-            .await?
-            {
-                write_materialization_document_job(&context.storage_handle, &preferred).await?;
-            }
             delete_materialization_global_job(&context.storage_handle, job_key).await?;
             return Ok(ProcessedMaterializationJob::default());
         }
@@ -962,6 +836,9 @@ async fn process_materialization_job(
     }
 }
 
+// The sidecar keyspace is per-document and event-ordered, so the predecessor
+// check costs O(pending jobs for this document): iterate below the target event
+// and stop at the first key that is not an unadvanced, live, older job.
 async fn older_materialization_job_exists(
     storage: &StorageHandle,
     document_id: Ulid,
@@ -998,182 +875,27 @@ async fn older_materialization_job_exists(
         for (key, value) in values {
             let key = key.to_vec();
             if key.as_slice() >= stop_key.as_ref() {
-                return older_global_materialization_job_exists(
-                    storage,
-                    document_id,
-                    event_id,
-                    advanced_event_ids,
-                    status.as_ref(),
-                )
-                .await;
+                return Ok(false);
             }
             let job = match postcard::from_bytes::<MetadataMaterializationJobRecord>(&value) {
                 Ok(job) => job,
                 Err(error) => {
-                    warn!(error = %error, key = ?key, "Repairing or deleting malformed metadata materialization document job while checking predecessors");
-                    if let Some((job_document_id, job_event_id)) =
-                        materialization_document_job_key_target(&key)
-                        && job_document_id == document_id
-                        && job_event_id < event_id
-                        && !advanced_event_ids.contains(&job_event_id)
-                    {
-                        match read_global_materialization_job(
-                            storage,
-                            job_document_id,
-                            job_event_id,
-                        )
-                        .await?
-                        {
-                            Some(job)
-                                if !status.as_ref().is_some_and(|status| {
-                                    materialization_status_obsoletes_job(status, &job)
-                                }) =>
-                            {
-                                write_materialization_document_job(storage, &job).await?;
-                                return Ok(true);
-                            }
-                            _ => {}
-                        }
-                    }
+                    warn!(error = %error, key = ?key, "Deleting malformed metadata materialization document job while checking predecessors");
                     delete_materialization_document_job(storage, key).await?;
                     continue;
                 }
             };
-            if !materialization_document_job_key_matches(&key, &job) {
-                warn!(key = ?key, "Repairing or deleting metadata materialization document job stored under non-canonical key");
-                if let Some((job_document_id, job_event_id)) =
-                    materialization_document_job_key_target(&key)
-                    && job_document_id == document_id
-                    && job_event_id < event_id
-                    && !advanced_event_ids.contains(&job_event_id)
-                {
-                    match read_global_materialization_job(storage, job_document_id, job_event_id)
-                        .await?
-                    {
-                        Some(global_job)
-                            if !status.as_ref().is_some_and(|status| {
-                                materialization_status_obsoletes_job(status, &global_job)
-                            }) =>
-                        {
-                            write_materialization_document_job(storage, &global_job).await?;
-                            return Ok(true);
-                        }
-                        _ => {}
-                    }
-                }
-                delete_materialization_document_job(storage, key).await?;
-                continue;
-            }
-            if job.document_id == document_id
-                && job.event_id < event_id
-                && !advanced_event_ids.contains(&job.event_id)
-                && !status
-                    .as_ref()
-                    .is_some_and(|status| materialization_status_obsoletes_job(status, &job))
-            {
-                match read_global_materialization_job(storage, job.document_id, job.event_id)
-                    .await?
-                {
-                    Some(global_job) => {
-                        if global_job != job {
-                            write_materialization_document_job(storage, &global_job).await?;
-                        }
-                        return Ok(true);
-                    }
-                    None => {
-                        warn!(key = ?key, "Deleting orphan metadata materialization document job");
-                        delete_materialization_document_job(storage, key).await?;
-                    }
-                }
-            }
-        }
-
-        match next_start_after {
-            Some(next) => start_after = Some(next),
-            None => {
-                return older_global_materialization_job_exists(
-                    storage,
-                    document_id,
-                    event_id,
-                    advanced_event_ids,
-                    status.as_ref(),
-                )
-                .await;
-            }
-        }
-    }
-}
-
-async fn older_global_materialization_job_exists(
-    storage: &StorageHandle,
-    document_id: Ulid,
-    event_id: Ulid,
-    advanced_event_ids: &BTreeSet<Ulid>,
-    status: Option<&MetadataMaterializationStatusRecord>,
-) -> Result<bool, MetadataMaterializationQueueError> {
-    let mut start_after = None;
-    loop {
-        let event = storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
-                prefix: None,
-                start: start_after.take().map(IterStart::After),
-                limit: MATERIALIZATION_SCAN_PAGE_SIZE,
-                txn_id: None,
-            })
-            .await;
-        let (values, next_start_after) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => {
-                return Err(MetadataMaterializationQueueError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
-            }
-        };
-
-        for (key, value) in values {
-            let key = key.to_vec();
-            let mut job = match postcard::from_bytes::<MetadataMaterializationJobRecord>(&value) {
-                Ok(job) => job,
-                Err(error) => {
-                    warn!(error = %error, key = ?key, "Repairing or deleting malformed metadata materialization job while checking global predecessors");
-                    if let Some(job) =
-                        repair_or_delete_malformed_materialization_job(storage, key).await?
-                        && job.document_id == document_id
-                        && job.event_id < event_id
-                        && !advanced_event_ids.contains(&job.event_id)
-                        && !status.is_some_and(|status| {
-                            materialization_status_obsoletes_job(status, &job)
-                        })
-                    {
-                        write_materialization_document_job(storage, &job).await?;
-                        return Ok(true);
-                    }
-                    continue;
-                }
-            };
-            if !materialization_job_key_matches(&key, &job) {
-                warn!(key = ?key, "Repairing metadata materialization job stored under non-canonical key while checking global predecessors");
-                let Some(global_job) =
-                    read_global_materialization_job(storage, job.document_id, job.event_id).await?
-                else {
-                    continue;
-                };
-                job = global_job;
-            }
             if job.document_id != document_id
                 || job.event_id >= event_id
                 || advanced_event_ids.contains(&job.event_id)
-                || status.is_some_and(|status| materialization_status_obsoletes_job(status, &job))
+                || status
+                    .as_ref()
+                    .is_some_and(|status| materialization_status_obsoletes_job(status, &job))
             {
                 continue;
             }
             if !materialization_event_exists(storage, &job).await? {
-                warn!(document_id = %job.document_id, event_id = %job.event_id, "Deleting orphan metadata materialization job while checking global predecessors");
+                warn!(document_id = %job.document_id, event_id = %job.event_id, "Deleting orphan metadata materialization document job while checking predecessors");
                 delete_materialization_job(
                     storage,
                     metadata_materialization_job_key(&job).to_vec(),
@@ -1181,7 +903,6 @@ async fn older_global_materialization_job_exists(
                 .await?;
                 continue;
             }
-            write_materialization_document_job(storage, &job).await?;
             return Ok(true);
         }
 
@@ -1328,7 +1049,7 @@ pub async fn metadata_materialization_jobs_exist(
 ) -> Result<bool, MetadataMaterializationQueueError> {
     let mut start_after = None;
     loop {
-        match storage
+        let (values, next_start_after) = match storage
             .send_storage_effect(StorageEffect::Iter {
                 key_space: METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
                 prefix: None,
@@ -1341,67 +1062,35 @@ pub async fn metadata_materialization_jobs_exist(
             Event::Storage(StorageEvent::IterResult {
                 values,
                 next_start_after,
-            }) => {
-                let Some((key, value)) = values.into_iter().next() else {
-                    return Ok(false);
-                };
-                match postcard::from_bytes::<MetadataMaterializationJobRecord>(&value) {
-                    Ok(job) if materialization_job_key_matches(key.as_ref(), &job) => {
-                        if materialization_job_is_live(storage, &job).await? {
-                            return Ok(true);
-                        }
-                        delete_materialization_global_job(storage, key.to_vec()).await?;
-                    }
-                    Ok(job) => {
-                        let key = key.to_vec();
-                        warn!(key = ?key, "Repairing metadata materialization job stored under non-canonical key while probing queue");
-                        if let Some(existing_job) = find_decoded_global_materialization_job(
-                            storage,
-                            job.document_id,
-                            job.event_id,
-                            Some(key.as_slice()),
-                        )
-                        .await?
-                        {
-                            delete_materialization_global_job(storage, key).await?;
-                            if materialization_job_is_live(storage, &existing_job).await? {
-                                return Ok(true);
-                            }
-                            delete_materialization_global_job(
-                                storage,
-                                metadata_materialization_job_key(&existing_job).to_vec(),
-                            )
-                            .await?;
-                            continue;
-                        }
-                        if materialization_job_is_live(storage, &job).await? {
-                            repair_materialization_job_key(storage, key, &job).await?;
-                            return Ok(true);
-                        }
-                        delete_materialization_global_job(storage, key).await?;
-                    }
-                    Err(error) => {
-                        let key = key.to_vec();
-                        warn!(error = %error, key = ?key, "Repairing or deleting malformed metadata materialization job while probing queue");
-                        if repair_or_delete_malformed_materialization_job(storage, key)
-                            .await?
-                            .is_some()
-                        {
-                            return Ok(true);
-                        }
-                    }
-                }
-                match next_start_after {
-                    Some(next) => start_after = Some(next),
-                    None => return Ok(false),
-                }
-            }
+            }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
                 return Err(MetadataMaterializationQueueError::UnexpectedEvent(format!(
                     "{other:?}"
                 )));
             }
+        };
+        let Some((key, _value)) = values.into_iter().next() else {
+            return Ok(false);
+        };
+        let key = key.to_vec();
+        match materialization_job_key_parts(&key) {
+            Some((due_at_ms, document_id, event_id)) => {
+                match read_document_job(storage, document_id, event_id).await? {
+                    Some(job) if job.due_at_ms == due_at_ms => {
+                        if materialization_job_is_live(storage, &job).await? {
+                            return Ok(true);
+                        }
+                        delete_materialization_job(storage, key).await?;
+                    }
+                    _ => delete_materialization_global_job(storage, key).await?,
+                }
+            }
+            None => delete_materialization_global_job(storage, key).await?,
+        }
+        match next_start_after {
+            Some(next) => start_after = Some(next),
+            None => return Ok(false),
         }
     }
 }
@@ -1435,140 +1124,6 @@ async fn delete_materialization_global_job(
         )],
     )
     .await
-}
-
-async fn repair_or_delete_malformed_materialization_job(
-    storage: &StorageHandle,
-    key: Vec<u8>,
-) -> Result<Option<MetadataMaterializationJobRecord>, MetadataMaterializationQueueError> {
-    let Some((due_at_ms, document_id, event_id)) = materialization_job_key_parts(&key) else {
-        delete_materialization_job(storage, key).await?;
-        return Ok(None);
-    };
-    let probe_job = MetadataMaterializationJobRecord {
-        document_id,
-        event_id,
-        due_at_ms: 0,
-        attempts: 0,
-    };
-    if !materialization_event_exists(storage, &probe_job).await? {
-        delete_materialization_job(storage, key).await?;
-        return Ok(None);
-    }
-    let current = read_materialization_status(storage, document_id, None).await?;
-    if current
-        .as_ref()
-        .is_some_and(|status| materialization_status_obsoletes_job(status, &probe_job))
-    {
-        delete_materialization_job(storage, key).await?;
-        return Ok(None);
-    }
-    if let Some(existing_job) = find_decoded_global_materialization_job(
-        storage,
-        document_id,
-        event_id,
-        Some(key.as_slice()),
-    )
-    .await?
-    {
-        delete_materialization_global_job(storage, key).await?;
-        return Ok(Some(existing_job));
-    }
-    let job = MetadataMaterializationJobRecord {
-        document_id,
-        event_id,
-        due_at_ms,
-        attempts: current
-            .filter(|status| status.event_id == event_id)
-            .map(|status| status.attempts)
-            .unwrap_or(0),
-    };
-    repair_materialization_job_key(storage, key, &job).await?;
-    Ok(Some(job))
-}
-
-async fn find_decoded_global_materialization_job(
-    storage: &StorageHandle,
-    document_id: Ulid,
-    event_id: Ulid,
-    skip_key: Option<&[u8]>,
-) -> Result<Option<MetadataMaterializationJobRecord>, MetadataMaterializationQueueError> {
-    let mut selected: Option<(Vec<u8>, MetadataMaterializationJobRecord)> = None;
-    let mut stale_keys = Vec::new();
-    let mut start_after = None;
-    loop {
-        let event = storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
-                prefix: None,
-                start: start_after.take().map(IterStart::After),
-                limit: MATERIALIZATION_SCAN_PAGE_SIZE,
-                txn_id: None,
-            })
-            .await;
-        let (values, next_start_after) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => {
-                return Err(MetadataMaterializationQueueError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
-            }
-        };
-
-        for (key, value) in values {
-            if skip_key.is_some_and(|skip_key| key.as_ref() == skip_key) {
-                continue;
-            }
-            let Ok(job) = postcard::from_bytes::<MetadataMaterializationJobRecord>(&value) else {
-                continue;
-            };
-            if job.document_id != document_id || job.event_id != event_id {
-                continue;
-            }
-            let key = key.to_vec();
-            if !materialization_job_is_live(storage, &job).await? {
-                stale_keys.push(key);
-                continue;
-            }
-            match selected.as_mut() {
-                Some((selected_key, selected_job))
-                    if materialization_job_preferred(&job, selected_job) =>
-                {
-                    stale_keys.push(std::mem::replace(selected_key, key));
-                    *selected_job = job;
-                }
-                Some(_) => stale_keys.push(key),
-                None => selected = Some((key, job)),
-            }
-        }
-
-        match next_start_after {
-            Some(next) => start_after = Some(next),
-            None => break,
-        }
-    }
-
-    let Some((key, job)) = selected else {
-        for key in stale_keys {
-            delete_materialization_global_job(storage, key).await?;
-        }
-        return Ok(None);
-    };
-    if !materialization_job_key_matches(&key, &job) {
-        repair_materialization_job_key(storage, key.clone(), &job).await?;
-    }
-    let canonical_key = metadata_materialization_job_key(&job);
-    for stale_key in stale_keys {
-        if stale_key.as_slice() != key.as_slice() && stale_key.as_slice() != canonical_key.as_ref()
-        {
-            delete_materialization_global_job(storage, stale_key).await?;
-        }
-    }
-    Ok(Some(job))
 }
 
 async fn delete_materialization_document_job(
@@ -1607,55 +1162,6 @@ async fn delete_materialization_entries(
     }
 }
 
-async fn repair_materialization_job_key(
-    storage: &StorageHandle,
-    old_key: Vec<u8>,
-    job: &MetadataMaterializationJobRecord,
-) -> Result<(), MetadataMaterializationQueueError> {
-    let canonical_key = metadata_materialization_job_key(job);
-    let txn_id = start_write_transaction(storage).await?;
-    let result = async {
-        transactional_batch_write(
-            storage,
-            txn_id,
-            vec![
-                metadata_materialization_job_write_entry(job)?,
-                metadata_materialization_document_job_write_entry(job)?,
-            ],
-        )
-        .await?;
-        if old_key.as_slice() != canonical_key.as_ref() {
-            transactional_batch_delete(
-                storage,
-                txn_id,
-                vec![(
-                    METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
-                    ByteView::from(old_key),
-                )],
-            )
-            .await?;
-        }
-        Ok(())
-    }
-    .await;
-    match result {
-        Ok(()) => {
-            commit_storage_transaction(storage, txn_id).await?;
-            Ok(())
-        }
-        Err(error) => {
-            abort_storage_transaction_best_effort(
-                storage,
-                txn_id,
-                "Failed to abort materialization repair transaction",
-                "Unexpected materialization repair transaction abort result",
-            )
-            .await;
-            Err(error)
-        }
-    }
-}
-
 fn materialization_job_key_target(key: &[u8]) -> Option<(Ulid, Ulid)> {
     materialization_job_key_parts(key).map(|(_, document_id, event_id)| (document_id, event_id))
 }
@@ -1675,28 +1181,6 @@ fn materialization_job_key_parts(key: &[u8]) -> Option<(u64, Ulid, Ulid)> {
         Ulid::from_bytes(document_id),
         Ulid::from_bytes(event_id),
     ))
-}
-
-fn materialization_job_key_matches(key: &[u8], job: &MetadataMaterializationJobRecord) -> bool {
-    metadata_materialization_job_key(job).as_ref() == key
-}
-
-fn materialization_document_job_key_target(key: &[u8]) -> Option<(Ulid, Ulid)> {
-    if key.len() != 32 {
-        return None;
-    }
-    let mut document_id = [0u8; 16];
-    document_id.copy_from_slice(&key[..16]);
-    let mut event_id = [0u8; 16];
-    event_id.copy_from_slice(&key[16..32]);
-    Some((Ulid::from_bytes(document_id), Ulid::from_bytes(event_id)))
-}
-
-fn materialization_document_job_key_matches(
-    key: &[u8],
-    job: &MetadataMaterializationJobRecord,
-) -> bool {
-    metadata_materialization_document_job_key(job.document_id, job.event_id).as_ref() == key
 }
 
 async fn metadata_graph_deleted(
@@ -2013,92 +1497,6 @@ async fn write_materialization_status_and_job(
     }
 }
 
-async fn write_materialization_document_job(
-    storage: &StorageHandle,
-    job: &MetadataMaterializationJobRecord,
-) -> Result<(), MetadataMaterializationQueueError> {
-    let (key_space, key, value) = metadata_materialization_document_job_write_entry(job)?;
-    match storage
-        .send_storage_effect(StorageEffect::Write {
-            key_space,
-            key,
-            value,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
-    }
-}
-
-async fn read_global_materialization_job(
-    storage: &StorageHandle,
-    document_id: Ulid,
-    event_id: Ulid,
-) -> Result<Option<MetadataMaterializationJobRecord>, MetadataMaterializationQueueError> {
-    if let Some(job) =
-        find_decoded_global_materialization_job(storage, document_id, event_id, None).await?
-    {
-        return Ok(Some(job));
-    }
-    find_repaired_malformed_global_materialization_job(storage, document_id, event_id).await
-}
-
-async fn find_repaired_malformed_global_materialization_job(
-    storage: &StorageHandle,
-    document_id: Ulid,
-    event_id: Ulid,
-) -> Result<Option<MetadataMaterializationJobRecord>, MetadataMaterializationQueueError> {
-    let mut start_after = None;
-    loop {
-        let event = storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
-                prefix: None,
-                start: start_after.take().map(IterStart::After),
-                limit: MATERIALIZATION_SCAN_PAGE_SIZE,
-                txn_id: None,
-            })
-            .await;
-        let (values, next_start_after) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => {
-                return Err(MetadataMaterializationQueueError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
-            }
-        };
-
-        for (key, value) in values {
-            let Err(error) = postcard::from_bytes::<MetadataMaterializationJobRecord>(&value)
-            else {
-                continue;
-            };
-            let key = key.to_vec();
-            warn!(error = %error, key = ?key, "Repairing or deleting malformed metadata materialization job while repairing document sidecar");
-            if let Some(job) = repair_or_delete_malformed_materialization_job(storage, key).await?
-                && job.document_id == document_id
-                && job.event_id == event_id
-            {
-                return Ok(Some(job));
-            }
-        }
-
-        match next_start_after {
-            Some(next) => start_after = Some(next),
-            None => return Ok(None),
-        }
-    }
-}
-
 async fn materialization_event_exists(
     storage: &StorageHandle,
     job: &MetadataMaterializationJobRecord,
@@ -2214,43 +1612,6 @@ mod tests {
         }
     }
 
-    async fn read_materialization_document_job(
-        storage: &StorageHandle,
-        key: Vec<u8>,
-    ) -> Option<MetadataMaterializationJobRecord> {
-        match storage
-            .send_storage_effect(StorageEffect::Read {
-                key_space: METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
-                key: ByteView::from(key),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => value.map(|value| {
-                postcard::from_bytes(&value).expect("materialization document job decodes")
-            }),
-            other => panic!("unexpected storage event: {other:?}"),
-        }
-    }
-
-    async fn read_materialization_global_job_at_key(
-        storage: &StorageHandle,
-        key: Vec<u8>,
-    ) -> Option<MetadataMaterializationJobRecord> {
-        match storage
-            .send_storage_effect(StorageEffect::Read {
-                key_space: METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
-                key: ByteView::from(key),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-                .map(|value| postcard::from_bytes(&value).expect("materialization job decodes")),
-            other => panic!("unexpected storage event: {other:?}"),
-        }
-    }
-
     #[tokio::test]
     async fn corrupt_materialization_job_only_is_deleted() {
         let dir = tempdir().unwrap();
@@ -2306,6 +1667,7 @@ mod tests {
                 ),
                 metadata_create_event_write_entry(&event).unwrap(),
                 metadata_materialization_job_write_entry(&valid_job).expect("job entry"),
+                metadata_materialization_document_job_write_entry(&valid_job).expect("sidecar"),
             ],
         )
         .await;
@@ -2382,51 +1744,6 @@ mod tests {
             )
             .await
             .unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn malformed_document_sidecar_repairs_from_valid_global_job_and_blocks_newer() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let document_id = Ulid::from_bytes([15u8; 16]);
-        let old_event_id = Ulid::from_parts(15, 1);
-        let newer_event_id = Ulid::from_parts(15, 2);
-        let old_job = MetadataMaterializationJobRecord {
-            document_id,
-            event_id: old_event_id,
-            due_at_ms: unix_timestamp_millis().saturating_add(60_000),
-            attempts: 0,
-        };
-        let old_event = create_event(document_id, old_event_id, "malformed-sidecar");
-        let document_key = metadata_materialization_document_job_key(document_id, old_event_id);
-        write_entries(
-            &storage,
-            vec![
-                metadata_create_event_write_entry(&old_event).unwrap(),
-                metadata_materialization_job_write_entry(&old_job).unwrap(),
-                (
-                    METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
-                    document_key.clone(),
-                    ByteView::from(vec![1, 2, 3]),
-                ),
-            ],
-        )
-        .await;
-
-        assert!(
-            older_materialization_job_exists(
-                &storage,
-                document_id,
-                newer_event_id,
-                &BTreeSet::new()
-            )
-            .await
-            .unwrap()
-        );
-        assert_eq!(
-            read_materialization_document_job(&storage, document_key.to_vec()).await,
-            Some(old_job)
         );
     }
 
@@ -2509,293 +1826,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn noncanonical_future_materialization_job_does_not_hide_due_job() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let now_ms = unix_timestamp_millis();
-        let future_job = MetadataMaterializationJobRecord {
-            document_id: Ulid::from_bytes([18u8; 16]),
-            event_id: Ulid::from_parts(18, 1),
-            due_at_ms: now_ms.saturating_add(60_000),
-            attempts: 0,
-        };
-        let due_job = MetadataMaterializationJobRecord {
-            document_id: Ulid::from_bytes([19u8; 16]),
-            event_id: Ulid::from_parts(19, 1),
-            due_at_ms: 1,
-            attempts: 0,
-        };
-        let future_event = create_event(future_job.document_id, future_job.event_id, "future");
-        let due_event = create_event(due_job.document_id, due_job.event_id, "due");
-        let misplaced_key = vec![0];
-        write_entries(
-            &storage,
-            vec![
-                metadata_create_event_write_entry(&future_event).unwrap(),
-                metadata_create_event_write_entry(&due_event).unwrap(),
-                (
-                    METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
-                    ByteView::from(misplaced_key.clone()),
-                    ByteView::from(postcard::to_allocvec(&future_job).unwrap()),
-                ),
-                metadata_materialization_job_write_entry(&due_job).unwrap(),
-            ],
-        )
-        .await;
-
-        let (jobs, has_more_due, _next_due_at_ms) =
-            scan_due_materialization_jobs(&storage, now_ms, 8)
-                .await
-                .unwrap();
-
-        assert_eq!(
-            jobs,
-            vec![(metadata_materialization_job_key(&due_job).to_vec(), due_job)]
-        );
-        assert!(!has_more_due);
-        assert!(
-            !storage_key_exists(
-                &storage,
-                METADATA_MATERIALIZATION_JOB_KEYSPACE,
-                misplaced_key
-            )
-            .await
-        );
-        assert!(
-            storage_key_exists(
-                &storage,
-                METADATA_MATERIALIZATION_JOB_KEYSPACE,
-                metadata_materialization_job_key(&future_job).to_vec()
-            )
-            .await
-        );
-    }
-
-    #[tokio::test]
-    async fn due_noncanonical_materialization_job_after_future_job_is_repaired() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let now_ms = unix_timestamp_millis();
-        let future_job = MetadataMaterializationJobRecord {
-            document_id: Ulid::from_bytes([20u8; 16]),
-            event_id: Ulid::from_parts(20, 1),
-            due_at_ms: now_ms.saturating_add(60_000),
-            attempts: 0,
-        };
-        let due_job = MetadataMaterializationJobRecord {
-            document_id: Ulid::from_bytes([21u8; 16]),
-            event_id: Ulid::from_parts(21, 1),
-            due_at_ms: 1,
-            attempts: 0,
-        };
-        let future_event = create_event(future_job.document_id, future_job.event_id, "future");
-        let due_event = create_event(due_job.document_id, due_job.event_id, "due");
-        let misplaced_key = vec![255];
-        write_entries(
-            &storage,
-            vec![
-                metadata_create_event_write_entry(&future_event).unwrap(),
-                metadata_create_event_write_entry(&due_event).unwrap(),
-                metadata_materialization_job_write_entry(&future_job).unwrap(),
-                (
-                    METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
-                    ByteView::from(misplaced_key.clone()),
-                    ByteView::from(postcard::to_allocvec(&due_job).unwrap()),
-                ),
-            ],
-        )
-        .await;
-
-        let (jobs, has_more_due, _next_due_at_ms) =
-            scan_due_materialization_jobs(&storage, now_ms, 8)
-                .await
-                .unwrap();
-
-        assert_eq!(
-            jobs,
-            vec![(metadata_materialization_job_key(&due_job).to_vec(), due_job)]
-        );
-        assert!(!has_more_due);
-        assert!(
-            !storage_key_exists(
-                &storage,
-                METADATA_MATERIALIZATION_JOB_KEYSPACE,
-                misplaced_key
-            )
-            .await
-        );
-    }
-
-    #[tokio::test]
-    async fn malformed_future_materialization_retry_preserves_encoded_due_at() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let now_ms = unix_timestamp_millis();
-        let document_id = Ulid::from_bytes([26u8; 16]);
-        let event_id = Ulid::from_parts(26, 1);
-        let event = create_event(document_id, event_id, "malformed-future-retry");
-        let future_job = MetadataMaterializationJobRecord {
-            document_id,
-            event_id,
-            due_at_ms: now_ms.saturating_add(60_000),
-            attempts: 1,
-        };
-        let future_key = metadata_materialization_job_key(&future_job);
-        let pending_retry = MetadataMaterializationStatusRecord {
-            document_id,
-            event_id,
-            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
-            context_digest: None,
-            dataset_digest: None,
-            state: MetadataMaterializationState::Pending,
-            attempts: 1,
-            last_error: Some("transient".to_string()),
-            updated_at_ms: now_ms,
-        };
-        write_entries(
-            &storage,
-            vec![
-                metadata_create_event_write_entry(&event).unwrap(),
-                metadata_materialization_status_write_entry(&pending_retry).unwrap(),
-                (
-                    METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
-                    future_key.clone(),
-                    ByteView::from(vec![1, 2, 3]),
-                ),
-            ],
-        )
-        .await;
-
-        let (jobs, has_more_due, next_due_at_ms) =
-            scan_due_materialization_jobs(&storage, now_ms, 8)
-                .await
-                .unwrap();
-
-        assert!(jobs.is_empty());
-        assert!(!has_more_due);
-        assert_eq!(next_due_at_ms, Some(future_job.due_at_ms));
-        assert_eq!(
-            read_materialization_global_job_at_key(&storage, future_key.to_vec()).await,
-            Some(future_job)
-        );
-    }
-
-    #[tokio::test]
-    async fn noncanonical_materialization_duplicate_preserves_future_retry() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let now_ms = unix_timestamp_millis();
-        let document_id = Ulid::from_bytes([27u8; 16]);
-        let event_id = Ulid::from_parts(27, 1);
-        let event = create_event(document_id, event_id, "noncanonical-future-retry");
-        let future_job = MetadataMaterializationJobRecord {
-            document_id,
-            event_id,
-            due_at_ms: now_ms.saturating_add(60_000),
-            attempts: 1,
-        };
-        let stale_job = MetadataMaterializationJobRecord {
-            due_at_ms: 1,
-            attempts: 0,
-            ..future_job.clone()
-        };
-        let misplaced_key = vec![0];
-        let future_key = metadata_materialization_job_key(&future_job);
-        write_entries(
-            &storage,
-            vec![
-                metadata_create_event_write_entry(&event).unwrap(),
-                metadata_materialization_job_write_entry(&future_job).unwrap(),
-                (
-                    METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
-                    ByteView::from(misplaced_key.clone()),
-                    ByteView::from(postcard::to_allocvec(&stale_job).unwrap()),
-                ),
-            ],
-        )
-        .await;
-
-        let (jobs, has_more_due, next_due_at_ms) =
-            scan_due_materialization_jobs(&storage, now_ms, 8)
-                .await
-                .unwrap();
-
-        assert!(jobs.is_empty());
-        assert!(!has_more_due);
-        assert_eq!(next_due_at_ms, Some(future_job.due_at_ms));
-        assert!(
-            !storage_key_exists(
-                &storage,
-                METADATA_MATERIALIZATION_JOB_KEYSPACE,
-                misplaced_key
-            )
-            .await
-        );
-        assert_eq!(
-            read_materialization_global_job_at_key(&storage, future_key.to_vec()).await,
-            Some(future_job)
-        );
-    }
-
-    #[tokio::test]
-    async fn canonical_materialization_duplicate_preserves_future_retry() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let now_ms = unix_timestamp_millis();
-        let document_id = Ulid::from_bytes([28u8; 16]);
-        let event_id = Ulid::from_parts(28, 1);
-        let event = create_event(document_id, event_id, "canonical-future-retry");
-        let future_job = MetadataMaterializationJobRecord {
-            document_id,
-            event_id,
-            due_at_ms: now_ms.saturating_add(60_000),
-            attempts: 1,
-        };
-        let stale_job = MetadataMaterializationJobRecord {
-            due_at_ms: 1,
-            attempts: 0,
-            ..future_job.clone()
-        };
-        let stale_key = metadata_materialization_job_key(&stale_job);
-        let future_key = metadata_materialization_job_key(&future_job);
-        let document_key = metadata_materialization_document_job_key(document_id, event_id);
-        write_entries(
-            &storage,
-            vec![
-                metadata_create_event_write_entry(&event).unwrap(),
-                metadata_materialization_job_write_entry(&stale_job).unwrap(),
-                metadata_materialization_job_write_entry(&future_job).unwrap(),
-            ],
-        )
-        .await;
-
-        let (jobs, has_more_due, next_due_at_ms) =
-            scan_due_materialization_jobs(&storage, now_ms, 8)
-                .await
-                .unwrap();
-
-        assert!(jobs.is_empty());
-        assert!(!has_more_due);
-        assert_eq!(next_due_at_ms, Some(future_job.due_at_ms));
-        assert!(
-            !storage_key_exists(
-                &storage,
-                METADATA_MATERIALIZATION_JOB_KEYSPACE,
-                stale_key.to_vec()
-            )
-            .await
-        );
-        assert_eq!(
-            read_materialization_global_job_at_key(&storage, future_key.to_vec()).await,
-            Some(future_job.clone())
-        );
-        assert_eq!(
-            read_materialization_document_job(&storage, document_key.to_vec()).await,
-            Some(future_job)
-        );
-    }
-
-    #[tokio::test]
     async fn orphan_global_materialization_job_is_deleted() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
@@ -2850,135 +1880,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn noncanonical_decodable_document_sidecar_repairs_from_global_job() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let document_id = Ulid::from_bytes([23u8; 16]);
-        let old_event_id = Ulid::from_parts(23, 1);
-        let newer_event_id = Ulid::from_parts(23, 2);
-        let old_job = MetadataMaterializationJobRecord {
-            document_id,
-            event_id: old_event_id,
-            due_at_ms: unix_timestamp_millis().saturating_add(60_000),
-            attempts: 0,
-        };
-        let wrong_job = MetadataMaterializationJobRecord {
-            event_id: Ulid::from_parts(23, 99),
-            ..old_job.clone()
-        };
-        let old_event = create_event(document_id, old_event_id, "noncanonical-sidecar");
-        let document_key = metadata_materialization_document_job_key(document_id, old_event_id);
-        write_entries(
-            &storage,
-            vec![
-                metadata_create_event_write_entry(&old_event).unwrap(),
-                metadata_materialization_job_write_entry(&old_job).unwrap(),
-                (
-                    METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
-                    document_key.clone(),
-                    ByteView::from(postcard::to_allocvec(&wrong_job).unwrap()),
-                ),
-            ],
-        )
-        .await;
-
-        assert!(
-            older_materialization_job_exists(
-                &storage,
-                document_id,
-                newer_event_id,
-                &BTreeSet::new()
-            )
-            .await
-            .unwrap()
-        );
-        assert_eq!(
-            read_materialization_document_job(&storage, document_key.to_vec()).await,
-            Some(old_job)
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_document_sidecar_repairs_from_global_job_and_blocks_newer() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let document_id = Ulid::from_bytes([24u8; 16]);
-        let old_event_id = Ulid::from_parts(24, 1);
-        let newer_event_id = Ulid::from_parts(24, 2);
-        let event = create_event(document_id, old_event_id, "missing-sidecar");
-        let old_job = MetadataMaterializationJobRecord {
-            document_id,
-            event_id: old_event_id,
-            due_at_ms: unix_timestamp_millis().saturating_add(60_000),
-            attempts: 0,
-        };
-        let document_key = metadata_materialization_document_job_key(document_id, old_event_id);
-        write_entries(
-            &storage,
-            vec![
-                metadata_create_event_write_entry(&event).unwrap(),
-                metadata_materialization_job_write_entry(&old_job).unwrap(),
-            ],
-        )
-        .await;
-
-        assert!(
-            older_materialization_job_exists(
-                &storage,
-                document_id,
-                newer_event_id,
-                &BTreeSet::new()
-            )
-            .await
-            .unwrap()
-        );
-        assert_eq!(
-            read_materialization_document_job(&storage, document_key.to_vec()).await,
-            Some(old_job)
-        );
-    }
-
-    #[tokio::test]
-    async fn future_orphan_global_materialization_job_is_deleted_during_predecessor_check() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let document_id = Ulid::from_bytes([25u8; 16]);
-        let old_event_id = Ulid::from_parts(25, 1);
-        let newer_event_id = Ulid::from_parts(25, 2);
-        let old_job = MetadataMaterializationJobRecord {
-            document_id,
-            event_id: old_event_id,
-            due_at_ms: unix_timestamp_millis().saturating_add(60_000),
-            attempts: 0,
-        };
-        let global_key = metadata_materialization_job_key(&old_job);
-        write_entries(
-            &storage,
-            vec![metadata_materialization_job_write_entry(&old_job).unwrap()],
-        )
-        .await;
-
-        assert!(
-            !older_materialization_job_exists(
-                &storage,
-                document_id,
-                newer_event_id,
-                &BTreeSet::new()
-            )
-            .await
-            .unwrap()
-        );
-        assert!(
-            !storage_key_exists(
-                &storage,
-                METADATA_MATERIALIZATION_JOB_KEYSPACE,
-                global_key.to_vec()
-            )
-            .await
-        );
-    }
-
-    #[tokio::test]
     async fn corrupt_materialization_document_job_is_deleted_while_checking_predecessors() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
@@ -3009,6 +1910,158 @@ mod tests {
             )
             .await
         );
+    }
+
+    #[tokio::test]
+    async fn scan_stops_early() {
+        // Due jobs sort before future jobs, so the scan returns at the first
+        // future key without paging the whole keyspace.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let now_ms = unix_timestamp_millis();
+        let document_id = Ulid::from_bytes([40u8; 16]);
+        let due_event = Ulid::from_parts(1, 1);
+        let event = create_event(document_id, due_event, "due");
+        let due_job = MetadataMaterializationJobRecord {
+            document_id,
+            event_id: due_event,
+            due_at_ms: 1,
+            attempts: 0,
+        };
+        let mut writes = vec![
+            metadata_create_event_write_entry(&event).unwrap(),
+            metadata_materialization_job_write_entry(&due_job).unwrap(),
+            metadata_materialization_document_job_write_entry(&due_job).unwrap(),
+        ];
+        for index in 0..600u64 {
+            let future_job = MetadataMaterializationJobRecord {
+                document_id: Ulid::from_bytes([41u8; 16]),
+                event_id: Ulid::from_parts(2, u128::from(index)),
+                due_at_ms: now_ms.saturating_add(60_000).saturating_add(index),
+                attempts: 0,
+            };
+            writes.push(metadata_materialization_job_write_entry(&future_job).unwrap());
+        }
+        write_entries(&storage, writes).await;
+
+        let before = storage.snapshot_metrics().requests_total;
+        let (jobs, has_more_due, next_due_at_ms) =
+            scan_due_materialization_jobs(&storage, now_ms, MATERIALIZATION_BATCH_SIZE)
+                .await
+                .unwrap();
+        let delta = storage.snapshot_metrics().requests_total - before;
+
+        assert_eq!(
+            jobs,
+            vec![(metadata_materialization_job_key(&due_job).to_vec(), due_job)]
+        );
+        assert!(!has_more_due);
+        assert!(next_due_at_ms.is_some());
+        assert!(delta <= 10, "scan issued {delta} storage requests");
+    }
+
+    #[tokio::test]
+    async fn stale_index_pruned() {
+        // An index row with no sidecar, and one whose sidecar due time differs,
+        // are both deleted and yield no job.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let now_ms = unix_timestamp_millis();
+        let orphan = MetadataMaterializationJobRecord {
+            document_id: Ulid::from_bytes([42u8; 16]),
+            event_id: Ulid::from_parts(1, 1),
+            due_at_ms: 1,
+            attempts: 0,
+        };
+        let mismatched = MetadataMaterializationJobRecord {
+            document_id: Ulid::from_bytes([43u8; 16]),
+            event_id: Ulid::from_parts(1, 2),
+            due_at_ms: 1,
+            attempts: 0,
+        };
+        let mismatched_sidecar = MetadataMaterializationJobRecord {
+            due_at_ms: 999,
+            ..mismatched.clone()
+        };
+        let orphan_key = metadata_materialization_job_key(&orphan);
+        let mismatched_key = metadata_materialization_job_key(&mismatched);
+        write_entries(
+            &storage,
+            vec![
+                metadata_materialization_job_write_entry(&orphan).unwrap(),
+                metadata_materialization_job_write_entry(&mismatched).unwrap(),
+                metadata_materialization_document_job_write_entry(&mismatched_sidecar).unwrap(),
+            ],
+        )
+        .await;
+
+        let (jobs, has_more_due, _next) =
+            scan_due_materialization_jobs(&storage, now_ms, MATERIALIZATION_BATCH_SIZE)
+                .await
+                .unwrap();
+
+        assert!(jobs.is_empty());
+        assert!(!has_more_due);
+        assert!(
+            !storage_key_exists(
+                &storage,
+                METADATA_MATERIALIZATION_JOB_KEYSPACE,
+                orphan_key.to_vec()
+            )
+            .await
+        );
+        assert!(
+            !storage_key_exists(
+                &storage,
+                METADATA_MATERIALIZATION_JOB_KEYSPACE,
+                mismatched_key.to_vec()
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn older_check_bounded() {
+        // The predecessor check for one document must not scan the sidecar rows
+        // of unrelated documents.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let document_id = Ulid::from_bytes([44u8; 16]);
+        let first = Ulid::from_parts(1, 1);
+        let middle = Ulid::from_parts(2, 1);
+        let last = Ulid::from_parts(3, 1);
+        let first_event = create_event(document_id, first, "first");
+        let job_for = |event_id: Ulid| MetadataMaterializationJobRecord {
+            document_id,
+            event_id,
+            due_at_ms: 1,
+            attempts: 0,
+        };
+        let mut writes = vec![
+            metadata_create_event_write_entry(&first_event).unwrap(),
+            metadata_materialization_document_job_write_entry(&job_for(first)).unwrap(),
+            metadata_materialization_document_job_write_entry(&job_for(middle)).unwrap(),
+            metadata_materialization_document_job_write_entry(&job_for(last)).unwrap(),
+        ];
+        for index in 0..500u64 {
+            let other = MetadataMaterializationJobRecord {
+                document_id: Ulid::from_parts(9, u128::from(index)),
+                event_id: Ulid::from_parts(9, u128::from(index)),
+                due_at_ms: 1,
+                attempts: 0,
+            };
+            writes.push(metadata_materialization_document_job_write_entry(&other).unwrap());
+        }
+        write_entries(&storage, writes).await;
+
+        let before = storage.snapshot_metrics().requests_total;
+        let older = older_materialization_job_exists(&storage, document_id, middle, &BTreeSet::new())
+            .await
+            .unwrap();
+        let delta = storage.snapshot_metrics().requests_total - before;
+
+        assert!(older);
+        assert!(delta <= 10, "older check issued {delta} storage requests");
     }
 
     #[test]
@@ -3438,7 +2491,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unrelated_jobs_do_not_force_global_predecessor_scan() {
+    async fn older_check_local() {
+        // Predecessor lookups read the status then one document-local sidecar
+        // scan; they never fall back to a full global keyspace scan.
         let (storage, receiver) = StorageHandle::new();
         let document_id = Ulid::from_bytes([11u8; 16]);
         let event_id = Ulid::from_parts(11, 2);
@@ -3487,27 +2542,10 @@ mod tests {
                 next_start_after: None,
             });
 
-            let (effect, response_tx, _span, _enqueued_at, _in_flight) =
-                receiver.recv().expect("global predecessor scan");
-            match effect {
-                StorageEffect::Iter {
-                    key_space,
-                    prefix,
-                    start,
-                    limit,
-                    txn_id: None,
-                } => {
-                    assert_eq!(key_space, METADATA_MATERIALIZATION_JOB_KEYSPACE);
-                    assert_eq!(prefix, None);
-                    assert_eq!(start, None);
-                    assert_eq!(limit, MATERIALIZATION_SCAN_PAGE_SIZE);
-                }
-                other => panic!("unexpected storage effect: {other:?}"),
-            }
-            response_tx.send(StorageEvent::IterResult {
-                values: Vec::new(),
-                next_start_after: None,
-            });
+            assert!(
+                receiver.recv().is_err(),
+                "no global predecessor scan is issued"
+            );
         });
 
         assert!(
@@ -3515,6 +2553,7 @@ mod tests {
                 .await
                 .unwrap()
         );
+        drop(storage);
         scripted.join().expect("scripted storage actor finished");
     }
 

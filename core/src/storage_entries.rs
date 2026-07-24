@@ -509,16 +509,21 @@ pub fn metadata_iri_reference_write_entry(
     ))
 }
 
+/// Due-index row for the materialization queue. The value is empty: the sidecar
+/// row is authoritative. Both rows MUST be written and deleted in one batch/txn
+/// so the index never references a document job that does not exist.
 pub fn metadata_materialization_job_write_entry(
     record: &MetadataMaterializationJobRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
         METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
         metadata_materialization_job_key(record),
-        postcard::to_allocvec(record)?.into(),
+        ByteView::from(Vec::new()),
     ))
 }
 
+/// Authoritative sidecar row for the materialization queue, paired with the due
+/// index row above; the two MUST be written and deleted together.
 pub fn metadata_materialization_document_job_write_entry(
     record: &MetadataMaterializationJobRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
