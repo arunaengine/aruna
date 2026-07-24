@@ -458,16 +458,12 @@ impl CreateMetadataDocumentOperation {
             None => None,
         };
         match self.choose_placement(config.as_ref()) {
-            Ok(placement) => self.append_create_event_effect(placement, realm_config_value),
+            Ok(placement) => self.append_create_event_effect(placement),
             Err(error) => self.fail(error),
         }
     }
 
-    fn append_create_event_effect(
-        &mut self,
-        placement: PlacementRef,
-        realm_config_value: Option<Value>,
-    ) -> Effects {
+    fn append_create_event_effect(&mut self, placement: PlacementRef) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.fail(CreateMetadataDocumentError::MissingTransaction);
         };
@@ -483,17 +479,7 @@ impl CreateMetadataDocumentOperation {
                 Ok(writes)
             });
         match writes {
-            Ok(mut writes) => {
-                if let Some(value) = realm_config_value {
-                    let target = DocumentSyncTarget::RealmConfig {
-                        realm_id: self.config.actor.realm_id,
-                    };
-                    writes.push((
-                        target.storage_keyspace().to_string(),
-                        target.storage_key(),
-                        value,
-                    ));
-                }
+            Ok(writes) => {
                 smallvec![Effect::Storage(StorageEffect::BatchWrite {
                     writes,
                     txn_id: Some(txn_id),
@@ -848,8 +834,8 @@ mod tests {
             panic!("expected transactional create append");
         };
         assert_eq!(*write_txn, txn_id);
-        assert!(writes.iter().any(|(key_space, key, _)| {
-            key_space == REALM_CONFIG_KEYSPACE && key.as_ref() == actor.realm_id.as_bytes()
+        assert!(!writes.iter().any(|(key_space, _, _)| {
+            key_space == REALM_CONFIG_KEYSPACE
         }));
         assert!(
             writes
@@ -1140,12 +1126,20 @@ mod tests {
         operation.start();
         let effects = operation.step(validation_result(document_id));
         begin_transaction(&mut operation, effects.as_slice());
-        operation.step(realm_config_read(
+        let effects = operation.step(realm_config_read(
             Some(&realm_config),
             &actor,
             group_id,
             document_id,
         ));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected transactional create append");
+        };
+        assert!(
+            !writes
+                .iter()
+                .any(|(key_space, _, _)| key_space == REALM_CONFIG_KEYSPACE)
+        );
 
         let placement = operation
             .record
