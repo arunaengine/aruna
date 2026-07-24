@@ -347,10 +347,10 @@ async fn generated_metadata_create_foreground_storage_effect_count_is_reduced()
         .requests_total;
 
     assert_eq!(created.record.document_id, document_id);
-    // Realm config read (outside the transaction so it cannot conflict), start,
-    // fence read, atomic event/fence write, and commit; a generated id still
-    // skips the existing-document read a client-supplied id needs.
-    assert_eq!(after - before, 5);
+    // Transaction start, the fence read of acceptance, path and realm config,
+    // the atomic event/fence write, and commit; a generated id still skips the
+    // existing-document read a client-supplied id needs.
+    assert_eq!(after - before, 4);
     Ok(())
 }
 
