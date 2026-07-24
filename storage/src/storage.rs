@@ -257,7 +257,12 @@ impl StorageHandle {
         handle
     }
 
-    fn channel(&self) -> &EffectSender {
+    fn channel_for(&self, effect: &StorageEffect) -> &EffectSender {
+        // Aborts free resources and must never wait behind bulk backpressure, so
+        // they always dispatch on the foreground lane regardless of priority.
+        if matches!(effect, StorageEffect::AbortTransaction { .. }) {
+            return &self.write_channel;
+        }
         match self.priority {
             StoragePriority::Foreground => &self.write_channel,
             StoragePriority::Bulk => &self.bulk_channel,
@@ -335,7 +340,7 @@ impl StorageHandle {
         let span = storage_effect_span(&effect);
         let in_flight = InFlightGuard::acquire(&self.metrics);
         match self
-            .channel()
+            .channel_for(&effect)
             .try_send((effect, response_tx, span, Instant::now(), in_flight))
         {
             Ok(()) => {}
@@ -383,7 +388,7 @@ impl StorageHandle {
         let span = storage_effect_span(&effect);
         let in_flight = InFlightGuard::acquire(&self.metrics);
         match self
-            .channel()
+            .channel_for(&effect)
             .try_send((effect, response_tx, span, Instant::now(), in_flight))
         {
             Ok(()) => {}
@@ -2083,6 +2088,46 @@ mod tests {
             let (_, priority) = super::recv_prioritized(&receivers).expect("bulk item");
             assert_eq!(priority, StoragePriority::Bulk);
         }
+        drop(keep);
+    }
+
+    #[test]
+    fn abort_routes_foreground() {
+        // A saturated bulk lane must not swallow a bulk handle's abort; aborts
+        // free resources and always dispatch on the foreground lane.
+        let (handle, receivers) = StorageHandle::new();
+        let mut keep = Vec::new();
+        loop {
+            let (tx, rx) = crossfire::oneshot::oneshot();
+            let effect = StorageEffect::Read {
+                key_space: "b".to_string(),
+                key: b"k".to_vec().into(),
+                txn_id: None,
+            };
+            let span = super::storage_effect_span(&effect);
+            let in_flight = super::InFlightGuard::acquire(&handle.metrics);
+            if handle
+                .bulk_channel
+                .try_send((effect, tx, span, Instant::now(), in_flight))
+                .is_err()
+            {
+                break;
+            }
+            keep.push(rx);
+        }
+
+        let txn_id = Ulid::from_parts(1, 1);
+        handle.bulk().enqueue_abort_transaction(txn_id, "test");
+
+        let (effect, ..) = receivers
+            .foreground
+            .try_recv()
+            .expect("abort routed to foreground");
+        assert!(matches!(
+            effect,
+            StorageEffect::AbortTransaction { txn_id: got } if got == txn_id
+        ));
+        assert!(receivers.bulk.try_recv().is_ok(), "bulk lane still saturated");
         drop(keep);
     }
 
