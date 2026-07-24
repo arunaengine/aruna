@@ -1448,7 +1448,9 @@ mod tests {
         assert!(ms >= base && ms < base.saturating_mul(2));
     }
 
-    #[tokio::test(start_paused = true)]
+    // Real timers: the scripted storage runs on an OS thread, so a paused clock
+    // would auto-advance the storage request timeout before it can respond.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn retry_recovers_conflict() {
         // A commit conflict on the first drive is retried; the fresh transaction
         // then commits, so the wrapper returns Ok.
@@ -1471,7 +1473,7 @@ mod tests {
         assert_eq!(starts, 3, "attempt 1 opens two txns, the retry opens one");
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn retry_exhausts_conflict() {
         // Every commit conflicts, so the wrapper exhausts its retries and returns
         // the conflict; each drive opens two txns via the internal recheck.
