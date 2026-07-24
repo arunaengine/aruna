@@ -467,6 +467,9 @@ async fn schedule_completed_materialization_syncs(
 struct FinishPlan {
     writes: Vec<(String, ByteView, ByteView)>,
     deletes: Vec<(String, ByteView)>,
+    /// Documents whose winning cursor advanced; their prior index rows are
+    /// pruned once per batch rather than once per chunk.
+    superseding: HashMap<Ulid, Ulid>,
 }
 
 // Chunked so a failure costs one chunk instead of the whole batch, and the
@@ -475,27 +478,46 @@ async fn finish_completed_materialization_jobs(
     storage: &StorageHandle,
     finished: Vec<FinishedMaterializationJob>,
 ) -> Result<(), MetadataMaterializationQueueError> {
+    let mut superseding = HashMap::new();
     let mut chunk = Vec::with_capacity(MATERIALIZATION_FINISH_CHUNK);
     for job in finished {
         chunk.push(job);
         if chunk.len() >= MATERIALIZATION_FINISH_CHUNK {
-            finish_chunk(storage, std::mem::take(&mut chunk)).await?;
+            let taken = std::mem::take(&mut chunk);
+            superseding.extend(finish_chunk(storage, taken).await?);
             chunk.reserve(MATERIALIZATION_FINISH_CHUNK);
         }
     }
     if !chunk.is_empty() {
-        finish_chunk(storage, chunk).await?;
+        superseding.extend(finish_chunk(storage, chunk).await?);
     }
-    Ok(())
+    prune_superseded_rows(storage, superseding).await
 }
 
+// The IRI reference index cannot be scanned per document, so this walks the
+// whole keyspace: once per batch, never once per chunk. Cleanup only, so it
+// runs after the chunks commit rather than inside them.
+async fn prune_superseded_rows(
+    storage: &StorageHandle,
+    superseding: HashMap<Ulid, Ulid>,
+) -> Result<(), MetadataMaterializationQueueError> {
+    if superseding.is_empty() {
+        return Ok(());
+    }
+    let stale =
+        super::iri_index::superseded_iri_reference_keys(storage, None, &superseding).await?;
+    delete_materialization_entries(storage, stale).await
+}
+
+/// Returns the documents whose projection this chunk advanced, so the batch can
+/// prune their prior-cursor index rows once.
 async fn finish_chunk(
     storage: &StorageHandle,
     finished: Vec<FinishedMaterializationJob>,
-) -> Result<(), MetadataMaterializationQueueError> {
+) -> Result<HashMap<Ulid, Ulid>, MetadataMaterializationQueueError> {
     let plan = plan_finish_chunk(storage, finished).await?;
     if plan.writes.is_empty() && plan.deletes.is_empty() {
-        return Ok(());
+        return Ok(plan.superseding);
     }
     let txn_id = start_write_transaction(storage).await?;
     let result = async {
@@ -506,7 +528,7 @@ async fn finish_chunk(
     match result {
         Ok(()) => {
             commit_storage_transaction(storage, txn_id).await?;
-            Ok(())
+            Ok(plan.superseding)
         }
         Err(error) => {
             abort_storage_transaction_best_effort(
@@ -653,13 +675,7 @@ async fn plan_finish_chunk(
         }
     }
 
-    // Delete prior-cursor index rows for the re-projected documents so fenced
-    // rows do not accumulate in storage or the predicate-less backlink scan.
-    if !superseding.is_empty() {
-        let stale =
-            super::iri_index::superseded_iri_reference_keys(storage, None, &superseding).await?;
-        plan.deletes.extend(stale);
-    }
+    plan.superseding = superseding;
     Ok(plan)
 }
 
