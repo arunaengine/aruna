@@ -1654,6 +1654,25 @@ mod tests {
         }
     }
 
+    async fn index_job_keys(storage: &StorageHandle) -> Vec<(u64, Ulid, Ulid)> {
+        match storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 4096,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values
+                .into_iter()
+                .filter_map(|(key, _)| materialization_job_key_parts(&key))
+                .collect(),
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn corrupt_materialization_job_only_is_deleted() {
         let dir = tempdir().unwrap();
@@ -2778,6 +2797,16 @@ mod tests {
                 (job, event, index_key)
             })
             .collect();
+        for (job, _, _) in &jobs {
+            write_entries(
+                &storage,
+                vec![
+                    metadata_materialization_job_write_entry(job).unwrap(),
+                    metadata_materialization_document_job_write_entry(job).unwrap(),
+                ],
+            )
+            .await;
+        }
         let finished: Vec<_> = jobs
             .iter()
             .map(|(job, event, index_key)| {
@@ -2806,6 +2835,85 @@ mod tests {
                 .expect("job requeued");
             assert_eq!(requeued.attempts, 1);
         }
+
+        // Exactly the rescheduled index rows survive: the old due_at=1 keys are
+        // gone and each document keeps one new-due row.
+        let index_keys = index_job_keys(&storage).await;
+        assert_eq!(index_keys.len(), jobs.len());
+        for (job, _, old_key) in &jobs {
+            assert!(
+                !storage_key_exists(
+                    &storage,
+                    METADATA_MATERIALIZATION_JOB_KEYSPACE,
+                    old_key.to_vec()
+                )
+                .await
+            );
+            let row = index_keys
+                .iter()
+                .find(|(_, doc, event)| *doc == job.document_id && *event == job.event_id)
+                .expect("rescheduled index row present");
+            assert_ne!(row.0, job.due_at_ms);
+        }
+    }
+
+    #[tokio::test]
+    async fn failing_apply_reschedules() {
+        // A non-terminal apply failure (missing metadata handle) reschedules the
+        // job with attempts advanced and both rows kept at a new due time.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let document_id = Ulid::from_bytes([90u8; 16]);
+        let event_id = Ulid::from_parts(3, 1);
+        let event = create_event(document_id, event_id, "reschedule");
+        let job = MetadataMaterializationJobRecord {
+            document_id,
+            event_id,
+            due_at_ms: 1,
+            attempts: 0,
+        };
+        let old_index_key = metadata_materialization_job_key(&job);
+        write_entries(
+            &storage,
+            vec![
+                metadata_create_event_write_entry(&event).unwrap(),
+                metadata_materialization_job_write_entry(&job).unwrap(),
+                metadata_materialization_document_job_write_entry(&job).unwrap(),
+            ],
+        )
+        .await;
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+
+        let result = process_metadata_materialization_batch(&context)
+            .await
+            .expect("batch drains");
+        assert_eq!(result.processed, 1);
+
+        let requeued = read_document_job(&storage, document_id, event_id)
+            .await
+            .unwrap()
+            .expect("job rescheduled");
+        assert_eq!(requeued.attempts, 1);
+        assert!(
+            !storage_key_exists(
+                &storage,
+                METADATA_MATERIALIZATION_JOB_KEYSPACE,
+                old_index_key.to_vec()
+            )
+            .await
+        );
+        let index_keys = index_job_keys(&storage).await;
+        assert_eq!(index_keys.len(), 1);
+        assert_eq!(index_keys[0].1, document_id);
+        assert_eq!(index_keys[0].2, event_id);
+        assert_ne!(index_keys[0].0, job.due_at_ms);
     }
 
     #[test]
