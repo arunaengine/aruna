@@ -802,7 +802,7 @@ fn defer_materialization_job(
     event: &MetadataCreateEventRecord,
     error: String,
 ) -> FinishedMaterializationJob {
-    if job.attempts.saturating_add(1) > MATERIALIZATION_MAX_ATTEMPTS {
+    if job.attempts.saturating_add(1) >= MATERIALIZATION_MAX_ATTEMPTS {
         FinishedMaterializationJob::Parked {
             job_key: job_key.to_vec(),
             job: job.clone(),
@@ -2109,7 +2109,8 @@ mod tests {
 
     #[tokio::test]
     async fn attempts_cap_parks() {
-        // A job at the attempt cap is parked as Failed with both rows removed.
+        // The apply whose count reaches the cap parks as Failed with both rows
+        // removed; the job at attempts cap-1 is that boundary apply.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let document_id = Ulid::from_bytes([45u8; 16]);
@@ -2119,7 +2120,7 @@ mod tests {
             document_id,
             event_id,
             due_at_ms: 1,
-            attempts: MATERIALIZATION_MAX_ATTEMPTS,
+            attempts: MATERIALIZATION_MAX_ATTEMPTS - 1,
         };
         let index_key = metadata_materialization_job_key(&job);
         let sidecar_key = metadata_materialization_document_job_key(document_id, event_id);
@@ -2160,9 +2161,38 @@ mod tests {
             .unwrap()
             .expect("failed status is written");
         assert_eq!(status.state, MetadataMaterializationState::Failed);
-        assert_eq!(status.attempts, MATERIALIZATION_MAX_ATTEMPTS + 1);
+        assert_eq!(status.attempts, MATERIALIZATION_MAX_ATTEMPTS);
         assert_eq!(status.last_error.as_deref(), Some("boom"));
         assert!(!metadata_materialization_jobs_exist(&storage).await.unwrap());
+    }
+
+    #[test]
+    fn cap_boundary_reschedules() {
+        // Below the cap reschedules with attempts advanced; at the cap parks.
+        let document_id = Ulid::from_bytes([46u8; 16]);
+        let event_id = Ulid::from_parts(2, 1);
+        let event = create_event(document_id, event_id, "boundary");
+        let reschedule = MetadataMaterializationJobRecord {
+            document_id,
+            event_id,
+            due_at_ms: 1,
+            attempts: MATERIALIZATION_MAX_ATTEMPTS - 2,
+        };
+        let key = metadata_materialization_job_key(&reschedule);
+        match defer_materialization_job(key.as_ref(), &reschedule, &event, "boom".into()) {
+            FinishedMaterializationJob::Rescheduled { status, .. } => {
+                assert_eq!(status.attempts, MATERIALIZATION_MAX_ATTEMPTS - 1);
+            }
+            other => panic!("expected reschedule, got {other:?}"),
+        }
+        let park = MetadataMaterializationJobRecord {
+            attempts: MATERIALIZATION_MAX_ATTEMPTS - 1,
+            ..reschedule
+        };
+        assert!(matches!(
+            defer_materialization_job(key.as_ref(), &park, &event, "boom".into()),
+            FinishedMaterializationJob::Parked { .. }
+        ));
     }
 
     #[test]
