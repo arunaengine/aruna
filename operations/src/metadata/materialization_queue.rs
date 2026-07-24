@@ -81,9 +81,26 @@ struct CompletedMaterializationSync {
     peers: Vec<NodeId>,
 }
 
+/// The outcome of one job attempt, resolved together in the per-batch finish
+/// transaction so a batch of failures costs one transaction, not one each.
+#[derive(Debug)]
+enum FinishedMaterializationJob {
+    Completed(CompletedMaterializationJob),
+    Rescheduled {
+        job_key: Vec<u8>,
+        job: MetadataMaterializationJobRecord,
+        status: MetadataMaterializationStatusRecord,
+    },
+    Parked {
+        job_key: Vec<u8>,
+        job: MetadataMaterializationJobRecord,
+        status: MetadataMaterializationStatusRecord,
+    },
+}
+
 #[derive(Debug, Default)]
 struct MaterializationGroupOutcome {
-    completed: Vec<CompletedMaterializationJob>,
+    finished: Vec<FinishedMaterializationJob>,
     processed: usize,
     craqle_elapsed: Duration,
     error: Option<MetadataMaterializationQueueError>,
@@ -249,7 +266,7 @@ fn materialization_group_concurrency() -> usize {
 
 fn collect_group_outcome(
     result: Result<MaterializationGroupOutcome, tokio::task::JoinError>,
-    completed: &mut Vec<CompletedMaterializationJob>,
+    finished: &mut Vec<FinishedMaterializationJob>,
     timings: &mut MaterializationBatchTimings,
     first_error: &mut Option<MetadataMaterializationQueueError>,
 ) {
@@ -259,7 +276,7 @@ fn collect_group_outcome(
             timings.craqle_elapsed = timings
                 .craqle_elapsed
                 .saturating_add(outcome.craqle_elapsed);
-            completed.extend(outcome.completed);
+            finished.extend(outcome.finished);
             if first_error.is_none() {
                 *first_error = outcome.error;
             }
@@ -289,7 +306,7 @@ async fn process_materialization_job_groups(
 
     let concurrency = materialization_group_concurrency();
     let mut tasks = JoinSet::new();
-    let mut completed = Vec::new();
+    let mut finished = Vec::new();
     let mut timings = MaterializationBatchTimings {
         groups: groups.len(),
         ..MaterializationBatchTimings::default()
@@ -301,7 +318,7 @@ async fn process_materialization_job_groups(
         if tasks.len() >= concurrency
             && let Some(result) = tasks.join_next().await
         {
-            collect_group_outcome(result, &mut completed, &mut timings, &mut first_error);
+            collect_group_outcome(result, &mut finished, &mut timings, &mut first_error);
         }
         let context = context.clone();
         tasks.spawn(async move {
@@ -326,9 +343,11 @@ async fn process_materialization_job_groups(
                         if processed_job.attempted {
                             outcome.processed = outcome.processed.saturating_add(1);
                         }
-                        if let Some(completed) = processed_job.completed {
-                            advanced_event_ids.insert(event_id);
-                            outcome.completed.push(completed);
+                        if let Some(finished) = processed_job.finished {
+                            if matches!(finished, FinishedMaterializationJob::Completed(_)) {
+                                advanced_event_ids.insert(event_id);
+                            }
+                            outcome.finished.push(finished);
                         }
                         if processed_job.stop_group {
                             break;
@@ -345,15 +364,11 @@ async fn process_materialization_job_groups(
     }
 
     while let Some(result) = tasks.join_next().await {
-        collect_group_outcome(result, &mut completed, &mut timings, &mut first_error);
+        collect_group_outcome(result, &mut finished, &mut timings, &mut first_error);
     }
     let finish_started = Instant::now();
-    let syncs = completed
-        .iter()
-        .filter_map(|job| job.sync.clone())
-        .collect::<Vec<_>>();
-    if let Err(error) =
-        finish_completed_materialization_jobs(&context.storage_handle, completed).await
+    let syncs = dedupe_graph_syncs(&finished);
+    if let Err(error) = finish_completed_materialization_jobs(&context.storage_handle, finished).await
         && first_error.is_none()
     {
         first_error = Some(error);
@@ -364,6 +379,20 @@ async fn process_materialization_job_groups(
     }
     schedule_completed_materialization_syncs(context, syncs).await;
     Ok(timings)
+}
+
+// One SyncGraphBestEffort per graph, keeping the last peers seen, so a batch
+// carrying many events for one document schedules a single sync.
+fn dedupe_graph_syncs(finished: &[FinishedMaterializationJob]) -> Vec<CompletedMaterializationSync> {
+    let mut by_graph: BTreeMap<String, CompletedMaterializationSync> = BTreeMap::new();
+    for job in finished {
+        if let FinishedMaterializationJob::Completed(job) = job
+            && let Some(sync) = &job.sync
+        {
+            by_graph.insert(sync.graph_iri.clone(), sync.clone());
+        }
+    }
+    by_graph.into_values().collect()
 }
 
 async fn schedule_completed_materialization_syncs(
@@ -397,13 +426,13 @@ async fn schedule_completed_materialization_syncs(
 
 async fn finish_completed_materialization_jobs(
     storage: &StorageHandle,
-    completed: Vec<CompletedMaterializationJob>,
+    finished: Vec<FinishedMaterializationJob>,
 ) -> Result<(), MetadataMaterializationQueueError> {
-    if completed.is_empty() {
+    if finished.is_empty() {
         return Ok(());
     }
     let txn_id = start_write_transaction(storage).await?;
-    let result = finish_completed_materialization_jobs_in_txn(storage, txn_id, completed).await;
+    let result = finish_completed_materialization_jobs_in_txn(storage, txn_id, finished).await;
     match result {
         Ok(()) => {
             commit_storage_transaction(storage, txn_id).await?;
@@ -425,33 +454,102 @@ async fn finish_completed_materialization_jobs(
 async fn finish_completed_materialization_jobs_in_txn(
     storage: &StorageHandle,
     txn_id: Ulid,
-    completed: Vec<CompletedMaterializationJob>,
+    finished: Vec<FinishedMaterializationJob>,
 ) -> Result<(), MetadataMaterializationQueueError> {
     let mut writes = Vec::new();
-    let mut deletes = Vec::with_capacity(completed.len().saturating_mul(2));
+    let mut deletes = Vec::with_capacity(finished.len().saturating_mul(2));
     let mut superseding: HashMap<Ulid, Ulid> = HashMap::new();
-    for job in completed {
-        if let Some(status) = job.status {
-            let current =
-                read_materialization_status(storage, status.document_id, Some(txn_id)).await?;
-            if should_write_final_materialization_status(current.as_ref(), &status) {
-                superseding.insert(status.document_id, status.event_id);
-                writes.extend(job.iri_index_writes);
-                if let Some(raw_state_write) = job.raw_state_write {
-                    writes.push(raw_state_write);
+    for finished in finished {
+        match finished {
+            FinishedMaterializationJob::Completed(job) => {
+                if let Some(status) = job.status {
+                    let current =
+                        read_materialization_status(storage, status.document_id, Some(txn_id))
+                            .await?;
+                    if should_write_final_materialization_status(current.as_ref(), &status) {
+                        superseding.insert(status.document_id, status.event_id);
+                        writes.extend(job.iri_index_writes);
+                        if let Some(raw_state_write) = job.raw_state_write {
+                            writes.push(raw_state_write);
+                        }
+                        writes.push(metadata_materialization_status_write_entry(&status)?);
+                    }
                 }
-                writes.push(metadata_materialization_status_write_entry(&status)?);
+                deletes.push((
+                    METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                    ByteView::from(job.job_key),
+                ));
+                if let Some(document_job_key) = job.document_job_key {
+                    deletes.push((
+                        METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+                        ByteView::from(document_job_key),
+                    ));
+                }
             }
-        }
-        deletes.push((
-            METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
-            ByteView::from(job.job_key),
-        ));
-        if let Some(document_job_key) = job.document_job_key {
-            deletes.push((
-                METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
-                ByteView::from(document_job_key),
-            ));
+            FinishedMaterializationJob::Rescheduled {
+                job_key,
+                job,
+                status,
+            } => {
+                let old_index_delete = (
+                    METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                    ByteView::from(job_key),
+                );
+                let current =
+                    read_materialization_status(storage, job.document_id, Some(txn_id)).await?;
+                if current
+                    .as_ref()
+                    .is_some_and(|current| materialization_retry_already_advanced(current, &job))
+                {
+                    deletes.push(old_index_delete);
+                    deletes.push((
+                        METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+                        metadata_materialization_document_job_key(job.document_id, job.event_id),
+                    ));
+                    continue;
+                }
+                let attempts = job.attempts.saturating_add(1);
+                let next_job = MetadataMaterializationJobRecord {
+                    document_id: job.document_id,
+                    event_id: job.event_id,
+                    due_at_ms: unix_timestamp_millis()
+                        .saturating_add(queue_retry_after_ms(attempts)),
+                    attempts,
+                };
+                if should_write_pending_retry_status(current.as_ref(), &status) {
+                    writes.push(metadata_materialization_status_write_entry(&status)?);
+                }
+                writes.push(metadata_materialization_job_write_entry(&next_job)?);
+                writes.push(metadata_materialization_document_job_write_entry(&next_job)?);
+                deletes.push(old_index_delete);
+            }
+            FinishedMaterializationJob::Parked {
+                job_key,
+                job,
+                status,
+            } => {
+                let current =
+                    read_materialization_status(storage, job.document_id, Some(txn_id)).await?;
+                if should_write_final_materialization_status(current.as_ref(), &status) {
+                    writes.push(metadata_materialization_status_write_entry(&status)?);
+                }
+                deletes.push((
+                    METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                    ByteView::from(job_key),
+                ));
+                deletes.push((
+                    METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+                    metadata_materialization_document_job_key(job.document_id, job.event_id),
+                ));
+                warn!(
+                    event = "materialization.job.parked",
+                    document_id = %job.document_id,
+                    event_id = %job.event_id,
+                    attempts = status.attempts,
+                    error = status.last_error.as_deref().unwrap_or_default(),
+                    "Parked metadata materialization job after exceeding attempt cap"
+                );
+            }
         }
     }
 
@@ -654,7 +752,7 @@ fn due_after(now_ms: u64, due_at_ms: u64) -> Duration {
 
 #[derive(Debug, Default)]
 struct ProcessedMaterializationJob {
-    completed: Option<CompletedMaterializationJob>,
+    finished: Option<FinishedMaterializationJob>,
     craqle_elapsed: Duration,
     attempted: bool,
     stop_group: bool,
@@ -663,16 +761,18 @@ struct ProcessedMaterializationJob {
 impl ProcessedMaterializationJob {
     fn completed(job: CompletedMaterializationJob, craqle_elapsed: Duration) -> Self {
         Self {
-            completed: Some(job),
+            finished: Some(FinishedMaterializationJob::Completed(job)),
             craqle_elapsed,
             attempted: true,
             stop_group: false,
         }
     }
 
-    fn rescheduled(craqle_elapsed: Duration) -> Self {
+    // Rescheduled and parked jobs both stop the group so later events for the
+    // same document do not apply out of order this batch.
+    fn deferred(finished: FinishedMaterializationJob, craqle_elapsed: Duration) -> Self {
         Self {
-            completed: None,
+            finished: Some(finished),
             craqle_elapsed,
             attempted: true,
             stop_group: true,
@@ -681,10 +781,33 @@ impl ProcessedMaterializationJob {
 
     fn blocked() -> Self {
         Self {
-            completed: None,
+            finished: None,
             craqle_elapsed: Duration::ZERO,
             attempted: false,
             stop_group: true,
+        }
+    }
+}
+
+// Attempt-capped jobs park as Failed; others reschedule with backoff. The
+// resulting row writes and deletes are folded into the per-batch finish txn.
+fn defer_materialization_job(
+    job_key: &[u8],
+    job: &MetadataMaterializationJobRecord,
+    event: &MetadataCreateEventRecord,
+    error: String,
+) -> FinishedMaterializationJob {
+    if job.attempts.saturating_add(1) > MATERIALIZATION_MAX_ATTEMPTS {
+        FinishedMaterializationJob::Parked {
+            job_key: job_key.to_vec(),
+            job: job.clone(),
+            status: materialization_failure_status(job, event, error, true),
+        }
+    } else {
+        FinishedMaterializationJob::Rescheduled {
+            job_key: job_key.to_vec(),
+            job: job.clone(),
+            status: materialization_failure_status(job, event, error, false),
         }
     }
 }
@@ -780,15 +903,10 @@ async fn process_materialization_job(
             {
                 Ok(writes) => writes,
                 Err(error) => {
-                    reschedule_materialization_job(
-                        &context.storage_handle,
-                        &job_key,
-                        &job,
-                        &event,
-                        error.to_string(),
-                    )
-                    .await?;
-                    return Ok(ProcessedMaterializationJob::rescheduled(craqle_elapsed));
+                    return Ok(ProcessedMaterializationJob::deferred(
+                        defer_materialization_job(&job_key, &job, &event, error.to_string()),
+                        craqle_elapsed,
+                    ));
                 }
             };
             Ok(ProcessedMaterializationJob::completed(
@@ -828,17 +946,10 @@ async fn process_materialization_job(
                 craqle_elapsed,
             ))
         }
-        Err(error) => {
-            reschedule_materialization_job(
-                &context.storage_handle,
-                &job_key,
-                &job,
-                &event,
-                error.to_string(),
-            )
-            .await?;
-            Ok(ProcessedMaterializationJob::rescheduled(craqle_elapsed))
-        }
+        Err(error) => Ok(ProcessedMaterializationJob::deferred(
+            defer_materialization_job(&job_key, &job, &event, error.to_string()),
+            craqle_elapsed,
+        )),
     }
 }
 
@@ -1389,115 +1500,6 @@ fn materialization_failure_status(
         last_error: Some(error),
         updated_at_ms: unix_timestamp_millis(),
     }
-}
-
-async fn reschedule_materialization_job(
-    storage: &StorageHandle,
-    job_key: &[u8],
-    job: &MetadataMaterializationJobRecord,
-    event: &MetadataCreateEventRecord,
-    error: String,
-) -> Result<(), MetadataMaterializationQueueError> {
-    let txn_id = start_write_transaction(storage).await?;
-    let result =
-        reschedule_materialization_job_in_txn(storage, txn_id, job_key, job, event, error).await;
-    match result {
-        Ok(()) => {
-            commit_storage_transaction(storage, txn_id).await?;
-            Ok(())
-        }
-        Err(error) => {
-            abort_storage_transaction_best_effort(
-                storage,
-                txn_id,
-                "Failed to abort materialization storage transaction",
-                "Unexpected materialization storage transaction abort result",
-            )
-            .await;
-            Err(error)
-        }
-    }
-}
-
-async fn reschedule_materialization_job_in_txn(
-    storage: &StorageHandle,
-    txn_id: Ulid,
-    job_key: &[u8],
-    job: &MetadataMaterializationJobRecord,
-    event: &MetadataCreateEventRecord,
-    error: String,
-) -> Result<(), MetadataMaterializationQueueError> {
-    let old_global_job_delete = (
-        METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
-        ByteView::from(job_key.to_vec()),
-    );
-    let current = read_materialization_status(storage, job.document_id, Some(txn_id)).await?;
-    if current
-        .as_ref()
-        .is_some_and(|status| materialization_retry_already_advanced(status, job))
-    {
-        return transactional_batch_delete(
-            storage,
-            txn_id,
-            vec![
-                old_global_job_delete,
-                (
-                    METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
-                    metadata_materialization_document_job_key(job.document_id, job.event_id),
-                ),
-            ],
-        )
-        .await;
-    }
-
-    let attempts = job.attempts.saturating_add(1);
-    if attempts > MATERIALIZATION_MAX_ATTEMPTS {
-        let status = materialization_failure_status(job, event, error.clone(), true);
-        let mut writes = Vec::new();
-        if should_write_final_materialization_status(current.as_ref(), &status) {
-            writes.push(metadata_materialization_status_write_entry(&status)?);
-        }
-        transactional_batch_write(storage, txn_id, writes).await?;
-        transactional_batch_delete(
-            storage,
-            txn_id,
-            vec![
-                old_global_job_delete,
-                (
-                    METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
-                    metadata_materialization_document_job_key(job.document_id, job.event_id),
-                ),
-            ],
-        )
-        .await?;
-        warn!(
-            event = "materialization.job.parked",
-            document_id = %job.document_id,
-            event_id = %job.event_id,
-            attempts,
-            error = %error,
-            "Parked metadata materialization job after exceeding attempt cap"
-        );
-        return Ok(());
-    }
-    let status = materialization_failure_status(job, event, error, false);
-    let retry_delay_ms = queue_retry_after_ms(attempts);
-    let next_job = MetadataMaterializationJobRecord {
-        document_id: job.document_id,
-        event_id: job.event_id,
-        due_at_ms: unix_timestamp_millis().saturating_add(retry_delay_ms),
-        attempts,
-    };
-    let mut writes = Vec::with_capacity(3);
-    if should_write_pending_retry_status(current.as_ref(), &status) {
-        writes.push(metadata_materialization_status_write_entry(&status)?);
-    }
-    writes.push(metadata_materialization_job_write_entry(&next_job)?);
-    writes.push(metadata_materialization_document_job_write_entry(
-        &next_job,
-    )?);
-    transactional_batch_write(storage, txn_id, writes).await?;
-    transactional_batch_delete(storage, txn_id, vec![old_global_job_delete]).await
 }
 
 fn is_terminal_materialization_error(error: &MetadataMaterializationQueueError) -> bool {
@@ -2125,7 +2127,9 @@ mod tests {
         )
         .await;
 
-        reschedule_materialization_job(&storage, index_key.as_ref(), &job, &event, "boom".into())
+        let parked = defer_materialization_job(index_key.as_ref(), &job, &event, "boom".into());
+        assert!(matches!(parked, FinishedMaterializationJob::Parked { .. }));
+        finish_completed_materialization_jobs(&storage, vec![parked])
             .await
             .unwrap();
 
@@ -2416,28 +2420,30 @@ mod tests {
 
         finish_completed_materialization_jobs(
             &storage,
-            vec![CompletedMaterializationJob {
-                job_key: old_job_key.to_vec(),
-                document_job_key: Some(
-                    metadata_materialization_document_job_key(
-                        old_job.document_id,
-                        old_job.event_id,
-                    )
-                    .to_vec(),
-                ),
-                status: Some(materialization_success_status(&old_job, &old_event, None)),
-                iri_index_writes: vec![(
-                    METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
-                    ByteView::from(stale_index_key.clone()),
-                    ByteView::from(vec![1]),
-                )],
-                raw_state_write: Some((
-                    METADATA_RAW_REVISION_KEYSPACE.to_string(),
-                    raw_state_key.clone(),
-                    ByteView::from(vec![1]),
-                )),
-                sync: None,
-            }],
+            vec![FinishedMaterializationJob::Completed(
+                CompletedMaterializationJob {
+                    job_key: old_job_key.to_vec(),
+                    document_job_key: Some(
+                        metadata_materialization_document_job_key(
+                            old_job.document_id,
+                            old_job.event_id,
+                        )
+                        .to_vec(),
+                    ),
+                    status: Some(materialization_success_status(&old_job, &old_event, None)),
+                    iri_index_writes: vec![(
+                        METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
+                        ByteView::from(stale_index_key.clone()),
+                        ByteView::from(vec![1]),
+                    )],
+                    raw_state_write: Some((
+                        METADATA_RAW_REVISION_KEYSPACE.to_string(),
+                        raw_state_key.clone(),
+                        ByteView::from(vec![1]),
+                    )),
+                    sync: None,
+                },
+            )],
         )
         .await
         .unwrap();
@@ -2536,12 +2542,18 @@ mod tests {
 
         let first = Ulid::from_parts(1, 1);
         let second = Ulid::from_parts(2, 1);
-        finish_completed_materialization_jobs(&storage, vec![build(first)])
-            .await
-            .unwrap();
-        finish_completed_materialization_jobs(&storage, vec![build(second)])
-            .await
-            .unwrap();
+        finish_completed_materialization_jobs(
+            &storage,
+            vec![FinishedMaterializationJob::Completed(build(first))],
+        )
+        .await
+        .unwrap();
+        finish_completed_materialization_jobs(
+            &storage,
+            vec![FinishedMaterializationJob::Completed(build(second))],
+        )
+        .await
+        .unwrap();
 
         let key_of = |cursor: Ulid| {
             aruna_core::storage_entries::metadata_iri_reference_key("p", "o", document_id, cursor)
@@ -2710,104 +2722,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_reschedule_is_atomic() {
-        let (storage, receivers) = StorageHandle::new();
-        let receiver = receivers.foreground;
-        let txn_id = Ulid::from_parts(5, 1);
-        let document_id = Ulid::from_bytes([4u8; 16]);
-        let event_id = Ulid::from_parts(5, 2);
-        let event = create_event(document_id, event_id, "retry");
-        let job = MetadataMaterializationJobRecord {
-            document_id,
-            event_id,
-            due_at_ms: 1,
-            attempts: 0,
-        };
-        let old_job_key = b"old-job".to_vec();
-        let scripted = thread::spawn({
-            let old_job_key = old_job_key.clone();
-            move || {
-                let (effect, response_tx, _span, _enqueued_at, _in_flight) =
-                    receiver.recv().expect("start transaction request");
-                assert_eq!(effect, StorageEffect::StartTransaction { read: false });
-                response_tx.send(StorageEvent::TransactionStarted { txn_id });
-
-                let (effect, response_tx, _span, _enqueued_at, _in_flight) =
-                    receiver.recv().expect("status read request");
-                let status_key = match effect {
-                    StorageEffect::Read {
-                        key_space,
-                        key,
-                        txn_id: Some(read_txn_id),
-                    } => {
-                        assert_eq!(read_txn_id, txn_id);
-                        assert_eq!(key_space, METADATA_MATERIALIZATION_STATUS_KEYSPACE);
-                        key
-                    }
-                    other => panic!("unexpected storage effect: {other:?}"),
+    async fn reschedules_batched() {
+        // Three failing jobs across distinct documents resolve in one finish
+        // transaction: the request delta stays at single-transaction scale.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let jobs: Vec<_> = (0..3u8)
+            .map(|seed| {
+                let document_id = Ulid::from_bytes([70 + seed; 16]);
+                let event_id = Ulid::from_parts(1, u128::from(seed));
+                let event = create_event(document_id, event_id, "retry");
+                let job = MetadataMaterializationJobRecord {
+                    document_id,
+                    event_id,
+                    due_at_ms: 1,
+                    attempts: 0,
                 };
-                response_tx.send(StorageEvent::ReadResult {
-                    key: status_key,
-                    value: None,
-                });
+                let index_key = metadata_materialization_job_key(&job);
+                (job, event, index_key)
+            })
+            .collect();
+        let finished: Vec<_> = jobs
+            .iter()
+            .map(|(job, event, index_key)| {
+                defer_materialization_job(index_key.as_ref(), job, event, "transient".into())
+            })
+            .collect();
+        assert!(finished.iter().all(|finished| matches!(
+            finished,
+            FinishedMaterializationJob::Rescheduled { .. }
+        )));
 
-                let (effect, response_tx, _span, _enqueued_at, _in_flight) =
-                    receiver.recv().expect("retry writes request");
-                let write_entries = match effect {
-                    StorageEffect::BatchWrite {
-                        writes,
-                        txn_id: Some(write_txn_id),
-                    } => {
-                        assert_eq!(write_txn_id, txn_id);
-                        assert_eq!(writes.len(), 3);
-                        writes
-                    }
-                    other => panic!("unexpected storage effect: {other:?}"),
-                };
-                assert_eq!(write_entries[0].0, METADATA_MATERIALIZATION_STATUS_KEYSPACE);
-                assert_eq!(write_entries[1].0, METADATA_MATERIALIZATION_JOB_KEYSPACE);
-                assert_eq!(
-                    write_entries[2].0,
-                    METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE
-                );
-                response_tx.send(StorageEvent::BatchWriteResult {
-                    entries: write_entries
-                        .iter()
-                        .map(|(key_space, key, _)| (key_space.clone(), key.clone()))
-                        .collect(),
-                });
-
-                let (effect, response_tx, _span, _enqueued_at, _in_flight) =
-                    receiver.recv().expect("old job delete request");
-                let deletes = match effect {
-                    StorageEffect::BatchDelete {
-                        deletes,
-                        txn_id: Some(delete_txn_id),
-                    } => {
-                        assert_eq!(delete_txn_id, txn_id);
-                        deletes
-                    }
-                    other => panic!("unexpected storage effect: {other:?}"),
-                };
-                assert_eq!(
-                    deletes,
-                    vec![(
-                        METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
-                        ByteView::from(old_job_key)
-                    )]
-                );
-                response_tx.send(StorageEvent::BatchDeleteResult { entries: deletes });
-
-                let (effect, response_tx, _span, _enqueued_at, _in_flight) =
-                    receiver.recv().expect("commit request");
-                assert_eq!(effect, StorageEffect::CommitTransaction { txn_id });
-                response_tx.send(StorageEvent::TransactionCommitted { txn_id });
-            }
-        });
-
-        reschedule_materialization_job(&storage, &old_job_key, &job, &event, "transient".into())
+        let before = storage.snapshot_metrics().requests_total;
+        finish_completed_materialization_jobs(&storage, finished)
             .await
             .unwrap();
-        scripted.join().expect("scripted storage actor finished");
+        let delta = storage.snapshot_metrics().requests_total - before;
+
+        // A single finish transaction issues far fewer requests than one
+        // transaction per job would.
+        assert!(delta <= 10, "finish issued {delta} storage requests");
+        for (job, _, _) in &jobs {
+            let requeued = read_document_job(&storage, job.document_id, job.event_id)
+                .await
+                .unwrap()
+                .expect("job requeued");
+            assert_eq!(requeued.attempts, 1);
+        }
+    }
+
+    #[test]
+    fn sync_dedupes_graphs() {
+        let graph_iri = MetadataRegistryRecord::graph_iri_for(Ulid::from_bytes([50u8; 16]));
+        let completed = |peers: Vec<NodeId>| {
+            FinishedMaterializationJob::Completed(CompletedMaterializationJob {
+                job_key: vec![1],
+                document_job_key: None,
+                status: None,
+                iri_index_writes: Vec::new(),
+                raw_state_write: None,
+                sync: Some(CompletedMaterializationSync {
+                    graph_iri: graph_iri.clone(),
+                    peers,
+                }),
+            })
+        };
+        let finished = vec![completed(vec![node(1)]), completed(vec![node(2)])];
+
+        let syncs = dedupe_graph_syncs(&finished);
+
+        assert_eq!(syncs.len(), 1);
+        assert_eq!(syncs[0].graph_iri, graph_iri);
+        assert_eq!(syncs[0].peers, vec![node(2)]);
     }
 }
