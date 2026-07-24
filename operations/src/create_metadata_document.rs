@@ -705,10 +705,13 @@ impl Operation for CreateMetadataDocumentOperation {
 mod tests {
     use super::{
         CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-        CreateMetadataDocumentPayload,
+        CreateMetadataDocumentPayload, create_metadata_document,
     };
 
+    use std::sync::Arc;
+
     use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
@@ -727,8 +730,12 @@ mod tests {
         Actor, MetadataRegistryRecord, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
     };
     use aruna_core::types::{Effects, GroupId, Key};
+    use aruna_storage::storage::EffectReceiver;
+    use aruna_storage::{FjallStorage, StorageHandle};
     use ulid::Ulid;
 
+    use crate::driver::DriverContext;
+    use crate::metadata::MetadataHandle;
     use crate::placement::resolve_shard_holders;
 
     fn actor(realm_id: RealmId, key_byte: u8) -> Actor {
@@ -1345,5 +1352,123 @@ mod tests {
                 aruna_core::errors::StorageError::WriteError,
             ))
         );
+    }
+
+    // Answers each storage effect of the create flow; the first `conflict_commits`
+    // commits fail with a conflict and the rest succeed. Returns StartTransaction
+    // count so tests can prove a retry occurred.
+    fn scripted_conflict_actor(
+        receiver: EffectReceiver,
+        conflict_commits: u32,
+    ) -> std::thread::JoinHandle<u32> {
+        std::thread::spawn(move || {
+            let mut starts = 0u32;
+            let mut commits = 0u32;
+            while let Ok((effect, response_tx, _span, _at, _guard)) = receiver.recv() {
+                let event = match effect {
+                    StorageEffect::StartTransaction { .. } => {
+                        starts += 1;
+                        StorageEvent::TransactionStarted {
+                            txn_id: Ulid::from_parts(u64::from(starts), 1),
+                        }
+                    }
+                    StorageEffect::BatchRead { .. } => StorageEvent::BatchReadResult {
+                        values: vec![
+                            (Key::from(vec![0u8]), None),
+                            (Key::from(vec![1u8]), None),
+                            (Key::from(vec![2u8]), None),
+                        ],
+                    },
+                    StorageEffect::BatchWrite { .. } => {
+                        StorageEvent::BatchWriteResult { entries: Vec::new() }
+                    }
+                    StorageEffect::CommitTransaction { txn_id } => {
+                        commits += 1;
+                        if commits <= conflict_commits {
+                            StorageEvent::Error {
+                                error: StorageError::TransactionConflict,
+                            }
+                        } else {
+                            StorageEvent::TransactionCommitted { txn_id }
+                        }
+                    }
+                    StorageEffect::AbortTransaction { txn_id } => {
+                        StorageEvent::TransactionAborted { txn_id }
+                    }
+                    StorageEffect::Write { key, .. } => StorageEvent::WriteResult { key },
+                    other => panic!("unexpected storage effect: {other:?}"),
+                };
+                response_tx.send(event);
+            }
+            starts
+        })
+    }
+
+    fn conflict_test_context(storage: StorageHandle, temp: &std::path::Path) -> Arc<DriverContext> {
+        let node_id = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+        let metadata_storage =
+            FjallStorage::open(temp.join("meta-store").to_str().unwrap()).unwrap();
+        let metadata_handle =
+            MetadataHandle::new(temp.join("meta"), node_id, metadata_storage, None, None, None)
+                .unwrap();
+        Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: Some(metadata_handle),
+            task_handle: None,
+            compute_handle: None,
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_recovers_conflict() {
+        // A commit conflict on the first drive is retried; the fresh transaction
+        // then commits, so the wrapper returns Ok.
+        let temp = tempfile::tempdir().unwrap();
+        let (storage, receivers) = StorageHandle::new();
+        let actor_thread = scripted_conflict_actor(receivers.foreground, 1);
+        let context = conflict_test_context(storage, temp.path());
+
+        let realm_id = RealmId([61u8; 32]);
+        let operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
+            actor(realm_id, 9),
+            GroupId::generate(),
+            Ulid::generate(),
+        ));
+        let result = create_metadata_document(operation, context.clone()).await;
+        assert!(result.is_ok(), "retry recovers conflict: {result:?}");
+
+        drop(context);
+        let starts = actor_thread.join().unwrap();
+        assert_eq!(starts, 3, "attempt 1 opens two txns, the retry opens one");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_exhausts_conflict() {
+        // Every commit conflicts, so the wrapper exhausts its retries and returns
+        // the conflict; each drive opens two txns via the internal recheck.
+        let temp = tempfile::tempdir().unwrap();
+        let (storage, receivers) = StorageHandle::new();
+        let actor_thread = scripted_conflict_actor(receivers.foreground, u32::MAX);
+        let context = conflict_test_context(storage, temp.path());
+
+        let realm_id = RealmId([62u8; 32]);
+        let operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
+            actor(realm_id, 9),
+            GroupId::generate(),
+            Ulid::generate(),
+        ));
+        let result = create_metadata_document(operation, context.clone()).await;
+        assert!(matches!(
+            result,
+            Err(CreateMetadataDocumentError::StorageError(
+                StorageError::TransactionConflict
+            ))
+        ));
+
+        drop(context);
+        let starts = actor_thread.join().unwrap();
+        assert_eq!(starts, 8, "four drive attempts each open two txns");
     }
 }
