@@ -1859,7 +1859,7 @@ dependencies = [
 [[package]]
 name = "craqle"
 version = "0.1.1"
-source = "git+https://github.com/arunaengine/craqle?branch=feat%2Frocrate-fidelity#e78e2de26510ec3e87ced9ce7b21daab1623fa05"
+source = "git+https://github.com/arunaengine/craqle?branch=feat%2Frocrate-fidelity#ab380770f76d07c6236454802074aa08d1b16f03"
 dependencies = [
  "blake3",
  "chrono",

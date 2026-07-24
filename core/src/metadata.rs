@@ -191,16 +191,23 @@ pub fn resolve_raw_revision(
     }))
 }
 
-fn apply_raw_upsert(
+pub fn apply_raw_upsert(
     document: &mut serde_json::Value,
     jsonld: &str,
     link_root: bool,
 ) -> Result<(), MetadataError> {
-    let entity: serde_json::Value = serde_json::from_str(jsonld)
+    let mut entity: serde_json::Value = serde_json::from_str(jsonld)
         .map_err(|error| MetadataError::InvalidInput(error.to_string()))?;
     let terms = RawTerms::new(document);
     let entity_id = raw_entity_id(&entity, &terms)
         .ok_or_else(|| MetadataError::InvalidInput("entity @id is missing".to_string()))?;
+    if let Some(value) = entity.as_object_mut().and_then(|entity| {
+        entity
+            .iter_mut()
+            .find_map(|(key, value)| terms.is_id(key).then_some(value))
+    }) {
+        *value = serde_json::Value::String(entity_id.clone());
+    }
     let graph = document
         .as_object_mut()
         .and_then(|object| {
@@ -1132,7 +1139,7 @@ mod tests {
 
         apply_raw_upsert(&mut document, &entity, true).unwrap();
 
-        assert_eq!(document["items"][2]["node"], "data/a.txt");
+        assert_eq!(document["items"][2]["node"], "./data/a.txt");
         assert_eq!(document["items"][1]["parts"][0]["@id"], "./data/a.txt");
     }
 

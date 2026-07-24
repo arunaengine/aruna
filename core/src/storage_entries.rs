@@ -201,6 +201,10 @@ pub fn metadata_materialization_status_key(document_id: Ulid) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
 }
 
+pub fn raw_revision_key(document_id: Ulid) -> Key {
+    ByteView::from(document_id.to_bytes().to_vec())
+}
+
 pub fn metadata_materialization_document_job_prefix(document_id: Ulid) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
 }

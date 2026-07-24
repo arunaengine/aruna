@@ -2050,6 +2050,20 @@ mod tests {
         assert_eq!(listed.documents.len(), 1);
         assert_eq!(listed.documents[0].document_id, created.summary.document_id);
 
+        let raw = export_metadata_rocrate(
+            State(test.state.clone()),
+            Extension(None),
+            Path(document_id.clone()),
+            Query(MetadataRoCrateExportParams {
+                view: Some(MetadataRoCrateView::Raw),
+                limit: None,
+                offset: None,
+                after: None,
+            }),
+        )
+        .await;
+        assert!(matches!(raw, Err(ServerError::NotFound)));
+
         let paged_jsonld = format!(
             r#"{{
   "@context": "https://w3id.org/ro/crate/1.2/context",
@@ -2126,6 +2140,11 @@ mod tests {
         assert_eq!(raw.context_digest.len(), 64);
         assert_eq!(raw.dataset_digest.as_deref().map(str::len), Some(64));
         assert!(raw.projected_event_id.is_none());
+        let projected_jsonld = installed_metadata_handle(test.state.get_ctx().as_ref())
+            .export_rocrate_jsonld(created.summary.graph_iri.clone())
+            .await
+            .unwrap();
+        assert!(!projected_jsonld.contains("file-2.txt"));
         let failed_event_id = Ulid::from_string(&raw.winning_event_id).unwrap();
         let mut failed_status = MetadataMaterializationStatusRecord {
             document_id: Ulid::from_string(&document_id).unwrap(),

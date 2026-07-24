@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use aruna_core::effects::{Effect, StorageEffect};
@@ -9,6 +10,7 @@ use aruna_core::metadata::{
     MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataEffect, MetadataEvent,
     MetadataGraphPolicy, MetadataMaterializationState, MetadataMaterializationStatusRecord,
     MetadataRequestDurability, MetadataUpsertEntityRequest, deterministic_materialization_actor,
+    resolve_raw_revision,
 };
 use aruna_core::storage_entries::{
     metadata_create_event_write_entry, metadata_materialization_job_write_entry,
@@ -22,6 +24,10 @@ use aruna_operations::metadata::materialization_queue::{
     process_metadata_materialization_batch,
 };
 use aruna_storage::{FjallStorage, StorageHandle};
+use craqle::{
+    CraqleIrokleOptions, CraqleNode, CraqleOptions, CraqleRequestDurability, CreateEntityRequest,
+    GrantAuthorizer, GraphId, GraphPolicy, PatchEntityRequest, PermissionGrant, PermissionLevel,
+};
 use tempfile::TempDir;
 use ulid::Ulid;
 
@@ -30,6 +36,197 @@ struct TestContext {
     _metadata_dir: Option<TempDir>,
     actor: Actor,
     context: Arc<DriverContext>,
+}
+
+#[tokio::test]
+async fn raw_projection_diverges() -> Result<(), Box<dyn std::error::Error>> {
+    // Concurrent CRDT writes remain multi-valued while raw replay uses event order.
+    let test = build_context(false).await?;
+    let document_id = Ulid::from_bytes([9u8; 16]);
+    let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
+    let base_jsonld = serde_json::json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "about": {"@id": graph_iri}
+            },
+            {
+                "@id": graph_iri,
+                "@type": "Dataset",
+                "name": "Original",
+                "description": "Concurrent update fixture",
+                "datePublished": "2026-01-01"
+            },
+            {
+                "@id": "#lab",
+                "@type": "Organization",
+                "name": "base"
+            }
+        ]
+    })
+    .to_string();
+    let base = create_event_with_payload(
+        &test,
+        document_id,
+        Ulid::from_parts(40, 1),
+        "divergence",
+        MetadataCreateEventPayload::RoCrate {
+            jsonld: base_jsonld.clone(),
+        },
+    );
+    let graph = GraphId::new(&base.record.graph_iri);
+
+    let dir = tempfile::tempdir()?;
+    let irokle_a = irokle::Irokle::builder().build()?;
+    let irokle_b = irokle::Irokle::builder().build()?;
+    let node_a = CraqleNode::open_with_options(
+        dir.path().join("a"),
+        CraqleOptions::new().with_irokle(
+            irokle_a.clone(),
+            CraqleIrokleOptions::new().with_initial_peers(BTreeSet::from([irokle_b.peer_id()])),
+        ),
+    )?;
+    let node_b = CraqleNode::open_with_options(
+        dir.path().join("b"),
+        CraqleOptions::new().with_irokle(
+            irokle_b.clone(),
+            CraqleIrokleOptions::new().with_initial_peers(BTreeSet::from([irokle_a.peer_id()])),
+        ),
+    )?;
+    let writer = GrantAuthorizer::new(vec![PermissionGrant::new(
+        "/datasets/**",
+        PermissionLevel::Write,
+    )]);
+    node_a.apply_rocrate_document_checked_with_policy(
+        &writer,
+        graph.clone(),
+        &base_jsonld,
+        GraphPolicy {
+            public: true,
+            permission_paths: vec!["/datasets/public/divergence".to_string()],
+        },
+    )?;
+    let topic_id = node_a
+        .irokle_topic_id(&graph)?
+        .expect("created graph has an Irokle topic");
+    sync_craqle(&irokle_a, &irokle_b, &node_b, topic_id)?;
+
+    node_a.patch_contextual_with(
+        &writer,
+        PatchEntityRequest {
+            entity: CreateEntityRequest {
+                graph: graph.clone(),
+                entity_id: "#lab".to_string(),
+                entity_type: "Organization".to_string(),
+                name: "Peer A".to_string(),
+                additional_triples: Vec::new(),
+            },
+            replaced_predicates: Vec::new(),
+        },
+        CraqleRequestDurability::Durable,
+        None,
+    )?;
+    node_b.patch_contextual_with(
+        &writer,
+        PatchEntityRequest {
+            entity: CreateEntityRequest {
+                graph: graph.clone(),
+                entity_id: "#lab".to_string(),
+                entity_type: "Organization".to_string(),
+                name: "Peer B".to_string(),
+                additional_triples: Vec::new(),
+            },
+            replaced_predicates: Vec::new(),
+        },
+        CraqleRequestDurability::Durable,
+        None,
+    )?;
+    for _ in 0..3 {
+        sync_craqle(&irokle_a, &irokle_b, &node_b, topic_id)?;
+        sync_craqle(&irokle_b, &irokle_a, &node_a, topic_id)?;
+    }
+
+    assert_eq!(
+        node_a.graph_fingerprint(&graph)?,
+        node_b.graph_fingerprint(&graph)?
+    );
+    let mut projected_names = node_a
+        .describe_subject(&GrantAuthorizer::default(), &graph, "#lab")?
+        .iter()
+        .filter_map(|(predicate, object)| {
+            (predicate == &craqle::EncodedTerm::from_named_node(&craqle::vocab::schema_name()))
+                .then(|| object.to_term())
+                .flatten()
+        })
+        .filter_map(|object| match object {
+            oxrdf::Term::Literal(value) => Some(value.value().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    projected_names.sort();
+    assert_eq!(projected_names, ["Peer A", "Peer B"]);
+
+    let update_a = create_event_with_payload(
+        &test,
+        document_id,
+        Ulid::from_parts(41, 1),
+        "divergence",
+        MetadataCreateEventPayload::UpsertContextualEntity {
+            jsonld: serde_json::json!({
+                "@id": "#lab",
+                "@type": "Organization",
+                "name": "Peer A"
+            })
+            .to_string(),
+        },
+    );
+    let update_b = create_event_with_payload(
+        &test,
+        document_id,
+        Ulid::from_parts(41, 2),
+        "divergence",
+        MetadataCreateEventPayload::UpsertContextualEntity {
+            jsonld: serde_json::json!({
+                "@id": "#lab",
+                "@type": "Organization",
+                "name": "Peer B"
+            })
+            .to_string(),
+        },
+    );
+    let revision = resolve_raw_revision(&[base, update_a, update_b])?.expect("raw base exists");
+    let raw: serde_json::Value = serde_json::from_str(&revision.jsonld)?;
+    let lab = raw["@graph"]
+        .as_array()
+        .and_then(|entries| entries.iter().find(|entry| entry["@id"] == "#lab"))
+        .expect("raw lab exists");
+    assert_eq!(lab["name"], "Peer B");
+    let projected = node_a.export_rocrate(&GrantAuthorizer::default(), &graph)?;
+    assert_ne!(
+        craqle::canonicalize_jsonld(&projected)?.digest,
+        revision.dataset_digest.expect("raw digest exists")
+    );
+    Ok(())
+}
+
+fn sync_craqle(
+    sender: &irokle::Irokle,
+    receiver: &irokle::Irokle,
+    receiver_node: &CraqleNode,
+    topic_id: irokle::TopicId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let summary = receiver.sync_summary(topic_id)?;
+    let data = sender.plan_sync_data(receiver.peer_id(), &summary)?;
+    if data.ops.is_empty() {
+        return Ok(());
+    }
+    let ack = receiver.receive_sync_data_from(sender.peer_id(), data)?;
+    let _ = sender.apply_sync_ack(&ack.0);
+    receiver_node.reconcile_irokle()?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -142,13 +339,35 @@ async fn entity_upsert_materialization_replay_is_idempotent()
         upsert_event_id,
         "entity-replay",
         MetadataCreateEventPayload::UpsertDataEntity {
-            jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file"}"#.to_string(),
+            jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file","description":"preserved"}"#.to_string(),
         },
     );
 
     assert_replayed_upsert_is_idempotent(metadata_handle, &upsert_event).await?;
 
-    let contextual_event_id = Ulid::from_parts(30, 3);
+    let patch_event = create_event_with_payload(
+        &test,
+        document_id,
+        Ulid::from_parts(30, 3),
+        "entity-replay",
+        MetadataCreateEventPayload::UpsertDataEntity {
+            jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"renamed"}"#.to_string(),
+        },
+    );
+    materialize_entity_upsert(metadata_handle, &patch_event).await?;
+    let projected: serde_json::Value = serde_json::from_str(
+        &metadata_handle
+            .export_rocrate_jsonld(create_event.record.graph_iri.clone())
+            .await?,
+    )?;
+    let entity = projected["@graph"]
+        .as_array()
+        .and_then(|graph| graph.iter().find(|entry| entry["@id"] == "./data/file.txt"))
+        .expect("patched entity exists");
+    assert_eq!(entity["name"], "renamed");
+    assert_eq!(entity["description"], "preserved");
+
+    let contextual_event_id = Ulid::from_parts(30, 4);
     let contextual_event = create_event_with_payload(
         &test,
         document_id,

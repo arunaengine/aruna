@@ -428,7 +428,7 @@ pub async fn export_metadata_rocrate(
             let raw = crate::metadata::raw::load_raw_view(context, record.document_id)
                 .await
                 .map_err(|error| MetadataApiError::Internal(error.to_string()))?
-                .ok_or(MetadataApiError::ServiceUnavailable)?;
+                .ok_or(MetadataApiError::NotFound)?;
             let dataset_digest = raw.revision.dataset_digest;
             Ok(ExportMetadataRoCrateResult::Raw {
                 record,
