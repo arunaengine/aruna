@@ -292,6 +292,7 @@ async fn final_status_with_leftover_job_is_cleaned_without_reapply()
         dataset_digest: None,
         state: MetadataMaterializationState::Materialized,
         attempts: 1,
+        failures: 0,
         last_error: None,
         updated_at_ms: 2,
     };

@@ -2182,6 +2182,7 @@ mod tests {
                 .map(|digest| digest.try_into().unwrap()),
             state: MetadataMaterializationState::Failed,
             attempts: 1,
+            failures: 0,
             last_error: Some("projection failed".to_string()),
             updated_at_ms: 1,
         };

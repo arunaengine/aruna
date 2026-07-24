@@ -377,7 +377,7 @@ impl CreateMetadataDocumentOperation {
         smallvec![self.graph_validation_effect()]
     }
 
-    fn read_realm_config_effect(&mut self) -> Effects {
+    fn realm_config_effect(&mut self) -> Effects {
         self.state = CreateMetadataDocumentState::ReadRealmConfig;
         let realm_target = DocumentSyncTarget::RealmConfig {
             realm_id: self.config.actor.realm_id,
@@ -585,7 +585,7 @@ impl Operation for CreateMetadataDocumentOperation {
             CreateMetadataDocumentState::ValidateGraph => match event {
                 Event::Metadata(MetadataEvent::ValidationResult { .. }) => {
                     if self.skip_existing_check {
-                        return self.read_realm_config_effect();
+                        return self.realm_config_effect();
                     }
                     self.state = CreateMetadataDocumentState::CheckExisting;
                     smallvec![read_registry_by_document_effect(
@@ -602,7 +602,7 @@ impl Operation for CreateMetadataDocumentOperation {
                 match crate::metadata::repository::parse_registry_read(event) {
                     Ok(Some(_)) => self
                         .fail_without_cleanup(CreateMetadataDocumentError::DocumentAlreadyExists),
-                    Ok(None) => self.read_realm_config_effect(),
+                    Ok(None) => self.realm_config_effect(),
                     Err(crate::metadata::repository::StorageReadError::Storage(error)) => {
                         self.fail_without_cleanup(error.into())
                     }
@@ -796,7 +796,7 @@ mod tests {
         })
     }
 
-    fn assert_create_fence_read(effects: &[Effect]) {
+    fn assert_fence_read(effects: &[Effect]) {
         let [
             Effect::Storage(StorageEffect::BatchRead {
                 reads,
@@ -960,7 +960,7 @@ mod tests {
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: retry_txn,
         }));
-        assert_create_fence_read(effects.as_slice());
+        assert_fence_read(effects.as_slice());
         let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
                 (
@@ -1008,7 +1008,7 @@ mod tests {
         let effects = operation.step(validation_result(document_id));
         let effects = supply_realm_config(&mut operation, effects.as_slice(), None, &actor);
         let effects = begin_transaction(&mut operation, effects.as_slice());
-        assert_create_fence_read(effects.as_slice());
+        assert_fence_read(effects.as_slice());
         let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
                 (metadata_create_acceptance_key(document_id), None),
@@ -1206,13 +1206,13 @@ mod tests {
         let effects = operation.step(validation_result(document_id));
         let effects = supply_realm_config(&mut operation, effects.as_slice(), None, &actor);
         let effects = begin_transaction(&mut operation, effects.as_slice());
-        assert_create_fence_read(effects.as_slice());
+        assert_fence_read(effects.as_slice());
         let effects = operation.step(create_fence_read(&actor, group_id, document_id));
         assert_create_event_append(effects.as_slice(), document_id, &actor);
     }
 
     #[test]
-    fn config_read_precedes_txn() {
+    fn config_precedes_txn() {
         // The realm config only steers placement, so it is read outside the
         // transaction: a config edit must never conflict a create.
         let realm_id = RealmId([22u8; 32]);
@@ -1241,7 +1241,7 @@ mod tests {
 
         let effects = supply_realm_config(&mut operation, effects.as_slice(), None, &actor);
         let effects = begin_transaction(&mut operation, effects.as_slice());
-        assert_create_fence_read(effects.as_slice());
+        assert_fence_read(effects.as_slice());
     }
 
     #[test]
@@ -1306,7 +1306,7 @@ mod tests {
         }));
         let effects = supply_realm_config(&mut operation, effects.as_slice(), None, &actor);
         let effects = begin_transaction(&mut operation, effects.as_slice());
-        assert_create_fence_read(effects.as_slice());
+        assert_fence_read(effects.as_slice());
         let effects = operation.step(create_fence_read(&actor, group_id, document_id));
         let create_event_key = assert_create_event_append(effects.as_slice(), document_id, &actor);
         assert_eq!(
@@ -1348,7 +1348,7 @@ mod tests {
         let effects = operation.step(validation_result(document_id));
         let effects = supply_realm_config(&mut operation, effects.as_slice(), None, &actor);
         let effects = begin_transaction(&mut operation, effects.as_slice());
-        assert_create_fence_read(effects.as_slice());
+        assert_fence_read(effects.as_slice());
         let effects = operation.step(create_fence_read(&actor, group_id, document_id));
         let create_event_key = assert_create_event_append(effects.as_slice(), document_id, &actor);
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
@@ -1410,7 +1410,7 @@ mod tests {
         }));
         let config_read = supply_realm_config(&mut operation, config_read.as_slice(), None, &actor);
         let fence_read = begin_transaction(&mut operation, config_read.as_slice());
-        assert_create_fence_read(fence_read.as_slice());
+        assert_fence_read(fence_read.as_slice());
         let append = operation.step(create_fence_read(&actor, group_id, document_id));
         assert_create_event_append(append.as_slice(), document_id, &actor);
 

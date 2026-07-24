@@ -469,6 +469,9 @@ pub struct MetadataMaterializationStatusRecord {
     pub dataset_digest: Option<[u8; 32]>,
     pub state: MetadataMaterializationState,
     pub attempts: u32,
+    /// Application-level failures only; infrastructure errors retry without
+    /// counting so an overloaded node never gives up on a document.
+    pub failures: u32,
     pub last_error: Option<String>,
     pub updated_at_ms: u64,
 }
@@ -492,6 +495,7 @@ impl MetadataMaterializationStatusRecord {
             dataset_digest: None,
             state: MetadataMaterializationState::Pending,
             attempts: 0,
+            failures: 0,
             last_error: None,
             updated_at_ms,
         }
@@ -503,7 +507,23 @@ pub struct MetadataMaterializationJobRecord {
     pub document_id: Ulid,
     pub event_id: Ulid,
     pub due_at_ms: u64,
+    /// Total tries; drives retry backoff and stale-duplicate detection.
     pub attempts: u32,
+    /// Application-level failures only; the attempt cap tests this counter so a
+    /// storm of timeouts cannot park a job.
+    pub failures: u32,
+}
+
+/// A job that exhausted its failure budget. Kept so the queue drain can pick it
+/// up again later: parking must never silently drop a document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataMaterializationDeadLetterRecord {
+    pub job: MetadataMaterializationJobRecord,
+    pub last_error: String,
+    pub parked_at_ms: u64,
+    /// How often this job has been parked; drives the requeue backoff.
+    pub parks: u32,
+    pub requeue_at_ms: u64,
 }
 
 impl MetadataMaterializationJobRecord {
@@ -513,6 +533,7 @@ impl MetadataMaterializationJobRecord {
             event_id: event.event_id,
             due_at_ms,
             attempts: 0,
+            failures: 0,
         }
     }
 }

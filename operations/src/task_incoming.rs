@@ -42,7 +42,8 @@ use crate::jobs::{JOB_DRAIN_RETRY_AFTER, JOB_PRUNE_POLL_AFTER, JOB_PRUNE_RETRY_A
 use crate::metadata::materialization_queue::{
     METADATA_MATERIALIZATION_NEXT_BATCH_AFTER, METADATA_MATERIALIZATION_POLL_AFTER,
     METADATA_MATERIALIZATION_RETRY_AFTER, metadata_materialization_jobs_exist,
-    process_metadata_materialization_batch, restore_metadata_materialization_timer,
+    process_metadata_materialization_batch, requeue_dead_letters,
+    restore_metadata_materialization_timer,
 };
 use crate::metadata::projector::{
     METADATA_PROJECTION_RETRY_AFTER, drain_pending_metadata_projection_queue,
@@ -1792,12 +1793,21 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
         )
         .await;
         restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
+        sweep_dead_letters(&context.storage_handle).await;
         restore_metadata_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
         restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
         restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
         restore_job_queue_timer(&context.storage_handle, &task_handle).await;
         restore_job_prune_timer(&context.storage_handle, &task_handle).await;
         restore_mirror_timer(&context.storage_handle, &task_handle).await;
+    }
+}
+
+// Parked materialization jobs come back on their own backoff, so a node that hit
+// the failure cap during a storm converges again without an operator or restart.
+async fn sweep_dead_letters(storage: &aruna_storage::StorageHandle) {
+    if let Err(error) = requeue_dead_letters(&storage.bulk()).await {
+        warn!(error = ?error, "Failed to requeue metadata materialization dead letters");
     }
 }
 
@@ -1866,6 +1876,7 @@ async fn initialize_task_handler(
     crate::node_info::restore_node_info_publish_timer(&context.storage_handle, &task_handle).await;
     restore_notification_outbox_timer(&context.storage_handle, &task_handle, Duration::ZERO).await;
     restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
+    sweep_dead_letters(&context.storage_handle).await;
     restore_metadata_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
     restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
     restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
