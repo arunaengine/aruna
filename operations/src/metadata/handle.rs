@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY};
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect, StoragePriority};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
@@ -151,6 +151,9 @@ async fn create_sync_bucket(
 #[derive(Clone)]
 pub struct MetadataHandle {
     inner: Arc<MetadataInner>,
+    /// Lane for this handle's own storage reads. Background drains use the bulk
+    /// lane so their lifecycle reads stay off the foreground sync path.
+    storage_priority: StoragePriority,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -736,7 +739,23 @@ impl MetadataHandle {
                 deferred_persist_requested: AtomicBool::new(false),
                 deferred_persist_running: AtomicBool::new(false),
             }),
+            storage_priority: StoragePriority::Foreground,
         })
+    }
+
+    /// A handle whose own storage reads dispatch on the bulk lane.
+    pub fn bulk(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            storage_priority: StoragePriority::Bulk,
+        }
+    }
+
+    fn lifecycle_storage(&self) -> StorageHandle {
+        match self.storage_priority {
+            StoragePriority::Foreground => self.inner.storage_handle.clone(),
+            StoragePriority::Bulk => self.inner.storage_handle.bulk(),
+        }
     }
 
     pub fn upsert_cached_registry_record(&self, record: MetadataRegistryRecord) {
@@ -859,9 +878,10 @@ impl MetadataHandle {
                 elapsed_ms = field::Empty,
             );
             let started = Instant::now();
-            let result = metadata_graph_deleted(self.inner.clone(), graph_iri)
-                .instrument(span.clone())
-                .await;
+            let result =
+                metadata_graph_deleted(self.inner.clone(), self.lifecycle_storage(), graph_iri)
+                    .instrument(span.clone())
+                    .await;
             match result {
                 Ok(read) if read.deleted => {
                     span.record("deleted", true);
@@ -1000,7 +1020,7 @@ impl MetadataHandle {
     }
 
     pub async fn prune_graph_if_deleted(&self, graph_iri: String) -> Result<bool, MetadataError> {
-        if !graph_lifecycle_deleted(self.inner.storage_handle.clone(), &graph_iri).await? {
+        if !graph_lifecycle_deleted(self.lifecycle_storage(), &graph_iri).await? {
             return Ok(false);
         }
         self.inner
@@ -2132,6 +2152,7 @@ async fn graph_lifecycle_record(
 
 async fn metadata_graph_deleted(
     inner: Arc<MetadataInner>,
+    storage_handle: StorageHandle,
     graph_iri: &str,
 ) -> Result<MetadataGraphDeletedRead, MetadataError> {
     if let Some((true, _)) = inner.visibility_cache.lifecycle_deleted_any(graph_iri) {
@@ -2141,7 +2162,7 @@ async fn metadata_graph_deleted(
         });
     }
 
-    let deleted = graph_lifecycle_deleted(inner.storage_handle.clone(), graph_iri).await?;
+    let deleted = graph_lifecycle_deleted(storage_handle, graph_iri).await?;
     inner
         .visibility_cache
         .store_lifecycle_deleted(graph_iri.to_string(), deleted);
@@ -4976,7 +4997,7 @@ async fn list_visible_graphs(inner: Arc<MetadataInner>) -> Result<Vec<String>, M
     let mut visible = Vec::with_capacity(graphs.len());
     for graph in graphs {
         let graph_iri = graph.as_str().to_string();
-        if !metadata_graph_deleted(inner.clone(), &graph_iri)
+        if !metadata_graph_deleted(inner.clone(), inner.storage_handle.clone(), &graph_iri)
             .await?
             .deleted
         {
@@ -5051,7 +5072,12 @@ async fn select_authorized_records(
             filtered_count += 1;
             continue;
         }
-        let deleted = metadata_graph_deleted(inner.clone(), &record.graph_iri).await?;
+        let deleted = metadata_graph_deleted(
+            inner.clone(),
+            inner.storage_handle.clone(),
+            &record.graph_iri,
+        )
+        .await?;
         if deleted.cache_hit {
             lifecycle_cache_hits += 1;
         } else {

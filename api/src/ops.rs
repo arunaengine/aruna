@@ -50,11 +50,13 @@ const OPS_MAX_CONCURRENT_REQUESTS: usize = 32;
 
 const DOCUMENT_SYNC_OUTBOX_QUEUE: &str = "document_sync_outbox";
 const METADATA_MATERIALIZATION_QUEUE: &str = "metadata_materialization";
+const MATERIALIZATION_DEAD_LETTER_QUEUE: &str = "metadata_materialization_dead_letters";
 const BLOB_REPLICATION_QUEUE: &str = "blob_replication";
 const REFERENCE_METADATA_REFRESH_QUEUE: &str = "reference_metadata_refresh";
-const QUEUE_NAMES: [&str; 4] = [
+const QUEUE_NAMES: [&str; 5] = [
     DOCUMENT_SYNC_OUTBOX_QUEUE,
     METADATA_MATERIALIZATION_QUEUE,
+    MATERIALIZATION_DEAD_LETTER_QUEUE,
     BLOB_REPLICATION_QUEUE,
     REFERENCE_METADATA_REFRESH_QUEUE,
 ];
@@ -400,12 +402,18 @@ impl QueueMetrics {
             .set((unix_timestamp_millis() / 1_000) as i64);
     }
 
+    // Sampled on the foreground lane: queue depth must stay observable exactly
+    // when the bulk lane is saturated.
     async fn refresh(&self, ctx: &DriverContext, reporter: &mut QueueLagReporter) {
-        let sample = reporter.sample(&ctx.storage_handle.bulk()).await;
+        let sample = reporter.sample(&ctx.storage_handle).await;
         self.apply(DOCUMENT_SYNC_OUTBOX_QUEUE, sample.document_sync_outbox);
         self.apply(
             METADATA_MATERIALIZATION_QUEUE,
             sample.metadata_materialization,
+        );
+        self.apply(
+            MATERIALIZATION_DEAD_LETTER_QUEUE,
+            sample.materialization_dead_letters,
         );
         self.apply(BLOB_REPLICATION_QUEUE, sample.blob_replication);
         self.apply(

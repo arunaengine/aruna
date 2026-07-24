@@ -41,9 +41,9 @@ use crate::jobs::store::release_job;
 use crate::jobs::{JOB_DRAIN_RETRY_AFTER, JOB_PRUNE_POLL_AFTER, JOB_PRUNE_RETRY_AFTER};
 use crate::metadata::materialization_queue::{
     METADATA_MATERIALIZATION_NEXT_BATCH_AFTER, METADATA_MATERIALIZATION_POLL_AFTER,
-    METADATA_MATERIALIZATION_RETRY_AFTER, metadata_materialization_jobs_exist,
-    process_metadata_materialization_batch, requeue_dead_letters,
-    restore_metadata_materialization_timer,
+    METADATA_MATERIALIZATION_RETRY_AFTER, MetadataMaterializationDrainResult,
+    metadata_materialization_jobs_exist, process_metadata_materialization_batch,
+    requeue_dead_letters, restore_metadata_materialization_timer,
 };
 use crate::metadata::projector::{
     METADATA_PROJECTION_RETRY_AFTER, drain_pending_metadata_projection_queue,
@@ -1177,6 +1177,10 @@ impl OperationsTaskHandler {
     fn bulk_context(&self) -> DriverContext {
         let mut context = self.context.as_ref().clone();
         context.storage_handle = context.storage_handle.bulk();
+        context.metadata_handle = context
+            .metadata_handle
+            .as_ref()
+            .map(|metadata_handle| metadata_handle.bulk());
         context
     }
 
@@ -1186,7 +1190,7 @@ impl OperationsTaskHandler {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(
                     TaskKey::DrainMetadataMaterializationQueue,
-                    METADATA_MATERIALIZATION_NEXT_BATCH_AFTER,
+                    drain_delay(&result),
                 )
                 .await;
             }
@@ -1803,6 +1807,16 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
     }
 }
 
+// A batch that processed nothing is blocked behind jobs that are not due yet, so
+// it backs off instead of rescanning the same head at batch pace.
+fn drain_delay(result: &MetadataMaterializationDrainResult) -> Duration {
+    if result.processed == 0 {
+        METADATA_MATERIALIZATION_RETRY_AFTER
+    } else {
+        METADATA_MATERIALIZATION_NEXT_BATCH_AFTER
+    }
+}
+
 // Parked materialization jobs come back on their own backoff, so a node that hit
 // the failure cap during a storm converges again without an operator or restart.
 async fn sweep_dead_letters(storage: &aruna_storage::StorageHandle) {
@@ -2027,6 +2041,26 @@ mod tests {
     use ulid::Ulid;
 
     use crate::notifications::outbox::new_notification_outbox_record;
+
+    #[test]
+    fn blocked_batch_waits() {
+        // Nothing processed means the due head is blocked, so the next scan
+        // waits instead of respinning at the 25ms batch pace.
+        let blocked = MetadataMaterializationDrainResult {
+            processed: 0,
+            has_more_due: true,
+            next_due_after: None,
+        };
+        let progressing = MetadataMaterializationDrainResult {
+            processed: 4,
+            ..blocked
+        };
+        assert_eq!(drain_delay(&blocked), METADATA_MATERIALIZATION_RETRY_AFTER);
+        assert_eq!(
+            drain_delay(&progressing),
+            METADATA_MATERIALIZATION_NEXT_BATCH_AFTER
+        );
+    }
 
     struct RecordingTaskHandler {
         seen: mpsc::Sender<TaskKey>,
