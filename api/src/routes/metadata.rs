@@ -4,7 +4,7 @@ use crate::auth::{
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::errors::AuthorizationError;
+use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::metadata::{
     MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
@@ -569,7 +569,8 @@ impl MetadataDocumentListItem {
         ),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 409, description = "Concurrent create conflict; retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1572,6 +1573,9 @@ fn map_create_metadata_error(error: CreateMetadataDocumentError) -> ServerError 
         CreateMetadataDocumentError::MetadataError(metadata_error) => {
             map_metadata_error(metadata_error)
         }
+        CreateMetadataDocumentError::StorageError(StorageError::TransactionConflict) => {
+            ServerError::Conflict("concurrent metadata create conflict; retry".to_string())
+        }
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -1993,6 +1997,19 @@ mod tests {
             metadata_handle, ..
         } = context;
         metadata_handle.as_ref().expect("metadata handle installed")
+    }
+
+    #[test]
+    fn maps_conflict_409() {
+        use axum::response::IntoResponse;
+        let mapped = map_create_metadata_error(CreateMetadataDocumentError::StorageError(
+            StorageError::TransactionConflict,
+        ));
+        assert!(matches!(mapped, ServerError::Conflict(_)));
+        assert_eq!(
+            mapped.into_response().status(),
+            axum::http::StatusCode::CONFLICT
+        );
     }
 
     #[tokio::test]
