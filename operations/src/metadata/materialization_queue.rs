@@ -410,10 +410,13 @@ async fn process_materialization_job_groups(
         first_error = Some(error);
     }
     timings.finish_elapsed = finish_started.elapsed();
+    // The applies behind these syncs are already durable, so they are scheduled
+    // even when a later finish chunk failed: the committed chunks deleted their
+    // job rows, so nothing would retry their only explicit push.
+    schedule_completed_materialization_syncs(context, syncs).await;
     if let Some(error) = first_error {
         return Err(error);
     }
-    schedule_completed_materialization_syncs(context, syncs).await;
     Ok(timings)
 }
 
