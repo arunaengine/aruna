@@ -34,7 +34,7 @@ use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use thiserror::Error;
 use tokio::task::JoinSet;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
@@ -894,8 +894,23 @@ pub async fn requeue_dead_letters(
             if dead_letter.requeue_at_ms > now_ms {
                 continue;
             }
-            if requeue_dead_letter(storage, &dead_letter).await? {
-                requeued = requeued.saturating_add(1);
+            match requeue_dead_letter(storage, &dead_letter).await {
+                Ok(true) => requeued = requeued.saturating_add(1),
+                Ok(false) => {}
+                // A racing finish for the same document aborts this requeue; the
+                // dead letter stays, so one contended document must not stop the
+                // sweep from freeing the rest.
+                Err(MetadataMaterializationQueueError::Storage(
+                    StorageError::TransactionConflict,
+                )) => {
+                    debug!(
+                        event = "materialization.deadletter.contended",
+                        document_id = %dead_letter.job.document_id,
+                        event_id = %dead_letter.job.event_id,
+                        "Deferring contended metadata materialization dead letter"
+                    );
+                }
+                Err(error) => return Err(error),
             }
         }
 
@@ -940,23 +955,6 @@ async fn requeue_dead_letter(
         failures: MATERIALIZATION_MAX_FAILURES.saturating_sub(1),
         parks: dead_letter.parks,
     };
-    if let Some(status) = read_materialization_status(storage, job.document_id, None).await?
-        && dead_letter_superseded(&status, &job)
-    {
-        info!(
-            event = "materialization.deadletter.superseded",
-            document_id = %job.document_id,
-            event_id = %job.event_id,
-            status_event_id = %status.event_id,
-            "Dropping superseded metadata materialization dead letter"
-        );
-        delete_dead_letter(
-            storage,
-            dead_letter_key(job.document_id, job.event_id).to_vec(),
-        )
-        .await?;
-        return Ok(false);
-    }
     let event = match read_create_event(storage, job.document_id, job.event_id).await {
         Ok(event) => event,
         Err(MetadataMaterializationQueueError::MetadataCreateEventMissing { .. }) => {
@@ -974,32 +972,11 @@ async fn requeue_dead_letter(
         ..new_pending_materialization_status(&event, unix_timestamp_millis())
     };
     let txn_id = start_write_transaction(storage).await?;
-    let result = async {
-        transactional_batch_write(
-            storage,
-            txn_id,
-            vec![
-                metadata_materialization_status_write_entry(&status)?,
-                metadata_materialization_job_write_entry(&job)?,
-                metadata_materialization_document_job_write_entry(&job)?,
-            ],
-        )
-        .await?;
-        transactional_batch_delete(
-            storage,
-            txn_id,
-            vec![(
-                METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE.to_string(),
-                dead_letter_key(job.document_id, job.event_id),
-            )],
-        )
-        .await
-    }
-    .await;
+    let result = requeue_in_txn(storage, txn_id, &job, &status).await;
     match result {
-        Ok(()) => {
+        Ok(requeued) => {
             commit_storage_transaction(storage, txn_id).await?;
-            Ok(true)
+            Ok(requeued)
         }
         Err(error) => {
             abort_storage_transaction_best_effort(
@@ -1012,6 +989,47 @@ async fn requeue_dead_letter(
             Err(error)
         }
     }
+}
+
+// The status guard is read inside the transaction: a newer event finishing
+// between the read and the commit writes that same key, so the conflict manager
+// aborts this requeue instead of letting it restore an obsolete event.
+async fn requeue_in_txn(
+    storage: &StorageHandle,
+    txn_id: Ulid,
+    job: &MetadataMaterializationJobRecord,
+    status: &MetadataMaterializationStatusRecord,
+) -> Result<bool, MetadataMaterializationQueueError> {
+    let dead_letter_delete = vec![(
+        METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE.to_string(),
+        dead_letter_key(job.document_id, job.event_id),
+    )];
+    if let Some(current) =
+        read_materialization_status(storage, job.document_id, Some(txn_id)).await?
+        && dead_letter_superseded(&current, job)
+    {
+        info!(
+            event = "materialization.deadletter.superseded",
+            document_id = %job.document_id,
+            event_id = %job.event_id,
+            status_event_id = %current.event_id,
+            "Dropping superseded metadata materialization dead letter"
+        );
+        transactional_batch_delete(storage, txn_id, dead_letter_delete).await?;
+        return Ok(false);
+    }
+    transactional_batch_write(
+        storage,
+        txn_id,
+        vec![
+            metadata_materialization_status_write_entry(status)?,
+            metadata_materialization_job_write_entry(job)?,
+            metadata_materialization_document_job_write_entry(job)?,
+        ],
+    )
+    .await?;
+    transactional_batch_delete(storage, txn_id, dead_letter_delete).await?;
+    Ok(true)
 }
 
 async fn delete_dead_letter(
@@ -3251,6 +3269,73 @@ mod tests {
             .expect("status survives");
         assert_eq!(status.event_id, newer_event_id);
         assert_eq!(status.state, MetadataMaterializationState::Materialized);
+        assert!(
+            read_document_job(&storage, document_id, old_event_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn requeue_aborts_raced() {
+        // A newer event finishing while the requeue is open must beat it: the
+        // requeue would otherwise reinstate an obsolete event as pending and
+        // delete nothing, leaving the document projected from stale state.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let document_id = Ulid::from_bytes([56u8; 16]);
+        let old_event_id = Ulid::from_parts(1, 1);
+        let newer_event_id = Ulid::from_parts(2, 1);
+        let old_event = create_event(document_id, old_event_id, "old");
+        let newer_event = create_event(document_id, newer_event_id, "newer");
+        let job = MetadataMaterializationJobRecord {
+            document_id,
+            event_id: old_event_id,
+            due_at_ms: 1,
+            attempts: MATERIALIZATION_MAX_FAILURES,
+            failures: MATERIALIZATION_MAX_FAILURES,
+            parks: 1,
+        };
+        let status = MetadataMaterializationStatusRecord {
+            failures: job.failures,
+            ..new_pending_materialization_status(&old_event, 1)
+        };
+        write_entries(
+            &storage,
+            vec![metadata_create_event_write_entry(&old_event).unwrap()],
+        )
+        .await;
+
+        let txn_id = start_write_transaction(&storage).await.unwrap();
+        assert!(
+            requeue_in_txn(&storage, txn_id, &job, &status)
+                .await
+                .unwrap()
+        );
+
+        let racing = start_write_transaction(&storage).await.unwrap();
+        transactional_batch_write(
+            &storage,
+            racing,
+            vec![
+                metadata_materialization_status_write_entry(&materialized_status(
+                    document_id,
+                    &newer_event,
+                ))
+                .unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+        commit_storage_transaction(&storage, racing).await.unwrap();
+
+        assert!(commit_storage_transaction(&storage, txn_id).await.is_err());
+        let current = read_materialization_status(&storage, document_id, None)
+            .await
+            .unwrap()
+            .expect("racing status survives");
+        assert_eq!(current.event_id, newer_event_id);
         assert!(
             read_document_job(&storage, document_id, old_event_id)
                 .await
