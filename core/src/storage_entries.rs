@@ -17,11 +17,11 @@ use crate::keyspaces::{
     METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
     METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, METADATA_IRI_REFERENCE_INDEX_KEYSPACE,
     METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE, METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
-    METADATA_MATERIALIZATION_JOB_KEYSPACE, METADATA_MATERIALIZATION_STATUS_KEYSPACE,
-    METADATA_PENDING_PROJECTION_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
-    NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE,
-    NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
-    USER_SUBJECT_INDEX_KEYSPACE,
+    METADATA_MATERIALIZATION_JOB_KEYSPACE, METADATA_MATERIALIZATION_PRUNE_KEYSPACE,
+    METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
+    NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
+    NOTIFICATION_OUTBOX_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
+    SHARD_MANIFEST_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
 };
 use crate::metadata::{
     MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
@@ -550,6 +550,23 @@ pub fn dead_letter_entry(
         dead_letter_key(record.job.document_id, record.job.event_id),
         postcard::to_allocvec(record)?.into(),
     ))
+}
+
+/// A document whose superseded IRI index rows still have to be dropped. Kept
+/// durable so cleanup survives the batch that scheduled it.
+pub fn materialization_prune_entry(
+    document_id: Ulid,
+    cursor: Ulid,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        METADATA_MATERIALIZATION_PRUNE_KEYSPACE.to_string(),
+        materialization_prune_key(document_id),
+        postcard::to_allocvec(&cursor)?.into(),
+    ))
+}
+
+pub fn materialization_prune_key(document_id: Ulid) -> Key {
+    ByteView::from(document_id.to_bytes().to_vec())
 }
 
 pub fn metadata_graph_prune_job_write_entry(
