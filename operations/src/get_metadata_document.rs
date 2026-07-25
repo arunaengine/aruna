@@ -200,6 +200,16 @@ impl Operation for GetMetadataDocumentOperation {
         self.output.expect("metadata get operation must set output")
     }
 
+    // A read of a document that does not exist yet, or whose graph has not
+    // materialized, is a 404 for the caller, not a node failure.
+    fn expected_error(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            GetMetadataDocumentError::DocumentNotFound
+                | GetMetadataDocumentError::MetadataError(MetadataError::GraphNotFound)
+        )
+    }
+
     fn abort(&mut self) -> Effects {
         smallvec![]
     }
