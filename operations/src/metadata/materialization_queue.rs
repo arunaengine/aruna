@@ -2135,7 +2135,8 @@ fn materialization_failure_kind(
             MetadataError::ChannelClosed
             | MetadataError::TaskJoin(_)
             | MetadataError::HandleMissing
-            | MetadataError::Persist(_),
+            | MetadataError::Persist(_)
+            | MetadataError::Storage(_),
         )
         | MetadataMaterializationQueueError::MetadataHandleMissing => {
             MaterializationFailureKind::Transient
@@ -3003,6 +3004,40 @@ mod tests {
                 assert_eq!(status.failures, job.failures);
             }
             other => panic!("expected reschedule, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_failure_transient() {
+        // The lifecycle read and the craqle apply reach the queue through the
+        // metadata handle; an overloaded lane or a failed disk write there must
+        // not spend the budget reserved for failures the document caused.
+        let document_id = Ulid::from_bytes([53u8; 16]);
+        let event_id = Ulid::from_parts(7, 1);
+        let event = create_event(document_id, event_id, "handle");
+        let job = MetadataMaterializationJobRecord {
+            document_id,
+            event_id,
+            due_at_ms: 1,
+            attempts: 0,
+            failures: MATERIALIZATION_MAX_FAILURES - 1,
+        };
+        let key = metadata_materialization_job_key(&job);
+        let errors = [
+            MetadataMaterializationQueueError::Metadata(MetadataError::Storage(
+                StorageError::QueueFull,
+            )),
+            MetadataMaterializationQueueError::Metadata(MetadataError::Storage(
+                StorageError::Timeout,
+            )),
+        ];
+        for error in errors {
+            match defer_materialization_job(key.as_ref(), &job, &event, &error) {
+                FinishedMaterializationJob::Rescheduled { status, .. } => {
+                    assert_eq!(status.failures, job.failures);
+                }
+                other => panic!("expected reschedule, got {other:?}"),
+            }
         }
     }
 

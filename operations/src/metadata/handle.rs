@@ -2059,9 +2059,7 @@ async fn ensure_remote_metadata_peer_is_configured_for_realm(
                 "remote metadata peer `{peer}` is not configured in realm `{realm_id}`"
             )))
         }
-        Event::Storage(StorageEvent::Error { error }) => Err(MetadataError::Backend(format!(
-            "realm config read failed for `{realm_id}`: {error}"
-        ))),
+        Event::Storage(StorageEvent::Error { error }) => Err(MetadataError::Storage(error)),
         other => Err(MetadataError::Backend(format!(
             "unexpected realm config read result for `{realm_id}`: {other:?}"
         ))),
@@ -2114,9 +2112,7 @@ where
             postcard::from_bytes(&bytes).map_err(|error| MetadataError::Backend(error.to_string()))
         }
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(T::default()),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(MetadataError::Backend(error.to_string()))
-        }
+        Event::Storage(StorageEvent::Error { error }) => Err(MetadataError::Storage(error)),
         other => Err(MetadataError::Backend(format!(
             "unexpected metadata auth state read result: {other:?}"
         ))),
@@ -2141,9 +2137,7 @@ async fn graph_lifecycle_record(
                     .map_err(|error| MetadataError::Backend(error.to_string()))
             })
             .transpose(),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(MetadataError::Backend(error.to_string()))
-        }
+        Event::Storage(StorageEvent::Error { error }) => Err(MetadataError::Storage(error)),
         other => Err(MetadataError::Backend(format!(
             "unexpected metadata graph lifecycle read result: {other:?}"
         ))),
@@ -3617,6 +3611,11 @@ fn metadata_error_from_craqle(error: CraqleError) -> MetadataError {
         CraqleError::Update(craqle::UpdateError::ValidationFailed(violations)) => {
             metadata_violations(violations)
         }
+        // Backend infrastructure, not the document: an apply that fails on disk
+        // or in the search worker must keep retrying instead of being parked.
+        error @ (CraqleError::Io(_) | CraqleError::Store(_) | CraqleError::SearchWorker(_)) => {
+            MetadataError::Persist(error.to_string())
+        }
         other => MetadataError::Backend(other.to_string()),
     }
 }
@@ -4197,9 +4196,7 @@ async fn list_deleted_graph_iris(
                 next_start_after,
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => {
-                return Err(MetadataError::Backend(format!(
-                    "metadata graph lifecycle iteration failed: {error:?}"
-                )));
+                return Err(MetadataError::Storage(error));
             }
             other => {
                 return Err(MetadataError::Backend(format!(
@@ -5449,6 +5446,15 @@ mod tests {
         assert_eq!(violations[0].code, "missing_root_data_entity");
         assert_eq!(violations[0].pointer, "/@graph");
         assert_eq!(violations[0].entity_id.as_deref(), Some("./"));
+    }
+
+    #[test]
+    fn maps_io_failures() {
+        // Infrastructure must stay distinguishable from a rejected payload: the
+        // materialization queue retries the former forever and parks the latter.
+        let error = metadata_error_from_craqle(CraqleError::Io(std::io::Error::other("disk")));
+
+        assert!(matches!(error, MetadataError::Persist(_)));
     }
 
     #[test]

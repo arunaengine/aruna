@@ -6,6 +6,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::NodeId;
+use crate::errors::StorageError;
 use crate::structs::{AuthContext, MetadataAuditOperation, MetadataRegistryRecord, RealmId};
 use crate::types::{GroupId, UserId};
 
@@ -876,6 +877,10 @@ pub enum MetadataError {
     /// document: retrying it is always valid.
     #[error("metadata persist failed: {0}")]
     Persist(String),
+    /// Storage adapter failure, kept typed so callers can tell an overloaded
+    /// node from a payload the backend will never accept.
+    #[error("metadata storage error: {0}")]
+    Storage(#[from] StorageError),
     #[error("metadata backend error: {0}")]
     Backend(String),
 }
