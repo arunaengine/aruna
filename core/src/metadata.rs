@@ -513,6 +513,9 @@ pub struct MetadataMaterializationJobRecord {
     /// Application-level failures only; the attempt cap tests this counter so a
     /// storm of timeouts cannot park a job.
     pub failures: u32,
+    /// How often this job was already parked. Carried across requeue so the
+    /// dead-letter backoff of a poison document keeps growing.
+    pub parks: u32,
 }
 
 /// A job that exhausted its failure budget. Kept so the queue drain can pick it
@@ -535,6 +538,7 @@ impl MetadataMaterializationJobRecord {
             due_at_ms,
             attempts: 0,
             failures: 0,
+            parks: 0,
         }
     }
 }

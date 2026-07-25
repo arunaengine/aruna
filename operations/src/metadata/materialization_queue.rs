@@ -617,6 +617,7 @@ async fn plan_finish_chunk(
                         .saturating_add(queue_retry_after_ms(attempts)),
                     attempts,
                     failures: status.failures,
+                    parks: job.parks,
                 };
                 if should_write_pending_retry_status(current, &status) {
                     plan.writes
@@ -797,13 +798,16 @@ async fn batch_read_values(
 }
 
 // A re-parked job keeps its park count so its requeue backoff keeps growing
-// instead of restarting at the base delay.
+// instead of restarting at the base delay. The count survives a requeue on the
+// job itself, since the requeue deletes the dead letter that carried it.
 fn parked_dead_letter(
     job: &MetadataMaterializationJobRecord,
     status: &MetadataMaterializationStatusRecord,
     previous: Option<&MetadataMaterializationDeadLetterRecord>,
 ) -> MetadataMaterializationDeadLetterRecord {
-    let parks = previous.map_or(1, |previous| previous.parks.saturating_add(1));
+    let parks = previous
+        .map_or(job.parks, |previous| previous.parks.max(job.parks))
+        .saturating_add(1);
     let now_ms = unix_timestamp_millis();
     MetadataMaterializationDeadLetterRecord {
         job: job.clone(),
@@ -934,6 +938,7 @@ async fn requeue_dead_letter(
         due_at_ms: unix_timestamp_millis(),
         attempts: 0,
         failures: MATERIALIZATION_MAX_FAILURES.saturating_sub(1),
+        parks: dead_letter.parks,
     };
     if let Some(status) = read_materialization_status(storage, job.document_id, None).await?
         && dead_letter_superseded(&status, &job)
@@ -1765,6 +1770,7 @@ fn should_write_pending_retry_status(
                     due_at_ms: 0,
                     attempts: next.attempts,
                     failures: next.failures,
+                    parks: 0,
                 },
             )
     })
@@ -2310,6 +2316,7 @@ mod tests {
             due_at_ms: 0,
             attempts: 0,
             failures: 0,
+            parks: 0,
         };
         older_job_exists(storage, &group, &job, advanced).await
     }
@@ -2412,6 +2419,7 @@ mod tests {
             due_at_ms: 1,
             attempts: 0,
             failures: 0,
+            parks: 0,
         };
         let (_, global_key, _) = metadata_materialization_job_write_entry(&old_job).unwrap();
         let document_key = metadata_materialization_document_job_key(document_id, old_event_id);
@@ -2510,6 +2518,7 @@ mod tests {
             due_at_ms: 1,
             attempts: 0,
             failures: 0,
+            parks: 0,
         };
         let document_key = metadata_materialization_document_job_key(document_id, old_event_id);
         write_entries(
@@ -2545,6 +2554,7 @@ mod tests {
             due_at_ms: 1,
             attempts: 0,
             failures: 0,
+            parks: 0,
         };
         let global_key = metadata_materialization_job_key(&job);
         let document_key = metadata_materialization_document_job_key(document_id, event_id);
@@ -2637,6 +2647,7 @@ mod tests {
             due_at_ms: 1,
             attempts: 0,
             failures: 0,
+            parks: 0,
         };
         let mut writes = vec![
             metadata_create_event_write_entry(&event).unwrap(),
@@ -2650,6 +2661,7 @@ mod tests {
                 due_at_ms: now_ms.saturating_add(60_000).saturating_add(index),
                 attempts: 0,
                 failures: 0,
+                parks: 0,
             };
             writes.push(metadata_materialization_job_write_entry(&future_job).unwrap());
         }
@@ -2689,6 +2701,7 @@ mod tests {
                 due_at_ms: 1,
                 attempts: 0,
                 failures: 0,
+                parks: 0,
             };
             writes.push(metadata_create_event_write_entry(&event).unwrap());
             writes.push(metadata_materialization_job_write_entry(&job).unwrap());
@@ -2724,6 +2737,7 @@ mod tests {
                 due_at_ms: 1,
                 attempts: 0,
                 failures: 0,
+                parks: 0,
             };
             writes.push(metadata_create_event_write_entry(&event).unwrap());
             writes.push(metadata_materialization_job_write_entry(&job).unwrap());
@@ -2754,6 +2768,7 @@ mod tests {
             due_at_ms: 1,
             attempts: 0,
             failures: 0,
+            parks: 0,
         };
         let mismatched = MetadataMaterializationJobRecord {
             document_id: Ulid::from_bytes([43u8; 16]),
@@ -2761,6 +2776,7 @@ mod tests {
             due_at_ms: 1,
             attempts: 0,
             failures: 0,
+            parks: 0,
         };
         let mismatched_sidecar = MetadataMaterializationJobRecord {
             due_at_ms: 999,
@@ -2820,6 +2836,7 @@ mod tests {
             due_at_ms: 1,
             attempts: 0,
             failures: 0,
+            parks: 0,
         };
         let mut writes = vec![
             metadata_create_event_write_entry(&first_event).unwrap(),
@@ -2834,6 +2851,7 @@ mod tests {
                 due_at_ms: 1,
                 attempts: 0,
                 failures: 0,
+                parks: 0,
             };
             writes.push(metadata_materialization_document_job_write_entry(&other).unwrap());
         }
@@ -2868,6 +2886,7 @@ mod tests {
             due_at_ms: 1,
             attempts: MATERIALIZATION_MAX_FAILURES - 1,
             failures: MATERIALIZATION_MAX_FAILURES - 1,
+            parks: 0,
         };
         let index_key = metadata_materialization_job_key(&job);
         let sidecar_key = metadata_materialization_document_job_key(document_id, event_id);
@@ -2931,6 +2950,7 @@ mod tests {
             due_at_ms: 1,
             attempts: MATERIALIZATION_MAX_FAILURES - 2,
             failures: MATERIALIZATION_MAX_FAILURES - 2,
+            parks: 0,
         };
         let key = metadata_materialization_job_key(&reschedule);
         match defer_materialization_job(key.as_ref(), &reschedule, &event, &application_failure()) {
@@ -2941,6 +2961,7 @@ mod tests {
         }
         let park = MetadataMaterializationJobRecord {
             failures: MATERIALIZATION_MAX_FAILURES - 1,
+            parks: 0,
             ..reschedule
         };
         assert!(matches!(
@@ -2962,6 +2983,7 @@ mod tests {
             due_at_ms: 1,
             attempts: MATERIALIZATION_MAX_FAILURES + 5,
             failures: MATERIALIZATION_MAX_FAILURES - 1,
+            parks: 0,
         };
         let key = metadata_materialization_job_key(&job);
         let errors = [
@@ -2997,6 +3019,7 @@ mod tests {
             due_at_ms: 1,
             attempts: 0,
             failures: MATERIALIZATION_MAX_FAILURES - 1,
+            parks: 0,
         };
         let key = metadata_materialization_job_key(&job);
         let error = MetadataMaterializationQueueError::from(MetadataIriIndexError::Storage(
@@ -3024,6 +3047,7 @@ mod tests {
             due_at_ms: 1,
             attempts: 0,
             failures: MATERIALIZATION_MAX_FAILURES - 1,
+            parks: 0,
         };
         let key = metadata_materialization_job_key(&job);
         let errors = [
@@ -3059,6 +3083,7 @@ mod tests {
             due_at_ms: 1,
             attempts: MATERIALIZATION_MAX_FAILURES,
             failures: MATERIALIZATION_MAX_FAILURES,
+            parks: 0,
         };
         let pending = MetadataMaterializationDeadLetterRecord {
             job: job.clone(),
@@ -3119,6 +3144,7 @@ mod tests {
             due_at_ms: 1,
             attempts: MATERIALIZATION_MAX_FAILURES,
             failures: MATERIALIZATION_MAX_FAILURES,
+            parks: 0,
         };
         let due = MetadataMaterializationDeadLetterRecord {
             job: parked,
@@ -3142,10 +3168,20 @@ mod tests {
             .unwrap()
             .expect("job is requeued");
         let key = metadata_materialization_job_key(&requeued);
-        assert!(matches!(
-            defer_materialization_job(key.as_ref(), &requeued, &event, &application_failure()),
-            FinishedMaterializationJob::Parked { .. }
-        ));
+        let FinishedMaterializationJob::Parked { job, status, .. } =
+            defer_materialization_job(key.as_ref(), &requeued, &event, &application_failure())
+        else {
+            panic!("expected park");
+        };
+
+        // The requeue deleted the dead letter that held the park count, so the
+        // job carries it: the second park must wait longer than the first.
+        let reparked = parked_dead_letter(&job, &status, None);
+        assert_eq!(reparked.parks, due.parks + 1);
+        assert!(
+            reparked.requeue_at_ms.saturating_sub(reparked.parked_at_ms)
+                > requeue_after_ms(due.parks)
+        );
     }
 
     // A status that already materialized `event_id`, as a newer event would.
@@ -3159,6 +3195,7 @@ mod tests {
             due_at_ms: 1,
             attempts: 0,
             failures: 0,
+            parks: 0,
         };
         materialization_success_status(&job, event, None)
     }
@@ -3182,6 +3219,7 @@ mod tests {
                 due_at_ms: 1,
                 attempts: MATERIALIZATION_MAX_FAILURES,
                 failures: MATERIALIZATION_MAX_FAILURES,
+                parks: 0,
             },
             last_error: "boom".to_string(),
             parked_at_ms: 1,
@@ -3239,6 +3277,7 @@ mod tests {
             due_at_ms: 1,
             attempts: MATERIALIZATION_MAX_FAILURES - 1,
             failures: MATERIALIZATION_MAX_FAILURES - 1,
+            parks: 0,
         };
         let job_key = metadata_materialization_job_key(&job);
         write_entries(
@@ -3396,6 +3435,7 @@ mod tests {
             due_at_ms: 1,
             attempts: 0,
             failures: 0,
+            parks: 0,
         };
         let newer_pending = MetadataMaterializationStatusRecord {
             document_id,
@@ -3514,6 +3554,7 @@ mod tests {
                 due_at_ms: 1,
                 attempts: 0,
                 failures: 0,
+                parks: 0,
             };
             write_entries(
                 storage,
@@ -3613,6 +3654,7 @@ mod tests {
             due_at_ms: 1,
             attempts: 0,
             failures: 0,
+            parks: 0,
         };
         let (_, old_job_key, _) = metadata_materialization_job_write_entry(&old_job).unwrap();
         write_entries(
@@ -3645,6 +3687,7 @@ mod tests {
             due_at_ms: 1,
             attempts: 0,
             failures: 0,
+            parks: 0,
         };
         write_entries(
             &storage,
@@ -3698,6 +3741,7 @@ mod tests {
             due_at_ms: 1,
             attempts: 0,
             failures: 0,
+            parks: 0,
         };
         let newer_status = MetadataMaterializationStatusRecord {
             document_id,
@@ -3818,6 +3862,7 @@ mod tests {
                 due_at_ms: 1,
                 attempts: 0,
                 failures: 0,
+                parks: 0,
             };
             CompletedMaterializationJob {
                 job_key: metadata_materialization_job_write_entry(&job)
@@ -3981,6 +4026,7 @@ mod tests {
             due_at_ms: 30_000,
             attempts: 1,
             failures: 0,
+            parks: 0,
         };
         let newer_pending = MetadataMaterializationStatusRecord {
             document_id,
@@ -4042,6 +4088,7 @@ mod tests {
                     due_at_ms: 1,
                     attempts: 0,
                     failures: 0,
+                    parks: 0,
                 };
                 let index_key = metadata_materialization_job_key(&job);
                 (job, event, index_key)
@@ -4122,6 +4169,7 @@ mod tests {
             due_at_ms: 1,
             attempts: 0,
             failures: 0,
+            parks: 0,
         };
         let old_index_key = metadata_materialization_job_key(&job);
         write_entries(
