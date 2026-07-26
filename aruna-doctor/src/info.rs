@@ -238,6 +238,7 @@ mod tests {
     use aruna::config::load;
     use aruna_api::server::{Server, ServerConfig};
     use aruna_api::server_state::ServerState;
+    use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{NodeCapabilities, RealmId};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::announce_realm_presence::{
@@ -248,7 +249,6 @@ mod tests {
     use aruna_operations::incoming::initialize_net_incoming;
     use aruna_operations::task_incoming::initialize_task_incoming;
     use aruna_tasks::TaskHandle;
-    use ed25519_dalek::SigningKey;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::net::TcpListener;
@@ -347,8 +347,7 @@ mod tests {
         )
         .await;
 
-        let realm_signing_key =
-            SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let realm_signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let capabilities = NodeCapabilities::management_node(realm_signing_key).unwrap();
         let bootstrap_user = aruna_core::UserId::local(Ulid::generate(), realm_id);

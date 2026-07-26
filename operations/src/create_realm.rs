@@ -494,6 +494,7 @@ fn seed_placement_defaults(config: &mut RealmConfigDocument) {
 
 #[cfg(test)]
 mod test {
+    use aruna_core::keys::generate_signing_key;
     use std::time::Duration;
 
     use aruna_core::UserId;
@@ -960,8 +961,7 @@ mod test {
             compute_handle: None,
         };
 
-        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-        let realm_signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let realm_signing_key: SigningKey = generate_signing_key();
         let pubkey = realm_signing_key.verifying_key().to_bytes();
         let realm_id = RealmId::from_bytes(pubkey);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();

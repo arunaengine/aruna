@@ -1911,6 +1911,7 @@ pub(crate) fn map_search_hit(hit: MetadataSearchHit) -> MetadataSearchHitRespons
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::keys::generate_signing_key;
 
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
@@ -5054,8 +5055,7 @@ mod tests {
     }
 
     fn test_realm_signing_key() -> SigningKey {
-        let mut rng = jsonwebtoken::signature::rand_core::OsRng;
-        SigningKey::generate(&mut rng)
+        generate_signing_key()
     }
 
     fn test_realm_id(seed: u8) -> RealmId {

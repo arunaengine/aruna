@@ -538,6 +538,7 @@ mod test {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
+    use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::structs::OidcProviderConfig;
     use aruna_core::structs::{
@@ -559,9 +560,9 @@ mod test {
     use base64::Engine;
     use byteview::ByteView;
     use chrono::Days;
+    use ed25519_dalek::Signer;
     use ed25519_dalek::SigningKey;
     use ed25519_dalek::pkcs8::EncodePrivateKey;
-    use jsonwebtoken::signature::SignerMut;
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
@@ -815,8 +816,7 @@ mod test {
             compute_handle: None,
             blob_handle: None,
         });
-        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-        let realm_signing_key = SigningKey::generate(&mut csprng);
+        let realm_signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_id = iroh::SecretKey::generate().public();
         let user_id = UserId::local(Ulid::generate(), realm_id);
@@ -881,7 +881,7 @@ mod test {
         assert!(auth.is_none());
         assert!(carrier.is_none());
 
-        let oidc_signing_key = SigningKey::generate(&mut csprng);
+        let oidc_signing_key = generate_signing_key();
         let oidc_token = sign_oidc_token(
             "https://issuer.example",
             "aruna-api",
@@ -907,7 +907,7 @@ mod test {
         let issuer = "https://issuer.example";
         let audience = "aruna-api";
         let kid = "main-key";
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let jwks = eddsa_jwk(kid, &signing_key);
         let (discovery_url, _jwks_uri, _metrics, task) =
             spawn_oidc_provider(issuer, kid, jwks).await;
@@ -941,7 +941,7 @@ mod test {
         let issuer = "https://issuer.example";
         let audience = "aruna-api";
         let kid = "symm-key";
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let jwks = eddsa_jwk(kid, &signing_key);
         let (discovery_url, _jwks_uri, _metrics, task) =
             spawn_oidc_provider(issuer, kid, jwks).await;
@@ -977,7 +977,7 @@ mod test {
     async fn oidc_validator_rejects_wrong_audience() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let jwks = eddsa_jwk(kid, &signing_key);
         let (discovery_url, _jwks_uri, _metrics, task) =
             spawn_oidc_provider(issuer, kid, jwks).await;
@@ -1008,7 +1008,7 @@ mod test {
         let issuer = "https://issuer.example";
         let audience = "aruna-api";
         let kid = "main-key";
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let jwks = eddsa_jwk(kid, &signing_key);
         let (discovery_url, _jwks_uri, metrics, task) =
             spawn_oidc_provider(issuer, kid, jwks).await;
@@ -1043,7 +1043,7 @@ mod test {
         let issuer = "https://issuer.example";
         let audience = "aruna-api";
         let kid = "main-key";
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let jwks = eddsa_jwk(kid, &signing_key);
         let (discovery_url, _jwks_uri, metrics, task) =
             spawn_oidc_provider(issuer, kid, jwks).await;
@@ -1090,7 +1090,7 @@ mod test {
         let issuer = "https://issuer.example";
         let audience = "aruna-api";
         let kid = "main-key";
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let jwks = eddsa_jwk(kid, &signing_key);
         let (discovery_url, _jwks_uri, _metrics, task) =
             spawn_oidc_provider(issuer, kid, jwks).await;
@@ -1142,8 +1142,8 @@ mod test {
         let audience = "aruna-api";
         let old_kid = "old-key";
         let new_kid = "new-key";
-        let old_signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
-        let new_signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let old_signing_key = generate_signing_key();
+        let new_signing_key = generate_signing_key();
         let (discovery_url, _jwks_uri, metrics, task) =
             spawn_oidc_provider(issuer, old_kid, eddsa_jwk(old_kid, &old_signing_key)).await;
         let provider = OidcProviderConfig {
@@ -1191,7 +1191,7 @@ mod test {
         let issuer = "https://issuer.example";
         let audience = "aruna-api";
         let kid = "main-key";
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let jwks = eddsa_jwk(kid, &signing_key);
         let (discovery_url, _jwks_uri, _metrics, task) =
             spawn_oidc_provider("https://different-issuer.example", kid, jwks).await;
@@ -1235,12 +1235,11 @@ mod test {
             blob_handle: None,
         });
 
-        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-        let mut realm_signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let realm_signing_key: SigningKey = generate_signing_key();
         let pubkey = realm_signing_key.verifying_key().to_bytes();
         let realm_id = RealmId::from_bytes(pubkey);
 
-        let node_signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let node_signing_key: SigningKey = generate_signing_key();
         let node_id =
             iroh::PublicKey::from_bytes(node_signing_key.verifying_key().as_bytes()).unwrap();
 
@@ -1321,7 +1320,7 @@ mod test {
         //
         // Test Server Nodes
         //
-        let issuer_key = SigningKey::generate(&mut csprng);
+        let issuer_key = generate_signing_key();
 
         let message = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(issuer_key.verifying_key().to_bytes());
@@ -1422,11 +1421,10 @@ mod test {
             blob_handle: None,
         });
 
-        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-        let realm_signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let realm_signing_key: SigningKey = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
 
-        let node_signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let node_signing_key: SigningKey = generate_signing_key();
         let node_id =
             iroh::PublicKey::from_bytes(node_signing_key.verifying_key().as_bytes()).unwrap();
 
@@ -1526,12 +1524,11 @@ mod test {
             blob_handle: None,
         });
 
-        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-        let mut realm_signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let realm_signing_key: SigningKey = generate_signing_key();
         let pubkey = realm_signing_key.verifying_key().to_bytes();
         let realm_id = RealmId::from_bytes(pubkey);
 
-        let node_signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let node_signing_key: SigningKey = generate_signing_key();
         let node_id =
             iroh::PublicKey::from_bytes(node_signing_key.verifying_key().as_bytes()).unwrap();
 
@@ -1649,7 +1646,7 @@ mod test {
         //
         // Expired server token
         //
-        let issuer_key = SigningKey::generate(&mut csprng);
+        let issuer_key = generate_signing_key();
 
         let message = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(issuer_key.verifying_key().to_bytes());
@@ -1803,8 +1800,7 @@ mod test {
             blob_handle: None,
         });
 
-        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-        let realm_signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let realm_signing_key: SigningKey = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_id = iroh::SecretKey::generate().public();
 
@@ -1840,7 +1836,7 @@ mod test {
 
         let now = chrono::Utc::now().timestamp().max(0) as u64;
         for _ in 0..2048 {
-            let issuer_key = SigningKey::generate(&mut csprng);
+            let issuer_key = generate_signing_key();
             let token = sign_untrusted_direct_token(&issuer_key, now);
             assert!(handle_token(&state, &token).await.is_err());
         }
@@ -1862,8 +1858,7 @@ mod test {
             blob_handle: None,
         });
 
-        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-        let mut realm_signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let realm_signing_key: SigningKey = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_id = iroh::SecretKey::generate().public();
 
@@ -1885,7 +1880,7 @@ mod test {
         .await
         .unwrap();
 
-        let issuer_key = SigningKey::generate(&mut csprng);
+        let issuer_key = generate_signing_key();
         let message = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(issuer_key.verifying_key().to_bytes());
         let delegation_signature = realm_signing_key.sign(message.as_bytes()).to_string();

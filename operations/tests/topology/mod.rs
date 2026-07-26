@@ -17,6 +17,7 @@
 
 #![allow(dead_code)]
 
+use aruna_core::keys::generate_signing_key;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -113,7 +114,7 @@ impl Topology {
              management={management} replication_factor={replication_factor}"
         );
 
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
         let user_id = UserId::local(Ulid::generate(), realm_id);
 

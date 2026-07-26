@@ -601,6 +601,7 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{Actor, RealmAuthorizationDocument, RealmId, Role};
@@ -630,8 +631,7 @@ mod tests {
         .unwrap();
         let task_handle = TaskHandle::new();
 
-        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-        let realm_signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let realm_signing_key: SigningKey = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
 

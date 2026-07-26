@@ -1,5 +1,19 @@
+use ed25519_dalek::SigningKey;
+
 use crate::id::{DhtKeyId, NodeId};
 use crate::structs::RealmId;
+
+/// Fresh Ed25519 signing key from operating-system randomness.
+///
+/// `SigningKey::generate` needs an infallible `rand_core` generator, and no
+/// `OsRng` implements that trait, so the entropy is drawn directly. A failing
+/// system generator is not recoverable.
+#[must_use]
+pub fn generate_signing_key() -> SigningKey {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("operating system random number generator failed");
+    SigningKey::from_bytes(&bytes)
+}
 
 /// Derive a DHT key from arbitrary bytes using BLAKE3.
 #[must_use]

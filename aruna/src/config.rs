@@ -3,6 +3,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::keys::generate_signing_key;
 use aruna_core::keyspaces::{NODE_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, OnboardingMode, OnboardingPhase,
@@ -841,9 +842,8 @@ fn node_capabilities_from_state(
 }
 
 fn generate_initialized_node_state() -> Result<PersistedNodeState, SetupError> {
-    let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-    let realm_signing_key = SigningKey::generate(&mut csprng);
-    let node_signing_key = SigningKey::generate(&mut csprng);
+    let realm_signing_key = generate_signing_key();
+    let node_signing_key = generate_signing_key();
 
     Ok(PersistedNodeState {
         boot_origin: BootOrigin::InitializedRealm,
@@ -872,13 +872,12 @@ async fn bootstrap_onboarded_node_state(
     node_labels: BTreeMap<String, String>,
 ) -> Result<BootstrappedNodeState, SetupError> {
     let decoded_secret = OnboardingSecret::decode(onboarding_secret)?;
-    let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-    let node_signing_key = SigningKey::generate(&mut csprng);
+    let node_signing_key = generate_signing_key();
     let net_secret_key = node_signing_key.to_bytes();
     let node_id = iroh::SecretKey::from_bytes(&net_secret_key).public();
 
     let issuer_signing_key = if matches!(decoded_secret.mode, OnboardingMode::Server) {
-        Some(SigningKey::generate(&mut csprng))
+        Some(generate_signing_key())
     } else {
         None
     };
@@ -1400,13 +1399,13 @@ mod tests {
         fjall_persist_policy_env, load, load_oidc_providers_from_env, parse_node_labels_env,
         persist_node_state, portal_config_env, rocrate_limits_env, validate_public_url,
     };
+    use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{
         DynamicDiscoveryMethod, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
         RoCrateLimits, StaticRealmEndpoint,
     };
     use aruna_net::{DiscoveryMethod, RelayMethod, endpoint_addr_to_config_string};
     use aruna_storage::{FjallPersistPolicy, FjallStorage};
-    use ed25519_dalek::SigningKey;
     use std::sync::OnceLock;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
@@ -2068,9 +2067,8 @@ mod tests {
         let tempdir = tempdir().unwrap();
         let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
 
-        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-        let realm_signing_key = SigningKey::generate(&mut csprng);
-        let net_signing_key = SigningKey::generate(&mut csprng);
+        let realm_signing_key = generate_signing_key();
+        let net_signing_key = generate_signing_key();
         let node_state = PersistedNodeState {
             boot_origin: BootOrigin::Onboarded,
             status: PersistedNodeStatus::Complete,
@@ -2134,9 +2132,8 @@ mod tests {
         let tempdir = tempdir().unwrap();
         let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
 
-        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-        let realm_signing_key = SigningKey::generate(&mut csprng);
-        let net_signing_key = SigningKey::generate(&mut csprng);
+        let realm_signing_key = generate_signing_key();
+        let net_signing_key = generate_signing_key();
         let node_state = PersistedNodeState {
             boot_origin: BootOrigin::Onboarded,
             status: PersistedNodeStatus::PendingOnboarding,

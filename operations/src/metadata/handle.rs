@@ -36,8 +36,8 @@ use craqle::{
     Action as CraqleAction, ActorId, AllowAllAuthorizer, AuthorizationError as CraqleAuthError,
     Authorizer as CraqleAuthorizer, Batch, CraqleError, CraqleFjallPersistMode,
     CraqleIrokleOptions, CraqleNode, CraqleOptions, CraqleRequestDurability, CreateCrateRequest,
-    CreateEntityRequest, GraphId, GraphPolicy, PatchEntityRequest, RoCrateError, SearchStorage,
-    vocab,
+    CreateEntityRequest, DescribeRequest, GraphId, GraphPolicy, GraphSearchRequest,
+    PatchEntityRequest, RoCrateError, SearchStorage, vocab,
 };
 use jsonwebtoken::DecodingKey;
 use oxrdf::{BlankNode, Dataset, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
@@ -812,7 +812,13 @@ impl MetadataHandle {
             };
             inner
                 .node
-                .describe_subject(&authorizer, &GraphId::new(&graph_iri), &graph_iri)
+                .describe_subject(
+                    &authorizer,
+                    DescribeRequest {
+                        graph: &GraphId::new(&graph_iri),
+                        subject_id: &graph_iri,
+                    },
+                )
                 .map(decode_hit_properties)
                 .unwrap_or_default()
         })
@@ -4838,8 +4844,10 @@ async fn search_local_graphs(
                         .node
                         .describe_subject(
                             &authorizer,
-                            &GraphId::new(&record.graph_iri),
-                            &subject_iri,
+                            DescribeRequest {
+                                graph: &GraphId::new(&record.graph_iri),
+                                subject_id: &subject_iri,
+                            },
                         )
                         .map(decode_hit_properties)
                         .unwrap_or_default();
@@ -4904,7 +4912,14 @@ async fn search_local_graphs(
             };
             let hits = inner
                 .node
-                .search_graphs(&authorizer, &graph_ids, &query, limit)
+                .search_graphs(
+                    &authorizer,
+                    GraphSearchRequest {
+                        graphs: &graph_ids,
+                        query: &query,
+                        limit,
+                    },
+                )
                 .map_err(|error| MetadataError::Backend(error.to_string()))?;
             let mut visible = Vec::with_capacity(hits.len().min(limit));
             for hit in hits {
@@ -4915,7 +4930,13 @@ async fn search_local_graphs(
                 // never fail the search, so fall back to an empty property set.
                 let properties = inner
                     .node
-                    .describe_subject(&authorizer, &GraphId::new(&hit.graph_id), &hit.subject_iri)
+                    .describe_subject(
+                        &authorizer,
+                        DescribeRequest {
+                            graph: &GraphId::new(&hit.graph_id),
+                            subject_id: &hit.subject_iri,
+                        },
+                    )
                     .map(decode_hit_properties)
                     .unwrap_or_default();
                 visible.push(metadata_search_hit_from_craqle(
@@ -5415,6 +5436,7 @@ mod tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
+    use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::{API_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::{
         ArunaArn, PathRestriction, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
@@ -5984,8 +6006,7 @@ mod tests {
     }
 
     fn signing_key() -> SigningKey {
-        let mut rng = jsonwebtoken::signature::rand_core::OsRng;
-        SigningKey::generate(&mut rng)
+        generate_signing_key()
     }
 
     fn node_id_from_seed(seed: u8) -> NodeId {

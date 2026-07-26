@@ -239,6 +239,7 @@ impl IssuerKeyCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::keys::generate_signing_key;
     use base64::Engine;
     use ed25519_dalek::SigningKey;
 
@@ -249,9 +250,8 @@ mod tests {
     #[tokio::test]
     async fn issuer_key_cache_evicts_beyond_capacity() {
         let cache = IssuerKeyCache::with_capacity_and_ttl(2, ISSUER_KEY_CACHE_TTL);
-        let mut rng = jsonwebtoken::signature::rand_core::OsRng;
         for _ in 0..5 {
-            let key = SigningKey::generate(&mut rng);
+            let key = generate_signing_key();
             cache.get_or_insert(&pubkey_b64(&key)).await.unwrap();
         }
         assert_eq!(cache.len().await, 2);
@@ -277,7 +277,7 @@ mod tests {
     async fn issuer_key_cache_refreshes_expired_entries() {
         let ttl = Duration::from_secs(3600);
         let cache = IssuerKeyCache::with_capacity_and_ttl(4, ttl);
-        let key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let key = generate_signing_key();
         let pubkey = pubkey_b64(&key);
         cache.get_or_insert(&pubkey).await.unwrap();
 

@@ -421,6 +421,7 @@ impl Operation for CheckPermissionsOperation {
 
 #[cfg(test)]
 mod test {
+    use aruna_core::keys::generate_signing_key;
     use std::collections::{HashMap, HashSet};
 
     use aruna_core::UserId;
@@ -447,8 +448,7 @@ mod test {
 
     #[tokio::test]
     pub async fn test_path_parsing() {
-        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-        let realm_signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let realm_signing_key: SigningKey = generate_signing_key();
         let pubkey = realm_signing_key.verifying_key().to_bytes();
         let realm_id = RealmId::from_bytes(pubkey);
         let group_id = Ulid::generate();

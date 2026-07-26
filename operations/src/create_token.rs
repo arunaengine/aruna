@@ -171,6 +171,7 @@ mod test {
     use crate::create_token::{CreateTokenConfig, CreateTokenOperation};
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
+    use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{NodeCapabilities, RealmId};
     use aruna_storage::storage;
     use ed25519_dalek::SigningKey;
@@ -192,8 +193,7 @@ mod test {
             compute_handle: None,
         };
 
-        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-        let signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let signing_key: SigningKey = generate_signing_key();
         let pubkey = signing_key.verifying_key().to_bytes();
         let realm_id = RealmId::from_bytes(pubkey);
         let capabilities = NodeCapabilities::management_node(signing_key).unwrap();

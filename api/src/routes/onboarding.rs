@@ -595,6 +595,7 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
+    use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::onboarding::{
         BootstrapOnboardingRequest, CreateOnboardingSecretRequest, OnboardingMode,
@@ -663,8 +664,7 @@ mod tests {
             compute_handle: None,
         });
 
-        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-        let realm_signing_key = SigningKey::generate(&mut csprng);
+        let realm_signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let user_id = UserId::local(Ulid::generate(), realm_id);
         let node_id = net_handle.node_id();
@@ -750,7 +750,7 @@ mod tests {
         .await
         .unwrap();
 
-        let issuer_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let issuer_key = generate_signing_key();
         let issuer_public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(issuer_key.verifying_key().to_bytes());
         let onboarding_secret = created.onboarding_secret;
@@ -997,7 +997,7 @@ mod tests {
             ))
             .to_string();
 
-        let issuer_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let issuer_key = generate_signing_key();
         let issuer_public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(issuer_key.verifying_key().to_bytes());
         let onboarding_secret = created.onboarding_secret;

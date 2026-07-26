@@ -155,7 +155,13 @@ async fn raw_projection_diverges() -> Result<(), Box<dyn std::error::Error>> {
         node_b.graph_fingerprint(&graph)?
     );
     let mut projected_names = node_a
-        .describe_subject(&GrantAuthorizer::default(), &graph, "#lab")?
+        .describe_subject(
+            &GrantAuthorizer::default(),
+            craqle::DescribeRequest {
+                graph: &graph,
+                subject_id: "#lab",
+            },
+        )?
         .iter()
         .filter_map(|(predicate, object)| {
             (predicate == &craqle::EncodedTerm::from_named_node(&craqle::vocab::schema_name()))

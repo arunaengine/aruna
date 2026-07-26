@@ -1388,6 +1388,7 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
+    use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
         GROUP_KEYSPACE, S3_BUCKET_KEYSPACE, USER_KEYSPACE,
@@ -1404,7 +1405,6 @@ mod tests {
     use axum::http::StatusCode;
     use axum::{Extension, Json};
     use byteview::ByteView;
-    use ed25519_dalek::SigningKey;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1502,8 +1502,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         });
-        let realm_signing_key =
-            SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let realm_signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let state = Arc::new(
             ServerState::new(

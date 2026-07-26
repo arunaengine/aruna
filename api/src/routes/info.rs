@@ -1579,6 +1579,7 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::errors::StorageError;
+    use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, QuotaConfig, RealmId};
     use aruna_operations::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
@@ -1593,7 +1594,6 @@ mod tests {
     use axum::extract::{FromRequest, State};
     use axum::http::StatusCode;
     use axum::{Extension, Json};
-    use ed25519_dalek::SigningKey;
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
     use tower::ServiceExt;
@@ -1611,8 +1611,7 @@ mod tests {
             compute_handle: None,
         });
 
-        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-        let realm_signing_key = SigningKey::generate(&mut csprng);
+        let realm_signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_id = iroh::SecretKey::generate().public();
 
@@ -2022,8 +2021,7 @@ mod tests {
             compute_handle: None,
         });
 
-        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-        let realm_signing_key = SigningKey::generate(&mut csprng);
+        let realm_signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let user_id = UserId::local(Ulid::generate(), realm_id);
         let node_id = iroh::SecretKey::generate().public();
