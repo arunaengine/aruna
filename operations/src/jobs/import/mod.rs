@@ -200,7 +200,9 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
             Ok(plan) => plan,
             Err(error) => return retryable_error(error),
         },
-        _ => None,
+        ImportPhase::Acquire | ImportPhase::Inspect | ImportPhase::Validate | ImportPhase::Done => {
+            None
+        }
     };
 
     loop {
