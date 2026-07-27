@@ -2437,7 +2437,7 @@ mod tests {
         header.set_entry_type(tar::EntryType::Regular);
         header.set_mode(0o644);
         header.set_size(1);
-        header.as_mut_bytes()[..12].copy_from_slice(b"out/\xff\xfe.txt");
+        header.as_mut_bytes()[..10].copy_from_slice(b"out/\xff\xfe.txt");
         header.set_cksum();
         let mut builder = tar::Builder::new(Vec::new());
         builder.append(&header, &b"x"[..]).unwrap();
