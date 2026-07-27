@@ -748,11 +748,14 @@ impl KubernetesBackend {
                 BackendError::Api("list exec did not expose standard output".to_string())
             })?;
             let mut listing = Vec::new();
-            stdout
-                .take(MAX_LISTING_BYTES)
-                .read_to_end(&mut listing)
-                .await
-                .map_err(io_error)?;
+            // A helper wedged mid-listing must not stall the capture forever.
+            tokio::time::timeout(
+                EXEC_JOIN_TIMEOUT,
+                stdout.take(MAX_LISTING_BYTES).read_to_end(&mut listing),
+            )
+            .await
+            .map_err(|_| BackendError::Timeout("output listing read timed out".to_string()))?
+            .map_err(io_error)?;
             join_exec(attached).await?;
             select_listed(&listing, glob)
         }
