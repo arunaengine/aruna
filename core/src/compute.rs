@@ -450,9 +450,33 @@ fn collapse_stars(pattern: &str) -> String {
     collapsed
 }
 
+/// POSIX 12.13 has no brace alternation, so `{` and `}` stay literal file name
+/// characters instead of expanding into alternates the caller never declared.
+fn escape_braces(pattern: &str) -> String {
+    let mut escaped = String::with_capacity(pattern.len());
+    let (mut skip, mut class) = (false, false);
+    for character in pattern.chars() {
+        match character {
+            _ if skip => skip = false,
+            '\\' => skip = true,
+            '[' if !class => class = true,
+            ']' if class => class = false,
+            '{' | '}' if !class => {
+                escaped.push('[');
+                escaped.push(character);
+                escaped.push(']');
+                continue;
+            }
+            _ => {}
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
 fn build_glob(pattern: &str) -> Result<Glob, String> {
     // `literal_separator` keeps `*` and `?` inside one path component, as POSIX requires.
-    GlobBuilder::new(&collapse_stars(pattern))
+    GlobBuilder::new(&escape_braces(&collapse_stars(pattern)))
         .literal_separator(true)
         .build()
         .map_err(|error| error.to_string())
@@ -698,6 +722,26 @@ mod tests {
         // A repeated `*` stays one POSIX wildcard instead of recursing.
         assert_eq!(matched("/out/**/*.txt"), vec!["/out/sub/c.txt"]);
         assert!(output_glob("/out/[a.txt").is_err());
+    }
+
+    #[test]
+    fn braces_stay_literal() {
+        // Brace alternation is undeclared, so `{a,b}` names one directory.
+        let glob = output_glob("/out/{a,b}/x.txt").unwrap();
+        assert!(glob.is_match("/out/{a,b}/x.txt"));
+        assert!(!glob.is_match("/out/a/x.txt"));
+        assert!(!glob.is_match("/out/b/x.txt"));
+        assert!(!has_wildcard("/out/{a,b}/x.txt"));
+        assert_eq!(
+            literal_prefix("/out/{a,b}/x.txt").unwrap(),
+            Path::new("/out/{a,b}/x.txt")
+        );
+
+        let matcher = OutputMatcher::new(["/out/{a,b}.csv", "/out/[ab]{x}.txt"]).unwrap();
+        assert!(matcher.is_match("/out/{a,b}.csv"));
+        assert!(!matcher.is_match("/out/a.csv"));
+        assert!(matcher.is_match("/out/a{x}.txt"));
+        assert!(!matcher.is_match("/out/ax.txt"));
     }
 
     #[test]
