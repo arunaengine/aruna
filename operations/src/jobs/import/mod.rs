@@ -29,7 +29,7 @@ use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::errors::{BlobError, SourceConnectorResolutionError, StagingSourceError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{JOB_ENTRY_KEYSPACE, ROCRATE_JOB_STATE_KEYSPACE};
-use aruna_core::metadata::MetadataValidationViolation;
+use aruna_core::metadata::{MetadataError, MetadataValidationViolation};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::{
@@ -47,6 +47,7 @@ use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, BufReader, SeekFrom};
 use tokio::sync::mpsc;
+use tracing::info;
 use ulid::Ulid;
 
 use self::archive::{
@@ -70,6 +71,8 @@ use crate::metadata::forward::{MetadataWriteError, create_metadata_document_rout
 use crate::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
 };
+use crate::s3::delete_object::DeleteObjectError;
+use crate::s3::delete_objects::{DeleteObjectsEntry, DeleteObjectsInput, delete_objects};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
@@ -107,6 +110,9 @@ struct ImportEntryPlan {
     target_key: String,
     described_id: Option<String>,
     code: ReasonCode,
+    /// Minted while planning so the rewritten identifiers can be validated
+    /// before the first write, and so a rollback knows what to delete.
+    version_id: Ulid,
     data_offset: u64,
     compressed_size: u64,
     uncompressed_size: u64,
@@ -134,6 +140,7 @@ struct ImportCheckpoint {
     failed: u64,
     rewritten_json: Option<String>,
     created: bool,
+    rolled_back: u64,
     failure: Option<String>,
     cancelled: bool,
 }
@@ -153,6 +160,7 @@ impl Default for ImportCheckpoint {
             failed: 0,
             rewritten_json: None,
             created: false,
+            rolled_back: 0,
             failure: None,
             cancelled: false,
         }
@@ -209,43 +217,44 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
             }
         }
 
-        let result =
-            match checkpoint.phase {
-                ImportPhase::Acquire => acquire_source(ctx, spec).await.map(|input| {
-                    checkpoint.refs.hidden_locations = vec![input.location.clone()];
-                    checkpoint.input = Some(input);
-                    checkpoint.phase = ImportPhase::Inspect;
-                }),
-                ImportPhase::Inspect => inspect_source(ctx, spec, &checkpoint).await.map(
-                    |(inspection, metadata_json)| {
+        let result = match checkpoint.phase {
+            ImportPhase::Acquire => acquire_source(ctx, spec).await.map(|input| {
+                checkpoint.refs.hidden_locations = vec![input.location.clone()];
+                checkpoint.input = Some(input);
+                checkpoint.phase = ImportPhase::Inspect;
+            }),
+            ImportPhase::Inspect => {
+                inspect_source(ctx, spec, &checkpoint)
+                    .await
+                    .map(|(inspection, metadata_json)| {
                         checkpoint.inspection = Some(inspection);
                         checkpoint.metadata_json = Some(metadata_json);
                         checkpoint.phase = ImportPhase::Validate;
-                    },
-                ),
-                ImportPhase::Validate => match validate_source(ctx, spec, &mut checkpoint).await {
-                    Ok(validated) => {
-                        plan = Some(validated);
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
-                },
-                ImportPhase::Write => match plan.as_ref() {
-                    Some(plan) => write_next(ctx, spec, &mut checkpoint, plan).await,
-                    None => Err(ImportFailure::Permanent(
-                        "import plan is missing".to_string(),
-                    )),
-                },
-                ImportPhase::Rewrite => match plan.as_ref() {
-                    Some(plan) => rewrite_crate(ctx, spec, &mut checkpoint, plan).await,
-                    None => Err(ImportFailure::Permanent(
-                        "import plan is missing".to_string(),
-                    )),
-                },
-                ImportPhase::Create => create_document(ctx, spec, &mut checkpoint).await,
-                ImportPhase::Cleanup => cleanup_source(ctx, &mut checkpoint).await,
-                ImportPhase::Done => return import_outcome(&checkpoint, spec),
-            };
+                    })
+            }
+            ImportPhase::Validate => match validate_source(ctx, spec, &mut checkpoint).await {
+                Ok(validated) => {
+                    plan = Some(validated);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            },
+            ImportPhase::Write => match plan.as_ref() {
+                Some(plan) => write_next(ctx, spec, &mut checkpoint, plan).await,
+                None => Err(ImportFailure::Permanent(
+                    "import plan is missing".to_string(),
+                )),
+            },
+            ImportPhase::Rewrite => match plan.as_ref() {
+                Some(plan) => rewrite_crate(ctx, spec, &mut checkpoint, plan).await,
+                None => Err(ImportFailure::Permanent(
+                    "import plan is missing".to_string(),
+                )),
+            },
+            ImportPhase::Create => create_document(ctx, spec, &mut checkpoint).await,
+            ImportPhase::Cleanup => cleanup_source(ctx, spec, plan.as_ref(), &mut checkpoint).await,
+            ImportPhase::Done => return import_outcome(&checkpoint, spec),
+        };
 
         match result {
             Ok(()) => {
@@ -300,7 +309,10 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
     }
 }
 
-pub(crate) async fn cleanup_after_panic(ctx: &JobContext) -> JobRunOutcome {
+pub(crate) async fn cleanup_after_panic(
+    ctx: &JobContext,
+    spec: &ImportRoCrateSpec,
+) -> JobRunOutcome {
     const PANIC_MESSAGE: &str = "job payload panicked";
 
     let mut checkpoint = match read_checkpoint(ctx).await {
@@ -314,31 +326,34 @@ pub(crate) async fn cleanup_after_panic(ctx: &JobContext) -> JobRunOutcome {
         cleanup_errors.push(error);
     }
     checkpoint.failure = Some(PANIC_MESSAGE.to_string());
-    if phase == ImportPhase::Write {
-        match read_plan(ctx).await {
-            Ok(plan) => {
-                if let Err(error) = mark_write_failure(ctx, plan.as_ref(), &mut checkpoint).await {
-                    cleanup_errors.push(error);
-                }
-            }
-            Err(error) => cleanup_errors.push(error),
+    let plan = match read_plan(ctx).await {
+        Ok(plan) => plan,
+        Err(error) => {
+            cleanup_errors.push(error);
+            None
         }
+    };
+    if phase == ImportPhase::Write
+        && let Err(error) = mark_write_failure(ctx, plan.as_ref(), &mut checkpoint).await
+    {
+        cleanup_errors.push(error);
     }
     checkpoint.phase = ImportPhase::Cleanup;
     if let Err(error) = persist_checkpoint(ctx, &checkpoint).await {
         cleanup_errors.push(error);
     }
-    if let Err(error) = cleanup_source(ctx, &mut checkpoint).await {
+    if let Err(error) = cleanup_source(ctx, spec, plan.as_ref(), &mut checkpoint).await {
         cleanup_errors.push(failure_message(error));
     }
     if let Err(error) = persist_checkpoint(ctx, &checkpoint).await {
         cleanup_errors.push(error);
     }
     let message = if cleanup_errors.is_empty() {
-        PANIC_MESSAGE.to_string()
+        format!("{PANIC_MESSAGE}; {}", write_state(&checkpoint))
     } else {
         format!(
-            "{PANIC_MESSAGE}; cleanup errors: {}",
+            "{PANIC_MESSAGE}; {}; cleanup errors: {}",
+            write_state(&checkpoint),
             cleanup_errors.join("; ")
         )
     };
@@ -680,6 +695,7 @@ async fn validate_source(
                 ReasonCode::Unlisted
             },
             described_id,
+            version_id: Ulid::generate(),
             data_offset: entry.data_offset,
             compressed_size: entry.compressed_size,
             uncompressed_size: entry.uncompressed_size,
@@ -688,6 +704,7 @@ async fn validate_source(
         });
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
+    preflight_crate(spec, ctx.owner_node_id, validated.value, &entries)?;
     if let Some(signature) = signature_entry(inspection) {
         let row = ImportReportRow {
             entry_key: format!("signature/{}", signature.path),
@@ -719,6 +736,51 @@ async fn validate_source(
     checkpoint.phase = ImportPhase::Write;
     ctx.progress.set_total(checkpoint.entries_total);
     Ok(plan)
+}
+
+/// Rejects a crate that would fail validation before anything is written.
+///
+/// Every rewritten identifier is already known here. The placeholder content
+/// hash is a literal value rather than a reference, so it cannot change the
+/// graph the validator walks.
+fn preflight_crate(
+    spec: &ImportRoCrateSpec,
+    node_id: aruna_core::NodeId,
+    value: serde_json::Value,
+    entries: &[ImportEntryPlan],
+) -> Result<(), ImportFailure> {
+    let mut targets = HashMap::new();
+    for entry in entries {
+        let Some(file_id) = entry.described_id.clone() else {
+            continue;
+        };
+        targets.insert(
+            file_id,
+            RewriteTarget {
+                w3id: entry_arn(spec, node_id, entry)?.to_w3id(),
+                hash_w3id: format!("{ARUNA_DATA_PREFIX}{}", hex::encode([0u8; 32])),
+                local_path: entry.path.clone(),
+            },
+        );
+    }
+    rewrite_document(value, &targets)
+        .map(|_| ())
+        .map_err(validation_failure)
+}
+
+fn entry_arn(
+    spec: &ImportRoCrateSpec,
+    node_id: aruna_core::NodeId,
+    entry: &ImportEntryPlan,
+) -> Result<VersionedObjectArn, ImportFailure> {
+    VersionedObjectArn::new(
+        spec.auth_context.realm_id,
+        node_id,
+        spec.target.bucket.clone(),
+        entry.target_key.clone(),
+        entry.version_id,
+    )
+    .map_err(|error| ImportFailure::Permanent(error.to_string()))
 }
 
 async fn write_next(
@@ -755,13 +817,9 @@ async fn write_next(
         .await?
         .unwrap_or_else(|| entry_report(entry));
     if row.detail.version_id.is_none() {
-        row.detail.version_id = Some(Ulid::generate());
+        row.detail.version_id = Some(entry.version_id);
         write_report(ctx, &row).await?;
     }
-    let version_id = row
-        .detail
-        .version_id
-        .ok_or_else(|| ImportFailure::Permanent("import version fence is missing".to_string()))?;
     let body = payload_stream(
         ctx,
         &input.location,
@@ -798,7 +856,7 @@ async fn write_next(
             checksum_type: None,
             exists: false,
             version_source: None,
-            preassigned_version_id: Some(version_id),
+            preassigned_version_id: Some(entry.version_id),
             quota_ceiling: quota,
         })
         .with_bucket_guard(bucket_info)
@@ -819,14 +877,7 @@ async fn write_next(
         .get_blake3()
         .and_then(|hash| hash.try_into().ok())
         .ok_or_else(|| ImportFailure::Retryable("written object has no BLAKE3 hash".to_string()))?;
-    let arn = VersionedObjectArn::new(
-        spec.auth_context.realm_id,
-        ctx.owner_node_id,
-        spec.target.bucket.clone(),
-        entry.target_key.clone(),
-        result.version_id,
-    )
-    .map_err(|error| ImportFailure::Permanent(error.to_string()))?;
+    let arn = entry_arn(spec, ctx.owner_node_id, entry)?;
     row.detail.version_id = Some(result.version_id);
     row.detail.blake3 = Some(hex::encode(hash));
     row.detail.size = Some(result.location.blob_size);
@@ -870,10 +921,6 @@ async fn rewrite_crate(
         let report = reports
             .get(&entry.path)
             .ok_or_else(|| ImportFailure::Permanent("import report row is missing".to_string()))?;
-        let version_id = report
-            .detail
-            .version_id
-            .ok_or_else(|| ImportFailure::Permanent("imported version is missing".to_string()))?;
         let hash: [u8; 32] = report
             .detail
             .blake3
@@ -885,18 +932,10 @@ async fn rewrite_crate(
                     .and_then(|hash| hash.try_into().ok())
                     .ok_or_else(|| ImportFailure::Permanent("imported hash is invalid".to_string()))
             })?;
-        let arn = VersionedObjectArn::new(
-            spec.auth_context.realm_id,
-            ctx.owner_node_id,
-            spec.target.bucket.clone(),
-            entry.target_key.clone(),
-            version_id,
-        )
-        .map_err(|error| ImportFailure::Permanent(error.to_string()))?;
         targets.insert(
             file_id.clone(),
             RewriteTarget {
-                w3id: arn.to_w3id(),
+                w3id: entry_arn(spec, ctx.owner_node_id, entry)?.to_w3id(),
                 hash_w3id: format!("{ARUNA_DATA_PREFIX}{}", hex::encode(hash)),
                 local_path: entry.path.clone(),
             },
@@ -968,17 +1007,19 @@ async fn create_document(
             checkpoint.phase = ImportPhase::Cleanup;
             Ok(())
         }
-        Err(error) if metadata_is_transient(&error) => {
-            Err(ImportFailure::Retryable(error.to_string()))
-        }
-        Err(error) => Err(ImportFailure::Permanent(error.to_string())),
+        Err(error) => Err(classify_metadata(error)),
     }
 }
 
 async fn cleanup_source(
     ctx: &JobContext,
+    spec: &ImportRoCrateSpec,
+    plan: Option<&ImportPlan>,
     checkpoint: &mut ImportCheckpoint,
 ) -> Result<(), ImportFailure> {
+    if let Some(plan) = plan.filter(|_| rollback_required(checkpoint)) {
+        checkpoint.rolled_back = rollback_writes(ctx, spec, plan, checkpoint).await?;
+    }
     let Some(input) = checkpoint.input.as_ref() else {
         checkpoint.refs.hidden_locations.clear();
         checkpoint.phase = ImportPhase::Done;
@@ -995,6 +1036,88 @@ async fn cleanup_source(
     checkpoint.refs.hidden_locations.clear();
     checkpoint.phase = ImportPhase::Done;
     Ok(())
+}
+
+/// A failed import must leave nothing behind. A cancelled one keeps what it
+/// already committed, which its report rows state entry by entry.
+fn rollback_required(checkpoint: &ImportCheckpoint) -> bool {
+    !checkpoint.created && checkpoint.failure.is_some()
+}
+
+/// Deletes exactly the object versions this import wrote.
+///
+/// Every version id is minted by this job, so a version another writer owns can
+/// never be removed, even where the import landed on an existing key.
+async fn rollback_writes(
+    ctx: &JobContext,
+    spec: &ImportRoCrateSpec,
+    plan: &ImportPlan,
+    checkpoint: &ImportCheckpoint,
+) -> Result<u64, ImportFailure> {
+    // The entry at `next_entry` may have landed before the failure was seen.
+    let attempted = plan
+        .entries
+        .len()
+        .min(checkpoint.next_entry.saturating_add(1));
+    let written = checkpoint.next_entry.min(plan.entries.len());
+    if attempted == 0 {
+        return Ok(0);
+    }
+    let bucket = match load_bucket(ctx, &spec.target.bucket).await {
+        Ok(bucket) => bucket,
+        Err(ImportFailure::Permanent(_)) => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let outcomes = delete_objects(
+        &ctx.driver,
+        DeleteObjectsInput {
+            bucket: spec.target.bucket.clone(),
+            entries: plan.entries[..attempted]
+                .iter()
+                .map(|entry| DeleteObjectsEntry {
+                    key: entry.target_key.clone(),
+                    version_id: Some(entry.version_id),
+                })
+                .collect(),
+            group_id: bucket.group_id,
+            realm_id: spec.auth_context.realm_id,
+            node_id: ctx.owner_node_id,
+            deleted_by: spec.auth_context.user_id,
+        },
+    )
+    .await;
+    let mut removed = 0;
+    for outcome in outcomes {
+        match outcome.result {
+            Ok(_) => removed += 1,
+            Err(DeleteObjectError::NoSuchVersion) => {}
+            Err(error) => {
+                return Err(ImportFailure::Retryable(format!(
+                    "rollback of `{}` failed: {error}",
+                    outcome.key
+                )));
+            }
+        }
+    }
+    for entry in &plan.entries[..written] {
+        let mut row = read_report(ctx, &entry.path)
+            .await?
+            .unwrap_or_else(|| entry_report(entry));
+        row.code = ReasonCode::Failed;
+        row.message = Some("written object was removed after the import failed".to_string());
+        row.detail.version_id = None;
+        row.detail.blake3 = None;
+        row.detail.size = None;
+        row.detail.arn = None;
+        row.detail.w3id = None;
+        write_report(ctx, &row).await?;
+    }
+    info!(
+        job_id = %ctx.job_id,
+        removed,
+        "Rolled back objects written by a failed RO-Crate import"
+    );
+    Ok(removed)
 }
 
 async fn ensure_targets(ctx: &JobContext, spec: &ImportRoCrateSpec) -> Result<(), ImportFailure> {
@@ -1624,6 +1747,21 @@ fn permanent_staging(error: &StagingSourceError) -> bool {
     )
 }
 
+/// A rejected document never becomes acceptable by retrying, so it is reported
+/// as violations and rolled back instead of burning the remaining attempts.
+fn classify_metadata(error: MetadataWriteError) -> ImportFailure {
+    match error {
+        MetadataWriteError::Create(CreateMetadataDocumentError::MetadataError(
+            MetadataError::Validation(violations),
+        )) => ImportFailure::Validation(violations),
+        MetadataWriteError::Create(CreateMetadataDocumentError::MetadataError(
+            MetadataError::InvalidInput(message),
+        )) => ImportFailure::Permanent(message),
+        error if metadata_is_transient(&error) => ImportFailure::Retryable(error.to_string()),
+        error => ImportFailure::Permanent(error.to_string()),
+    }
+}
+
 fn metadata_is_transient(error: &MetadataWriteError) -> bool {
     matches!(
         error,
@@ -1659,7 +1797,10 @@ fn import_outcome(checkpoint: &ImportCheckpoint, spec: &ImportRoCrateSpec) -> Jo
         return JobRunOutcome::Cancelled;
     }
     if let Some(error) = &checkpoint.failure {
-        return JobRunOutcome::Failed(JobError::permanent(error.clone()));
+        return JobRunOutcome::Failed(JobError::permanent(format!(
+            "{error}; {}",
+            write_state(checkpoint)
+        )));
     }
     JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(ImportRoCrateResult {
         document_id: checkpoint.created.then_some(spec.document_id),
@@ -1669,6 +1810,19 @@ fn import_outcome(checkpoint: &ImportCheckpoint, spec: &ImportRoCrateSpec) -> Jo
         failed: checkpoint.failed,
         report_digest: [0; 32],
     }))
+}
+
+/// States what a failed import left behind, so the report never leaves the
+/// caller guessing whether data landed.
+fn write_state(checkpoint: &ImportCheckpoint) -> String {
+    if checkpoint.created {
+        return "the metadata document was created".to_string();
+    }
+    match checkpoint.rolled_back {
+        0 => "no objects were written".to_string(),
+        1 => "1 written object was removed".to_string(),
+        removed => format!("{removed} written objects were removed"),
+    }
 }
 
 fn failure_message(error: ImportFailure) -> String {
@@ -1820,27 +1974,28 @@ mod tests {
         .unwrap();
 
         let node_id = iroh::SecretKey::from_bytes(&[6; 32]).public();
+        let spec = ImportRoCrateSpec {
+            auth_context: AuthContext {
+                user_id: owner,
+                realm_id,
+                path_restrictions: None,
+            },
+            source: ImportRoCrateSource::Upload { upload_id },
+            target: ImportRoCrateTarget {
+                bucket: "target".to_string(),
+                prefix: "crate".to_string(),
+            },
+            metadata: ImportMetadataTarget {
+                group_id: Ulid::from_bytes([7; 16]),
+                path: "crate".to_string(),
+                public: false,
+            },
+            limits: Default::default(),
+            document_id: Ulid::from_bytes([8; 16]),
+        };
         let mut record = JobRecord::new(
             job_id,
-            JobPayload::ImportRoCrate(ImportRoCrateSpec {
-                auth_context: AuthContext {
-                    user_id: owner,
-                    realm_id,
-                    path_restrictions: None,
-                },
-                source: ImportRoCrateSource::Upload { upload_id },
-                target: ImportRoCrateTarget {
-                    bucket: "target".to_string(),
-                    prefix: "crate".to_string(),
-                },
-                metadata: ImportMetadataTarget {
-                    group_id: Ulid::from_bytes([7; 16]),
-                    path: "crate".to_string(),
-                    public: false,
-                },
-                limits: Default::default(),
-                document_id: Ulid::from_bytes([8; 16]),
-            }),
+            JobPayload::ImportRoCrate(spec.clone()),
             owner,
             node_id,
             1,
@@ -1884,7 +2039,7 @@ mod tests {
         .await
         .unwrap();
 
-        let JobRunOutcome::Failed(error) = cleanup_after_panic(&ctx).await else {
+        let JobRunOutcome::Failed(error) = cleanup_after_panic(&ctx, &spec).await else {
             panic!("panic cleanup must fail the job")
         };
         assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);

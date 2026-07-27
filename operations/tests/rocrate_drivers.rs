@@ -284,6 +284,84 @@ async fn imports_mixed_encoding() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
+async fn rejects_before_writes() -> Result<(), Box<dyn std::error::Error>> {
+    // An unreachable file entity must fail the job without touching the bucket.
+    let fixture = build_fixture(false).await?;
+    let document_id = Ulid::generate();
+    let upload_id = create_upload(&fixture, orphan_archive().await?).await?;
+    let spec = import_spec(&fixture, upload_id, document_id);
+    let job_id = JobId::new();
+    let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let JobRunOutcome::Failed(error) = run_rocrate_import(&context, &spec).await else {
+        return Err("orphaned crate was imported".into());
+    };
+    assert!(
+        error.message.contains("no objects were written"),
+        "{}",
+        error.message
+    );
+    assert!(object_versions(&fixture, TARGET_KEY).await?.is_empty());
+    let rows = read_rows(&fixture, job_id).await?;
+    assert!(rows.iter().all(|row| row.detail.arn.is_none()));
+    assert!(rows.iter().any(|row| {
+        row.detail
+            .validation
+            .as_ref()
+            .is_some_and(|violation| violation.code == "orphaned_data_entity")
+    }));
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rollback_removes_writes() -> Result<(), Box<dyn std::error::Error>> {
+    // The second payload fails its checksum after the first one has landed.
+    let fixture = build_fixture(false).await?;
+    let existing = put_object(&fixture, "imported/data1.txt", b"kept".to_vec()).await?;
+    let mut archive = pair_archive().await?;
+    let local = zip_offsets(&archive, b"PK\x03\x04")[2];
+    let central = zip_offsets(&archive, b"PK\x01\x02")[2];
+    write_u32(&mut archive, local + 14, 0);
+    write_u32(&mut archive, central + 16, 0);
+    let document_id = Ulid::generate();
+    let upload_id = create_upload(&fixture, archive).await?;
+    let spec = import_spec(&fixture, upload_id, document_id);
+    let job_id = JobId::new();
+    let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+
+    let JobRunOutcome::Failed(error) = run_rocrate_import(&context, &spec).await else {
+        return Err("checksum mismatch did not fail the import".into());
+    };
+
+    assert!(
+        error.message.contains("1 written object was removed"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        object_versions(&fixture, "imported/data1.txt").await?,
+        vec![existing.version_id]
+    );
+    assert!(
+        object_versions(&fixture, "imported/data2.txt")
+            .await?
+            .is_empty()
+    );
+    let rows = read_rows(&fixture, job_id).await?;
+    let first = rows
+        .iter()
+        .find(|row| row.entry_key == "data1.txt")
+        .ok_or("first entry report row is missing")?;
+    assert_eq!(first.code, ReasonCode::Failed);
+    assert_eq!(first.detail.arn, None);
+    assert_eq!(first.detail.version_id, None);
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn report_rows_coexist() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = build_fixture(false).await?;
     let payload_path = "signature/ro-crate-metadata.json.minisig";
@@ -425,7 +503,7 @@ async fn rejects_directory_limit() -> Result<(), Box<dyn std::error::Error>> {
 
     assert_eq!(
         message,
-        format!("ZIP central directory exceeds limit {directory_limit}")
+        format!("ZIP central directory exceeds limit {directory_limit}; no objects were written")
     );
     fixture.stop().await;
     Ok(())
@@ -1689,6 +1767,35 @@ async fn mixed_archive() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
             .await?;
     }
     Ok(archive.close().await?)
+}
+
+async fn orphan_archive() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let json = serde_json::json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "about": {"@id": "./"}
+            },
+            {
+                "@id": "./",
+                "@type": "Dataset",
+                "name": "Orphan fixture",
+                "description": "The root never mentions its file",
+                "datePublished": "2026-07-27"
+            },
+            {"@id": "data.txt", "@type": "File", "name": "Unreachable"}
+        ]
+    })
+    .to_string();
+    custom_archive(
+        json,
+        ZipEntryBuilder::new("data.txt".to_string().into(), Compression::Deflate),
+        false,
+    )
+    .await
 }
 
 async fn pair_archive() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
