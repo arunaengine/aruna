@@ -667,6 +667,7 @@ pub async fn create_metadata_document(
     get,
     path = "/metadata",
     tag = "metadata",
+    description = "Authentication is optional and changes the result: an authenticated caller sees every document their identity may read, an anonymous caller sees only public documents.",
     params(
         ("group_id" = Option<String>, Query, description = "Optional group id filter"),
         ("path_prefix" = Option<String>, Query, description = "Normalized metadata path prefix, for example profiles/"),
@@ -677,7 +678,8 @@ pub async fn create_metadata_document(
     responses(
         (status = 200, description = "Visible metadata documents", body = ListMetadataResponse),
         (status = 400, description = "Invalid query", body = ErrorResponse)
-    )
+    ),
+    security((), ("bearer_auth" = []))
 )]
 pub async fn list_all_metadata_documents(
     State(state): State<Arc<ServerState>>,
@@ -695,6 +697,7 @@ pub async fn list_all_metadata_documents(
     get,
     path = "/groups/{group_id}/metadata",
     tag = "metadata",
+    description = "Authentication is optional and changes the result: an authenticated caller sees every document of the group their identity may read, an anonymous caller sees only public documents.",
     params(
         ("group_id" = String, Path, description = "Group id"),
         ("path_prefix" = Option<String>, Query, description = "Normalized metadata path prefix, for example profiles/"),
@@ -705,7 +708,8 @@ pub async fn list_all_metadata_documents(
     responses(
         (status = 200, description = "Visible metadata documents", body = ListMetadataResponse),
         (status = 400, description = "Invalid group id", body = ErrorResponse)
-    )
+    ),
+    security((), ("bearer_auth" = []))
 )]
 pub async fn list_metadata_documents(
     State(state): State<Arc<ServerState>>,
@@ -724,6 +728,7 @@ pub async fn list_metadata_documents(
     get,
     path = "/metadata/{document_id}",
     tag = "metadata",
+    description = "Authentication is optional and changes the result: a document that is not public is only returned to a caller whose identity may read it.",
     params(("document_id" = String, Path, description = "Metadata document id")),
     responses(
         (status = 200, description = "Metadata document summary", body = MetadataDocumentSummary),
@@ -731,7 +736,8 @@ pub async fn list_metadata_documents(
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse)
-    )
+    ),
+    security((), ("bearer_auth" = []))
 )]
 pub async fn get_metadata_document(
     State(state): State<Arc<ServerState>>,
@@ -796,6 +802,7 @@ pub async fn delete_metadata_document(
     get,
     path = "/metadata/{document_id}/rocrate",
     tag = "metadata",
+    description = "Authentication is optional and changes the result: a document that is not public is only exported to a caller whose identity may read it.",
     params(
         ("document_id" = String, Path, description = "Metadata document id"),
         ("view" = Option<MetadataRoCrateView>, Query, description = "Export view: full, summary, page, or raw"),
@@ -852,7 +859,8 @@ pub async fn delete_metadata_document(
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
         (status = 503, description = "Requested view is not available", body = ErrorResponse)
-    )
+    ),
+    security((), ("bearer_auth" = []))
 )]
 pub async fn export_metadata_rocrate(
     State(state): State<Arc<ServerState>>,
@@ -1227,6 +1235,7 @@ pub async fn add_metadata_contextual_entity(
     post,
     path = "/metadata/{document_id}/sparql/query",
     tag = "metadata",
+    description = "Authentication is optional and changes the result: the document is only queried for a caller whose identity may read it.",
     params(("document_id" = String, Path, description = "Metadata document id")),
     request_body(
         content = SparqlQueryRequest,
@@ -1257,7 +1266,8 @@ pub async fn add_metadata_contextual_entity(
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse)
-    )
+    ),
+    security((), ("bearer_auth" = []))
 )]
 pub async fn query_metadata_document(
     State(state): State<Arc<ServerState>>,
@@ -1293,6 +1303,7 @@ pub async fn query_metadata_document(
     post,
     path = "/metadata/sparql/query",
     tag = "metadata",
+    description = "Authentication is optional and changes the result: the queried graph union only contains metadata the caller may read.",
     request_body(
         content = SparqlQueryRequest,
         description = "Run a SPARQL `SELECT` or `ASK` query across all visible metadata. `mode=local` evaluates the current node's authorized graph union. `mode=distributed` accepts only union-safe `ASK` or `SELECT DISTINCT` single-pattern queries and merges partition sets. Distributed mode is best-effort by default; set `allow_partial=false` to fail if any partition is unavailable.",
@@ -1320,7 +1331,8 @@ pub async fn query_metadata_document(
         (status = 200, description = "SPARQL query result", body = MetadataQueryResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 501, description = "Unsupported query mode", body = ErrorResponse)
-    )
+    ),
+    security((), ("bearer_auth" = []))
 )]
 pub async fn query_all_metadata(
     State(state): State<Arc<ServerState>>,
@@ -1355,6 +1367,7 @@ pub async fn query_all_metadata(
     get,
     path = "/metadata/search",
     tag = "metadata",
+    description = "Authentication is optional and changes the result: hits are restricted to metadata the caller may read, so an anonymous request returns fewer documents.",
     params(
         ("q" = Option<String>, Query, description = "Search query; optional when conforms_to is set"),
         ("conforms_to" = Option<String>, Query, description = "Exact RO-Crate conformsTo profile IRI"),
@@ -1367,7 +1380,8 @@ pub async fn query_all_metadata(
         (status = 200, description = "Metadata search hits", body = MetadataSearchResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 501, description = "Unsupported query mode", body = ErrorResponse)
-    )
+    ),
+    security((), ("bearer_auth" = []))
 )]
 pub async fn search_metadata(
     State(state): State<Arc<ServerState>>,

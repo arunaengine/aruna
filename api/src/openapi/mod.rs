@@ -59,3 +59,82 @@ impl Modify for SecurityAddon {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ApiDoc;
+    use serde_json::{Value, json};
+
+    /// Operations that serve anonymous callers but return more to an authenticated one.
+    /// They pair an empty requirement with `bearer_auth` so clients send an available
+    /// token without presenting the operation as authentication-only.
+    const OPTIONAL_AUTH: &[(&str, &str)] = &[
+        ("/metadata", "get"),
+        ("/groups/{group_id}/metadata", "get"),
+        ("/metadata/{document_id}", "get"),
+        ("/metadata/{document_id}/rocrate", "get"),
+        ("/metadata/{document_id}/sparql/query", "post"),
+        ("/metadata/sparql/query", "post"),
+        ("/metadata/search", "get"),
+        ("/info", "get"),
+        ("/info/realm", "get"),
+        ("/ga4gh/drs/v1/objects", "post"),
+        ("/ga4gh/drs/v1/objects/{object_id}", "get"),
+        ("/ga4gh/drs/v1/download", "get"),
+    ];
+
+    /// Operations that reject an anonymous caller.
+    const REQUIRED_AUTH: &[(&str, &str)] = &[
+        ("/users/register", "post"),
+        ("/metadata", "post"),
+        ("/metadata/{document_id}", "delete"),
+        ("/metadata/references", "get"),
+    ];
+
+    fn operation_security(doc: &Value, path: &str, method: &str) -> Vec<Value> {
+        doc["paths"][path][method]["security"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{method} {path} declares no security requirement"))
+            .clone()
+    }
+
+    #[test]
+    fn pins_optional_security() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        for (path, method) in OPTIONAL_AUTH {
+            let security = operation_security(&doc, path, method);
+            assert!(
+                security.contains(&json!({ "bearer_auth": [] })),
+                "{method} {path} must offer bearer_auth so clients send a held token"
+            );
+            assert!(
+                security.contains(&json!({})),
+                "{method} {path} must keep the empty requirement that marks auth optional"
+            );
+        }
+    }
+
+    #[test]
+    fn pins_required_security() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        for (path, method) in REQUIRED_AUTH {
+            let security = operation_security(&doc, path, method);
+            assert!(
+                security.contains(&json!({ "bearer_auth": [] })),
+                "{method} {path} must require bearer_auth"
+            );
+            assert!(
+                !security.contains(&json!({})),
+                "{method} {path} rejects anonymous callers, so auth must not read as optional"
+            );
+        }
+    }
+
+    #[test]
+    fn declares_security_schemes() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let schemes = &doc["components"]["securitySchemes"];
+        assert_eq!(schemes["bearer_auth"]["scheme"], json!("bearer"));
+        assert_eq!(schemes["basic_auth"]["scheme"], json!("basic"));
+    }
+}

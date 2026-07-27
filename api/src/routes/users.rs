@@ -515,13 +515,15 @@ async fn register_admin(
     post,
     path = "/users/register",
     tag = "users",
+    description = "Requires an OIDC bearer token from a configured issuer, not an Aruna access token.",
     request_body = RegisterUserRequest,
     responses(
         (status = 201, description = "User registered", body = RegisterUserResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse)
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 async fn register_user(
     State(state): State<Arc<ServerState>>,
