@@ -2,7 +2,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use aruna_core::compute::{
-    BackendError, InputStream, StagingMode, TaskSpec, normalize_container_path, paths_overlap,
+    BackendError, InputStream, StagingMode, TaskSpec, has_wildcard, literal_prefix,
+    normalize_container_path, paths_overlap,
 };
 use aruna_core::structs::ensure_confined_relative_path;
 
@@ -133,15 +134,23 @@ impl StageLayout {
                     "duplicate output path `{output}`"
                 )));
             }
-            let parent = path.parent().ok_or_else(|| {
-                BackendError::InvalidSpec(format!("output path `{output}` has no parent"))
-            })?;
+            // A pattern is captured under its literal prefix; the wildcard
+            // components must never be created as directories.
+            let parent = if has_wildcard(output) {
+                literal_prefix(output).map_err(BackendError::InvalidSpec)?
+            } else {
+                path.parent()
+                    .ok_or_else(|| {
+                        BackendError::InvalidSpec(format!("output path `{output}` has no parent"))
+                    })?
+                    .to_path_buf()
+            };
             if parent == std::path::Path::new("/") {
                 return Err(BackendError::InvalidSpec(
                     "root output parent is forbidden".to_string(),
                 ));
             }
-            output_parents.insert(parent.to_path_buf());
+            output_parents.insert(parent);
         }
         for input in files
             .iter()
@@ -270,6 +279,22 @@ mod tests {
         spec.inputs = vec![TaskInput::from_bytes("/work/.command.sh", "data")];
         spec.output_paths = vec!["/work/out.txt".to_string()];
         assert!(StageLayout::from_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn plans_wildcard_parent() {
+        // Only the literal prefix of a pattern becomes a real directory.
+        let mut spec = TaskSpec::new(AttemptRef::new("job", 0), "image");
+        spec.output_paths = vec!["/output/*/result.txt".to_string()];
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        assert_eq!(
+            layout.output_parents,
+            BTreeSet::from([PathBuf::from("/output")])
+        );
+
+        let mut spec = TaskSpec::new(AttemptRef::new("job", 0), "image");
+        spec.output_paths = vec!["/*.txt".to_string()];
+        assert!(StageLayout::from_spec(&spec).is_err());
     }
 
     #[test]

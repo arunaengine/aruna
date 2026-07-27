@@ -4,6 +4,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
 const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Bounds one output listing well above the caller's match limit.
+const MAX_LISTED_FILES: u64 = 100_000;
 
 fn main() {
     if let Err(error) = run() {
@@ -22,6 +24,7 @@ fn run() -> Result<(), String> {
     match command.as_str() {
         "stage" => stage_command(&arguments),
         "fetch" => fetch_command(&arguments),
+        "list" => list_command(&arguments),
         "probe" => probe_command(&arguments),
         _ => Err(format!("unknown helper command `{command}`")),
     }
@@ -40,6 +43,13 @@ fn fetch_command(arguments: &[std::ffi::OsString]) -> Result<(), String> {
     let path = required_value(arguments, "--path")?;
     fetch_archive(&workspace, &path, io::stdout().lock())
         .map_err(|error| format!("fetch failed: {error}"))
+}
+
+fn list_command(arguments: &[std::ffi::OsString]) -> Result<(), String> {
+    let workspace = required_path(arguments, "--workspace")?;
+    let prefix = required_value(arguments, "--prefix")?;
+    list_files(&workspace, &prefix, io::stdout().lock())
+        .map_err(|error| format!("list failed: {error}"))
 }
 
 fn probe_command(arguments: &[std::ffi::OsString]) -> Result<(), String> {
@@ -133,6 +143,51 @@ fn fetch_archive(workspace: &Path, path: &str, writer: impl Write) -> io::Result
     let mut archive = tar::Builder::new(writer);
     archive.append_data(&mut header, relative, File::open(source)?)?;
     archive.finish()
+}
+
+/// Emit every regular file below `prefix` as a NUL-terminated absolute
+/// container path. Symlinks are skipped, so a listing stays inside the
+/// workspace; the caller applies the output pattern.
+fn list_files(workspace: &Path, prefix: &str, mut writer: impl Write) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let relative = safe_absolute(prefix)?;
+    let root = workspace.canonicalize()?;
+    let mut pending = vec![root.join(&relative)];
+    let mut listed = 0u64;
+    while let Some(directory) = pending.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            listed += 1;
+            if listed > MAX_LISTED_FILES {
+                return Err(io::Error::other("listing limit exceeded"));
+            }
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(&root)
+                .map_err(|_| io::Error::other("listing escaped workspace"))?;
+            writer.write_all(b"/")?;
+            writer.write_all(relative.as_os_str().as_bytes())?;
+            writer.write_all(&[0])?;
+        }
+    }
+    writer.flush()
 }
 
 fn compare_marker(marker: &Path, sentinel: &Path) -> io::Result<()> {
@@ -305,6 +360,32 @@ mod tests {
         assert!(compare_marker(&marker, &sentinel).is_ok());
         std::fs::write(&sentinel, br#"{"epoch":2}"#).unwrap();
         assert!(compare_marker(&marker, &sentinel).is_err());
+    }
+
+    #[test]
+    fn lists_workspace_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("out/sub")).unwrap();
+        std::fs::write(workspace.join("out/a.txt"), b"a").unwrap();
+        std::fs::write(workspace.join("out/sub/b.txt"), b"b").unwrap();
+        std::fs::write(workspace.join("other.txt"), b"c").unwrap();
+
+        let mut listed = Vec::new();
+        list_files(&workspace, "/out", &mut listed).unwrap();
+
+        let mut paths: Vec<_> = listed
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8(path.to_vec()).unwrap())
+            .collect();
+        paths.sort();
+        assert_eq!(paths, vec!["/out/a.txt", "/out/sub/b.txt"]);
+
+        // A missing prefix directory lists nothing instead of failing.
+        let mut empty = Vec::new();
+        list_files(&workspace, "/absent", &mut empty).unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]

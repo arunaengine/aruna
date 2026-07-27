@@ -9,9 +9,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
-    ExecutorKind, FenceContext, LogLimits, LogStream, LogTails, MAX_TRANSFER_BYTES, NetworkAccess,
-    ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec, TombstoneEvidence,
-    TombstoneSpec, UserSpec, normalize_container_path,
+    ExecutorKind, FenceContext, LogLimits, LogStream, LogTails, MAX_OUTPUT_MATCHES,
+    MAX_TRANSFER_BYTES, NetworkAccess, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode,
+    TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix,
+    normalize_container_path,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -452,7 +453,7 @@ impl ExecutorBackend for ApptainerBackend {
         }
         let directory = self.state.attempt_dir(context);
         let attempt: AttemptRecord = read_json(&directory.join("attempt.json"))?;
-        if !attempt.output_paths.iter().any(|output| output == path) {
+        if !declared_outputs(&attempt)?.is_match(path) {
             return Err(BackendError::InvalidSpec(
                 "output path was not declared".to_string(),
             ));
@@ -482,6 +483,33 @@ impl ExecutorBackend for ApptainerBackend {
             size,
             chunks: Box::pin(ChannelStream(rx)),
         })
+    }
+
+    async fn list_outputs(
+        &self,
+        context: &FenceContext,
+        pattern: &str,
+    ) -> Result<Vec<String>, BackendError> {
+        let status = self.attempt_status(context)?;
+        if !status.is_terminal() {
+            return Err(BackendError::InvalidSpec(
+                "attempt is not terminal".to_string(),
+            ));
+        }
+        let directory = self.state.attempt_dir(context);
+        let attempt: AttemptRecord = read_json(&directory.join("attempt.json"))?;
+        if !attempt.output_paths.iter().any(|output| output == pattern) {
+            return Err(BackendError::InvalidSpec(
+                "output path was not declared".to_string(),
+            ));
+        }
+        let glob = OutputMatcher::new([pattern]).map_err(BackendError::InvalidSpec)?;
+        let prefix = literal_prefix(pattern).map_err(BackendError::InvalidSpec)?;
+        let root = directory
+            .join("workspace/root")
+            .canonicalize()
+            .map_err(io_error)?;
+        list_workspace(&root, &host_path(&root, &prefix), &glob)
     }
 
     async fn reconcile(&self, context: &FenceContext) -> ReconcileEvidence {
@@ -1108,6 +1136,58 @@ fn io_error(error: std::io::Error) -> BackendError {
     BackendError::Api(format!("Apptainer backend: {error}"))
 }
 
+fn declared_outputs(attempt: &AttemptRecord) -> Result<OutputMatcher, BackendError> {
+    OutputMatcher::new(attempt.output_paths.iter().map(String::as_str))
+        .map_err(BackendError::InvalidSpec)
+}
+
+/// Regular files below `start` whose container path the pattern selects.
+/// Symlinks are skipped, so a listing can never leave the workspace root.
+fn list_workspace(
+    root: &Path,
+    start: &Path,
+    glob: &OutputMatcher,
+) -> Result<Vec<String>, BackendError> {
+    let mut matched = Vec::new();
+    let mut pending = vec![start.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_error(error)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(io_error)?;
+            let file_type = entry.file_type().map_err(io_error)?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let relative = path.strip_prefix(root).map_err(|_| {
+                BackendError::InvalidSpec("listing escaped the workspace".to_string())
+            })?;
+            let absolute = format!("/{}", relative.display());
+            if glob.is_match(&absolute) {
+                if matched.len() >= MAX_OUTPUT_MATCHES {
+                    return Err(BackendError::InvalidSpec(
+                        "pattern matches too many files".to_string(),
+                    ));
+                }
+                matched.push(absolute);
+            }
+        }
+    }
+    matched.sort();
+    Ok(matched)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1132,6 +1212,28 @@ mod tests {
         };
 
         backend.cleanup(&context).await.unwrap();
+    }
+
+    #[test]
+    fn lists_matching_files() {
+        let root = tempdir().unwrap();
+        let root = root.path();
+        std::fs::create_dir_all(root.join("out/sub")).unwrap();
+        for path in ["out/a.txt", "out/b.csv", "out/sub/c.txt"] {
+            std::fs::write(root.join(path), b"x").unwrap();
+        }
+        std::os::unix::fs::symlink(root.join("out/a.txt"), root.join("out/link.txt")).unwrap();
+        let glob = OutputMatcher::new(["/out/*.txt"]).unwrap();
+
+        let matched = list_workspace(root, &root.join("out"), &glob).unwrap();
+
+        // Symlinks never resolve, and `*` stops at the separator.
+        assert_eq!(matched, vec!["/out/a.txt".to_string()]);
+        assert!(
+            list_workspace(root, &root.join("absent"), &glob)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

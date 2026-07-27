@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
-    ExecutorKind, FenceContext, LogLimits, LogStream, LogTails, MAX_TRANSFER_BYTES, NOBODY,
-    ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec, TombstoneEvidence,
-    TombstoneSpec, UserSpec, normalize_container_path,
+    ExecutorKind, FenceContext, LogLimits, LogStream, LogTails, MAX_OUTPUT_MATCHES,
+    MAX_TRANSFER_BYTES, NOBODY, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode,
+    TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix,
+    normalize_container_path,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -42,9 +43,9 @@ use super::{BackendCaps, ExecutorBackend, digest_pinned};
 mod manifest;
 
 use manifest::{
-    HELPER_PATH, StageMarker, WORKLOAD_SA, helper_pod, job_manifest, marker_manifest, marker_name,
-    mount_buckets, mount_name, mount_pv_manifest, mount_pvc_manifest, needs_workspace,
-    network_policies, pvc_manifest, secret_manifest, secret_name, workspace_name,
+    HELPER_PATH, StageMarker, WORKLOAD_SA, WORKSPACE_PATH, helper_pod, job_manifest,
+    marker_manifest, marker_name, mount_buckets, mount_name, mount_pv_manifest, mount_pvc_manifest,
+    needs_workspace, network_policies, pvc_manifest, secret_manifest, secret_name, workspace_name,
 };
 
 pub const EPOCH_ANNOTATION: &str = "aruna-engine.org/attempt-epoch";
@@ -52,6 +53,8 @@ pub const GENERATION_ANNOTATION: &str = "aruna-engine.org/controller-generation"
 pub const STATE_ANNOTATION: &str = "aruna-engine.org/state";
 pub const ROLE_LABEL: &str = "aruna-engine.org/role";
 const DEFAULT_WORKSPACE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// Bounds one helper listing response.
+const MAX_LISTING_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct KubernetesBackend {
@@ -688,6 +691,72 @@ impl KubernetesBackend {
         Ok(())
     }
 
+    /// Enumerate the workspace below `prefix` through a helper Pod and keep the
+    /// paths the pattern selects. The helper emits NUL-terminated paths.
+    async fn list_archive(
+        &self,
+        context: &FenceContext,
+        prefix: &str,
+        glob: &OutputMatcher,
+    ) -> Result<Vec<String>, BackendError> {
+        let pod = self
+            .create_helper(context, "fetch", &CancellationToken::new())
+            .await?;
+        let params = AttachParams::default()
+            .container("helper")
+            .stdin(false)
+            .stdout(true)
+            .stderr(false);
+        let listed = async {
+            let mut attached = self
+                .pods()
+                .exec(
+                    &pod.name_any(),
+                    [
+                        HELPER_PATH,
+                        "list",
+                        "--workspace",
+                        WORKSPACE_PATH,
+                        "--prefix",
+                        prefix,
+                    ],
+                    &params,
+                )
+                .await
+                .map_err(kube_error)?;
+            let stdout = attached.stdout().ok_or_else(|| {
+                BackendError::Api("list exec did not expose standard output".to_string())
+            })?;
+            let mut listing = Vec::new();
+            stdout
+                .take(MAX_LISTING_BYTES)
+                .read_to_end(&mut listing)
+                .await
+                .map_err(io_error)?;
+            join_exec(attached).await?;
+            let mut matched = Vec::new();
+            for path in listing.split(|byte| *byte == 0) {
+                let Ok(path) = std::str::from_utf8(path) else {
+                    return Err(BackendError::Api("listing is not UTF-8".to_string()));
+                };
+                if path.is_empty() || !glob.is_match(path) {
+                    continue;
+                }
+                if matched.len() >= MAX_OUTPUT_MATCHES {
+                    return Err(BackendError::InvalidSpec(
+                        "pattern matches too many files".to_string(),
+                    ));
+                }
+                matched.push(path.to_string());
+            }
+            matched.sort();
+            Ok(matched)
+        }
+        .await;
+        let _ = self.delete_pod(&pod).await;
+        listed
+    }
+
     async fn fetch_archive(
         &self,
         context: &FenceContext,
@@ -1063,6 +1132,28 @@ impl ExecutorBackend for KubernetesBackend {
         self.fetch_archive(context, path).await
     }
 
+    async fn list_outputs(
+        &self,
+        context: &FenceContext,
+        pattern: &str,
+    ) -> Result<Vec<String>, BackendError> {
+        let job = self.get_job(context).await?;
+        if !job_status(&job).is_terminal() {
+            return Err(BackendError::InvalidSpec(
+                "attempt is not terminal".to_string(),
+            ));
+        }
+        validate_output(&job, pattern)?;
+        let glob = OutputMatcher::new([pattern]).map_err(BackendError::InvalidSpec)?;
+        let prefix = literal_prefix(pattern).map_err(BackendError::InvalidSpec)?;
+        // The listing helper needs the workspace claim, which the task pods hold
+        // until they are reaped.
+        self.save_logs(context).await?;
+        self.delete_tasks(context).await?;
+        self.list_archive(context, &prefix.to_string_lossy(), &glob)
+            .await
+    }
+
     async fn reconcile(&self, context: &FenceContext) -> ReconcileEvidence {
         match self.jobs().get_opt(&context.attempt.external_name()).await {
             Ok(Some(job)) => {
@@ -1392,6 +1483,7 @@ fn validate_marker(
     Ok(marker)
 }
 
+/// A path is valid when it was declared literally or matches a declared pattern.
 fn validate_output(job: &Job, path: &str) -> Result<(), BackendError> {
     normalize_container_path(path).map_err(BackendError::InvalidSpec)?;
     let outputs = job
@@ -1402,7 +1494,9 @@ fn validate_output(job: &Job, path: &str) -> Result<(), BackendError> {
         .ok_or_else(|| BackendError::Conflict("Job output declarations are missing".to_string()))?;
     let outputs: Vec<String> = serde_json::from_str(outputs)
         .map_err(|error| BackendError::Conflict(format!("invalid Job outputs: {error}")))?;
-    if !outputs.iter().any(|output| output == path) {
+    let declared = OutputMatcher::new(outputs.iter().map(String::as_str))
+        .map_err(BackendError::InvalidSpec)?;
+    if !declared.is_match(path) {
         return Err(BackendError::InvalidSpec(
             "output path was not declared".to_string(),
         ));
@@ -1997,6 +2091,25 @@ mod tests {
                 }
             }]
         })
+    }
+
+    #[test]
+    fn accepts_pattern_output() {
+        // A declared wildcard output authorizes every path it selects.
+        let job: Job = serde_json::from_value(json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {
+                "name": "aruna-job-a1", "namespace": "compute",
+                "annotations": {"aruna-engine.org/output-paths": r#"["/out/*.txt","/log/run.txt"]"#}
+            }
+        }))
+        .expect("build job");
+
+        assert!(validate_output(&job, "/out/a.txt").is_ok());
+        assert!(validate_output(&job, "/out/*.txt").is_ok());
+        assert!(validate_output(&job, "/log/run.txt").is_ok());
+        assert!(validate_output(&job, "/out/sub/a.txt").is_err());
+        assert!(validate_output(&job, "/out/a.csv").is_err());
     }
 
     #[tokio::test]

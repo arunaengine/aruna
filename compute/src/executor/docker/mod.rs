@@ -9,8 +9,9 @@ use std::time::Duration;
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptRef, AttemptStatus, BackendError,
     CancelEvidence, ExecutorKind, FenceContext, InputStream, LogLimits, LogStream, LogTails,
-    MAX_TRANSFER_BYTES, NOBODY, NetworkAccess, ReconcileEvidence, ResumePoint, StagingMode,
-    TaskInput, TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec,
+    MAX_OUTPUT_MATCHES, MAX_TRANSFER_BYTES, NOBODY, NetworkAccess, OutputMatcher,
+    ReconcileEvidence, ResumePoint, StagingMode, TaskInput, TaskOutput, TaskSpec,
+    TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix,
 };
 use async_trait::async_trait;
 use bollard::models::{
@@ -936,6 +937,41 @@ fn stream_output(
     }
 }
 
+/// Collect the regular files of a directory archive that the pattern selects.
+/// Entry payloads are skipped; only the headers are inspected.
+fn list_archive(
+    archive: impl Read,
+    base: &Path,
+    glob: &OutputMatcher,
+) -> Result<Vec<String>, BackendError> {
+    let mut archive = tar::Archive::new(archive);
+    let mut matched = Vec::new();
+    for entry in archive.entries().map_err(archive_error)? {
+        let entry = entry.map_err(archive_error)?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let path = entry.path().map_err(archive_api)?;
+        if path
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(output_spec("archive entry path is unsafe"));
+        }
+        let Some(absolute) = base.join(path).to_str().map(str::to_string) else {
+            continue;
+        };
+        if glob.is_match(&absolute) {
+            if matched.len() >= MAX_OUTPUT_MATCHES {
+                return Err(output_spec("pattern matches too many files"));
+            }
+            matched.push(absolute);
+        }
+    }
+    matched.sort();
+    Ok(matched)
+}
+
 fn build_config(
     config: &DockerConfig,
     context: &FenceContext,
@@ -1363,6 +1399,47 @@ impl ExecutorBackend for DockerBackend {
             Err(_) => Err(BackendError::Api(
                 "output parse stopped before the tar header".to_string(),
             )),
+        }
+    }
+
+    async fn list_outputs(
+        &self,
+        context: &FenceContext,
+        pattern: &str,
+    ) -> Result<Vec<String>, BackendError> {
+        let _guard = self.control_guard(context).await?;
+        let attempt = &context.attempt;
+        attempt.validate().map_err(BackendError::InvalidSpec)?;
+        let glob = OutputMatcher::new([pattern]).map_err(BackendError::InvalidSpec)?;
+        let prefix = literal_prefix(pattern).map_err(BackendError::InvalidSpec)?;
+        // Entries of a directory archive are relative to the requested directory.
+        let base = prefix
+            .parent()
+            .ok_or_else(|| output_spec("pattern has no literal parent"))?
+            .to_path_buf();
+        let inspect = self.inspect_matching_attempt(attempt).await?;
+        if !inspect_to_status(inspect.clone()).is_terminal() {
+            return Err(output_spec("attempt is not terminal"));
+        }
+        let container_id = inspect.id.as_deref().ok_or_else(|| {
+            BackendError::Api("Docker inspect response omitted the container ID".to_string())
+        })?;
+        let options = DownloadFromContainerOptionsBuilder::new()
+            .path(&prefix.to_string_lossy())
+            .build();
+        let raw = self
+            .docker
+            .download_from_container(container_id, Some(options))
+            .map(|chunk| chunk.map_err(|error| io::Error::other(classify_archive(&error))));
+        let counted = Box::pin(count_limited(raw, MAX_TRANSFER_BYTES));
+        let reader = SyncIoBridge::new_with_handle(StreamReader::new(counted), Handle::current());
+        let listed = tokio::task::spawn_blocking(move || list_archive(reader, &base, &glob))
+            .await
+            .map_err(|error| BackendError::Api(format!("output listing stopped: {error}")))?;
+        match listed {
+            // An absent output directory selects nothing rather than failing.
+            Err(BackendError::NotFound(_)) => Ok(Vec::new()),
+            other => other,
         }
     }
 

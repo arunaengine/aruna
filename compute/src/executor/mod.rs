@@ -152,6 +152,18 @@ pub trait ExecutorBackend: Send + Sync {
         path: &str,
     ) -> Result<TaskOutput, BackendError>;
 
+    /// Resolve a declared POSIX output pattern against the terminal attempt's
+    /// filesystem. Zero matches is an empty list, never an error.
+    async fn list_outputs(
+        &self,
+        _context: &FenceContext,
+        _pattern: &str,
+    ) -> Result<Vec<String>, BackendError> {
+        Err(BackendError::InvalidSpec(
+            "backend does not support wildcard outputs".to_string(),
+        ))
+    }
+
     /// Query by deterministic name after restart / lease loss. Never mutates.
     async fn reconcile(&self, context: &FenceContext) -> ReconcileEvidence;
 

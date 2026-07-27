@@ -3,7 +3,10 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use aruna_compute::ExecutorBackend;
-use aruna_core::compute::{BackendError, FenceContext, MAX_TRANSFER_BYTES, S3Mount, TaskInput};
+use aruna_core::compute::{
+    BackendError, FenceContext, MAX_OUTPUT_MATCHES, MAX_TRANSFER_BYTES, S3Mount, TaskInput,
+    has_wildcard, output_suffix,
+};
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
@@ -441,11 +444,78 @@ pub async fn capture_outputs(
     node_id: NodeId,
 ) -> Result<Vec<OutputObject>, JobError> {
     let mut outputs = Vec::with_capacity(spec.file_outputs.len());
-    for output in &spec.file_outputs {
-        outputs
-            .push(put_file_output(context, backend, fence, spec, record, node_id, output).await?);
+    for declared in &spec.file_outputs {
+        for output in resolve_output(backend, fence, declared).await? {
+            outputs.push(
+                put_file_output(context, backend, fence, spec, record, node_id, &output).await?,
+            );
+        }
     }
     Ok(outputs)
+}
+
+/// Resolve one declared output into the concrete files to upload. A wildcard
+/// path is expanded against the terminal attempt; a literal path is uploaded as
+/// declared and still fails the job when it is missing.
+async fn resolve_output(
+    backend: &Arc<dyn ExecutorBackend>,
+    fence: &FenceContext,
+    output: &OutputSelection,
+) -> Result<Vec<OutputSelection>, JobError> {
+    if !has_wildcard(&output.container_path) {
+        return Ok(vec![output.clone()]);
+    }
+    let mut matched = backend
+        .list_outputs(fence, &output.container_path)
+        .await
+        .map_err(|error| output_read_error(&error))?;
+    matched.sort();
+    matched.dedup();
+    tracing::debug!(
+        pattern = %output.container_path,
+        matched = matched.len(),
+        "Expanded wildcard output"
+    );
+    expand_selection(output, matched)
+}
+
+/// One selection per matched file, keyed by the match with `path_prefix` stripped.
+/// Zero matches captures nothing, which the spec allows for a selection pattern.
+fn expand_selection(
+    output: &OutputSelection,
+    matched: Vec<String>,
+) -> Result<Vec<OutputSelection>, JobError> {
+    let prefix = output.path_prefix.as_deref().ok_or_else(|| {
+        JobError::permanent(format!(
+            "output `{}` contains wildcards without a path_prefix",
+            output.container_path
+        ))
+    })?;
+    if matched.len() > MAX_OUTPUT_MATCHES {
+        return Err(JobError::permanent(format!(
+            "output `{}` matches more than {MAX_OUTPUT_MATCHES} files",
+            output.container_path
+        )));
+    }
+    let OutputDestination::S3 { bucket, key } = &output.destination;
+    matched
+        .into_iter()
+        .map(|path| {
+            let suffix = output_suffix(&path, prefix).ok_or_else(|| {
+                JobError::permanent(format!("output `{path}` is outside path_prefix `{prefix}`"))
+            })?;
+            Ok(OutputSelection {
+                container_path: path,
+                path_prefix: None,
+                destination: OutputDestination::S3 {
+                    bucket: bucket.clone(),
+                    key: format!("{}/{suffix}", key.trim_end_matches('/')),
+                },
+                name: output.name.clone(),
+                description: output.description.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Stream one declared container output into its S3 destination. When the
@@ -1193,6 +1263,76 @@ mod tests {
         assert_eq!(merged.len(), MAX_OUTPUT_MANIFEST_OBJECTS);
 
         let error = merge_outputs(inventoried, vec![output("overflow")]).unwrap_err();
+        assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
+    }
+
+    fn wildcard_output(pattern: &str) -> OutputSelection {
+        OutputSelection {
+            container_path: pattern.to_string(),
+            path_prefix: Some("/out".to_string()),
+            destination: OutputDestination::S3 {
+                bucket: "dest".to_string(),
+                key: "results/".to_string(),
+            },
+            name: Some("reports".to_string()),
+            description: None,
+        }
+    }
+
+    fn expanded_keys(output: &OutputSelection, matched: Vec<String>) -> Vec<String> {
+        expand_selection(output, matched)
+            .unwrap()
+            .iter()
+            .map(|output| {
+                let OutputDestination::S3 { key, .. } = &output.destination;
+                key.clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn expands_matched_keys() {
+        let output = wildcard_output("/out/*.txt");
+        let matched = vec!["/out/a.txt".to_string(), "/out/b.txt".to_string()];
+
+        let expanded = expand_selection(&output, matched).unwrap();
+
+        assert_eq!(expanded[1].container_path, "/out/b.txt");
+        assert_eq!(expanded[1].name.as_deref(), Some("reports"));
+        assert!(expanded[1].path_prefix.is_none());
+        // The suffix below path_prefix keeps every nested component.
+        assert_eq!(
+            expanded_keys(&output, vec!["/out/a.txt".to_string()]),
+            vec!["results/a.txt"]
+        );
+        assert_eq!(
+            expanded_keys(
+                &wildcard_output("/out/*/*/*.txt"),
+                vec!["/out/sub/deep/b.txt".to_string()]
+            ),
+            vec!["results/sub/deep/b.txt"]
+        );
+    }
+
+    #[test]
+    fn empty_expansion_captures() {
+        // Zero matches is a legitimate empty selection, not a job failure.
+        assert!(
+            expand_selection(&wildcard_output("/out/*.txt"), Vec::new())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rejects_foreign_match() {
+        let output = wildcard_output("/out/*.txt");
+        let error = expand_selection(&output, vec!["/other/a.txt".to_string()]).unwrap_err();
+        assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
+
+        let mut output = output;
+        output.path_prefix = None;
+        let error = expand_selection(&output, vec!["/out/a.txt".to_string()]).unwrap_err();
         assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
     }
 
