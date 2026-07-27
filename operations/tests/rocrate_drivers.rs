@@ -7,9 +7,11 @@ use std::time::{Duration, SystemTime};
 
 use aruna_blob::blob::BlobHandler;
 use aruna_core::effects::{BlobEffect, StorageEffect};
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, REALM_CONFIG_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE,
+    S3_BUCKET_KEYSPACE,
 };
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
@@ -80,6 +82,7 @@ struct StorageGate {
     hit: Option<oneshot::Receiver<()>>,
     release: mpsc::Sender<()>,
     stop: Arc<AtomicBool>,
+    faulty: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -99,6 +102,12 @@ impl StorageGate {
 
     fn release(&self) {
         self.release.send(()).expect("version gate releases");
+    }
+
+    /// Make every bucket lookup fail, which is what an interrupted cleanup
+    /// looks like from inside the import.
+    fn fail_buckets(&self, faulty: bool) {
+        self.faulty.store(faulty, Ordering::Release);
     }
 
     async fn stop(&mut self) {
@@ -355,6 +364,97 @@ async fn rollback_removes_writes() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("first entry report row is missing")?;
     assert_eq!(first.code, ReasonCode::Failed);
     assert_eq!(first.detail.arn, None);
+    assert_eq!(first.detail.version_id, None);
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn resumes_pending_rollback() -> Result<(), Box<dyn std::error::Error>> {
+    // A run that dies inside cleanup leaves written versions behind, so the
+    // resumed run must load the plan and roll them back.
+    let mut fixture = build_fixture(true).await?;
+    let document_id = Ulid::generate();
+    let upload_id = create_upload(&fixture, pair_archive().await?).await?;
+    let spec = import_spec(&fixture, upload_id, document_id);
+    let job_id = JobId::new();
+    let mut first_context =
+        claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    first_context.final_attempt = true;
+    let first_token = first_context.claim_token;
+    let mut first_run = tokio::spawn({
+        let spec = spec.clone();
+        async move { run_rocrate_import(&first_context, &spec).await }
+    });
+    let mut hit = fixture.gate.as_mut().expect("gated fixture").take_hit();
+
+    let gate_result = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            result = &mut first_run => Err(format!(
+                "import ended before the committed version gate: {}",
+                run_name(result)
+            )),
+            result = &mut hit => {
+                result.map_err(|error| error.to_string())?;
+                Ok(())
+            }
+        }
+    })
+    .await
+    .map_err(|_| "import did not reach the committed version gate")?;
+    gate_result?;
+
+    // Break every bucket lookup once the first payload is committed: the next
+    // write fails, and the rollback that follows cannot finish either.
+    let gate = fixture.gate.as_ref().expect("gated fixture");
+    gate.fail_buckets(true);
+    gate.release();
+    let JobRunOutcome::Failed(interrupted) = first_run.await? else {
+        return Err("import with an unreadable bucket did not fail".into());
+    };
+    assert!(
+        interrupted.message.contains("rollback cannot read bucket"),
+        "{}",
+        interrupted.message
+    );
+    assert_eq!(
+        object_versions(&fixture, "imported/data1.txt").await?.len(),
+        1,
+        "the interrupted cleanup must leave its write in place"
+    );
+    gate.fail_buckets(false);
+
+    release_job(
+        &fixture.context.storage_handle,
+        job_id,
+        first_token,
+        unix_timestamp_millis(),
+    )
+    .await?;
+    let second_context =
+        claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+
+    let JobRunOutcome::Failed(error) = run_rocrate_import(&second_context, &spec).await else {
+        return Err("resumed cleanup did not fail the import".into());
+    };
+
+    assert!(
+        error.message.contains("1 written object was removed"),
+        "{}",
+        error.message
+    );
+    assert!(
+        object_versions(&fixture, "imported/data1.txt")
+            .await?
+            .is_empty()
+    );
+    let rows = read_rows(&fixture, job_id).await?;
+    let first = rows
+        .iter()
+        .find(|row| row.entry_key == "data1.txt")
+        .ok_or("first entry report row is missing")?;
+    assert_eq!(first.code, ReasonCode::Failed);
     assert_eq!(first.detail.version_id, None);
 
     fixture.stop().await;
@@ -1092,12 +1192,20 @@ fn storage_proxy(
     let (release, release_receiver) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
+    let faulty = Arc::new(AtomicBool::new(false));
+    let thread_faulty = faulty.clone();
     let thread = std::thread::Builder::new()
         .name("rocrate-storage-gate".to_string())
         .spawn(move || {
             let mut version_transaction = None;
             let mut hit_sender = Some(hit_sender);
             while let Ok((effect, response, _span, _queued, _in_flight)) = receiver.recv() {
+                if thread_faulty.load(Ordering::Acquire) && bucket_read(&effect) {
+                    response.send(StorageEvent::Error {
+                        error: StorageError::ReadError,
+                    });
+                    continue;
+                }
                 if let Some(transaction) = version_txn(&effect) {
                     version_transaction = Some(transaction);
                 }
@@ -1137,9 +1245,17 @@ fn storage_proxy(
             hit: Some(hit),
             release,
             stop,
+            faulty,
             thread: Some(thread),
         },
     ))
+}
+
+fn bucket_read(effect: &StorageEffect) -> bool {
+    matches!(
+        effect,
+        StorageEffect::Read { key_space, .. } if key_space == S3_BUCKET_KEYSPACE
+    )
 }
 
 fn version_txn(effect: &StorageEffect) -> Option<Ulid> {

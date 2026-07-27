@@ -184,19 +184,23 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
     if let Err(error) = persist_checkpoint(ctx, &checkpoint).await {
         return retryable_error(error);
     }
-    let mut plan = if matches!(
-        checkpoint.phase,
-        ImportPhase::Write | ImportPhase::Rewrite | ImportPhase::Create
-    ) {
-        match read_plan(ctx).await {
-            Ok(Some(plan)) => Some(plan),
-            Ok(None) => {
-                return JobRunOutcome::Failed(JobError::permanent("import plan is missing"));
+    let mut plan = match checkpoint.phase {
+        ImportPhase::Write | ImportPhase::Rewrite | ImportPhase::Create => {
+            match read_plan(ctx).await {
+                Ok(Some(plan)) => Some(plan),
+                Ok(None) => {
+                    return JobRunOutcome::Failed(JobError::permanent("import plan is missing"));
+                }
+                Err(error) => return retryable_error(error),
             }
-            Err(error) => return retryable_error(error),
         }
-    } else {
-        None
+        // A resumed cleanup rolls back with the plan; a failure before
+        // planning simply has none.
+        ImportPhase::Cleanup => match read_plan(ctx).await {
+            Ok(plan) => plan,
+            Err(error) => return retryable_error(error),
+        },
+        _ => None,
     };
 
     loop {
@@ -874,6 +878,7 @@ async fn write_next(
     .ok_or_else(|| ImportFailure::Retryable("object write returned no result".to_string()))?;
     // The preflight validated identifiers built from the planned version.
     if result.version_id != entry.version_id {
+        report_divergent(ctx, entry, result.version_id).await?;
         return Err(ImportFailure::Permanent(
             "written object version does not match the planned version".to_string(),
         ));
@@ -1044,6 +1049,26 @@ async fn cleanup_source(
     Ok(())
 }
 
+/// Name a version the store returned instead of the planned one. Rollback only
+/// removes versions this job minted, so an unplanned version must not be
+/// deleted blindly; the system row keeps it findable.
+async fn report_divergent(
+    ctx: &JobContext,
+    entry: &ImportEntryPlan,
+    written: Ulid,
+) -> Result<(), ImportFailure> {
+    let mut row = entry_report(entry);
+    row.entry_key = format!("divergent/{}", entry.path);
+    row.code = ReasonCode::Failed;
+    row.message = Some(format!(
+        "object write returned version {written} instead of the planned {}; \
+         the written version was left in place",
+        entry.version_id
+    ));
+    row.detail.version_id = Some(written);
+    write_system_report(ctx, &row).await
+}
+
 /// A failed import must leave nothing behind. A cancelled one keeps what it
 /// already committed, which its report rows state entry by entry.
 fn rollback_required(checkpoint: &ImportCheckpoint) -> bool {
@@ -1065,15 +1090,20 @@ async fn rollback_writes(
         .entries
         .len()
         .min(checkpoint.next_entry.saturating_add(1));
-    let written = checkpoint.next_entry.min(plan.entries.len());
     if attempted == 0 {
         return Ok(0);
     }
-    let bucket = match load_bucket(ctx, &spec.target.bucket).await {
-        Ok(bucket) => bucket,
-        Err(ImportFailure::Permanent(_)) => return Ok(0),
-        Err(error) => return Err(error),
-    };
+    // An unreachable bucket leaves the rollback unfinished, so it must requeue
+    // instead of reporting a clean one.
+    let bucket = load_bucket(ctx, &spec.target.bucket)
+        .await
+        .map_err(|error| {
+            ImportFailure::Retryable(format!(
+                "rollback cannot read bucket `{}`: {}",
+                spec.target.bucket,
+                failure_message(error)
+            ))
+        })?;
     let outcomes = delete_objects(
         &ctx.driver,
         DeleteObjectsInput {
@@ -1093,10 +1123,12 @@ async fn rollback_writes(
     )
     .await;
     let mut removed = 0;
-    for outcome in outcomes {
+    // Only a version that was really removed loses its report detail, so the
+    // entry that failed before writing keeps its own failure message.
+    for (entry, outcome) in plan.entries[..attempted].iter().zip(outcomes) {
         match outcome.result {
             Ok(_) => removed += 1,
-            Err(DeleteObjectError::NoSuchVersion) => {}
+            Err(DeleteObjectError::NoSuchVersion) => continue,
             Err(error) => {
                 return Err(ImportFailure::Retryable(format!(
                     "rollback of `{}` failed: {error}",
@@ -1104,8 +1136,6 @@ async fn rollback_writes(
                 )));
             }
         }
-    }
-    for entry in &plan.entries[..written] {
         let mut row = read_report(ctx, &entry.path)
             .await?
             .unwrap_or_else(|| entry_report(entry));
