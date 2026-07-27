@@ -47,6 +47,7 @@ pub mod native_reference;
 pub mod node_info;
 pub mod notifications;
 pub mod onboarding_secret_state;
+pub mod permission_rules;
 pub mod placement;
 pub mod process_placements;
 mod queue_backoff;

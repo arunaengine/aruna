@@ -1,15 +1,10 @@
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::AuthorizationError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::AUTH_KEYSPACE;
+use aruna_core::events::Event;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
-    AuthContext, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument, RealmId, Role,
-};
-use aruna_core::types::{Effects, GroupId, TxnId};
-use globset::Glob;
-use smallvec::smallvec;
-use ulid::Ulid;
+use aruna_core::structs::{AuthContext, Permission};
+use aruna_core::types::Effects;
+
+use crate::permission_rules::{PermissionRulesConfig, PermissionRulesOperation};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CheckPermissionsConfig {
@@ -18,355 +13,26 @@ pub struct CheckPermissionsConfig {
     pub required_permission: Permission,
 }
 
+/// Decides a single path. Rule collection and evaluation live in
+/// `permission_rules`, so read paths that filter many paths at once share
+/// exactly these semantics.
 #[derive(Debug, PartialEq)]
 pub struct CheckPermissionsOperation {
-    config: CheckPermissionsConfig,
-    txn_id: Option<TxnId>,
-    group_id: Option<Ulid>,
-    realm_auth_doc: Option<RealmAuthorizationDocument>,
-    group_auth_doc: Option<GroupAuthorizationDocument>,
-    output: Option<Result<bool, AuthorizationError>>,
-    state: CheckPermissionsState,
-}
-
-struct CollectedRole {
-    role: Role,
-    direct: bool,
-    public: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum CheckPermissionsState {
-    Init,
-    StartTransaction,
-    GetRealmAuthDoc,
-    GetGroupAuthDoc,
-    CheckPermissions,
-    Finish,
-    Error,
-}
-
-impl std::fmt::Display for CheckPermissionsState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                CheckPermissionsState::Init => "CheckPermissionsState::Init",
-                CheckPermissionsState::StartTransaction =>
-                    "CheckPermissionsState::StartTransaction",
-                CheckPermissionsState::GetRealmAuthDoc => "CheckPermissionsState::GetRealmAuthDoc",
-                CheckPermissionsState::GetGroupAuthDoc => "CheckPermissionsState::GetGroupAuthDoc",
-                CheckPermissionsState::CheckPermissions =>
-                    "CheckPermissionsState::CheckPermissions",
-                CheckPermissionsState::Finish => "CheckPermissionsState::Finish",
-                CheckPermissionsState::Error => "CheckPermissionsState::Error",
-            }
-        )
-    }
+    rules: PermissionRulesOperation,
+    path: String,
+    required_permission: Permission,
 }
 
 impl CheckPermissionsOperation {
     pub fn new(config: CheckPermissionsConfig) -> Self {
         CheckPermissionsOperation {
-            config,
-            txn_id: None,
-            realm_auth_doc: None,
-            group_id: None,
-            group_auth_doc: None,
-            output: None,
-            state: CheckPermissionsState::Init,
+            rules: PermissionRulesOperation::new(PermissionRulesConfig {
+                auth_context: config.auth_context,
+                path: config.path.clone(),
+            }),
+            path: config.path,
+            required_permission: config.required_permission,
         }
-    }
-
-    fn handle_start_transaction(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
-        if let (
-            CheckPermissionsState::StartTransaction,
-            Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-        ) = (self.state, event)
-        {
-            self.txn_id = Some(txn_id);
-            let effects = self.get_realm_auth_doc();
-            match effects {
-                Ok(effects) => effects,
-                Err(err) => self.fail(err),
-            }
-        } else {
-            self.unexpected_event(
-                self.state,
-                "Event::Storage(StorageEvent::TransactionStart)",
-                got,
-            )
-        }
-    }
-
-    fn handle_realm_auth(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
-        if let (
-            CheckPermissionsState::GetRealmAuthDoc,
-            Event::Storage(StorageEvent::ReadResult { value, .. }),
-        ) = (self.state, event)
-        {
-            match self.emit_realm_auth_doc(value) {
-                Ok(effects) => effects,
-                Err(err) => self.fail(err),
-            }
-        } else {
-            self.unexpected_event(self.state, "Event::Storage(StorageEvent::ReadResult)", got)
-        }
-    }
-
-    fn handle_group_auth(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
-        if let (
-            CheckPermissionsState::GetGroupAuthDoc,
-            Event::Storage(StorageEvent::ReadResult { value, .. }),
-        ) = (self.state, event)
-        {
-            match self.emit_group_auth_doc(value) {
-                Ok(effects) => effects,
-                Err(err) => self.fail(err),
-            }
-        } else {
-            self.unexpected_event(self.state, "Event::Storage(StorageEvent::ReadResult)", got)
-        }
-    }
-
-    fn handle_check_permissions(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
-        if let (
-            CheckPermissionsState::CheckPermissions,
-            Event::Storage(StorageEvent::TransactionCommitted { .. }),
-        ) = (self.state, event)
-        {
-            match self.emit_check_permissions() {
-                Ok(effects) => effects,
-                Err(err) => self.fail(err),
-            }
-        } else {
-            self.unexpected_event(
-                self.state,
-                "Event::Storage(StorageEvent::TransactionCommitted)",
-                got,
-            )
-        }
-    }
-
-    fn parse_path(path: &str) -> Result<(RealmId, Option<GroupId>), AuthorizationError> {
-        let mut levels = path.split("/");
-        levels.next();
-        let realm = levels
-            .next()
-            .and_then(|rid| RealmId::from_base64(rid).ok())
-            .ok_or_else(|| AuthorizationError::InvalidRealmId)?;
-
-        let separator = levels.next();
-
-        let group = if separator == Some("g") {
-            levels.next().and_then(|g| Ulid::from_string(g).ok())
-        } else {
-            None
-        };
-
-        Ok((realm, group))
-    }
-
-    fn get_realm_auth_doc(&mut self) -> Result<Effects, AuthorizationError> {
-        self.state = CheckPermissionsState::GetRealmAuthDoc;
-        let (realm, group) = CheckPermissionsOperation::parse_path(&self.config.path)?;
-        self.group_id = group;
-        Ok(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: AUTH_KEYSPACE.to_string(),
-            key: (*realm.as_bytes()).into(),
-            txn_id: self.txn_id
-        })])
-    }
-
-    fn emit_realm_auth_doc(
-        &mut self,
-        value: Option<byteview::ByteView>,
-    ) -> Result<Effects, AuthorizationError> {
-        self.realm_auth_doc = Some(RealmAuthorizationDocument::from_bytes(
-            &value.ok_or_else(|| AuthorizationError::AuthDocNotFound)?,
-        )?);
-
-        match self.group_id {
-            Some(group) => {
-                self.state = CheckPermissionsState::GetGroupAuthDoc;
-                Ok(smallvec![Effect::Storage(StorageEffect::Read {
-                    txn_id: self.txn_id,
-                    key_space: AUTH_KEYSPACE.to_string(),
-                    key: group.to_bytes().into(),
-                })])
-            }
-            None => {
-                self.state = CheckPermissionsState::CheckPermissions;
-                Ok(smallvec![Effect::Storage(
-                    StorageEffect::CommitTransaction {
-                        txn_id: self
-                            .txn_id
-                            .ok_or_else(|| AuthorizationError::NoTransactionFound)?
-                    }
-                )])
-            }
-        }
-    }
-
-    fn emit_group_auth_doc(
-        &mut self,
-        value: Option<byteview::ByteView>,
-    ) -> Result<Effects, AuthorizationError> {
-        self.state = CheckPermissionsState::CheckPermissions;
-        self.group_auth_doc = Some(GroupAuthorizationDocument::from_bytes(
-            &value.ok_or_else(|| AuthorizationError::AuthDocNotFound)?,
-        )?);
-
-        Ok(smallvec![Effect::Storage(
-            StorageEffect::CommitTransaction {
-                txn_id: self
-                    .txn_id
-                    .ok_or_else(|| AuthorizationError::NoTransactionFound)?
-            }
-        )])
-    }
-
-    fn emit_check_permissions(&mut self) -> Result<Effects, AuthorizationError> {
-        self.state = CheckPermissionsState::Finish;
-        let roles = self.collect_roles()?;
-        let allowed = self.check_permissions(roles)?;
-        let allowed = if allowed {
-            self.check_path_restrictions()?
-        } else {
-            false
-        };
-        self.output = Some(Ok(allowed));
-        Ok(smallvec![])
-    }
-
-    fn collect_roles(&mut self) -> Result<Vec<CollectedRole>, AuthorizationError> {
-        let realm_auth_doc = self
-            .realm_auth_doc
-            .as_ref()
-            .ok_or_else(|| AuthorizationError::AuthDocNotFound)?;
-        let realm_id = realm_auth_doc.realm_id;
-        let auth_user = self.config.auth_context.user_id;
-        let mut roles = realm_auth_doc.roles.clone();
-        if let Some(group) = &self.group_auth_doc {
-            roles.extend(group.roles.clone());
-        }
-        Ok(roles
-            .into_values()
-            .filter_map(|role| {
-                // Public roles apply by assigning this realm's exact Everyone
-                // principal. Other nil user ids are not public for this realm.
-                let public = role.is_public(realm_id);
-                let direct = !auth_user.is_nil() && role.assigned_users.contains(&auth_user);
-                (public || direct).then_some(CollectedRole {
-                    role,
-                    direct,
-                    public,
-                })
-            })
-            .collect())
-    }
-
-    fn check_permissions(&mut self, roles: Vec<CollectedRole>) -> Result<bool, AuthorizationError> {
-        let mut allowed = false;
-        for CollectedRole {
-            role,
-            direct,
-            public,
-        } in roles
-        {
-            for (path, permission) in role.permissions {
-                let glob = Glob::new(&path)?.compile_matcher();
-                if glob.is_match(&self.config.path) {
-                    if public
-                        && permission == Permission::READ
-                        && self.config.required_permission == Permission::READ
-                    {
-                        allowed = true;
-                    }
-
-                    if direct {
-                        match permission {
-                            Permission::DENY => {
-                                return Ok(false);
-                            }
-                            Permission::READ => {
-                                if self.config.required_permission == Permission::READ {
-                                    allowed = true;
-                                }
-                            }
-                            Permission::WRITE => allowed = true,
-                        }
-                    }
-                }
-            }
-        }
-        Ok(allowed)
-    }
-
-    fn check_path_restrictions(&self) -> Result<bool, AuthorizationError> {
-        let Some(restrictions) = self.config.auth_context.path_restrictions.as_ref() else {
-            return Ok(true);
-        };
-
-        let mut allowed = false;
-        for restriction in restrictions {
-            let glob = Glob::new(&restriction.pattern)?.compile_matcher();
-            if glob.is_match(&self.config.path) {
-                match restriction.permission {
-                    Permission::DENY => return Ok(false),
-                    Permission::READ => {
-                        if self.config.required_permission == Permission::READ {
-                            allowed = true;
-                        }
-                    }
-                    Permission::WRITE => allowed = true,
-                }
-            }
-        }
-
-        Ok(allowed)
-    }
-
-    fn fail(&mut self, err: AuthorizationError) -> Effects {
-        self.state = CheckPermissionsState::Error;
-        self.output = Some(Err(err));
-        self.abort()
-    }
-
-    fn fail_with_cleanup(&mut self, err: AuthorizationError, cleanup_effects: Effects) -> Effects {
-        self.state = CheckPermissionsState::Error;
-        self.output = Some(Err(err));
-        cleanup_effects
-    }
-
-    fn unexpected_event(
-        &mut self,
-        state: CheckPermissionsState,
-        expected: &'static str,
-        got: String,
-    ) -> Effects {
-        let cleanup_effects = self.abort();
-        self.fail_with_cleanup(
-            AuthorizationError::UnexpectedEvent {
-                state: state.to_string(),
-                expected,
-                got,
-            },
-            cleanup_effects,
-        )
-    }
-
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return Err(self.fail(error.into()));
-        }
-
-        Ok(event)
     }
 }
 
@@ -375,63 +41,41 @@ impl Operation for CheckPermissionsOperation {
 
     type Error = AuthorizationError;
 
-    fn start(&mut self) -> aruna_core::types::Effects {
-        self.state = CheckPermissionsState::StartTransaction;
-
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: true
-        })]
+    fn start(&mut self) -> Effects {
+        self.rules.start()
     }
 
-    fn step(&mut self, event: Event) -> aruna_core::types::Effects {
-        let event = match self.fail_on_storage_error(event) {
-            Ok(event) => event,
-            Err(effects) => return effects,
-        };
-
-        match self.state {
-            CheckPermissionsState::StartTransaction => self.handle_start_transaction(event),
-            CheckPermissionsState::GetRealmAuthDoc => self.handle_realm_auth(event),
-            CheckPermissionsState::GetGroupAuthDoc => self.handle_group_auth(event),
-            CheckPermissionsState::CheckPermissions => self.handle_check_permissions(event),
-            CheckPermissionsState::Finish
-            | CheckPermissionsState::Init
-            | CheckPermissionsState::Error => smallvec![],
-        }
+    fn step(&mut self, event: Event) -> Effects {
+        self.rules.step(event)
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            CheckPermissionsState::Finish | CheckPermissionsState::Error
-        )
+        self.rules.is_complete()
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or_else(|| AuthorizationError::NotFinished)?
+        let CheckPermissionsOperation {
+            rules,
+            path,
+            required_permission,
+        } = self;
+        Ok(rules.finalize()?.allows(&path, &required_permission))
     }
 
-    fn abort(&mut self) -> aruna_core::types::Effects {
-        match self.txn_id {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+    fn abort(&mut self) -> Effects {
+        self.rules.abort()
     }
 }
 
 #[cfg(test)]
 mod test {
-    use aruna_core::keys::generate_signing_key;
     use std::collections::{HashMap, HashSet};
 
     use aruna_core::UserId;
-    use aruna_core::structs::{
-        Actor, AuthContext, PathRestriction, Permission, RealmAuthorizationDocument, RealmId, Role,
-    };
+    use aruna_core::structs::{Actor, AuthContext, Permission, RealmId};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
-    use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -445,198 +89,6 @@ mod test {
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive};
-
-    #[tokio::test]
-    pub async fn test_path_parsing() {
-        let realm_signing_key: SigningKey = generate_signing_key();
-        let pubkey = realm_signing_key.verifying_key().to_bytes();
-        let realm_id = RealmId::from_bytes(pubkey);
-        let group_id = Ulid::generate();
-        let path = format!("/{}/g/{}", realm_id, group_id.to_string());
-        let (parsed_realm_id, parsed_group_id) =
-            CheckPermissionsOperation::parse_path(&path).unwrap();
-
-        assert_eq!(realm_id, parsed_realm_id);
-        assert_eq!(group_id, parsed_group_id.unwrap());
-
-        let path = format!("/{}/admin", realm_id);
-        let (parsed_realm_id, parsed_group_id) =
-            CheckPermissionsOperation::parse_path(&path).unwrap();
-
-        assert_eq!(realm_id, parsed_realm_id);
-        assert!(parsed_group_id.is_none());
-
-        let path = format!("/abcd/g/{}", Ulid::generate().to_string());
-        assert!(CheckPermissionsOperation::parse_path(&path).is_err());
-    }
-
-    #[test]
-    fn path_restrictions_enforce_whitelist_and_required_permission() {
-        let realm_id = RealmId([0u8; 32]);
-        let group_id = Ulid::generate();
-        let pattern = format!("/{realm_id}/g/{group_id}/meta/**");
-        let mut operation = CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: AuthContext {
-                user_id: UserId::local(Ulid::generate(), realm_id),
-                realm_id,
-                path_restrictions: Some(vec![PathRestriction {
-                    pattern: pattern.clone(),
-                    permission: Permission::READ,
-                }]),
-            },
-            path: format!("/{realm_id}/g/{group_id}/meta/document"),
-            required_permission: Permission::READ,
-        });
-
-        assert!(operation.check_path_restrictions().unwrap());
-
-        operation.config.path = format!("/{realm_id}/g/{group_id}/data/document");
-        assert!(!operation.check_path_restrictions().unwrap());
-
-        operation.config.path = format!("/{realm_id}/g/{group_id}/meta/document");
-        operation.config.required_permission = Permission::WRITE;
-        assert!(!operation.check_path_restrictions().unwrap());
-
-        operation.config.required_permission = Permission::READ;
-        operation.config.auth_context.path_restrictions = Some(vec![PathRestriction {
-            pattern,
-            permission: Permission::DENY,
-        }]);
-        assert!(!operation.check_path_restrictions().unwrap());
-    }
-
-    #[test]
-    fn collect_roles_only_treats_same_realm_nil_as_public() {
-        let realm_id = RealmId([1u8; 32]);
-        let other_realm_id = RealmId([2u8; 32]);
-        let group_id = Ulid::generate();
-        let role = Role {
-            role_id: Ulid::generate(),
-            name: "foreign-nil".to_string(),
-            permissions: HashMap::from([(
-                format!("/{realm_id}/g/{group_id}/data/**"),
-                Permission::READ,
-            )]),
-            assigned_users: HashSet::from([UserId::nil(other_realm_id)]),
-        };
-        let mut operation = CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: AuthContext::anonymous(realm_id),
-            path: format!("/{realm_id}/g/{group_id}/data/object"),
-            required_permission: Permission::READ,
-        });
-        operation.realm_auth_doc = Some(RealmAuthorizationDocument {
-            realm_id,
-            roles: HashMap::from([(role.role_id, role)]),
-            operation_restrictions: HashMap::new(),
-        });
-
-        assert!(operation.collect_roles().unwrap().is_empty());
-    }
-
-    #[test]
-    fn public_grants_are_read_only_when_evaluating_permissions() {
-        let realm_id = RealmId([2u8; 32]);
-        let group_id = Ulid::generate();
-        let user_id = UserId::local(Ulid::generate(), realm_id);
-        let path = format!("/{realm_id}/g/{group_id}/data/object");
-
-        let public_write = Role {
-            role_id: Ulid::generate(),
-            name: "public-write".to_string(),
-            permissions: HashMap::from([(path.clone(), Permission::WRITE)]),
-            assigned_users: HashSet::from([UserId::nil(realm_id)]),
-        };
-        let mut write_operation = CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: AuthContext::anonymous(realm_id),
-            path: path.clone(),
-            required_permission: Permission::WRITE,
-        });
-        assert!(
-            !write_operation
-                .check_permissions(vec![super::CollectedRole {
-                    role: public_write,
-                    direct: false,
-                    public: true,
-                }])
-                .unwrap()
-        );
-
-        let public_direct_write = Role {
-            role_id: Ulid::generate(),
-            name: "public-direct-write".to_string(),
-            permissions: HashMap::from([(path.clone(), Permission::WRITE)]),
-            assigned_users: HashSet::from([UserId::nil(realm_id), user_id]),
-        };
-        assert!(
-            write_operation
-                .check_permissions(vec![super::CollectedRole {
-                    role: public_direct_write,
-                    direct: true,
-                    public: true,
-                }])
-                .unwrap()
-        );
-
-        let public_deny = Role {
-            role_id: Ulid::generate(),
-            name: "public-deny".to_string(),
-            permissions: HashMap::from([(path.clone(), Permission::DENY)]),
-            assigned_users: HashSet::from([UserId::nil(realm_id)]),
-        };
-        let direct_read = Role {
-            role_id: Ulid::generate(),
-            name: "direct-read".to_string(),
-            permissions: HashMap::from([(path.clone(), Permission::READ)]),
-            assigned_users: HashSet::from([user_id]),
-        };
-        let public_direct_deny = Role {
-            role_id: Ulid::generate(),
-            name: "public-direct-deny".to_string(),
-            permissions: HashMap::from([(path.clone(), Permission::DENY)]),
-            assigned_users: HashSet::from([UserId::nil(realm_id), user_id]),
-        };
-        let mut read_operation = CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: AuthContext {
-                user_id,
-                realm_id,
-                path_restrictions: None,
-            },
-            path,
-            required_permission: Permission::READ,
-        });
-        assert!(
-            read_operation
-                .check_permissions(vec![
-                    super::CollectedRole {
-                        role: public_deny,
-                        direct: false,
-                        public: true,
-                    },
-                    super::CollectedRole {
-                        role: direct_read.clone(),
-                        direct: true,
-                        public: false,
-                    },
-                ])
-                .unwrap()
-        );
-        assert!(
-            !read_operation
-                .check_permissions(vec![
-                    super::CollectedRole {
-                        role: public_direct_deny,
-                        direct: true,
-                        public: true,
-                    },
-                    super::CollectedRole {
-                        role: direct_read,
-                        direct: true,
-                        public: false,
-                    },
-                ])
-                .unwrap()
-        );
-    }
 
     #[tokio::test]
     pub async fn public_roles_apply_to_everyone_and_are_read_only() {

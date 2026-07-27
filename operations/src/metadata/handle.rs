@@ -5176,8 +5176,7 @@ enum LocalReadScope<T> {
 
 struct GraphVisibilityScope {
     records: Arc<Vec<MetadataRegistryRecord>>,
-    auth_realm: Option<RealmId>,
-    readable_groups: HashSet<GroupId>,
+    permissions: GroupPermissionRules,
     lifecycle_visibility: LifecycleVisibility,
 }
 
@@ -5216,9 +5215,21 @@ impl GraphVisibilityScope {
                 }
             }
         }
-        record.public
-            || (self.auth_realm == Some(record.realm_id)
-                && self.readable_groups.contains(&record.group_id))
+        // Rules are collected per group, but every record is decided on its own
+        // permission path, so per-document grants and denials agree with the
+        // decision `can_read_record` makes for the same caller and record.
+        self.permissions.record_visible(record)
+    }
+
+    // Digest of every graph this scope may evaluate, in registry order.
+    fn visible_digest(&self, visibility_cache: &MetadataVisibilityCache) -> [u8; 32] {
+        let mut digest = ScopeDigest::default();
+        for record in self.records.iter() {
+            if self.record_visible(visibility_cache, record) {
+                digest.push(&record.graph_iri);
+            }
+        }
+        digest.finish()
     }
 
     // Graphs without a registry record stay invisible (fail closed).
@@ -5259,42 +5270,26 @@ async fn resolve_graph_visibility_scope(
         LifecycleVisibility::FreshDeletedGraphs(lifecycle_refresh.deleted_graphs)
     };
     let auth_realm = auth_context.as_ref().map(|auth| auth.realm_id);
-    let mut readable_groups = HashSet::new();
-    if let Some(auth_context) = auth_context {
-        let context = DriverContext {
-            storage_handle: inner.storage_handle.clone(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
-        let groups = drive(ListGroupOperation::new(), &context)
-            .await
-            .map_err(|error| MetadataError::Backend(error.to_string()))?;
-        for group in groups {
-            if group.realm_id != auth_context.realm_id {
-                continue;
-            }
-            let readable = drive(
-                CheckPermissionsOperation::new(CheckPermissionsConfig {
-                    auth_context: auth_context.clone(),
-                    path: format!("/{}/g/{}/meta/**", group.realm_id, group.group_id),
-                    required_permission: Permission::READ,
-                }),
-                &context,
-            )
-            .await
-            .unwrap_or(false);
-            if readable {
-                readable_groups.insert(group.group_id);
-            }
-        }
-    }
+    let context = DriverContext {
+        storage_handle: inner.storage_handle.clone(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    };
+    let permissions = GroupPermissionRules::collect(
+        &context,
+        auth_context.as_ref(),
+        records
+            .iter()
+            .filter(|record| Some(record.realm_id) == auth_realm)
+            .map(|record| record.group_id),
+    )
+    .await;
     Ok(GraphVisibilityScope {
         records,
-        auth_realm,
-        readable_groups,
+        permissions,
         lifecycle_visibility,
     })
 }
@@ -6055,6 +6050,39 @@ mod tests {
         }
     }
 
+    fn group_record(group_id: GroupId, document_path: &str) -> MetadataRegistryRecord {
+        let mut record = registry_record(document_path);
+        record.group_id = group_id;
+        record.public = false;
+        record.permission_path = MetadataRegistryRecord::permission_path_for(
+            &record.realm_id,
+            group_id,
+            document_path,
+            record.document_id,
+        );
+        record
+    }
+
+    fn read_rules(patterns: &[(&str, Permission)]) -> crate::permission_rules::PermissionRules {
+        crate::permission_rules::PermissionRules::from_roles(
+            vec![crate::permission_rules::CollectedRole {
+                role: aruna_core::structs::Role {
+                    role_id: Ulid::generate(),
+                    name: "test".to_string(),
+                    permissions: patterns
+                        .iter()
+                        .map(|(pattern, permission)| ((*pattern).to_string(), permission.clone()))
+                        .collect(),
+                    assigned_users: HashSet::new(),
+                },
+                direct: true,
+                public: false,
+            }],
+            None,
+        )
+        .expect("patterns compile")
+    }
+
     fn filled_cache(records: Vec<MetadataRegistryRecord>) -> MetadataVisibilityCache {
         let cache = MetadataVisibilityCache::new();
         cache.store_registry_records(Arc::new(records));
@@ -6327,8 +6355,7 @@ mod tests {
 
         let anonymous = GraphVisibilityScope {
             records: Arc::new(records.clone()),
-            auth_realm: None,
-            readable_groups: HashSet::new(),
+            permissions: GroupPermissionRules::default(),
             lifecycle_visibility: LifecycleVisibility::Cache,
         };
         assert!(anonymous.graph_visible(&cache, &public_record.graph_iri));
@@ -6339,10 +6366,13 @@ mod tests {
             &MetadataRegistryRecord::graph_iri_for(Ulid::generate())
         ));
 
+        let readable = HashMap::from([(
+            private_record.group_id,
+            read_rules(&[(private_record.permission_path.as_str(), Permission::READ)]),
+        )]);
         let member = GraphVisibilityScope {
             records: Arc::new(records.clone()),
-            auth_realm: Some(realm),
-            readable_groups: HashSet::from([private_record.group_id]),
+            permissions: GroupPermissionRules::from_groups(Some(realm), readable.clone()),
             lifecycle_visibility: LifecycleVisibility::Cache,
         };
         assert!(member.graph_visible(&cache, &public_record.graph_iri));
@@ -6351,12 +6381,67 @@ mod tests {
 
         let wrong_realm = GraphVisibilityScope {
             records: Arc::new(records),
-            auth_realm: Some(RealmId([8u8; 32])),
-            readable_groups: HashSet::from([private_record.group_id]),
+            permissions: GroupPermissionRules::from_groups(Some(RealmId([8u8; 32])), readable),
             lifecycle_visibility: LifecycleVisibility::Cache,
         };
         assert!(wrong_realm.graph_visible(&cache, &public_record.graph_iri));
         assert!(!wrong_realm.graph_visible(&cache, &private_record.graph_iri));
+    }
+
+    #[test]
+    fn deny_hides_document() {
+        // A per-document DENY under a group-wide READ hides only that document.
+        let realm = RealmId([7u8; 32]);
+        let group_id = Ulid::generate();
+        let secret = group_record(group_id, "datasets/secret");
+        let open = group_record(group_id, "datasets/open");
+        let mut records = vec![secret.clone(), open.clone()];
+        records.sort_unstable_by_key(|record| record.document_id);
+
+        let rules = HashMap::from([(
+            group_id,
+            read_rules(&[
+                (
+                    format!("/{realm}/g/{group_id}/meta/**").as_str(),
+                    Permission::READ,
+                ),
+                (secret.permission_path.as_str(), Permission::DENY),
+            ]),
+        )]);
+        let scope = GraphVisibilityScope {
+            records: Arc::new(records),
+            permissions: GroupPermissionRules::from_groups(Some(realm), rules),
+            lifecycle_visibility: LifecycleVisibility::Cache,
+        };
+
+        let cache = MetadataVisibilityCache::new();
+        assert!(!scope.graph_visible(&cache, &secret.graph_iri));
+        assert!(scope.graph_visible(&cache, &open.graph_iri));
+    }
+
+    #[test]
+    fn narrow_grant_visible() {
+        // A grant on one document shows it without opening the whole group.
+        let realm = RealmId([7u8; 32]);
+        let group_id = Ulid::generate();
+        let granted = group_record(group_id, "datasets/shared");
+        let hidden = group_record(group_id, "datasets/hidden");
+        let mut records = vec![granted.clone(), hidden.clone()];
+        records.sort_unstable_by_key(|record| record.document_id);
+
+        let rules = HashMap::from([(
+            group_id,
+            read_rules(&[(granted.permission_path.as_str(), Permission::READ)]),
+        )]);
+        let scope = GraphVisibilityScope {
+            records: Arc::new(records),
+            permissions: GroupPermissionRules::from_groups(Some(realm), rules),
+            lifecycle_visibility: LifecycleVisibility::Cache,
+        };
+
+        let cache = MetadataVisibilityCache::new();
+        assert!(scope.graph_visible(&cache, &granted.graph_iri));
+        assert!(!scope.graph_visible(&cache, &hidden.graph_iri));
     }
 
     #[test]
@@ -6366,8 +6451,7 @@ mod tests {
         cache.store_lifecycle_deleted(deleted_record.graph_iri.clone(), false);
         let scope = GraphVisibilityScope {
             records: Arc::new(vec![deleted_record.clone()]),
-            auth_realm: None,
-            readable_groups: HashSet::new(),
+            permissions: GroupPermissionRules::default(),
             lifecycle_visibility: LifecycleVisibility::FreshDeletedGraphs(HashSet::from([
                 deleted_record.graph_iri.clone(),
             ])),
