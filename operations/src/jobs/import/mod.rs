@@ -872,6 +872,12 @@ async fn write_next(
         Err(error) => return Err(classify_put(error)),
     }
     .ok_or_else(|| ImportFailure::Retryable("object write returned no result".to_string()))?;
+    // The preflight validated identifiers built from the planned version.
+    if result.version_id != entry.version_id {
+        return Err(ImportFailure::Permanent(
+            "written object version does not match the planned version".to_string(),
+        ));
+    }
     let hash: [u8; 32] = result
         .location
         .get_blake3()
