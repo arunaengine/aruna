@@ -12,6 +12,7 @@ pub mod raw;
 pub mod repository;
 mod search_cursor;
 mod search_enrichment;
+pub mod stats;
 mod summary_cache;
 
 use std::sync::Arc;
