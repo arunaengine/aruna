@@ -6,6 +6,9 @@ use std::path::{Component, Path, PathBuf};
 const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Bounds one output listing well above the caller's match limit.
 const MAX_LISTED_FILES: u64 = 100_000;
+/// Mirrors the listing bound the caller reads with, so an oversized listing
+/// fails here instead of being cut short in transit.
+const MAX_LISTING_BYTES: u64 = 16 * 1024 * 1024;
 
 fn main() {
     if let Err(error) = run() {
@@ -146,8 +149,9 @@ fn fetch_archive(workspace: &Path, path: &str, writer: impl Write) -> io::Result
 }
 
 /// Emit every regular file below `prefix` as a NUL-terminated absolute
-/// container path. Symlinks are skipped, so a listing stays inside the
-/// workspace; the caller applies the output pattern.
+/// container path, then an empty record and the decimal path count. The
+/// terminator lets the caller reject a listing that was cut short; symlinks are
+/// skipped, so a listing stays inside the workspace.
 fn list_files(workspace: &Path, prefix: &str, mut writer: impl Write) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -155,6 +159,8 @@ fn list_files(workspace: &Path, prefix: &str, mut writer: impl Write) -> io::Res
     let root = workspace.canonicalize()?;
     let mut pending = vec![root.join(&relative)];
     let mut listed = 0u64;
+    // Starts at the widest terminator record so it always fits under the bound.
+    let mut written = 32u64;
     while let Some(directory) = pending.pop() {
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
@@ -182,11 +188,21 @@ fn list_files(workspace: &Path, prefix: &str, mut writer: impl Write) -> io::Res
             let relative = path
                 .strip_prefix(&root)
                 .map_err(|_| io::Error::other("listing escaped workspace"))?;
+            let bytes = relative.as_os_str().as_bytes();
+            written = written
+                .checked_add(bytes.len() as u64 + 2)
+                .ok_or_else(|| io::Error::other("listing size overflows"))?;
+            if written > MAX_LISTING_BYTES {
+                return Err(io::Error::other("listing byte limit exceeded"));
+            }
             writer.write_all(b"/")?;
-            writer.write_all(relative.as_os_str().as_bytes())?;
+            writer.write_all(bytes)?;
             writer.write_all(&[0])?;
         }
     }
+    writer.write_all(&[0])?;
+    writer.write_all(listed.to_string().as_bytes())?;
+    writer.write_all(&[0])?;
     writer.flush()
 }
 
@@ -374,9 +390,16 @@ mod tests {
         let mut listed = Vec::new();
         list_files(&workspace, "/out", &mut listed).unwrap();
 
-        let mut paths: Vec<_> = listed
+        // The stream ends with an empty record and the decimal path count.
+        let mut records: Vec<&[u8]> = listed
+            .strip_suffix(&[0])
+            .expect("listing ends with the terminator")
             .split(|byte| *byte == 0)
-            .filter(|path| !path.is_empty())
+            .collect();
+        assert_eq!(records.pop(), Some(&b"2"[..]));
+        assert_eq!(records.pop(), Some(&b""[..]));
+        let mut paths: Vec<_> = records
+            .into_iter()
             .map(|path| String::from_utf8(path.to_vec()).unwrap())
             .collect();
         paths.sort();
@@ -385,7 +408,7 @@ mod tests {
         // A missing prefix directory lists nothing instead of failing.
         let mut empty = Vec::new();
         list_files(&workspace, "/absent", &mut empty).unwrap();
-        assert!(empty.is_empty());
+        assert_eq!(empty, b"\x000\x00");
     }
 
     #[test]

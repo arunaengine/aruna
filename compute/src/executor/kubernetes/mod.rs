@@ -55,8 +55,10 @@ pub const GENERATION_ANNOTATION: &str = "aruna-engine.org/controller-generation"
 pub const STATE_ANNOTATION: &str = "aruna-engine.org/state";
 pub const ROLE_LABEL: &str = "aruna-engine.org/role";
 const DEFAULT_WORKSPACE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
-/// Bounds one helper listing response.
+/// Bounds one helper listing response; the helper enforces the same bound.
 const MAX_LISTING_BYTES: u64 = 16 * 1024 * 1024;
+/// Bounds the wait for an exec status so a stalled helper cannot hang a capture.
+const EXEC_JOIN_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 pub struct KubernetesBackend {
@@ -709,7 +711,8 @@ impl KubernetesBackend {
     }
 
     /// Enumerate the workspace below `prefix` through a helper Pod and keep the
-    /// paths the pattern selects. The helper emits NUL-terminated paths.
+    /// paths the pattern selects. The helper emits NUL-terminated paths closed
+    /// by an empty record and the decimal path count.
     async fn list_archive(
         &self,
         context: &FenceContext,
@@ -751,23 +754,7 @@ impl KubernetesBackend {
                 .await
                 .map_err(io_error)?;
             join_exec(attached).await?;
-            let mut matched = Vec::new();
-            for path in listing.split(|byte| *byte == 0) {
-                let Ok(path) = std::str::from_utf8(path) else {
-                    return Err(BackendError::Api("listing is not UTF-8".to_string()));
-                };
-                if path.is_empty() || !glob.is_match(path) {
-                    continue;
-                }
-                if matched.len() >= MAX_OUTPUT_MATCHES {
-                    return Err(BackendError::InvalidSpec(
-                        "pattern matches too many files".to_string(),
-                    ));
-                }
-                matched.push(path.to_string());
-            }
-            matched.sort();
-            Ok(matched)
+            select_listed(&listing, glob)
         }
         .await;
         let _ = self.delete_pod(&pod).await;
@@ -1929,6 +1916,55 @@ impl Write for ArchiveWriter {
     }
 }
 
+/// Split a helper listing into its path records, rejecting a stream whose
+/// terminator is missing or whose count disagrees: a short read must fail the
+/// capture instead of silently dropping matches.
+fn listed_paths(listing: &[u8]) -> Result<Vec<&[u8]>, BackendError> {
+    let truncated = || BackendError::InvalidSpec("output listing is truncated".to_string());
+    let body = listing.strip_suffix(&[0]).ok_or_else(truncated)?;
+    let mut records: Vec<&[u8]> = body.split(|byte| *byte == 0).collect();
+    let count = records.pop().ok_or_else(truncated)?;
+    if records.pop() != Some(&b""[..]) {
+        return Err(truncated());
+    }
+    let count = std::str::from_utf8(count)
+        .ok()
+        .and_then(|count| count.parse::<usize>().ok())
+        .ok_or_else(truncated)?;
+    if count != records.len() || records.iter().any(|path| path.is_empty()) {
+        return Err(BackendError::InvalidSpec(
+            "output listing is inconsistent".to_string(),
+        ));
+    }
+    Ok(records)
+}
+
+/// Listed paths the pattern selects. A path that is not UTF-8 cannot be
+/// addressed as an output, so it is skipped instead of failing the capture.
+fn select_listed(listing: &[u8], glob: &OutputMatcher) -> Result<Vec<String>, BackendError> {
+    let mut matched = Vec::new();
+    for path in listed_paths(listing)? {
+        let Ok(path) = std::str::from_utf8(path) else {
+            tracing::warn!(
+                path = %String::from_utf8_lossy(path),
+                "skipping output path that is not UTF-8"
+            );
+            continue;
+        };
+        if !glob.is_match(path) {
+            continue;
+        }
+        if matched.len() >= MAX_OUTPUT_MATCHES {
+            return Err(BackendError::InvalidSpec(
+                "pattern matches too many files".to_string(),
+            ));
+        }
+        matched.push(path.to_string());
+    }
+    matched.sort();
+    Ok(matched)
+}
+
 async fn stream_output<R: AsyncRead + Unpin>(
     mut stdout: R,
     attached: kube::api::AttachedProcess,
@@ -1976,10 +2012,16 @@ async fn join_exec(mut attached: kube::api::AttachedProcess) -> Result<(), Backe
     let status = attached.take_status().ok_or_else(|| {
         BackendError::Api("Kubernetes exec status stream is unavailable".to_string())
     })?;
-    attached.join().await.map_err(remote_error)?;
-    let status = status
+    let joined = async {
+        attached.join().await.map_err(remote_error)?;
+        status
+            .await
+            .ok_or_else(|| BackendError::Api("Kubernetes exec returned no status".to_string()))
+    };
+    // A helper that stops writing must not hold the capture open forever.
+    let status = tokio::time::timeout(EXEC_JOIN_TIMEOUT, joined)
         .await
-        .ok_or_else(|| BackendError::Api("Kubernetes exec returned no status".to_string()))?;
+        .map_err(|_| BackendError::Timeout("Kubernetes exec did not finish".to_string()))??;
     if status.status.as_deref() == Some("Success") {
         return Ok(());
     }
@@ -2148,6 +2190,67 @@ mod tests {
         assert!(validate_output(&job, "/log/run.txt").is_ok());
         assert!(validate_output(&job, "/out/sub/a.txt").is_err());
         assert!(validate_output(&job, "/out/a.csv").is_err());
+    }
+
+    fn listing(paths: &[&[u8]]) -> Vec<u8> {
+        let mut listing = Vec::new();
+        for path in paths {
+            listing.extend_from_slice(path);
+            listing.push(0);
+        }
+        listing.push(0);
+        listing.extend_from_slice(paths.len().to_string().as_bytes());
+        listing.push(0);
+        listing
+    }
+
+    #[test]
+    fn rejects_cut_listing() {
+        // Without the terminator a capped read would upload a partial listing
+        // while the job still reported success.
+        let glob = OutputMatcher::new(["/out/*.txt"]).expect("build matcher");
+        let full = listing(&[b"/out/a.txt", b"/out/b.txt"]);
+        assert_eq!(
+            select_listed(&full, &glob).expect("accept full listing"),
+            vec!["/out/a.txt".to_string(), "/out/b.txt".to_string()]
+        );
+
+        for cut in [full.len() - 1, full.len() - 4, 11, 0] {
+            assert!(
+                matches!(
+                    select_listed(&full[..cut], &glob),
+                    Err(BackendError::InvalidSpec(_))
+                ),
+                "listing cut at {cut} was accepted"
+            );
+        }
+        // A terminator that disagrees with the records is equally unusable.
+        let mut miscounted = listing(&[b"/out/a.txt"]);
+        miscounted.pop();
+        miscounted.pop();
+        miscounted.extend_from_slice(b"2\0");
+        assert!(matches!(
+            select_listed(&miscounted, &glob),
+            Err(BackendError::InvalidSpec(_))
+        ));
+        assert!(
+            select_listed(&listing(&[]), &glob)
+                .expect("accept empty listing")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn skips_invalid_listing() {
+        // A file whose name is not UTF-8 cannot be addressed, but it must not
+        // fail the capture of the files that can be.
+        let glob = OutputMatcher::new(["/out/*.txt"]).expect("build matcher");
+        let listing = listing(&[b"/out/a.txt", b"/out/\xff\xfe.txt", b"/out/b.txt"]);
+
+        assert_eq!(
+            select_listed(&listing, &glob).expect("accept mixed listing"),
+            vec!["/out/a.txt".to_string(), "/out/b.txt".to_string()]
+        );
     }
 
     #[tokio::test]
