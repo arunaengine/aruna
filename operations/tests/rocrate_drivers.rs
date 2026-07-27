@@ -57,6 +57,10 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
+const ELABFTW: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/eln/elabftw.eln"
+));
 const BUCKET: &str = "rocrate-target";
 const TARGET_KEY: &str = "imported/data.txt";
 const SOURCE_KEY: &str = "sources/crate.zip";
@@ -166,6 +170,114 @@ async fn drivers_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     archive.by_name("data.txt")?.read_to_end(&mut payload)?;
     assert_eq!(payload, PAYLOAD);
     assert!(archive.by_name("ro-crate-metadata.json").is_ok());
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn imports_eln_export() -> Result<(), Box<dyn std::error::Error>> {
+    // The eLabFTW export identifies its folders and files with literal spaces.
+    let fixture = build_fixture(false).await?;
+    let document_id = Ulid::generate();
+    let upload_id = upload_media(&fixture, ELABFTW.to_vec(), RoCrateMediaType::Eln).await?;
+    let spec = import_spec(&fixture, upload_id, document_id);
+    let job_id = JobId::new();
+    let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let result = match run_rocrate_import(&context, &spec).await {
+        JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) => result,
+        JobRunOutcome::Failed(error) => {
+            return Err(format!("eln import failed: {}", error.message).into());
+        }
+        _ => return Err("eln import did not finish".into()),
+    };
+    assert_eq!(result.entries_total, 3);
+    assert_eq!(result.imported, 2);
+    assert_eq!(result.unlisted, 1);
+    assert_eq!(result.document_id, Some(document_id));
+    assert_eq!(
+        object_versions(
+            &fixture,
+            "imported/Demo - Gold-master-experiment - 4af4da4e/example.jpg"
+        )
+        .await?
+        .len(),
+        1
+    );
+    assert_eq!(
+        replay_metadata_event_log(fixture.context.as_ref()).await?,
+        1
+    );
+    assert_eq!(
+        process_metadata_materialization_batch(fixture.context.as_ref())
+            .await?
+            .processed,
+        1
+    );
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn imports_nested_folders() -> Result<(), Box<dyn std::error::Error>> {
+    // Mirrors an ELN export: wrapper directory, doubled separator, spaced ids.
+    let fixture = build_fixture(false).await?;
+    let document_id = Ulid::generate();
+    let upload_id = upload_media(&fixture, nested_eln().await?, RoCrateMediaType::Eln).await?;
+    let spec = import_spec(&fixture, upload_id, document_id);
+    let job_id = JobId::new();
+    let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let result = match run_rocrate_import(&context, &spec).await {
+        JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) => result,
+        JobRunOutcome::Failed(error) => {
+            return Err(format!("nested import failed: {}", error.message).into());
+        }
+        _ => return Err("nested import did not finish".into()),
+    };
+    assert_eq!(result.imported, 1);
+    assert_eq!(result.unlisted, 1);
+    assert_eq!(
+        object_versions(&fixture, "imported/Demo - Experiment - abc123/example.txt")
+            .await?
+            .len(),
+        1
+    );
+    assert_eq!(
+        replay_metadata_event_log(fixture.context.as_ref()).await?,
+        1
+    );
+    assert_eq!(
+        process_metadata_materialization_batch(fixture.context.as_ref())
+            .await?
+            .processed,
+        1
+    );
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn imports_mixed_encoding() -> Result<(), Box<dyn std::error::Error>> {
+    // One entity is encoded and referenced literally; the other is the reverse.
+    let fixture = build_fixture(false).await?;
+    let document_id = Ulid::generate();
+    let upload_id = create_upload(&fixture, mixed_archive().await?).await?;
+    let spec = import_spec(&fixture, upload_id, document_id);
+    let job_id = JobId::new();
+    let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let result = match run_rocrate_import(&context, &spec).await {
+        JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) => result,
+        JobRunOutcome::Failed(error) => {
+            return Err(format!("mixed-encoding import failed: {}", error.message).into());
+        }
+        _ => return Err("mixed-encoding import did not finish".into()),
+    };
+    assert_eq!(result.imported, 2);
+    for key in ["imported/data/a b.txt", "imported/data/c d.txt"] {
+        assert_eq!(object_versions(&fixture, key).await?.len(), 1, "{key}");
+    }
 
     fixture.stop().await;
     Ok(())
@@ -1133,6 +1245,14 @@ async fn create_upload(
     fixture: &Fixture,
     archive: Vec<u8>,
 ) -> Result<Ulid, Box<dyn std::error::Error>> {
+    upload_media(fixture, archive, RoCrateMediaType::Zip).await
+}
+
+async fn upload_media(
+    fixture: &Fixture,
+    archive: Vec<u8>,
+    media_type: RoCrateMediaType,
+) -> Result<Ulid, Box<dyn std::error::Error>> {
     let upload_id = Ulid::generate();
     let size = archive.len() as u64;
     let blob = BackendStream::<Result<Bytes, StreamError>>::new(stream::once(async move {
@@ -1165,7 +1285,7 @@ async fn create_upload(
         location,
         blake3,
         size: stored_size,
-        media_type: RoCrateMediaType::Zip,
+        media_type,
         expires_at_ms: unix_timestamp_millis().saturating_add(60_000),
         claimed_by: None,
     };
@@ -1470,6 +1590,105 @@ fn pair_json() -> String {
         ]
     })
     .to_string()
+}
+
+fn nested_json() -> String {
+    let folder = "./Demo - Experiment - abc123/";
+    serde_json::json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "about": {"@id": "./"}
+            },
+            {
+                "@id": "./",
+                "@type": "Dataset",
+                "name": "Nested fixture",
+                "description": "Folder datasets carrying spaces",
+                "datePublished": "2026-07-27",
+                "hasPart": [{"@id": folder}, {"@id": "./ -  - bb8b469d/"}]
+            },
+            {
+                "@id": folder,
+                "@type": "Dataset",
+                "name": "Experiment",
+                "hasPart": [{"@id": format!("{folder}example.txt")}]
+            },
+            {"@id": "./ -  - bb8b469d/", "@type": "Dataset", "name": "Untitled"},
+            {"@id": format!("{folder}example.txt"), "@type": "File", "name": "Example"}
+        ]
+    })
+    .to_string()
+}
+
+async fn nested_eln() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let wrapper = "2026-07-27-export";
+    let mut archive = async_zip::base::write::ZipFileWriter::new(Vec::new());
+    for (name, bytes) in [
+        (
+            format!("{wrapper}/ro-crate-metadata.json"),
+            nested_json().into_bytes(),
+        ),
+        (
+            // Exports in the wild double the separator after the folder name.
+            format!("{wrapper}/Demo - Experiment - abc123//example.txt"),
+            PAYLOAD.to_vec(),
+        ),
+        (
+            format!("{wrapper}/ro-crate-preview.html"),
+            b"<html></html>".to_vec(),
+        ),
+    ] {
+        archive
+            .write_entry_whole(
+                ZipEntryBuilder::new(name.into(), Compression::Deflate),
+                &bytes,
+            )
+            .await?;
+    }
+    Ok(archive.close().await?)
+}
+
+async fn mixed_archive() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let json = serde_json::json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "about": {"@id": "./"}
+            },
+            {
+                "@id": "./",
+                "@type": "Dataset",
+                "name": "Mixed fixture",
+                "description": "Identifiers and references disagree on encoding",
+                "datePublished": "2026-07-27",
+                "hasPart": [{"@id": "./data/a%20b.txt"}, {"@id": "./data/c d.txt"}]
+            },
+            {"@id": "./data/a b.txt", "@type": "File", "name": "Literal"},
+            {"@id": "./data/c%20d.txt", "@type": "File", "name": "Encoded"}
+        ]
+    })
+    .to_string();
+    let mut archive = async_zip::base::write::ZipFileWriter::new(Vec::new());
+    for (name, bytes) in [
+        ("ro-crate-metadata.json", json.into_bytes()),
+        ("data/a b.txt", PAYLOAD.to_vec()),
+        ("data/c d.txt", PAYLOAD.to_vec()),
+    ] {
+        archive
+            .write_entry_whole(
+                ZipEntryBuilder::new(name.to_string().into(), Compression::Deflate),
+                &bytes,
+            )
+            .await?;
+    }
+    Ok(archive.close().await?)
 }
 
 async fn pair_archive() -> Result<Vec<u8>, Box<dyn std::error::Error>> {

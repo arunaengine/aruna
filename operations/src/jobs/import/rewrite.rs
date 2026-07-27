@@ -4,6 +4,7 @@ use aruna_core::metadata::MetadataValidationViolation;
 use craqle::{CrateViolation, RoCrateError, UpdateError};
 use oxrdf::{NamedOrBlankNode, Term};
 use oxttl::NQuadsParser;
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 use url::Url;
@@ -13,6 +14,19 @@ use crate::jobs::rocrate_jsonld::{JsonLdKeywords, RDF_TYPE_IRI, is_file_type};
 const JSONLD_BASE_IRI: &str = "https://craqle.invalid/";
 const SCHEMA_CONTENT_IRI: &str = "http://schema.org/contentUrl";
 const LOCAL_PATH_IRI: &str = "https://w3id.org/ro/terms#localPath";
+/// ASCII characters an IRI cannot carry literally. `%` is excluded so an already
+/// encoded identifier normalizes to itself.
+const ID_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'<')
+    .add(b'>')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
 
 #[derive(Debug, Error)]
 pub enum CrateValidationError {
@@ -41,16 +55,20 @@ pub struct RewriteOutcome {
     pub warnings: Vec<String>,
 }
 
+/// Validates a crate and returns it with every identifier IRI-encoded.
+///
+/// Normalization happens on the document itself: an identifier that only a
+/// normalized copy makes valid would be dropped by the JSON-LD parser once the
+/// crate reaches the create path, orphaning everything behind it.
 pub fn validate_document(jsonld: &str) -> Result<ValidatedDocument, CrateValidationError> {
-    let value: Value = serde_json::from_str(jsonld)
+    let mut value: Value = serde_json::from_str(jsonld)
         .map_err(|error| CrateValidationError::Invalid(error.to_string()))?;
-    let mut validation = value.clone();
-    normalize_ids(&mut validation);
-    let validation = serde_json::to_string(&validation)
-        .map_err(|error| CrateValidationError::Invalid(error.to_string()))?;
-    let canonical = craqle::validate_rocrate_jsonld(&validation).map_err(map_validation_error)?;
-    let file_subjects = file_subjects(&canonical.nquads)?;
     let keywords = JsonLdKeywords::new(&value);
+    normalize_ids(&mut value, &keywords);
+    let normalized = serde_json::to_string(&value)
+        .map_err(|error| CrateValidationError::Invalid(error.to_string()))?;
+    let canonical = craqle::validate_rocrate_jsonld(&normalized).map_err(map_validation_error)?;
+    let file_subjects = file_subjects(&canonical.nquads)?;
     let mut file_ids = Vec::new();
     collect_file_ids(&value, &file_subjects, &keywords, &mut file_ids)?;
     Ok(ValidatedDocument { value, file_ids })
@@ -61,6 +79,7 @@ pub fn rewrite_document(
     targets: &HashMap<String, RewriteTarget>,
 ) -> Result<RewriteOutcome, CrateValidationError> {
     let keywords = JsonLdKeywords::new(&value);
+    let targets = expanded_targets(targets)?;
     let compact_content = keywords.term_matches(
         "contentUrl",
         &[
@@ -73,7 +92,7 @@ pub fn rewrite_document(
     let mut warnings = HashSet::new();
     rewrite_value(
         &mut value,
-        targets,
+        &targets,
         &keywords,
         compact_content,
         compact_path,
@@ -144,17 +163,48 @@ fn collect_file_ids(
     Ok(())
 }
 
-fn normalize_ids(value: &mut Value) {
+fn normalize_ids(value: &mut Value, keywords: &JsonLdKeywords) {
     match value {
-        Value::Array(values) => values.iter_mut().for_each(normalize_ids),
+        Value::Array(values) => values
+            .iter_mut()
+            .for_each(|value| normalize_ids(value, keywords)),
         Value::Object(object) => {
-            if let Some(Value::String(id)) = object.get_mut("@id") {
-                *id = id.replace(' ', "%20");
+            for (key, value) in object.iter_mut() {
+                if let Value::String(id) = value
+                    && keywords.is_id(key)
+                    && let Some(canonical) = canonical_id(id)
+                {
+                    *id = canonical;
+                }
+                normalize_ids(value, keywords);
             }
-            object.values_mut().for_each(normalize_ids);
         }
         _ => {}
     }
+}
+
+fn canonical_id(id: &str) -> Option<String> {
+    let canonical = utf8_percent_encode(id, ID_ENCODE_SET).to_string();
+    (canonical != id).then_some(canonical)
+}
+
+/// Keys every target by its resolved IRI, so an entity and the references to it
+/// still meet when they differ in `./` prefix or percent-encoding.
+fn expanded_targets(
+    targets: &HashMap<String, RewriteTarget>,
+) -> Result<HashMap<String, &RewriteTarget>, CrateValidationError> {
+    let mut expanded = HashMap::with_capacity(targets.len());
+    for (id, target) in targets {
+        expanded.insert(expanded_id(id)?, target);
+    }
+    Ok(expanded)
+}
+
+fn matching_target(targets: &HashMap<String, &RewriteTarget>, id: &str) -> Option<RewriteTarget> {
+    expanded_id(id)
+        .ok()
+        .and_then(|id| targets.get(&id))
+        .map(|target| (*target).clone())
 }
 
 fn expanded_id(id: &str) -> Result<String, CrateValidationError> {
@@ -170,7 +220,7 @@ fn expanded_id(id: &str) -> Result<String, CrateValidationError> {
 
 fn rewrite_value(
     value: &mut Value,
-    targets: &HashMap<String, RewriteTarget>,
+    targets: &HashMap<String, &RewriteTarget>,
     keywords: &JsonLdKeywords,
     compact_content: bool,
     compact_path: bool,
@@ -180,7 +230,7 @@ fn rewrite_value(
         Value::Array(values) => {
             for value in values {
                 if let Value::String(raw) = value
-                    && targets.contains_key(raw)
+                    && matching_target(targets, raw).is_some()
                 {
                     warnings.insert(raw.clone());
                 }
@@ -200,7 +250,7 @@ fn rewrite_value(
                 .map(|(key, id)| (key.to_string(), id.to_string()));
             if let Some((id_key, target)) = original_id
                 .as_ref()
-                .and_then(|(key, id)| targets.get(id).cloned().map(|target| (key, target)))
+                .and_then(|(key, id)| matching_target(targets, id).map(|target| (key, target)))
             {
                 object.insert(id_key.clone(), Value::String(target.w3id.clone()));
                 if object.len() > 1 {
@@ -230,7 +280,7 @@ fn rewrite_value(
                 }
                 if !keywords.is_id(key)
                     && let Value::String(raw) = value
-                    && targets.contains_key(raw)
+                    && matching_target(targets, raw).is_some()
                 {
                     warnings.insert(raw.clone());
                 }
@@ -438,6 +488,120 @@ mod tests {
             Err(CrateValidationError::Violations(violations))
                 if violations[0].code == "unsupported_crate_version"
         ));
+    }
+
+    fn target(name: &str) -> RewriteTarget {
+        RewriteTarget {
+            w3id: format!("https://w3id.org/aruna/data/arn:{name}"),
+            hash_w3id: format!("https://w3id.org/aruna/data/{}", "a".repeat(64)),
+            local_path: format!("data/{name}"),
+        }
+    }
+
+    #[test]
+    fn matches_mixed_ids() {
+        // One entity is encoded and referenced literally; the other is reversed.
+        let document = json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "about": {"@id": "./"},
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"}
+                },
+                {
+                    "@id": "./",
+                    "@type": "Dataset",
+                    "name": "test",
+                    "description": "test crate",
+                    "datePublished": "2026-07-27",
+                    "hasPart": [{"@id": "./data/a%20b.txt"}, {"@id": "./data/c d.txt"}]
+                },
+                {"@id": "./data/a b.txt", "@type": "File", "name": "a"},
+                {"@id": "./data/c%20d.txt", "@type": "File", "name": "c"}
+            ]
+        })
+        .to_string();
+
+        let validated = validate_document(&document).unwrap();
+        assert_eq!(
+            validated.file_ids,
+            vec![
+                "./data/a%20b.txt".to_string(),
+                "./data/c%20d.txt".to_string()
+            ]
+        );
+        let rewritten = rewrite_document(
+            validated.value,
+            &HashMap::from([
+                ("./data/a%20b.txt".to_string(), target("a")),
+                ("./data/c%20d.txt".to_string(), target("c")),
+            ]),
+        )
+        .unwrap();
+
+        let value: Value = serde_json::from_str(&rewritten.jsonld).unwrap();
+        assert_eq!(
+            value["@graph"][1]["hasPart"],
+            json!([
+                {"@id": "https://w3id.org/aruna/data/arn:a"},
+                {"@id": "https://w3id.org/aruna/data/arn:c"}
+            ])
+        );
+        assert!(craqle::validate_rocrate_jsonld(&rewritten.jsonld).is_ok());
+    }
+
+    #[test]
+    fn encodes_nested_ids() {
+        // A folder dataset whose id needs encoding must survive as written.
+        let folder = "./Demo - Experiment - abc123/";
+        let document = json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "about": {"@id": "./"},
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"}
+                },
+                {
+                    "@id": "./",
+                    "@type": "Dataset",
+                    "name": "test",
+                    "description": "test crate",
+                    "datePublished": "2026-07-27",
+                    "hasPart": [{"@id": folder}, {"@id": "./ -  - bb8b469d/"}]
+                },
+                {
+                    "@id": folder,
+                    "@type": "Dataset",
+                    "name": "folder",
+                    "hasPart": {"@id": format!("{folder}example.txt")}
+                },
+                {"@id": "./ -  - bb8b469d/", "@type": "Dataset", "name": "empty"},
+                {"@id": format!("{folder}example.txt"), "@type": "File", "name": "example"}
+            ]
+        })
+        .to_string();
+
+        let validated = validate_document(&document).unwrap();
+        let file_id = "./Demo%20-%20Experiment%20-%20abc123/example.txt";
+        assert_eq!(validated.file_ids, vec![file_id.to_string()]);
+        let rewritten = rewrite_document(
+            validated.value,
+            &HashMap::from([(file_id.to_string(), target("example"))]),
+        )
+        .unwrap();
+
+        let value: Value = serde_json::from_str(&rewritten.jsonld).unwrap();
+        assert_eq!(
+            value["@graph"][2]["@id"],
+            "./Demo%20-%20Experiment%20-%20abc123/"
+        );
+        assert_eq!(value["@graph"][3]["@id"], "./%20-%20%20-%20bb8b469d/");
+        // The emitted bytes must validate unaided: the create path normalizes nothing.
+        assert!(craqle::validate_rocrate_jsonld(&rewritten.jsonld).is_ok());
     }
 
     #[test]
