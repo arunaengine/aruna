@@ -39,6 +39,7 @@ use craqle::{
     CreateEntityRequest, DescribeRequest, GraphId, GraphPolicy, GraphSearchRequest,
     PatchEntityRequest, RoCrateError, SearchStorage, vocab,
 };
+use futures_util::FutureExt;
 use jsonwebtoken::DecodingKey;
 use oxrdf::{BlankNode, Dataset, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use serde::de::DeserializeOwned;
@@ -355,11 +356,6 @@ impl RegistryCacheEntry {
 struct LifecycleDeletedCacheEntry {
     deleted: bool,
     expires_at: Instant,
-}
-
-struct MetadataGraphDeletedRead {
-    deleted: bool,
-    cache_hit: bool,
 }
 
 struct VisibilityFillResult {
@@ -903,7 +899,7 @@ impl MetadataHandle {
                     .instrument(span.clone())
                     .await;
             match result {
-                Ok(read) if read.deleted => {
+                Ok(true) => {
                     span.record("deleted", true);
                     record_elapsed_ms(&span, "elapsed_ms", started);
                     match &effect {
@@ -931,7 +927,7 @@ impl MetadataHandle {
                         _ => {}
                     }
                 }
-                Ok(_) => {
+                Ok(false) => {
                     span.record("deleted", false);
                     record_elapsed_ms(&span, "elapsed_ms", started);
                 }
@@ -2185,22 +2181,16 @@ async fn metadata_graph_deleted(
     inner: Arc<MetadataInner>,
     storage_handle: StorageHandle,
     graph_iri: &str,
-) -> Result<MetadataGraphDeletedRead, MetadataError> {
+) -> Result<bool, MetadataError> {
     if let Some((true, _)) = inner.visibility_cache.lifecycle_deleted_any(graph_iri) {
-        return Ok(MetadataGraphDeletedRead {
-            deleted: true,
-            cache_hit: true,
-        });
+        return Ok(true);
     }
 
     let deleted = graph_lifecycle_deleted(storage_handle, graph_iri).await?;
     inner
         .visibility_cache
         .store_lifecycle_deleted(graph_iri.to_string(), deleted);
-    Ok(MetadataGraphDeletedRead {
-        deleted,
-        cache_hit: false,
-    })
+    Ok(deleted)
 }
 
 async fn graph_lifecycle_deleted(
@@ -5088,10 +5078,7 @@ async fn list_visible_graphs(inner: Arc<MetadataInner>) -> Result<Vec<String>, M
     let mut visible = Vec::with_capacity(graphs.len());
     for graph in graphs {
         let graph_iri = graph.as_str().to_string();
-        if !metadata_graph_deleted(inner.clone(), inner.storage_handle.clone(), &graph_iri)
-            .await?
-            .deleted
-        {
+        if !metadata_graph_deleted(inner.clone(), inner.storage_handle.clone(), &graph_iri).await? {
             visible.push(graph_iri);
         }
     }
@@ -5142,101 +5129,99 @@ async fn select_authorized_records(
     let span = Span::current();
     let started = Instant::now();
     let allowed_graphs = graph_filter.map(|graphs| graphs.into_iter().collect::<HashSet<_>>());
-    let mut visible = Vec::new();
-    let mut deleted_count = 0usize;
-    let mut filtered_count = 0usize;
-    let mut lifecycle_cache_hits = 0usize;
-    let mut lifecycle_cache_misses = 0usize;
-    let mut public_count = 0usize;
-    let mut private_checked_count = 0usize;
-    let mut denied_count = 0usize;
-    for record in records.iter() {
-        if let Some(filter) = allowed_graphs.as_ref()
-            && !filter.contains(&record.graph_iri)
-        {
-            filtered_count += 1;
-            continue;
-        }
-        if let Some(group_id) = group_id
-            && record.group_id != group_id
-        {
-            filtered_count += 1;
-            continue;
-        }
-        let deleted = metadata_graph_deleted(
-            inner.clone(),
-            inner.storage_handle.clone(),
-            &record.graph_iri,
-        )
+    let record_count = records.len();
+    // Filtering first keeps the scope resolution to the groups and lifecycle
+    // entries a filtered request can still see.
+    let candidates = filter_candidate_records(records, allowed_graphs.as_ref(), group_id);
+    let filtered_count = record_count - candidates.len();
+
+    // Boxed so the read paths that already resolve a scope do not nest this
+    // future again: the combined depth exceeds the auto-trait recursion limit.
+    let scope = resolve_graph_visibility_scope(&inner, auth_context, candidates)
+        .boxed()
         .await?;
-        if deleted.cache_hit {
-            lifecycle_cache_hits += 1;
-        } else {
-            lifecycle_cache_misses += 1;
-        }
-        if deleted.deleted {
-            deleted_count += 1;
+    let selection = select_visible_records(&scope, &inner.visibility_cache);
+    let evaluated = scope.records.len() as u64;
+    // Lifecycle is resolved once per request, so the cache counters report how
+    // the whole request was decided instead of per-record point reads.
+    let lifecycle_cached = matches!(scope.lifecycle_visibility, LifecycleVisibility::Cache);
+    span.record("visible_count", selection.visible.len() as u64);
+    span.record("deleted_count", selection.deleted as u64);
+    span.record("filtered_count", filtered_count as u64);
+    span.record(
+        "lifecycle_cache_hits",
+        if lifecycle_cached { evaluated } else { 0 },
+    );
+    span.record(
+        "lifecycle_cache_misses",
+        if lifecycle_cached { 0 } else { evaluated },
+    );
+    span.record("lifecycle_reads", 1u64);
+    span.record("public_count", selection.public as u64);
+    span.record("private_checked_count", selection.private as u64);
+    span.record("denied_count", selection.denied as u64);
+    record_elapsed_ms(&span, "elapsed_ms", started);
+    Ok(selection.visible)
+}
+
+fn filter_candidate_records(
+    records: Arc<Vec<MetadataRegistryRecord>>,
+    allowed_graphs: Option<&HashSet<String>>,
+    group_id: Option<GroupId>,
+) -> Arc<Vec<MetadataRegistryRecord>> {
+    if allowed_graphs.is_none() && group_id.is_none() {
+        return records;
+    }
+    Arc::new(
+        records
+            .iter()
+            .filter(|record| {
+                allowed_graphs.is_none_or(|graphs| graphs.contains(&record.graph_iri))
+                    && group_id.is_none_or(|group_id| record.group_id == group_id)
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
+struct RecordSelection {
+    visible: Vec<MetadataRegistryRecord>,
+    deleted: usize,
+    public: usize,
+    private: usize,
+    denied: usize,
+}
+
+// In-memory counterpart of the lazy scope decision: every record is decided
+// against the already resolved lifecycle snapshot and group rules.
+fn select_visible_records(
+    scope: &GraphVisibilityScope,
+    visibility_cache: &MetadataVisibilityCache,
+) -> RecordSelection {
+    let mut selection = RecordSelection {
+        visible: Vec::new(),
+        deleted: 0,
+        public: 0,
+        private: 0,
+        denied: 0,
+    };
+    for record in scope.records.iter() {
+        if scope.record_deleted(visibility_cache, &record.graph_iri) {
+            selection.deleted += 1;
             continue;
         }
         if record.public {
-            public_count += 1;
+            selection.public += 1;
         } else {
-            private_checked_count += 1;
+            selection.private += 1;
         }
-        if can_read_record_locally(inner.storage_handle.clone(), auth_context.clone(), record)
-            .await?
-        {
-            visible.push(record.clone());
+        if scope.permissions.record_visible(record) {
+            selection.visible.push(record.clone());
         } else {
-            denied_count += 1;
+            selection.denied += 1;
         }
     }
-    span.record("visible_count", visible.len() as u64);
-    span.record("deleted_count", deleted_count as u64);
-    span.record("filtered_count", filtered_count as u64);
-    span.record("lifecycle_cache_hits", lifecycle_cache_hits as u64);
-    span.record("lifecycle_cache_misses", lifecycle_cache_misses as u64);
-    span.record("lifecycle_reads", lifecycle_cache_misses as u64);
-    span.record("public_count", public_count as u64);
-    span.record("private_checked_count", private_checked_count as u64);
-    span.record("denied_count", denied_count as u64);
-    record_elapsed_ms(&span, "elapsed_ms", started);
-    Ok(visible)
-}
-
-async fn can_read_record_locally(
-    storage_handle: StorageHandle,
-    auth_context: Option<AuthContext>,
-    record: &MetadataRegistryRecord,
-) -> Result<bool, MetadataError> {
-    if record.public {
-        return Ok(true);
-    }
-    let Some(auth_context) = auth_context else {
-        return Ok(false);
-    };
-    if auth_context.realm_id != record.realm_id {
-        return Ok(false);
-    }
-
-    let context = DriverContext {
-        storage_handle,
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: None,
-        compute_handle: None,
-    };
-    drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context,
-            path: record.permission_path.clone(),
-            required_permission: Permission::READ,
-        }),
-        &context,
-    )
-    .await
-    .map_err(|error| MetadataError::Backend(error.to_string()))
+    selection
 }
 
 // All-metadata reads defer per-graph authorization to evaluation time: the
@@ -5263,35 +5248,32 @@ impl GraphVisibilityScope {
         registry_record_for_graph(&self.records, graph_iri)
     }
 
+    // A tombstone in the request's own snapshot or in the cache hides the graph.
+    fn record_deleted(&self, visibility_cache: &MetadataVisibilityCache, graph_iri: &str) -> bool {
+        if matches!(
+            visibility_cache.lifecycle_deleted_any(graph_iri),
+            Some((true, _))
+        ) {
+            return true;
+        }
+        match &self.lifecycle_visibility {
+            LifecycleVisibility::Cache => false,
+            LifecycleVisibility::FreshDeletedGraphs(deleted_graphs) => {
+                deleted_graphs.contains(graph_iri)
+            }
+        }
+    }
+
     fn record_visible(
         &self,
         visibility_cache: &MetadataVisibilityCache,
         record: &MetadataRegistryRecord,
     ) -> bool {
-        match &self.lifecycle_visibility {
-            LifecycleVisibility::Cache => {
-                if matches!(
-                    visibility_cache.lifecycle_deleted_any(&record.graph_iri),
-                    Some((true, _))
-                ) {
-                    return false;
-                }
-            }
-            LifecycleVisibility::FreshDeletedGraphs(deleted_graphs) => {
-                if deleted_graphs.contains(&record.graph_iri)
-                    || matches!(
-                        visibility_cache.lifecycle_deleted_any(&record.graph_iri),
-                        Some((true, _))
-                    )
-                {
-                    return false;
-                }
-            }
-        }
         // Rules are collected per group, but every record is decided on its own
         // permission path, so per-document grants and denials agree with the
         // decision `can_read_record` makes for the same caller and record.
-        self.permissions.record_visible(record)
+        !self.record_deleted(visibility_cache, &record.graph_iri)
+            && self.permissions.record_visible(record)
     }
 
     // Digest of every graph this scope may evaluate, in registry order.
@@ -6515,6 +6497,150 @@ mod tests {
         let cache = MetadataVisibilityCache::new();
         assert!(scope.graph_visible(&cache, &granted.graph_iri));
         assert!(!scope.graph_visible(&cache, &hidden.graph_iri));
+    }
+
+    fn scope_for(
+        mut records: Vec<MetadataRegistryRecord>,
+        permissions: GroupPermissionRules,
+    ) -> GraphVisibilityScope {
+        records.sort_unstable_by_key(|record| record.document_id);
+        GraphVisibilityScope {
+            records: Arc::new(records),
+            permissions,
+            lifecycle_visibility: LifecycleVisibility::Cache,
+        }
+    }
+
+    #[test]
+    fn selection_excludes_deleted() {
+        let live = registry_record("datasets/live");
+        let deleted = registry_record("datasets/deleted");
+        let cache = MetadataVisibilityCache::new();
+        cache.store_lifecycle_deleted(deleted.graph_iri.clone(), true);
+        let scope = scope_for(
+            vec![live.clone(), deleted.clone()],
+            GroupPermissionRules::default(),
+        );
+
+        let selection = select_visible_records(&scope, &cache);
+
+        assert_eq!(selection.deleted, 1);
+        assert_eq!(
+            selection
+                .visible
+                .iter()
+                .map(|record| record.graph_iri.clone())
+                .collect::<Vec<_>>(),
+            vec![live.graph_iri]
+        );
+    }
+
+    #[test]
+    fn selection_excludes_denied() {
+        // A per-document DENY under a group-wide grant hides only that document.
+        let realm = RealmId([7u8; 32]);
+        let group_id = Ulid::generate();
+        let secret = group_record(group_id, "datasets/secret");
+        let open = group_record(group_id, "datasets/open");
+        let rules = HashMap::from([(
+            group_id,
+            read_rules(&[
+                (
+                    format!("/{realm}/g/{group_id}/meta/**").as_str(),
+                    Permission::READ,
+                ),
+                (secret.permission_path.as_str(), Permission::DENY),
+            ]),
+        )]);
+        let scope = scope_for(
+            vec![secret.clone(), open.clone()],
+            GroupPermissionRules::from_groups(Some(realm), rules),
+        );
+
+        let selection = select_visible_records(&scope, &MetadataVisibilityCache::new());
+
+        assert_eq!(selection.denied, 1);
+        assert_eq!(selection.private, 2);
+        assert_eq!(selection.visible.len(), 1);
+        assert_eq!(selection.visible[0].graph_iri, open.graph_iri);
+    }
+
+    #[test]
+    fn narrow_grant_selected() {
+        let realm = RealmId([7u8; 32]);
+        let group_id = Ulid::generate();
+        let granted = group_record(group_id, "datasets/shared");
+        let hidden = group_record(group_id, "datasets/hidden");
+        let rules = HashMap::from([(
+            group_id,
+            read_rules(&[(granted.permission_path.as_str(), Permission::READ)]),
+        )]);
+        let scope = scope_for(
+            vec![granted.clone(), hidden.clone()],
+            GroupPermissionRules::from_groups(Some(realm), rules),
+        );
+
+        let selection = select_visible_records(&scope, &MetadataVisibilityCache::new());
+
+        assert_eq!(selection.visible.len(), 1);
+        assert_eq!(selection.visible[0].graph_iri, granted.graph_iri);
+        assert_eq!(selection.denied, 1);
+    }
+
+    #[test]
+    fn anonymous_sees_public() {
+        // Anonymous callers hold no rules, so only public records survive.
+        let public = registry_record("datasets/public");
+        let private = group_record(Ulid::generate(), "datasets/private");
+        let scope = scope_for(
+            vec![public.clone(), private.clone()],
+            GroupPermissionRules::default(),
+        );
+
+        let selection = select_visible_records(&scope, &MetadataVisibilityCache::new());
+
+        assert_eq!(selection.public, 1);
+        assert_eq!(selection.denied, 1);
+        assert_eq!(selection.visible.len(), 1);
+        assert_eq!(selection.visible[0].graph_iri, public.graph_iri);
+    }
+
+    #[test]
+    fn filters_restrict_candidates() {
+        let group_id = Ulid::generate();
+        let wanted = group_record(group_id, "datasets/wanted");
+        let same_group = group_record(group_id, "datasets/sibling");
+        let other_group = group_record(Ulid::generate(), "datasets/other");
+        let records = Arc::new(vec![
+            wanted.clone(),
+            same_group.clone(),
+            other_group.clone(),
+        ]);
+
+        let by_graph = filter_candidate_records(
+            records.clone(),
+            Some(&HashSet::from([wanted.graph_iri.clone()])),
+            None,
+        );
+        assert_eq!(by_graph.len(), 1);
+        assert_eq!(by_graph[0].graph_iri, wanted.graph_iri);
+
+        let by_group = filter_candidate_records(records.clone(), None, Some(group_id));
+        assert_eq!(by_group.len(), 2);
+        assert!(by_group.iter().all(|record| record.group_id == group_id));
+
+        let combined = filter_candidate_records(
+            records.clone(),
+            Some(&HashSet::from([
+                wanted.graph_iri.clone(),
+                other_group.graph_iri.clone(),
+            ])),
+            Some(group_id),
+        );
+        assert_eq!(combined.len(), 1);
+        assert_eq!(combined[0].graph_iri, wanted.graph_iri);
+
+        assert_eq!(filter_candidate_records(records, None, None).len(), 3);
     }
 
     #[test]
