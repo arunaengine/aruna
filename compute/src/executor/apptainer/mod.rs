@@ -58,13 +58,12 @@ impl ApptainerBackend {
             return Ok(to_status(&directory, status));
         }
         if let Some(payload) = read_optional::<PayloadRecord>(&directory.join("payload.json"))? {
-            if runtime::process_live(&payload.process)? {
-                return Ok(running_status(&directory));
+            let running = running_status(&directory, payload.started_at_ms);
+            if runtime::process_live(&payload.process)? || !runtime::cgroup_empty(&payload.cgroup)?
+            {
+                return Ok(running);
             }
-            if !runtime::cgroup_empty(&payload.cgroup)? {
-                return Ok(running_status(&directory));
-            }
-            return settle_status(&directory, running_status(&directory));
+            return settle_status(&directory, running);
         }
         if directory.join("supervisor.json").exists() {
             return settle_status(&directory, submitted_status(&directory));
@@ -1029,11 +1028,11 @@ fn submitted_status(directory: &Path) -> AttemptStatus {
     }
 }
 
-fn running_status(directory: &Path) -> AttemptStatus {
+fn running_status(directory: &Path, started_at_ms: Option<u64>) -> AttemptStatus {
     AttemptStatus {
         phase: AttemptPhase::Running,
         backend_ref: directory.display().to_string(),
-        started_at_ms: None,
+        started_at_ms,
         finished_at_ms: None,
     }
 }
@@ -1303,6 +1302,7 @@ mod tests {
             &PayloadRecord {
                 process: dead_record(),
                 cgroup: backend.cgroup_path(context),
+                started_at_ms: Some(1),
             },
         )
         .unwrap();
@@ -1363,7 +1363,7 @@ mod tests {
         )
         .unwrap();
 
-        let status = settle_status(root.path(), running_status(root.path())).unwrap();
+        let status = settle_status(root.path(), running_status(root.path(), Some(1))).unwrap();
 
         assert!(matches!(status.phase, AttemptPhase::Exited { code: 0 }));
     }

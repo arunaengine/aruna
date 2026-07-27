@@ -18,10 +18,12 @@ use json_patch::Patch as JsonPatch;
 use k8s_openapi::api::authorization::v1::SelfSubjectAccessReview;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{
-    ConfigMap, Namespace, PersistentVolume, PersistentVolumeClaim, Pod, Secret, ServiceAccount,
+    ConfigMap, ContainerState, Namespace, PersistentVolume, PersistentVolumeClaim, Pod, Secret,
+    ServiceAccount,
 };
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::api::storage::v1::{CSIDriver, StorageClass};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use k8s_openapi::jiff::Timestamp;
 use kube::api::{
     Api, AttachParams, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams,
@@ -606,23 +608,34 @@ impl KubernetesBackend {
         let mut status = job_status(job);
         if status.is_terminal() {
             let pods = self.task_pods(context).await?;
-            if let Some(terminated) = pods.iter().find_map(|pod| {
-                pod.status
-                    .as_ref()
-                    .and_then(|status| status.container_statuses.as_ref())
-                    .and_then(|statuses| statuses.iter().find(|status| status.name == "task"))
-                    .and_then(|status| status.state.as_ref())
-                    .and_then(|state| state.terminated.as_ref())
-            }) {
+            if let Some(terminated) = pods
+                .iter()
+                .find_map(|pod| task_state(pod)?.terminated.as_ref())
+            {
                 status.phase = AttemptPhase::Exited {
                     code: terminated.exit_code,
                 };
+                // A failed Job carries no completionTime, so the container is the
+                // only terminal timing evidence.
+                status.started_at_ms = status
+                    .started_at_ms
+                    .or_else(|| time_ms(terminated.started_at.as_ref()));
+                status.finished_at_ms = status
+                    .finished_at_ms
+                    .or_else(|| time_ms(terminated.finished_at.as_ref()));
             }
-        } else if job_pending(job) {
+            return Ok(status);
+        }
+        let pending = job_pending(job);
+        if !pending && status.started_at_ms.is_some() {
+            return Ok(status);
+        }
+        // Costs one extra Pod list per poll until a start time is observed: the
+        // Job reports startTime only once its controller has processed the Job.
+        let pods = self.task_pods(context).await?;
+        if pending {
             let now = Timestamp::now();
-            if let Some(reason) = self
-                .task_pods(context)
-                .await?
+            if let Some(reason) = pods
                 .iter()
                 .find_map(|pod| pod_stuck_reason(pod, self.config.pull_deadline, now))
             {
@@ -632,8 +645,12 @@ impl KubernetesBackend {
                     "failing attempt whose container cannot start"
                 );
                 status.phase = AttemptPhase::Failed { reason };
+                return Ok(status);
             }
         }
+        status.started_at_ms = status
+            .started_at_ms
+            .or_else(|| pods.iter().find_map(pod_started));
         Ok(status)
     }
 
@@ -1546,12 +1563,17 @@ fn job_status(job: &Job) -> AttemptStatus {
     } else {
         AttemptPhase::Submitted
     };
+    let times = job.status.as_ref();
     AttemptStatus {
         phase,
         backend_ref: job.metadata.uid.clone().unwrap_or_else(|| job.name_any()),
-        started_at_ms: None,
-        finished_at_ms: None,
+        started_at_ms: time_ms(times.and_then(|status| status.start_time.as_ref())),
+        finished_at_ms: time_ms(times.and_then(|status| status.completion_time.as_ref())),
     }
+}
+
+fn time_ms(time: Option<&Time>) -> Option<u64> {
+    u64::try_from(time?.0.as_millisecond()).ok()
 }
 
 /// Active but unready Pods are the only ones that can hold a stuck container.
@@ -1605,12 +1627,28 @@ fn pod_stuck_reason(pod: &Pod, deadline: Duration, now: Timestamp) -> Option<Str
 
 /// Log reads only succeed once the task container has left its waiting state.
 fn task_started(pod: &Pod) -> bool {
+    task_state(pod).is_some_and(|state| state.running.is_some() || state.terminated.is_some())
+}
+
+fn task_state(pod: &Pod) -> Option<&ContainerState> {
     pod.status
+        .as_ref()?
+        .container_statuses
+        .as_ref()?
+        .iter()
+        .find(|status| status.name == "task")?
+        .state
         .as_ref()
-        .and_then(|status| status.container_statuses.as_ref())
-        .and_then(|statuses| statuses.iter().find(|status| status.name == "task"))
-        .and_then(|status| status.state.as_ref())
-        .is_some_and(|state| state.running.is_some() || state.terminated.is_some())
+}
+
+/// The container start survives its exit, so both states carry the evidence.
+fn pod_started(pod: &Pod) -> Option<u64> {
+    let state = task_state(pod)?;
+    match (state.running.as_ref(), state.terminated.as_ref()) {
+        (Some(running), _) => time_ms(running.started_at.as_ref()),
+        (None, Some(terminated)) => time_ms(terminated.started_at.as_ref()),
+        (None, None) => None,
+    }
 }
 
 fn job_epoch(job: &Job) -> Result<u64, BackendError> {
@@ -2462,6 +2500,70 @@ mod tests {
             None
         );
         assert!(task_started(&pod));
+    }
+
+    #[test]
+    fn maps_job_times() {
+        // Without these the task log has no duration and the walltime cap has
+        // no anchor.
+        let job: Job = serde_json::from_value(json!({
+            "apiVersion":"batch/v1","kind":"Job",
+            "metadata":{"name":"aruna-job-a1","namespace":"compute","uid":"job-uid"},
+            "status":{
+                "startTime":POD_START,
+                "completionTime":"2027-01-01T00:01:00Z",
+                "conditions":[{"type":"Complete","status":"True"}]
+            }
+        }))
+        .expect("build job");
+
+        let status = job_status(&job);
+
+        assert_eq!(status.phase, AttemptPhase::Exited { code: 0 });
+        assert_eq!(
+            status.started_at_ms,
+            u64::try_from(probe_now(0).as_millisecond()).ok()
+        );
+        assert_eq!(
+            status.finished_at_ms,
+            u64::try_from(probe_now(60).as_millisecond()).ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn status_uses_pod_start() {
+        // The Job publishes startTime only once its controller processed it, so
+        // the running container is the earlier evidence.
+        let client = fake_client(|method, path| match (method, path) {
+            ("GET", "/apis/batch/v1/namespaces/compute/jobs/aruna-job-a1") => {
+                let mut job = job_json("running");
+                job["status"] = json!({"active": 1, "ready": 1});
+                (200, job)
+            }
+            ("GET", "/api/v1/namespaces/compute/pods") => {
+                let pod = task_pod(json!({"running":{"startedAt":POD_START}}), POD_START);
+                (
+                    200,
+                    json!({
+                        "apiVersion":"v1","kind":"PodList","metadata":{},
+                        "items":[serde_json::to_value(pod).expect("encode running pod")]
+                    }),
+                )
+            }
+            _ => (404, status_json(404)),
+        });
+        let backend = KubernetesBackend {
+            client,
+            config: test_config(),
+        };
+
+        let status = backend.status(&context()).await.unwrap();
+
+        assert_eq!(status.phase, AttemptPhase::Running);
+        assert_eq!(
+            status.started_at_ms,
+            u64::try_from(probe_now(0).as_millisecond()).ok()
+        );
     }
 
     fn stuck_list() -> Value {
