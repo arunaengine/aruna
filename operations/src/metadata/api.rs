@@ -51,6 +51,7 @@ use crate::get_realm_nodes::GetRealmNodesOperation;
 use crate::list_groups::ListGroupOperation;
 use crate::list_metadata_documents::ListMetadataDocumentsOperation;
 use crate::metadata::repository::{LIST_METADATA_PAGE_SIZE, StorageReadError};
+use crate::permission_rules::GroupPermissionRules;
 use crate::placement::resolve_shard_holders;
 use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, SearchBucketsOperation};
 
@@ -367,30 +368,32 @@ pub async fn list_visible_metadata_documents(
         });
     }
 
-    // Group-granular estimate: one permission probe per group, reused for every
-    // record in it, so counting never pays a per-document check. A targeted
-    // lookup skips the whole scan and reports the estimate as unknown.
+    // One rule collection (a read per distinct group) replaces the per-record
+    // permission drives; `record_visible` mirrors `can_read_record` for the
+    // same caller and record, so every later check is pure memory.
+    let auth = request
+        .auth
+        .as_ref()
+        .filter(|auth| auth.realm_id == realm_id);
+    let permissions = GroupPermissionRules::collect(
+        context,
+        auth,
+        records
+            .iter()
+            .filter(|record| record.realm_id == realm_id)
+            .map(|record| record.group_id),
+    )
+    .await;
+
     let mut total_estimate = None;
     if limit >= METADATA_ESTIMATE_MIN_LIMIT {
-        let mut group_reads = HashMap::new();
-        let mut matching = 0usize;
-        for record in &records {
-            if !metadata_record_matches_filters(record, request.path_prefix.as_deref()) {
-                continue;
-            }
-            if record.public
-                || group_read_allowed(
-                    context,
-                    realm_id,
-                    request.auth.as_ref(),
-                    record,
-                    &mut group_reads,
-                )
-                .await?
-            {
-                matching += 1;
-            }
-        }
+        let matching = records
+            .iter()
+            .filter(|record| {
+                metadata_record_matches_filters(record, request.path_prefix.as_deref())
+            })
+            .filter(|record| permissions.record_visible(record))
+            .count();
         total_estimate = Some(matching);
     }
 
@@ -401,7 +404,7 @@ pub async fn list_visible_metadata_documents(
         if !metadata_record_matches_filters(&record, request.path_prefix.as_deref()) {
             continue;
         }
-        if !can_read_record(context, realm_id, request.auth.as_ref(), &record).await? {
+        if !permissions.record_visible(&record) {
             continue;
         }
         visible_count += 1;
@@ -1211,23 +1214,6 @@ async fn can_read_record(
         Ok(allowed) => Ok(allowed),
         Err(_) => Ok(false),
     }
-}
-
-/// Probes read access once per group, using the first non-public record met
-/// there as the representative path, and reuses that answer for the group.
-async fn group_read_allowed(
-    context: &DriverContext,
-    realm_id: RealmId,
-    auth: Option<&AuthContext>,
-    record: &MetadataRegistryRecord,
-    probes: &mut HashMap<GroupId, bool>,
-) -> Result<bool, MetadataApiError> {
-    if let Some(&allowed) = probes.get(&record.group_id) {
-        return Ok(allowed);
-    }
-    let allowed = can_read_record(context, realm_id, auth, record).await?;
-    probes.insert(record.group_id, allowed);
-    Ok(allowed)
 }
 
 async fn ensure_permission(
@@ -2380,9 +2366,13 @@ mod tests {
     use std::collections::BTreeMap;
 
     use aruna_core::UserId;
+    use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::metadata::MetadataCreateEventPayload;
     use aruna_core::storage_entries::metadata_create_event_and_pending_projection_write_entries;
-    use aruna_core::structs::PlacementRef;
+    use aruna_core::structs::{
+        Actor, GroupAuthorizationDocument, PlacementRef, RealmAuthorizationDocument, Role,
+    };
+    use aruna_core::types::{Key, RoleId};
     use aruna_storage::storage;
     use tempfile::{TempDir, tempdir};
 
@@ -2688,7 +2678,7 @@ mod tests {
         assert_eq!(browse.total_estimate, Some(3));
     }
 
-    // Anonymous callers resolve no group probe, so only public records count.
+    // Anonymous callers collect no rules, so only public records count.
     #[tokio::test]
     async fn estimate_skips_private() {
         let test = metadata_test();
@@ -2710,6 +2700,231 @@ mod tests {
         assert_eq!(result.documents.len(), 1);
         assert_eq!(result.documents[0].record.document_id, readable.document_id);
         assert_eq!(result.total_estimate, Some(1));
+    }
+
+    fn auth_for(user_id: UserId) -> AuthContext {
+        AuthContext {
+            user_id,
+            realm_id: TEST_REALM_ID,
+            path_restrictions: None,
+        }
+    }
+
+    fn user_role(
+        user_id: UserId,
+        permissions: HashMap<String, Permission>,
+    ) -> HashMap<RoleId, Role> {
+        let role_id = Ulid::generate();
+        HashMap::from([(
+            role_id,
+            Role {
+                role_id,
+                name: "listing".to_string(),
+                permissions,
+                assigned_users: HashSet::from([user_id]),
+            },
+        )])
+    }
+
+    // The rules collection reads both documents; without them a group yields no
+    // rules and every non-public record in it stays hidden.
+    async fn write_auth_docs(test: &MetadataTest, group_id: GroupId, roles: HashMap<RoleId, Role>) {
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+            user_id: UserId::local(Ulid::generate(), TEST_REALM_ID),
+            realm_id: TEST_REALM_ID,
+        };
+        let realm_doc = RealmAuthorizationDocument::new_default_realm_doc(TEST_REALM_ID);
+        let group_doc = GroupAuthorizationDocument { group_id, roles };
+        let entries = [
+            (
+                Key::from(*TEST_REALM_ID.as_bytes()),
+                realm_doc.to_bytes(&actor).expect("realm doc encodes"),
+            ),
+            (
+                Key::from(group_id.to_bytes()),
+                group_doc.to_bytes(&actor).expect("group doc encodes"),
+            ),
+        ];
+        for (key, value) in entries {
+            match test
+                .context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: AUTH_KEYSPACE.to_string(),
+                    key,
+                    value: value.into(),
+                    txn_id: None,
+                })
+                .await
+            {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {}
+                other => panic!("unexpected write event: {other:?}"),
+            }
+        }
+    }
+
+    // A caller who holds no role in the group sees the public records only, and
+    // the counts describe the visible set rather than the scanned one.
+    #[tokio::test]
+    async fn stranger_sees_public() {
+        let test = metadata_test();
+        let group_id = Ulid::generate();
+        let stranger = UserId::local(Ulid::generate(), TEST_REALM_ID);
+        write_auth_docs(
+            &test,
+            group_id,
+            user_role(
+                UserId::local(Ulid::generate(), TEST_REALM_ID),
+                HashMap::from([(
+                    format!("/{TEST_REALM_ID}/g/{group_id}/**"),
+                    Permission::WRITE,
+                )]),
+            ),
+        )
+        .await;
+        let visible = public_record(group_id, Ulid::generate());
+        seed_registry_cache(&test, &visible).await;
+        for _ in 0..2 {
+            let mut hidden = public_record(group_id, Ulid::generate());
+            hidden.public = false;
+            seed_registry_cache(&test, &hidden).await;
+        }
+
+        let page = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            ListVisibleMetadataDocumentsRequest {
+                auth: Some(auth_for(stranger)),
+                ..summary_request(group_id, false)
+            },
+        )
+        .await
+        .expect("listing succeeds");
+        assert_eq!(listed_ids(&page), vec![visible.document_id]);
+        assert_eq!(page.total_returned, 1);
+        assert_eq!(page.total_estimate, Some(1));
+
+        let beyond = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            ListVisibleMetadataDocumentsRequest {
+                offset: Some(1),
+                auth: Some(auth_for(stranger)),
+                ..summary_request(group_id, false)
+            },
+        )
+        .await
+        .expect("listing succeeds");
+        assert!(beyond.documents.is_empty());
+        assert_eq!(beyond.total_returned, 0);
+        assert_eq!(beyond.total_estimate, Some(1));
+    }
+
+    // An unauthenticated caller must not inherit a member's grants.
+    #[tokio::test]
+    async fn anonymous_sees_public() {
+        let test = metadata_test();
+        let group_id = Ulid::generate();
+        let member = UserId::local(Ulid::generate(), TEST_REALM_ID);
+        write_auth_docs(
+            &test,
+            group_id,
+            user_role(
+                member,
+                HashMap::from([(
+                    format!("/{TEST_REALM_ID}/g/{group_id}/meta/**"),
+                    Permission::READ,
+                )]),
+            ),
+        )
+        .await;
+        let visible = public_record(group_id, Ulid::generate());
+        seed_registry_cache(&test, &visible).await;
+        let mut hidden = public_record(group_id, Ulid::generate());
+        hidden.public = false;
+        seed_registry_cache(&test, &hidden).await;
+
+        let anonymous = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            summary_request(group_id, false),
+        )
+        .await
+        .expect("listing succeeds");
+        assert_eq!(listed_ids(&anonymous), vec![visible.document_id]);
+        assert_eq!(anonymous.total_estimate, Some(1));
+
+        let signed = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            ListVisibleMetadataDocumentsRequest {
+                auth: Some(auth_for(member)),
+                ..summary_request(group_id, false)
+            },
+        )
+        .await
+        .expect("listing succeeds");
+        assert_eq!(signed.total_returned, 2);
+        assert_eq!(signed.total_estimate, Some(2));
+    }
+
+    // A per-document DENY inside a group-wide grant: the estimate must decide
+    // each document, not reuse one representative answer for the whole group.
+    #[tokio::test]
+    async fn estimate_counts_exact() {
+        let test = metadata_test();
+        let group_id = Ulid::generate();
+        let member = UserId::local(Ulid::generate(), TEST_REALM_ID);
+        let mut allowed = public_record(group_id, Ulid::generate());
+        allowed.public = false;
+        let mut denied = public_record(group_id, Ulid::generate());
+        denied.public = false;
+        write_auth_docs(
+            &test,
+            group_id,
+            user_role(
+                member,
+                HashMap::from([
+                    (
+                        format!("/{TEST_REALM_ID}/g/{group_id}/meta/**"),
+                        Permission::READ,
+                    ),
+                    (denied.permission_path.clone(), Permission::DENY),
+                ]),
+            ),
+        )
+        .await;
+        seed_registry_cache(&test, &allowed).await;
+        seed_registry_cache(&test, &denied).await;
+
+        let page = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            ListVisibleMetadataDocumentsRequest {
+                auth: Some(auth_for(member)),
+                ..summary_request(group_id, false)
+            },
+        )
+        .await
+        .expect("listing succeeds");
+        assert_eq!(listed_ids(&page), vec![allowed.document_id]);
+        assert_eq!(page.total_estimate, Some(1));
+
+        // A targeted lookup still reports no estimate for the same caller.
+        let lookup = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            ListVisibleMetadataDocumentsRequest {
+                limit: Some(METADATA_ESTIMATE_MIN_LIMIT - 1),
+                auth: Some(auth_for(member)),
+                ..summary_request(group_id, false)
+            },
+        )
+        .await
+        .expect("listing succeeds");
+        assert_eq!(lookup.total_returned, 1);
+        assert_eq!(lookup.total_estimate, None);
     }
 
     // path_prefix must scope the estimate to the same set the page came from.
