@@ -37,7 +37,7 @@ use craqle::{
     Authorizer as CraqleAuthorizer, Batch, CraqleError, CraqleFjallPersistMode,
     CraqleIrokleOptions, CraqleNode, CraqleOptions, CraqleRequestDurability, CreateCrateRequest,
     CreateEntityRequest, DescribeRequest, GraphId, GraphPolicy, GraphSearchRequest,
-    PatchEntityRequest, RoCrateError, SearchStorage, vocab,
+    PatchEntityRequest, RoCrateError, SearchRequest, SearchStorage, vocab,
 };
 use futures_util::FutureExt;
 use jsonwebtoken::DecodingKey;
@@ -59,7 +59,7 @@ use super::query_cache::{
     CachedQuery, LocalScopeKind, MetadataQueryCache, ScopeDigest, graphs_digest, local_key,
 };
 use super::repository::{REGISTRY_FILL_PAGE_SIZE, iter_all_registry_effect, parse_registry_iter};
-use super::search_cursor::METADATA_SEARCH_MAX_PAGINATION_DEPTH;
+use super::search_cursor::{METADATA_SEARCH_MAX_PAGINATION_DEPTH, compare_hits};
 use super::search_enrichment::{hit_snippet, hit_title};
 use super::summary_cache::summary_cache;
 use crate::auth::{
@@ -4828,6 +4828,8 @@ fn snapshot_iri_references(
         graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
         registry_records = field::Empty,
         authorized_graphs = field::Empty,
+        readable_groups = field::Empty,
+        lazy = field::Empty,
         registry_ms = field::Empty,
         authorization_ms = field::Empty,
         craqle_search_ms = field::Empty,
@@ -4850,6 +4852,161 @@ async fn search_local_graphs(
     let total_started = Instant::now();
 
     let records = list_registry_records_for_local_read(inner.clone(), &span).await?;
+    // Without a candidate filter the request spans the realm, so craqle
+    // authorizes the index hits it returns instead of every visible graph.
+    let lazy = iri_filter.is_none() && graph_iris.is_none() && group_id.is_none();
+    span.record("lazy", lazy);
+
+    let result = if lazy {
+        search_realm_scope(inner, auth_context, records, query, limit, &span).await
+    } else {
+        search_candidate_graphs(
+            inner,
+            auth_context,
+            records,
+            graph_iris,
+            query,
+            limit,
+            group_id,
+            iri_filter,
+            &span,
+        )
+        .await
+    };
+
+    match &result {
+        Ok(hits) => {
+            span.record("result", "ok");
+            span.record("hit_count", hits.len() as u64);
+        }
+        Err(error) => record_error(&span, &error.to_string()),
+    }
+    record_elapsed_ms(&span, "elapsed_ms", total_started);
+    result
+}
+
+fn record_backend_search(
+    span: &Span,
+    search_span: &Span,
+    started: Instant,
+    result: &Result<Vec<MetadataSearchHit>, MetadataError>,
+) {
+    let elapsed = started.elapsed();
+    record_duration_ms(search_span, "elapsed_ms", elapsed);
+    record_duration_ms(span, "craqle_search_ms", elapsed);
+    match result {
+        Ok(hits) => {
+            search_span.record("result", "ok");
+            search_span.record("hit_count", hits.len() as u64);
+        }
+        Err(error) => record_error(search_span, &error.to_string()),
+    }
+    warn_if_slow_metadata_backend("search", None, elapsed);
+}
+
+async fn search_realm_scope(
+    inner: Arc<MetadataInner>,
+    auth_context: Option<AuthContext>,
+    records: Arc<Vec<MetadataRegistryRecord>>,
+    query: String,
+    limit: usize,
+    span: &Span,
+) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+    let authorization_started = Instant::now();
+    let scope = resolve_graph_visibility_scope(&inner, auth_context, records)
+        .boxed()
+        .await?;
+    record_elapsed_ms(span, "authorization_ms", authorization_started);
+    span.record("readable_groups", scope.permissions.group_count() as u64);
+    if limit == 0 || scope.records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let search_span = debug_span!(
+        "metadata.backend.craqle.search",
+        lazy = true,
+        query_len = query.len() as u64,
+        limit = limit as u64,
+        elapsed_ms = field::Empty,
+        result = field::Empty,
+        hit_count = field::Empty,
+    );
+    let blocking_span = search_span.clone();
+    let search_started = Instant::now();
+    let _permit = inner.craqle_read_permits.clone().acquire_owned().await.ok();
+    let result = match tokio::task::spawn_blocking(move || {
+        blocking_span.in_scope(|| search_visible_scope(&inner, &scope, &query, limit))
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(MetadataError::TaskJoin(error.to_string())),
+    };
+    record_backend_search(span, &search_span, search_started, &result);
+    result
+}
+
+// Craqle post-filters the index hits it returns through the request's already
+// resolved scope, so the work scales with the page instead of the realm.
+fn search_visible_scope(
+    inner: &MetadataInner,
+    scope: &GraphVisibilityScope,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+    let authorizer = ScopeAuthorizer {
+        scope,
+        visibility_cache: &inner.visibility_cache,
+    };
+    let hits = inner
+        .node
+        .search(&authorizer, SearchRequest { query, limit })
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    let mut visible = Vec::with_capacity(hits.len().min(limit));
+    for hit in hits {
+        let Some(record) = scope.record_for_graph(&hit.graph_id) else {
+            continue;
+        };
+        // Enrichment is best-effort: a pending or raced projection must never
+        // fail the search, so fall back to an empty property set.
+        let properties = inner
+            .node
+            .describe_subject(
+                &authorizer,
+                DescribeRequest {
+                    graph: &GraphId::new(&hit.graph_id),
+                    subject_id: &hit.subject_iri,
+                },
+            )
+            .map(decode_hit_properties)
+            .unwrap_or_default();
+        visible.push(metadata_search_hit_from_craqle(
+            hit,
+            record,
+            &properties,
+            query,
+        ));
+    }
+    // The unfiltered entry point returns raw index order; the search cursor's
+    // watermark needs the merged score-descending order instead.
+    visible.sort_by(compare_hits);
+    Ok(visible)
+}
+
+// Requests narrowed by graph, group, or IRI filter keep a genuine candidate
+// set, so pre-filtering it stays cheaper than post-filtering the whole index.
+#[allow(clippy::too_many_arguments)]
+async fn search_candidate_graphs(
+    inner: Arc<MetadataInner>,
+    auth_context: Option<AuthContext>,
+    records: Arc<Vec<MetadataRegistryRecord>>,
+    graph_iris: Option<Vec<String>>,
+    query: String,
+    limit: usize,
+    group_id: Option<GroupId>,
+    iri_filter: Option<(String, String)>,
+    span: &Span,
+) -> Result<Vec<MetadataSearchHit>, MetadataError> {
     let iri_matches = match iri_filter.as_ref() {
         Some((predicate_iri, object_iri)) => Some(
             super::iri_index::lookup_metadata_iri_references(
@@ -4877,13 +5034,10 @@ async fn search_local_graphs(
     let allowed_records =
         select_authorized_records(inner.clone(), auth_context, records, graph_iris, group_id)
             .await?;
-    record_elapsed_ms(&span, "authorization_ms", authorization_started);
+    record_elapsed_ms(span, "authorization_ms", authorization_started);
     span.record("authorized_graphs", allowed_records.len() as u64);
 
     if limit == 0 || allowed_records.is_empty() {
-        span.record("result", "ok");
-        span.record("hit_count", 0u64);
-        record_elapsed_ms(&span, "elapsed_ms", total_started);
         return Ok(Vec::new());
     }
 
@@ -4940,9 +5094,6 @@ async fn search_local_graphs(
             Ok(hits) => hits,
             Err(error) => return Err(MetadataError::TaskJoin(error.to_string())),
         };
-        span.record("result", "ok");
-        span.record("hit_count", hits.len() as u64);
-        record_elapsed_ms(&span, "elapsed_ms", total_started);
         return Ok(hits);
     }
 
@@ -5020,23 +5171,7 @@ async fn search_local_graphs(
         Ok(result) => result,
         Err(error) => Err(MetadataError::TaskJoin(error.to_string())),
     };
-    let search_elapsed = search_started.elapsed();
-    record_duration_ms(&search_span, "elapsed_ms", search_elapsed);
-    record_duration_ms(&span, "craqle_search_ms", search_elapsed);
-    match &result {
-        Ok(hits) => {
-            search_span.record("result", "ok");
-            span.record("result", "ok");
-            search_span.record("hit_count", hits.len() as u64);
-            span.record("hit_count", hits.len() as u64);
-        }
-        Err(error) => {
-            record_error(&search_span, &error.to_string());
-            record_error(&span, &error.to_string());
-        }
-    }
-    warn_if_slow_metadata_backend("search", None, search_elapsed);
-    record_elapsed_ms(&span, "elapsed_ms", total_started);
+    record_backend_search(span, &search_span, search_started, &result);
     result
 }
 
@@ -5056,6 +5191,38 @@ impl CraqleAuthorizer for AllowedGraphAuthorizer {
         action: CraqleAction,
     ) -> Result<(), CraqleAuthError> {
         if matches!(action, CraqleAction::Read) && self.graph_iris.contains(graph.as_str()) {
+            return Ok(());
+        }
+
+        Err(CraqleAuthError::PermissionDenied {
+            action,
+            graph: graph.as_str().to_string(),
+        })
+    }
+}
+
+/// Lazy counterpart of [`AllowedGraphAuthorizer`], answering craqle per hit.
+///
+/// Craqle's stored policy is ignored on purpose: the registry record, the
+/// lifecycle tombstones and the caller's collected rules are authoritative
+/// here, and a graph without a registry record stays invisible.
+struct ScopeAuthorizer<'a> {
+    scope: &'a GraphVisibilityScope,
+    visibility_cache: &'a MetadataVisibilityCache,
+}
+
+impl CraqleAuthorizer for ScopeAuthorizer<'_> {
+    fn authorize(
+        &self,
+        graph: &GraphId,
+        _policy: &GraphPolicy,
+        action: CraqleAction,
+    ) -> Result<(), CraqleAuthError> {
+        if matches!(action, CraqleAction::Read)
+            && self
+                .scope
+                .graph_visible(self.visibility_cache, graph.as_str())
+        {
             return Ok(());
         }
 
@@ -6497,6 +6664,130 @@ mod tests {
         let cache = MetadataVisibilityCache::new();
         assert!(scope.graph_visible(&cache, &granted.graph_iri));
         assert!(!scope.graph_visible(&cache, &hidden.graph_iri));
+    }
+
+    // Permissive on purpose: craqle's stored policy must not sway the decision.
+    fn open_policy() -> GraphPolicy {
+        GraphPolicy {
+            public: true,
+            permission_paths: Vec::new(),
+        }
+    }
+
+    fn admits(authorizer: &ScopeAuthorizer<'_>, graph_iri: &str) -> bool {
+        authorizer
+            .authorize(&GraphId::new(graph_iri), &open_policy(), CraqleAction::Read)
+            .is_ok()
+    }
+
+    #[test]
+    fn authorizer_admits_public() {
+        let public = registry_record("datasets/public");
+        let scope = scope_for(vec![public.clone()], GroupPermissionRules::default());
+        let cache = MetadataVisibilityCache::new();
+        let authorizer = ScopeAuthorizer {
+            scope: &scope,
+            visibility_cache: &cache,
+        };
+
+        assert!(admits(&authorizer, &public.graph_iri));
+        assert!(
+            authorizer
+                .authorize(
+                    &GraphId::new(&public.graph_iri),
+                    &open_policy(),
+                    CraqleAction::Write,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn authorizer_refuses_denied() {
+        // A per-document DENY under a group-wide grant hides only that document.
+        let realm = RealmId([7u8; 32]);
+        let group_id = Ulid::generate();
+        let secret = group_record(group_id, "datasets/secret");
+        let open = group_record(group_id, "datasets/open");
+        let rules = HashMap::from([(
+            group_id,
+            read_rules(&[
+                (
+                    format!("/{realm}/g/{group_id}/meta/**").as_str(),
+                    Permission::READ,
+                ),
+                (secret.permission_path.as_str(), Permission::DENY),
+            ]),
+        )]);
+        let scope = scope_for(
+            vec![secret.clone(), open.clone()],
+            GroupPermissionRules::from_groups(Some(realm), rules),
+        );
+        let cache = MetadataVisibilityCache::new();
+        let authorizer = ScopeAuthorizer {
+            scope: &scope,
+            visibility_cache: &cache,
+        };
+
+        assert!(!admits(&authorizer, &secret.graph_iri));
+        assert!(admits(&authorizer, &open.graph_iri));
+    }
+
+    #[test]
+    fn authorizer_admits_narrow() {
+        // A grant on one document shows it without opening the whole group.
+        let realm = RealmId([7u8; 32]);
+        let group_id = Ulid::generate();
+        let granted = group_record(group_id, "datasets/shared");
+        let hidden = group_record(group_id, "datasets/hidden");
+        let rules = HashMap::from([(
+            group_id,
+            read_rules(&[(granted.permission_path.as_str(), Permission::READ)]),
+        )]);
+        let scope = scope_for(
+            vec![granted.clone(), hidden.clone()],
+            GroupPermissionRules::from_groups(Some(realm), rules),
+        );
+        let cache = MetadataVisibilityCache::new();
+        let authorizer = ScopeAuthorizer {
+            scope: &scope,
+            visibility_cache: &cache,
+        };
+
+        assert!(admits(&authorizer, &granted.graph_iri));
+        assert!(!admits(&authorizer, &hidden.graph_iri));
+    }
+
+    #[test]
+    fn authorizer_refuses_deleted() {
+        // Craqle still holds the graph, so only our tombstone can hide it.
+        let deleted = registry_record("datasets/deleted");
+        let scope = scope_for(vec![deleted.clone()], GroupPermissionRules::default());
+        let cache = MetadataVisibilityCache::new();
+        cache.store_lifecycle_deleted(deleted.graph_iri.clone(), true);
+        let authorizer = ScopeAuthorizer {
+            scope: &scope,
+            visibility_cache: &cache,
+        };
+
+        assert!(!admits(&authorizer, &deleted.graph_iri));
+    }
+
+    #[test]
+    fn authorizer_refuses_unlisted() {
+        // Craqle may hold graphs the registry does not list; they stay hidden.
+        let known = registry_record("datasets/known");
+        let scope = scope_for(vec![known], GroupPermissionRules::default());
+        let cache = MetadataVisibilityCache::new();
+        let authorizer = ScopeAuthorizer {
+            scope: &scope,
+            visibility_cache: &cache,
+        };
+
+        assert!(!admits(
+            &authorizer,
+            &MetadataRegistryRecord::graph_iri_for(Ulid::generate())
+        ));
     }
 
     fn scope_for(
