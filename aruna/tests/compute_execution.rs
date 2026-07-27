@@ -268,6 +268,7 @@ async fn execution_end_to_end() -> TestResult<()> {
     spec.inputs[0].container_path = Some("/input/input.txt".to_string());
     spec.file_outputs = vec![OutputSelection {
         container_path: "/output/result.txt".to_string(),
+        path_prefix: None,
         destination: OutputDestination::S3 {
             bucket: fixture.source_bucket.clone(),
             key: "outputs/result.txt".to_string(),

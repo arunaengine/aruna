@@ -8,11 +8,19 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::Stream;
+use globset::{Glob, GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroize;
 
 pub const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Pattern characters of IEEE Std 1003.1-2017 (POSIX) 12.13, the only wildcards
+/// TES 1.1 allows in `tesOutput.path`.
+const WILDCARDS: [char; 3] = ['*', '?', '['];
+
+/// Upper bound on the files a single wildcard output may expand to.
+pub const MAX_OUTPUT_MATCHES: usize = 1024;
 
 pub type InputStream = Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>;
 pub type OutputChunks = Pin<Box<dyn Stream<Item = Result<Bytes, BackendError>> + Send + Sync>>;
@@ -419,6 +427,100 @@ pub fn paths_overlap(input: &str, output_parent: &str) -> Result<bool, String> {
     Ok(input == output_parent || output_parent.starts_with(&input))
 }
 
+/// True when a container path carries a POSIX 12.13 wildcard.
+pub fn has_wildcard(path: &str) -> bool {
+    path.contains(WILDCARDS)
+}
+
+/// POSIX gives a run of `*` the meaning of a single `*`, so `**` must not turn
+/// into the recursive wildcard of the glob engine.
+fn collapse_stars(pattern: &str) -> String {
+    let mut collapsed = String::with_capacity(pattern.len());
+    let (mut escaped, mut star) = (false, false);
+    for character in pattern.chars() {
+        match character {
+            _ if escaped => (escaped, star) = (false, false),
+            '\\' => (escaped, star) = (true, false),
+            '*' if star => continue,
+            '*' => star = true,
+            _ => star = false,
+        }
+        collapsed.push(character);
+    }
+    collapsed
+}
+
+fn build_glob(pattern: &str) -> Result<Glob, String> {
+    // `literal_separator` keeps `*` and `?` inside one path component, as POSIX requires.
+    GlobBuilder::new(&collapse_stars(pattern))
+        .literal_separator(true)
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+/// Compile one output pattern into a matcher anchored at the absolute pattern.
+pub fn output_glob(pattern: &str) -> Result<GlobMatcher, String> {
+    normalize_container_path(pattern)?;
+    Ok(build_glob(pattern)?.compile_matcher())
+}
+
+/// Deepest wildcard-free ancestor of a pattern, which is the directory a backend
+/// enumerates. A wildcard-free path yields itself.
+pub fn literal_prefix(pattern: &str) -> Result<PathBuf, String> {
+    let normalized = normalize_container_path(pattern)?;
+    let mut prefix = PathBuf::from("/");
+    for component in normalized.components() {
+        let Component::Normal(part) = component else {
+            continue;
+        };
+        if part.to_string_lossy().contains(WILDCARDS) {
+            break;
+        }
+        prefix.push(part);
+    }
+    Ok(prefix)
+}
+
+/// The part of `path` below `prefix`, split on a path-component boundary.
+/// `None` when `prefix` is not a strict ancestor of `path`.
+pub fn output_suffix(path: &str, prefix: &str) -> Option<String> {
+    let path = normalize_container_path(path).ok()?;
+    let prefix = normalize_container_path(prefix).ok()?;
+    let suffix = path.strip_prefix(&prefix).ok()?.to_str()?;
+    (!suffix.is_empty()).then(|| suffix.to_string())
+}
+
+/// The declared outputs of one attempt: a wildcard path selects every file it
+/// matches, a wildcard-free path only itself.
+#[derive(Debug)]
+pub struct OutputMatcher {
+    literals: Vec<String>,
+    patterns: GlobSet,
+}
+
+impl OutputMatcher {
+    pub fn new<'a>(declared: impl IntoIterator<Item = &'a str>) -> Result<Self, String> {
+        let mut literals = Vec::new();
+        let mut builder = GlobSetBuilder::new();
+        for path in declared {
+            normalize_container_path(path)?;
+            if has_wildcard(path) {
+                builder.add(build_glob(path)?);
+            } else {
+                literals.push(path.to_string());
+            }
+        }
+        Ok(Self {
+            literals,
+            patterns: builder.build().map_err(|error| error.to_string())?,
+        })
+    }
+
+    pub fn is_match(&self, path: &str) -> bool {
+        self.literals.iter().any(|literal| literal == path) || self.patterns.is_match(path)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttemptPhase {
     Submitted,
@@ -559,4 +661,88 @@ pub struct TombstoneSpec {
 pub struct TombstoneEvidence {
     pub backend_ref: String,
     pub attempt_epoch: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LISTING: [&str; 6] = [
+        "/out/a.txt",
+        "/out/b.txt",
+        "/out/ab.txt",
+        "/out/report.csv",
+        "/out/sub/c.txt",
+        "/out/sub/deep/d.txt",
+    ];
+
+    fn matched(pattern: &str) -> Vec<&'static str> {
+        let glob = output_glob(pattern).unwrap();
+        LISTING
+            .into_iter()
+            .filter(|path| glob.is_match(path))
+            .collect()
+    }
+
+    #[test]
+    fn expands_posix_pattern() {
+        // `*` and `?` must stay inside one path component; `[..]` is a class.
+        assert_eq!(
+            matched("/out/*.txt"),
+            vec!["/out/a.txt", "/out/b.txt", "/out/ab.txt"]
+        );
+        assert_eq!(matched("/out/?.txt"), vec!["/out/a.txt", "/out/b.txt"]);
+        assert_eq!(matched("/out/[ab].txt"), vec!["/out/a.txt", "/out/b.txt"]);
+        assert_eq!(matched("/out/sub/*.txt"), vec!["/out/sub/c.txt"]);
+        assert!(matched("/out/*.md").is_empty());
+        // A repeated `*` stays one POSIX wildcard instead of recursing.
+        assert_eq!(matched("/out/**/*.txt"), vec!["/out/sub/c.txt"]);
+        assert!(output_glob("/out/[a.txt").is_err());
+    }
+
+    #[test]
+    fn detects_wildcards() {
+        assert!(has_wildcard("/out/*.txt"));
+        assert!(has_wildcard("/out/?.txt"));
+        assert!(has_wildcard("/out/[ab].txt"));
+        assert!(!has_wildcard("/out/report.txt"));
+    }
+
+    #[test]
+    fn finds_literal_prefix() {
+        assert_eq!(literal_prefix("/out/*.txt").unwrap(), Path::new("/out"));
+        assert_eq!(literal_prefix("/out/*/x.txt").unwrap(), Path::new("/out"));
+        assert_eq!(literal_prefix("/*.txt").unwrap(), Path::new("/"));
+        assert_eq!(
+            literal_prefix("/out/report.txt").unwrap(),
+            Path::new("/out/report.txt")
+        );
+        assert!(literal_prefix("out/*.txt").is_err());
+    }
+
+    #[test]
+    fn strips_output_prefix() {
+        assert_eq!(output_suffix("/out/a.txt", "/out").unwrap(), "a.txt");
+        assert_eq!(
+            output_suffix("/out/sub/deep/d.txt", "/out").unwrap(),
+            "sub/deep/d.txt"
+        );
+        assert_eq!(
+            output_suffix("/out/sub/c.txt", "/out/sub").unwrap(),
+            "c.txt"
+        );
+        // A prefix must end on a component boundary and stay a strict ancestor.
+        assert!(output_suffix("/output/a.txt", "/out").is_none());
+        assert!(output_suffix("/out", "/out").is_none());
+        assert!(output_suffix("/other/a.txt", "/out").is_none());
+    }
+
+    #[test]
+    fn matches_declared_outputs() {
+        let matcher = OutputMatcher::new(["/out/report.txt", "/out/*.csv"]).unwrap();
+        assert!(matcher.is_match("/out/report.txt"));
+        assert!(matcher.is_match("/out/report.csv"));
+        assert!(!matcher.is_match("/out/sub/report.csv"));
+        assert!(!matcher.is_match("/out/other.txt"));
+    }
 }
