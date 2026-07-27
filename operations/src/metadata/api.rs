@@ -56,6 +56,15 @@ use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, SearchBucke
 
 const DEFAULT_LIST_METADATA_LIMIT: usize = 50;
 const MAX_LIST_METADATA_LIMIT: usize = 1_000;
+/// Bounds the response payload and the number of RO-Crate summary exports an
+/// unauthenticated caller can force per request. The realm-wide registry scan
+/// is removed by the cached list path, not by this clamp.
+const ANONYMOUS_LIST_METADATA_LIMIT: usize = 100;
+/// Splits a targeted lookup from a browse page: the portal pages at 48, a
+/// run-crate or preview lookup at 1, and only a browse page pays the estimate.
+const METADATA_ESTIMATE_MIN_LIMIT: usize = 24;
+// Bounded so a single summary page cannot saturate the craqle read permits.
+const METADATA_SUMMARY_FANOUT_LIMIT: usize = 8;
 const METADATA_REFERENCES_DEFAULT_LIMIT: usize = 25;
 const METADATA_REFERENCES_MAX_LIMIT: usize = 100;
 const METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT: usize = 8;
@@ -103,6 +112,11 @@ pub struct ListVisibleMetadataDocumentsResult {
     pub limit: usize,
     pub offset: usize,
     pub total_returned: usize,
+    /// Approximate number of documents matching the request filters across all
+    /// pages. Group-granular, so it can over- or under-count against the
+    /// glob-granular read rules. `None` when the request was too small to be a
+    /// browse page and the estimate was not computed.
+    pub total_estimate: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -299,28 +313,61 @@ pub async fn list_visible_metadata_documents(
     realm_id: RealmId,
     request: ListVisibleMetadataDocumentsRequest,
 ) -> Result<ListVisibleMetadataDocumentsResult, MetadataApiError> {
-    let limit = request
-        .limit
-        .unwrap_or(DEFAULT_LIST_METADATA_LIMIT)
-        .clamp(1, MAX_LIST_METADATA_LIMIT);
+    let limit = effective_list_limit(request.limit, request.auth.is_none());
     let offset = request.offset.unwrap_or(0);
 
-    let mut records = Vec::new();
-    let include_pending_projection = request.include_summary;
-    if let Some(group_id) = request.group_id {
-        records.extend(
-            load_group_metadata_records(context, group_id, include_pending_projection).await?,
-        );
-    } else {
-        let groups = drive(ListGroupOperation::new(), context)
+    let group_ids = match request.group_id {
+        Some(group_id) => vec![group_id],
+        None => drive(ListGroupOperation::new(), context)
             .await
-            .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-        for group in groups {
-            records.extend(
-                load_group_metadata_records(context, group.group_id, include_pending_projection)
-                    .await?,
-            );
+            .map_err(|error| MetadataApiError::Internal(error.to_string()))?
+            .into_iter()
+            .map(|group| group.group_id)
+            .collect(),
+    };
+    // Summary listings must show documents whose projection has not landed yet;
+    // the pending keyspace is scanned once per request, never once per group.
+    let mut pending = if request.include_summary {
+        load_pending_records(context, request.group_id).await?
+    } else {
+        HashMap::new()
+    };
+
+    let mut records = Vec::new();
+    for group_id in group_ids {
+        let mut group_records = load_group_records(context, group_id).await?;
+        if let Some(pending_records) = pending.remove(&group_id) {
+            merge_pending_metadata_records(&mut group_records, pending_records);
+            group_records.sort_by_key(|record| record.document_id);
         }
+        records.extend(group_records);
+    }
+
+    // Group-granular estimate: one permission probe per group, reused for every
+    // record in it, so counting never pays a per-document check. A targeted
+    // lookup skips the whole scan and reports the estimate as unknown.
+    let mut total_estimate = None;
+    if limit >= METADATA_ESTIMATE_MIN_LIMIT {
+        let mut group_reads = HashMap::new();
+        let mut matching = 0usize;
+        for record in &records {
+            if !metadata_record_matches_filters(record, request.path_prefix.as_deref()) {
+                continue;
+            }
+            if record.public
+                || group_read_allowed(
+                    context,
+                    realm_id,
+                    request.auth.as_ref(),
+                    record,
+                    &mut group_reads,
+                )
+                .await?
+            {
+                matching += 1;
+            }
+        }
+        total_estimate = Some(matching);
     }
 
     let needed = offset.saturating_add(limit);
@@ -378,6 +425,8 @@ pub async fn list_visible_metadata_documents(
         limit,
         offset,
         total_returned,
+        // Never report fewer than the page already discloses.
+        total_estimate: total_estimate.map(|estimate| estimate.max(total_returned)),
     })
 }
 
@@ -874,14 +923,24 @@ fn authorized_realm_nodes(
         .collect())
 }
 
-async fn load_group_metadata_records(
+fn effective_list_limit(requested: Option<usize>, anonymous: bool) -> usize {
+    let maximum = if anonymous {
+        ANONYMOUS_LIST_METADATA_LIMIT
+    } else {
+        MAX_LIST_METADATA_LIMIT
+    };
+    requested
+        .unwrap_or(DEFAULT_LIST_METADATA_LIMIT)
+        .clamp(1, maximum)
+}
+
+async fn load_group_records(
     context: &DriverContext,
     group_id: GroupId,
-    include_pending_projection: bool,
 ) -> Result<Vec<MetadataRegistryRecord>, MetadataApiError> {
     // Listing remains eventually consistent: the handle-owned visibility cache
     // serves stale snapshots while one refill updates the operation-owned read path.
-    if !include_pending_projection && let Some(metadata_handle) = context.metadata_handle.as_ref() {
+    if let Some(metadata_handle) = context.metadata_handle.as_ref() {
         match metadata_handle
             .list_cached_registry_records_for_group(group_id)
             .await
@@ -896,26 +955,16 @@ async fn load_group_metadata_records(
         }
     }
 
-    let mut records = drive(ListMetadataDocumentsOperation::new(group_id), context)
+    drive(ListMetadataDocumentsOperation::new(group_id), context)
         .await
-        .map_err(|err| MetadataApiError::Internal(err.to_string()))?;
-
-    if include_pending_projection {
-        merge_pending_metadata_records(
-            &mut records,
-            load_pending_group_metadata_records(context, group_id).await?,
-        );
-        records.sort_by_key(|record| record.document_id);
-    }
-
-    Ok(records)
+        .map_err(|err| MetadataApiError::Internal(err.to_string()))
 }
 
-async fn load_pending_group_metadata_records(
+async fn load_pending_records(
     context: &DriverContext,
-    group_id: GroupId,
-) -> Result<Vec<MetadataRegistryRecord>, MetadataApiError> {
-    let mut records = Vec::new();
+    group_filter: Option<GroupId>,
+) -> Result<HashMap<GroupId, Vec<MetadataRegistryRecord>>, MetadataApiError> {
+    let mut records: HashMap<GroupId, Vec<MetadataRegistryRecord>> = HashMap::new();
     let mut start_after = None;
 
     loop {
@@ -950,13 +999,13 @@ async fn load_pending_group_metadata_records(
                 continue;
             };
             let record = event.record;
-            if record.group_id != group_id {
+            if group_filter.is_some_and(|group_id| record.group_id != group_id) {
                 continue;
             }
             if metadata_graph_is_deleted(context, &record.graph_iri).await? {
                 continue;
             }
-            records.push(record);
+            records.entry(record.group_id).or_default().push(record);
         }
 
         if next_start_after.is_none() {
@@ -1138,6 +1187,23 @@ async fn can_read_record(
         Ok(allowed) => Ok(allowed),
         Err(_) => Ok(false),
     }
+}
+
+/// Probes read access once per group, using the first non-public record met
+/// there as the representative path, and reuses that answer for the group.
+async fn group_read_allowed(
+    context: &DriverContext,
+    realm_id: RealmId,
+    auth: Option<&AuthContext>,
+    record: &MetadataRegistryRecord,
+    probes: &mut HashMap<GroupId, bool>,
+) -> Result<bool, MetadataApiError> {
+    if let Some(&allowed) = probes.get(&record.group_id) {
+        return Ok(allowed);
+    }
+    let allowed = can_read_record(context, realm_id, auth, record).await?;
+    probes.insert(record.group_id, allowed);
+    Ok(allowed)
 }
 
 async fn ensure_permission(
@@ -1903,7 +1969,7 @@ fn record_search_node_result(
 #[tracing::instrument(
     name = "metadata.operation.query_distributed",
     level = "debug",
-    skip(context, auth, query, scope),
+    skip(context, auth, bearer_token, query, scope),
     fields(
         mode = ?scope.mode,
         query_len = query.len() as u64,
@@ -1912,6 +1978,7 @@ fn record_search_node_result(
         discovery_ms = field::Empty,
         elapsed_ms = field::Empty,
         result = field::Empty,
+        cache = field::Empty,
     )
 )]
 #[allow(clippy::too_many_arguments)]
@@ -2050,7 +2117,7 @@ async fn run_query_distributed(
 #[tracing::instrument(
     name = "metadata.operation.search_distributed",
     level = "debug",
-    skip(context, auth, query, resume, watermark, scope),
+    skip(context, auth, bearer_token, query, resume, watermark, scope),
     fields(
         mode = ?scope.mode,
         query_len = query.len() as u64,
@@ -2288,8 +2355,364 @@ mod tests {
 
     use std::collections::BTreeMap;
 
+    use aruna_core::UserId;
+    use aruna_core::metadata::MetadataCreateEventPayload;
+    use aruna_core::storage_entries::metadata_create_event_and_pending_projection_write_entries;
+    use aruna_core::structs::PlacementRef;
     use aruna_storage::storage;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
+
+    use crate::metadata::MetadataHandle;
+
+    const TEST_REALM_ID: RealmId = RealmId([7u8; 32]);
+
+    struct MetadataTest {
+        context: DriverContext,
+        _storage_dir: TempDir,
+        _metadata_dir: TempDir,
+    }
+
+    fn metadata_test() -> MetadataTest {
+        let storage_dir = tempdir().expect("storage dir");
+        let metadata_dir = tempdir().expect("metadata dir");
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().expect("storage path"))
+                .expect("storage opens");
+        let metadata_handle = MetadataHandle::new(
+            metadata_dir.path(),
+            iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+            storage_handle.clone(),
+            None,
+            None,
+            None,
+        )
+        .expect("metadata handle");
+        MetadataTest {
+            context: DriverContext {
+                storage_handle,
+                net_handle: None,
+                blob_handle: None,
+                metadata_handle: Some(metadata_handle),
+                task_handle: None,
+                compute_handle: None,
+            },
+            _storage_dir: storage_dir,
+            _metadata_dir: metadata_dir,
+        }
+    }
+
+    fn public_record(group_id: GroupId, document_id: Ulid) -> MetadataRegistryRecord {
+        MetadataRegistryRecord {
+            realm_id: TEST_REALM_ID,
+            group_id,
+            document_id,
+            document_path: "datasets/cached".to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: true,
+            permission_path: MetadataRegistryRecord::permission_path_for(
+                &TEST_REALM_ID,
+                group_id,
+                "datasets/cached",
+                document_id,
+            ),
+            placement: PlacementRef::NIL,
+            holder_node_ids: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_event_id: Ulid::generate(),
+        }
+    }
+
+    fn summary_request(
+        group_id: GroupId,
+        include_summary: bool,
+    ) -> ListVisibleMetadataDocumentsRequest {
+        ListVisibleMetadataDocumentsRequest {
+            group_id: Some(group_id),
+            path_prefix: None,
+            include_summary,
+            limit: None,
+            offset: None,
+            auth: None,
+        }
+    }
+
+    // The visibility cache only accepts upserts once it has been filled.
+    async fn seed_registry_cache(test: &MetadataTest, record: &MetadataRegistryRecord) {
+        let handle = test
+            .context
+            .metadata_handle
+            .as_ref()
+            .expect("metadata handle");
+        handle
+            .list_cached_registry_records_for_group(record.group_id)
+            .await
+            .expect("registry cache fills");
+        handle.upsert_cached_registry_record(record.clone());
+    }
+
+    async fn write_pending_marker(test: &MetadataTest, record: &MetadataRegistryRecord) {
+        let event = MetadataCreateEventRecord {
+            event_id: record.last_event_id,
+            record: record.clone(),
+            user_id: UserId::local(Ulid::generate(), TEST_REALM_ID),
+            node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+            payload: MetadataCreateEventPayload::Scaffold {
+                name: "Pending".to_string(),
+                description: "Projection in flight".to_string(),
+                date_published: "2026-01-01".to_string(),
+                license: None,
+            },
+            occurred_at_ms: 1,
+        };
+        for (key_space, key, value) in
+            metadata_create_event_and_pending_projection_write_entries(&event)
+                .expect("event encodes")
+        {
+            match test
+                .context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space,
+                    key,
+                    value,
+                    txn_id: None,
+                })
+                .await
+            {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {}
+                other => panic!("unexpected write event: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn anonymous_limit_clamped() {
+        assert_eq!(
+            effective_list_limit(None, true),
+            DEFAULT_LIST_METADATA_LIMIT
+        );
+        assert_eq!(
+            effective_list_limit(Some(MAX_LIST_METADATA_LIMIT), true),
+            ANONYMOUS_LIST_METADATA_LIMIT
+        );
+        assert_eq!(
+            effective_list_limit(Some(MAX_LIST_METADATA_LIMIT), false),
+            MAX_LIST_METADATA_LIMIT
+        );
+        assert_eq!(
+            effective_list_limit(Some(usize::MAX), false),
+            MAX_LIST_METADATA_LIMIT
+        );
+        assert_eq!(effective_list_limit(Some(0), true), 1);
+    }
+
+    // The record lives only in the registry cache and the graph was never
+    // projected, so a returned summary can only come from the summary cache.
+    #[tokio::test]
+    async fn summary_from_cache() {
+        let test = metadata_test();
+        let record = public_record(Ulid::generate(), Ulid::generate());
+        seed_registry_cache(&test, &record).await;
+        summary_cache().insert(
+            &record.graph_iri,
+            record.last_event_id,
+            "{\"cached\":true}",
+            Instant::now(),
+        );
+
+        let result = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            summary_request(record.group_id, true),
+        )
+        .await
+        .expect("summary listing succeeds");
+
+        assert_eq!(result.documents.len(), 1);
+        assert_eq!(
+            result.documents[0].rocrate_summary_jsonld.as_deref(),
+            Some("{\"cached\":true}")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_summary_refused() {
+        // A cursor advance must fall through to the handle, not serve the entry.
+        let test = metadata_test();
+        let record = public_record(Ulid::generate(), Ulid::generate());
+        seed_registry_cache(&test, &record).await;
+        summary_cache().insert(
+            &record.graph_iri,
+            Ulid::generate(),
+            "{\"stale\":true}",
+            Instant::now(),
+        );
+
+        let result = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            summary_request(record.group_id, true),
+        )
+        .await
+        .expect("summary listing succeeds");
+
+        assert_eq!(result.documents.len(), 1);
+        assert!(result.documents[0].rocrate_summary_jsonld.is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_summary_listed() {
+        let test = metadata_test();
+        let record = public_record(Ulid::generate(), Ulid::generate());
+        write_pending_marker(&test, &record).await;
+
+        let result = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            summary_request(record.group_id, true),
+        )
+        .await
+        .expect("summary listing succeeds");
+        assert_eq!(result.documents.len(), 1);
+        assert_eq!(result.documents[0].record.document_id, record.document_id);
+        assert!(result.documents[0].rocrate_summary_jsonld.is_none());
+
+        let plain = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            summary_request(record.group_id, false),
+        )
+        .await
+        .expect("plain listing succeeds");
+        assert!(plain.documents.is_empty());
+    }
+
+    // The page window must not truncate the estimate, and paging must not move it.
+    #[tokio::test]
+    async fn estimate_beyond_page() {
+        let test = metadata_test();
+        let group_id = Ulid::generate();
+        let seeded = METADATA_ESTIMATE_MIN_LIMIT + 2;
+        for _ in 0..seeded {
+            seed_registry_cache(&test, &public_record(group_id, Ulid::generate())).await;
+        }
+
+        let page = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            ListVisibleMetadataDocumentsRequest {
+                limit: Some(METADATA_ESTIMATE_MIN_LIMIT),
+                ..summary_request(group_id, false)
+            },
+        )
+        .await
+        .expect("listing succeeds");
+        assert_eq!(page.documents.len(), METADATA_ESTIMATE_MIN_LIMIT);
+        assert_eq!(page.total_returned, METADATA_ESTIMATE_MIN_LIMIT);
+        assert_eq!(page.total_estimate, Some(seeded));
+
+        let tail = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            ListVisibleMetadataDocumentsRequest {
+                limit: Some(METADATA_ESTIMATE_MIN_LIMIT),
+                offset: Some(seeded - 1),
+                ..summary_request(group_id, false)
+            },
+        )
+        .await
+        .expect("listing succeeds");
+        assert_eq!(tail.documents.len(), 1);
+        assert_eq!(tail.total_estimate, Some(seeded));
+    }
+
+    // A targeted lookup must not pay for the realm-wide estimate scan, and
+    // must report the estimate as absent rather than as a truncated count.
+    #[tokio::test]
+    async fn lookup_omits_estimate() {
+        let test = metadata_test();
+        let group_id = Ulid::generate();
+        for _ in 0..3 {
+            seed_registry_cache(&test, &public_record(group_id, Ulid::generate())).await;
+        }
+
+        let lookup = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            ListVisibleMetadataDocumentsRequest {
+                limit: Some(METADATA_ESTIMATE_MIN_LIMIT - 1),
+                ..summary_request(group_id, false)
+            },
+        )
+        .await
+        .expect("listing succeeds");
+        assert_eq!(lookup.total_returned, 3);
+        assert_eq!(lookup.total_estimate, None);
+
+        let browse = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            ListVisibleMetadataDocumentsRequest {
+                limit: Some(METADATA_ESTIMATE_MIN_LIMIT),
+                ..summary_request(group_id, false)
+            },
+        )
+        .await
+        .expect("listing succeeds");
+        assert_eq!(browse.total_estimate, Some(3));
+    }
+
+    // Anonymous callers resolve no group probe, so only public records count.
+    #[tokio::test]
+    async fn estimate_skips_private() {
+        let test = metadata_test();
+        let group_id = Ulid::generate();
+        let readable = public_record(group_id, Ulid::generate());
+        seed_registry_cache(&test, &readable).await;
+        let mut private = public_record(group_id, Ulid::generate());
+        private.public = false;
+        seed_registry_cache(&test, &private).await;
+
+        let result = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            summary_request(group_id, false),
+        )
+        .await
+        .expect("listing succeeds");
+
+        assert_eq!(result.documents.len(), 1);
+        assert_eq!(result.documents[0].record.document_id, readable.document_id);
+        assert_eq!(result.total_estimate, Some(1));
+    }
+
+    // path_prefix must scope the estimate to the same set the page came from.
+    #[tokio::test]
+    async fn estimate_honours_prefix() {
+        let test = metadata_test();
+        let group_id = Ulid::generate();
+        for _ in 0..2 {
+            seed_registry_cache(&test, &public_record(group_id, Ulid::generate())).await;
+        }
+        let mut other = public_record(group_id, Ulid::generate());
+        other.document_path = "other/excluded".to_string();
+        seed_registry_cache(&test, &other).await;
+
+        let result = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            ListVisibleMetadataDocumentsRequest {
+                path_prefix: Some("datasets".to_string()),
+                ..summary_request(group_id, false)
+            },
+        )
+        .await
+        .expect("listing succeeds");
+
+        assert_eq!(result.total_returned, 2);
+        assert_eq!(result.total_estimate, Some(2));
+    }
 
     #[test]
     fn deduplicates_select_rows_from_multiple_nodes() {

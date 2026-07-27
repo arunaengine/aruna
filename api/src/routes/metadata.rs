@@ -193,6 +193,12 @@ pub struct ListMetadataResponse {
     pub limit: usize,
     pub offset: usize,
     pub total_returned: usize,
+    /// Approximate total across all pages: it can over-count when a
+    /// per-document DENY subtracts from a group-wide grant, and under-count
+    /// when a grant is narrower than a group. Absent on targeted lookups, whose
+    /// limit is too small to be worth the scan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_estimate: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1509,6 +1515,7 @@ async fn run_list_metadata_documents(
         limit: result.limit,
         offset: result.offset,
         total_returned: result.total_returned,
+        total_estimate: result.total_estimate,
     })
 }
 
