@@ -21,6 +21,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::api::storage::v1::{CSIDriver, StorageClass};
+use k8s_openapi::jiff::Timestamp;
 use kube::api::{
     Api, AttachParams, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams,
     Preconditions,
@@ -614,6 +615,21 @@ impl KubernetesBackend {
                     code: terminated.exit_code,
                 };
             }
+        } else if job_pending(job) {
+            let now = Timestamp::now();
+            if let Some(reason) = self
+                .task_pods(context)
+                .await?
+                .iter()
+                .find_map(|pod| pod_stuck_reason(pod, self.config.pull_deadline, now))
+            {
+                tracing::warn!(
+                    attempt = %context.attempt.external_name(),
+                    %reason,
+                    "failing attempt whose container cannot start"
+                );
+                status.phase = AttemptPhase::Failed { reason };
+            }
         }
         Ok(status)
     }
@@ -1001,6 +1017,11 @@ impl ExecutorBackend for KubernetesBackend {
             let Some(pod) = pods.first() else {
                 return Ok(LogTails::default());
             };
+            // A container that never started rejects log reads, which must not
+            // block the terminal handling that reaps the attempt.
+            if !task_started(pod) {
+                return Ok(LogTails::default());
+            }
             self.pods()
                 .logs(
                     &pod.name_any(),
@@ -1439,6 +1460,65 @@ fn job_status(job: &Job) -> AttemptStatus {
     }
 }
 
+/// Active but unready Pods are the only ones that can hold a stuck container.
+fn job_pending(job: &Job) -> bool {
+    job.status
+        .as_ref()
+        .is_some_and(|status| status.active.unwrap_or(0) > 0 && status.ready.unwrap_or(0) == 0)
+}
+
+/// Kubelet reasons for a container that cannot start without outside help.
+fn stuck_wait(reason: &str) -> bool {
+    matches!(
+        reason,
+        "InvalidImageName"
+            | "ErrImagePull"
+            | "ImagePullBackOff"
+            | "CreateContainerConfigError"
+            | "CreateContainerError"
+    )
+}
+
+/// Kubernetes retries a failing image pull forever, so the Job counts such a
+/// Pod as active and never reports a terminal condition. A malformed reference
+/// fails at once; a retryable reason fails once it outlives `deadline`.
+fn pod_stuck_reason(pod: &Pod, deadline: Duration, now: Timestamp) -> Option<String> {
+    let status = pod.status.as_ref()?;
+    let waited = status
+        .start_time
+        .as_ref()
+        .or_else(|| pod.metadata.creation_timestamp.as_ref())
+        .map(|since| Duration::try_from(now.duration_since(since.0)).unwrap_or_default())
+        .unwrap_or_default();
+    status
+        .init_container_statuses
+        .iter()
+        .chain(status.container_statuses.iter())
+        .flatten()
+        .find_map(|container| {
+            let waiting = container.state.as_ref()?.waiting.as_ref()?;
+            let reason = waiting.reason.as_deref()?;
+            if !stuck_wait(reason) || (reason != "InvalidImageName" && waited <= deadline) {
+                return None;
+            }
+            let detail = waiting.message.as_deref().unwrap_or("no detail reported");
+            Some(format!(
+                "container `{}` cannot start ({reason}): {detail}",
+                container.name
+            ))
+        })
+}
+
+/// Log reads only succeed once the task container has left its waiting state.
+fn task_started(pod: &Pod) -> bool {
+    pod.status
+        .as_ref()
+        .and_then(|status| status.container_statuses.as_ref())
+        .and_then(|statuses| statuses.iter().find(|status| status.name == "task"))
+        .and_then(|status| status.state.as_ref())
+        .is_some_and(|state| state.running.is_some() || state.terminated.is_some())
+}
+
 fn job_epoch(job: &Job) -> Result<u64, BackendError> {
     annotation_u64(job, EPOCH_ANNOTATION)
 }
@@ -1825,6 +1905,7 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
     use super::*;
+    use crate::executor::logs::NullSink;
 
     fn context() -> FenceContext {
         FenceContext {
@@ -2198,5 +2279,129 @@ mod tests {
                 .iter()
                 .any(|path| path.contains("csidrivers"))
         );
+    }
+
+    const POD_START: &str = "2027-01-01T00:00:00Z";
+
+    fn probe_now(after: i64) -> Timestamp {
+        let start: Timestamp = POD_START.parse().expect("parse pod start");
+        Timestamp::from_second(start.as_second() + after).expect("build probe time")
+    }
+
+    fn task_pod(state: Value, started: &str) -> Pod {
+        serde_json::from_value(json!({
+            "apiVersion":"v1","kind":"Pod",
+            "metadata":{
+                "name":"task-pod","namespace":"compute","uid":"pod-uid",
+                "labels":{ROLE_LABEL:"task"}
+            },
+            "status":{
+                "phase":"Pending","startTime":started,
+                "containerStatuses":[{
+                    "name":"task","image":"registry.example/task:1","imageID":"",
+                    "ready":false,"restartCount":0,"state":state
+                }]
+            }
+        }))
+        .expect("build task pod")
+    }
+
+    fn waiting_pod(reason: &str, started: &str) -> Pod {
+        task_pod(
+            json!({"waiting":{"reason":reason,"message":"pull access failed"}}),
+            started,
+        )
+    }
+
+    #[test]
+    fn fails_invalid_image() {
+        // A malformed reference is permanent, so the deadline must not apply.
+        let pod = waiting_pod("InvalidImageName", POD_START);
+        let reason = pod_stuck_reason(&pod, Duration::from_secs(300), probe_now(1))
+            .expect("reject invalid image");
+        assert!(reason.contains("InvalidImageName"), "{reason}");
+    }
+
+    #[test]
+    fn waits_pull_backoff() {
+        // A registry blip inside the deadline must stay Running.
+        let pod = waiting_pod("ImagePullBackOff", POD_START);
+        assert_eq!(
+            pod_stuck_reason(&pod, Duration::from_secs(30), probe_now(5)),
+            None
+        );
+    }
+
+    #[test]
+    fn fails_stalled_pull() {
+        let pod = waiting_pod("ImagePullBackOff", POD_START);
+        let reason = pod_stuck_reason(&pod, Duration::from_secs(30), probe_now(120))
+            .expect("reject stalled pull");
+        assert!(reason.contains("ImagePullBackOff"), "{reason}");
+        assert!(reason.contains("pull access failed"), "{reason}");
+    }
+
+    #[test]
+    fn ignores_running_pod() {
+        let pod = task_pod(json!({"running":{"startedAt":POD_START}}), POD_START);
+        assert_eq!(
+            pod_stuck_reason(&pod, Duration::from_secs(30), probe_now(9_000)),
+            None
+        );
+        assert!(task_started(&pod));
+    }
+
+    fn stuck_list() -> Value {
+        let pod = waiting_pod("ImagePullBackOff", "2020-01-01T00:00:00Z");
+        json!({
+            "apiVersion":"v1","kind":"PodList","metadata":{},
+            "items":[serde_json::to_value(pod).expect("encode stuck pod")]
+        })
+    }
+
+    fn stuck_client() -> Client {
+        fake_client(|method, path| match (method, path) {
+            ("GET", "/apis/batch/v1/namespaces/compute/jobs/aruna-job-a1") => {
+                (200, job_json("running"))
+            }
+            ("GET", "/api/v1/namespaces/compute/pods") => (200, stuck_list()),
+            _ => (404, status_json(404)),
+        })
+    }
+
+    #[tokio::test]
+    async fn status_fails_stuck() {
+        // The Job stays active forever, so the stuck Pod must drive the phase.
+        let backend = KubernetesBackend {
+            client: stuck_client(),
+            config: test_config(),
+        };
+
+        let status = backend.status(&context()).await.unwrap();
+
+        match status.phase {
+            AttemptPhase::Failed { reason } => {
+                assert!(reason.contains("ImagePullBackOff"), "{reason}");
+            }
+            other => panic!("unexpected phase: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn skips_unstarted_logs() {
+        // Terminal handling parks the job when log capture errors, so a Pod
+        // that never started must report empty logs instead of failing.
+        let backend = KubernetesBackend {
+            client: stuck_client(),
+            config: test_config(),
+        };
+
+        let tails = backend
+            .fetch_logs(&context(), &LogLimits::default(), &NullSink)
+            .await
+            .unwrap();
+
+        assert!(tails.stdout.is_empty());
+        assert_eq!(tails.stdout_total, 0);
     }
 }

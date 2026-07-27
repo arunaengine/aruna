@@ -3,7 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -230,18 +230,17 @@ impl ApptainerBackend {
             .arg(&temp)
             .arg(format!("docker://{image}"))
             .kill_on_drop(true);
-        let status = tokio::select! {
+        let output = tokio::select! {
             _ = cancel.cancelled() => return Err(BackendError::Cancelled),
-            result = tokio::time::timeout(self.config.pull_deadline, command.status()) => {
+            result = tokio::time::timeout(self.config.pull_deadline, command.output()) => {
                 result
                     .map_err(|_| BackendError::Timeout("Apptainer image pull timed out".to_string()))?
                     .map_err(io_error)?
             }
         };
-        if !status.success() {
-            return Err(BackendError::Api(format!(
-                "Apptainer image pull failed with {status}"
-            )));
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(pull_error(&stderr, output.status));
         }
         File::open(&temp)
             .and_then(|file| file.sync_all())
@@ -852,6 +851,29 @@ async fn resolve_digest(
     Ok(format!("{}@{digest}", repository_name(image)))
 }
 
+/// A pull that can never succeed must be permanent, or the attempt is requeued
+/// until the park budget runs out instead of failing with the registry cause.
+fn pull_error(stderr: &str, status: ExitStatus) -> BackendError {
+    let detail = format!(
+        "Apptainer image pull failed with {status}: {}",
+        stderr.trim()
+    );
+    if image_missing(stderr) {
+        BackendError::ImageNotFound(detail)
+    } else if image_denied(stderr) {
+        BackendError::ImageUnauthorized(detail)
+    } else {
+        BackendError::Unavailable(detail)
+    }
+}
+
+fn image_denied(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    ["unauthorized", "denied", "forbidden", "authentication"]
+        .iter()
+        .any(|message| stderr.contains(message))
+}
+
 fn image_missing(stderr: &str) -> bool {
     let stderr = stderr.to_ascii_lowercase();
     ["image not found", "manifest unknown", "name unknown"]
@@ -1342,6 +1364,20 @@ mod tests {
     fn classifies_registry_failure() {
         assert!(image_missing("MANIFEST_UNKNOWN: manifest unknown"));
         assert!(!image_missing("dial tcp: connection timed out"));
+    }
+
+    #[test]
+    fn classifies_pull_error() {
+        // A hopeless pull must be permanent; only a blip may be retried.
+        use std::os::unix::process::ExitStatusExt;
+        let status = ExitStatus::from_raw(256);
+        let missing = pull_error("FATAL: manifest unknown", status);
+        let denied = pull_error("FATAL: unauthorized: authentication required", status);
+        let blip = pull_error("dial tcp: connection timed out", status);
+        assert!(matches!(missing, BackendError::ImageNotFound(_)));
+        assert!(matches!(denied, BackendError::ImageUnauthorized(_)));
+        assert!(matches!(blip, BackendError::Unavailable(_)));
+        assert!(!missing.retryable() && !denied.retryable() && blip.retryable());
     }
 
     #[tokio::test]
