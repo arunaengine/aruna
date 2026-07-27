@@ -1570,21 +1570,19 @@ fn job_pending(job: &Job) -> bool {
         .is_some_and(|status| status.active.unwrap_or(0) > 0 && status.ready.unwrap_or(0) == 0)
 }
 
-/// Kubelet reasons for a container that cannot start without outside help.
-fn stuck_wait(reason: &str) -> bool {
+/// Reasons the kubelet reports only after repeated failed attempts. A bare
+/// `ErrImagePull` is a single try, so it never proves a stuck container.
+fn repeated_wait(reason: &str) -> bool {
     matches!(
         reason,
-        "InvalidImageName"
-            | "ErrImagePull"
-            | "ImagePullBackOff"
-            | "CreateContainerConfigError"
-            | "CreateContainerError"
+        "ImagePullBackOff" | "CreateContainerConfigError" | "CreateContainerError"
     )
 }
 
 /// Kubernetes retries a failing image pull forever, so the Job counts such a
 /// Pod as active and never reports a terminal condition. A malformed reference
-/// fails at once; a retryable reason fails once it outlives `deadline`.
+/// fails at once; a repeated failure fails once it outlives `deadline`, which
+/// is anchored at the Pod start and so also covers scheduling.
 fn pod_stuck_reason(pod: &Pod, deadline: Duration, now: Timestamp) -> Option<String> {
     let status = pod.status.as_ref()?;
     let waited = status
@@ -1601,7 +1599,7 @@ fn pod_stuck_reason(pod: &Pod, deadline: Duration, now: Timestamp) -> Option<Str
         .find_map(|container| {
             let waiting = container.state.as_ref()?.waiting.as_ref()?;
             let reason = waiting.reason.as_deref()?;
-            if !stuck_wait(reason) || (reason != "InvalidImageName" && waited <= deadline) {
+            if reason != "InvalidImageName" && !(repeated_wait(reason) && waited > deadline) {
                 return None;
             }
             let detail = waiting.message.as_deref().unwrap_or("no detail reported");
@@ -2588,11 +2586,30 @@ mod tests {
 
     #[test]
     fn fails_stalled_pull() {
-        let pod = waiting_pod("ImagePullBackOff", POD_START);
-        let reason = pod_stuck_reason(&pod, Duration::from_secs(30), probe_now(120))
-            .expect("reject stalled pull");
-        assert!(reason.contains("ImagePullBackOff"), "{reason}");
-        assert!(reason.contains("pull access failed"), "{reason}");
+        // Only a reason implying repeated failures may end the attempt, and
+        // then only past the deadline.
+        for reason in [
+            "ImagePullBackOff",
+            "CreateContainerConfigError",
+            "CreateContainerError",
+        ] {
+            let pod = waiting_pod(reason, POD_START);
+            let stuck = pod_stuck_reason(&pod, Duration::from_secs(30), probe_now(120))
+                .expect("reject stalled pull");
+            assert!(stuck.contains(reason), "{stuck}");
+            assert!(stuck.contains("pull access failed"), "{stuck}");
+        }
+    }
+
+    #[test]
+    fn waits_single_pull() {
+        // The deadline starts at the Pod, so scheduling and volume attach time
+        // count against it; one observed ErrImagePull is not repeated failure.
+        let pod = waiting_pod("ErrImagePull", POD_START);
+        assert_eq!(
+            pod_stuck_reason(&pod, Duration::from_secs(30), probe_now(9_000)),
+            None
+        );
     }
 
     #[test]
