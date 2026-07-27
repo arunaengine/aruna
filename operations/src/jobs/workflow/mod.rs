@@ -771,26 +771,23 @@ pub async fn supervise_and_finalize(
         .resources
         .max_walltime_ms
         .unwrap_or(DEFAULT_WALLTIME.as_millis() as u64);
-    let walltime_left = read_job_record(&storage, job_id, None)
+    // A record without start evidence anchors the cap here, so no attempt can
+    // outrun the walltime limit for want of a backend-reported start.
+    let started_at_ms = read_job_record(&storage, job_id, None)
         .await
         .ok()
         .flatten()
         .and_then(|record| record.started_at_ms)
-        .map(|started_at_ms| {
-            Duration::from_millis(
-                started_at_ms
-                    .saturating_add(walltime_ms)
-                    .saturating_sub(unix_timestamp_millis()),
-            )
-        });
+        .unwrap_or_else(unix_timestamp_millis);
+    let walltime_left = Duration::from_millis(
+        started_at_ms
+            .saturating_add(walltime_ms)
+            .saturating_sub(unix_timestamp_millis()),
+    );
     let wait_and_finalize = async {
-        let result = if let Some(walltime_left) = walltime_left {
-            tokio::select! {
-                result = backend.wait(&fence, &cancel) => Some(result),
-                _ = tokio::time::sleep(walltime_left) => None,
-            }
-        } else {
-            Some(backend.wait(&fence, &cancel).await)
+        let result = tokio::select! {
+            result = backend.wait(&fence, &cancel) => Some(result),
+            _ = tokio::time::sleep(walltime_left) => None,
         };
         if let Some(result) = result {
             finalize_attempt(
@@ -1903,7 +1900,7 @@ mod tests {
         Arc::get_mut(&mut ctx).unwrap().task_handle = None;
         let (record, token, attempt) = ready_with_intent(&storage).await;
         let job_id = record.job_id;
-        transition_external_to_running(&storage, job_id, token, None, 6)
+        transition_external_to_running(&storage, job_id, token, None, unix_timestamp_millis())
             .await
             .unwrap();
         let backend = StubBackend::new(StubReconcile::NotFound);
@@ -1960,7 +1957,7 @@ mod tests {
         Arc::get_mut(&mut ctx).unwrap().task_handle = None;
         let (record, token, attempt) = ready_with_intent(&storage).await;
         let job_id = record.job_id;
-        transition_external_to_running(&storage, job_id, token, None, 6)
+        transition_external_to_running(&storage, job_id, token, None, unix_timestamp_millis())
             .await
             .unwrap();
         let backend = StubBackend::new(StubReconcile::NotFound);
@@ -1998,6 +1995,45 @@ mod tests {
         transition_external_to_running(&storage, job_id, token, Some(1), 6)
             .await
             .unwrap();
+        let backend = StubBackend::new(StubReconcile::Waiting);
+        let mut spec = execution_spec();
+        spec.resources.max_walltime_ms = Some(0);
+
+        supervise_and_finalize(
+            ctx,
+            job_id,
+            token,
+            backend.clone(),
+            fence(&attempt),
+            spec,
+            "ws-test".to_string(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(backend.cancels.load(Ordering::Relaxed), 1);
+        assert_eq!(stored.state, JobState::Failed);
+        assert_eq!(
+            stored.last_error.unwrap().message,
+            "walltime limit exceeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn arms_missing_start() {
+        // A record carrying no backend start evidence must still be capped,
+        // anchored at the moment supervision begins.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let mut ctx = context(storage.clone());
+        Arc::get_mut(&mut ctx).unwrap().task_handle = None;
+        let (record, token, attempt) = ready_with_intent(&storage).await;
+        let job_id = record.job_id;
+        assert!(record.started_at_ms.is_none());
         let backend = StubBackend::new(StubReconcile::Waiting);
         let mut spec = execution_spec();
         spec.resources.max_walltime_ms = Some(0);

@@ -1474,9 +1474,11 @@ pub async fn transition_external_to_running(
         if record.cancel_requested {
             return Ok(JobMutation::Skip);
         }
-        if let Some(started_at_ms) = started_at_ms {
-            record.started_at_ms.get_or_insert(started_at_ms);
-        }
+        // Running must always carry a start: it anchors the walltime cap, and a
+        // backend that reports none still started when the controller saw it.
+        record
+            .started_at_ms
+            .get_or_insert(started_at_ms.unwrap_or(now_ms));
         record.state = JobState::Running;
         record.updated_at_ms = now_ms;
         if let Some(claim) = record.claim.as_mut() {
@@ -3384,6 +3386,31 @@ mod tests {
         assert_eq!(stored.attempt_intent, committed.record.attempt_intent);
         assert!(stored.started_at_ms.is_none());
         assert!(stored.claim.is_some());
+    }
+
+    #[tokio::test]
+    async fn running_backfills_start() {
+        // Kubernetes and Apptainer accept an attempt before reporting a start
+        // time; without a start the walltime cap would have no anchor.
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0xA9; 16]);
+        let token = Ulid::generate();
+        insert_job(&storage, &execution_record(job_id, token, JobState::Ready))
+            .await
+            .unwrap();
+
+        let stored = transition_external_to_running(&storage, job_id, token, None, 6_000)
+            .await
+            .unwrap();
+
+        assert_eq!(stored.state, JobState::Running);
+        assert_eq!(stored.started_at_ms, Some(6_000));
+
+        // Later evidence must not move an already anchored start.
+        let stored = transition_external_to_running(&storage, job_id, token, Some(9_000), 9_100)
+            .await
+            .unwrap();
+        assert_eq!(stored.started_at_ms, Some(6_000));
     }
 
     #[tokio::test]
