@@ -40,6 +40,7 @@ use super::search_cursor::{
     METADATA_SEARCH_MAX_PAGINATION_DEPTH, NodeSearchResult, SearchCursor, SearchCursorError,
     SearchPageCursor, SearchWatermark, paginate, query_fingerprint, resume_fetch_limit,
 };
+use super::summary_cache::summary_cache;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::get_metadata_document::{
@@ -343,12 +344,16 @@ pub async fn list_visible_metadata_documents(
 
     let mut documents = Vec::with_capacity(selected.len());
     if request.include_summary {
-        let summaries = futures_util::future::join_all(
-            selected
-                .iter()
-                .map(|record| export_rocrate_summary_jsonld(context, &record.graph_iri)),
-        )
-        .await;
+        let exports = selected
+            .iter()
+            .map(|record| {
+                export_rocrate_summary_jsonld(context, &record.graph_iri, record.last_event_id)
+            })
+            .collect::<Vec<_>>();
+        let summaries = stream::iter(exports)
+            .buffered(METADATA_SUMMARY_FANOUT_LIMIT)
+            .collect::<Vec<_>>()
+            .await;
         for (record, summary) in selected.into_iter().zip(summaries) {
             let rocrate_summary_jsonld = match summary {
                 Ok(summary) => Some(summary),
@@ -406,7 +411,12 @@ pub async fn export_metadata_rocrate(
         MetadataRoCrateExportView::Summary => {
             ensure_record_materialized_for_graph_read(context, &record).await?;
             Ok(ExportMetadataRoCrateResult::Summary {
-                jsonld: export_rocrate_summary_jsonld(context, &record.graph_iri).await?,
+                jsonld: export_rocrate_summary_jsonld(
+                    context,
+                    &record.graph_iri,
+                    record.last_event_id,
+                )
+                .await?,
                 record,
             })
         }
@@ -1199,18 +1209,33 @@ async fn export_rocrate_jsonld(
         .map_err(map_metadata_event_error)
 }
 
+/// Summaries are cached per `(graph_iri, cursor)`. The lookup carries no
+/// authorization data because it only runs once `can_read_record` accepted that
+/// record; it MUST NOT be moved above that check.
 async fn export_rocrate_summary_jsonld(
     context: &DriverContext,
     graph_iri: &str,
+    cursor: Ulid,
 ) -> Result<String, MetadataApiError> {
     let handle = context
         .metadata_handle
         .clone()
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    handle
+    // The handle rejects deleted graphs before every export, so a hit has to
+    // re-check the authoritative lifecycle record itself.
+    if let Some(summary) = summary_cache().get(graph_iri, cursor, Instant::now()) {
+        if !metadata_graph_is_deleted(context, graph_iri).await? {
+            return Ok(summary.to_string());
+        }
+        summary_cache().remove(graph_iri);
+    }
+
+    let summary = handle
         .export_rocrate_summary_jsonld(graph_iri.to_string())
         .await
-        .map_err(map_metadata_event_error)
+        .map_err(map_metadata_event_error)?;
+    summary_cache().insert(graph_iri, cursor, &summary, Instant::now());
+    Ok(summary)
 }
 
 async fn export_rocrate_page(
@@ -1921,6 +1946,36 @@ async fn run_query_distributed(
     };
     let remote_auth_token = metadata_auth_token_from_bearer(bearer_token.as_deref());
 
+    // Remote partitions authorize on the forwarded credential, so entries are
+    // partitioned by credential digest. The local invalidation signals only
+    // cover the local partition; the TTL bounds remote staleness.
+    let cache_stamp = handle.query_cache().stamp(handle.visibility_generation());
+    let cache_key = super::query_cache::credential_digest(auth.as_ref(), bearer_token.as_deref())
+        .map(|credential| {
+            super::query_cache::remote_key(&super::query_cache::RemoteKeyInput {
+                distributed: mode == MetadataApiQueryMode::Distributed,
+                realm_id,
+                credential: &credential,
+                graph_iris: graph_iris.as_deref(),
+                sparql: &query,
+                allow_partial: scope.allow_partial,
+                target_nodes: scope.target_nodes.as_deref(),
+            })
+        })
+        .filter(|_| !scope.discovery_failed);
+    if let Some(key) = cache_key
+        && let Some(cached) = handle.query_cache().get(&key, cache_stamp, Instant::now())
+    {
+        span.record("cache", "hit");
+        span.record("result", cached.results.kind());
+        record_elapsed_ms(&span, "elapsed_ms", total_started);
+        return Ok((
+            (*cached.results).clone(),
+            super::query_cache::cached_stats(&cached),
+        ));
+    }
+    span.record("cache", "miss");
+
     let local_call: MetadataNodeCall<MetadataQueryResults> = metadata_node_call(
         (
             handle.clone(),
@@ -1971,6 +2026,19 @@ async fn run_query_distributed(
     match &result {
         Ok(results) => {
             span.record("result", results.kind());
+            if let Some(key) = cache_key
+                && super::query_cache::store_complete(
+                    handle.query_cache(),
+                    key,
+                    results,
+                    &fanout_stats,
+                    cache_stamp,
+                    handle.visibility_generation(),
+                    Instant::now(),
+                )
+            {
+                span.record("cache", "stored");
+            }
         }
         Err(_) => {
             span.record("result", "error");

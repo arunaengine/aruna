@@ -6,11 +6,13 @@ pub mod materialization_queue;
 pub mod projector;
 mod protocol;
 pub mod prune_queue;
+mod query_cache;
 mod queue_storage;
 pub mod raw;
 pub mod repository;
 mod search_cursor;
 mod search_enrichment;
+mod summary_cache;
 
 use std::sync::Arc;
 

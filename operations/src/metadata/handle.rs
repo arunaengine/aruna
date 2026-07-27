@@ -54,16 +54,20 @@ use super::protocol::{
     MetadataAuthToken, MetadataTransportMessage, encode_message, read_message,
     write_encoded_message, write_message,
 };
+use super::query_cache::{
+    CachedQuery, LocalScopeKind, MetadataQueryCache, ScopeDigest, graphs_digest, local_key,
+};
 use super::repository::{REGISTRY_FILL_PAGE_SIZE, iter_all_registry_effect, parse_registry_iter};
 use super::search_cursor::METADATA_SEARCH_MAX_PAGINATION_DEPTH;
 use super::search_enrichment::{hit_snippet, hit_title};
+use super::summary_cache::summary_cache;
 use crate::auth::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache,
     validate_aruna_bearer_token,
 };
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
-use crate::list_groups::ListGroupOperation;
+use crate::permission_rules::GroupPermissionRules;
 use crate::realm_peer::{RealmPeerError, ensure_realm_peer};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
@@ -249,6 +253,7 @@ struct MetadataInner {
     document_sync_db: Option<fjall::OptimisticTxDatabase>,
     document_sync_persist_policy: FjallPersistPolicy,
     visibility_cache: MetadataVisibilityCache,
+    query_cache: MetadataQueryCache,
     craqle_permits: Arc<tokio::sync::Semaphore>,
     craqle_read_permits: Arc<tokio::sync::Semaphore>,
     deferred_persist_requested: AtomicBool,
@@ -734,6 +739,7 @@ impl MetadataHandle {
                 document_sync_db,
                 document_sync_persist_policy: metadata_options.document_sync_persist_policy,
                 visibility_cache: MetadataVisibilityCache::new(),
+                query_cache: MetadataQueryCache::new(),
                 craqle_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
                 craqle_read_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
                 deferred_persist_requested: AtomicBool::new(false),
@@ -824,6 +830,14 @@ impl MetadataHandle {
         })
         .await
         .unwrap_or_default()
+    }
+
+    pub(super) fn query_cache(&self) -> &MetadataQueryCache {
+        &self.inner.query_cache
+    }
+
+    pub(super) fn visibility_generation(&self) -> u64 {
+        self.inner.visibility_cache.current_generation()
     }
 
     /// Test hook: marks all visibility cache entries as expired so the next
@@ -990,7 +1004,8 @@ impl MetadataHandle {
                 let started = Instant::now();
                 // Heavy mutations and cheap reads queue on separate pools so
                 // trivial reads never wait behind long materializations.
-                let permits = if metadata_effect_mutates_graph(&other) {
+                let mutates_graph = metadata_effect_mutates_graph(&other);
+                let permits = if mutates_graph {
                     self.inner.craqle_permits.clone()
                 } else {
                     self.inner.craqle_read_permits.clone()
@@ -1012,6 +1027,12 @@ impl MetadataHandle {
                 };
                 record_elapsed_ms(&span, "elapsed_ms", started);
                 span.record("result", metadata_event_kind(&metadata_event));
+                // WAL-replayed applies skip the lifecycle read and never touch
+                // the visibility generation, so cached results are only
+                // invalidated by this counter.
+                if mutates_graph && !matches!(metadata_event, MetadataEvent::Error { .. }) {
+                    self.inner.query_cache.bump_apply();
+                }
                 Event::Metadata(metadata_event)
             }
         }
@@ -1019,10 +1040,20 @@ impl MetadataHandle {
 
     pub async fn reconcile_document_sync(&self) -> Result<usize, MetadataError> {
         let inner = self.inner.clone();
-        tokio::task::spawn_blocking(move || inner.node.reconcile_irokle())
+        let applied = tokio::task::spawn_blocking(move || inner.node.reconcile_irokle())
             .await
             .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
-            .map_err(|error| MetadataError::Backend(error.to_string()))
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        // Peer document sync writes graphs without emitting an effect, so each
+        // graph the pass touched drops its summary, which may be keyed on a
+        // cursor that already led the content those records just landed.
+        if !applied.is_empty() {
+            self.inner.query_cache.bump_apply();
+            for graph in &applied {
+                summary_cache().remove(graph.as_str());
+            }
+        }
+        Ok(applied.len())
     }
 
     pub async fn prune_graph_if_deleted(&self, graph_iri: String) -> Result<bool, MetadataError> {
@@ -4327,6 +4358,7 @@ async fn warn_unprojected_graphs(inner: Arc<MetadataInner>, records: &[MetadataR
         result = field::Empty,
         row_count = field::Empty,
         triple_count = field::Empty,
+        cache = field::Empty,
     )
 )]
 async fn query_local_graphs(
@@ -4338,6 +4370,11 @@ async fn query_local_graphs(
     let span = Span::current();
     let total_started = Instant::now();
     let query = parse_metadata_query(&sparql)?;
+    // Stamped before any read so a mutation racing this query invalidates the
+    // entry it stores.
+    let cache_stamp = inner
+        .query_cache
+        .stamp(inner.visibility_cache.current_generation());
 
     let records = list_registry_records_for_local_read(inner.clone(), &span).await?;
 
@@ -4366,10 +4403,32 @@ async fn query_local_graphs(
             false
         }
         LocalReadScope::Lazy(scope) => {
-            span.record("readable_groups", scope.readable_groups.len() as u64);
+            span.record("readable_groups", scope.permissions.group_count() as u64);
             true
         }
     };
+
+    let cache_key = match &scope {
+        LocalReadScope::Eager(allowed) => {
+            local_key(LocalScopeKind::Eager, &graphs_digest(allowed), &sparql)
+        }
+        LocalReadScope::Lazy(scope) => local_key(
+            LocalScopeKind::Lazy,
+            &scope.visible_digest(&inner.visibility_cache),
+            &sparql,
+        ),
+    };
+    if let Some(cached) = inner
+        .query_cache
+        .get(&cache_key, cache_stamp, Instant::now())
+    {
+        span.record("cache", "hit");
+        span.record("result", cached.results.kind());
+        record_metadata_query_result_counts(&span, &cached.results);
+        record_elapsed_ms(&span, "elapsed_ms", total_started);
+        return Ok((*cached.results).clone());
+    }
+    span.record("cache", "miss");
 
     let query_span = debug_span!(
         "metadata.backend.craqle.query_graphs",
@@ -4385,6 +4444,7 @@ async fn query_local_graphs(
         query_span.record("graph_count", allowed.len() as u64);
     }
     let blocking_span = query_span.clone();
+    let cache_inner = inner.clone();
     let query_started = Instant::now();
     // Queries are reads: take from the read pool so they never queue behind
     // long-running materializations holding the mutation permits.
@@ -4430,6 +4490,19 @@ async fn query_local_graphs(
             span.record("result", results.kind());
             record_metadata_query_result_counts(&query_span, results);
             record_metadata_query_result_counts(&span, results);
+            let stored = cache_inner.query_cache.insert(
+                cache_key,
+                CachedQuery {
+                    results: Arc::new(results.clone()),
+                    nodes_queried: 0,
+                },
+                cache_stamp,
+                cache_inner.visibility_cache.current_generation(),
+                Instant::now(),
+            );
+            if stored {
+                span.record("cache", "stored");
+            }
         }
         Err(error) => {
             record_error(&query_span, &error.to_string());
