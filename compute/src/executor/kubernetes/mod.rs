@@ -1603,7 +1603,7 @@ fn pod_stuck_reason(pod: &Pod, deadline: Duration, now: Timestamp) -> Option<Str
     let waited = status
         .start_time
         .as_ref()
-        .or_else(|| pod.metadata.creation_timestamp.as_ref())
+        .or(pod.metadata.creation_timestamp.as_ref())
         .map(|since| Duration::try_from(now.duration_since(since.0)).unwrap_or_default())
         .unwrap_or_default();
     status
