@@ -1172,7 +1172,15 @@ fn list_workspace(
             let relative = path.strip_prefix(root).map_err(|_| {
                 BackendError::InvalidSpec("listing escaped the workspace".to_string())
             })?;
-            let absolute = format!("/{}", relative.display());
+            // A lossy name would address a file that does not exist, so skip it.
+            let Some(relative) = relative.to_str() else {
+                tracing::warn!(
+                    path = %relative.display(),
+                    "skipping output path that is not UTF-8"
+                );
+                continue;
+            };
+            let absolute = format!("/{relative}");
             if glob.is_match(&absolute) {
                 if matched.len() >= MAX_OUTPUT_MATCHES {
                     return Err(BackendError::InvalidSpec(
@@ -1233,6 +1241,25 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn skips_invalid_name() {
+        // A lossy name matches the pattern but addresses no file, so the fetch
+        // that follows would fail forever.
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tempdir().unwrap();
+        let root = root.path();
+        std::fs::create_dir_all(root.join("out")).unwrap();
+        std::fs::write(root.join("out/a.txt"), b"x").unwrap();
+        let invalid = std::ffi::OsStr::from_bytes(b"\xff\xfe.txt");
+        std::fs::write(root.join("out").join(invalid), b"y").unwrap();
+        let glob = OutputMatcher::new(["/out/*.txt"]).unwrap();
+
+        let matched = list_workspace(root, &root.join("out"), &glob).unwrap();
+
+        assert_eq!(matched, vec!["/out/a.txt".to_string()]);
     }
 
     #[test]
