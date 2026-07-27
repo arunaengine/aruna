@@ -2426,7 +2426,7 @@ mod tests {
         let matched = list_archive(io::Cursor::new(bytes), Path::new("/"), &glob).unwrap();
 
         assert_eq!(matched, vec!["/out/a.txt", "/out/b.txt"]);
-        assert!(MAX_LISTING_SCAN_BYTES > MAX_TRANSFER_BYTES);
+        const { assert!(MAX_LISTING_SCAN_BYTES > MAX_TRANSFER_BYTES) };
     }
 
     #[test]
