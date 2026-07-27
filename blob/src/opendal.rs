@@ -322,6 +322,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn builds_unsigned_s3() {
+        // `skip_signature` must stay a valid S3 config key across opendal upgrades.
+        build_service::<services::S3>(HashMap::from([
+            ("bucket".to_string(), "public-data".to_string()),
+            ("endpoint".to_string(), "https://s3.example.org".to_string()),
+            ("region".to_string(), "eu-central-1".to_string()),
+            ("skip_signature".to_string(), "true".to_string()),
+        ]))
+        .unwrap();
+
+        build_service::<services::S3>(HashMap::from([
+            ("bucket".to_string(), "public-data".to_string()),
+            ("endpoint".to_string(), "https://s3.example.org".to_string()),
+            ("region".to_string(), "eu-central-1".to_string()),
+            ("skip_signature".to_string(), "nope".to_string()),
+        ]))
+        .unwrap_err();
+    }
+
+    #[tokio::test]
     async fn check_reports_success() {
         let dir = tempdir().unwrap();
         let operator = build_service::<services::Fs>(HashMap::from([(
