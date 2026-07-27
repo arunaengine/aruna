@@ -23,7 +23,7 @@ use aruna_operations::get_metadata_document::load_metadata_record_by_document as
 use aruna_operations::jobs::service::submit_export_job;
 use aruna_operations::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
-    ListVisibleMetadataDocumentsRequest, MetadataApiError, MetadataApiQueryMode,
+    ListVisibleMetadataDocumentsRequest, MetadataApiError, MetadataApiQueryMode, MetadataListOrder,
     MetadataDocumentQueryRequest, MetadataFanoutStats, MetadataQueryRequest,
     MetadataReferenceEntry, MetadataReferencesExecution, MetadataReferencesRequest,
     MetadataRoCrateExportView as OperationMetadataRoCrateExportView, MetadataSearchRequest,
@@ -228,6 +228,8 @@ pub struct ListMetadataQuery {
     pub limit: Option<usize>,
     #[serde(default)]
     pub offset: Option<usize>,
+    #[serde(default)]
+    pub order: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -673,7 +675,8 @@ pub async fn create_metadata_document(
         ("path_prefix" = Option<String>, Query, description = "Normalized metadata path prefix, for example profiles/"),
         ("include" = Option<String>, Query, description = "Comma-separated includes. Currently supports summary"),
         ("limit" = Option<usize>, Query, description = "Maximum documents to return"),
-        ("offset" = Option<usize>, Query, description = "Number of filtered documents to skip")
+        ("offset" = Option<usize>, Query, description = "Number of filtered documents to skip"),
+        ("order" = Option<String>, Query, description = "Page order: created (default, ascending document id) or recent (descending updated_at, tie-broken by descending document id). Any other value is rejected with 400")
     ),
     responses(
         (status = 200, description = "Visible metadata documents", body = ListMetadataResponse),
@@ -703,7 +706,8 @@ pub async fn list_all_metadata_documents(
         ("path_prefix" = Option<String>, Query, description = "Normalized metadata path prefix, for example profiles/"),
         ("include" = Option<String>, Query, description = "Comma-separated includes. Currently supports summary"),
         ("limit" = Option<usize>, Query, description = "Maximum documents to return"),
-        ("offset" = Option<usize>, Query, description = "Number of filtered documents to skip")
+        ("offset" = Option<usize>, Query, description = "Number of filtered documents to skip"),
+        ("order" = Option<String>, Query, description = "Page order: created (default, ascending document id) or recent (descending updated_at, tie-broken by descending document id). Any other value is rejected with 400")
     ),
     responses(
         (status = 200, description = "Visible metadata documents", body = ListMetadataResponse),
@@ -1497,6 +1501,7 @@ async fn run_list_metadata_documents(
     group_id: Option<Ulid>,
 ) -> ServerResult<ListMetadataResponse> {
     let include = parse_metadata_include_flags(query.include.as_deref())?;
+    let order = parse_metadata_order(query.order.as_deref())?;
     let ctx = state.get_ctx();
     let result = run_list_visible_metadata_documents(
         ctx.as_ref(),
@@ -1507,6 +1512,7 @@ async fn run_list_metadata_documents(
             include_summary: include.summary,
             limit: query.limit,
             offset: query.offset,
+            order,
             auth,
         },
     )
@@ -1548,6 +1554,16 @@ fn parse_metadata_include_flags(include: Option<&str>) -> ServerResult<MetadataI
         }
     }
     Ok(flags)
+}
+
+fn parse_metadata_order(order: Option<&str>) -> ServerResult<MetadataListOrder> {
+    match order.map(str::trim) {
+        None | Some("") | Some("created") => Ok(MetadataListOrder::Created),
+        Some("recent") => Ok(MetadataListOrder::Recent),
+        Some(_) => Err(ServerError::BadRequestMessage(
+            "order must be created or recent".to_string(),
+        )),
+    }
 }
 
 fn format_timestamp_ms(timestamp_ms: u64) -> String {
@@ -2031,6 +2047,28 @@ mod tests {
         assert_eq!(
             mapped.into_response().status(),
             axum::http::StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_order() {
+        use axum::response::IntoResponse;
+        assert!(matches!(
+            parse_metadata_order(None),
+            Ok(MetadataListOrder::Created)
+        ));
+        assert!(matches!(
+            parse_metadata_order(Some("created")),
+            Ok(MetadataListOrder::Created)
+        ));
+        assert!(matches!(
+            parse_metadata_order(Some("recent")),
+            Ok(MetadataListOrder::Recent)
+        ));
+        let rejected = parse_metadata_order(Some("updated")).expect_err("unknown order rejected");
+        assert_eq!(
+            rejected.into_response().status(),
+            axum::http::StatusCode::BAD_REQUEST
         );
     }
 

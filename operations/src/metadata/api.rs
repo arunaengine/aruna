@@ -90,6 +90,16 @@ pub enum MetadataApiError {
     Internal(String),
 }
 
+/// Order the visible metadata listing is paginated in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MetadataListOrder {
+    /// Ascending document id, which is creation order for ULID ids.
+    #[default]
+    Created,
+    /// Descending `updated_at_ms`, tie-broken by descending document id.
+    Recent,
+}
+
 #[derive(Debug, Clone)]
 pub struct ListVisibleMetadataDocumentsRequest {
     pub group_id: Option<GroupId>,
@@ -97,6 +107,7 @@ pub struct ListVisibleMetadataDocumentsRequest {
     pub include_summary: bool,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    pub order: MetadataListOrder,
     pub auth: Option<AuthContext>,
 }
 
@@ -325,9 +336,11 @@ pub async fn list_visible_metadata_documents(
             .map(|group| group.group_id)
             .collect(),
     };
-    // Summary listings must show documents whose projection has not landed yet;
-    // the pending keyspace is scanned once per request, never once per group.
-    let mut pending = if request.include_summary {
+    // Summary listings and recency listings must show documents whose projection
+    // has not landed yet; the pending keyspace is scanned once per request,
+    // never once per group.
+    let recent = request.order == MetadataListOrder::Recent;
+    let mut pending = if request.include_summary || recent {
         load_pending_records(context, request.group_id).await?
     } else {
         HashMap::new()
@@ -341,6 +354,17 @@ pub async fn list_visible_metadata_documents(
             group_records.sort_by_key(|record| record.document_id);
         }
         records.extend(group_records);
+    }
+
+    // Ordering precedes both the estimate scan and the offset window so that
+    // pagination and the early exit page the same sequence.
+    if recent {
+        records.sort_by(|left, right| {
+            right
+                .updated_at_ms
+                .cmp(&left.updated_at_ms)
+                .then_with(|| right.document_id.cmp(&left.document_id))
+        });
     }
 
     // Group-granular estimate: one permission probe per group, reused for every
@@ -2433,6 +2457,7 @@ mod tests {
             include_summary,
             limit: None,
             offset: None,
+            order: MetadataListOrder::default(),
             auth: None,
         }
     }
@@ -2712,6 +2737,93 @@ mod tests {
 
         assert_eq!(result.total_returned, 2);
         assert_eq!(result.total_estimate, Some(2));
+    }
+
+    // Update stamps deliberately disagree with the ascending document ids.
+    async fn seed_timed_records(
+        test: &MetadataTest,
+        group_id: GroupId,
+    ) -> Vec<MetadataRegistryRecord> {
+        let mut records = Vec::new();
+        for updated_at_ms in [10u64, 30, 20] {
+            let mut record = public_record(group_id, Ulid::generate());
+            record.updated_at_ms = updated_at_ms;
+            seed_registry_cache(test, &record).await;
+            records.push(record);
+        }
+        records
+    }
+
+    fn listed_ids(result: &ListVisibleMetadataDocumentsResult) -> Vec<Ulid> {
+        result
+            .documents
+            .iter()
+            .map(|document| document.record.document_id)
+            .collect()
+    }
+
+    // Recency ordering must precede the offset window so pages walk it too.
+    #[tokio::test]
+    async fn orders_recent_first() {
+        let test = metadata_test();
+        let group_id = Ulid::generate();
+        let records = seed_timed_records(&test, group_id).await;
+
+        let page = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            ListVisibleMetadataDocumentsRequest {
+                order: MetadataListOrder::Recent,
+                ..summary_request(group_id, false)
+            },
+        )
+        .await
+        .expect("listing succeeds");
+        assert_eq!(
+            listed_ids(&page),
+            vec![
+                records[1].document_id,
+                records[2].document_id,
+                records[0].document_id
+            ]
+        );
+
+        let second = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            ListVisibleMetadataDocumentsRequest {
+                limit: Some(1),
+                offset: Some(1),
+                order: MetadataListOrder::Recent,
+                ..summary_request(group_id, false)
+            },
+        )
+        .await
+        .expect("listing succeeds");
+        assert_eq!(listed_ids(&second), vec![records[2].document_id]);
+    }
+
+    // The default page stays in ascending document id order.
+    #[tokio::test]
+    async fn default_keeps_created() {
+        let test = metadata_test();
+        let group_id = Ulid::generate();
+        let records = seed_timed_records(&test, group_id).await;
+
+        let page = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            summary_request(group_id, false),
+        )
+        .await
+        .expect("listing succeeds");
+
+        let mut expected = records
+            .iter()
+            .map(|record| record.document_id)
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(listed_ids(&page), expected);
     }
 
     #[test]
