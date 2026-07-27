@@ -85,6 +85,10 @@ const SYNC_MIRROR_REQUEST_TIMEOUT: Duration =
 const METADATA_GRAPH_SYNC_ATTEMPTS: usize = 3;
 const METADATA_GRAPH_SYNC_RETRY_AFTER: Duration = Duration::from_millis(250);
 const SLOW_METADATA_BACKEND_THRESHOLD: Duration = Duration::from_millis(100);
+// Craqle rebuilds a describe context per hit and Aruna maps one document per
+// graph, so search enrichment overlaps instead of memoizing; the craqle read
+// semaphore, not this task cap, is the real concurrency limit.
+const METADATA_ENRICH_TASKS: usize = 8;
 pub(crate) const METADATA_QUERY_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const METADATA_QUERY_MAX_ROWS: usize = 10_000;
 pub(crate) const METADATA_QUERY_MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
@@ -812,17 +816,7 @@ impl MetadataHandle {
             let authorizer = AllowedGraphAuthorizer {
                 graph_iris: HashSet::from([graph_iri.clone()]),
             };
-            inner
-                .node
-                .describe_subject(
-                    &authorizer,
-                    DescribeRequest {
-                        graph: &GraphId::new(&graph_iri),
-                        subject_id: &graph_iri,
-                    },
-                )
-                .map(decode_hit_properties)
-                .unwrap_or_default()
+            describe_hit_properties(&inner.node, &authorizer, &graph_iri, &graph_iri)
         })
         .await
         .unwrap_or_default()
@@ -4931,62 +4925,69 @@ async fn search_realm_scope(
         result = field::Empty,
         hit_count = field::Empty,
     );
-    let blocking_span = search_span.clone();
     let search_started = Instant::now();
-    let _permit = inner.craqle_read_permits.clone().acquire_owned().await.ok();
-    let result = match tokio::task::spawn_blocking(move || {
-        blocking_span.in_scope(|| search_visible_scope(&inner, &scope, &query, limit))
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => Err(MetadataError::TaskJoin(error.to_string())),
-    };
+    let result = search_visible_scope(&inner, Arc::new(scope), query, limit, &search_span).await;
     record_backend_search(span, &search_span, search_started, &result);
     result
 }
 
 // Craqle post-filters the index hits it returns through the request's already
 // resolved scope, so the work scales with the page instead of the realm.
-fn search_visible_scope(
-    inner: &MetadataInner,
-    scope: &GraphVisibilityScope,
-    query: &str,
+async fn search_visible_scope(
+    inner: &Arc<MetadataInner>,
+    scope: Arc<GraphVisibilityScope>,
+    query: String,
     limit: usize,
+    search_span: &Span,
 ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
-    let authorizer = ScopeAuthorizer {
-        scope,
-        visibility_cache: &inner.visibility_cache,
+    let describe = scope_hit_describe(inner, &scope);
+    let mut hits = {
+        let task_inner = inner.clone();
+        let task_scope = scope.clone();
+        let task_query = query.clone();
+        let blocking_span = search_span.clone();
+        let _permit = inner.craqle_read_permits.clone().acquire_owned().await.ok();
+        tokio::task::spawn_blocking(move || {
+            blocking_span.in_scope(|| {
+                let authorizer = ScopeAuthorizer {
+                    scope: &task_scope,
+                    visibility_cache: &task_inner.visibility_cache,
+                };
+                task_inner
+                    .node
+                    .search(
+                        &authorizer,
+                        SearchRequest {
+                            query: &task_query,
+                            limit,
+                        },
+                    )
+                    .map_err(|error| MetadataError::Backend(error.to_string()))
+            })
+        })
+        .await
+        .map_err(|error| MetadataError::TaskJoin(error.to_string()))??
     };
-    let hits = inner
-        .node
-        .search(&authorizer, SearchRequest { query, limit })
-        .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    let mut visible = Vec::with_capacity(hits.len().min(limit));
-    for hit in hits {
-        let Some(record) = scope.record_for_graph(&hit.graph_id) else {
-            continue;
-        };
-        // Enrichment is best-effort: a pending or raced projection must never
-        // fail the search, so fall back to an empty property set.
-        let properties = inner
-            .node
-            .describe_subject(
-                &authorizer,
-                DescribeRequest {
-                    graph: &GraphId::new(&hit.graph_id),
-                    subject_id: &hit.subject_iri,
-                },
-            )
-            .map(decode_hit_properties)
-            .unwrap_or_default();
-        visible.push(metadata_search_hit_from_craqle(
-            hit,
-            record,
-            &properties,
-            query,
-        ));
-    }
+    hits.retain(|hit| scope.record_for_graph(&hit.graph_id).is_some());
+    let targets = hits
+        .iter()
+        .map(|hit| (hit.graph_id.clone(), hit.subject_iri.clone()))
+        .collect::<Vec<_>>();
+    let properties =
+        describe_hits_parallel(&inner.craqle_read_permits, targets, describe, search_span).await;
+    let mut visible = hits
+        .into_iter()
+        .zip(properties)
+        .filter_map(|(hit, properties)| {
+            let record = scope.record_for_graph(&hit.graph_id)?;
+            Some(metadata_search_hit_from_craqle(
+                hit,
+                record,
+                &properties,
+                &query,
+            ))
+        })
+        .collect::<Vec<_>>();
     // The unfiltered entry point returns raw index order; the search cursor's
     // watermark needs the merged score-descending order instead.
     visible.sort_by(compare_hits);
@@ -5048,53 +5049,43 @@ async fn search_candidate_graphs(
             .iter()
             .map(|record| record.graph_iri.clone())
             .collect::<HashSet<_>>();
-        let _permit = inner.craqle_read_permits.clone().acquire_owned().await.ok();
-        let hits = match tokio::task::spawn_blocking(move || {
-            let authorizer = AllowedGraphAuthorizer {
+        let describe = allowed_hit_describe(
+            &inner,
+            Arc::new(AllowedGraphAuthorizer {
                 graph_iris: allowed_graphs,
-            };
-            let mut hits = allowed_records
-                .into_iter()
-                .filter_map(|record| {
-                    let subject_iri = matches.get(&record.document_id)?.first()?.clone();
-                    let properties = inner
-                        .node
-                        .describe_subject(
-                            &authorizer,
-                            DescribeRequest {
-                                graph: &GraphId::new(&record.graph_iri),
-                                subject_id: &subject_iri,
-                            },
-                        )
-                        .map(decode_hit_properties)
-                        .unwrap_or_default();
-                    let title = super::search_enrichment::hit_title(
-                        &properties,
-                        &record.document_path,
-                        &subject_iri,
-                    );
-                    Some(MetadataSearchHit {
-                        document_id: record.document_id.to_string(),
-                        group_id: record.group_id.to_string(),
-                        document_path: record.document_path,
-                        graph_iri: record.graph_iri,
-                        subject_iri,
-                        score: 1.0,
-                        title,
-                        snippet: None,
-                    })
-                })
-                .collect::<Vec<_>>();
-            hits.sort_by(|left, right| left.document_id.cmp(&right.document_id));
-            hits.truncate(limit);
-            hits
-        })
-        .await
-        {
-            Ok(hits) => hits,
-            Err(error) => return Err(MetadataError::TaskJoin(error.to_string())),
-        };
-        return Ok(hits);
+            }),
+        );
+        // The page is ordered by document id alone, so it is cut before the
+        // describes instead of enriching every candidate.
+        let mut candidates = allowed_records
+            .into_iter()
+            .filter_map(|record| {
+                let subject_iri = matches.get(&record.document_id)?.first()?.clone();
+                Some((record, subject_iri))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(record, _)| record.document_id);
+        candidates.truncate(limit);
+        let targets = candidates
+            .iter()
+            .map(|(record, subject_iri)| (record.graph_iri.clone(), subject_iri.clone()))
+            .collect::<Vec<_>>();
+        let properties =
+            describe_hits_parallel(&inner.craqle_read_permits, targets, describe, span).await;
+        return Ok(candidates
+            .into_iter()
+            .zip(properties)
+            .map(|((record, subject_iri), properties)| MetadataSearchHit {
+                document_id: record.document_id.to_string(),
+                group_id: record.group_id.to_string(),
+                title: hit_title(&properties, &record.document_path, &subject_iri),
+                document_path: record.document_path,
+                graph_iri: record.graph_iri,
+                subject_iri,
+                score: 1.0,
+                snippet: None,
+            })
+            .collect());
     }
 
     let by_graph: HashMap<_, _> = allowed_records
@@ -5116,63 +5107,176 @@ async fn search_candidate_graphs(
         result = field::Empty,
         hit_count = field::Empty,
     );
-    let blocking_span = search_span.clone();
     let search_started = Instant::now();
-    let _permit = inner.craqle_read_permits.clone().acquire_owned().await.ok();
-    let result = match tokio::task::spawn_blocking(move || {
-        blocking_span.in_scope(|| {
-            let authorizer = AllowedGraphAuthorizer {
-                graph_iris: allowed_graphs,
-            };
-            let hits = inner
-                .node
-                .search_graphs(
-                    &authorizer,
-                    GraphSearchRequest {
-                        graphs: &graph_ids,
-                        query: &query,
-                        limit,
-                    },
-                )
-                .map_err(|error| MetadataError::Backend(error.to_string()))?;
-            let mut visible = Vec::with_capacity(hits.len().min(limit));
-            for hit in hits {
-                let Some(record) = by_graph.get(&hit.graph_id) else {
-                    continue;
-                };
-                // Enrichment is best-effort: a pending or raced projection must
-                // never fail the search, so fall back to an empty property set.
-                let properties = inner
-                    .node
-                    .describe_subject(
-                        &authorizer,
-                        DescribeRequest {
-                            graph: &GraphId::new(&hit.graph_id),
-                            subject_id: &hit.subject_iri,
-                        },
-                    )
-                    .map(decode_hit_properties)
-                    .unwrap_or_default();
-                visible.push(metadata_search_hit_from_craqle(
-                    hit,
-                    record,
-                    &properties,
-                    &query,
-                ));
-                if visible.len() >= limit {
-                    break;
-                }
-            }
-            Ok(visible)
-        })
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => Err(MetadataError::TaskJoin(error.to_string())),
-    };
+    let authorizer = Arc::new(AllowedGraphAuthorizer {
+        graph_iris: allowed_graphs,
+    });
+    let result = search_allowed_graphs(
+        &inner,
+        authorizer,
+        by_graph,
+        graph_ids,
+        &query,
+        limit,
+        &search_span,
+    )
+    .await;
     record_backend_search(span, &search_span, search_started, &result);
     result
+}
+
+async fn search_allowed_graphs(
+    inner: &Arc<MetadataInner>,
+    authorizer: Arc<AllowedGraphAuthorizer>,
+    by_graph: HashMap<String, MetadataRegistryRecord>,
+    graph_ids: Vec<GraphId>,
+    query: &str,
+    limit: usize,
+    search_span: &Span,
+) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+    let describe = allowed_hit_describe(inner, authorizer.clone());
+    let hits = {
+        let task_inner = inner.clone();
+        let task_query = query.to_string();
+        let blocking_span = search_span.clone();
+        let _permit = inner.craqle_read_permits.clone().acquire_owned().await.ok();
+        tokio::task::spawn_blocking(move || {
+            blocking_span.in_scope(|| {
+                task_inner
+                    .node
+                    .search_graphs(
+                        authorizer.as_ref(),
+                        GraphSearchRequest {
+                            graphs: &graph_ids,
+                            query: &task_query,
+                            limit,
+                        },
+                    )
+                    .map_err(|error| MetadataError::Backend(error.to_string()))
+            })
+        })
+        .await
+        .map_err(|error| MetadataError::TaskJoin(error.to_string()))??
+    };
+    let hits = hits
+        .into_iter()
+        .filter(|hit| by_graph.contains_key(&hit.graph_id))
+        .take(limit)
+        .collect::<Vec<_>>();
+    let targets = hits
+        .iter()
+        .map(|hit| (hit.graph_id.clone(), hit.subject_iri.clone()))
+        .collect::<Vec<_>>();
+    let properties =
+        describe_hits_parallel(&inner.craqle_read_permits, targets, describe, search_span).await;
+    Ok(hits
+        .into_iter()
+        .zip(properties)
+        .filter_map(|(hit, properties)| {
+            let record = by_graph.get(&hit.graph_id)?;
+            Some(metadata_search_hit_from_craqle(
+                hit,
+                record,
+                &properties,
+                query,
+            ))
+        })
+        .collect())
+}
+
+/// Describes one hit's `(graph_iri, subject_iri)` against a fixed authorizer.
+type HitDescribe = Arc<dyn Fn(&str, &str) -> Vec<(String, Term)> + Send + Sync>;
+
+/// Enriches hits in parallel, one blocking task per chunk of `targets`.
+///
+/// The returned properties align with `targets` by index: chunks stay
+/// contiguous and are concatenated in chunk order, so hit order never depends
+/// on which task finished first.
+async fn describe_hits_parallel(
+    read_permits: &Arc<tokio::sync::Semaphore>,
+    targets: Vec<(String, String)>,
+    describe: HitDescribe,
+    span: &Span,
+) -> Vec<Vec<(String, Term)>> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let chunk_size = targets.len().div_ceil(METADATA_ENRICH_TASKS);
+    let tasks = targets
+        .chunks(chunk_size)
+        .map(<[(String, String)]>::to_vec)
+        .map(|chunk| {
+            let permits = read_permits.clone();
+            let describe = describe.clone();
+            let span = span.clone();
+            async move {
+                let chunk_len = chunk.len();
+                let _permit = permits.acquire_owned().await.ok();
+                tokio::task::spawn_blocking(move || {
+                    span.in_scope(|| {
+                        chunk
+                            .iter()
+                            .map(|(graph_iri, subject_iri)| describe(graph_iri, subject_iri))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    warn!(%error, "metadata search enrichment task failed");
+                    vec![Vec::new(); chunk_len]
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    futures_util::future::join_all(tasks)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+fn scope_hit_describe(
+    inner: &Arc<MetadataInner>,
+    scope: &Arc<GraphVisibilityScope>,
+) -> HitDescribe {
+    let inner = inner.clone();
+    let scope = scope.clone();
+    Arc::new(move |graph_iri, subject_iri| {
+        let authorizer = ScopeAuthorizer {
+            scope: &scope,
+            visibility_cache: &inner.visibility_cache,
+        };
+        describe_hit_properties(&inner.node, &authorizer, graph_iri, subject_iri)
+    })
+}
+
+fn allowed_hit_describe(
+    inner: &Arc<MetadataInner>,
+    authorizer: Arc<AllowedGraphAuthorizer>,
+) -> HitDescribe {
+    let inner = inner.clone();
+    Arc::new(move |graph_iri, subject_iri| {
+        describe_hit_properties(&inner.node, authorizer.as_ref(), graph_iri, subject_iri)
+    })
+}
+
+// Enrichment is best-effort: a pending or raced projection must never fail the
+// search, so fall back to an empty property set.
+fn describe_hit_properties(
+    node: &CraqleNode,
+    authorizer: &dyn CraqleAuthorizer,
+    graph_iri: &str,
+    subject_iri: &str,
+) -> Vec<(String, Term)> {
+    node.describe_subject(
+        authorizer,
+        DescribeRequest {
+            graph: &GraphId::new(graph_iri),
+            subject_id: subject_iri,
+        },
+    )
+    .map(decode_hit_properties)
+    .unwrap_or_default()
 }
 
 fn clamp_remote_search_graph_limit(limit: usize) -> usize {
@@ -6788,6 +6892,56 @@ mod tests {
             &authorizer,
             &MetadataRegistryRecord::graph_iri_for(Ulid::generate())
         ));
+    }
+
+    #[tokio::test]
+    async fn enrichment_keeps_order() {
+        // The gate forces the describes to complete in exactly reverse order;
+        // the properties must still line up with the targets that asked for them.
+        let count = METADATA_ENRICH_TASKS;
+        let gate = Arc::new((Mutex::new(count - 1), std::sync::Condvar::new()));
+        let describe_gate = gate.clone();
+        let describe: HitDescribe = Arc::new(move |_graph_iri, subject_iri: &str| {
+            let index = subject_iri
+                .rsplit('/')
+                .next()
+                .and_then(|tail| tail.parse::<usize>().ok())
+                .expect("indexed subject");
+            let (turn, ready) = &*describe_gate;
+            let mut turn = turn.lock().expect("gate lock");
+            // Bounded so a lost wakeup fails the assertion instead of hanging.
+            while *turn != index {
+                let (guard, wait) = ready
+                    .wait_timeout(turn, Duration::from_secs(30))
+                    .expect("gate lock");
+                turn = guard;
+                if wait.timed_out() {
+                    break;
+                }
+            }
+            *turn = index.wrapping_sub(1);
+            ready.notify_all();
+            vec![(
+                "urn:test:index".to_string(),
+                Term::Literal(Literal::new_simple_literal(index.to_string())),
+            )]
+        });
+
+        let targets = (0..count)
+            .map(|index| ("urn:graph".to_string(), format!("urn:subject/{index}")))
+            .collect::<Vec<_>>();
+        let permits = Arc::new(tokio::sync::Semaphore::new(count));
+        let properties = describe_hits_parallel(&permits, targets, describe, &Span::none()).await;
+
+        let expected = (0..count)
+            .map(|index| {
+                vec![(
+                    "urn:test:index".to_string(),
+                    Term::Literal(Literal::new_simple_literal(index.to_string())),
+                )]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(properties, expected);
     }
 
     fn scope_for(
