@@ -420,8 +420,15 @@ pub async fn list_visible_metadata_documents(
     if request.include_summary {
         let exports = selected
             .iter()
-            .map(|record| {
+            .map(|record| async move {
+                // The registry cursor advances at event acceptance, but the
+                // graph only at materialization. Exporting inside that window
+                // would hand out the content (and cache it under the new cursor)
+                // the event just replaced, so a pending document lists without
+                // a summary instead.
+                ensure_record_materialized_for_graph_read(context, record).await?;
                 export_rocrate_summary_jsonld(context, &record.graph_iri, record.last_event_id)
+                    .await
             })
             .collect::<Vec<_>>();
         let summaries = stream::iter(exports)
