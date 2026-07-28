@@ -45,6 +45,8 @@ pub struct BlobHandler {
     connections: Arc<Mutex<HashMap<Ulid, Connection>>>,
     operator_status: Arc<RwLock<aruna_core::structs::Status>>,
     transfer_slots: Arc<Semaphore>,
+    read_slots: Arc<Semaphore>,
+    spool_slots: Arc<Semaphore>,
     inflight: Arc<AtomicUsize>,
 }
 

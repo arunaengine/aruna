@@ -7,20 +7,30 @@ use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
+use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{BackendConfig, BlobState, Status};
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use aruna_storage::storage::StorageHandle;
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::Stream;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use std::task::{Context, Poll};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::{Duration, Instant, interval, timeout};
 use ulid::Ulid;
 
 // Bounds concurrent transfers so overload queues instead of exhausting fds.
 pub(super) const TRANSFER_SLOTS: usize = 256;
+// Reads hold a backend connection for as long as the returned stream lives.
+pub(super) const READ_SLOTS: usize = 256;
+// Spools take their own pool because their input stream may issue nested
+// transfer and read effects; sharing a pool with those would deadlock.
+pub(super) const SPOOL_SLOTS: usize = 64;
 const QUEUE_WAIT_WARN: Duration = Duration::from_millis(100);
 const SLOW_LOCAL_EFFECT: Duration = Duration::from_secs(1);
 const SLOW_CONTROL_EFFECT: Duration = Duration::from_secs(120);
@@ -31,14 +41,16 @@ enum EffectClass {
     Local,
     Control,
     Transfer,
+    Read,
+    Spool,
 }
 
 impl EffectClass {
     fn slow_threshold(self) -> Duration {
         match self {
-            EffectClass::Local => SLOW_LOCAL_EFFECT,
+            EffectClass::Local | EffectClass::Read => SLOW_LOCAL_EFFECT,
             EffectClass::Control => SLOW_CONTROL_EFFECT,
-            EffectClass::Transfer => SLOW_TRANSFER_EFFECT,
+            EffectClass::Transfer | EffectClass::Spool => SLOW_TRANSFER_EFFECT,
         }
     }
 }
@@ -48,7 +60,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::Write { .. } => (EffectClass::Transfer, "write"),
         BlobEffect::WritePart { .. } => (EffectClass::Transfer, "write_part"),
         BlobEffect::Compose { .. } => (EffectClass::Transfer, "compose"),
-        BlobEffect::SpoolHidden { .. } => (EffectClass::Transfer, "spool_hidden"),
+        BlobEffect::SpoolHidden { .. } => (EffectClass::Spool, "spool_hidden"),
         BlobEffect::Replicate { .. } => (EffectClass::Transfer, "replicate"),
         BlobEffect::HandleReplication { .. } => (EffectClass::Transfer, "handle_replication"),
         BlobEffect::ServeRead { .. } => (EffectClass::Transfer, "serve_read"),
@@ -57,12 +69,54 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::SendMessage { .. } => (EffectClass::Control, "send_message"),
         BlobEffect::ReadMessage { .. } => (EffectClass::Control, "read_message"),
         BlobEffect::CloseConnection { .. } => (EffectClass::Control, "close_connection"),
-        BlobEffect::Read { .. } => (EffectClass::Local, "read"),
-        BlobEffect::ReadRange { .. } => (EffectClass::Local, "read_range"),
-        BlobEffect::ReadHiddenRange { .. } => (EffectClass::Local, "read_hidden_range"),
+        BlobEffect::Read { .. } => (EffectClass::Read, "read"),
+        BlobEffect::ReadRange { .. } => (EffectClass::Read, "read_range"),
+        BlobEffect::ReadHiddenRange { .. } => (EffectClass::Read, "read_hidden_range"),
         BlobEffect::Delete { .. } => (EffectClass::Local, "delete"),
         BlobEffect::DeleteHidden { .. } => (EffectClass::Local, "delete_hidden"),
         BlobEffect::ListHidden { .. } => (EffectClass::Local, "list_hidden"),
+    }
+}
+
+// Holds a read slot until the lazily consumed stream is dropped.
+struct PermitStream {
+    inner: BackendStream<Result<Bytes, StreamError>>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Stream for PermitStream {
+    type Item = Result<Bytes, StreamError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().inner.0.as_mut().poll_next(cx)
+    }
+}
+
+fn hold_permit(
+    blob: BackendStream<Result<Bytes, StreamError>>,
+    permit: OwnedSemaphorePermit,
+) -> BackendStream<Result<Bytes, StreamError>> {
+    BackendStream(Box::pin(PermitStream {
+        inner: blob,
+        _permit: permit,
+    }))
+}
+
+// Error events drop the permit here; only a live stream keeps a slot.
+fn attach_permit(event: BlobEvent, permit: Option<OwnedSemaphorePermit>) -> BlobEvent {
+    let Some(permit) = permit else {
+        return event;
+    };
+    match event {
+        BlobEvent::ReadFinished { blob, stream_size } => BlobEvent::ReadFinished {
+            blob: hold_permit(blob, permit),
+            stream_size,
+        },
+        BlobEvent::HiddenRead { blob, stream_size } => BlobEvent::HiddenRead {
+            blob: hold_permit(blob, permit),
+            stream_size,
+        },
+        other => other,
     }
 }
 
@@ -86,22 +140,29 @@ impl BlobHandle {
 
     pub async fn send_blob_effect(&self, effect: BlobEffect) -> Event {
         let (class, kind) = classify_effect(&effect);
-        let _permit = if class == EffectClass::Transfer {
-            let queued = Instant::now();
-            let permit = self.handler.transfer_slots.clone().acquire_owned().await;
-            let queue_wait = queued.elapsed();
-            if queue_wait >= QUEUE_WAIT_WARN {
-                tracing::warn!(
-                    event = "blob.queue.lag",
-                    effect = kind,
-                    queue_wait_ms = queue_wait.as_millis() as u64,
-                    in_flight = self.handler.inflight.load(Ordering::Relaxed),
-                    "Blob transfer slots saturated"
-                );
+        let slots = match class {
+            EffectClass::Transfer => Some(self.handler.transfer_slots.clone()),
+            EffectClass::Read => Some(self.handler.read_slots.clone()),
+            EffectClass::Spool => Some(self.handler.spool_slots.clone()),
+            EffectClass::Local | EffectClass::Control => None,
+        };
+        let permit = match slots {
+            Some(slots) => {
+                let queued = Instant::now();
+                let permit = slots.acquire_owned().await;
+                let queue_wait = queued.elapsed();
+                if queue_wait >= QUEUE_WAIT_WARN {
+                    tracing::warn!(
+                        event = "blob.queue.lag",
+                        effect = kind,
+                        queue_wait_ms = queue_wait.as_millis() as u64,
+                        in_flight = self.handler.inflight.load(Ordering::Relaxed),
+                        "Blob slots saturated"
+                    );
+                }
+                permit.ok()
             }
-            permit.ok()
-        } else {
-            None
+            None => None,
         };
 
         let in_flight = self.handler.inflight.fetch_add(1, Ordering::Relaxed) + 1;
@@ -109,6 +170,12 @@ impl BlobHandle {
         // Boxed so the large per-effect future never inflates caller stacks.
         let blob_event = Box::pin(self.handler.execute_effect(effect)).await;
         self.handler.inflight.fetch_sub(1, Ordering::Relaxed);
+        // Read events carry a lazy stream, so the slot follows the stream.
+        let blob_event = if class == EffectClass::Read {
+            attach_permit(blob_event, permit)
+        } else {
+            blob_event
+        };
         let service = started.elapsed();
         if service >= class.slow_threshold() {
             tracing::warn!(
@@ -183,6 +250,8 @@ impl BlobHandler {
             connections: Arc::new(Mutex::new(HashMap::new())),
             operator_status: Arc::new(RwLock::new(Status::Unavailable)),
             transfer_slots: Arc::new(Semaphore::new(TRANSFER_SLOTS)),
+            read_slots: Arc::new(Semaphore::new(READ_SLOTS)),
+            spool_slots: Arc::new(Semaphore::new(SPOOL_SLOTS)),
             inflight: Arc::new(AtomicUsize::new(0)),
         };
         let initial_status = blob_handler.probe_operator_status().await;
@@ -433,17 +502,24 @@ impl BlobHandler {
     fn report_pressure(&self) {
         let in_flight = self.inflight.load(Ordering::Relaxed);
         let free_slots = self.transfer_slots.available_permits();
-        if free_slots == 0 {
+        let free_reads = self.read_slots.available_permits();
+        let free_spools = self.spool_slots.available_permits();
+        if free_slots == 0 || free_reads == 0 || free_spools == 0 {
             tracing::warn!(
                 event = "blob.slots.exhausted",
                 in_flight,
-                "All blob transfer slots are busy"
+                free_slots,
+                free_reads,
+                free_spools,
+                "A blob slot pool is fully busy"
             );
         } else if in_flight > 0 {
             tracing::debug!(
                 event = "blob.pressure",
                 in_flight,
                 free_slots,
+                free_reads,
+                free_spools,
                 "Blob effects in flight"
             );
         }

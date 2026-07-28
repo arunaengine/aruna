@@ -1191,6 +1191,39 @@ fn get_storage_path_rejects_replicated_traversal_path() {
         Err(BlobError::ConversionError(ConversionError::UnsafePath(_)))
     ));
 }
+
+#[tokio::test]
+async fn read_holds_permit() {
+    // The read slot must stay taken until the lazily consumed stream is dropped.
+    let context = setup_blob_handle(8).await;
+    let Event::Blob(BlobEvent::WriteFinished { location }) = context
+        .blob_handle
+        .send_blob_effect(BlobEffect::Write {
+            bucket: "bucket".to_string(),
+            key: "object".to_string(),
+            created_by: test_user_id(),
+            blob: stream_from_bytes(b"payload"),
+        })
+        .await
+    else {
+        panic!("write failed")
+    };
+
+    let slots = context.blob_handle.handler.read_slots.clone();
+    let free = slots.available_permits();
+    let Event::Blob(BlobEvent::ReadFinished { blob, .. }) = context
+        .blob_handle
+        .send_blob_effect(BlobEffect::Read { location })
+        .await
+    else {
+        panic!("read failed")
+    };
+
+    assert_eq!(slots.available_permits(), free - 1);
+    drop(blob);
+    assert_eq!(slots.available_permits(), free);
+}
+
 #[tokio::test]
 async fn reservation_forces_rollover() {
     // With one slot per bucket, concurrent writers must roll over instead of
