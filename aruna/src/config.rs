@@ -11,7 +11,7 @@ use aruna_core::onboarding::{
     bootstrap_node_proof_message,
 };
 use aruna_core::structs::{
-    BlobTimeoutConfig, DynamicDiscoveryMethod, KIND_LABEL_KEY, NodeCapabilities,
+    Backend, BlobTimeoutConfig, DynamicDiscoveryMethod, KIND_LABEL_KEY, NodeCapabilities,
     OidcProviderConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
     RoCrateLimits,
 };
@@ -34,7 +34,7 @@ use iroh::EndpointAddr;
 use iroh::KeyParsingError;
 use serde::{Deserialize, Serialize};
 use std::array::TryFromSliceError;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::ParseIntError;
 use std::path::PathBuf;
@@ -56,6 +56,8 @@ pub struct Config {
     pub fjall_persist_policy: FjallPersistPolicy,
     pub document_sync_storage_path: PathBuf,
     pub blob_root: String,
+    pub blob_backend: Backend,
+    pub blob_service_config: HashMap<String, String>,
     pub blob_bucket_prefix: Option<String>,
     pub blob_max_bucket_size: Option<u64>,
     pub blob_multipart_bucket: Option<String>,
@@ -225,6 +227,40 @@ impl Config {
     }
 }
 
+// S3 credentials come exclusively from these variables; the opendal layer
+// additionally disables ambient AWS config and IMDS lookups.
+fn blob_service_config_env(backend: &Backend) -> Result<HashMap<String, String>, SetupError> {
+    let mut config = HashMap::new();
+    if *backend != Backend::S3 {
+        return Ok(config);
+    }
+    config.insert("endpoint".to_string(), dotenvy::var("BLOB_S3_ENDPOINT")?);
+    config.insert(
+        "access_key_id".to_string(),
+        dotenvy::var("BLOB_S3_ACCESS_KEY_ID")?,
+    );
+    config.insert(
+        "secret_access_key".to_string(),
+        dotenvy::var("BLOB_S3_SECRET_ACCESS_KEY")?,
+    );
+    if let Ok(region) = dotenvy::var("BLOB_S3_REGION") {
+        config.insert("region".to_string(), region);
+    }
+    let path_style = dotenvy::var("BLOB_S3_FORCE_PATH_STYLE")
+        .ok()
+        .map(|value| value.trim().parse::<bool>())
+        .transpose()
+        .map_err(|error| ConversionError::FromStrError(error.to_string()))?
+        .unwrap_or(true);
+    config.insert("force_path_style".to_string(), path_style.to_string());
+    if let Ok(bucket) = dotenvy::var("BLOB_S3_BUCKET")
+        && !bucket.trim().is_empty()
+    {
+        config.insert("bucket".to_string(), bucket.trim().to_string());
+    }
+    Ok(config)
+}
+
 pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     let storage_path = dotenvy::var("STORAGE_PATH")?;
     let metadata_storage_path =
@@ -238,6 +274,11 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     let blob_root =
         dotenvy::var("BLOB_ROOT").unwrap_or_else(|_| format!("{storage_path}/blobstore"));
     let blob_bucket_prefix = dotenvy::var("BLOB_BUCKET_PREFIX").ok();
+    let blob_backend = match dotenvy::var("BLOB_BACKEND").ok() {
+        Some(value) => Backend::from_str(value.trim())?,
+        None => Backend::FileSystem,
+    };
+    let blob_service_config = blob_service_config_env(&blob_backend)?;
 
     let max_concurrent_uni_streams = dotenvy::var("MAX_CONCURRENT_UNI_STREAMS")
         .ok()
@@ -411,6 +452,8 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             fjall_persist_policy,
             document_sync_storage_path,
             blob_root,
+            blob_backend,
+            blob_service_config,
             blob_bucket_prefix,
             blob_max_bucket_size,
             blob_multipart_bucket,

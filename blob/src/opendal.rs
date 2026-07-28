@@ -33,7 +33,7 @@ pub(crate) fn init_backend_operator(
     match config.backend_type {
         Backend::S3 => {
             config.service_config.insert("bucket".to_string(), bucket);
-            build_service::<services::S3>(config.service_config)
+            build_service::<services::S3>(s3_operator_config(config.service_config))
                 .map_err(blob_operator_creation_error)
         }
         Backend::HTTP => build_service::<services::Http>(config.service_config)
@@ -50,7 +50,8 @@ pub(crate) fn init_operator(
     config: HashMap<String, String>,
 ) -> Result<Operator, BlobError> {
     match backend_type {
-        Backend::S3 => build_service::<services::S3>(config).map_err(blob_operator_creation_error),
+        Backend::S3 => build_service::<services::S3>(s3_operator_config(config))
+            .map_err(blob_operator_creation_error),
         Backend::HTTP => {
             build_service::<services::Http>(config).map_err(blob_operator_creation_error)
         }
@@ -249,6 +250,23 @@ where
         .finish())
 }
 
+// reqsign resolves credentials when the operator is built, so ambient AWS
+// config and EC2 metadata lookups must be disabled up front. `force_path_style`
+// is our canonical key; opendal speaks `enable_virtual_host_style`.
+fn s3_operator_config(mut config: HashMap<String, String>) -> HashMap<String, String> {
+    config.insert("disable_config_load".to_string(), "true".to_string());
+    config.insert("disable_ec2_metadata".to_string(), "true".to_string());
+    let path_style = config
+        .remove("force_path_style")
+        .map(|value| value.trim().parse::<bool>().unwrap_or(true))
+        .unwrap_or(true);
+    config.insert(
+        "enable_virtual_host_style".to_string(),
+        (!path_style).to_string(),
+    );
+    config
+}
+
 fn blob_operator_creation_error(error: String) -> BlobError {
     BlobError::OperatorCreationFailed(error)
 }
@@ -339,6 +357,27 @@ mod tests {
             ("skip_signature".to_string(), "nope".to_string()),
         ]))
         .unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn hardens_s3_config() {
+        // Lockdown + path-style keys must stay valid across opendal upgrades.
+        let config = s3_operator_config(HashMap::from([
+            ("bucket".to_string(), "data".to_string()),
+            ("endpoint".to_string(), "https://s3.example.org".to_string()),
+            ("region".to_string(), "eu-central-1".to_string()),
+            ("access_key_id".to_string(), "key".to_string()),
+            ("secret_access_key".to_string(), "secret".to_string()),
+            ("force_path_style".to_string(), "false".to_string()),
+        ]));
+        assert_eq!(config.get("disable_config_load").map(String::as_str), Some("true"));
+        assert_eq!(config.get("disable_ec2_metadata").map(String::as_str), Some("true"));
+        assert_eq!(
+            config.get("enable_virtual_host_style").map(String::as_str),
+            Some("true")
+        );
+        assert!(!config.contains_key("force_path_style"));
+        build_service::<services::S3>(config).unwrap();
     }
 
     #[tokio::test]

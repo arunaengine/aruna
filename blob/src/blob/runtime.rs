@@ -454,6 +454,16 @@ impl BlobHandler {
         if !self.backend_config.root.trim().is_empty() {
             config.insert("root".to_string(), self.backend_config.root.clone());
         }
+        // S3 operators need a bucket; without a pinned one, probe the multipart
+        // bucket that startup guarantees.
+        if backend_type == aruna_core::structs::Backend::S3 && !config.contains_key("bucket") {
+            match self.backend_config.multipart_bucket.as_deref() {
+                Some(bucket) => {
+                    config.insert("bucket".to_string(), bucket.to_string());
+                }
+                None => return Status::NotConfigured,
+            }
+        }
 
         match init_operator(backend_type, config) {
             Ok(operator) => {

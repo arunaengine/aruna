@@ -26,22 +26,22 @@ pub async fn create_s3_client(
     Ok(Client::from_conf(s3_config))
 }
 
+fn required_key<'a>(config: &'a HashMap<String, String>, key: &str) -> Result<&'a str, BlobError> {
+    config.get(key).map(String::as_str).ok_or_else(|| {
+        BlobError::OperatorCreationFailed(format!("blob backend config is missing {key}"))
+    })
+}
+
 pub async fn make_bucket(bucket: &str, config: &HashMap<String, String>) -> Result<(), BlobError> {
     let s3_client = create_s3_client(
-        config
-            .get("endpoint")
-            .expect("Config is missing endpoint URL"),
+        required_key(config, "endpoint")?,
         config.get("region").cloned(),
-        config
-            .get("access_key_id")
-            .expect("Config is missing access key id"),
-        config
-            .get("secret_access_key")
-            .expect("Config is missing secret access key"),
+        required_key(config, "access_key_id")?,
+        required_key(config, "secret_access_key")?,
         config
             .get("force_path_style")
-            .map(|val| val.parse::<bool>().unwrap_or(false))
-            .unwrap_or(false),
+            .map(|val| val.parse::<bool>().unwrap_or(true))
+            .unwrap_or(true),
     )
     .await?;
 
