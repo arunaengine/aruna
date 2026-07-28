@@ -734,8 +734,8 @@ async fn hidden_spool_limits() {
 }
 
 #[tokio::test]
-async fn range_bypasses_loop() {
-    // Import readers fetch hidden ranges while the blob loop consumes their payload.
+async fn range_passes_writes() {
+    // Import readers fetch hidden ranges while a write consumes their payload.
     let context = setup_blob_handle(5).await;
     let namespace = Ulid::from_bytes([6u8; 16]);
     let Event::Blob(BlobEvent::HiddenSpooled { location, .. }) = context
@@ -808,6 +808,88 @@ async fn range_bypasses_loop() {
             .unwrap(),
         Event::Blob(BlobEvent::WriteFinished { .. })
     ));
+}
+
+#[tokio::test]
+async fn interlocked_writes_complete() {
+    // Each body yields only once both writes stream concurrently; the old
+    // sequential effect loop deadlocked here.
+    let context = setup_blob_handle(16).await;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let mut tasks = Vec::new();
+    for index in 0..2 {
+        let handle = context.blob_handle.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            let body = BackendStream::new(futures::stream::once(async move {
+                barrier.wait().await;
+                Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"payload"))
+            }));
+            handle
+                .send_blob_effect(BlobEffect::Write {
+                    bucket: "bucket".to_string(),
+                    key: format!("object-{index}"),
+                    created_by: test_user_id(),
+                    blob: body,
+                })
+                .await
+        }));
+    }
+    for task in tasks {
+        let event = tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("write starved")
+            .unwrap();
+        assert!(matches!(event, Event::Blob(BlobEvent::WriteFinished { .. })));
+    }
+}
+
+#[tokio::test]
+async fn tracks_concurrent_loads() {
+    // Racing writes into one backend bucket must not lose load increments.
+    let context = setup_blob_handle(64).await;
+    let Event::Blob(BlobEvent::WriteFinished { location }) = context
+        .blob_handle
+        .send_blob_effect(BlobEffect::Write {
+            bucket: "bucket".to_string(),
+            key: "seed".to_string(),
+            created_by: test_user_id(),
+            blob: stream_from_bytes(b"seed"),
+        })
+        .await
+    else {
+        panic!("seed write failed")
+    };
+    let writers = 8;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(writers));
+    let mut tasks = Vec::new();
+    for index in 0..writers {
+        let handle = context.blob_handle.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            let body = BackendStream::new(futures::stream::once(async move {
+                barrier.wait().await;
+                Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"payload"))
+            }));
+            handle
+                .send_blob_effect(BlobEffect::Write {
+                    bucket: "bucket".to_string(),
+                    key: format!("object-{index}"),
+                    created_by: test_user_id(),
+                    blob: body,
+                })
+                .await
+        }));
+    }
+    for task in tasks {
+        let event = tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("write starved")
+            .unwrap();
+        assert!(matches!(event, Event::Blob(BlobEvent::WriteFinished { .. })));
+    }
+    let load = bucket_load(&context.storage_handle, &location.storage_bucket).await;
+    assert_eq!(load, 1 + writers as u64);
 }
 
 #[tokio::test]
