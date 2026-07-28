@@ -310,6 +310,9 @@ const PEER_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(5);
 const PEER_MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
 const PEER_SUCCESS_REFRESH_DELAY: Duration = Duration::from_secs(300);
 const PEER_MANAGER_IDLE_DELAY: Duration = Duration::from_secs(300);
+// Overall open_stream budget: first open attempt, DHT-signed endpoint
+// re-resolution (an otherwise unbounded DHT lookup), and the retry combined.
+const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug)]
 struct PeerConnectivityManagerState {
@@ -1191,6 +1194,31 @@ impl NetHandle {
             )));
         }
 
+        // An offline peer must fail within a bounded window; the inner path is
+        // otherwise open (10s) + unbounded DHT resolve + open (10s).
+        match tokio::time::timeout(OPEN_STREAM_TIMEOUT, self.open_stream_inner(node_id, alpn)).await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                if node_id != self.inner.node_id {
+                    send_peer_connectivity_event(
+                        &self.inner.peer_connectivity_tx,
+                        PeerConnectivityEvent::ConnectionFailure {
+                            node_id,
+                            source: "stream_open".to_string(),
+                            error: "stream open timed out".to_string(),
+                        },
+                    );
+                }
+                Err(NetError::Stream(format!(
+                    "stream open to {node_id} timed out after {}s",
+                    OPEN_STREAM_TIMEOUT.as_secs()
+                )))
+            }
+        }
+    }
+
+    async fn open_stream_inner(&self, node_id: NodeId, alpn: Alpn) -> Result<streams::BiStream> {
         if node_id != self.inner.node_id {
             if let Err(err) = self.inner.dht.add_peer(node_id) {
                 warn!(
