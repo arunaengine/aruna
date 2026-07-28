@@ -3,7 +3,7 @@ use crate::blob::blob_keyspace_helper::{
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::replication::queue::write_live_replication_obligation_effect;
-use crate::replication::util::dht_registration_effect;
+use crate::blob::cleanup::schedule_blob_cleanup_effect;
 use crate::usage_stats::{
     QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError,
     schedule_usage_snapshot_publish_effect,
@@ -11,8 +11,9 @@ use crate::usage_stats::{
 use aruna_blob::hash::Hasher;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
+    BLOB_CLEANUP_KEYSPACE,
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
     S3_MULTIPART_UPLOAD_PART_KEYSPACE,
@@ -20,7 +21,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobHeadKey, BlobVersion, CurrentVersionPointer,
+    AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobVersion, CurrentVersionPointer,
     MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
     MultipartUpload, MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus, RealmId,
     RoCrateLimits, UsageDelta, VersionKey,
@@ -51,13 +52,11 @@ pub enum CompleteMultipartUploadState {
     WriteBlobVersionRecord,
     WriteObjectMetadata,
     DeleteUploadRecords,
+    WriteCleanupRecords,
     WriteLiveReplicationObligation,
     EnforceQuota,
     UpdateUsage,
     CommitFinalizeTransaction,
-    RegisterBlobInDht,
-    CleanupDuplicate,
-    CleanupPartBlobs,
     AbortFinalizeTransaction,
     ResetUploadTransaction,
     ReadUploadForReset,
@@ -168,7 +167,6 @@ pub struct CompleteMultipartUploadOperation {
     was_live: bool,
     usage_update: Option<UsageCounterUpdate>,
     quota_gate: Option<QuotaGate>,
-    cleanup_part_index: usize,
     pending_error: Option<CompleteMultipartUploadError>,
     output: Option<Result<CompleteMultipartUploadResult, CompleteMultipartUploadError>>,
     rocrate_limits: RoCrateLimits,
@@ -193,7 +191,6 @@ impl CompleteMultipartUploadOperation {
             was_live: false,
             usage_update: None,
             quota_gate: None,
-            cleanup_part_index: 0,
             pending_error: None,
             output: None,
             rocrate_limits: RoCrateLimits::default(),
@@ -863,6 +860,64 @@ impl CompleteMultipartUploadOperation {
         let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
+        self.write_cleanup_records()
+    }
+
+    // Deferred housekeeping commits atomically with the completed upload, so a
+    // crash after commit can never leak part blobs.
+    fn write_cleanup_records(&mut self) -> Effects {
+        let mut works: Vec<BlobCleanupWork> = self
+            .upload_parts
+            .iter()
+            .map(|record| BlobCleanupWork::DeleteBlob {
+                location: record.location.clone(),
+            })
+            .collect();
+        if let (Some(composed), Some(chosen)) =
+            (self.composed_location.as_ref(), self.final_location.as_ref())
+            && composed != chosen
+        {
+            works.push(BlobCleanupWork::DeleteBlob {
+                location: composed.clone(),
+            });
+        }
+        if let Some(blake3) = self
+            .final_location
+            .as_ref()
+            .and_then(|location| location.get_blake3())
+            && let Ok(blake3) = blake3.try_into()
+        {
+            works.push(BlobCleanupWork::RegisterDht {
+                blake3,
+                realm_id: self.input.realm_id,
+                ttl_ms: self.rocrate_limits.holder_ttl_ms,
+            });
+        }
+
+        let mut writes = Vec::with_capacity(works.len());
+        for work in works {
+            let value = match work.to_bytes() {
+                Ok(value) => value,
+                Err(err) => return self.schedule_error(err.into()),
+            };
+            writes.push((
+                BLOB_CLEANUP_KEYSPACE.to_string(),
+                Ulid::generate().to_bytes().to_vec().into(),
+                value.into(),
+            ));
+        }
+
+        self.state = CompleteMultipartUploadState::WriteCleanupRecords;
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn handle_cleanup_written(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
         self.write_live_replication_obligation()
     }
 
@@ -1014,111 +1069,29 @@ impl CompleteMultipartUploadOperation {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
         self.txn_id = None;
-        self.register_blob_in_dht_or_continue()
-    }
-
-    fn register_blob_in_dht_or_continue(&mut self) -> Effects {
-        let Some(location) = self.final_location.as_ref() else {
-            return self.begin_cleanup_part_blobs();
+        self.composed_location = None;
+        let Some(location) = self.final_location.clone() else {
+            return self.emit_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         };
-        let Some(blake3_hash) = location.get_blake3() else {
-            return self.begin_cleanup_part_blobs();
+        let Some(version_id) = self.version_id else {
+            return self.emit_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         };
-        self.state = CompleteMultipartUploadState::RegisterBlobInDht;
-        match dht_registration_effect(
-            blake3_hash,
-            self.input.realm_id,
-            self.input.node_id,
-            &self.rocrate_limits,
-        ) {
-            Ok(effect) => smallvec![effect],
-            Err(_) => self.begin_cleanup_part_blobs(),
-        }
-    }
-
-    fn handle_blob_registered_in_dht(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. }))
-            | Event::Net(NetEvent::Dht(DhtEvent::Error { .. }))
-            | Event::Net(NetEvent::Error(_)) => self.cleanup_duplicate_or_continue(),
-            _ => self.emit_error(CompleteMultipartUploadError::InvalidOperationState),
-        }
-    }
-
-    fn cleanup_duplicate_or_continue(&mut self) -> Effects {
-        let Some(composed_location) = self.composed_location.clone() else {
-            return self.begin_cleanup_part_blobs();
+        let response_hashes = match self.input.checksum_type {
+            MultipartChecksumType::FullObject => location.hashes.clone(),
+            MultipartChecksumType::Composite => self.composite_hashes.clone(),
         };
-        let Some(final_location) = self.final_location.as_ref() else {
-            return self.begin_cleanup_part_blobs();
-        };
-
-        if &composed_location != final_location {
-            self.state = CompleteMultipartUploadState::CleanupDuplicate;
-            return smallvec![Effect::Blob(BlobEffect::Delete {
-                location: composed_location,
-            })];
-        }
-
-        self.begin_cleanup_part_blobs()
-    }
-
-    fn handle_duplicate_cleanup(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
-                self.begin_cleanup_part_blobs()
-            }
-            _ => self.emit_error(CompleteMultipartUploadError::InvalidOperationState),
-        }
-    }
-
-    fn begin_cleanup_part_blobs(&mut self) -> Effects {
-        self.cleanup_part_index = 0;
-        self.upload_record = None;
-        self.state = CompleteMultipartUploadState::CleanupPartBlobs;
-        self.cleanup_next_part_blob()
-    }
-
-    fn cleanup_next_part_blob(&mut self) -> Effects {
-        let Some(record) = self.upload_parts.get(self.cleanup_part_index) else {
-            self.state = CompleteMultipartUploadState::Finish;
-            self.composed_location = None;
-            let Some(location) = self.final_location.clone() else {
-                return self
-                    .emit_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
-            };
-            let Some(version_id) = self.version_id else {
-                return self
-                    .emit_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
-            };
-            let response_hashes = match self.input.checksum_type {
-                MultipartChecksumType::FullObject => location.hashes.clone(),
-                MultipartChecksumType::Composite => self.composite_hashes.clone(),
-            };
-            self.output = Some(Ok(CompleteMultipartUploadResult {
-                location,
-                version_id,
-                checksum_type: self.input.checksum_type,
-                response_hashes,
-                part_count: self.resolved_parts.len(),
-            }));
-            return smallvec![schedule_usage_snapshot_publish_effect()];
-        };
-
-        self.state = CompleteMultipartUploadState::CleanupPartBlobs;
-        smallvec![Effect::Blob(BlobEffect::Delete {
-            location: record.location.clone(),
-        })]
-    }
-
-    fn handle_cleanup_part_blob(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
-                self.cleanup_part_index += 1;
-                self.cleanup_next_part_blob()
-            }
-            _ => self.emit_error(CompleteMultipartUploadError::InvalidOperationState),
-        }
+        self.output = Some(Ok(CompleteMultipartUploadResult {
+            location,
+            version_id,
+            checksum_type: self.input.checksum_type,
+            response_hashes,
+            part_count: self.resolved_parts.len(),
+        }));
+        self.state = CompleteMultipartUploadState::Finish;
+        smallvec![
+            schedule_usage_snapshot_publish_effect(),
+            schedule_blob_cleanup_effect()
+        ]
     }
 
     fn handle_reset_transaction_started(&mut self, event: Event) -> Effects {
@@ -1251,6 +1224,9 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::DeleteUploadRecords => {
                 self.handle_upload_records_deleted(event)
             }
+            CompleteMultipartUploadState::WriteCleanupRecords => {
+                self.handle_cleanup_written(event)
+            }
             CompleteMultipartUploadState::WriteLiveReplicationObligation => {
                 self.handle_live_replication_obligation_written(event)
             }
@@ -1259,11 +1235,6 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::CommitFinalizeTransaction => {
                 self.handle_finalize_committed(event)
             }
-            CompleteMultipartUploadState::RegisterBlobInDht => {
-                self.handle_blob_registered_in_dht(event)
-            }
-            CompleteMultipartUploadState::CleanupDuplicate => self.handle_duplicate_cleanup(event),
-            CompleteMultipartUploadState::CleanupPartBlobs => self.handle_cleanup_part_blob(event),
             CompleteMultipartUploadState::AbortFinalizeTransaction => {
                 self.handle_abort_finalize_transaction(event)
             }
@@ -1395,6 +1366,7 @@ fn composite_digest_for_algorithm(algorithm: ChecksumAlgorithm, bytes: &[u8]) ->
 mod tests {
     use super::*;
     use aruna_core::structs::MultipartUploadChecksumHint;
+    use aruna_core::task::{TaskEffect, TaskKey};
 
     fn finalize_input() -> CompleteMultipartUploadInput {
         let realm_id = RealmId::from_bytes([3u8; 32]);
@@ -1626,7 +1598,8 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_part_blobs_includes_omitted_parts() {
+    fn cleanup_covers_omitted() {
+        // Deferred delete records must cover requested AND omitted parts.
         let input = finalize_input();
         let mut op = CompleteMultipartUploadOperation::new(input);
         let requested = part_record(1, 10);
@@ -1649,17 +1622,70 @@ mod tests {
         op.upload_parts = vec![requested.clone(), omitted.clone()];
         op.resolved_parts = vec![requested.clone()];
 
-        let effects = op.begin_cleanup_part_blobs();
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::Delete { location })] if location == &requested.location
-        ));
+        let effects = op.write_cleanup_records();
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice()
+        else {
+            panic!("expected cleanup batch write");
+        };
+        let works: Vec<BlobCleanupWork> = writes
+            .iter()
+            .map(|(key_space, _, value)| {
+                assert_eq!(key_space, BLOB_CLEANUP_KEYSPACE);
+                BlobCleanupWork::from_bytes(value.as_ref()).unwrap()
+            })
+            .collect();
+        for record in [&requested, &omitted] {
+            assert!(works.iter().any(|work| matches!(
+                work,
+                BlobCleanupWork::DeleteBlob { location } if location == &record.location
+            )));
+        }
+    }
 
-        let effects = op.step(Event::Blob(BlobEvent::DeleteFinished));
+    #[test]
+    fn finish_after_commit() {
+        // The response must be ready at finalize commit; housekeeping is deferred.
+        let input = finalize_input();
+        let mut op = CompleteMultipartUploadOperation::new(input);
+        let location = BackendLocation {
+            root: "/tmp".to_string(),
+            storage_bucket: "objects".to_string(),
+            backend_path: "object".to_string(),
+            ulid: Ulid::generate(),
+            compressed: false,
+            encrypted: false,
+            created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([4u8; 32])),
+            created_at: SystemTime::now(),
+            staging: false,
+            partial: false,
+            blob_size: 10,
+            hashes: HashMap::new(),
+        };
+        op.final_location = Some(location.clone());
+        op.version_id = Some(Ulid::generate());
+        op.state = CompleteMultipartUploadState::CommitFinalizeTransaction;
+        op.txn_id = Some(TxnId::generate());
+
+        let effects = op.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: TxnId::generate(),
+        }));
+
+        assert!(op.is_complete());
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Blob(BlobEffect::Delete { location })] if location == &omitted.location
+            [
+                Effect::Task(TaskEffect::ShortenTimer {
+                    key: TaskKey::PublishUsageSnapshots,
+                    ..
+                }),
+                Effect::Task(TaskEffect::ShortenTimer {
+                    key: TaskKey::DrainBlobCleanupQueue,
+                    ..
+                }),
+            ]
         ));
+        let result = op.finalize().unwrap().unwrap().unwrap();
+        assert_eq!(result.location, location);
     }
 
     // A quota rejection at EnforceQuota leaves the finalize transaction open. It

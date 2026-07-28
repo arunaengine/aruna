@@ -133,6 +133,30 @@ impl From<(String, u64)> for BackendBucket {
     }
 }
 
+/// Deferred blob housekeeping written atomically with a completed upload and
+/// drained outside the request path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BlobCleanupWork {
+    DeleteBlob {
+        location: BackendLocation,
+    },
+    RegisterDht {
+        blake3: [u8; 32],
+        realm_id: RealmId,
+        ttl_ms: u64,
+    },
+}
+
+impl BlobCleanupWork {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BackendLocation {
     pub root: String,

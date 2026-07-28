@@ -37,6 +37,7 @@ pub const USER_SUBJECT_CLAIMS_KEYSPACE: &str = "user_subject_claims";
 
 // Blob + S3 keyspaces
 pub const BLOB_LOCATIONS_KEYSPACE: &str = "blob_locations";
+pub const BLOB_CLEANUP_KEYSPACE: &str = "blob_pending_cleanups";
 pub const BLOB_HEAD_KEYSPACE: &str = "blob_heads";
 pub const BLOB_VERSIONS_KEYSPACE: &str = "blob_versions";
 pub const HASH_PATHS_INDEX_KEYSPACE: &str = "hash_paths_index";
