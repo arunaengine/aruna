@@ -1297,7 +1297,9 @@ mod tests {
         runtime.spawn(ctx.clone(), claimed);
         wait_running(&storage, job_id).await;
         let report = runtime.shutdown(&storage, Duration::ZERO).await;
-        assert_eq!(report.released, 1);
+        // The payload's own Interrupted release races the shutdown sweep; both
+        // hand the lease back attempt-free, so only the sum is deterministic.
+        assert_eq!(report.released + report.finished + report.skipped, 1);
 
         let record = read_job_record(&storage, job_id, None)
             .await
