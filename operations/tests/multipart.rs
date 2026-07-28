@@ -1,3 +1,5 @@
+// Fresh builds overflow the default query depth in nested async layouts.
+#![recursion_limit = "256"]
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;

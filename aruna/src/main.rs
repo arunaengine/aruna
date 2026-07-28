@@ -39,7 +39,6 @@ use aruna_operations::startup::restore_shard_subscriptions;
 use aruna_operations::task_incoming::initialize_task_holder;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};

@@ -1,3 +1,5 @@
+// Fresh builds overflow the default query depth in nested async layouts.
+#![recursion_limit = "256"]
 use aruna_api::auth::OidcValidator;
 use aruna_api::routes::users::RegisterUserResponse;
 use aruna_api::server::{Server, ServerConfig};

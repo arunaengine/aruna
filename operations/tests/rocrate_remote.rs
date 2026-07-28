@@ -1,3 +1,5 @@
+// Fresh builds overflow the default query depth in nested async layouts.
+#![recursion_limit = "256"]
 //! Driven two-node remote (Bao read) RO-Crate export integration.
 //!
 //! The exporter node holds only the metadata document; the payload version lives

@@ -1,3 +1,5 @@
+// Fresh builds overflow the default query depth in nested async layouts.
+#![recursion_limit = "256"]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
