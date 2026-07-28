@@ -599,6 +599,14 @@ impl BlobHandler {
             Err(e) => return BlobEvent::Error(e),
         };
 
+        // A retried cleanup must not decrement the load a second time.
+        match operator.stat(&storage_path).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return BlobEvent::DeleteFinished;
+            }
+            Err(error) => return BlobEvent::Error(BlobError::DeleteError(error.to_string())),
+        }
         if let Err(e) = operator.delete(&storage_path).await {
             return BlobEvent::Error(BlobError::DeleteError(e.to_string()));
         }
