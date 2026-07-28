@@ -106,7 +106,8 @@ impl BlobHandle {
 
         let in_flight = self.handler.inflight.fetch_add(1, Ordering::Relaxed) + 1;
         let started = Instant::now();
-        let blob_event = self.handler.execute_effect(effect).await;
+        // Boxed so the large per-effect future never inflates caller stacks.
+        let blob_event = Box::pin(self.handler.execute_effect(effect)).await;
         self.handler.inflight.fetch_sub(1, Ordering::Relaxed);
         let service = started.elapsed();
         if service >= class.slow_threshold() {
