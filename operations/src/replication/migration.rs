@@ -7,6 +7,7 @@ use aruna_core::structs::{
     ArunaArn, BucketInfo, BucketReplicationConfig, RealmId, SyncMode, SyncRelationship, SyncState,
     SyncStatusSnapshot,
 };
+use aruna_core::types::TxnId;
 use aruna_storage::StorageHandle;
 use thiserror::Error;
 use tracing::warn;
@@ -23,6 +24,7 @@ use crate::sync_relationship::{
 };
 
 const MIGRATION_PAGE_SIZE: usize = 128;
+const PRUNE_TXN_RETRIES: usize = 8;
 const LEGACY_SYNC_MIGRATION_KEY: &[u8] = b"migration/s3-sync-relationships-v1";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -314,6 +316,8 @@ async fn read_bucket_info(
     }
 }
 
+// Transactional read-modify-write: a plain write would clobber a concurrent
+// CORS or replication update to the same bucket record.
 async fn prune_legacy_target(
     storage: &StorageHandle,
     bucket: &str,
@@ -321,22 +325,98 @@ async fn prune_legacy_target(
     target: &aruna_core::structs::BucketReplicationTarget,
 ) -> Result<(), LegacySyncMigrationError> {
     config.targets.retain(|candidate| candidate != target);
-    let Some(mut info) = read_bucket_info(storage, bucket).await? else {
+    for _ in 0..PRUNE_TXN_RETRIES {
+        if prune_target_txn(storage, bucket, target).await? {
+            return Ok(());
+        }
+    }
+    Err(StorageError::TransactionConflict.into())
+}
+
+async fn prune_target_txn(
+    storage: &StorageHandle,
+    bucket: &str,
+    target: &aruna_core::structs::BucketReplicationTarget,
+) -> Result<bool, LegacySyncMigrationError> {
+    let txn_id = match storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => return Err(LegacySyncMigrationError::UnexpectedEvent(other)),
+    };
+
+    if let Err(error) = prune_target_write(storage, bucket, target, txn_id).await {
+        abort_prune_txn(storage, txn_id).await;
+        return Err(error);
+    }
+
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(true),
+        Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }) => Ok(false),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(LegacySyncMigrationError::UnexpectedEvent(other)),
+    }
+}
+
+async fn prune_target_write(
+    storage: &StorageHandle,
+    bucket: &str,
+    target: &aruna_core::structs::BucketReplicationTarget,
+    txn_id: TxnId,
+) -> Result<(), LegacySyncMigrationError> {
+    let value = match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: bucket.as_bytes().to_vec().into(),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => return Err(LegacySyncMigrationError::UnexpectedEvent(other)),
+    };
+    let Some(value) = value else {
         return Ok(());
     };
-    info.replication = (!config.targets.is_empty()).then(|| config.clone());
-    let event = storage
+    let mut info = BucketInfo::from_bytes(&value)?;
+    let Some(mut replication) = info.replication.take() else {
+        return Ok(());
+    };
+    replication.targets.retain(|candidate| candidate != target);
+    info.replication = (!replication.targets.is_empty()).then_some(replication);
+
+    match storage
         .send_storage_effect(StorageEffect::Write {
             key_space: S3_BUCKET_KEYSPACE.to_string(),
             key: bucket.as_bytes().to_vec().into(),
             value: info.to_bytes()?.into(),
-            txn_id: None,
+            txn_id: Some(txn_id),
         })
-        .await;
-    match event {
+        .await
+    {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(LegacySyncMigrationError::UnexpectedEvent(other)),
+    }
+}
+
+async fn abort_prune_txn(storage: &StorageHandle, txn_id: TxnId) {
+    let event = storage
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        .await;
+    if !matches!(
+        event,
+        Event::Storage(StorageEvent::TransactionAborted { .. })
+    ) {
+        warn!(%txn_id, "failed to abort legacy sync prune transaction");
     }
 }
 
