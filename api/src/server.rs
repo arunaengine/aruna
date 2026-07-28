@@ -6,14 +6,23 @@ use crate::routes::rest_router;
 pub(crate) use crate::server_state::{ServerState, swagger_ui};
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::{Method, Uri, header};
+use axum::http::{Method, StatusCode, Uri, header};
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Redirect, Response};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
+use tower_http::timeout::TimeoutLayer;
 
 pub const DEFAULT_MAX_HTTP_BODY_SIZE: usize = 1024 * 1024;
+
+// Backstop only, far above any legitimate request: the interactive bounds live
+// in the discovery/fanout/open_stream deadlines. This catches handler paths
+// that would otherwise hold the connection for unbounded peer I/O. Streaming
+// response bodies (SSE, archive downloads) are not covered — the layer bounds
+// the time to produce the response, not the body.
+const REST_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug)]
 pub struct Server {
@@ -45,7 +54,9 @@ impl Server {
     }
     pub fn build_router(&self) -> Router {
         // Build the main API router
-        let api_v1 = Router::new().merge(rest_router(self.state.clone()));
+        let api_v1 = Router::new().merge(rest_router(self.state.clone())).layer(
+            TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, REST_REQUEST_TIMEOUT),
+        );
         let api_authority = self
             .api_public_url
             .as_deref()
