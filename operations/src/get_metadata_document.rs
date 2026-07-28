@@ -105,8 +105,10 @@ pub async fn is_metadata_record_materialized_for_graph_read(
     let Some(status) = parse_materialization_status_read(event)? else {
         return Ok(true);
     };
-    Ok(status.event_id != record.last_event_id
-        || matches!(status.state, MetadataMaterializationState::Materialized))
+    // Registry rows can replicate ahead of the document event, so only a status
+    // recorded for exactly this cursor proves the graph matches the record.
+    Ok(status.event_id == record.last_event_id
+        && matches!(status.state, MetadataMaterializationState::Materialized))
 }
 
 impl Operation for GetMetadataDocumentOperation {
@@ -212,5 +214,101 @@ impl Operation for GetMetadataDocumentOperation {
 
     fn abort(&mut self) -> Effects {
         smallvec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DriverContext, is_metadata_record_materialized_for_graph_read};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::handle::Handle;
+    use aruna_core::metadata::{MetadataMaterializationState, MetadataMaterializationStatusRecord};
+    use aruna_core::storage_entries::metadata_materialization_status_write_entry;
+    use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
+    use aruna_storage::storage::FjallStorage;
+    use tempfile::tempdir;
+    use ulid::Ulid;
+
+    fn make_record(document_id: Ulid, last_event_id: Ulid) -> MetadataRegistryRecord {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let group_id = Ulid::generate();
+        let path = format!("datasets/{document_id}");
+        MetadataRegistryRecord {
+            realm_id,
+            group_id,
+            document_id,
+            document_path: path.clone(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: false,
+            permission_path: MetadataRegistryRecord::permission_path_for(
+                &realm_id,
+                group_id,
+                &path,
+                document_id,
+            ),
+            placement: PlacementRef::NIL,
+            holder_node_ids: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_event_id,
+        }
+    }
+
+    fn make_status(document_id: Ulid, event_id: Ulid) -> MetadataMaterializationStatusRecord {
+        MetadataMaterializationStatusRecord {
+            document_id,
+            event_id,
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            context_digest: None,
+            dataset_digest: None,
+            state: MetadataMaterializationState::Materialized,
+            attempts: 1,
+            failures: 0,
+            last_error: None,
+            updated_at_ms: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn withholds_stale_status() {
+        // A registry row replicated ahead of its document event must not export
+        // the graph materialized for the previous event.
+        let temp_dir = tempdir().unwrap();
+        let storage_handle = FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+
+        let document_id = Ulid::generate();
+        let materialized_event = Ulid::generate();
+        let status = make_status(document_id, materialized_event);
+        let (key_space, key, value) = metadata_materialization_status_write_entry(&status).unwrap();
+        storage_handle
+            .send_effect(aruna_core::effects::Effect::Storage(StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: None,
+            }))
+            .await;
+
+        let stale = make_record(document_id, Ulid::generate());
+        assert!(
+            !is_metadata_record_materialized_for_graph_read(&context, &stale)
+                .await
+                .unwrap()
+        );
+
+        let current = make_record(document_id, materialized_event);
+        assert!(
+            is_metadata_record_materialized_for_graph_read(&context, &current)
+                .await
+                .unwrap()
+        );
     }
 }
