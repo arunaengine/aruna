@@ -4,7 +4,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use aruna_core::compute::paths_overlap;
+use aruna_core::compute::{
+    has_wildcard, literal_prefix, output_glob, output_suffix, paths_overlap,
+};
 use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
     AuthContext, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId,
@@ -146,10 +148,17 @@ pub struct TesOutput {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Destination URL; a directory prefix when `path` contains wildcards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Absolute container path, optionally with POSIX (IEEE Std 1003.1-2017,
+    /// 12.13) wildcards `*`, `?`, and `[...]` selecting several files.
     #[serde(default)]
     pub path: String,
+    /// Literal ancestor stripped from every matched path before it is appended
+    /// to `url`. Required when `path` has wildcards, ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
     #[serde(rename = "type", default)]
     pub kind: TesFileType,
 }
@@ -796,9 +805,23 @@ fn map_task_to_spec(
         file_outputs.push(output);
     }
     for output in &file_outputs {
-        let parent = FilePath::new(&output.container_path)
-            .parent()
-            .and_then(FilePath::to_str)
+        // A pattern is captured under its literal prefix, which is the directory
+        // the container must be able to write.
+        let pattern = has_wildcard(&output.container_path)
+            .then(|| output_glob(&output.container_path))
+            .transpose()
+            .map_err(|_| TesError::bad_request("invalid output path"))?;
+        let parent = if pattern.is_some() {
+            literal_prefix(&output.container_path)
+                .map_err(|_| TesError::bad_request("invalid output parent path"))?
+        } else {
+            FilePath::new(&output.container_path)
+                .parent()
+                .ok_or_else(|| TesError::bad_request("invalid output parent path"))?
+                .to_path_buf()
+        };
+        let parent = parent
+            .to_str()
             .ok_or_else(|| TesError::bad_request("invalid output parent path"))?;
         if parent == "/" {
             return Err(TesError::bad_request("root output parent is forbidden"));
@@ -806,6 +829,7 @@ fn map_task_to_spec(
         for input in &inputs {
             if let Some(path) = input.container_path.as_deref()
                 && (path == output.container_path
+                    || pattern.as_ref().is_some_and(|glob| glob.is_match(path))
                     || paths_overlap(path, parent)
                         .map_err(|_| TesError::bad_request("invalid input or output path"))?)
             {
@@ -892,6 +916,12 @@ fn map_input(input: &TesInput, s3_mounts: bool) -> Result<InputSelection, TesErr
         .ok_or_else(|| TesError::bad_request("input url is required"))?;
     let (bucket, key) = parse_s3_url(url, "input")?;
     validate_path(&input.path, "input path", false)?;
+    // TES 1.1 defines wildcards for outputs only; an input path is one file.
+    if has_wildcard(&input.path) {
+        return Err(TesError::bad_request(
+            "input path must not contain wildcards",
+        ));
+    }
     Ok(InputSelection {
         source: InputSource::S3 {
             bucket,
@@ -915,6 +945,7 @@ fn map_output(output: &TesOutput) -> Result<OutputSelection, TesError> {
         return Err(TesError::bad_request("directory outputs are not supported"));
     }
     validate_path(&output.path, "output path", false)?;
+    let path_prefix = output_prefix(output)?;
     let url = output
         .url
         .as_deref()
@@ -922,10 +953,39 @@ fn map_output(output: &TesOutput) -> Result<OutputSelection, TesError> {
     let (bucket, key) = parse_s3_url(url, "output")?;
     Ok(OutputSelection {
         container_path: output.path.clone(),
+        path_prefix,
         destination: OutputDestination::S3 { bucket, key },
         name: output.name.clone(),
         description: output.description.clone(),
     })
+}
+
+/// TES 1.1 makes `path_prefix` required when `path` carries POSIX wildcards and
+/// ignored otherwise, so a wildcard-free output drops any prefix it was sent.
+fn output_prefix(output: &TesOutput) -> Result<Option<String>, TesError> {
+    if !has_wildcard(&output.path) {
+        return Ok(None);
+    }
+    output_glob(&output.path).map_err(|error| {
+        TesError::bad_request(format!(
+            "output path `{}` is not a valid pattern: {error}",
+            output.path
+        ))
+    })?;
+    let prefix = output.path_prefix.as_deref().ok_or_else(|| {
+        TesError::bad_request(format!(
+            "output path `{}` contains wildcards and requires path_prefix",
+            output.path
+        ))
+    })?;
+    validate_path(prefix, "output path_prefix", false)?;
+    if has_wildcard(prefix) || output_suffix(&output.path, prefix).is_none() {
+        return Err(TesError::bad_request(format!(
+            "output path_prefix `{prefix}` must be a literal ancestor of `{}`",
+            output.path
+        )));
+    }
+    Ok(Some(prefix.to_string()))
 }
 
 fn parse_s3_url(url: &str, role: &str) -> Result<(String, String), TesError> {
@@ -1057,6 +1117,7 @@ fn project_task(record: &JobRecord, view: TesView, base_url: &str) -> TesTask {
                 description: output.description.clone(),
                 url: Some(format!("s3://{bucket}/{key}")),
                 path: output.container_path.clone(),
+                path_prefix: output.path_prefix.clone(),
                 kind: TesFileType::File,
             }
         })
@@ -1911,6 +1972,83 @@ mod tests {
             .zones
             .push("zone-a".to_string());
         assert!(map_task_to_spec(&task, None, true).is_err());
+    }
+
+    #[test]
+    fn maps_wildcard_output() {
+        let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+        task.outputs[0].path = "/out/*.txt".to_string();
+        task.outputs[0].path_prefix = Some("/out".to_string());
+        task.outputs[0].url = Some("s3://dest/results".to_string());
+
+        let (spec, _) = map_task_to_spec(&task, None, true).unwrap();
+
+        assert_eq!(spec.file_outputs[0].container_path, "/out/*.txt");
+        assert_eq!(spec.file_outputs[0].path_prefix.as_deref(), Some("/out"));
+    }
+
+    #[test]
+    fn rejects_input_match() {
+        // An input the pattern would select must not be captured as an output.
+        let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+        task.inputs[0].path = "/in/data.csv".to_string();
+        task.outputs[0].path = "/in/*.csv".to_string();
+        task.outputs[0].path_prefix = Some("/in".to_string());
+
+        let error = map_task_to_spec(&task, None, true).unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn rejects_missing_prefix() {
+        let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+        task.outputs[0].path = "/out/*.txt".to_string();
+
+        let error = map_task_to_spec(&task, None, true).unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("/out/*.txt"), "{}", error.message);
+    }
+
+    #[test]
+    fn rejects_foreign_prefix() {
+        let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+        task.outputs[0].path = "/out/sub/*.txt".to_string();
+        for prefix in ["/other", "/out/s", "/out/*", "out"] {
+            task.outputs[0].path_prefix = Some(prefix.to_string());
+            let error = map_task_to_spec(&task, None, true).unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST, "{prefix}");
+        }
+        // The pattern itself must still compile.
+        task.outputs[0].path = "/out/[a.txt".to_string();
+        task.outputs[0].path_prefix = Some("/out".to_string());
+        assert_eq!(
+            map_task_to_spec(&task, None, true).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn ignores_unused_prefix() {
+        // TES 1.1 ignores path_prefix unless the path carries wildcards.
+        let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+        task.outputs[0].path_prefix = Some("/out".to_string());
+
+        let (spec, _) = map_task_to_spec(&task, None, true).unwrap();
+
+        assert!(spec.file_outputs[0].path_prefix.is_none());
+    }
+
+    #[test]
+    fn rejects_wildcard_input() {
+        // TES 1.1 defines wildcards for outputs only.
+        let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+        task.inputs[0].path = "/in/*.csv".to_string();
+
+        let error = map_task_to_spec(&task, None, true).unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]

@@ -6,6 +6,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::NodeId;
+use crate::errors::StorageError;
 use crate::structs::{AuthContext, MetadataAuditOperation, MetadataRegistryRecord, RealmId};
 use crate::types::{GroupId, UserId};
 
@@ -469,6 +470,9 @@ pub struct MetadataMaterializationStatusRecord {
     pub dataset_digest: Option<[u8; 32]>,
     pub state: MetadataMaterializationState,
     pub attempts: u32,
+    /// Application-level failures only; infrastructure errors retry without
+    /// counting so an overloaded node never gives up on a document.
+    pub failures: u32,
     pub last_error: Option<String>,
     pub updated_at_ms: u64,
 }
@@ -492,6 +496,7 @@ impl MetadataMaterializationStatusRecord {
             dataset_digest: None,
             state: MetadataMaterializationState::Pending,
             attempts: 0,
+            failures: 0,
             last_error: None,
             updated_at_ms,
         }
@@ -503,7 +508,26 @@ pub struct MetadataMaterializationJobRecord {
     pub document_id: Ulid,
     pub event_id: Ulid,
     pub due_at_ms: u64,
+    /// Total tries; drives retry backoff and stale-duplicate detection.
     pub attempts: u32,
+    /// Application-level failures only; the attempt cap tests this counter so a
+    /// storm of timeouts cannot park a job.
+    pub failures: u32,
+    /// How often this job was already parked. Carried across requeue so the
+    /// dead-letter backoff of a poison document keeps growing.
+    pub parks: u32,
+}
+
+/// A job that exhausted its failure budget. Kept so the queue drain can pick it
+/// up again later: parking must never silently drop a document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataMaterializationDeadLetterRecord {
+    pub job: MetadataMaterializationJobRecord,
+    pub last_error: String,
+    pub parked_at_ms: u64,
+    /// How often this job has been parked; drives the requeue backoff.
+    pub parks: u32,
+    pub requeue_at_ms: u64,
 }
 
 impl MetadataMaterializationJobRecord {
@@ -513,6 +537,8 @@ impl MetadataMaterializationJobRecord {
             event_id: event.event_id,
             due_at_ms,
             attempts: 0,
+            failures: 0,
+            parks: 0,
         }
     }
 }
@@ -851,6 +877,14 @@ pub enum MetadataError {
     Validation(Vec<MetadataValidationViolation>),
     #[error("metadata graph not found")]
     GraphNotFound,
+    /// Durability failure while persisting backend state. Infrastructure, not the
+    /// document: retrying it is always valid.
+    #[error("metadata persist failed: {0}")]
+    Persist(String),
+    /// Storage adapter failure, kept typed so callers can tell an overloaded
+    /// node from a payload the backend will never accept.
+    #[error("metadata storage error: {0}")]
+    Storage(#[from] StorageError),
     #[error("metadata backend error: {0}")]
     Backend(String),
 }

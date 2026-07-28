@@ -771,26 +771,16 @@ pub async fn supervise_and_finalize(
         .resources
         .max_walltime_ms
         .unwrap_or(DEFAULT_WALLTIME.as_millis() as u64);
-    let walltime_left = read_job_record(&storage, job_id, None)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|record| record.started_at_ms)
-        .map(|started_at_ms| {
-            Duration::from_millis(
-                started_at_ms
-                    .saturating_add(walltime_ms)
-                    .saturating_sub(unix_timestamp_millis()),
-            )
-        });
+    let started_at_ms = walltime_anchor(&storage, job_id, token).await;
+    let walltime_left = Duration::from_millis(
+        started_at_ms
+            .saturating_add(walltime_ms)
+            .saturating_sub(unix_timestamp_millis()),
+    );
     let wait_and_finalize = async {
-        let result = if let Some(walltime_left) = walltime_left {
-            tokio::select! {
-                result = backend.wait(&fence, &cancel) => Some(result),
-                _ = tokio::time::sleep(walltime_left) => None,
-            }
-        } else {
-            Some(backend.wait(&fence, &cancel).await)
+        let result = tokio::select! {
+            result = backend.wait(&fence, &cancel) => Some(result),
+            _ = tokio::time::sleep(walltime_left) => None,
         };
         if let Some(result) = result {
             finalize_attempt(
@@ -806,6 +796,32 @@ pub async fn supervise_and_finalize(
         .is_none()
     {
         info!(job_id = %job_id, "Execution supervisor superseded; abandoning");
+    }
+}
+
+/// The walltime cap needs an anchor even without backend start evidence. The
+/// first supervision pass persists the one it derives, so a restarted
+/// supervisor cannot hand the attempt a fresh window.
+async fn walltime_anchor(
+    storage: &aruna_storage::StorageHandle,
+    job_id: JobId,
+    token: ulid::Ulid,
+) -> u64 {
+    if let Some(started_at_ms) = read_job_record(storage, job_id, None)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|record| record.started_at_ms)
+    {
+        return started_at_ms;
+    }
+    let anchor = unix_timestamp_millis();
+    match record_attempt_started(storage, job_id, token, anchor).await {
+        Ok(record) => record.started_at_ms.unwrap_or(anchor),
+        Err(error) => {
+            warn!(job_id = %job_id, error = %error, "Walltime anchor write failed");
+            anchor
+        }
     }
 }
 
@@ -1903,7 +1919,7 @@ mod tests {
         Arc::get_mut(&mut ctx).unwrap().task_handle = None;
         let (record, token, attempt) = ready_with_intent(&storage).await;
         let job_id = record.job_id;
-        transition_external_to_running(&storage, job_id, token, None, 6)
+        transition_external_to_running(&storage, job_id, token, None, unix_timestamp_millis())
             .await
             .unwrap();
         let backend = StubBackend::new(StubReconcile::NotFound);
@@ -1960,7 +1976,7 @@ mod tests {
         Arc::get_mut(&mut ctx).unwrap().task_handle = None;
         let (record, token, attempt) = ready_with_intent(&storage).await;
         let job_id = record.job_id;
-        transition_external_to_running(&storage, job_id, token, None, 6)
+        transition_external_to_running(&storage, job_id, token, None, unix_timestamp_millis())
             .await
             .unwrap();
         let backend = StubBackend::new(StubReconcile::NotFound);
@@ -2024,6 +2040,70 @@ mod tests {
             stored.last_error.unwrap().message,
             "walltime limit exceeded"
         );
+    }
+
+    #[tokio::test]
+    async fn arms_missing_start() {
+        // A record carrying no backend start evidence must still be capped,
+        // anchored at the moment supervision begins.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let mut ctx = context(storage.clone());
+        Arc::get_mut(&mut ctx).unwrap().task_handle = None;
+        let (record, token, attempt) = ready_with_intent(&storage).await;
+        let job_id = record.job_id;
+        assert!(record.started_at_ms.is_none());
+        let backend = StubBackend::new(StubReconcile::Waiting);
+        let mut spec = execution_spec();
+        spec.resources.max_walltime_ms = Some(0);
+
+        supervise_and_finalize(
+            ctx,
+            job_id,
+            token,
+            backend.clone(),
+            fence(&attempt),
+            spec,
+            "ws-test".to_string(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(backend.cancels.load(Ordering::Relaxed), 1);
+        assert_eq!(stored.state, JobState::Failed);
+        assert_eq!(
+            stored.last_error.unwrap().message,
+            "walltime limit exceeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn anchor_survives_restart() {
+        // A crashlooping supervisor must not keep granting the attempt a fresh
+        // pre-Running window, so the first derived anchor is the durable one.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let (record, token, _attempt) = ready_with_intent(&storage).await;
+        let job_id = record.job_id;
+        assert!(record.started_at_ms.is_none());
+
+        let first = walltime_anchor(&storage, job_id, token).await;
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.started_at_ms, Some(first));
+        assert_eq!(walltime_anchor(&storage, job_id, token).await, first);
+        // Backend start evidence never moves an anchor that already exists.
+        record_attempt_started(&storage, job_id, token, first.saturating_add(60_000))
+            .await
+            .unwrap();
+        assert_eq!(walltime_anchor(&storage, job_id, token).await, first);
     }
 
     #[tokio::test]

@@ -73,6 +73,10 @@ pub enum MetadataRawReadError {
     Metadata(#[from] MetadataError),
     #[error("unexpected metadata raw-read event: {0}")]
     UnexpectedEvent(String),
+    /// The event log itself is inconsistent, so retrying the same read cannot
+    /// help. Kept apart from [`Self::UnexpectedEvent`], which is adapter noise.
+    #[error("inconsistent metadata raw event log: {0}")]
+    InconsistentLog(String),
 }
 
 pub async fn load_raw_view(
@@ -146,7 +150,7 @@ pub(crate) async fn prepare_raw_event(
                 .iter()
                 .any(|candidate| candidate.event_id == event.event_id)
             {
-                return Err(MetadataRawReadError::UnexpectedEvent(format!(
+                return Err(MetadataRawReadError::InconsistentLog(format!(
                     "raw event log is missing {}",
                     event.event_id
                 )));
@@ -198,7 +202,7 @@ async fn initial_raw_state(
         }
     };
     let state = resolve_raw_state(&events)?.ok_or_else(|| {
-        MetadataRawReadError::UnexpectedEvent(format!(
+        MetadataRawReadError::InconsistentLog(format!(
             "raw event log is missing {}",
             event.event_id
         ))
@@ -235,7 +239,7 @@ async fn rebuild_raw_state(
         .await?,
     );
     resolve_raw_state(&events)?.ok_or_else(|| {
-        MetadataRawReadError::UnexpectedEvent(format!(
+        MetadataRawReadError::InconsistentLog(format!(
             "raw base event is missing for {}",
             event.record.document_id
         ))
@@ -374,14 +378,14 @@ async fn read_raw_event(
                 postcard::from_bytes(&value).map_err(ConversionError::from)?;
             validate_raw_event(document_id, &event)?;
             if event.event_id != event_id {
-                return Err(MetadataRawReadError::UnexpectedEvent(format!(
+                return Err(MetadataRawReadError::InconsistentLog(format!(
                     "raw event key mismatch for {document_id}/{event_id}"
                 )));
             }
             Ok(event)
         }
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Err(
-            MetadataRawReadError::UnexpectedEvent(format!("raw event {event_id} is missing")),
+            MetadataRawReadError::InconsistentLog(format!("raw event {event_id} is missing")),
         ),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(MetadataRawReadError::UnexpectedEvent(format!("{other:?}"))),
@@ -446,7 +450,7 @@ fn validate_raw_event(
     event: &MetadataCreateEventRecord,
 ) -> Result<(), MetadataRawReadError> {
     if event.record.document_id != document_id {
-        return Err(MetadataRawReadError::UnexpectedEvent(format!(
+        return Err(MetadataRawReadError::InconsistentLog(format!(
             "raw event belongs to document {}",
             event.record.document_id
         )));

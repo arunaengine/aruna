@@ -40,9 +40,10 @@ use crate::jobs::runtime::JobsRuntime;
 use crate::jobs::store::release_job;
 use crate::jobs::{JOB_DRAIN_RETRY_AFTER, JOB_PRUNE_POLL_AFTER, JOB_PRUNE_RETRY_AFTER};
 use crate::metadata::materialization_queue::{
-    METADATA_MATERIALIZATION_POLL_AFTER, METADATA_MATERIALIZATION_RETRY_AFTER,
+    METADATA_MATERIALIZATION_NEXT_BATCH_AFTER, METADATA_MATERIALIZATION_POLL_AFTER,
+    METADATA_MATERIALIZATION_RETRY_AFTER, MetadataMaterializationDrainResult,
     metadata_materialization_jobs_exist, process_metadata_materialization_batch,
-    restore_metadata_materialization_timer,
+    requeue_dead_letters, restore_metadata_materialization_timer,
 };
 use crate::metadata::projector::{
     METADATA_PROJECTION_RETRY_AFTER, drain_pending_metadata_projection_queue,
@@ -102,6 +103,8 @@ pub static UNDELIVERABLE_RECORD_COUNT: std::sync::atomic::AtomicU64 =
 
 const DRAIN_SUBBATCH_RECORDS: usize = 512;
 const DURABLE_QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
+/// Rearm ticks between dead-letter sweeps, i.e. one sweep a minute.
+const DEAD_LETTER_SWEEP_TICKS: usize = 12;
 /// How long a record may wait for its shard topic's genesis before the drain
 /// stops treating the wait as normal and says so at error level.
 const OUTBOX_STUCK_AFTER: Duration = Duration::from_secs(300);
@@ -1171,12 +1174,25 @@ impl OperationsTaskHandler {
         }
     }
 
+    /// A context whose storage effects dispatch on the bulk lane, so background
+    /// queue draining never starves foreground sync traffic.
+    fn bulk_context(&self) -> DriverContext {
+        let mut context = self.context.as_ref().clone();
+        context.storage_handle = context.storage_handle.bulk();
+        context.metadata_handle = context
+            .metadata_handle
+            .as_ref()
+            .map(|metadata_handle| metadata_handle.bulk());
+        context
+    }
+
     async fn drain_metadata_materialization_queue(&self) {
-        match process_metadata_materialization_batch(&self.context).await {
+        let bulk = self.bulk_context();
+        match process_metadata_materialization_batch(&bulk).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(
                     TaskKey::DrainMetadataMaterializationQueue,
-                    std::time::Duration::ZERO,
+                    drain_delay(&result),
                 )
                 .await;
             }
@@ -1189,26 +1205,24 @@ impl OperationsTaskHandler {
                 )
                 .await;
             }
-            Ok(_) => {
-                match metadata_materialization_jobs_exist(&self.context.storage_handle).await {
-                    Ok(false) => {}
-                    Ok(true) => {
-                        self.reschedule_timer(
-                            TaskKey::DrainMetadataMaterializationQueue,
-                            METADATA_MATERIALIZATION_POLL_AFTER,
-                        )
-                        .await;
-                    }
-                    Err(error) => {
-                        warn!(task_id = ?TaskKey::DrainMetadataMaterializationQueue, error = ?error, "Failed to probe metadata materialization jobs");
-                        self.reschedule_timer(
-                            TaskKey::DrainMetadataMaterializationQueue,
-                            METADATA_MATERIALIZATION_RETRY_AFTER,
-                        )
-                        .await;
-                    }
+            Ok(_) => match metadata_materialization_jobs_exist(&bulk.storage_handle).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    self.reschedule_timer(
+                        TaskKey::DrainMetadataMaterializationQueue,
+                        METADATA_MATERIALIZATION_POLL_AFTER,
+                    )
+                    .await;
                 }
-            }
+                Err(error) => {
+                    warn!(task_id = ?TaskKey::DrainMetadataMaterializationQueue, error = ?error, "Failed to probe metadata materialization jobs");
+                    self.reschedule_timer(
+                        TaskKey::DrainMetadataMaterializationQueue,
+                        METADATA_MATERIALIZATION_RETRY_AFTER,
+                    )
+                    .await;
+                }
+            },
             Err(error) => {
                 warn!(task_id = ?TaskKey::DrainMetadataMaterializationQueue, error = ?error, "Failed to drain metadata materialization queue");
                 self.reschedule_timer(
@@ -1221,7 +1235,8 @@ impl OperationsTaskHandler {
     }
 
     async fn drain_metadata_graph_prune_queue(&self) {
-        match process_metadata_graph_prune_batch(&self.context).await {
+        let bulk = self.bulk_context();
+        match process_metadata_graph_prune_batch(&bulk).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(
                     TaskKey::DrainMetadataGraphPruneQueue,
@@ -1238,7 +1253,7 @@ impl OperationsTaskHandler {
                 )
                 .await;
             }
-            Ok(_) => match metadata_graph_prune_jobs_exist(&self.context.storage_handle).await {
+            Ok(_) => match metadata_graph_prune_jobs_exist(&bulk.storage_handle).await {
                 Ok(false) => {}
                 Ok(true) => {
                     self.reschedule_timer(
@@ -1765,11 +1780,13 @@ fn spawn_durable_queue_rearm(context: &Arc<DriverContext>, task_handle: &TaskHan
 }
 
 async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: TaskHandle) {
+    let mut ticks = 0usize;
     loop {
         tokio::time::sleep(DURABLE_QUEUE_REARM_AFTER).await;
         let Some(context) = context.upgrade() else {
             return;
         };
+        ticks = ticks.saturating_add(1);
         restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
         restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
@@ -1784,12 +1801,35 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
         )
         .await;
         restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
-        restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
+        // Dead letters retry on a minute-scale backoff, so sweeping every rearm
+        // tick would scan the keyspace far more often than it can yield work.
+        if ticks.is_multiple_of(DEAD_LETTER_SWEEP_TICKS) {
+            sweep_dead_letters(&context.storage_handle).await;
+        }
+        restore_metadata_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
         restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
         restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
         restore_job_queue_timer(&context.storage_handle, &task_handle).await;
         restore_job_prune_timer(&context.storage_handle, &task_handle).await;
         restore_mirror_timer(&context.storage_handle, &task_handle).await;
+    }
+}
+
+// A batch that processed nothing is blocked behind jobs that are not due yet, so
+// it backs off instead of rescanning the same head at batch pace.
+fn drain_delay(result: &MetadataMaterializationDrainResult) -> Duration {
+    if result.processed == 0 {
+        METADATA_MATERIALIZATION_RETRY_AFTER
+    } else {
+        METADATA_MATERIALIZATION_NEXT_BATCH_AFTER
+    }
+}
+
+// Parked materialization jobs come back on their own backoff, so a node that hit
+// the failure cap during a storm converges again without an operator or restart.
+async fn sweep_dead_letters(storage: &aruna_storage::StorageHandle) {
+    if let Err(error) = requeue_dead_letters(&storage.bulk()).await {
+        warn!(error = ?error, "Failed to requeue metadata materialization dead letters");
     }
 }
 
@@ -1858,7 +1898,8 @@ async fn initialize_task_handler(
     crate::node_info::restore_node_info_publish_timer(&context.storage_handle, &task_handle).await;
     restore_notification_outbox_timer(&context.storage_handle, &task_handle, Duration::ZERO).await;
     restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
-    restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
+    sweep_dead_letters(&context.storage_handle).await;
+    restore_metadata_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
     restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
     restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
     restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
@@ -2008,6 +2049,26 @@ mod tests {
     use ulid::Ulid;
 
     use crate::notifications::outbox::new_notification_outbox_record;
+
+    #[test]
+    fn blocked_batch_waits() {
+        // Nothing processed means the due head is blocked, so the next scan
+        // waits instead of respinning at the 25ms batch pace.
+        let blocked = MetadataMaterializationDrainResult {
+            processed: 0,
+            has_more_due: true,
+            next_due_after: None,
+        };
+        let progressing = MetadataMaterializationDrainResult {
+            processed: 4,
+            ..blocked
+        };
+        assert_eq!(drain_delay(&blocked), METADATA_MATERIALIZATION_RETRY_AFTER);
+        assert_eq!(
+            drain_delay(&progressing),
+            METADATA_MATERIALIZATION_NEXT_BATCH_AFTER
+        );
+    }
 
     struct RecordingTaskHandler {
         seen: mpsc::Sender<TaskKey>,

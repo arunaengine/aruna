@@ -2874,7 +2874,8 @@ mod tests {
 
     #[tokio::test]
     async fn replay_skips_write() {
-        let (storage, receiver) = StorageHandle::new();
+        let (storage, receivers) = StorageHandle::new();
+        let receiver = receivers.foreground;
         let key = DhtKeyId::from_data(b"unchanged-replay");
         let entry = make_entry(1, key, now_unix_secs().saturating_add(200));
         let encoded = encode_entries(std::slice::from_ref(&entry)).expect("encode entry");

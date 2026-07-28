@@ -21,7 +21,7 @@ version = "3.0.0-alpha.41"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
-rust-version = "1.95.0"
+rust-version = "1.97.1"
 
 [workspace.dependencies]
 # Workspace crates
@@ -41,16 +41,16 @@ async-compression = { version = "0.4.42", default-features = false, features = [
     "tokio",
     "deflate",
 ] }
-async-trait = "0.1.89"
+async-trait = "0.1.91"
 async_zip = { package = "astral_async_zip", version = "0.0.20", features = [
     "tokio",
     "deflate",
 ] }
-aws-config = { version = "1.9.0", default-features = false, features = [
+aws-config = { version = "1.10.1", default-features = false, features = [
     "default-https-client",
     "rt-tokio",
 ] }
-aws-sdk-s3 = { version = "1.138.1", default-features = false, features = [
+aws-sdk-s3 = { version = "1.140.0", default-features = false, features = [
     "default-https-client",
     "http-1x",
     "rt-tokio",
@@ -58,13 +58,13 @@ aws-sdk-s3 = { version = "1.138.1", default-features = false, features = [
 axum = "0.8.9"
 axum-extra = { version = "0.12.6", features = ["query"] }
 bao-tree = "0.16.0"
-base64 = "0.22.1"
+base64 = "0.23.0"
 blake3 = { version = "1.8.5", features = ["serde"] }
 bollard = "0.21.0"
 byteview = "0.10.1"
 bytes = "1.12.1"
 chrono = { version = "0.4.45", features = ["serde"] }
-clap = { version = "4.6.2", features = ["derive"] }
+clap = { version = "4.6.4", features = ["derive"] }
 console-subscriber = "0.5.0"
 craqle = { git = "https://github.com/arunaengine/craqle", branch = "main", features = [
     "iroh",
@@ -74,16 +74,17 @@ crossfire = "3.1.19"
 crypto_box = "0.9.1"
 data-encoding = "2.11.0"
 dotenvy = "0.15.7"
-ed25519-dalek = { version = "2.2.0", features = ["rand_core", "pem"] }
+ed25519-dalek = { version = "3.0.0", features = ["pem"] }
 fjall = "3.1.8"
 flate2 = "1.1.9"
 futures = "0.3.33"
 futures-core = "0.3.33"
 futures-util = { version = "0.3.33", features = ["io"] }
+getrandom = "0.4.3"
 globset = "0.4.19"
 hex = "0.4.3"
 http = "1.4.2"
-hyper = { version = "1.10.1", features = ["full"] }
+hyper = { version = "1.11.0", features = ["full"] }
 hyper-util = { version = "0.1.20", features = [
     "server",
     "server-auto",
@@ -92,15 +93,15 @@ hyper-util = { version = "0.1.20", features = [
     "tokio",
     "service",
 ] }
-iroh = "1.0.2"
-iroh-base = "1.0.2"
+iroh = "1.0.3"
+iroh-base = "1.0.3"
 irokle = { git = "https://github.com/arunaengine/irokle.git", branch = "main", features = [
     "fjall",
     "iroh",
 ] }
 iroh-io = "0.6.2"
 iroh-quinn = "0.16.1"
-jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 json-patch = "4.2.0"
 lru = "0.18.1"
 md5 = "0.8.1"
@@ -139,7 +140,7 @@ reqwest = { version = "0.13.4", default-features = false, features = [
 ] }
 rustix = { version = "1.1.4", features = ["process"] }
 rustls = { version = "0.23.42", features = ["ring"] }
-kube = { version = "4.0", default-features = false, features = [
+kube = { version = "4.2.0", default-features = false, features = [
     "client",
     "jsonpatch",
     "runtime",
@@ -148,8 +149,8 @@ kube = { version = "4.0", default-features = false, features = [
 ] }
 k8s-openapi = { version = "0.28", features = ["v1_32"] }
 s3s = "0.14.1"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0.150", features = ["raw_value"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["raw_value"] }
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 smallvec = "1.15.2"
@@ -160,9 +161,9 @@ sysinfo = { version = "0.39.6", default-features = false, features = [
 ] }
 tar = "0.4.46"
 tempfile = "3.27.0"
-thiserror = "2.0.18"
-tokio = { version = "1.53.0", features = ["full", "tracing"] }
-tokio-util = { version = "0.7.18", features = ["compat", "io-util"] }
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["full", "tracing"] }
+tokio-util = { version = "0.7.19", features = ["compat", "io-util"] }
 tower = { version = "0.5.3", features = ["limit"] }
 tower-http = { version = "0.7.0", features = ["cors", "fs", "timeout"] }
 tracing = "0.1.44"
@@ -190,3 +191,4 @@ zip = { version = "8.6.0", default-features = false }
 
 [profile.release]
 panic = "abort"
+

@@ -132,8 +132,10 @@ async fn validates_corpus() {
         Some("https://w3id.org/ro/crate/1.2/context")
     );
     assert_eq!(elabftw.wrapper.as_deref(), Some("2025-09-16-103731-export"));
-    let image = "./Demo - Gold-master-experiment - 4af4da4e/example.jpg";
-    let json = "./Molecular-biology - Facilis-illum-sed-reprehenderit - a7658b02/autesse.json";
+    // eLabFTW writes identifiers with literal spaces; validation encodes them.
+    let image = "./Demo%20-%20Gold-master-experiment%20-%204af4da4e/example.jpg";
+    let json =
+        "./Molecular-biology%20-%20Facilis-illum-sed-reprehenderit%20-%20a7658b02/autesse.json";
     assert_eq!(
         elabftw.file_ids.iter().cloned().collect::<BTreeSet<_>>(),
         BTreeSet::from([image.to_string(), json.to_string()])
@@ -150,8 +152,16 @@ async fn validates_corpus() {
             "fd/fdedffebcfbbdc8eb9a554d54951783ced67e23ac0c38445f67112bfb81543147d8960561fcd7745e3e3ec098ded2d5f86730ad635520319e502c11c5260ba2c.json"
         )
     );
-    assert!(elabftw.paths.contains(image.trim_start_matches("./")));
-    assert!(elabftw.paths.contains(json.trim_start_matches("./")));
+    assert!(
+        elabftw
+            .paths
+            .contains("Demo - Gold-master-experiment - 4af4da4e/example.jpg")
+    );
+    assert!(
+        elabftw.paths.contains(
+            "Molecular-biology - Facilis-illum-sed-reprehenderit - a7658b02/autesse.json"
+        )
+    );
 
     let pasta = read_fixture(handle, PASTA, 2).await;
     assert_eq!(

@@ -16,6 +16,7 @@ use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
+use aruna_core::keys::generate_signing_key;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::onboarding::{
     CreateOnboardingSecretRequest, CreateOnboardingSecretResponse, OnboardingMode, OnboardingPhase,
@@ -44,7 +45,6 @@ use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
-use ed25519_dalek::SigningKey;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::StatusCode;
 use std::collections::HashMap;
@@ -575,7 +575,7 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
         .to_str()
         .ok_or_else(|| std::io::Error::other("invalid temp path"))?;
     let storage = FjallStorage::open(storage_path)?;
-    let realm_signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+    let realm_signing_key = generate_signing_key();
     let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
     let user_id = UserId::new(Ulid::generate(), realm_id);
     let net = NetHandle::new(

@@ -161,7 +161,11 @@ pub enum OutputDestination {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputSelection {
+    /// Absolute container path, which may carry POSIX 12.13 wildcards.
     pub container_path: String,
+    /// Literal ancestor stripped from every matched path to build the
+    /// destination key. Required with wildcards, absent otherwise.
+    pub path_prefix: Option<String>,
     pub destination: OutputDestination,
     pub name: Option<String>,
     pub description: Option<String>,
@@ -497,6 +501,7 @@ impl ExecutionSpec {
         for output in std::mem::take(&mut self.workspace_outputs) {
             self.file_outputs.push(OutputSelection {
                 container_path: output.container_path,
+                path_prefix: None,
                 destination: OutputDestination::S3 {
                     bucket: bucket.to_string(),
                     key: output.dest_key,
@@ -1495,6 +1500,7 @@ mod tests {
             spec.file_outputs,
             vec![OutputSelection {
                 container_path: "/out/report.txt".to_string(),
+                path_prefix: None,
                 destination: OutputDestination::S3 {
                     bucket: "ws-job".to_string(),
                     key: "outputs/report.txt".to_string(),

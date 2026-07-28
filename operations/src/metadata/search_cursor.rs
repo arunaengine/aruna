@@ -281,7 +281,7 @@ fn score_key(score: f32) -> i64 {
     (score as f64 * 1_000_000.0) as i64
 }
 
-fn compare_hits(left: &MetadataSearchHit, right: &MetadataSearchHit) -> Ordering {
+pub(super) fn compare_hits(left: &MetadataSearchHit, right: &MetadataSearchHit) -> Ordering {
     score_key(right.score)
         .cmp(&score_key(left.score))
         .then_with(|| left.graph_iri.cmp(&right.graph_iri))

@@ -104,9 +104,10 @@ struct PendingMetadataCreateApply {
     lifecycle_revision: Option<DocumentSyncChange>,
 }
 
-struct MetadataPlacementFence {
-    config_write: Option<(String, ByteView, Value)>,
-}
+/// Placement fence outcome. The transactional read of the realm config is the
+/// whole fence: a concurrent config mutation conflicts the commit. The config
+/// row is never written back, which would only conflict its readers.
+struct MetadataPlacementFence;
 
 enum MetadataPlacementOutcome<T> {
     Accepted(T),
@@ -2622,19 +2623,18 @@ impl DocumentSyncService {
 
         let txn_id = start_storage_transaction(&self.storage).await?;
         let mut writes = Vec::with_capacity(candidates.len() * 3 + cursor_writes.len());
-        let mut config_writes = BTreeMap::new();
         let mut accepted = Vec::with_capacity(candidates.len());
         let mut accepted_candidates = Vec::with_capacity(candidates.len());
         let mut deferred_cursor_topics = BTreeSet::new();
         for (apply, entries) in candidates {
-            let fence = match metadata_placement_fence_in_transaction(
+            match metadata_placement_fence_in_transaction(
                 &self.storage,
                 &apply.record.record,
                 txn_id,
             )
             .await
             {
-                Ok(MetadataPlacementOutcome::Accepted(fence)) => fence,
+                Ok(MetadataPlacementOutcome::Accepted(MetadataPlacementFence)) => {}
                 Ok(MetadataPlacementOutcome::Deferred(dependency)) => {
                     warn!(
                         topic_id = %apply.topic_id,
@@ -2674,19 +2674,15 @@ impl DocumentSyncService {
                     return Err(error);
                 }
             };
-            accepted_candidates.push((apply, entries, fence.config_write));
+            accepted_candidates.push((apply, entries));
         }
-        for (apply, entries, config_write) in accepted_candidates {
+        for (apply, entries) in accepted_candidates {
             if deferred_cursor_topics.contains(&apply.topic_id) {
                 continue;
-            }
-            if let Some(config_write) = config_write {
-                config_writes.insert(apply.record.record.realm_id, config_write);
             }
             writes.extend(entries);
             accepted.push(apply);
         }
-        writes.extend(config_writes.into_values());
         writes.extend(cursor_writes.into_iter().filter_map(|(topic_id, write)| {
             (!deferred_cursor_topics.contains(&topic_id)).then_some(write)
         }));
@@ -3292,8 +3288,8 @@ async fn apply_metadata_registry_upsert_to_storage(
     };
     for _ in 0..2 {
         let txn_id = start_storage_transaction(storage).await?;
-        let fence = match metadata_placement_fence_in_transaction(storage, &record, txn_id).await {
-            Ok(MetadataPlacementOutcome::Accepted(fence)) => fence,
+        match metadata_placement_fence_in_transaction(storage, &record, txn_id).await {
+            Ok(MetadataPlacementOutcome::Accepted(MetadataPlacementFence)) => {}
             Ok(MetadataPlacementOutcome::Deferred(dependency)) => {
                 let _ = storage
                     .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
@@ -3351,10 +3347,7 @@ async fn apply_metadata_registry_upsert_to_storage(
             return Ok(MetadataPlacementOutcome::Accepted(()));
         }
 
-        let mut entries = base_entries.clone();
-        if let Some(config_write) = fence.config_write {
-            entries.push(config_write);
-        }
+        let entries = base_entries.clone();
         match storage_batch_delete_and_write_in_transaction(storage, txn_id, Vec::new(), entries)
             .await
         {
@@ -4472,9 +4465,7 @@ async fn metadata_placement_fence_in_transaction(
     .await?;
     let Some(value) = value else {
         return if record.placement == PlacementRef::NIL {
-            Ok(MetadataPlacementOutcome::Accepted(MetadataPlacementFence {
-                config_write: None,
-            }))
+            Ok(MetadataPlacementOutcome::Accepted(MetadataPlacementFence))
         } else {
             Ok(MetadataPlacementOutcome::Deferred(dependency))
         };
@@ -4489,13 +4480,7 @@ async fn metadata_placement_fence_in_transaction(
     {
         return Ok(MetadataPlacementOutcome::Deferred(dependency));
     }
-    Ok(MetadataPlacementOutcome::Accepted(MetadataPlacementFence {
-        config_write: Some((
-            REALM_CONFIG_KEYSPACE.to_string(),
-            target.storage_key(),
-            value,
-        )),
-    }))
+    Ok(MetadataPlacementOutcome::Accepted(MetadataPlacementFence))
 }
 
 async fn storage_read_from(
@@ -9726,6 +9711,64 @@ mod tests {
             .await
             .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn upsert_keeps_config() {
+        // The placement fence reads the realm config inside its transaction and
+        // must not write it back: an identical write only conflicts the config's
+        // readers, which is how inbound sync used to stall concurrent creates.
+        let (_dir, storage) = test_storage();
+        let group_id = Ulid::from_parts(2_130, 1);
+        let document_id = Ulid::from_parts(2_131, 1);
+        let record = registry_record(
+            group_id,
+            document_id,
+            "datasets/config-untouched",
+            100,
+            Ulid::from_parts(2_132, 1),
+        );
+        let actor = test_actor(1, UserId::nil(record.realm_id), record.realm_id);
+        let mut config = RealmConfigDocument::default_for_realm(record.realm_id, Vec::new());
+        config.seed_default_placement();
+        let config_target = DocumentSyncTarget::RealmConfig {
+            realm_id: record.realm_id,
+        };
+        storage_batch_write_to(
+            &storage,
+            vec![(
+                config_target.storage_keyspace().to_string(),
+                config_target.storage_key(),
+                config
+                    .to_bytes(&actor)
+                    .expect("realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("realm config writes");
+        let before = storage.snapshot_metrics().requests_total;
+
+        apply_metadata_registry_upsert_to_storage(
+            &storage,
+            record.clone(),
+            postcard::to_allocvec(&record).expect("registry serializes"),
+        )
+        .await
+        .expect("registry upsert applies");
+
+        assert!(
+            read_storage_value(
+                &storage,
+                METADATA_INDEX_KEYSPACE,
+                metadata_registry_key(group_id, document_id),
+            )
+            .await
+            .is_some(),
+            "the upsert still lands"
+        );
+        assert_eq!(storage.snapshot_metrics().conflicts_total, 0);
+        assert!(storage.snapshot_metrics().requests_total > before);
     }
 
     #[tokio::test]

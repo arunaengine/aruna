@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::errors::ConversionError;
+use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     METADATA_IRI_REFERENCE_INDEX_KEYSPACE, METADATA_MATERIALIZATION_STATUS_KEYSPACE,
@@ -17,6 +17,7 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
+use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
@@ -25,6 +26,24 @@ const IRI_INDEX_PAGE_SIZE: usize = 128;
 const IRI_INDEX_WRITE_BATCH_SIZE: usize = 128;
 
 pub(crate) const DCTERMS_CONFORMS_TO_IRI: &str = "http://purl.org/dc/terms/conformsTo";
+
+/// Keeps the storage cause intact so callers can tell an overloaded backend
+/// apart from a genuine index or document problem.
+#[derive(Debug, Error)]
+pub(crate) enum MetadataIriIndexError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
+    #[error("unexpected metadata IRI reference index event: {0}")]
+    UnexpectedEvent(String),
+}
+
+impl From<MetadataIriIndexError> for MetadataError {
+    fn from(error: MetadataIriIndexError) -> Self {
+        MetadataError::Backend(error.to_string())
+    }
+}
 
 pub(crate) fn project_metadata_iri_references(
     document_id: Ulid,
@@ -109,7 +128,7 @@ pub(crate) async fn lookup_iri_backlinks(
 async fn scan_iri_reference_records(
     storage: &StorageHandle,
     prefix: Option<ByteView>,
-) -> Result<Vec<MetadataIriReferenceIndexRecord>, MetadataError> {
+) -> Result<Vec<MetadataIriReferenceIndexRecord>, MetadataIriIndexError> {
     let mut start_after = None;
     let mut records = Vec::new();
     loop {
@@ -129,13 +148,8 @@ async fn scan_iri_reference_records(
             }) => {
                 for (_, value) in values {
                     records.push(
-                        postcard::from_bytes::<MetadataIriReferenceIndexRecord>(&value).map_err(
-                            |error| {
-                                MetadataError::Backend(format!(
-                                    "failed to decode metadata IRI reference index: {error}"
-                                ))
-                            },
-                        )?,
+                        postcard::from_bytes::<MetadataIriReferenceIndexRecord>(&value)
+                            .map_err(ConversionError::from)?,
                     );
                 }
                 match next_start_after {
@@ -143,13 +157,9 @@ async fn scan_iri_reference_records(
                     None => break,
                 }
             }
-            Event::Storage(StorageEvent::Error { error }) => {
-                return Err(MetadataError::Backend(error.to_string()));
-            }
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataError::Backend(format!(
-                    "unexpected metadata IRI reference index event: {other:?}"
-                )));
+                return Err(MetadataIriIndexError::UnexpectedEvent(format!("{other:?}")));
             }
         }
     }
@@ -213,7 +223,7 @@ async fn select_iri_reference_keys<F>(
     storage: &StorageHandle,
     txn_id: Option<Ulid>,
     mut select: F,
-) -> Result<Vec<(String, ByteView)>, MetadataError>
+) -> Result<Vec<(String, ByteView)>, MetadataIriIndexError>
 where
     F: FnMut(Ulid, Ulid) -> bool,
 {
@@ -234,13 +244,9 @@ where
                 values,
                 next_start_after,
             }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => {
-                return Err(MetadataError::Backend(error.to_string()));
-            }
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataError::Backend(format!(
-                    "unexpected metadata IRI reference index event: {other:?}"
-                )));
+                return Err(MetadataIriIndexError::UnexpectedEvent(format!("{other:?}")));
             }
         };
         for (key, _) in values {
@@ -265,7 +271,7 @@ pub(crate) async fn superseded_iri_reference_keys(
     storage: &StorageHandle,
     txn_id: Option<Ulid>,
     current_cursors: &HashMap<Ulid, Ulid>,
-) -> Result<Vec<(String, ByteView)>, MetadataError> {
+) -> Result<Vec<(String, ByteView)>, MetadataIriIndexError> {
     select_iri_reference_keys(storage, txn_id, |document_id, cursor| {
         current_cursors
             .get(&document_id)
@@ -282,7 +288,7 @@ async fn stale_rebuild_iri_reference_keys(
     storage: &StorageHandle,
     reprojected: &HashMap<Ulid, Ulid>,
     registered: &HashMap<Ulid, Ulid>,
-) -> Result<Vec<(String, ByteView)>, MetadataError> {
+) -> Result<Vec<(String, ByteView)>, MetadataIriIndexError> {
     select_iri_reference_keys(storage, None, |document_id, cursor| {
         reprojected.get(&document_id) != Some(&cursor)
             && registered.get(&document_id) != Some(&cursor)
@@ -296,10 +302,10 @@ pub(crate) async fn document_iri_reference_keys(
     storage: &StorageHandle,
     document_ids: &BTreeSet<Ulid>,
 ) -> Result<Vec<(String, ByteView)>, MetadataError> {
-    select_iri_reference_keys(storage, None, |document_id, _| {
+    Ok(select_iri_reference_keys(storage, None, |document_id, _| {
         document_ids.contains(&document_id)
     })
-    .await
+    .await?)
 }
 
 pub(crate) async fn delete_iri_reference_keys(
@@ -316,12 +322,10 @@ pub(crate) async fn delete_iri_reference_keys(
         {
             Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
             Event::Storage(StorageEvent::Error { error }) => {
-                return Err(MetadataError::Backend(error.to_string()));
+                return Err(MetadataIriIndexError::from(error).into());
             }
             other => {
-                return Err(MetadataError::Backend(format!(
-                    "unexpected metadata IRI reference index delete event: {other:?}"
-                )));
+                return Err(MetadataIriIndexError::UnexpectedEvent(format!("{other:?}")).into());
             }
         }
     }
@@ -393,7 +397,7 @@ fn collect_iri_backlinks(
 async fn read_materialization_status(
     storage: &StorageHandle,
     document_id: Ulid,
-) -> Result<Option<MetadataMaterializationStatusRecord>, MetadataError> {
+) -> Result<Option<MetadataMaterializationStatusRecord>, MetadataIriIndexError> {
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: METADATA_MATERIALIZATION_STATUS_KEYSPACE.to_string(),
@@ -403,30 +407,20 @@ async fn read_materialization_status(
         .await
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|bytes| {
-                postcard::from_bytes(&bytes).map_err(|error| {
-                    MetadataError::Backend(format!(
-                        "failed to decode metadata materialization status: {error}"
-                    ))
-                })
-            })
-            .transpose(),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(MetadataError::Backend(error.to_string()))
-        }
-        other => Err(MetadataError::Backend(format!(
-            "unexpected metadata materialization status event: {other:?}"
-        ))),
+            .map(|bytes| postcard::from_bytes(&bytes).map_err(ConversionError::from))
+            .transpose()
+            .map_err(MetadataIriIndexError::from),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataIriIndexError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
 async fn write_metadata_iri_references(
     storage: &StorageHandle,
     records: &[MetadataIriReferenceIndexRecord],
-) -> Result<(), MetadataError> {
+) -> Result<(), MetadataIriIndexError> {
     for records in records.chunks(IRI_INDEX_WRITE_BATCH_SIZE) {
-        let writes = metadata_iri_reference_write_entries(records)
-            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        let writes = metadata_iri_reference_write_entries(records)?;
         match storage
             .send_storage_effect(StorageEffect::BatchWrite {
                 writes,
@@ -435,13 +429,9 @@ async fn write_metadata_iri_references(
             .await
         {
             Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-            Event::Storage(StorageEvent::Error { error }) => {
-                return Err(MetadataError::Backend(error.to_string()));
-            }
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataError::Backend(format!(
-                    "unexpected metadata IRI reference index write event: {other:?}"
-                )));
+                return Err(MetadataIriIndexError::UnexpectedEvent(format!("{other:?}")));
             }
         }
     }
@@ -640,6 +630,20 @@ mod tests {
             filtered[0].subject_iris,
             vec!["https://example.test/root".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn decode_error_classified() {
+        // A corrupt row must stay a conversion failure: callers charge those to
+        // the document, while storage failures must never spend that budget.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        write_index_row(&storage, Ulid::from_parts(1, 1), Ulid::from_parts(2, 1)).await;
+
+        let error = scan_iri_reference_records(&storage, None)
+            .await
+            .expect_err("malformed row fails to decode");
+        assert!(matches!(error, MetadataIriIndexError::Conversion(_)));
     }
 
     #[tokio::test]

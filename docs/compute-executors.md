@@ -60,6 +60,11 @@ Input files may share a directory with outputs. Exact input/output collisions,
 input-file ancestors, duplicate paths, and root output parents are rejected.
 Paths are normalized by components, so `/out` and `/output` remain distinct.
 
+An output path may carry the POSIX wildcards `*`, `?`, and `[...]`, which never
+cross `/`. Each match is uploaded below the declared destination with the
+required `path_prefix` stripped, and a pattern that matches nothing captures
+nothing. A declared path without wildcards must still exist when the task ends.
+
 ## Docker
 
 Required configuration:
@@ -199,8 +204,9 @@ release fallback.
 ## Helper image
 
 The helper source is in `scripts/compute-helper`. It provides only `stage`,
-`fetch`, and `probe`: safe tar staging, tar output fetch, marker comparison, and
-probe installation. It contains no AWS SDK or credential input.
+`fetch`, `list`, and `probe`: safe tar staging, tar output fetch, workspace
+listing for wildcard outputs, marker comparison, and probe installation. It
+contains no AWS SDK or credential input.
 
 Build the plain local image from the repository root with:
 

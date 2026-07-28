@@ -114,7 +114,7 @@ pub enum SourceConnectorResolutionError {
     ResolveFailed,
 }
 
-#[derive(Debug, Error, PartialEq, Clone)]
+#[derive(Debug, Error, PartialEq, Eq, Clone)]
 pub enum StorageError {
     #[error("Key not found")]
     KeyNotFound,

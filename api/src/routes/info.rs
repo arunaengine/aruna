@@ -15,6 +15,7 @@ use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissio
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
+use aruna_operations::metadata::stats::count_realm_documents;
 use aruna_operations::mutate_realm_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementError, RealmPlacementMutation,
     drive_realm_placement_mutation,
@@ -1127,6 +1128,13 @@ pub struct UsageResponse {
     pub logical_bytes: u64,
     pub referenced_bytes: u64,
     pub realm: UsageTotals,
+    /// Realm-wide total of live metadata documents, excluding lifecycle-deleted
+    /// ones. This is the realm's document volume, not a count of what the
+    /// calling principal may read, so it is not filtered per caller. Absent on
+    /// the group usage endpoint and on nodes without a metadata subsystem, so
+    /// an absent count never reads as zero documents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_documents: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota: Option<GroupQuotaStatus>,
 }
@@ -1205,6 +1213,7 @@ impl UsageResponse {
             logical_bytes: local.logical_bytes,
             referenced_bytes: local.referenced_bytes,
             realm: realm.into(),
+            metadata_documents: None,
             quota: None,
         }
     }
@@ -1243,7 +1252,18 @@ pub async fn get_usage(
     require_realm_auth(&state, auth)?;
     let local = load_usage_counters(&state, USAGE_GLOBAL_KEY.to_vec()).await?;
     let realm = load_realm_usage(&state, RealmUsageScope::Global).await?;
-    Ok((StatusCode::OK, Json(UsageResponse::new(local, realm))))
+    let mut response = UsageResponse::new(local, realm);
+    // Best effort: storage counters stay reportable when the metadata
+    // subsystem cannot answer, and the omitted field never reads as zero.
+    response.metadata_documents =
+        match count_realm_documents(&state.get_ctx(), state.get_realm_id()).await {
+            Ok(count) => count,
+            Err(error) => {
+                warn!(error = %error, "metadata document count unavailable for usage response");
+                None
+            }
+        };
+    Ok((StatusCode::OK, Json(response)))
 }
 
 fn map_realm_nodes(
@@ -1579,6 +1599,7 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::errors::StorageError;
+    use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, QuotaConfig, RealmId};
     use aruna_operations::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
@@ -1593,7 +1614,6 @@ mod tests {
     use axum::extract::{FromRequest, State};
     use axum::http::StatusCode;
     use axum::{Extension, Json};
-    use ed25519_dalek::SigningKey;
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
     use tower::ServiceExt;
@@ -1611,8 +1631,7 @@ mod tests {
             compute_handle: None,
         });
 
-        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-        let realm_signing_key = SigningKey::generate(&mut csprng);
+        let realm_signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_id = iroh::SecretKey::generate().public();
 
@@ -1932,6 +1951,104 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(response.buckets, 2, "flat fields report local total");
         assert_eq!(response.realm.buckets, 5, "realm sums local and remote");
+        assert_eq!(
+            response.metadata_documents, None,
+            "a node without a metadata subsystem omits the count"
+        );
+        let body = serde_json::to_value(&response).unwrap();
+        assert!(!body.as_object().unwrap().contains_key("metadata_documents"));
+    }
+
+    /// The reported total covers every live document in the realm, including
+    /// the private ones the caller holds no role for.
+    #[tokio::test]
+    async fn usage_counts_documents() {
+        use aruna_core::storage_entries::metadata_registry_write_entries;
+        use aruna_core::structs::{MetadataRegistryRecord, PlacementRef};
+
+        let storage_dir = tempdir().unwrap();
+        let metadata_dir = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let node_id = iroh::SecretKey::generate().public();
+        let metadata_handle = aruna_operations::metadata::MetadataHandle::new(
+            metadata_dir.path(),
+            node_id,
+            storage_handle.clone(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let realm_signing_key = generate_signing_key();
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: Some(metadata_handle),
+            task_handle: None,
+            compute_handle: None,
+        });
+        let state = Arc::new(
+            ServerState::new(
+                driver_ctx,
+                realm_id,
+                node_id,
+                NodeCapabilities::local_node(realm_id).unwrap(),
+                false,
+                None,
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
+            )
+            .await,
+        );
+
+        let group_id = Ulid::generate();
+        let mut writes = Vec::new();
+        for (index, public) in [(0u8, true), (1, true), (2, false)] {
+            let document_id = Ulid::from_parts(index.into(), index.into());
+            let path = format!("datasets/{index}");
+            let record = MetadataRegistryRecord {
+                realm_id,
+                group_id,
+                document_id,
+                document_path: path.clone(),
+                graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+                public,
+                permission_path: MetadataRegistryRecord::permission_path_for(
+                    &realm_id,
+                    group_id,
+                    &path,
+                    document_id,
+                ),
+                placement: PlacementRef::NIL,
+                holder_node_ids: Vec::new(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                last_event_id: Ulid::nil(),
+            };
+            writes.extend(metadata_registry_write_entries(&record).unwrap());
+        }
+        assert!(matches!(
+            state
+                .get_ctx()
+                .storage_handle
+                .send_storage_effect(StorageEffect::BatchWrite {
+                    writes,
+                    txn_id: None,
+                })
+                .await,
+            aruna_core::events::Event::Storage(
+                aruna_core::events::StorageEvent::BatchWriteResult { .. }
+            )
+        ));
+
+        let auth = test_auth_context(&state);
+        let (_, Json(response)) = get_usage(State(state), Extension(Some(auth)))
+            .await
+            .unwrap();
+
+        assert_eq!(response.metadata_documents, Some(3));
     }
 
     #[test]
@@ -2022,8 +2139,7 @@ mod tests {
             compute_handle: None,
         });
 
-        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-        let realm_signing_key = SigningKey::generate(&mut csprng);
+        let realm_signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let user_id = UserId::local(Ulid::generate(), realm_id);
         let node_id = iroh::SecretKey::generate().public();

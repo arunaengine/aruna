@@ -86,10 +86,15 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Run cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+      # The official action builds a container from Docker Hub, whose rate
+      # limited pulls time out on hosted runners; install the binary instead.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
-          command: check
+          tool: cargo-deny@0.20.2
+
+      - name: Run cargo-deny
+        run: cargo deny check
 
   shellcheck:
     runs-on: ubuntu-latest

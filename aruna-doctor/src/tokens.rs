@@ -450,6 +450,7 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
+    use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
     use aruna_core::structs::{
         Actor, NodeCapabilities, OidcProviderConfig, RealmConfigDocument, RealmId, TokenClaims,
@@ -736,8 +737,7 @@ mod tests {
         )
         .await;
 
-        let realm_signing_key =
-            SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let realm_signing_key = generate_signing_key();
         let realm_id =
             aruna_core::structs::RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let capabilities = NodeCapabilities::management_node(realm_signing_key).unwrap();
@@ -880,7 +880,7 @@ mod tests {
     }
 
     fn aruna_token_fixture() -> (SigningKey, RealmId, UserId) {
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
         let user_id = UserId::local(Ulid::generate(), realm_id);
         (signing_key, realm_id, user_id)
@@ -969,8 +969,7 @@ mod tests {
     #[tokio::test]
     async fn delegated_server_token_view_is_valid_for_trusted_realm() {
         let (realm_signing_key, realm_id, user_id) = aruna_token_fixture();
-        let issuer_signing_key =
-            SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let issuer_signing_key = generate_signing_key();
         let issuer_pubkey = public_key_base64(&issuer_signing_key);
         let mut claims = aruna_token_claims(realm_id, user_id);
         claims.issuer_pubkey = Some(issuer_pubkey.clone());
@@ -1127,7 +1126,7 @@ mod tests {
         let _guard = env_lock().lock().await;
         let issuer = "https://issuer.example";
         let kid = "main-key";
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let oidc_token = sign_oidc_token(issuer, kid, &signing_key, "subject-123", Some("Alice"));
         let (provider, oidc_task) =
             spawn_oidc_provider(issuer, kid, &signing_key, oidc_token).await;
@@ -1161,7 +1160,7 @@ mod tests {
         let _guard = env_lock().lock().await;
         let issuer = "https://issuer.example";
         let kid = "main-key";
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let oidc_token = sign_oidc_token(issuer, kid, &signing_key, "subject-admin", Some("Admin"));
         let (provider, oidc_task) =
             spawn_oidc_provider(issuer, kid, &signing_key, oidc_token).await;

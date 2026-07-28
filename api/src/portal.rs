@@ -164,6 +164,7 @@ mod tests {
     use crate::server::{DEFAULT_MAX_HTTP_BODY_SIZE, Server, ServerConfig};
     use crate::server_state::{PortalStatus, ServerState};
     use aruna_core::UserId;
+    use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{Actor, NodeCapabilities, OidcProviderConfig, RealmId};
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::driver::{DriverContext, drive};
@@ -174,7 +175,6 @@ mod tests {
     use axum::http::{Method, StatusCode, header};
     use axum::routing::get;
     use axum::{Json, Router};
-    use ed25519_dalek::SigningKey;
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
     use tokio::net::TcpListener;
@@ -193,8 +193,7 @@ mod tests {
             compute_handle: None,
         });
 
-        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-        let realm_signing_key = SigningKey::generate(&mut csprng);
+        let realm_signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_id = iroh::SecretKey::generate().public();
 

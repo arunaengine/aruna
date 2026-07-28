@@ -483,6 +483,66 @@ async fn search_honors_explicit_graph_filter_before_visible_limit() -> Result<()
     Ok(())
 }
 
+async fn replay_crate(harness: &TestHarness, graph_iri: &str, name: &str) -> Result<(), BoxError> {
+    let event = harness
+        .handle
+        .send_metadata_effect(MetadataEffect::CreateCrate {
+            request: MetadataCreateCrateRequest {
+                graph_iri: graph_iri.to_string(),
+                name: name.to_string(),
+                description: format!("Crate graph {name}"),
+                date_published: "2026-01-01".to_string(),
+                license: None,
+                policy: MetadataGraphPolicy {
+                    public: true,
+                    permission_paths: Vec::new(),
+                },
+                durability: MetadataRequestDurability::WalAlreadyDurable,
+                deterministic_actor: None,
+            },
+        })
+        .await;
+    match event {
+        Event::Metadata(MetadataEvent::CreateCrateResult { .. }) => Ok(()),
+        other => Err(format!("replay crate failed: {other:?}").into()),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn query_cache_invalidates() -> Result<(), BoxError> {
+    // The second crate replays an already-durable write: it skips the
+    // lifecycle read and never advances the visibility generation, so only the
+    // apply counter can invalidate the cached result.
+    let harness = build_harness(None).await?;
+    let graphs = [0usize, 1]
+        .map(|index| format!("https://w3id.org/aruna/bench-{index:04}"))
+        .to_vec();
+    let records = graphs
+        .iter()
+        .enumerate()
+        .map(|(index, graph_iri)| registry_record(harness.group_id, index, Some(graph_iri.clone())))
+        .collect::<Vec<_>>();
+    write_registry_records(&harness, &records).await?;
+    create_crate(&harness, &graphs[0], &crate_name(0)).await?;
+
+    let first = query_names(&harness).await?;
+    assert!(
+        names_contain(&first, 0),
+        "cold query missed the first crate"
+    );
+    assert!(!names_contain(&first, 1), "second crate exists too early");
+    assert_eq!(query_names(&harness).await?, first, "repeat query diverged");
+
+    replay_crate(&harness, &graphs[1], &crate_name(1)).await?;
+    let second = query_names(&harness).await?;
+    assert!(
+        names_contain(&second, 1),
+        "cached result survived a graph mutation"
+    );
+    assert!(names_contain(&second, 0), "first crate vanished");
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lazy_visibility_matches_eager_query_and_search_semantics() -> Result<(), BoxError> {
     let harness = build_harness(None).await?;

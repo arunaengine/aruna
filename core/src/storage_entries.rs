@@ -16,7 +16,8 @@ use crate::keyspaces::{
     METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
     METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
     METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, METADATA_IRI_REFERENCE_INDEX_KEYSPACE,
-    METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
+    METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE, METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
+    METADATA_MATERIALIZATION_JOB_KEYSPACE, METADATA_MATERIALIZATION_PRUNE_KEYSPACE,
     METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
     NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
     NOTIFICATION_OUTBOX_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
@@ -24,7 +25,8 @@ use crate::keyspaces::{
 };
 use crate::metadata::{
     MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
-    MetadataGraphPruneJobRecord, MetadataIriReferenceIndexRecord, MetadataMaterializationJobRecord,
+    MetadataGraphPruneJobRecord, MetadataIriReferenceIndexRecord,
+    MetadataMaterializationDeadLetterRecord, MetadataMaterializationJobRecord,
     MetadataMaterializationStatusRecord,
 };
 use crate::structs::{
@@ -214,6 +216,10 @@ pub fn metadata_materialization_document_job_key(document_id: Ulid, event_id: Ul
     bytes.extend_from_slice(&document_id.to_bytes());
     bytes.extend_from_slice(&event_id.to_bytes());
     ByteView::from(bytes)
+}
+
+pub fn dead_letter_key(document_id: Ulid, event_id: Ulid) -> Key {
+    metadata_materialization_document_job_key(document_id, event_id)
 }
 
 pub fn metadata_materialization_job_key(record: &MetadataMaterializationJobRecord) -> Key {
@@ -509,16 +515,21 @@ pub fn metadata_iri_reference_write_entry(
     ))
 }
 
+/// Due-index row for the materialization queue. The value is empty: the sidecar
+/// row is authoritative. Both rows MUST be written and deleted in one batch/txn
+/// so the index never references a document job that does not exist.
 pub fn metadata_materialization_job_write_entry(
     record: &MetadataMaterializationJobRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     Ok((
         METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
         metadata_materialization_job_key(record),
-        postcard::to_allocvec(record)?.into(),
+        ByteView::from(Vec::new()),
     ))
 }
 
+/// Authoritative sidecar row for the materialization queue, paired with the due
+/// index row above; the two MUST be written and deleted together.
 pub fn metadata_materialization_document_job_write_entry(
     record: &MetadataMaterializationJobRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
@@ -527,6 +538,35 @@ pub fn metadata_materialization_document_job_write_entry(
         metadata_materialization_document_job_key(record.document_id, record.event_id),
         postcard::to_allocvec(record)?.into(),
     ))
+}
+
+/// Parked job kept for later requeue; the drain rearm loop retries these so a
+/// node converges without an operator or a restart.
+pub fn dead_letter_entry(
+    record: &MetadataMaterializationDeadLetterRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE.to_string(),
+        dead_letter_key(record.job.document_id, record.job.event_id),
+        postcard::to_allocvec(record)?.into(),
+    ))
+}
+
+/// A document whose superseded IRI index rows still have to be dropped. Kept
+/// durable so cleanup survives the batch that scheduled it.
+pub fn materialization_prune_entry(
+    document_id: Ulid,
+    cursor: Ulid,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        METADATA_MATERIALIZATION_PRUNE_KEYSPACE.to_string(),
+        materialization_prune_key(document_id),
+        postcard::to_allocvec(&cursor)?.into(),
+    ))
+}
+
+pub fn materialization_prune_key(document_id: Ulid) -> Key {
+    ByteView::from(document_id.to_bytes().to_vec())
 }
 
 pub fn metadata_graph_prune_job_write_entry(

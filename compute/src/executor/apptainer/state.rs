@@ -61,6 +61,8 @@ pub struct ProcessRecord {
 pub struct PayloadRecord {
     pub process: ProcessRecord,
     pub cgroup: PathBuf,
+    #[serde(default)]
+    pub started_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -255,4 +257,30 @@ pub fn sync_dir(path: &Path) -> Result<(), BackendError> {
 
 fn state_error(error: std::io::Error) -> BackendError {
     BackendError::Api(format!("Apptainer state: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payload_start_optional() {
+        // A payload written before the start time existed must still decode.
+        let record = PayloadRecord {
+            process: ProcessRecord {
+                pid: 7,
+                start_ticks: 9,
+            },
+            cgroup: PathBuf::from("/sys/fs/cgroup/attempt"),
+            started_at_ms: Some(1_700_000_000_000),
+        };
+        let encoded = serde_json::to_vec(&record).expect("encode payload");
+
+        let decoded: PayloadRecord = serde_json::from_slice(&encoded).expect("decode payload");
+        assert_eq!(decoded.started_at_ms, Some(1_700_000_000_000));
+
+        let legacy = br#"{"process":{"pid":7,"start_ticks":9},"cgroup":"/c"}"#;
+        let decoded: PayloadRecord = serde_json::from_slice(legacy).expect("decode legacy payload");
+        assert_eq!(decoded.started_at_ms, None);
+    }
 }

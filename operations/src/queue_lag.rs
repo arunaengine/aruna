@@ -10,7 +10,8 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_REPLICATION_JOB_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE,
-    METADATA_MATERIALIZATION_JOB_KEYSPACE, REFERENCE_METADATA_REFRESH_JOB_KEYSPACE,
+    METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
+    REFERENCE_METADATA_REFRESH_JOB_KEYSPACE,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
@@ -39,6 +40,9 @@ pub struct QueueLagSnapshot {
 pub struct DurableQueueLagSample {
     pub document_sync_outbox: Result<QueueLagSnapshot, String>,
     pub metadata_materialization: Result<QueueLagSnapshot, String>,
+    /// Parked materialization jobs awaiting requeue; a depth that only grows
+    /// means documents are failing to materialize.
+    pub materialization_dead_letters: Result<QueueLagSnapshot, String>,
     pub blob_replication: Result<QueueLagSnapshot, String>,
     pub reference_metadata_refresh: Result<QueueLagSnapshot, String>,
 }
@@ -77,9 +81,16 @@ impl QueueLagReporter {
             false,
         ))
         .await;
+        let materialization_dead_letters = probe_with_timeout(probe_queue_depth(
+            storage,
+            METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE,
+            false,
+        ))
+        .await;
         let sample = DurableQueueLagSample {
             document_sync_outbox,
             metadata_materialization,
+            materialization_dead_letters,
             blob_replication,
             reference_metadata_refresh,
         };

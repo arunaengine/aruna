@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
-    ExecutorKind, FenceContext, LogLimits, LogStream, LogTails, MAX_TRANSFER_BYTES, NOBODY,
-    ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec, TombstoneEvidence,
-    TombstoneSpec, UserSpec, normalize_container_path,
+    ExecutorKind, FenceContext, LogLimits, LogStream, LogTails, MAX_OUTPUT_MATCHES,
+    MAX_TRANSFER_BYTES, NOBODY, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode,
+    TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix,
+    normalize_container_path,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -17,10 +18,13 @@ use json_patch::Patch as JsonPatch;
 use k8s_openapi::api::authorization::v1::SelfSubjectAccessReview;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{
-    ConfigMap, Namespace, PersistentVolume, PersistentVolumeClaim, Pod, Secret, ServiceAccount,
+    ConfigMap, ContainerState, Namespace, PersistentVolume, PersistentVolumeClaim, Pod, Secret,
+    ServiceAccount,
 };
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::api::storage::v1::{CSIDriver, StorageClass};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+use k8s_openapi::jiff::Timestamp;
 use kube::api::{
     Api, AttachParams, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams,
     Preconditions,
@@ -41,9 +45,9 @@ use super::{BackendCaps, ExecutorBackend, digest_pinned};
 mod manifest;
 
 use manifest::{
-    HELPER_PATH, StageMarker, WORKLOAD_SA, helper_pod, job_manifest, marker_manifest, marker_name,
-    mount_buckets, mount_name, mount_pv_manifest, mount_pvc_manifest, needs_workspace,
-    network_policies, pvc_manifest, secret_manifest, secret_name, workspace_name,
+    HELPER_PATH, StageMarker, WORKLOAD_SA, WORKSPACE_PATH, helper_pod, job_manifest,
+    marker_manifest, marker_name, mount_buckets, mount_name, mount_pv_manifest, mount_pvc_manifest,
+    needs_workspace, network_policies, pvc_manifest, secret_manifest, secret_name, workspace_name,
 };
 
 pub const EPOCH_ANNOTATION: &str = "aruna-engine.org/attempt-epoch";
@@ -51,6 +55,10 @@ pub const GENERATION_ANNOTATION: &str = "aruna-engine.org/controller-generation"
 pub const STATE_ANNOTATION: &str = "aruna-engine.org/state";
 pub const ROLE_LABEL: &str = "aruna-engine.org/role";
 const DEFAULT_WORKSPACE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// Bounds one helper listing response; the helper enforces the same bound.
+const MAX_LISTING_BYTES: u64 = 16 * 1024 * 1024;
+/// Bounds the wait for an exec status so a stalled helper cannot hang a capture.
+const EXEC_JOIN_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 pub struct KubernetesBackend {
@@ -602,19 +610,49 @@ impl KubernetesBackend {
         let mut status = job_status(job);
         if status.is_terminal() {
             let pods = self.task_pods(context).await?;
-            if let Some(terminated) = pods.iter().find_map(|pod| {
-                pod.status
-                    .as_ref()
-                    .and_then(|status| status.container_statuses.as_ref())
-                    .and_then(|statuses| statuses.iter().find(|status| status.name == "task"))
-                    .and_then(|status| status.state.as_ref())
-                    .and_then(|state| state.terminated.as_ref())
-            }) {
+            if let Some(terminated) = pods
+                .iter()
+                .find_map(|pod| task_state(pod)?.terminated.as_ref())
+            {
                 status.phase = AttemptPhase::Exited {
                     code: terminated.exit_code,
                 };
+                // A failed Job carries no completionTime, so the container is the
+                // only terminal timing evidence.
+                status.started_at_ms = status
+                    .started_at_ms
+                    .or_else(|| time_ms(terminated.started_at.as_ref()));
+                status.finished_at_ms = status
+                    .finished_at_ms
+                    .or_else(|| time_ms(terminated.finished_at.as_ref()));
+            }
+            return Ok(status);
+        }
+        let pending = job_pending(job);
+        if !pending && status.started_at_ms.is_some() {
+            return Ok(status);
+        }
+        // Costs one extra Pod list per poll until a start time is observed: the
+        // Job reports startTime only once its controller has processed the Job.
+        let pods = self.task_pods(context).await?;
+        if pending {
+            let now = Timestamp::now();
+            if let Some(reason) = pods
+                .iter()
+                .find_map(|pod| pod_stuck_reason(pod, self.config.pull_deadline, now))
+            {
+                tracing::warn!(
+                    attempt = %context.attempt.external_name(),
+                    %reason,
+                    "failing attempt whose container cannot start"
+                );
+                status.phase = AttemptPhase::Failed { reason };
+                return Ok(status);
             }
         }
+        status.started_at_ms = status
+            .started_at_ms
+            .or_else(|| pods.iter().find_map(pod_started));
         Ok(status)
     }
 
@@ -670,6 +708,60 @@ impl KubernetesBackend {
             self.delete_pod(&pod).await?;
         }
         Ok(())
+    }
+
+    /// Enumerate the workspace below `prefix` through a helper Pod and keep the
+    /// paths the pattern selects. The helper emits NUL-terminated paths closed
+    /// by an empty record and the decimal path count.
+    async fn list_archive(
+        &self,
+        context: &FenceContext,
+        prefix: &str,
+        glob: &OutputMatcher,
+    ) -> Result<Vec<String>, BackendError> {
+        let pod = self
+            .create_helper(context, "fetch", &CancellationToken::new())
+            .await?;
+        let params = AttachParams::default()
+            .container("helper")
+            .stdin(false)
+            .stdout(true)
+            .stderr(false);
+        let listed = async {
+            let mut attached = self
+                .pods()
+                .exec(
+                    &pod.name_any(),
+                    [
+                        HELPER_PATH,
+                        "list",
+                        "--workspace",
+                        WORKSPACE_PATH,
+                        "--prefix",
+                        prefix,
+                    ],
+                    &params,
+                )
+                .await
+                .map_err(kube_error)?;
+            let stdout = attached.stdout().ok_or_else(|| {
+                BackendError::Api("list exec did not expose standard output".to_string())
+            })?;
+            let mut listing = Vec::new();
+            // A helper wedged mid-listing must not stall the capture forever.
+            tokio::time::timeout(
+                EXEC_JOIN_TIMEOUT,
+                stdout.take(MAX_LISTING_BYTES).read_to_end(&mut listing),
+            )
+            .await
+            .map_err(|_| BackendError::Timeout("output listing read timed out".to_string()))?
+            .map_err(io_error)?;
+            join_exec(attached).await?;
+            select_listed(&listing, glob)
+        }
+        .await;
+        let _ = self.delete_pod(&pod).await;
+        listed
     }
 
     async fn fetch_archive(
@@ -1001,6 +1093,11 @@ impl ExecutorBackend for KubernetesBackend {
             let Some(pod) = pods.first() else {
                 return Ok(LogTails::default());
             };
+            // A container that never started rejects log reads, which must not
+            // block the terminal handling that reaps the attempt.
+            if !task_started(pod) {
+                return Ok(LogTails::default());
+            }
             self.pods()
                 .logs(
                     &pod.name_any(),
@@ -1040,6 +1137,28 @@ impl ExecutorBackend for KubernetesBackend {
         self.save_logs(context).await?;
         self.delete_tasks(context).await?;
         self.fetch_archive(context, path).await
+    }
+
+    async fn list_outputs(
+        &self,
+        context: &FenceContext,
+        pattern: &str,
+    ) -> Result<Vec<String>, BackendError> {
+        let job = self.get_job(context).await?;
+        if !job_status(&job).is_terminal() {
+            return Err(BackendError::InvalidSpec(
+                "attempt is not terminal".to_string(),
+            ));
+        }
+        validate_output(&job, pattern)?;
+        let glob = OutputMatcher::new([pattern]).map_err(BackendError::InvalidSpec)?;
+        let prefix = literal_prefix(pattern).map_err(BackendError::InvalidSpec)?;
+        // The listing helper needs the workspace claim, which the task pods hold
+        // until they are reaped.
+        self.save_logs(context).await?;
+        self.delete_tasks(context).await?;
+        self.list_archive(context, &prefix.to_string_lossy(), &glob)
+            .await
     }
 
     async fn reconcile(&self, context: &FenceContext) -> ReconcileEvidence {
@@ -1371,6 +1490,7 @@ fn validate_marker(
     Ok(marker)
 }
 
+/// A path is valid when it was declared literally or matches a declared pattern.
 fn validate_output(job: &Job, path: &str) -> Result<(), BackendError> {
     normalize_container_path(path).map_err(BackendError::InvalidSpec)?;
     let outputs = job
@@ -1381,7 +1501,9 @@ fn validate_output(job: &Job, path: &str) -> Result<(), BackendError> {
         .ok_or_else(|| BackendError::Conflict("Job output declarations are missing".to_string()))?;
     let outputs: Vec<String> = serde_json::from_str(outputs)
         .map_err(|error| BackendError::Conflict(format!("invalid Job outputs: {error}")))?;
-    if !outputs.iter().any(|output| output == path) {
+    let declared = OutputMatcher::new(outputs.iter().map(String::as_str))
+        .map_err(BackendError::InvalidSpec)?;
+    if !declared.is_match(path) {
         return Err(BackendError::InvalidSpec(
             "output path was not declared".to_string(),
         ));
@@ -1431,11 +1553,89 @@ fn job_status(job: &Job) -> AttemptStatus {
     } else {
         AttemptPhase::Submitted
     };
+    let times = job.status.as_ref();
     AttemptStatus {
         phase,
         backend_ref: job.metadata.uid.clone().unwrap_or_else(|| job.name_any()),
-        started_at_ms: None,
-        finished_at_ms: None,
+        started_at_ms: time_ms(times.and_then(|status| status.start_time.as_ref())),
+        finished_at_ms: time_ms(times.and_then(|status| status.completion_time.as_ref())),
+    }
+}
+
+fn time_ms(time: Option<&Time>) -> Option<u64> {
+    u64::try_from(time?.0.as_millisecond()).ok()
+}
+
+/// Active but unready Pods are the only ones that can hold a stuck container.
+fn job_pending(job: &Job) -> bool {
+    job.status
+        .as_ref()
+        .is_some_and(|status| status.active.unwrap_or(0) > 0 && status.ready.unwrap_or(0) == 0)
+}
+
+/// Reasons the kubelet reports only after repeated failed attempts. A bare
+/// `ErrImagePull` is a single try, so it never proves a stuck container.
+fn repeated_wait(reason: &str) -> bool {
+    matches!(
+        reason,
+        "ImagePullBackOff" | "CreateContainerConfigError" | "CreateContainerError"
+    )
+}
+
+/// Kubernetes retries a failing image pull forever, so the Job counts such a
+/// Pod as active and never reports a terminal condition. A malformed reference
+/// fails at once; a repeated failure fails once it outlives `deadline`, which
+/// is anchored at the Pod start and so also covers scheduling.
+fn pod_stuck_reason(pod: &Pod, deadline: Duration, now: Timestamp) -> Option<String> {
+    let status = pod.status.as_ref()?;
+    let waited = status
+        .start_time
+        .as_ref()
+        .or(pod.metadata.creation_timestamp.as_ref())
+        .map(|since| Duration::try_from(now.duration_since(since.0)).unwrap_or_default())
+        .unwrap_or_default();
+    status
+        .init_container_statuses
+        .iter()
+        .chain(status.container_statuses.iter())
+        .flatten()
+        .find_map(|container| {
+            let waiting = container.state.as_ref()?.waiting.as_ref()?;
+            let reason = waiting.reason.as_deref()?;
+            if reason != "InvalidImageName" && !(repeated_wait(reason) && waited > deadline) {
+                return None;
+            }
+            let detail = waiting.message.as_deref().unwrap_or("no detail reported");
+            Some(format!(
+                "container `{}` cannot start ({reason}): {detail}",
+                container.name
+            ))
+        })
+}
+
+/// Log reads only succeed once the task container has left its waiting state.
+fn task_started(pod: &Pod) -> bool {
+    task_state(pod).is_some_and(|state| state.running.is_some() || state.terminated.is_some())
+}
+
+fn task_state(pod: &Pod) -> Option<&ContainerState> {
+    pod.status
+        .as_ref()?
+        .container_statuses
+        .as_ref()?
+        .iter()
+        .find(|status| status.name == "task")?
+        .state
+        .as_ref()
+}
+
+/// The container start survives its exit, so both states carry the evidence.
+fn pod_started(pod: &Pod) -> Option<u64> {
+    let state = task_state(pod)?;
+    match (state.running.as_ref(), state.terminated.as_ref()) {
+        (Some(running), _) => time_ms(running.started_at.as_ref()),
+        (None, Some(terminated)) => time_ms(terminated.started_at.as_ref()),
+        (None, None) => None,
     }
 }
 
@@ -1717,6 +1917,55 @@ impl Write for ArchiveWriter {
     }
 }
 
+/// Split a helper listing into its path records, rejecting a stream whose
+/// terminator is missing or whose count disagrees: a short read must fail the
+/// capture instead of silently dropping matches.
+fn listed_paths(listing: &[u8]) -> Result<Vec<&[u8]>, BackendError> {
+    let truncated = || BackendError::InvalidSpec("output listing is truncated".to_string());
+    let body = listing.strip_suffix(&[0]).ok_or_else(truncated)?;
+    let mut records: Vec<&[u8]> = body.split(|byte| *byte == 0).collect();
+    let count = records.pop().ok_or_else(truncated)?;
+    if records.pop() != Some(&b""[..]) {
+        return Err(truncated());
+    }
+    let count = std::str::from_utf8(count)
+        .ok()
+        .and_then(|count| count.parse::<usize>().ok())
+        .ok_or_else(truncated)?;
+    if count != records.len() || records.iter().any(|path| path.is_empty()) {
+        return Err(BackendError::InvalidSpec(
+            "output listing is inconsistent".to_string(),
+        ));
+    }
+    Ok(records)
+}
+
+/// Listed paths the pattern selects. A path that is not UTF-8 cannot be
+/// addressed as an output, so it is skipped instead of failing the capture.
+fn select_listed(listing: &[u8], glob: &OutputMatcher) -> Result<Vec<String>, BackendError> {
+    let mut matched = Vec::new();
+    for path in listed_paths(listing)? {
+        let Ok(path) = std::str::from_utf8(path) else {
+            tracing::warn!(
+                path = %String::from_utf8_lossy(path),
+                "skipping output path that is not UTF-8"
+            );
+            continue;
+        };
+        if !glob.is_match(path) {
+            continue;
+        }
+        if matched.len() >= MAX_OUTPUT_MATCHES {
+            return Err(BackendError::InvalidSpec(
+                "pattern matches too many files".to_string(),
+            ));
+        }
+        matched.push(path.to_string());
+    }
+    matched.sort();
+    Ok(matched)
+}
+
 async fn stream_output<R: AsyncRead + Unpin>(
     mut stdout: R,
     attached: kube::api::AttachedProcess,
@@ -1764,10 +2013,16 @@ async fn join_exec(mut attached: kube::api::AttachedProcess) -> Result<(), Backe
     let status = attached.take_status().ok_or_else(|| {
         BackendError::Api("Kubernetes exec status stream is unavailable".to_string())
     })?;
-    attached.join().await.map_err(remote_error)?;
-    let status = status
+    let joined = async {
+        attached.join().await.map_err(remote_error)?;
+        status
+            .await
+            .ok_or_else(|| BackendError::Api("Kubernetes exec returned no status".to_string()))
+    };
+    // A helper that stops writing must not hold the capture open forever.
+    let status = tokio::time::timeout(EXEC_JOIN_TIMEOUT, joined)
         .await
-        .ok_or_else(|| BackendError::Api("Kubernetes exec returned no status".to_string()))?;
+        .map_err(|_| BackendError::Timeout("Kubernetes exec did not finish".to_string()))??;
     if status.status.as_deref() == Some("Success") {
         return Ok(());
     }
@@ -1825,6 +2080,7 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
     use super::*;
+    use crate::executor::logs::NullSink;
 
     fn context() -> FenceContext {
         FenceContext {
@@ -1916,6 +2172,86 @@ mod tests {
                 }
             }]
         })
+    }
+
+    #[test]
+    fn accepts_pattern_output() {
+        // A declared wildcard output authorizes every path it selects.
+        let job: Job = serde_json::from_value(json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {
+                "name": "aruna-job-a1", "namespace": "compute",
+                "annotations": {"aruna-engine.org/output-paths": r#"["/out/*.txt","/log/run.txt"]"#}
+            }
+        }))
+        .expect("build job");
+
+        assert!(validate_output(&job, "/out/a.txt").is_ok());
+        assert!(validate_output(&job, "/out/*.txt").is_ok());
+        assert!(validate_output(&job, "/log/run.txt").is_ok());
+        assert!(validate_output(&job, "/out/sub/a.txt").is_err());
+        assert!(validate_output(&job, "/out/a.csv").is_err());
+    }
+
+    fn listing(paths: &[&[u8]]) -> Vec<u8> {
+        let mut listing = Vec::new();
+        for path in paths {
+            listing.extend_from_slice(path);
+            listing.push(0);
+        }
+        listing.push(0);
+        listing.extend_from_slice(paths.len().to_string().as_bytes());
+        listing.push(0);
+        listing
+    }
+
+    #[test]
+    fn rejects_cut_listing() {
+        // Without the terminator a capped read would upload a partial listing
+        // while the job still reported success.
+        let glob = OutputMatcher::new(["/out/*.txt"]).expect("build matcher");
+        let full = listing(&[b"/out/a.txt", b"/out/b.txt"]);
+        assert_eq!(
+            select_listed(&full, &glob).expect("accept full listing"),
+            vec!["/out/a.txt".to_string(), "/out/b.txt".to_string()]
+        );
+
+        for cut in [full.len() - 1, full.len() - 4, 11, 0] {
+            assert!(
+                matches!(
+                    select_listed(&full[..cut], &glob),
+                    Err(BackendError::InvalidSpec(_))
+                ),
+                "listing cut at {cut} was accepted"
+            );
+        }
+        // A terminator that disagrees with the records is equally unusable.
+        let mut miscounted = listing(&[b"/out/a.txt"]);
+        miscounted.pop();
+        miscounted.pop();
+        miscounted.extend_from_slice(b"2\0");
+        assert!(matches!(
+            select_listed(&miscounted, &glob),
+            Err(BackendError::InvalidSpec(_))
+        ));
+        assert!(
+            select_listed(&listing(&[]), &glob)
+                .expect("accept empty listing")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn skips_invalid_listing() {
+        // A file whose name is not UTF-8 cannot be addressed, but it must not
+        // fail the capture of the files that can be.
+        let glob = OutputMatcher::new(["/out/*.txt"]).expect("build matcher");
+        let listing = listing(&[b"/out/a.txt", b"/out/\xff\xfe.txt", b"/out/b.txt"]);
+
+        assert_eq!(
+            select_listed(&listing, &glob).expect("accept mixed listing"),
+            vec!["/out/a.txt".to_string(), "/out/b.txt".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -2198,5 +2534,212 @@ mod tests {
                 .iter()
                 .any(|path| path.contains("csidrivers"))
         );
+    }
+
+    const POD_START: &str = "2027-01-01T00:00:00Z";
+
+    fn probe_now(after: i64) -> Timestamp {
+        let start: Timestamp = POD_START.parse().expect("parse pod start");
+        Timestamp::from_second(start.as_second() + after).expect("build probe time")
+    }
+
+    fn task_pod(state: Value, started: &str) -> Pod {
+        serde_json::from_value(json!({
+            "apiVersion":"v1","kind":"Pod",
+            "metadata":{
+                "name":"task-pod","namespace":"compute","uid":"pod-uid",
+                "labels":{ROLE_LABEL:"task"}
+            },
+            "status":{
+                "phase":"Pending","startTime":started,
+                "containerStatuses":[{
+                    "name":"task","image":"registry.example/task:1","imageID":"",
+                    "ready":false,"restartCount":0,"state":state
+                }]
+            }
+        }))
+        .expect("build task pod")
+    }
+
+    fn waiting_pod(reason: &str, started: &str) -> Pod {
+        task_pod(
+            json!({"waiting":{"reason":reason,"message":"pull access failed"}}),
+            started,
+        )
+    }
+
+    #[test]
+    fn fails_invalid_image() {
+        // A malformed reference is permanent, so the deadline must not apply.
+        let pod = waiting_pod("InvalidImageName", POD_START);
+        let reason = pod_stuck_reason(&pod, Duration::from_secs(300), probe_now(1))
+            .expect("reject invalid image");
+        assert!(reason.contains("InvalidImageName"), "{reason}");
+    }
+
+    #[test]
+    fn waits_pull_backoff() {
+        // A registry blip inside the deadline must stay Running.
+        let pod = waiting_pod("ImagePullBackOff", POD_START);
+        assert_eq!(
+            pod_stuck_reason(&pod, Duration::from_secs(30), probe_now(5)),
+            None
+        );
+    }
+
+    #[test]
+    fn fails_stalled_pull() {
+        // Only a reason implying repeated failures may end the attempt, and
+        // then only past the deadline.
+        for reason in [
+            "ImagePullBackOff",
+            "CreateContainerConfigError",
+            "CreateContainerError",
+        ] {
+            let pod = waiting_pod(reason, POD_START);
+            let stuck = pod_stuck_reason(&pod, Duration::from_secs(30), probe_now(120))
+                .expect("reject stalled pull");
+            assert!(stuck.contains(reason), "{stuck}");
+            assert!(stuck.contains("pull access failed"), "{stuck}");
+        }
+    }
+
+    #[test]
+    fn waits_single_pull() {
+        // The deadline starts at the Pod, so scheduling and volume attach time
+        // count against it; one observed ErrImagePull is not repeated failure.
+        let pod = waiting_pod("ErrImagePull", POD_START);
+        assert_eq!(
+            pod_stuck_reason(&pod, Duration::from_secs(30), probe_now(9_000)),
+            None
+        );
+    }
+
+    #[test]
+    fn ignores_running_pod() {
+        let pod = task_pod(json!({"running":{"startedAt":POD_START}}), POD_START);
+        assert_eq!(
+            pod_stuck_reason(&pod, Duration::from_secs(30), probe_now(9_000)),
+            None
+        );
+        assert!(task_started(&pod));
+    }
+
+    #[test]
+    fn maps_job_times() {
+        // Without these the task log has no duration and the walltime cap has
+        // no anchor.
+        let job: Job = serde_json::from_value(json!({
+            "apiVersion":"batch/v1","kind":"Job",
+            "metadata":{"name":"aruna-job-a1","namespace":"compute","uid":"job-uid"},
+            "status":{
+                "startTime":POD_START,
+                "completionTime":"2027-01-01T00:01:00Z",
+                "conditions":[{"type":"Complete","status":"True"}]
+            }
+        }))
+        .expect("build job");
+
+        let status = job_status(&job);
+
+        assert_eq!(status.phase, AttemptPhase::Exited { code: 0 });
+        assert_eq!(
+            status.started_at_ms,
+            u64::try_from(probe_now(0).as_millisecond()).ok()
+        );
+        assert_eq!(
+            status.finished_at_ms,
+            u64::try_from(probe_now(60).as_millisecond()).ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn status_uses_pod_start() {
+        // The Job publishes startTime only once its controller processed it, so
+        // the running container is the earlier evidence.
+        let client = fake_client(|method, path| match (method, path) {
+            ("GET", "/apis/batch/v1/namespaces/compute/jobs/aruna-job-a1") => {
+                let mut job = job_json("running");
+                job["status"] = json!({"active": 1, "ready": 1});
+                (200, job)
+            }
+            ("GET", "/api/v1/namespaces/compute/pods") => {
+                let pod = task_pod(json!({"running":{"startedAt":POD_START}}), POD_START);
+                (
+                    200,
+                    json!({
+                        "apiVersion":"v1","kind":"PodList","metadata":{},
+                        "items":[serde_json::to_value(pod).expect("encode running pod")]
+                    }),
+                )
+            }
+            _ => (404, status_json(404)),
+        });
+        let backend = KubernetesBackend {
+            client,
+            config: test_config(),
+        };
+
+        let status = backend.status(&context()).await.unwrap();
+
+        assert_eq!(status.phase, AttemptPhase::Running);
+        assert_eq!(
+            status.started_at_ms,
+            u64::try_from(probe_now(0).as_millisecond()).ok()
+        );
+    }
+
+    fn stuck_list() -> Value {
+        let pod = waiting_pod("ImagePullBackOff", "2020-01-01T00:00:00Z");
+        json!({
+            "apiVersion":"v1","kind":"PodList","metadata":{},
+            "items":[serde_json::to_value(pod).expect("encode stuck pod")]
+        })
+    }
+
+    fn stuck_client() -> Client {
+        fake_client(|method, path| match (method, path) {
+            ("GET", "/apis/batch/v1/namespaces/compute/jobs/aruna-job-a1") => {
+                (200, job_json("running"))
+            }
+            ("GET", "/api/v1/namespaces/compute/pods") => (200, stuck_list()),
+            _ => (404, status_json(404)),
+        })
+    }
+
+    #[tokio::test]
+    async fn status_fails_stuck() {
+        // The Job stays active forever, so the stuck Pod must drive the phase.
+        let backend = KubernetesBackend {
+            client: stuck_client(),
+            config: test_config(),
+        };
+
+        let status = backend.status(&context()).await.unwrap();
+
+        match status.phase {
+            AttemptPhase::Failed { reason } => {
+                assert!(reason.contains("ImagePullBackOff"), "{reason}");
+            }
+            other => panic!("unexpected phase: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn skips_unstarted_logs() {
+        // Terminal handling parks the job when log capture errors, so a Pod
+        // that never started must report empty logs instead of failing.
+        let backend = KubernetesBackend {
+            client: stuck_client(),
+            config: test_config(),
+        };
+
+        let tails = backend
+            .fetch_logs(&context(), &LogLimits::default(), &NullSink)
+            .await
+            .unwrap();
+
+        assert!(tails.stdout.is_empty());
+        assert_eq!(tails.stdout_total, 0);
     }
 }

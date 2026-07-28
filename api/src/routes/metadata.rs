@@ -4,7 +4,7 @@ use crate::auth::{
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::errors::AuthorizationError;
+use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::metadata::{
     MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
@@ -24,7 +24,7 @@ use aruna_operations::jobs::service::submit_export_job;
 use aruna_operations::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
     ListVisibleMetadataDocumentsRequest, MetadataApiError, MetadataApiQueryMode,
-    MetadataDocumentQueryRequest, MetadataFanoutStats, MetadataQueryRequest,
+    MetadataDocumentQueryRequest, MetadataFanoutStats, MetadataListOrder, MetadataQueryRequest,
     MetadataReferenceEntry, MetadataReferencesExecution, MetadataReferencesRequest,
     MetadataRoCrateExportView as OperationMetadataRoCrateExportView, MetadataSearchRequest,
     export_metadata_rocrate as run_export_metadata_rocrate,
@@ -193,6 +193,11 @@ pub struct ListMetadataResponse {
     pub limit: usize,
     pub offset: usize,
     pub total_returned: usize,
+    /// Exact total of documents visible to the caller across all pages,
+    /// evaluated per document against the caller's permission rules. Absent
+    /// on targeted lookups, whose limit is too small to be worth the scan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_estimate: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -222,6 +227,8 @@ pub struct ListMetadataQuery {
     pub limit: Option<usize>,
     #[serde(default)]
     pub offset: Option<usize>,
+    #[serde(default)]
+    pub order: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -569,7 +576,8 @@ impl MetadataDocumentListItem {
         ),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 409, description = "Concurrent create conflict; retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -660,17 +668,20 @@ pub async fn create_metadata_document(
     get,
     path = "/metadata",
     tag = "metadata",
+    description = "Authentication is optional and changes the result: an authenticated caller sees every document their identity may read, an anonymous caller sees only public documents.",
     params(
         ("group_id" = Option<String>, Query, description = "Optional group id filter"),
         ("path_prefix" = Option<String>, Query, description = "Normalized metadata path prefix, for example profiles/"),
         ("include" = Option<String>, Query, description = "Comma-separated includes. Currently supports summary"),
         ("limit" = Option<usize>, Query, description = "Maximum documents to return"),
-        ("offset" = Option<usize>, Query, description = "Number of filtered documents to skip")
+        ("offset" = Option<usize>, Query, description = "Number of filtered documents to skip"),
+        ("order" = Option<String>, Query, description = "Page order: created (default, ascending document id) or recent (descending updated_at, tie-broken by descending document id). Any other value is rejected with 400")
     ),
     responses(
         (status = 200, description = "Visible metadata documents", body = ListMetadataResponse),
         (status = 400, description = "Invalid query", body = ErrorResponse)
-    )
+    ),
+    security((), ("bearer_auth" = []))
 )]
 pub async fn list_all_metadata_documents(
     State(state): State<Arc<ServerState>>,
@@ -688,17 +699,20 @@ pub async fn list_all_metadata_documents(
     get,
     path = "/groups/{group_id}/metadata",
     tag = "metadata",
+    description = "Authentication is optional and changes the result: an authenticated caller sees every document of the group their identity may read, an anonymous caller sees only public documents.",
     params(
         ("group_id" = String, Path, description = "Group id"),
         ("path_prefix" = Option<String>, Query, description = "Normalized metadata path prefix, for example profiles/"),
         ("include" = Option<String>, Query, description = "Comma-separated includes. Currently supports summary"),
         ("limit" = Option<usize>, Query, description = "Maximum documents to return"),
-        ("offset" = Option<usize>, Query, description = "Number of filtered documents to skip")
+        ("offset" = Option<usize>, Query, description = "Number of filtered documents to skip"),
+        ("order" = Option<String>, Query, description = "Page order: created (default, ascending document id) or recent (descending updated_at, tie-broken by descending document id). Any other value is rejected with 400")
     ),
     responses(
         (status = 200, description = "Visible metadata documents", body = ListMetadataResponse),
         (status = 400, description = "Invalid group id", body = ErrorResponse)
-    )
+    ),
+    security((), ("bearer_auth" = []))
 )]
 pub async fn list_metadata_documents(
     State(state): State<Arc<ServerState>>,
@@ -717,6 +731,7 @@ pub async fn list_metadata_documents(
     get,
     path = "/metadata/{document_id}",
     tag = "metadata",
+    description = "Authentication is optional and changes the result: a document that is not public is only returned to a caller whose identity may read it.",
     params(("document_id" = String, Path, description = "Metadata document id")),
     responses(
         (status = 200, description = "Metadata document summary", body = MetadataDocumentSummary),
@@ -724,7 +739,8 @@ pub async fn list_metadata_documents(
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse)
-    )
+    ),
+    security((), ("bearer_auth" = []))
 )]
 pub async fn get_metadata_document(
     State(state): State<Arc<ServerState>>,
@@ -789,6 +805,7 @@ pub async fn delete_metadata_document(
     get,
     path = "/metadata/{document_id}/rocrate",
     tag = "metadata",
+    description = "Authentication is optional and changes the result: a document that is not public is only exported to a caller whose identity may read it.",
     params(
         ("document_id" = String, Path, description = "Metadata document id"),
         ("view" = Option<MetadataRoCrateView>, Query, description = "Export view: full, summary, page, or raw"),
@@ -845,7 +862,8 @@ pub async fn delete_metadata_document(
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
         (status = 503, description = "Requested view is not available", body = ErrorResponse)
-    )
+    ),
+    security((), ("bearer_auth" = []))
 )]
 pub async fn export_metadata_rocrate(
     State(state): State<Arc<ServerState>>,
@@ -1220,6 +1238,7 @@ pub async fn add_metadata_contextual_entity(
     post,
     path = "/metadata/{document_id}/sparql/query",
     tag = "metadata",
+    description = "Authentication is optional and changes the result: the document is only queried for a caller whose identity may read it.",
     params(("document_id" = String, Path, description = "Metadata document id")),
     request_body(
         content = SparqlQueryRequest,
@@ -1250,7 +1269,8 @@ pub async fn add_metadata_contextual_entity(
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse)
-    )
+    ),
+    security((), ("bearer_auth" = []))
 )]
 pub async fn query_metadata_document(
     State(state): State<Arc<ServerState>>,
@@ -1286,6 +1306,7 @@ pub async fn query_metadata_document(
     post,
     path = "/metadata/sparql/query",
     tag = "metadata",
+    description = "Authentication is optional and changes the result: the queried graph union only contains metadata the caller may read.",
     request_body(
         content = SparqlQueryRequest,
         description = "Run a SPARQL `SELECT` or `ASK` query across all visible metadata. `mode=local` evaluates the current node's authorized graph union. `mode=distributed` accepts only union-safe `ASK` or `SELECT DISTINCT` single-pattern queries and merges partition sets. Distributed mode is best-effort by default; set `allow_partial=false` to fail if any partition is unavailable.",
@@ -1313,7 +1334,8 @@ pub async fn query_metadata_document(
         (status = 200, description = "SPARQL query result", body = MetadataQueryResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 501, description = "Unsupported query mode", body = ErrorResponse)
-    )
+    ),
+    security((), ("bearer_auth" = []))
 )]
 pub async fn query_all_metadata(
     State(state): State<Arc<ServerState>>,
@@ -1348,6 +1370,7 @@ pub async fn query_all_metadata(
     get,
     path = "/metadata/search",
     tag = "metadata",
+    description = "Authentication is optional and changes the result: hits are restricted to metadata the caller may read, so an anonymous request returns fewer documents.",
     params(
         ("q" = Option<String>, Query, description = "Search query; optional when conforms_to is set"),
         ("conforms_to" = Option<String>, Query, description = "Exact RO-Crate conformsTo profile IRI"),
@@ -1360,7 +1383,8 @@ pub async fn query_all_metadata(
         (status = 200, description = "Metadata search hits", body = MetadataSearchResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 501, description = "Unsupported query mode", body = ErrorResponse)
-    )
+    ),
+    security((), ("bearer_auth" = []))
 )]
 pub async fn search_metadata(
     State(state): State<Arc<ServerState>>,
@@ -1476,6 +1500,7 @@ async fn run_list_metadata_documents(
     group_id: Option<Ulid>,
 ) -> ServerResult<ListMetadataResponse> {
     let include = parse_metadata_include_flags(query.include.as_deref())?;
+    let order = parse_metadata_order(query.order.as_deref())?;
     let ctx = state.get_ctx();
     let result = run_list_visible_metadata_documents(
         ctx.as_ref(),
@@ -1486,6 +1511,7 @@ async fn run_list_metadata_documents(
             include_summary: include.summary,
             limit: query.limit,
             offset: query.offset,
+            order,
             auth,
         },
     )
@@ -1508,6 +1534,7 @@ async fn run_list_metadata_documents(
         limit: result.limit,
         offset: result.offset,
         total_returned: result.total_returned,
+        total_estimate: result.total_estimate,
     })
 }
 
@@ -1526,6 +1553,16 @@ fn parse_metadata_include_flags(include: Option<&str>) -> ServerResult<MetadataI
         }
     }
     Ok(flags)
+}
+
+fn parse_metadata_order(order: Option<&str>) -> ServerResult<MetadataListOrder> {
+    match order.map(str::trim) {
+        None | Some("") | Some("created") => Ok(MetadataListOrder::Created),
+        Some("recent") => Ok(MetadataListOrder::Recent),
+        Some(_) => Err(ServerError::BadRequestMessage(
+            "order must be created or recent".to_string(),
+        )),
+    }
 }
 
 fn format_timestamp_ms(timestamp_ms: u64) -> String {
@@ -1571,6 +1608,9 @@ fn map_create_metadata_error(error: CreateMetadataDocumentError) -> ServerError 
     match error {
         CreateMetadataDocumentError::MetadataError(metadata_error) => {
             map_metadata_error(metadata_error)
+        }
+        CreateMetadataDocumentError::StorageError(StorageError::TransactionConflict) => {
+            ServerError::Conflict("concurrent metadata create conflict; retry".to_string())
         }
         other => ServerError::InternalError(other.to_string()),
     }
@@ -1907,6 +1947,7 @@ pub(crate) fn map_search_hit(hit: MetadataSearchHit) -> MetadataSearchHitRespons
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::keys::generate_signing_key;
 
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
@@ -1993,6 +2034,41 @@ mod tests {
             metadata_handle, ..
         } = context;
         metadata_handle.as_ref().expect("metadata handle installed")
+    }
+
+    #[test]
+    fn maps_conflict_409() {
+        use axum::response::IntoResponse;
+        let mapped = map_create_metadata_error(CreateMetadataDocumentError::StorageError(
+            StorageError::TransactionConflict,
+        ));
+        assert!(matches!(mapped, ServerError::Conflict(_)));
+        assert_eq!(
+            mapped.into_response().status(),
+            axum::http::StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_order() {
+        use axum::response::IntoResponse;
+        assert!(matches!(
+            parse_metadata_order(None),
+            Ok(MetadataListOrder::Created)
+        ));
+        assert!(matches!(
+            parse_metadata_order(Some("created")),
+            Ok(MetadataListOrder::Created)
+        ));
+        assert!(matches!(
+            parse_metadata_order(Some("recent")),
+            Ok(MetadataListOrder::Recent)
+        ));
+        let rejected = parse_metadata_order(Some("updated")).expect_err("unknown order rejected");
+        assert_eq!(
+            rejected.into_response().status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]
@@ -2165,6 +2241,7 @@ mod tests {
                 .map(|digest| digest.try_into().unwrap()),
             state: MetadataMaterializationState::Failed,
             attempts: 1,
+            failures: 0,
             last_error: Some("projection failed".to_string()),
             updated_at_ms: 1,
         };
@@ -5036,8 +5113,7 @@ mod tests {
     }
 
     fn test_realm_signing_key() -> SigningKey {
-        let mut rng = jsonwebtoken::signature::rand_core::OsRng;
-        SigningKey::generate(&mut rng)
+        generate_signing_key()
     }
 
     fn test_realm_id(seed: u8) -> RealmId {
@@ -5309,8 +5385,8 @@ mod tests {
     }
 
     async fn setup_state_with_closed_storage() -> Arc<ServerState> {
-        let (storage_handle, receiver) = storage::StorageHandle::new();
-        drop(receiver);
+        let (storage_handle, receivers) = storage::StorageHandle::new();
+        drop(receivers);
 
         let realm_id = test_realm_id(3);
         let node_id = iroh::SecretKey::from_bytes(&[14u8; 32]).public();

@@ -789,10 +789,11 @@ async fn supervise(
 
 async fn handle_panic(ctx: &JobContext, record: &JobRecord) -> JobRunOutcome {
     warn!(job_id = %ctx.job_id, "Job payload panicked; failing the attempt");
-    if ctx.final_attempt && matches!(&record.payload, JobPayload::ImportRoCrate(_)) {
-        crate::jobs::import::cleanup_after_panic(ctx).await
-    } else {
-        JobRunOutcome::Failed(JobError::retryable("job payload panicked"))
+    match &record.payload {
+        JobPayload::ImportRoCrate(spec) if ctx.final_attempt => {
+            crate::jobs::import::cleanup_after_panic(ctx, spec).await
+        }
+        _ => JobRunOutcome::Failed(JobError::retryable("job payload panicked")),
     }
 }
 

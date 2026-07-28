@@ -893,6 +893,17 @@ mod tests {
     fn delete_rides_stored_bucket() {
         let actor = actor();
         let mut record = record(&actor);
+        // Deterministic identity so the placement collision check cannot flake on
+        // the timestamp bytes of a freshly generated document id.
+        record.group_id = Ulid::from_bytes([3; 16]);
+        record.document_id = Ulid::from_bytes([5; 16]);
+        record.graph_iri = MetadataRegistryRecord::graph_iri_for(record.document_id);
+        record.permission_path = MetadataRegistryRecord::permission_path_for(
+            &record.realm_id,
+            record.group_id,
+            &record.document_path,
+            record.document_id,
+        );
         let mut config = RealmConfigDocument::new(record.realm_id, Vec::new(), 3);
         let strategy = PlacementStrategy {
             strategy_id: Ulid::from_bytes([1; 16]),

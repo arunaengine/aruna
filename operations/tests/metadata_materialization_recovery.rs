@@ -13,8 +13,9 @@ use aruna_core::metadata::{
     resolve_raw_revision,
 };
 use aruna_core::storage_entries::{
-    metadata_create_event_write_entry, metadata_materialization_job_write_entry,
-    metadata_materialization_status_key, metadata_materialization_status_write_entry,
+    metadata_create_event_write_entry, metadata_materialization_document_job_write_entry,
+    metadata_materialization_job_write_entry, metadata_materialization_status_key,
+    metadata_materialization_status_write_entry,
 };
 use aruna_core::structs::{Actor, MetadataRegistryRecord, PlacementRef, RealmId};
 use aruna_operations::driver::DriverContext;
@@ -154,7 +155,13 @@ async fn raw_projection_diverges() -> Result<(), Box<dyn std::error::Error>> {
         node_b.graph_fingerprint(&graph)?
     );
     let mut projected_names = node_a
-        .describe_subject(&GrantAuthorizer::default(), &graph, "#lab")?
+        .describe_subject(
+            &GrantAuthorizer::default(),
+            craqle::DescribeRequest {
+                graph: &graph,
+                subject_id: "#lab",
+            },
+        )?
         .iter()
         .filter_map(|(predicate, object)| {
             (predicate == &craqle::EncodedTerm::from_named_node(&craqle::vocab::schema_name()))
@@ -244,6 +251,7 @@ async fn crash_after_craqle_apply_before_finish_retries_idempotently()
             metadata_create_event_write_entry(&event)?,
             metadata_materialization_status_write_entry(&status)?,
             metadata_materialization_job_write_entry(&job)?,
+            metadata_materialization_document_job_write_entry(&job)?,
         ],
     )
     .await?;
@@ -290,6 +298,7 @@ async fn final_status_with_leftover_job_is_cleaned_without_reapply()
         dataset_digest: None,
         state: MetadataMaterializationState::Materialized,
         attempts: 1,
+        failures: 0,
         last_error: None,
         updated_at_ms: 2,
     };
@@ -298,13 +307,16 @@ async fn final_status_with_leftover_job_is_cleaned_without_reapply()
         vec![
             metadata_materialization_status_write_entry(&final_status)?,
             metadata_materialization_job_write_entry(&job)?,
+            metadata_materialization_document_job_write_entry(&job)?,
         ],
     )
     .await?;
 
     let drained = process_metadata_materialization_batch(test.context.as_ref()).await?;
 
-    assert_eq!(drained.processed, 1);
+    // The final status obsoletes the leftover job, so the scan prunes it as
+    // not-live rather than reapplying: nothing is processed, both rows go.
+    assert_eq!(drained.processed, 0);
     assert_eq!(job_count(&test.context.storage_handle).await?, 0);
     assert_eq!(
         read_status(&test.context.storage_handle, document_id).await?,

@@ -6,6 +6,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::keys::generate_signing_key;
 use aruna_core::keyspaces::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
 use aruna_core::structs::{Actor, NodeCapabilities, OidcProviderConfig, User, oidc_subject_key};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -207,7 +208,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
     )
     .await;
 
-    let realm_signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+    let realm_signing_key = generate_signing_key();
     let realm_id =
         aruna_core::structs::RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
     let bootstrap_user = UserId::local(Ulid::generate(), realm_id);
@@ -298,7 +299,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
 async fn oidc_registration_route_creates_user_indexes_and_token() {
     let issuer = "https://issuer.example";
     let kid = "main-key";
-    let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+    let signing_key = generate_signing_key();
     let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
     let node = spawn_test_node(provider).await;
 

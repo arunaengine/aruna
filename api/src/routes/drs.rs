@@ -251,6 +251,7 @@ pub async fn get_authorizations(
     get,
     path = "/ga4gh/drs/v1/objects/{object_id}",
     tag = "drs",
+    description = "Authentication is optional and changes the result: an anonymous caller only resolves objects readable by the public role.",
     params(("object_id" = String, Path, description = "Aruna data W3ID, content-hash ch ARN, or versioned s3 ARN locator")),
     responses(
         (status = 200, body = DrsObjectResponse),
@@ -258,7 +259,7 @@ pub async fn get_authorizations(
         (status = 403, body = DrsErrorPayload),
         (status = 404, body = DrsErrorPayload)
     ),
-    security((),("bearer_auth" = []))
+    security((), ("bearer_auth" = []))
 )]
 pub async fn get_object(
     State(state): State<Arc<ServerState>>,
@@ -286,11 +287,13 @@ pub async fn get_object(
     post,
     path = "/ga4gh/drs/v1/objects",
     tag = "drs",
+    description = "Authentication is optional and changes the result: an anonymous caller only resolves objects readable by the public role.",
     request_body = DrsBulkObjectsRequestBody,
     responses(
         (status = 200, body = DrsBulkObjectsResponse),
         (status = 400, body = DrsErrorPayload)
-    )
+    ),
+    security((), ("bearer_auth" = []))
 )]
 pub async fn post_objects(
     State(state): State<Arc<ServerState>>,
@@ -329,12 +332,14 @@ pub async fn post_objects(
     get,
     path = "/ga4gh/drs/v1/download",
     tag = "drs",
+    description = "Authentication is optional and changes the result: an anonymous caller only downloads objects readable by the public role.",
     params(("object_id" = String, Query, description = "Aruna data W3ID, content-hash ch ARN, or versioned s3 ARN locator")),
     responses(
         (status = 200, description = "Object bytes"),
         (status = 400, body = DrsErrorPayload),
         (status = 404, body = DrsErrorPayload)
-    )
+    ),
+    security((), ("bearer_auth" = []))
 )]
 pub async fn download_object(
     State(state): State<Arc<ServerState>>,

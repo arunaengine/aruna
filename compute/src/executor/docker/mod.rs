@@ -9,8 +9,9 @@ use std::time::Duration;
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptRef, AttemptStatus, BackendError,
     CancelEvidence, ExecutorKind, FenceContext, InputStream, LogLimits, LogStream, LogTails,
-    MAX_TRANSFER_BYTES, NOBODY, NetworkAccess, ReconcileEvidence, ResumePoint, StagingMode,
-    TaskInput, TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec,
+    MAX_OUTPUT_MATCHES, MAX_TRANSFER_BYTES, NOBODY, NetworkAccess, OutputMatcher,
+    ReconcileEvidence, ResumePoint, StagingMode, TaskInput, TaskOutput, TaskSpec,
+    TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix,
 };
 use async_trait::async_trait;
 use bollard::models::{
@@ -44,6 +45,10 @@ const GENERATION_LABEL: &str = "aruna-engine.org/controller-generation";
 const DIRECTORY_MODE: u32 = 1 << 31;
 const NON_REGULAR_MODES: u32 =
     DIRECTORY_MODE | (1 << 27) | (1 << 26) | (1 << 25) | (1 << 24) | (1 << 21) | (1 << 19);
+/// A wildcard listing streams the whole prefix archive to read its headers and
+/// uploads none of it, so the per-file transfer cap must not apply. This bound
+/// only stops an archive that never ends.
+const MAX_LISTING_SCAN_BYTES: u64 = 1024 * MAX_TRANSFER_BYTES;
 
 mod control;
 
@@ -936,6 +941,47 @@ fn stream_output(
     }
 }
 
+/// Collect the regular files of a directory archive that the pattern selects.
+/// Entry payloads are skipped; only the headers are inspected.
+fn list_archive(
+    archive: impl Read,
+    base: &Path,
+    glob: &OutputMatcher,
+) -> Result<Vec<String>, BackendError> {
+    let mut archive = tar::Archive::new(archive);
+    let mut matched = Vec::new();
+    for entry in archive.entries().map_err(archive_error)? {
+        let entry = entry.map_err(archive_error)?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let path = entry.path().map_err(archive_api)?;
+        if path
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(output_spec("archive entry path is unsafe"));
+        }
+        // A lossy name would address a file that does not exist, so skip it.
+        let joined = base.join(path);
+        let Some(absolute) = joined.to_str().map(str::to_string) else {
+            tracing::warn!(
+                path = %joined.display(),
+                "skipping output path that is not UTF-8"
+            );
+            continue;
+        };
+        if glob.is_match(&absolute) {
+            if matched.len() >= MAX_OUTPUT_MATCHES {
+                return Err(output_spec("pattern matches too many files"));
+            }
+            matched.push(absolute);
+        }
+    }
+    matched.sort();
+    Ok(matched)
+}
+
 fn build_config(
     config: &DockerConfig,
     context: &FenceContext,
@@ -1363,6 +1409,47 @@ impl ExecutorBackend for DockerBackend {
             Err(_) => Err(BackendError::Api(
                 "output parse stopped before the tar header".to_string(),
             )),
+        }
+    }
+
+    async fn list_outputs(
+        &self,
+        context: &FenceContext,
+        pattern: &str,
+    ) -> Result<Vec<String>, BackendError> {
+        let _guard = self.control_guard(context).await?;
+        let attempt = &context.attempt;
+        attempt.validate().map_err(BackendError::InvalidSpec)?;
+        let glob = OutputMatcher::new([pattern]).map_err(BackendError::InvalidSpec)?;
+        let prefix = literal_prefix(pattern).map_err(BackendError::InvalidSpec)?;
+        // Entries of a directory archive are relative to the requested directory.
+        let base = prefix
+            .parent()
+            .ok_or_else(|| output_spec("pattern has no literal parent"))?
+            .to_path_buf();
+        let inspect = self.inspect_matching_attempt(attempt).await?;
+        if !inspect_to_status(inspect.clone()).is_terminal() {
+            return Err(output_spec("attempt is not terminal"));
+        }
+        let container_id = inspect.id.as_deref().ok_or_else(|| {
+            BackendError::Api("Docker inspect response omitted the container ID".to_string())
+        })?;
+        let options = DownloadFromContainerOptionsBuilder::new()
+            .path(&prefix.to_string_lossy())
+            .build();
+        let raw = self
+            .docker
+            .download_from_container(container_id, Some(options))
+            .map(|chunk| chunk.map_err(|error| io::Error::other(classify_archive(&error))));
+        let counted = Box::pin(count_limited(raw, MAX_LISTING_SCAN_BYTES));
+        let reader = SyncIoBridge::new_with_handle(StreamReader::new(counted), Handle::current());
+        let listed = tokio::task::spawn_blocking(move || list_archive(reader, &base, &glob))
+            .await
+            .map_err(|error| BackendError::Api(format!("output listing stopped: {error}")))?;
+        match listed {
+            // An absent output directory selects nothing rather than failing.
+            Err(BackendError::NotFound(_)) => Ok(Vec::new()),
+            other => other,
         }
     }
 
@@ -2322,6 +2409,57 @@ mod tests {
             parse_bytes(bytes, Path::new("output.txt"), limit).await,
             Err(BackendError::InvalidSpec(_))
         ));
+    }
+
+    #[test]
+    fn lists_past_transfer() {
+        // Name collection streams the whole prefix archive but uploads nothing,
+        // so scratch payload must not be charged to the transfer cap.
+        let scratch = vec![b'x'; 256 * 1024];
+        let bytes = make_archive(&[
+            ("out/a.txt", tar::EntryType::Regular, b"1"),
+            ("out/scratch.bin", tar::EntryType::Regular, &scratch),
+            ("out/b.txt", tar::EntryType::Regular, b"2"),
+        ]);
+        let glob = OutputMatcher::new(["/out/*.txt"]).unwrap();
+
+        let matched = list_archive(io::Cursor::new(bytes), Path::new("/"), &glob).unwrap();
+
+        assert_eq!(matched, vec!["/out/a.txt", "/out/b.txt"]);
+        const { assert!(MAX_LISTING_SCAN_BYTES > MAX_TRANSFER_BYTES) };
+    }
+
+    #[test]
+    fn skips_invalid_listing() {
+        // A file whose name is not UTF-8 cannot be addressed as an output, but
+        // it must not fail the capture of the files that can be.
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_size(1);
+        header.as_mut_bytes()[..10].copy_from_slice(b"out/\xff\xfe.txt");
+        header.set_cksum();
+        let mut builder = tar::Builder::new(Vec::new());
+        builder.append(&header, &b"x"[..]).unwrap();
+        builder
+            .append_data(
+                &mut {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_entry_type(tar::EntryType::Regular);
+                    header.set_mode(0o644);
+                    header.set_size(1);
+                    header
+                },
+                "out/a.txt",
+                &b"1"[..],
+            )
+            .unwrap();
+        let bytes = builder.into_inner().unwrap();
+        let glob = OutputMatcher::new(["/out/*.txt"]).unwrap();
+
+        let matched = list_archive(io::Cursor::new(bytes), Path::new("/"), &glob).unwrap();
+
+        assert_eq!(matched, vec!["/out/a.txt"]);
     }
 
     #[test]

@@ -24,6 +24,7 @@ irokle = { workspace = true }
 futures = { workspace = true }
 prometheus-client = { workspace = true }
 ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
 globset = { workspace = true }
 oxrdf = { workspace = true }
 percent-encoding = { workspace = true }

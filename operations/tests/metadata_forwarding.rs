@@ -1,3 +1,4 @@
+use aruna_core::keys::generate_signing_key;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -478,7 +479,7 @@ struct Realm {
 
 impl Realm {
     fn new() -> Self {
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
         Self {
             realm_id,

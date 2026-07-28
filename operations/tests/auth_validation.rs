@@ -1,5 +1,6 @@
 use aruna_core::UserId;
 use aruna_core::auth::bearer_token_hash;
+use aruna_core::keys::generate_signing_key;
 use aruna_core::structs::{RealmId, TokenClaims};
 use aruna_operations::auth::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, validate_aruna_bearer_token,
@@ -187,8 +188,7 @@ fn realm_fixture() -> (SigningKey, RealmId, UserId) {
 }
 
 fn signing_key() -> SigningKey {
-    let mut rng = jsonwebtoken::signature::rand_core::OsRng;
-    SigningKey::generate(&mut rng)
+    generate_signing_key()
 }
 
 fn trusted_state(realm_id: RealmId) -> TestAuthState {

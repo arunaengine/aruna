@@ -3,15 +3,16 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
-    ExecutorKind, FenceContext, LogLimits, LogStream, LogTails, MAX_TRANSFER_BYTES, NetworkAccess,
-    ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec, TombstoneEvidence,
-    TombstoneSpec, UserSpec, normalize_container_path,
+    ExecutorKind, FenceContext, LogLimits, LogStream, LogTails, MAX_OUTPUT_MATCHES,
+    MAX_TRANSFER_BYTES, NetworkAccess, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode,
+    TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix,
+    normalize_container_path,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -57,13 +58,12 @@ impl ApptainerBackend {
             return Ok(to_status(&directory, status));
         }
         if let Some(payload) = read_optional::<PayloadRecord>(&directory.join("payload.json"))? {
-            if runtime::process_live(&payload.process)? {
-                return Ok(running_status(&directory));
+            let running = running_status(&directory, payload.started_at_ms);
+            if runtime::process_live(&payload.process)? || !runtime::cgroup_empty(&payload.cgroup)?
+            {
+                return Ok(running);
             }
-            if !runtime::cgroup_empty(&payload.cgroup)? {
-                return Ok(running_status(&directory));
-            }
-            return settle_status(&directory, running_status(&directory));
+            return settle_status(&directory, running);
         }
         if directory.join("supervisor.json").exists() {
             return settle_status(&directory, submitted_status(&directory));
@@ -230,18 +230,17 @@ impl ApptainerBackend {
             .arg(&temp)
             .arg(format!("docker://{image}"))
             .kill_on_drop(true);
-        let status = tokio::select! {
+        let output = tokio::select! {
             _ = cancel.cancelled() => return Err(BackendError::Cancelled),
-            result = tokio::time::timeout(self.config.pull_deadline, command.status()) => {
+            result = tokio::time::timeout(self.config.pull_deadline, command.output()) => {
                 result
                     .map_err(|_| BackendError::Timeout("Apptainer image pull timed out".to_string()))?
                     .map_err(io_error)?
             }
         };
-        if !status.success() {
-            return Err(BackendError::Api(format!(
-                "Apptainer image pull failed with {status}"
-            )));
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(pull_error(&stderr, output.status));
         }
         File::open(&temp)
             .and_then(|file| file.sync_all())
@@ -453,7 +452,7 @@ impl ExecutorBackend for ApptainerBackend {
         }
         let directory = self.state.attempt_dir(context);
         let attempt: AttemptRecord = read_json(&directory.join("attempt.json"))?;
-        if !attempt.output_paths.iter().any(|output| output == path) {
+        if !declared_outputs(&attempt)?.is_match(path) {
             return Err(BackendError::InvalidSpec(
                 "output path was not declared".to_string(),
             ));
@@ -483,6 +482,33 @@ impl ExecutorBackend for ApptainerBackend {
             size,
             chunks: Box::pin(ChannelStream(rx)),
         })
+    }
+
+    async fn list_outputs(
+        &self,
+        context: &FenceContext,
+        pattern: &str,
+    ) -> Result<Vec<String>, BackendError> {
+        let status = self.attempt_status(context)?;
+        if !status.is_terminal() {
+            return Err(BackendError::InvalidSpec(
+                "attempt is not terminal".to_string(),
+            ));
+        }
+        let directory = self.state.attempt_dir(context);
+        let attempt: AttemptRecord = read_json(&directory.join("attempt.json"))?;
+        if !attempt.output_paths.iter().any(|output| output == pattern) {
+            return Err(BackendError::InvalidSpec(
+                "output path was not declared".to_string(),
+            ));
+        }
+        let glob = OutputMatcher::new([pattern]).map_err(BackendError::InvalidSpec)?;
+        let prefix = literal_prefix(pattern).map_err(BackendError::InvalidSpec)?;
+        let root = directory
+            .join("workspace/root")
+            .canonicalize()
+            .map_err(io_error)?;
+        list_workspace(&root, &host_path(&root, &prefix), &glob)
     }
 
     async fn reconcile(&self, context: &FenceContext) -> ReconcileEvidence {
@@ -852,6 +878,29 @@ async fn resolve_digest(
     Ok(format!("{}@{digest}", repository_name(image)))
 }
 
+/// A pull that can never succeed must be permanent, or the attempt is requeued
+/// until the park budget runs out instead of failing with the registry cause.
+fn pull_error(stderr: &str, status: ExitStatus) -> BackendError {
+    let detail = format!(
+        "Apptainer image pull failed with {status}: {}",
+        stderr.trim()
+    );
+    if image_missing(stderr) {
+        BackendError::ImageNotFound(detail)
+    } else if image_denied(stderr) {
+        BackendError::ImageUnauthorized(detail)
+    } else {
+        BackendError::Unavailable(detail)
+    }
+}
+
+fn image_denied(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    ["unauthorized", "denied", "forbidden", "authentication"]
+        .iter()
+        .any(|message| stderr.contains(message))
+}
+
 fn image_missing(stderr: &str) -> bool {
     let stderr = stderr.to_ascii_lowercase();
     ["image not found", "manifest unknown", "name unknown"]
@@ -979,11 +1028,11 @@ fn submitted_status(directory: &Path) -> AttemptStatus {
     }
 }
 
-fn running_status(directory: &Path) -> AttemptStatus {
+fn running_status(directory: &Path, started_at_ms: Option<u64>) -> AttemptStatus {
     AttemptStatus {
         phase: AttemptPhase::Running,
         backend_ref: directory.display().to_string(),
-        started_at_ms: None,
+        started_at_ms,
         finished_at_ms: None,
     }
 }
@@ -1086,6 +1135,66 @@ fn io_error(error: std::io::Error) -> BackendError {
     BackendError::Api(format!("Apptainer backend: {error}"))
 }
 
+fn declared_outputs(attempt: &AttemptRecord) -> Result<OutputMatcher, BackendError> {
+    OutputMatcher::new(attempt.output_paths.iter().map(String::as_str))
+        .map_err(BackendError::InvalidSpec)
+}
+
+/// Regular files below `start` whose container path the pattern selects.
+/// Symlinks are skipped, so a listing can never leave the workspace root.
+fn list_workspace(
+    root: &Path,
+    start: &Path,
+    glob: &OutputMatcher,
+) -> Result<Vec<String>, BackendError> {
+    let mut matched = Vec::new();
+    let mut pending = vec![start.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_error(error)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(io_error)?;
+            let file_type = entry.file_type().map_err(io_error)?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let relative = path.strip_prefix(root).map_err(|_| {
+                BackendError::InvalidSpec("listing escaped the workspace".to_string())
+            })?;
+            // A lossy name would address a file that does not exist, so skip it.
+            let Some(relative) = relative.to_str() else {
+                tracing::warn!(
+                    path = %relative.display(),
+                    "skipping output path that is not UTF-8"
+                );
+                continue;
+            };
+            let absolute = format!("/{relative}");
+            if glob.is_match(&absolute) {
+                if matched.len() >= MAX_OUTPUT_MATCHES {
+                    return Err(BackendError::InvalidSpec(
+                        "pattern matches too many files".to_string(),
+                    ));
+                }
+                matched.push(absolute);
+            }
+        }
+    }
+    matched.sort();
+    Ok(matched)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1110,6 +1219,47 @@ mod tests {
         };
 
         backend.cleanup(&context).await.unwrap();
+    }
+
+    #[test]
+    fn lists_matching_files() {
+        let root = tempdir().unwrap();
+        let root = root.path();
+        std::fs::create_dir_all(root.join("out/sub")).unwrap();
+        for path in ["out/a.txt", "out/b.csv", "out/sub/c.txt"] {
+            std::fs::write(root.join(path), b"x").unwrap();
+        }
+        std::os::unix::fs::symlink(root.join("out/a.txt"), root.join("out/link.txt")).unwrap();
+        let glob = OutputMatcher::new(["/out/*.txt"]).unwrap();
+
+        let matched = list_workspace(root, &root.join("out"), &glob).unwrap();
+
+        // Symlinks never resolve, and `*` stops at the separator.
+        assert_eq!(matched, vec!["/out/a.txt".to_string()]);
+        assert!(
+            list_workspace(root, &root.join("absent"), &glob)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn skips_invalid_name() {
+        // A lossy name matches the pattern but addresses no file, so the fetch
+        // that follows would fail forever.
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tempdir().unwrap();
+        let root = root.path();
+        std::fs::create_dir_all(root.join("out")).unwrap();
+        std::fs::write(root.join("out/a.txt"), b"x").unwrap();
+        let invalid = std::ffi::OsStr::from_bytes(b"\xff\xfe.txt");
+        std::fs::write(root.join("out").join(invalid), b"y").unwrap();
+        let glob = OutputMatcher::new(["/out/*.txt"]).unwrap();
+
+        let matched = list_workspace(root, &root.join("out"), &glob).unwrap();
+
+        assert_eq!(matched, vec!["/out/a.txt".to_string()]);
     }
 
     #[test]
@@ -1179,6 +1329,7 @@ mod tests {
             &PayloadRecord {
                 process: dead_record(),
                 cgroup: backend.cgroup_path(context),
+                started_at_ms: Some(1),
             },
         )
         .unwrap();
@@ -1239,7 +1390,7 @@ mod tests {
         )
         .unwrap();
 
-        let status = settle_status(root.path(), running_status(root.path())).unwrap();
+        let status = settle_status(root.path(), running_status(root.path(), Some(1))).unwrap();
 
         assert!(matches!(status.phase, AttemptPhase::Exited { code: 0 }));
     }
@@ -1342,6 +1493,20 @@ mod tests {
     fn classifies_registry_failure() {
         assert!(image_missing("MANIFEST_UNKNOWN: manifest unknown"));
         assert!(!image_missing("dial tcp: connection timed out"));
+    }
+
+    #[test]
+    fn classifies_pull_error() {
+        // A hopeless pull must be permanent; only a blip may be retried.
+        use std::os::unix::process::ExitStatusExt;
+        let status = ExitStatus::from_raw(256);
+        let missing = pull_error("FATAL: manifest unknown", status);
+        let denied = pull_error("FATAL: unauthorized: authentication required", status);
+        let blip = pull_error("dial tcp: connection timed out", status);
+        assert!(matches!(missing, BackendError::ImageNotFound(_)));
+        assert!(matches!(denied, BackendError::ImageUnauthorized(_)));
+        assert!(matches!(blip, BackendError::Unavailable(_)));
+        assert!(!missing.retryable() && !denied.retryable() && blip.retryable());
     }
 
     #[tokio::test]

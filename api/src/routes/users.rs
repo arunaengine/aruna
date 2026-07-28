@@ -515,13 +515,15 @@ async fn register_admin(
     post,
     path = "/users/register",
     tag = "users",
+    description = "Requires an OIDC bearer token from a configured issuer, not an Aruna access token.",
     request_body = RegisterUserRequest,
     responses(
         (status = 201, description = "User registered", body = RegisterUserResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse)
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 async fn register_user(
     State(state): State<Arc<ServerState>>,
@@ -1002,6 +1004,7 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
+    use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
     use aruna_core::onboarding::{OnboardingMode, OnboardingSecret, OnboardingSecretRecord};
     use aruna_core::structs::{
@@ -1242,8 +1245,7 @@ mod tests {
         )
         .await;
 
-        let realm_signing_key =
-            SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let realm_signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_id = net_handle.node_id();
         let realm_admin_id = UserId::local(Ulid::generate(), realm_id);
@@ -1422,7 +1424,7 @@ mod tests {
     async fn get_user_for_regular_registered_user_returns_forbidden() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
         let node = spawn_test_node(provider, true).await;
 
@@ -1457,7 +1459,7 @@ mod tests {
     async fn issued_user_token_carries_bounded_expiry() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
         let node = spawn_test_node(provider, true).await;
 
@@ -1490,7 +1492,7 @@ mod tests {
     async fn bootstrap_registration_consumes_secret() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
         let node = spawn_test_node(provider, false).await;
 
@@ -1534,7 +1536,7 @@ mod tests {
     async fn get_user_for_missing_user_without_admin_permissions_returns_forbidden() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
         let node = spawn_test_node(provider, true).await;
 
@@ -1571,7 +1573,7 @@ mod tests {
     async fn get_user_requires_authentication() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
         let node = spawn_test_node(provider, true).await;
 
@@ -1596,12 +1598,11 @@ mod tests {
     async fn get_user_returns_unimplemented_for_foreign_realm_token() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
         let node = spawn_test_node(provider, true).await;
 
-        let foreign_realm_signing_key =
-            SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let foreign_realm_signing_key = generate_signing_key();
         let foreign_realm_id =
             RealmId::from_bytes(foreign_realm_signing_key.verifying_key().to_bytes());
         node.state.add_trusted_realm(foreign_realm_id).await;
@@ -1670,7 +1671,7 @@ mod tests {
     async fn get_token_returns_aruna_token_for_registered_oidc_user() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
         let node = spawn_test_node(provider, true).await;
 
@@ -1706,7 +1707,7 @@ mod tests {
     async fn get_token_rejects_scoped_aruna_token() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
         let node = spawn_test_node(provider, true).await;
 
@@ -1741,7 +1742,7 @@ mod tests {
     async fn get_token_rejects_alias_aruna_token() {
         let issuer = "https://issuer.example";
         let kid = "main-key";
-        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let signing_key = generate_signing_key();
         let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
         let node = spawn_test_node(provider, true).await;
 
@@ -1809,12 +1810,12 @@ mod resolve_tests {
     use crate::error::ServerError;
     use crate::server_state::ServerState;
     use aruna_core::UserId;
+    use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{AuthContext, NodeCapabilities, RealmId};
     use aruna_operations::driver::DriverContext;
     use aruna_storage::FjallStorage;
     use axum::extract::State;
     use axum::{Extension, Json};
-    use ed25519_dalek::SigningKey;
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
@@ -1830,8 +1831,7 @@ mod resolve_tests {
             task_handle: None,
             compute_handle: None,
         });
-        let realm_signing_key =
-            SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let realm_signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let state = Arc::new(
             ServerState::new(

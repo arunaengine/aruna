@@ -5,7 +5,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect, StoragePriority};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -13,7 +13,8 @@ use aruna_core::telemetry::{LatencyAggregator, duration_ms, record_stage};
 use aruna_core::util::prefix_upper_bound;
 use async_trait::async_trait;
 use byteview::ByteView;
-use crossfire::{TrySendError, mpsc, oneshot};
+use crossfire::select::Select;
+use crossfire::{RecvError, TryRecvError, TrySendError, mpsc, oneshot};
 use fjall::{
     KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PersistMode, Readable,
 };
@@ -32,6 +33,9 @@ pub type EffectSender = crossfire::MTx<mpsc::Array<EffectHandle>>;
 pub type EffectReceiver = crossfire::Rx<mpsc::Array<EffectHandle>>;
 
 const STORAGE_EFFECT_QUEUE_CAPACITY: usize = 65_536;
+// Bulk lane queues are small so background work hits QueueFull backpressure early
+// instead of building an unbounded backlog ahead of foreground sync traffic.
+const BULK_EFFECT_QUEUE_CAPACITY: usize = 4_096;
 
 enum Txn {
     Read(fjall::Snapshot),
@@ -84,6 +88,12 @@ fn storage_effect_key_space(effect: &StorageEffect) -> Option<&str> {
 }
 const MAX_GROUP_COMMIT: usize = 256;
 const READ_POOL_THREADS: usize = 4;
+const BULK_READ_POOL_THREADS: usize = 2;
+// Foreground effects served per admitted bulk effect. Counting effects rather
+// than batches keeps the bulk share constant under load: a batch may carry up to
+// MAX_GROUP_COMMIT effects, so per-batch credit would shrink the share to
+// nothing exactly when the queue is deepest.
+const FOREGROUND_PER_BULK: usize = 8;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FjallPersistPolicy {
@@ -166,6 +176,8 @@ pub struct FjallStorage {
     txns: HashMap<Ulid, Txn>,
     read_pool: Vec<EffectSender>,
     next_reader: usize,
+    bulk_read_pool: Vec<EffectSender>,
+    next_bulk_reader: usize,
 }
 
 #[derive(Debug, Default)]
@@ -213,22 +225,54 @@ pub struct StorageMetricsSnapshot {
     pub last_error: Option<String>,
 }
 
+/// Write-actor receivers, one per dispatch lane. Foreground is drained before
+/// bulk so background work never starves sync traffic.
+pub struct StorageReceivers {
+    pub foreground: EffectReceiver,
+    pub bulk: EffectReceiver,
+}
+
 #[derive(Clone, Debug)]
 pub struct StorageHandle {
     write_channel: EffectSender,
+    bulk_channel: EffectSender,
+    priority: StoragePriority,
     metrics: Arc<StorageMetrics>,
 }
 
 impl StorageHandle {
-    pub fn new() -> (Self, EffectReceiver) {
-        let (sender, receiver) = mpsc::bounded_blocking(STORAGE_EFFECT_QUEUE_CAPACITY);
+    pub fn new() -> (Self, StorageReceivers) {
+        let (sender, foreground) = mpsc::bounded_blocking(STORAGE_EFFECT_QUEUE_CAPACITY);
+        let (bulk_sender, bulk) = mpsc::bounded_blocking(BULK_EFFECT_QUEUE_CAPACITY);
         (
             StorageHandle {
                 write_channel: sender,
+                bulk_channel: bulk_sender,
+                priority: StoragePriority::Foreground,
                 metrics: Arc::new(StorageMetrics::default()),
             },
-            receiver,
+            StorageReceivers { foreground, bulk },
         )
+    }
+
+    /// A handle whose effects dispatch on the bulk lane, served only when the
+    /// foreground lane is idle.
+    pub fn bulk(&self) -> StorageHandle {
+        let mut handle = self.clone();
+        handle.priority = StoragePriority::Bulk;
+        handle
+    }
+
+    fn channel_for(&self, effect: &StorageEffect) -> &EffectSender {
+        // Aborts free resources and must never wait behind bulk backpressure, so
+        // they always dispatch on the foreground lane regardless of priority.
+        if matches!(effect, StorageEffect::AbortTransaction { .. }) {
+            return &self.write_channel;
+        }
+        match self.priority {
+            StoragePriority::Foreground => &self.write_channel,
+            StoragePriority::Bulk => &self.bulk_channel,
+        }
     }
 
     pub fn get_errors(&self) -> u64 {
@@ -301,10 +345,13 @@ impl StorageHandle {
         let active_txn_id = active_txn_id_for_effect(&effect);
         let span = storage_effect_span(&effect);
         let in_flight = InFlightGuard::acquire(&self.metrics);
-        match self
-            .write_channel
-            .try_send((effect, response_tx, span, Instant::now(), in_flight))
-        {
+        match self.channel_for(&effect).try_send((
+            effect,
+            response_tx,
+            span,
+            Instant::now(),
+            in_flight,
+        )) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 if let Some(txn_id) = active_txn_id {
@@ -349,10 +396,13 @@ impl StorageHandle {
         let effect = StorageEffect::AbortTransaction { txn_id };
         let span = storage_effect_span(&effect);
         let in_flight = InFlightGuard::acquire(&self.metrics);
-        match self
-            .write_channel
-            .try_send((effect, response_tx, span, Instant::now(), in_flight))
-        {
+        match self.channel_for(&effect).try_send((
+            effect,
+            response_tx,
+            span,
+            Instant::now(),
+            in_flight,
+        )) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => warn!(
                 event = "storage.transaction.abort_enqueue_full",
@@ -488,9 +538,18 @@ impl FjallStorage {
             .manual_journal_persist(true)
             .open()?;
 
-        let (sender, receiver) = StorageHandle::new();
+        let (sender, receivers) = StorageHandle::new();
         let store = Store::new(db);
-        let read_pool = spawn_read_pool(store.clone(), READ_POOL_THREADS);
+        let read_pool = spawn_read_pool(
+            store.clone(),
+            READ_POOL_THREADS,
+            STORAGE_EFFECT_QUEUE_CAPACITY,
+        );
+        let bulk_read_pool = spawn_read_pool(
+            store.clone(),
+            BULK_READ_POOL_THREADS,
+            BULK_EFFECT_QUEUE_CAPACITY,
+        );
         let channel_closed = sender.metrics.channel_closed.clone();
 
         thread::spawn(move || {
@@ -501,8 +560,10 @@ impl FjallStorage {
                 txns: HashMap::new(),
                 read_pool,
                 next_reader: 0,
+                bulk_read_pool,
+                next_bulk_reader: 0,
             };
-            storage.receive_loop(receiver);
+            storage.receive_loop(receivers);
         });
 
         Ok(sender)
@@ -543,61 +604,111 @@ impl FjallStorage {
         }
     }
 
-    #[tracing::instrument(name = "storage.receive_loop", level = "debug", skip(self, receiver))]
-    pub fn receive_loop(&mut self, receiver: EffectReceiver) {
+    #[tracing::instrument(name = "storage.receive_loop", level = "debug", skip(self, receivers))]
+    pub fn receive_loop(&mut self, receivers: StorageReceivers) {
         let mut slow_queue = SlowQueueAggregator::default();
-        let mut group: Vec<EffectHandle> = Vec::new();
-        let mut group_index: Option<PendingWriteIndex> = None;
+        let mut lanes = LaneScheduler::default();
         loop {
-            let Ok(first) = receiver.recv() else {
-                tracing::warn!("Storage receiver channel closed, shutting down storage thread.");
-                break;
+            let (first, priority) = match lanes.next(&receivers) {
+                Ok(pair) => pair,
+                Err(_) => {
+                    tracing::warn!(
+                        "Storage receiver channel closed, shutting down storage thread."
+                    );
+                    break;
+                }
             };
-            let mut pending = Vec::with_capacity(8);
-            pending.push(first);
-            while pending.len() < MAX_GROUP_COMMIT {
-                match receiver.try_recv() {
-                    Ok(item) => pending.push(item),
-                    Err(_) => break,
+            match priority {
+                StoragePriority::Foreground => {
+                    let served = self.serve_foreground_batch(&receivers, first, &mut slow_queue);
+                    lanes.record_foreground(served);
+                }
+                StoragePriority::Bulk => {
+                    if is_poolable_read(&first.0) {
+                        self.forward_to_read_pool(first, StoragePriority::Bulk, &mut slow_queue);
+                    } else {
+                        self.process_single(first, &mut slow_queue);
+                    }
                 }
             }
-
-            for item in pending {
-                if is_groupable_write(&item.0) {
-                    if let Some(index) = &mut group_index {
-                        index.insert(&item.0);
-                    }
-                    group.push(item);
-                    continue;
-                }
-                if is_poolable_read(&item.0) {
-                    let conflicts = !group.is_empty()
-                        && group_index
-                            .get_or_insert_with(|| PendingWriteIndex::from_group(&group))
-                            .conflicts_with_read(&item.0);
-                    if conflicts {
-                        self.flush_write_group(&mut group, &mut slow_queue);
-                        group_index = None;
-                    }
-                    self.forward_to_read_pool(item, &mut slow_queue);
-                    continue;
-                }
-                self.flush_write_group(&mut group, &mut slow_queue);
-                group_index = None;
-                self.process_single(item, &mut slow_queue);
-            }
-            self.flush_write_group(&mut group, &mut slow_queue);
-            group_index = None;
         }
     }
 
-    fn forward_to_read_pool(&mut self, item: EffectHandle, slow_queue: &mut SlowQueueAggregator) {
-        let reader = self.next_reader % self.read_pool.len();
-        self.next_reader = self.next_reader.wrapping_add(1);
-        match self.read_pool[reader].try_send(item) {
-            Ok(()) => {}
-            Err(TrySendError::Full(item)) | Err(TrySendError::Disconnected(item)) => {
-                self.process_single(item, slow_queue);
+    /// Returns how many foreground effects were served, which is what the lane
+    /// scheduler credits the bulk lane against.
+    fn serve_foreground_batch(
+        &mut self,
+        receivers: &StorageReceivers,
+        first: EffectHandle,
+        slow_queue: &mut SlowQueueAggregator,
+    ) -> usize {
+        let mut pending = Vec::with_capacity(8);
+        pending.push(first);
+        while pending.len() < MAX_GROUP_COMMIT {
+            match receivers.foreground.try_recv() {
+                Ok(item) => pending.push(item),
+                Err(_) => break,
+            }
+        }
+        let served = pending.len();
+
+        let mut group: Vec<EffectHandle> = Vec::new();
+        let mut group_index: Option<PendingWriteIndex> = None;
+        for item in pending {
+            if is_groupable_write(&item.0) {
+                if let Some(index) = &mut group_index {
+                    index.insert(&item.0);
+                }
+                group.push(item);
+                continue;
+            }
+            if is_poolable_read(&item.0) {
+                let conflicts = !group.is_empty()
+                    && group_index
+                        .get_or_insert_with(|| PendingWriteIndex::from_group(&group))
+                        .conflicts_with_read(&item.0);
+                if conflicts {
+                    self.flush_write_group(&mut group, slow_queue);
+                    group_index = None;
+                }
+                self.forward_to_read_pool(item, StoragePriority::Foreground, slow_queue);
+                continue;
+            }
+            self.flush_write_group(&mut group, slow_queue);
+            group_index = None;
+            self.process_single(item, slow_queue);
+        }
+        self.flush_write_group(&mut group, slow_queue);
+        served
+    }
+
+    fn forward_to_read_pool(
+        &mut self,
+        item: EffectHandle,
+        priority: StoragePriority,
+        slow_queue: &mut SlowQueueAggregator,
+    ) {
+        match priority {
+            StoragePriority::Foreground => {
+                let reader = self.next_reader % self.read_pool.len();
+                self.next_reader = self.next_reader.wrapping_add(1);
+                match self.read_pool[reader].try_send(item) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(item)) | Err(TrySendError::Disconnected(item)) => {
+                        self.process_single(item, slow_queue);
+                    }
+                }
+            }
+            StoragePriority::Bulk => {
+                let reader = self.next_bulk_reader % self.bulk_read_pool.len();
+                self.next_bulk_reader = self.next_bulk_reader.wrapping_add(1);
+                match self.bulk_read_pool[reader].try_send(item) {
+                    Ok(()) => {}
+                    // A full bulk read queue backpressures rather than stealing
+                    // the write actor thread from foreground sync traffic.
+                    Err(TrySendError::Full(item)) => reject_bulk_read(item),
+                    Err(TrySendError::Disconnected(item)) => self.process_single(item, slow_queue),
+                }
             }
         }
     }
@@ -1542,10 +1653,103 @@ fn iter_may_include_key(
     }
 }
 
-fn spawn_read_pool(store: Store, threads: usize) -> Vec<EffectSender> {
+/// Lane picker for the write actor. Foreground is preferred, and every
+/// [`FOREGROUND_PER_BULK`] foreground effects earn one bulk effect, so the drain
+/// keeps a fixed share of the actor no matter how deep the foreground queue is.
+#[derive(Debug, Default)]
+struct LaneScheduler {
+    credit: usize,
+}
+
+impl LaneScheduler {
+    fn record_foreground(&mut self, served: usize) {
+        self.credit = self.credit.saturating_add(served);
+    }
+
+    fn next(
+        &mut self,
+        receivers: &StorageReceivers,
+    ) -> Result<(EffectHandle, StoragePriority), RecvError> {
+        loop {
+            if self.credit >= FOREGROUND_PER_BULK
+                && let Ok(item) = receivers.bulk.try_recv()
+            {
+                self.credit = self.credit.saturating_sub(FOREGROUND_PER_BULK);
+                return Ok((item, StoragePriority::Bulk));
+            }
+            let foreground = receivers.foreground.try_recv();
+            if let Ok(item) = foreground {
+                return Ok((item, StoragePriority::Foreground));
+            }
+            let bulk = receivers.bulk.try_recv();
+            if let Ok(item) = bulk {
+                self.credit = 0;
+                return Ok((item, StoragePriority::Bulk));
+            }
+            match (foreground, bulk) {
+                (Err(TryRecvError::Disconnected), Err(TryRecvError::Disconnected)) => {
+                    return Err(RecvError);
+                }
+                (Err(TryRecvError::Disconnected), _) => {
+                    self.credit = 0;
+                    return receivers
+                        .bulk
+                        .recv()
+                        .map(|item| (item, StoragePriority::Bulk));
+                }
+                (_, Err(TryRecvError::Disconnected)) => {
+                    self.credit = 0;
+                    return receivers
+                        .foreground
+                        .recv()
+                        .map(|item| (item, StoragePriority::Foreground));
+                }
+                _ => {}
+            }
+            // Both lanes are open but empty: block on a biased select so an idle
+            // node sleeps with zero wakeups and foreground stays preferred.
+            self.credit = 0;
+            let mut select = Select::new_bias();
+            select.add(&receivers.foreground);
+            select.add(&receivers.bulk);
+            let received = match select.select() {
+                Ok(result) if result == receivers.foreground => receivers
+                    .foreground
+                    .read_select(result)
+                    .map(|item| (item, StoragePriority::Foreground)),
+                Ok(result) => receivers
+                    .bulk
+                    .read_select(result)
+                    .map(|item| (item, StoragePriority::Bulk)),
+                Err(RecvError) => return Err(RecvError),
+            };
+            if let Ok(pair) = received {
+                return Ok(pair);
+            }
+        }
+    }
+}
+
+fn reject_bulk_read(item: EffectHandle) {
+    let (effect, response_tx, span, _enqueued_at, in_flight) = item;
+    let _guard = span.enter();
+    warn!(
+        event = "storage.bulk_read.queue_full",
+        operation = storage_effect_kind(&effect),
+        "Rejecting bulk read: bulk read pool queue full"
+    );
+    drop(in_flight);
+    if !response_tx.is_disconnected() {
+        response_tx.send(StorageEvent::Error {
+            error: StorageError::QueueFull,
+        });
+    }
+}
+
+fn spawn_read_pool(store: Store, threads: usize, capacity: usize) -> Vec<EffectSender> {
     let mut senders = Vec::with_capacity(threads);
     for _ in 0..threads {
-        let (sender, receiver) = mpsc::bounded_blocking(STORAGE_EFFECT_QUEUE_CAPACITY);
+        let (sender, receiver) = mpsc::bounded_blocking(capacity);
         let store = store.clone();
         thread::spawn(move || read_pool_loop(store, receiver));
         senders.push(sender);
@@ -1885,7 +2089,7 @@ fn collect_page(iter: fjall::Iter, limit: usize) -> Result<PageResult, StorageEr
 #[cfg(test)]
 mod tests {
     use super::{FjallPersistPolicy, FjallStorage, StorageHandle};
-    use aruna_core::effects::{Effect, IterStart, StorageEffect};
+    use aruna_core::effects::{Effect, IterStart, StorageEffect, StoragePriority};
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
@@ -1898,6 +2102,240 @@ mod tests {
     const RESTART_CHILD_PATH_ENV: &str = "ARUNA_STORAGE_RESTART_CHILD_PATH";
     const RESTART_CHILD_MODE_ENV: &str = "ARUNA_STORAGE_RESTART_CHILD_MODE";
     const RESTART_CHILD_TEST: &str = "storage::tests::buffered_persistence_restart_child_process";
+
+    #[test]
+    fn foreground_precedes_bulk() {
+        // All four effects are enqueued before the first recv, so lane order is
+        // deterministic: the single foreground effect precedes the three bulk.
+        let (handle, receivers) = StorageHandle::new();
+        let read = |key_space: &str| StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key: b"k".to_vec().into(),
+            txn_id: None,
+        };
+        let mut keep = Vec::new();
+        for key_space in ["b1", "b2", "b3"] {
+            let (tx, rx) = crossfire::oneshot::oneshot();
+            let effect = read(key_space);
+            let span = super::storage_effect_span(&effect);
+            let in_flight = super::InFlightGuard::acquire(&handle.metrics);
+            assert!(
+                handle
+                    .bulk_channel
+                    .try_send((effect, tx, span, Instant::now(), in_flight))
+                    .is_ok(),
+                "bulk enqueue"
+            );
+            keep.push(rx);
+        }
+        let (tx, rx) = crossfire::oneshot::oneshot();
+        let effect = read("fg");
+        let span = super::storage_effect_span(&effect);
+        let in_flight = super::InFlightGuard::acquire(&handle.metrics);
+        assert!(
+            handle
+                .write_channel
+                .try_send((effect, tx, span, Instant::now(), in_flight))
+                .is_ok(),
+            "foreground enqueue"
+        );
+        keep.push(rx);
+
+        let mut lanes = super::LaneScheduler::default();
+        let (first, priority) = lanes.next(&receivers).expect("first item");
+        assert_eq!(priority, StoragePriority::Foreground);
+        assert_eq!(super::storage_effect_key_space(&first.0), Some("fg"));
+        for _ in 0..3 {
+            let (_, priority) = lanes.next(&receivers).expect("bulk item");
+            assert_eq!(priority, StoragePriority::Bulk);
+        }
+        drop(keep);
+    }
+
+    #[test]
+    fn bulk_keeps_share() {
+        // Credit is earned per foreground effect, not per batch: one batch may
+        // swallow the whole foreground queue, and it must still buy the bulk
+        // lane its proportional slots or a deep queue starves the drain.
+        let (handle, receivers) = StorageHandle::new();
+        let read = |key_space: &str| StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key: b"k".to_vec().into(),
+            txn_id: None,
+        };
+        let mut keep = Vec::new();
+        let mut enqueue = |channel: &super::EffectSender, key_space: &str| {
+            let (tx, rx) = crossfire::oneshot::oneshot();
+            let effect = read(key_space);
+            let span = super::storage_effect_span(&effect);
+            let in_flight = super::InFlightGuard::acquire(&handle.metrics);
+            assert!(
+                channel
+                    .try_send((effect, tx, span, Instant::now(), in_flight))
+                    .is_ok(),
+                "enqueue {key_space}"
+            );
+            keep.push(rx);
+        };
+        let batch = super::MAX_GROUP_COMMIT;
+        let expected_bulk = batch / super::FOREGROUND_PER_BULK;
+        for _ in 0..batch {
+            enqueue(&handle.write_channel, "fg");
+        }
+        for _ in 0..expected_bulk {
+            enqueue(&handle.bulk_channel, "bulk");
+        }
+
+        let mut lanes = super::LaneScheduler::default();
+        let (_, priority) = lanes.next(&receivers).expect("first item");
+        assert_eq!(priority, StoragePriority::Foreground);
+        // The actor drains the rest of the foreground queue as one batch.
+        lanes.record_foreground(batch);
+
+        let mut bulk_served = 0usize;
+        for _ in 0..expected_bulk {
+            let (_, priority) = lanes.next(&receivers).expect("item");
+            if priority == StoragePriority::Bulk {
+                bulk_served += 1;
+            }
+        }
+        assert_eq!(
+            bulk_served, expected_bulk,
+            "a full foreground batch buys {expected_bulk} bulk slots"
+        );
+        drop(keep);
+    }
+
+    #[test]
+    fn abort_routes_foreground() {
+        // A saturated bulk lane must not swallow a bulk handle's abort; aborts
+        // free resources and always dispatch on the foreground lane.
+        let (handle, receivers) = StorageHandle::new();
+        let mut keep = Vec::new();
+        loop {
+            let (tx, rx) = crossfire::oneshot::oneshot();
+            let effect = StorageEffect::Read {
+                key_space: "b".to_string(),
+                key: b"k".to_vec().into(),
+                txn_id: None,
+            };
+            let span = super::storage_effect_span(&effect);
+            let in_flight = super::InFlightGuard::acquire(&handle.metrics);
+            if handle
+                .bulk_channel
+                .try_send((effect, tx, span, Instant::now(), in_flight))
+                .is_err()
+            {
+                break;
+            }
+            keep.push(rx);
+        }
+
+        let txn_id = Ulid::from_parts(1, 1);
+        handle.bulk().enqueue_abort_transaction(txn_id, "test");
+
+        let (effect, ..) = receivers
+            .foreground
+            .try_recv()
+            .expect("abort routed to foreground");
+        assert!(matches!(
+            effect,
+            StorageEffect::AbortTransaction { txn_id: got } if got == txn_id
+        ));
+        assert!(
+            receivers.bulk.try_recv().is_ok(),
+            "bulk lane still saturated"
+        );
+        drop(keep);
+    }
+
+    #[tokio::test]
+    async fn bulk_lane_works() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let bulk = handle.bulk();
+        let write = bulk
+            .send_storage_effect(StorageEffect::Write {
+                key_space: "node_state".to_string(),
+                key: b"k".to_vec().into(),
+                value: b"v".to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            write,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        let read = bulk
+            .send_storage_effect(StorageEffect::Read {
+                key_space: "node_state".to_string(),
+                key: b"k".to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+        match read {
+            Event::Storage(StorageEvent::ReadResult {
+                value: Some(value), ..
+            }) => assert_eq!(value.as_ref(), b"v"),
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bulk_full_rejects() {
+        // A saturated bulk read pool rejects with QueueFull instead of running
+        // the read inline on the write actor thread.
+        let dir = tempdir().unwrap();
+        let db = fjall::OptimisticTxDatabase::builder(dir.path())
+            .manual_journal_persist(true)
+            .open()
+            .unwrap();
+        let (bulk_sender, _bulk_receiver) = crossfire::mpsc::bounded_blocking(1);
+        let mut storage = super::FjallStorage {
+            store: super::Store::new(db),
+            persist_policy: FjallPersistPolicy::default(),
+            txns: std::collections::HashMap::new(),
+            read_pool: Vec::new(),
+            next_reader: 0,
+            bulk_read_pool: vec![bulk_sender],
+            next_bulk_reader: 0,
+        };
+        let metrics = std::sync::Arc::new(super::StorageMetrics::default());
+        let read_effect = || StorageEffect::Read {
+            key_space: "node_state".to_string(),
+            key: b"missing".to_vec().into(),
+            txn_id: None,
+        };
+
+        let filler = read_effect();
+        let span = super::storage_effect_span(&filler);
+        let guard = super::InFlightGuard::acquire(&metrics);
+        let (filler_tx, _filler_rx) = crossfire::oneshot::oneshot();
+        assert!(
+            storage.bulk_read_pool[0]
+                .try_send((filler, filler_tx, span, Instant::now(), guard))
+                .is_ok(),
+            "saturate bulk read pool"
+        );
+
+        let target = read_effect();
+        let span = super::storage_effect_span(&target);
+        let guard = super::InFlightGuard::acquire(&metrics);
+        let (target_tx, mut target_rx) = crossfire::oneshot::oneshot();
+        let mut slow = super::SlowQueueAggregator::default();
+        storage.forward_to_read_pool(
+            (target, target_tx, span, Instant::now(), guard),
+            StoragePriority::Bulk,
+            &mut slow,
+        );
+
+        match target_rx.try_recv() {
+            Ok(StorageEvent::Error {
+                error: StorageError::QueueFull,
+            }) => {}
+            other => panic!("expected QueueFull rejection, got {other:?}"),
+        }
+    }
 
     fn assert_write_result(event: Event, expected_key: &[u8]) {
         match event {
@@ -2011,7 +2449,8 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_stays_counted() {
-        let (handle, receiver) = StorageHandle::new();
+        let (handle, receivers) = StorageHandle::new();
+        let receiver = receivers.foreground;
         let mut probe = Box::pin(handle.send_storage_effect(StorageEffect::Read {
             key_space: "node_state".to_string(),
             key: b"node_state".to_vec().into(),
@@ -2036,7 +2475,8 @@ mod tests {
 
     #[tokio::test]
     async fn failed_enqueue_balances() {
-        let (handle, receiver) = StorageHandle::new();
+        let (handle, receivers) = StorageHandle::new();
+        let receiver = receivers.foreground;
         drop(receiver);
 
         let event = handle
@@ -2063,11 +2503,14 @@ mod tests {
             FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
         let StorageHandle {
             write_channel,
+            bulk_channel,
+            priority: _,
             metrics,
         } = handle;
 
         assert!(!metrics.channel_closed.load(Ordering::Relaxed));
         drop(write_channel);
+        drop(bulk_channel);
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while !metrics.channel_closed.load(Ordering::Relaxed) && Instant::now() < deadline {
@@ -2079,7 +2522,8 @@ mod tests {
 
     #[tokio::test]
     async fn sync_all_handle_surfaces_persist_errors() {
-        let (handle, receiver) = StorageHandle::new();
+        let (handle, receivers) = StorageHandle::new();
+        let receiver = receivers.foreground;
         thread::spawn(move || {
             let (effect, response_tx, _span, _enqueued_at, _in_flight) =
                 receiver.recv().expect("sync_all effect should arrive");
@@ -2719,7 +3163,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_effect_counts_conflicts_separately_from_errors() {
-        let (handle, receiver) = StorageHandle::new();
+        let (handle, receivers) = StorageHandle::new();
+        let receiver = receivers.foreground;
         thread::spawn(move || {
             let (effect, response_tx, _span, _enqueued_at, _in_flight) =
                 receiver.recv().expect("first effect should arrive");

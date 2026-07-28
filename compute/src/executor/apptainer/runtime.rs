@@ -53,14 +53,17 @@ pub fn supervisor(attempt_dir: &Path) -> Result<(), BackendError> {
             "invalid launcher readiness byte".to_string(),
         ));
     }
+    // Recorded before the launcher is released so a poll can report the start
+    // without waiting for the terminal status record.
+    let started_at_ms = now_ms();
     write_json(
         &attempt_dir.join("payload.json"),
         &PayloadRecord {
             process,
             cgroup: launch.cgroup.clone(),
+            started_at_ms: Some(started_at_ms),
         },
     )?;
-    let started_at_ms = now_ms();
     stream.write_all(&[1]).map_err(io_error)?;
     drop(stream);
 

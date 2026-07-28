@@ -11,6 +11,16 @@ pub trait Operation: Send + std::fmt::Debug + PartialEq {
     fn is_complete(&self) -> bool;
     fn finalize(self) -> Result<Self::Output, Self::Error>;
     fn abort(&mut self) -> Effects;
+
+    /// Whether an error is an ordinary client-visible outcome (not found, denied)
+    /// rather than an operational failure. Expected errors are logged at debug so
+    /// polling clients cannot flood the error stream and its span exporter.
+    fn expected_error(_error: &Self::Error) -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
 }
 
 pub trait SubOperation: Send + std::fmt::Debug {

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY};
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect, StoragePriority};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
@@ -36,9 +36,10 @@ use craqle::{
     Action as CraqleAction, ActorId, AllowAllAuthorizer, AuthorizationError as CraqleAuthError,
     Authorizer as CraqleAuthorizer, Batch, CraqleError, CraqleFjallPersistMode,
     CraqleIrokleOptions, CraqleNode, CraqleOptions, CraqleRequestDurability, CreateCrateRequest,
-    CreateEntityRequest, GraphId, GraphPolicy, PatchEntityRequest, RoCrateError, SearchStorage,
-    vocab,
+    CreateEntityRequest, DescribeRequest, GraphId, GraphPolicy, GraphSearchRequest,
+    PatchEntityRequest, RoCrateError, SearchRequest, SearchStorage, vocab,
 };
+use futures_util::FutureExt;
 use jsonwebtoken::DecodingKey;
 use oxrdf::{BlankNode, Dataset, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use serde::de::DeserializeOwned;
@@ -54,16 +55,20 @@ use super::protocol::{
     MetadataAuthToken, MetadataTransportMessage, encode_message, read_message,
     write_encoded_message, write_message,
 };
+use super::query_cache::{
+    CachedQuery, LocalScopeKind, MetadataQueryCache, ScopeDigest, graphs_digest, local_key,
+};
 use super::repository::{REGISTRY_FILL_PAGE_SIZE, iter_all_registry_effect, parse_registry_iter};
-use super::search_cursor::METADATA_SEARCH_MAX_PAGINATION_DEPTH;
+use super::search_cursor::{METADATA_SEARCH_MAX_PAGINATION_DEPTH, compare_hits};
 use super::search_enrichment::{hit_snippet, hit_title};
+use super::summary_cache::summary_cache;
 use crate::auth::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache,
     validate_aruna_bearer_token,
 };
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
-use crate::list_groups::ListGroupOperation;
+use crate::permission_rules::GroupPermissionRules;
 use crate::realm_peer::{RealmPeerError, ensure_realm_peer};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
@@ -80,6 +85,10 @@ const SYNC_MIRROR_REQUEST_TIMEOUT: Duration =
 const METADATA_GRAPH_SYNC_ATTEMPTS: usize = 3;
 const METADATA_GRAPH_SYNC_RETRY_AFTER: Duration = Duration::from_millis(250);
 const SLOW_METADATA_BACKEND_THRESHOLD: Duration = Duration::from_millis(100);
+// Craqle rebuilds a describe context per hit and Aruna maps one document per
+// graph, so search enrichment overlaps instead of memoizing; the craqle read
+// semaphore, not this task cap, is the real concurrency limit.
+const METADATA_ENRICH_TASKS: usize = 8;
 pub(crate) const METADATA_QUERY_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const METADATA_QUERY_MAX_ROWS: usize = 10_000;
 pub(crate) const METADATA_QUERY_MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
@@ -151,6 +160,9 @@ async fn create_sync_bucket(
 #[derive(Clone)]
 pub struct MetadataHandle {
     inner: Arc<MetadataInner>,
+    /// Lane for this handle's own storage reads. Background drains use the bulk
+    /// lane so their lifecycle reads stay off the foreground sync path.
+    storage_priority: StoragePriority,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -246,6 +258,7 @@ struct MetadataInner {
     document_sync_db: Option<fjall::OptimisticTxDatabase>,
     document_sync_persist_policy: FjallPersistPolicy,
     visibility_cache: MetadataVisibilityCache,
+    query_cache: MetadataQueryCache,
     craqle_permits: Arc<tokio::sync::Semaphore>,
     craqle_read_permits: Arc<tokio::sync::Semaphore>,
     deferred_persist_requested: AtomicBool,
@@ -347,11 +360,6 @@ impl RegistryCacheEntry {
 struct LifecycleDeletedCacheEntry {
     deleted: bool,
     expires_at: Instant,
-}
-
-struct MetadataGraphDeletedRead {
-    deleted: bool,
-    cache_hit: bool,
 }
 
 struct VisibilityFillResult {
@@ -731,12 +739,29 @@ impl MetadataHandle {
                 document_sync_db,
                 document_sync_persist_policy: metadata_options.document_sync_persist_policy,
                 visibility_cache: MetadataVisibilityCache::new(),
+                query_cache: MetadataQueryCache::new(),
                 craqle_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
                 craqle_read_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
                 deferred_persist_requested: AtomicBool::new(false),
                 deferred_persist_running: AtomicBool::new(false),
             }),
+            storage_priority: StoragePriority::Foreground,
         })
+    }
+
+    /// A handle whose own storage reads dispatch on the bulk lane.
+    pub fn bulk(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            storage_priority: StoragePriority::Bulk,
+        }
+    }
+
+    fn lifecycle_storage(&self) -> StorageHandle {
+        match self.storage_priority {
+            StoragePriority::Foreground => self.inner.storage_handle.clone(),
+            StoragePriority::Bulk => self.inner.storage_handle.bulk(),
+        }
     }
 
     pub fn upsert_cached_registry_record(&self, record: MetadataRegistryRecord) {
@@ -791,14 +816,18 @@ impl MetadataHandle {
             let authorizer = AllowedGraphAuthorizer {
                 graph_iris: HashSet::from([graph_iri.clone()]),
             };
-            inner
-                .node
-                .describe_subject(&authorizer, &GraphId::new(&graph_iri), &graph_iri)
-                .map(decode_hit_properties)
-                .unwrap_or_default()
+            describe_hit_properties(&inner.node, &authorizer, &graph_iri, &graph_iri)
         })
         .await
         .unwrap_or_default()
+    }
+
+    pub(super) fn query_cache(&self) -> &MetadataQueryCache {
+        &self.inner.query_cache
+    }
+
+    pub(super) fn visibility_generation(&self) -> u64 {
+        self.inner.visibility_cache.current_generation()
     }
 
     /// Test hook: marks all visibility cache entries as expired so the next
@@ -859,11 +888,12 @@ impl MetadataHandle {
                 elapsed_ms = field::Empty,
             );
             let started = Instant::now();
-            let result = metadata_graph_deleted(self.inner.clone(), graph_iri)
-                .instrument(span.clone())
-                .await;
+            let result =
+                metadata_graph_deleted(self.inner.clone(), self.lifecycle_storage(), graph_iri)
+                    .instrument(span.clone())
+                    .await;
             match result {
-                Ok(read) if read.deleted => {
+                Ok(true) => {
                     span.record("deleted", true);
                     record_elapsed_ms(&span, "elapsed_ms", started);
                     match &effect {
@@ -891,7 +921,7 @@ impl MetadataHandle {
                         _ => {}
                     }
                 }
-                Ok(_) => {
+                Ok(false) => {
                     span.record("deleted", false);
                     record_elapsed_ms(&span, "elapsed_ms", started);
                 }
@@ -964,7 +994,8 @@ impl MetadataHandle {
                 let started = Instant::now();
                 // Heavy mutations and cheap reads queue on separate pools so
                 // trivial reads never wait behind long materializations.
-                let permits = if metadata_effect_mutates_graph(&other) {
+                let mutates_graph = metadata_effect_mutates_graph(&other);
+                let permits = if mutates_graph {
                     self.inner.craqle_permits.clone()
                 } else {
                     self.inner.craqle_read_permits.clone()
@@ -986,6 +1017,12 @@ impl MetadataHandle {
                 };
                 record_elapsed_ms(&span, "elapsed_ms", started);
                 span.record("result", metadata_event_kind(&metadata_event));
+                // WAL-replayed applies skip the lifecycle read and never touch
+                // the visibility generation, so cached results are only
+                // invalidated by this counter.
+                if mutates_graph && !matches!(metadata_event, MetadataEvent::Error { .. }) {
+                    self.inner.query_cache.bump_apply();
+                }
                 Event::Metadata(metadata_event)
             }
         }
@@ -993,14 +1030,24 @@ impl MetadataHandle {
 
     pub async fn reconcile_document_sync(&self) -> Result<usize, MetadataError> {
         let inner = self.inner.clone();
-        tokio::task::spawn_blocking(move || inner.node.reconcile_irokle())
+        let applied = tokio::task::spawn_blocking(move || inner.node.reconcile_irokle())
             .await
             .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
-            .map_err(|error| MetadataError::Backend(error.to_string()))
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        // Peer document sync writes graphs without emitting an effect, so each
+        // graph the pass touched drops its summary, which may be keyed on a
+        // cursor that already led the content those records just landed.
+        if !applied.is_empty() {
+            self.inner.query_cache.bump_apply();
+            for graph in &applied {
+                summary_cache().remove(graph.as_str());
+            }
+        }
+        Ok(applied.len())
     }
 
     pub async fn prune_graph_if_deleted(&self, graph_iri: String) -> Result<bool, MetadataError> {
-        if !graph_lifecycle_deleted(self.inner.storage_handle.clone(), &graph_iri).await? {
+        if !graph_lifecycle_deleted(self.lifecycle_storage(), &graph_iri).await? {
             return Ok(false);
         }
         self.inner
@@ -2039,9 +2086,7 @@ async fn ensure_remote_metadata_peer_is_configured_for_realm(
                 "remote metadata peer `{peer}` is not configured in realm `{realm_id}`"
             )))
         }
-        Event::Storage(StorageEvent::Error { error }) => Err(MetadataError::Backend(format!(
-            "realm config read failed for `{realm_id}`: {error}"
-        ))),
+        Event::Storage(StorageEvent::Error { error }) => Err(MetadataError::Storage(error)),
         other => Err(MetadataError::Backend(format!(
             "unexpected realm config read result for `{realm_id}`: {other:?}"
         ))),
@@ -2094,9 +2139,7 @@ where
             postcard::from_bytes(&bytes).map_err(|error| MetadataError::Backend(error.to_string()))
         }
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(T::default()),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(MetadataError::Backend(error.to_string()))
-        }
+        Event::Storage(StorageEvent::Error { error }) => Err(MetadataError::Storage(error)),
         other => Err(MetadataError::Backend(format!(
             "unexpected metadata auth state read result: {other:?}"
         ))),
@@ -2121,9 +2164,7 @@ async fn graph_lifecycle_record(
                     .map_err(|error| MetadataError::Backend(error.to_string()))
             })
             .transpose(),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(MetadataError::Backend(error.to_string()))
-        }
+        Event::Storage(StorageEvent::Error { error }) => Err(MetadataError::Storage(error)),
         other => Err(MetadataError::Backend(format!(
             "unexpected metadata graph lifecycle read result: {other:?}"
         ))),
@@ -2132,23 +2173,18 @@ async fn graph_lifecycle_record(
 
 async fn metadata_graph_deleted(
     inner: Arc<MetadataInner>,
+    storage_handle: StorageHandle,
     graph_iri: &str,
-) -> Result<MetadataGraphDeletedRead, MetadataError> {
+) -> Result<bool, MetadataError> {
     if let Some((true, _)) = inner.visibility_cache.lifecycle_deleted_any(graph_iri) {
-        return Ok(MetadataGraphDeletedRead {
-            deleted: true,
-            cache_hit: true,
-        });
+        return Ok(true);
     }
 
-    let deleted = graph_lifecycle_deleted(inner.storage_handle.clone(), graph_iri).await?;
+    let deleted = graph_lifecycle_deleted(storage_handle, graph_iri).await?;
     inner
         .visibility_cache
         .store_lifecycle_deleted(graph_iri.to_string(), deleted);
-    Ok(MetadataGraphDeletedRead {
-        deleted,
-        cache_hit: false,
-    })
+    Ok(deleted)
 }
 
 async fn graph_lifecycle_deleted(
@@ -2974,7 +3010,7 @@ fn flush_document_sync_journal(
         }
         Err(error) => {
             record_error(&span, &error.to_string());
-            Err(MetadataError::Backend(format!(
+            Err(MetadataError::Persist(format!(
                 "failed to flush document sync journal: {error}"
             )))
         }
@@ -2989,7 +3025,7 @@ fn flush_metadata_persistence(
     inner
         .node
         .persist_fjall()
-        .map_err(metadata_error_from_craqle)?;
+        .map_err(|error| MetadataError::Persist(error.to_string()))?;
     flush_document_sync_journal(inner, effect_name, graph_iri)
 }
 
@@ -3596,6 +3632,11 @@ fn metadata_error_from_craqle(error: CraqleError) -> MetadataError {
         CraqleError::Update(craqle::UpdateError::ValidationFailed(violations)) => {
             metadata_violations(violations)
         }
+        // Backend infrastructure, not the document: an apply that fails on disk
+        // or in the search worker must keep retrying instead of being parked.
+        error @ (CraqleError::Io(_) | CraqleError::Store(_) | CraqleError::SearchWorker(_)) => {
+            MetadataError::Persist(error.to_string())
+        }
         other => MetadataError::Backend(other.to_string()),
     }
 }
@@ -4176,9 +4217,7 @@ async fn list_deleted_graph_iris(
                 next_start_after,
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => {
-                return Err(MetadataError::Backend(format!(
-                    "metadata graph lifecycle iteration failed: {error:?}"
-                )));
+                return Err(MetadataError::Storage(error));
             }
             other => {
                 return Err(MetadataError::Backend(format!(
@@ -4303,6 +4342,7 @@ async fn warn_unprojected_graphs(inner: Arc<MetadataInner>, records: &[MetadataR
         result = field::Empty,
         row_count = field::Empty,
         triple_count = field::Empty,
+        cache = field::Empty,
     )
 )]
 async fn query_local_graphs(
@@ -4314,6 +4354,11 @@ async fn query_local_graphs(
     let span = Span::current();
     let total_started = Instant::now();
     let query = parse_metadata_query(&sparql)?;
+    // Stamped before any read so a mutation racing this query invalidates the
+    // entry it stores.
+    let cache_stamp = inner
+        .query_cache
+        .stamp(inner.visibility_cache.current_generation());
 
     let records = list_registry_records_for_local_read(inner.clone(), &span).await?;
 
@@ -4342,10 +4387,32 @@ async fn query_local_graphs(
             false
         }
         LocalReadScope::Lazy(scope) => {
-            span.record("readable_groups", scope.readable_groups.len() as u64);
+            span.record("readable_groups", scope.permissions.group_count() as u64);
             true
         }
     };
+
+    let cache_key = match &scope {
+        LocalReadScope::Eager(allowed) => {
+            local_key(LocalScopeKind::Eager, &graphs_digest(allowed), &sparql)
+        }
+        LocalReadScope::Lazy(scope) => local_key(
+            LocalScopeKind::Lazy,
+            &scope.visible_digest(&inner.visibility_cache),
+            &sparql,
+        ),
+    };
+    if let Some(cached) = inner
+        .query_cache
+        .get(&cache_key, cache_stamp, Instant::now())
+    {
+        span.record("cache", "hit");
+        span.record("result", cached.results.kind());
+        record_metadata_query_result_counts(&span, &cached.results);
+        record_elapsed_ms(&span, "elapsed_ms", total_started);
+        return Ok((*cached.results).clone());
+    }
+    span.record("cache", "miss");
 
     let query_span = debug_span!(
         "metadata.backend.craqle.query_graphs",
@@ -4361,6 +4428,7 @@ async fn query_local_graphs(
         query_span.record("graph_count", allowed.len() as u64);
     }
     let blocking_span = query_span.clone();
+    let cache_inner = inner.clone();
     let query_started = Instant::now();
     // Queries are reads: take from the read pool so they never queue behind
     // long-running materializations holding the mutation permits.
@@ -4406,6 +4474,19 @@ async fn query_local_graphs(
             span.record("result", results.kind());
             record_metadata_query_result_counts(&query_span, results);
             record_metadata_query_result_counts(&span, results);
+            let stored = cache_inner.query_cache.insert(
+                cache_key,
+                CachedQuery {
+                    results: Arc::new(results.clone()),
+                    nodes_queried: 0,
+                },
+                cache_stamp,
+                cache_inner.visibility_cache.current_generation(),
+                Instant::now(),
+            );
+            if stored {
+                span.record("cache", "stored");
+            }
         }
         Err(error) => {
             record_error(&query_span, &error.to_string());
@@ -4741,6 +4822,8 @@ fn snapshot_iri_references(
         graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
         registry_records = field::Empty,
         authorized_graphs = field::Empty,
+        readable_groups = field::Empty,
+        lazy = field::Empty,
         registry_ms = field::Empty,
         authorization_ms = field::Empty,
         craqle_search_ms = field::Empty,
@@ -4763,6 +4846,168 @@ async fn search_local_graphs(
     let total_started = Instant::now();
 
     let records = list_registry_records_for_local_read(inner.clone(), &span).await?;
+    // Without a candidate filter the request spans the realm, so craqle
+    // authorizes the index hits it returns instead of every visible graph.
+    let lazy = iri_filter.is_none() && graph_iris.is_none() && group_id.is_none();
+    span.record("lazy", lazy);
+
+    let result = if lazy {
+        search_realm_scope(inner, auth_context, records, query, limit, &span).await
+    } else {
+        search_candidate_graphs(
+            inner,
+            auth_context,
+            records,
+            graph_iris,
+            query,
+            limit,
+            group_id,
+            iri_filter,
+            &span,
+        )
+        .await
+    };
+
+    match &result {
+        Ok(hits) => {
+            span.record("result", "ok");
+            span.record("hit_count", hits.len() as u64);
+        }
+        Err(error) => record_error(&span, &error.to_string()),
+    }
+    record_elapsed_ms(&span, "elapsed_ms", total_started);
+    result
+}
+
+fn record_backend_search(
+    span: &Span,
+    search_span: &Span,
+    started: Instant,
+    result: &Result<Vec<MetadataSearchHit>, MetadataError>,
+) {
+    let elapsed = started.elapsed();
+    record_duration_ms(search_span, "elapsed_ms", elapsed);
+    record_duration_ms(span, "craqle_search_ms", elapsed);
+    match result {
+        Ok(hits) => {
+            search_span.record("result", "ok");
+            search_span.record("hit_count", hits.len() as u64);
+        }
+        Err(error) => record_error(search_span, &error.to_string()),
+    }
+    warn_if_slow_metadata_backend("search", None, elapsed);
+}
+
+async fn search_realm_scope(
+    inner: Arc<MetadataInner>,
+    auth_context: Option<AuthContext>,
+    records: Arc<Vec<MetadataRegistryRecord>>,
+    query: String,
+    limit: usize,
+    span: &Span,
+) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+    let authorization_started = Instant::now();
+    let scope = resolve_graph_visibility_scope(&inner, auth_context, records)
+        .boxed()
+        .await?;
+    record_elapsed_ms(span, "authorization_ms", authorization_started);
+    span.record("readable_groups", scope.permissions.group_count() as u64);
+    if limit == 0 || scope.records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let search_span = debug_span!(
+        "metadata.backend.craqle.search",
+        lazy = true,
+        query_len = query.len() as u64,
+        limit = limit as u64,
+        elapsed_ms = field::Empty,
+        result = field::Empty,
+        hit_count = field::Empty,
+    );
+    let search_started = Instant::now();
+    let result = search_visible_scope(&inner, Arc::new(scope), query, limit, &search_span).await;
+    record_backend_search(span, &search_span, search_started, &result);
+    result
+}
+
+// Craqle post-filters the index hits it returns through the request's already
+// resolved scope, so the work scales with the page instead of the realm.
+async fn search_visible_scope(
+    inner: &Arc<MetadataInner>,
+    scope: Arc<GraphVisibilityScope>,
+    query: String,
+    limit: usize,
+    search_span: &Span,
+) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+    let describe = scope_hit_describe(inner, &scope);
+    let mut hits = {
+        let task_inner = inner.clone();
+        let task_scope = scope.clone();
+        let task_query = query.clone();
+        let blocking_span = search_span.clone();
+        let _permit = inner.craqle_read_permits.clone().acquire_owned().await.ok();
+        tokio::task::spawn_blocking(move || {
+            blocking_span.in_scope(|| {
+                let authorizer = ScopeAuthorizer {
+                    scope: &task_scope,
+                    visibility_cache: &task_inner.visibility_cache,
+                };
+                task_inner
+                    .node
+                    .search(
+                        &authorizer,
+                        SearchRequest {
+                            query: &task_query,
+                            limit,
+                        },
+                    )
+                    .map_err(|error| MetadataError::Backend(error.to_string()))
+            })
+        })
+        .await
+        .map_err(|error| MetadataError::TaskJoin(error.to_string()))??
+    };
+    hits.retain(|hit| scope.record_for_graph(&hit.graph_id).is_some());
+    let targets = hits
+        .iter()
+        .map(|hit| (hit.graph_id.clone(), hit.subject_iri.clone()))
+        .collect::<Vec<_>>();
+    let properties =
+        describe_hits_parallel(&inner.craqle_read_permits, targets, describe, search_span).await;
+    let mut visible = hits
+        .into_iter()
+        .zip(properties)
+        .filter_map(|(hit, properties)| {
+            let record = scope.record_for_graph(&hit.graph_id)?;
+            Some(metadata_search_hit_from_craqle(
+                hit,
+                record,
+                &properties,
+                &query,
+            ))
+        })
+        .collect::<Vec<_>>();
+    // The unfiltered entry point returns raw index order; the search cursor's
+    // watermark needs the merged score-descending order instead.
+    visible.sort_by(compare_hits);
+    Ok(visible)
+}
+
+// Requests narrowed by graph, group, or IRI filter keep a genuine candidate
+// set, so pre-filtering it stays cheaper than post-filtering the whole index.
+#[allow(clippy::too_many_arguments)]
+async fn search_candidate_graphs(
+    inner: Arc<MetadataInner>,
+    auth_context: Option<AuthContext>,
+    records: Arc<Vec<MetadataRegistryRecord>>,
+    graph_iris: Option<Vec<String>>,
+    query: String,
+    limit: usize,
+    group_id: Option<GroupId>,
+    iri_filter: Option<(String, String)>,
+    span: &Span,
+) -> Result<Vec<MetadataSearchHit>, MetadataError> {
     let iri_matches = match iri_filter.as_ref() {
         Some((predicate_iri, object_iri)) => Some(
             super::iri_index::lookup_metadata_iri_references(
@@ -4790,13 +5035,10 @@ async fn search_local_graphs(
     let allowed_records =
         select_authorized_records(inner.clone(), auth_context, records, graph_iris, group_id)
             .await?;
-    record_elapsed_ms(&span, "authorization_ms", authorization_started);
+    record_elapsed_ms(span, "authorization_ms", authorization_started);
     span.record("authorized_graphs", allowed_records.len() as u64);
 
     if limit == 0 || allowed_records.is_empty() {
-        span.record("result", "ok");
-        span.record("hit_count", 0u64);
-        record_elapsed_ms(&span, "elapsed_ms", total_started);
         return Ok(Vec::new());
     }
 
@@ -4807,54 +5049,43 @@ async fn search_local_graphs(
             .iter()
             .map(|record| record.graph_iri.clone())
             .collect::<HashSet<_>>();
-        let _permit = inner.craqle_read_permits.clone().acquire_owned().await.ok();
-        let hits = match tokio::task::spawn_blocking(move || {
-            let authorizer = AllowedGraphAuthorizer {
+        let describe = allowed_hit_describe(
+            &inner,
+            Arc::new(AllowedGraphAuthorizer {
                 graph_iris: allowed_graphs,
-            };
-            let mut hits = allowed_records
-                .into_iter()
-                .filter_map(|record| {
-                    let subject_iri = matches.get(&record.document_id)?.first()?.clone();
-                    let properties = inner
-                        .node
-                        .describe_subject(
-                            &authorizer,
-                            &GraphId::new(&record.graph_iri),
-                            &subject_iri,
-                        )
-                        .map(decode_hit_properties)
-                        .unwrap_or_default();
-                    let title = super::search_enrichment::hit_title(
-                        &properties,
-                        &record.document_path,
-                        &subject_iri,
-                    );
-                    Some(MetadataSearchHit {
-                        document_id: record.document_id.to_string(),
-                        group_id: record.group_id.to_string(),
-                        document_path: record.document_path,
-                        graph_iri: record.graph_iri,
-                        subject_iri,
-                        score: 1.0,
-                        title,
-                        snippet: None,
-                    })
-                })
-                .collect::<Vec<_>>();
-            hits.sort_by(|left, right| left.document_id.cmp(&right.document_id));
-            hits.truncate(limit);
-            hits
-        })
-        .await
-        {
-            Ok(hits) => hits,
-            Err(error) => return Err(MetadataError::TaskJoin(error.to_string())),
-        };
-        span.record("result", "ok");
-        span.record("hit_count", hits.len() as u64);
-        record_elapsed_ms(&span, "elapsed_ms", total_started);
-        return Ok(hits);
+            }),
+        );
+        // The page is ordered by document id alone, so it is cut before the
+        // describes instead of enriching every candidate.
+        let mut candidates = allowed_records
+            .into_iter()
+            .filter_map(|record| {
+                let subject_iri = matches.get(&record.document_id)?.first()?.clone();
+                Some((record, subject_iri))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(record, _)| record.document_id);
+        candidates.truncate(limit);
+        let targets = candidates
+            .iter()
+            .map(|(record, subject_iri)| (record.graph_iri.clone(), subject_iri.clone()))
+            .collect::<Vec<_>>();
+        let properties =
+            describe_hits_parallel(&inner.craqle_read_permits, targets, describe, span).await;
+        return Ok(candidates
+            .into_iter()
+            .zip(properties)
+            .map(|((record, subject_iri), properties)| MetadataSearchHit {
+                document_id: record.document_id.to_string(),
+                group_id: record.group_id.to_string(),
+                title: hit_title(&properties, &record.document_path, &subject_iri),
+                document_path: record.document_path,
+                graph_iri: record.graph_iri,
+                subject_iri,
+                score: 1.0,
+                snippet: None,
+            })
+            .collect());
     }
 
     let by_graph: HashMap<_, _> = allowed_records
@@ -4876,66 +5107,176 @@ async fn search_local_graphs(
         result = field::Empty,
         hit_count = field::Empty,
     );
-    let blocking_span = search_span.clone();
     let search_started = Instant::now();
-    let _permit = inner.craqle_read_permits.clone().acquire_owned().await.ok();
-    let result = match tokio::task::spawn_blocking(move || {
-        blocking_span.in_scope(|| {
-            let authorizer = AllowedGraphAuthorizer {
-                graph_iris: allowed_graphs,
-            };
-            let hits = inner
-                .node
-                .search_graphs(&authorizer, &graph_ids, &query, limit)
-                .map_err(|error| MetadataError::Backend(error.to_string()))?;
-            let mut visible = Vec::with_capacity(hits.len().min(limit));
-            for hit in hits {
-                let Some(record) = by_graph.get(&hit.graph_id) else {
-                    continue;
-                };
-                // Enrichment is best-effort: a pending or raced projection must
-                // never fail the search, so fall back to an empty property set.
-                let properties = inner
-                    .node
-                    .describe_subject(&authorizer, &GraphId::new(&hit.graph_id), &hit.subject_iri)
-                    .map(decode_hit_properties)
-                    .unwrap_or_default();
-                visible.push(metadata_search_hit_from_craqle(
-                    hit,
-                    record,
-                    &properties,
-                    &query,
-                ));
-                if visible.len() >= limit {
-                    break;
-                }
-            }
-            Ok(visible)
-        })
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => Err(MetadataError::TaskJoin(error.to_string())),
-    };
-    let search_elapsed = search_started.elapsed();
-    record_duration_ms(&search_span, "elapsed_ms", search_elapsed);
-    record_duration_ms(&span, "craqle_search_ms", search_elapsed);
-    match &result {
-        Ok(hits) => {
-            search_span.record("result", "ok");
-            span.record("result", "ok");
-            search_span.record("hit_count", hits.len() as u64);
-            span.record("hit_count", hits.len() as u64);
-        }
-        Err(error) => {
-            record_error(&search_span, &error.to_string());
-            record_error(&span, &error.to_string());
-        }
-    }
-    warn_if_slow_metadata_backend("search", None, search_elapsed);
-    record_elapsed_ms(&span, "elapsed_ms", total_started);
+    let authorizer = Arc::new(AllowedGraphAuthorizer {
+        graph_iris: allowed_graphs,
+    });
+    let result = search_allowed_graphs(
+        &inner,
+        authorizer,
+        by_graph,
+        graph_ids,
+        &query,
+        limit,
+        &search_span,
+    )
+    .await;
+    record_backend_search(span, &search_span, search_started, &result);
     result
+}
+
+async fn search_allowed_graphs(
+    inner: &Arc<MetadataInner>,
+    authorizer: Arc<AllowedGraphAuthorizer>,
+    by_graph: HashMap<String, MetadataRegistryRecord>,
+    graph_ids: Vec<GraphId>,
+    query: &str,
+    limit: usize,
+    search_span: &Span,
+) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+    let describe = allowed_hit_describe(inner, authorizer.clone());
+    let hits = {
+        let task_inner = inner.clone();
+        let task_query = query.to_string();
+        let blocking_span = search_span.clone();
+        let _permit = inner.craqle_read_permits.clone().acquire_owned().await.ok();
+        tokio::task::spawn_blocking(move || {
+            blocking_span.in_scope(|| {
+                task_inner
+                    .node
+                    .search_graphs(
+                        authorizer.as_ref(),
+                        GraphSearchRequest {
+                            graphs: &graph_ids,
+                            query: &task_query,
+                            limit,
+                        },
+                    )
+                    .map_err(|error| MetadataError::Backend(error.to_string()))
+            })
+        })
+        .await
+        .map_err(|error| MetadataError::TaskJoin(error.to_string()))??
+    };
+    let hits = hits
+        .into_iter()
+        .filter(|hit| by_graph.contains_key(&hit.graph_id))
+        .take(limit)
+        .collect::<Vec<_>>();
+    let targets = hits
+        .iter()
+        .map(|hit| (hit.graph_id.clone(), hit.subject_iri.clone()))
+        .collect::<Vec<_>>();
+    let properties =
+        describe_hits_parallel(&inner.craqle_read_permits, targets, describe, search_span).await;
+    Ok(hits
+        .into_iter()
+        .zip(properties)
+        .filter_map(|(hit, properties)| {
+            let record = by_graph.get(&hit.graph_id)?;
+            Some(metadata_search_hit_from_craqle(
+                hit,
+                record,
+                &properties,
+                query,
+            ))
+        })
+        .collect())
+}
+
+/// Describes one hit's `(graph_iri, subject_iri)` against a fixed authorizer.
+type HitDescribe = Arc<dyn Fn(&str, &str) -> Vec<(String, Term)> + Send + Sync>;
+
+/// Enriches hits in parallel, one blocking task per chunk of `targets`.
+///
+/// The returned properties align with `targets` by index: chunks stay
+/// contiguous and are concatenated in chunk order, so hit order never depends
+/// on which task finished first.
+async fn describe_hits_parallel(
+    read_permits: &Arc<tokio::sync::Semaphore>,
+    targets: Vec<(String, String)>,
+    describe: HitDescribe,
+    span: &Span,
+) -> Vec<Vec<(String, Term)>> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let chunk_size = targets.len().div_ceil(METADATA_ENRICH_TASKS);
+    let tasks = targets
+        .chunks(chunk_size)
+        .map(<[(String, String)]>::to_vec)
+        .map(|chunk| {
+            let permits = read_permits.clone();
+            let describe = describe.clone();
+            let span = span.clone();
+            async move {
+                let chunk_len = chunk.len();
+                let _permit = permits.acquire_owned().await.ok();
+                tokio::task::spawn_blocking(move || {
+                    span.in_scope(|| {
+                        chunk
+                            .iter()
+                            .map(|(graph_iri, subject_iri)| describe(graph_iri, subject_iri))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    warn!(%error, "metadata search enrichment task failed");
+                    vec![Vec::new(); chunk_len]
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    futures_util::future::join_all(tasks)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+fn scope_hit_describe(
+    inner: &Arc<MetadataInner>,
+    scope: &Arc<GraphVisibilityScope>,
+) -> HitDescribe {
+    let inner = inner.clone();
+    let scope = scope.clone();
+    Arc::new(move |graph_iri, subject_iri| {
+        let authorizer = ScopeAuthorizer {
+            scope: &scope,
+            visibility_cache: &inner.visibility_cache,
+        };
+        describe_hit_properties(&inner.node, &authorizer, graph_iri, subject_iri)
+    })
+}
+
+fn allowed_hit_describe(
+    inner: &Arc<MetadataInner>,
+    authorizer: Arc<AllowedGraphAuthorizer>,
+) -> HitDescribe {
+    let inner = inner.clone();
+    Arc::new(move |graph_iri, subject_iri| {
+        describe_hit_properties(&inner.node, authorizer.as_ref(), graph_iri, subject_iri)
+    })
+}
+
+// Enrichment is best-effort: a pending or raced projection must never fail the
+// search, so fall back to an empty property set.
+fn describe_hit_properties(
+    node: &CraqleNode,
+    authorizer: &dyn CraqleAuthorizer,
+    graph_iri: &str,
+    subject_iri: &str,
+) -> Vec<(String, Term)> {
+    node.describe_subject(
+        authorizer,
+        DescribeRequest {
+            graph: &GraphId::new(graph_iri),
+            subject_id: subject_iri,
+        },
+    )
+    .map(decode_hit_properties)
+    .unwrap_or_default()
 }
 
 fn clamp_remote_search_graph_limit(limit: usize) -> usize {
@@ -4964,6 +5305,38 @@ impl CraqleAuthorizer for AllowedGraphAuthorizer {
     }
 }
 
+/// Lazy counterpart of [`AllowedGraphAuthorizer`], answering craqle per hit.
+///
+/// Craqle's stored policy is ignored on purpose: the registry record, the
+/// lifecycle tombstones and the caller's collected rules are authoritative
+/// here, and a graph without a registry record stays invisible.
+struct ScopeAuthorizer<'a> {
+    scope: &'a GraphVisibilityScope,
+    visibility_cache: &'a MetadataVisibilityCache,
+}
+
+impl CraqleAuthorizer for ScopeAuthorizer<'_> {
+    fn authorize(
+        &self,
+        graph: &GraphId,
+        _policy: &GraphPolicy,
+        action: CraqleAction,
+    ) -> Result<(), CraqleAuthError> {
+        if matches!(action, CraqleAction::Read)
+            && self
+                .scope
+                .graph_visible(self.visibility_cache, graph.as_str())
+        {
+            return Ok(());
+        }
+
+        Err(CraqleAuthError::PermissionDenied {
+            action,
+            graph: graph.as_str().to_string(),
+        })
+    }
+}
+
 async fn list_visible_graphs(inner: Arc<MetadataInner>) -> Result<Vec<String>, MetadataError> {
     let graphs = tokio::task::spawn_blocking({
         let inner = inner.clone();
@@ -4976,10 +5349,7 @@ async fn list_visible_graphs(inner: Arc<MetadataInner>) -> Result<Vec<String>, M
     let mut visible = Vec::with_capacity(graphs.len());
     for graph in graphs {
         let graph_iri = graph.as_str().to_string();
-        if !metadata_graph_deleted(inner.clone(), &graph_iri)
-            .await?
-            .deleted
-        {
+        if !metadata_graph_deleted(inner.clone(), inner.storage_handle.clone(), &graph_iri).await? {
             visible.push(graph_iri);
         }
     }
@@ -5030,96 +5400,99 @@ async fn select_authorized_records(
     let span = Span::current();
     let started = Instant::now();
     let allowed_graphs = graph_filter.map(|graphs| graphs.into_iter().collect::<HashSet<_>>());
-    let mut visible = Vec::new();
-    let mut deleted_count = 0usize;
-    let mut filtered_count = 0usize;
-    let mut lifecycle_cache_hits = 0usize;
-    let mut lifecycle_cache_misses = 0usize;
-    let mut public_count = 0usize;
-    let mut private_checked_count = 0usize;
-    let mut denied_count = 0usize;
-    for record in records.iter() {
-        if let Some(filter) = allowed_graphs.as_ref()
-            && !filter.contains(&record.graph_iri)
-        {
-            filtered_count += 1;
-            continue;
-        }
-        if let Some(group_id) = group_id
-            && record.group_id != group_id
-        {
-            filtered_count += 1;
-            continue;
-        }
-        let deleted = metadata_graph_deleted(inner.clone(), &record.graph_iri).await?;
-        if deleted.cache_hit {
-            lifecycle_cache_hits += 1;
-        } else {
-            lifecycle_cache_misses += 1;
-        }
-        if deleted.deleted {
-            deleted_count += 1;
+    let record_count = records.len();
+    // Filtering first keeps the scope resolution to the groups and lifecycle
+    // entries a filtered request can still see.
+    let candidates = filter_candidate_records(records, allowed_graphs.as_ref(), group_id);
+    let filtered_count = record_count - candidates.len();
+
+    // Boxed so the read paths that already resolve a scope do not nest this
+    // future again: the combined depth exceeds the auto-trait recursion limit.
+    let scope = resolve_graph_visibility_scope(&inner, auth_context, candidates)
+        .boxed()
+        .await?;
+    let selection = select_visible_records(&scope, &inner.visibility_cache);
+    let evaluated = scope.records.len() as u64;
+    // Lifecycle is resolved once per request, so the cache counters report how
+    // the whole request was decided instead of per-record point reads.
+    let lifecycle_cached = matches!(scope.lifecycle_visibility, LifecycleVisibility::Cache);
+    span.record("visible_count", selection.visible.len() as u64);
+    span.record("deleted_count", selection.deleted as u64);
+    span.record("filtered_count", filtered_count as u64);
+    span.record(
+        "lifecycle_cache_hits",
+        if lifecycle_cached { evaluated } else { 0 },
+    );
+    span.record(
+        "lifecycle_cache_misses",
+        if lifecycle_cached { 0 } else { evaluated },
+    );
+    span.record("lifecycle_reads", 1u64);
+    span.record("public_count", selection.public as u64);
+    span.record("private_checked_count", selection.private as u64);
+    span.record("denied_count", selection.denied as u64);
+    record_elapsed_ms(&span, "elapsed_ms", started);
+    Ok(selection.visible)
+}
+
+fn filter_candidate_records(
+    records: Arc<Vec<MetadataRegistryRecord>>,
+    allowed_graphs: Option<&HashSet<String>>,
+    group_id: Option<GroupId>,
+) -> Arc<Vec<MetadataRegistryRecord>> {
+    if allowed_graphs.is_none() && group_id.is_none() {
+        return records;
+    }
+    Arc::new(
+        records
+            .iter()
+            .filter(|record| {
+                allowed_graphs.is_none_or(|graphs| graphs.contains(&record.graph_iri))
+                    && group_id.is_none_or(|group_id| record.group_id == group_id)
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
+struct RecordSelection {
+    visible: Vec<MetadataRegistryRecord>,
+    deleted: usize,
+    public: usize,
+    private: usize,
+    denied: usize,
+}
+
+// In-memory counterpart of the lazy scope decision: every record is decided
+// against the already resolved lifecycle snapshot and group rules.
+fn select_visible_records(
+    scope: &GraphVisibilityScope,
+    visibility_cache: &MetadataVisibilityCache,
+) -> RecordSelection {
+    let mut selection = RecordSelection {
+        visible: Vec::new(),
+        deleted: 0,
+        public: 0,
+        private: 0,
+        denied: 0,
+    };
+    for record in scope.records.iter() {
+        if scope.record_deleted(visibility_cache, &record.graph_iri) {
+            selection.deleted += 1;
             continue;
         }
         if record.public {
-            public_count += 1;
+            selection.public += 1;
         } else {
-            private_checked_count += 1;
+            selection.private += 1;
         }
-        if can_read_record_locally(inner.storage_handle.clone(), auth_context.clone(), record)
-            .await?
-        {
-            visible.push(record.clone());
+        if scope.permissions.record_visible(record) {
+            selection.visible.push(record.clone());
         } else {
-            denied_count += 1;
+            selection.denied += 1;
         }
     }
-    span.record("visible_count", visible.len() as u64);
-    span.record("deleted_count", deleted_count as u64);
-    span.record("filtered_count", filtered_count as u64);
-    span.record("lifecycle_cache_hits", lifecycle_cache_hits as u64);
-    span.record("lifecycle_cache_misses", lifecycle_cache_misses as u64);
-    span.record("lifecycle_reads", lifecycle_cache_misses as u64);
-    span.record("public_count", public_count as u64);
-    span.record("private_checked_count", private_checked_count as u64);
-    span.record("denied_count", denied_count as u64);
-    record_elapsed_ms(&span, "elapsed_ms", started);
-    Ok(visible)
-}
-
-async fn can_read_record_locally(
-    storage_handle: StorageHandle,
-    auth_context: Option<AuthContext>,
-    record: &MetadataRegistryRecord,
-) -> Result<bool, MetadataError> {
-    if record.public {
-        return Ok(true);
-    }
-    let Some(auth_context) = auth_context else {
-        return Ok(false);
-    };
-    if auth_context.realm_id != record.realm_id {
-        return Ok(false);
-    }
-
-    let context = DriverContext {
-        storage_handle,
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: None,
-        compute_handle: None,
-    };
-    drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context,
-            path: record.permission_path.clone(),
-            required_permission: Permission::READ,
-        }),
-        &context,
-    )
-    .await
-    .map_err(|error| MetadataError::Backend(error.to_string()))
+    selection
 }
 
 // All-metadata reads defer per-graph authorization to evaluation time: the
@@ -5132,8 +5505,7 @@ enum LocalReadScope<T> {
 
 struct GraphVisibilityScope {
     records: Arc<Vec<MetadataRegistryRecord>>,
-    auth_realm: Option<RealmId>,
-    readable_groups: HashSet<GroupId>,
+    permissions: GroupPermissionRules,
     lifecycle_visibility: LifecycleVisibility,
 }
 
@@ -5147,34 +5519,43 @@ impl GraphVisibilityScope {
         registry_record_for_graph(&self.records, graph_iri)
     }
 
+    // A tombstone in the request's own snapshot or in the cache hides the graph.
+    fn record_deleted(&self, visibility_cache: &MetadataVisibilityCache, graph_iri: &str) -> bool {
+        if matches!(
+            visibility_cache.lifecycle_deleted_any(graph_iri),
+            Some((true, _))
+        ) {
+            return true;
+        }
+        match &self.lifecycle_visibility {
+            LifecycleVisibility::Cache => false,
+            LifecycleVisibility::FreshDeletedGraphs(deleted_graphs) => {
+                deleted_graphs.contains(graph_iri)
+            }
+        }
+    }
+
     fn record_visible(
         &self,
         visibility_cache: &MetadataVisibilityCache,
         record: &MetadataRegistryRecord,
     ) -> bool {
-        match &self.lifecycle_visibility {
-            LifecycleVisibility::Cache => {
-                if matches!(
-                    visibility_cache.lifecycle_deleted_any(&record.graph_iri),
-                    Some((true, _))
-                ) {
-                    return false;
-                }
-            }
-            LifecycleVisibility::FreshDeletedGraphs(deleted_graphs) => {
-                if deleted_graphs.contains(&record.graph_iri)
-                    || matches!(
-                        visibility_cache.lifecycle_deleted_any(&record.graph_iri),
-                        Some((true, _))
-                    )
-                {
-                    return false;
-                }
+        // Rules are collected per group, but every record is decided on its own
+        // permission path, so per-document grants and denials agree with the
+        // decision `can_read_record` makes for the same caller and record.
+        !self.record_deleted(visibility_cache, &record.graph_iri)
+            && self.permissions.record_visible(record)
+    }
+
+    // Digest of every graph this scope may evaluate, in registry order.
+    fn visible_digest(&self, visibility_cache: &MetadataVisibilityCache) -> [u8; 32] {
+        let mut digest = ScopeDigest::default();
+        for record in self.records.iter() {
+            if self.record_visible(visibility_cache, record) {
+                digest.push(&record.graph_iri);
             }
         }
-        record.public
-            || (self.auth_realm == Some(record.realm_id)
-                && self.readable_groups.contains(&record.group_id))
+        digest.finish()
     }
 
     // Graphs without a registry record stay invisible (fail closed).
@@ -5215,42 +5596,26 @@ async fn resolve_graph_visibility_scope(
         LifecycleVisibility::FreshDeletedGraphs(lifecycle_refresh.deleted_graphs)
     };
     let auth_realm = auth_context.as_ref().map(|auth| auth.realm_id);
-    let mut readable_groups = HashSet::new();
-    if let Some(auth_context) = auth_context {
-        let context = DriverContext {
-            storage_handle: inner.storage_handle.clone(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
-        let groups = drive(ListGroupOperation::new(), &context)
-            .await
-            .map_err(|error| MetadataError::Backend(error.to_string()))?;
-        for group in groups {
-            if group.realm_id != auth_context.realm_id {
-                continue;
-            }
-            let readable = drive(
-                CheckPermissionsOperation::new(CheckPermissionsConfig {
-                    auth_context: auth_context.clone(),
-                    path: format!("/{}/g/{}/meta/**", group.realm_id, group.group_id),
-                    required_permission: Permission::READ,
-                }),
-                &context,
-            )
-            .await
-            .unwrap_or(false);
-            if readable {
-                readable_groups.insert(group.group_id);
-            }
-        }
-    }
+    let context = DriverContext {
+        storage_handle: inner.storage_handle.clone(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    };
+    let permissions = GroupPermissionRules::collect(
+        &context,
+        auth_context.as_ref(),
+        records
+            .iter()
+            .filter(|record| Some(record.realm_id) == auth_realm)
+            .map(|record| record.group_id),
+    )
+    .await;
     Ok(GraphVisibilityScope {
         records,
-        auth_realm,
-        readable_groups,
+        permissions,
         lifecycle_visibility,
     })
 }
@@ -5392,6 +5757,7 @@ mod tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
+    use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::{API_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::{
         ArunaArn, PathRestriction, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
@@ -5423,6 +5789,15 @@ mod tests {
         assert_eq!(violations[0].code, "missing_root_data_entity");
         assert_eq!(violations[0].pointer, "/@graph");
         assert_eq!(violations[0].entity_id.as_deref(), Some("./"));
+    }
+
+    #[test]
+    fn maps_io_failures() {
+        // Infrastructure must stay distinguishable from a rejected payload: the
+        // materialization queue retries the former forever and parks the latter.
+        let error = metadata_error_from_craqle(CraqleError::Io(std::io::Error::other("disk")));
+
+        assert!(matches!(error, MetadataError::Persist(_)));
     }
 
     #[test]
@@ -5952,8 +6327,7 @@ mod tests {
     }
 
     fn signing_key() -> SigningKey {
-        let mut rng = jsonwebtoken::signature::rand_core::OsRng;
-        SigningKey::generate(&mut rng)
+        generate_signing_key()
     }
 
     fn node_id_from_seed(seed: u8) -> NodeId {
@@ -6000,6 +6374,39 @@ mod tests {
             updated_at_ms: 0,
             last_event_id: Ulid::nil(),
         }
+    }
+
+    fn group_record(group_id: GroupId, document_path: &str) -> MetadataRegistryRecord {
+        let mut record = registry_record(document_path);
+        record.group_id = group_id;
+        record.public = false;
+        record.permission_path = MetadataRegistryRecord::permission_path_for(
+            &record.realm_id,
+            group_id,
+            document_path,
+            record.document_id,
+        );
+        record
+    }
+
+    fn read_rules(patterns: &[(&str, Permission)]) -> crate::permission_rules::PermissionRules {
+        crate::permission_rules::PermissionRules::from_roles(
+            vec![crate::permission_rules::CollectedRole {
+                role: aruna_core::structs::Role {
+                    role_id: Ulid::generate(),
+                    name: "test".to_string(),
+                    permissions: patterns
+                        .iter()
+                        .map(|(pattern, permission)| ((*pattern).to_string(), permission.clone()))
+                        .collect(),
+                    assigned_users: HashSet::new(),
+                },
+                direct: true,
+                public: false,
+            }],
+            None,
+        )
+        .expect("patterns compile")
     }
 
     fn filled_cache(records: Vec<MetadataRegistryRecord>) -> MetadataVisibilityCache {
@@ -6274,8 +6681,7 @@ mod tests {
 
         let anonymous = GraphVisibilityScope {
             records: Arc::new(records.clone()),
-            auth_realm: None,
-            readable_groups: HashSet::new(),
+            permissions: GroupPermissionRules::default(),
             lifecycle_visibility: LifecycleVisibility::Cache,
         };
         assert!(anonymous.graph_visible(&cache, &public_record.graph_iri));
@@ -6286,10 +6692,13 @@ mod tests {
             &MetadataRegistryRecord::graph_iri_for(Ulid::generate())
         ));
 
+        let readable = HashMap::from([(
+            private_record.group_id,
+            read_rules(&[(private_record.permission_path.as_str(), Permission::READ)]),
+        )]);
         let member = GraphVisibilityScope {
             records: Arc::new(records.clone()),
-            auth_realm: Some(realm),
-            readable_groups: HashSet::from([private_record.group_id]),
+            permissions: GroupPermissionRules::from_groups(Some(realm), readable.clone()),
             lifecycle_visibility: LifecycleVisibility::Cache,
         };
         assert!(member.graph_visible(&cache, &public_record.graph_iri));
@@ -6298,12 +6707,385 @@ mod tests {
 
         let wrong_realm = GraphVisibilityScope {
             records: Arc::new(records),
-            auth_realm: Some(RealmId([8u8; 32])),
-            readable_groups: HashSet::from([private_record.group_id]),
+            permissions: GroupPermissionRules::from_groups(Some(RealmId([8u8; 32])), readable),
             lifecycle_visibility: LifecycleVisibility::Cache,
         };
         assert!(wrong_realm.graph_visible(&cache, &public_record.graph_iri));
         assert!(!wrong_realm.graph_visible(&cache, &private_record.graph_iri));
+    }
+
+    #[test]
+    fn deny_hides_document() {
+        // A per-document DENY under a group-wide READ hides only that document.
+        let realm = RealmId([7u8; 32]);
+        let group_id = Ulid::generate();
+        let secret = group_record(group_id, "datasets/secret");
+        let open = group_record(group_id, "datasets/open");
+        let mut records = vec![secret.clone(), open.clone()];
+        records.sort_unstable_by_key(|record| record.document_id);
+
+        let rules = HashMap::from([(
+            group_id,
+            read_rules(&[
+                (
+                    format!("/{realm}/g/{group_id}/meta/**").as_str(),
+                    Permission::READ,
+                ),
+                (secret.permission_path.as_str(), Permission::DENY),
+            ]),
+        )]);
+        let scope = GraphVisibilityScope {
+            records: Arc::new(records),
+            permissions: GroupPermissionRules::from_groups(Some(realm), rules),
+            lifecycle_visibility: LifecycleVisibility::Cache,
+        };
+
+        let cache = MetadataVisibilityCache::new();
+        assert!(!scope.graph_visible(&cache, &secret.graph_iri));
+        assert!(scope.graph_visible(&cache, &open.graph_iri));
+    }
+
+    #[test]
+    fn narrow_grant_visible() {
+        // A grant on one document shows it without opening the whole group.
+        let realm = RealmId([7u8; 32]);
+        let group_id = Ulid::generate();
+        let granted = group_record(group_id, "datasets/shared");
+        let hidden = group_record(group_id, "datasets/hidden");
+        let mut records = vec![granted.clone(), hidden.clone()];
+        records.sort_unstable_by_key(|record| record.document_id);
+
+        let rules = HashMap::from([(
+            group_id,
+            read_rules(&[(granted.permission_path.as_str(), Permission::READ)]),
+        )]);
+        let scope = GraphVisibilityScope {
+            records: Arc::new(records),
+            permissions: GroupPermissionRules::from_groups(Some(realm), rules),
+            lifecycle_visibility: LifecycleVisibility::Cache,
+        };
+
+        let cache = MetadataVisibilityCache::new();
+        assert!(scope.graph_visible(&cache, &granted.graph_iri));
+        assert!(!scope.graph_visible(&cache, &hidden.graph_iri));
+    }
+
+    // Permissive on purpose: craqle's stored policy must not sway the decision.
+    fn open_policy() -> GraphPolicy {
+        GraphPolicy {
+            public: true,
+            permission_paths: Vec::new(),
+        }
+    }
+
+    fn admits(authorizer: &ScopeAuthorizer<'_>, graph_iri: &str) -> bool {
+        authorizer
+            .authorize(&GraphId::new(graph_iri), &open_policy(), CraqleAction::Read)
+            .is_ok()
+    }
+
+    #[test]
+    fn authorizer_admits_public() {
+        let public = registry_record("datasets/public");
+        let scope = scope_for(vec![public.clone()], GroupPermissionRules::default());
+        let cache = MetadataVisibilityCache::new();
+        let authorizer = ScopeAuthorizer {
+            scope: &scope,
+            visibility_cache: &cache,
+        };
+
+        assert!(admits(&authorizer, &public.graph_iri));
+        assert!(
+            authorizer
+                .authorize(
+                    &GraphId::new(&public.graph_iri),
+                    &open_policy(),
+                    CraqleAction::Write,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn authorizer_refuses_denied() {
+        // A per-document DENY under a group-wide grant hides only that document.
+        let realm = RealmId([7u8; 32]);
+        let group_id = Ulid::generate();
+        let secret = group_record(group_id, "datasets/secret");
+        let open = group_record(group_id, "datasets/open");
+        let rules = HashMap::from([(
+            group_id,
+            read_rules(&[
+                (
+                    format!("/{realm}/g/{group_id}/meta/**").as_str(),
+                    Permission::READ,
+                ),
+                (secret.permission_path.as_str(), Permission::DENY),
+            ]),
+        )]);
+        let scope = scope_for(
+            vec![secret.clone(), open.clone()],
+            GroupPermissionRules::from_groups(Some(realm), rules),
+        );
+        let cache = MetadataVisibilityCache::new();
+        let authorizer = ScopeAuthorizer {
+            scope: &scope,
+            visibility_cache: &cache,
+        };
+
+        assert!(!admits(&authorizer, &secret.graph_iri));
+        assert!(admits(&authorizer, &open.graph_iri));
+    }
+
+    #[test]
+    fn authorizer_admits_narrow() {
+        // A grant on one document shows it without opening the whole group.
+        let realm = RealmId([7u8; 32]);
+        let group_id = Ulid::generate();
+        let granted = group_record(group_id, "datasets/shared");
+        let hidden = group_record(group_id, "datasets/hidden");
+        let rules = HashMap::from([(
+            group_id,
+            read_rules(&[(granted.permission_path.as_str(), Permission::READ)]),
+        )]);
+        let scope = scope_for(
+            vec![granted.clone(), hidden.clone()],
+            GroupPermissionRules::from_groups(Some(realm), rules),
+        );
+        let cache = MetadataVisibilityCache::new();
+        let authorizer = ScopeAuthorizer {
+            scope: &scope,
+            visibility_cache: &cache,
+        };
+
+        assert!(admits(&authorizer, &granted.graph_iri));
+        assert!(!admits(&authorizer, &hidden.graph_iri));
+    }
+
+    #[test]
+    fn authorizer_refuses_deleted() {
+        // Craqle still holds the graph, so only our tombstone can hide it.
+        let deleted = registry_record("datasets/deleted");
+        let scope = scope_for(vec![deleted.clone()], GroupPermissionRules::default());
+        let cache = MetadataVisibilityCache::new();
+        cache.store_lifecycle_deleted(deleted.graph_iri.clone(), true);
+        let authorizer = ScopeAuthorizer {
+            scope: &scope,
+            visibility_cache: &cache,
+        };
+
+        assert!(!admits(&authorizer, &deleted.graph_iri));
+    }
+
+    #[test]
+    fn authorizer_refuses_unlisted() {
+        // Craqle may hold graphs the registry does not list; they stay hidden.
+        let known = registry_record("datasets/known");
+        let scope = scope_for(vec![known], GroupPermissionRules::default());
+        let cache = MetadataVisibilityCache::new();
+        let authorizer = ScopeAuthorizer {
+            scope: &scope,
+            visibility_cache: &cache,
+        };
+
+        assert!(!admits(
+            &authorizer,
+            &MetadataRegistryRecord::graph_iri_for(Ulid::generate())
+        ));
+    }
+
+    #[tokio::test]
+    async fn enrichment_keeps_order() {
+        // The gate forces the describes to complete in exactly reverse order;
+        // the properties must still line up with the targets that asked for them.
+        let count = METADATA_ENRICH_TASKS;
+        let gate = Arc::new((Mutex::new(count - 1), std::sync::Condvar::new()));
+        let describe_gate = gate.clone();
+        let describe: HitDescribe = Arc::new(move |_graph_iri, subject_iri: &str| {
+            let index = subject_iri
+                .rsplit('/')
+                .next()
+                .and_then(|tail| tail.parse::<usize>().ok())
+                .expect("indexed subject");
+            let (turn, ready) = &*describe_gate;
+            let mut turn = turn.lock().expect("gate lock");
+            // Bounded so a lost wakeup fails the assertion instead of hanging.
+            while *turn != index {
+                let (guard, wait) = ready
+                    .wait_timeout(turn, Duration::from_secs(30))
+                    .expect("gate lock");
+                turn = guard;
+                if wait.timed_out() {
+                    break;
+                }
+            }
+            *turn = index.wrapping_sub(1);
+            ready.notify_all();
+            vec![(
+                "urn:test:index".to_string(),
+                Term::Literal(Literal::new_simple_literal(index.to_string())),
+            )]
+        });
+
+        let targets = (0..count)
+            .map(|index| ("urn:graph".to_string(), format!("urn:subject/{index}")))
+            .collect::<Vec<_>>();
+        let permits = Arc::new(tokio::sync::Semaphore::new(count));
+        let properties = describe_hits_parallel(&permits, targets, describe, &Span::none()).await;
+
+        let expected = (0..count)
+            .map(|index| {
+                vec![(
+                    "urn:test:index".to_string(),
+                    Term::Literal(Literal::new_simple_literal(index.to_string())),
+                )]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(properties, expected);
+    }
+
+    fn scope_for(
+        mut records: Vec<MetadataRegistryRecord>,
+        permissions: GroupPermissionRules,
+    ) -> GraphVisibilityScope {
+        records.sort_unstable_by_key(|record| record.document_id);
+        GraphVisibilityScope {
+            records: Arc::new(records),
+            permissions,
+            lifecycle_visibility: LifecycleVisibility::Cache,
+        }
+    }
+
+    #[test]
+    fn selection_excludes_deleted() {
+        let live = registry_record("datasets/live");
+        let deleted = registry_record("datasets/deleted");
+        let cache = MetadataVisibilityCache::new();
+        cache.store_lifecycle_deleted(deleted.graph_iri.clone(), true);
+        let scope = scope_for(
+            vec![live.clone(), deleted.clone()],
+            GroupPermissionRules::default(),
+        );
+
+        let selection = select_visible_records(&scope, &cache);
+
+        assert_eq!(selection.deleted, 1);
+        assert_eq!(
+            selection
+                .visible
+                .iter()
+                .map(|record| record.graph_iri.clone())
+                .collect::<Vec<_>>(),
+            vec![live.graph_iri]
+        );
+    }
+
+    #[test]
+    fn selection_excludes_denied() {
+        // A per-document DENY under a group-wide grant hides only that document.
+        let realm = RealmId([7u8; 32]);
+        let group_id = Ulid::generate();
+        let secret = group_record(group_id, "datasets/secret");
+        let open = group_record(group_id, "datasets/open");
+        let rules = HashMap::from([(
+            group_id,
+            read_rules(&[
+                (
+                    format!("/{realm}/g/{group_id}/meta/**").as_str(),
+                    Permission::READ,
+                ),
+                (secret.permission_path.as_str(), Permission::DENY),
+            ]),
+        )]);
+        let scope = scope_for(
+            vec![secret.clone(), open.clone()],
+            GroupPermissionRules::from_groups(Some(realm), rules),
+        );
+
+        let selection = select_visible_records(&scope, &MetadataVisibilityCache::new());
+
+        assert_eq!(selection.denied, 1);
+        assert_eq!(selection.private, 2);
+        assert_eq!(selection.visible.len(), 1);
+        assert_eq!(selection.visible[0].graph_iri, open.graph_iri);
+    }
+
+    #[test]
+    fn narrow_grant_selected() {
+        let realm = RealmId([7u8; 32]);
+        let group_id = Ulid::generate();
+        let granted = group_record(group_id, "datasets/shared");
+        let hidden = group_record(group_id, "datasets/hidden");
+        let rules = HashMap::from([(
+            group_id,
+            read_rules(&[(granted.permission_path.as_str(), Permission::READ)]),
+        )]);
+        let scope = scope_for(
+            vec![granted.clone(), hidden.clone()],
+            GroupPermissionRules::from_groups(Some(realm), rules),
+        );
+
+        let selection = select_visible_records(&scope, &MetadataVisibilityCache::new());
+
+        assert_eq!(selection.visible.len(), 1);
+        assert_eq!(selection.visible[0].graph_iri, granted.graph_iri);
+        assert_eq!(selection.denied, 1);
+    }
+
+    #[test]
+    fn anonymous_sees_public() {
+        // Anonymous callers hold no rules, so only public records survive.
+        let public = registry_record("datasets/public");
+        let private = group_record(Ulid::generate(), "datasets/private");
+        let scope = scope_for(
+            vec![public.clone(), private.clone()],
+            GroupPermissionRules::default(),
+        );
+
+        let selection = select_visible_records(&scope, &MetadataVisibilityCache::new());
+
+        assert_eq!(selection.public, 1);
+        assert_eq!(selection.denied, 1);
+        assert_eq!(selection.visible.len(), 1);
+        assert_eq!(selection.visible[0].graph_iri, public.graph_iri);
+    }
+
+    #[test]
+    fn filters_restrict_candidates() {
+        let group_id = Ulid::generate();
+        let wanted = group_record(group_id, "datasets/wanted");
+        let same_group = group_record(group_id, "datasets/sibling");
+        let other_group = group_record(Ulid::generate(), "datasets/other");
+        let records = Arc::new(vec![
+            wanted.clone(),
+            same_group.clone(),
+            other_group.clone(),
+        ]);
+
+        let by_graph = filter_candidate_records(
+            records.clone(),
+            Some(&HashSet::from([wanted.graph_iri.clone()])),
+            None,
+        );
+        assert_eq!(by_graph.len(), 1);
+        assert_eq!(by_graph[0].graph_iri, wanted.graph_iri);
+
+        let by_group = filter_candidate_records(records.clone(), None, Some(group_id));
+        assert_eq!(by_group.len(), 2);
+        assert!(by_group.iter().all(|record| record.group_id == group_id));
+
+        let combined = filter_candidate_records(
+            records.clone(),
+            Some(&HashSet::from([
+                wanted.graph_iri.clone(),
+                other_group.graph_iri.clone(),
+            ])),
+            Some(group_id),
+        );
+        assert_eq!(combined.len(), 1);
+        assert_eq!(combined[0].graph_iri, wanted.graph_iri);
+
+        assert_eq!(filter_candidate_records(records, None, None).len(), 3);
     }
 
     #[test]
@@ -6313,8 +7095,7 @@ mod tests {
         cache.store_lifecycle_deleted(deleted_record.graph_iri.clone(), false);
         let scope = GraphVisibilityScope {
             records: Arc::new(vec![deleted_record.clone()]),
-            auth_realm: None,
-            readable_groups: HashSet::new(),
+            permissions: GroupPermissionRules::default(),
             lifecycle_visibility: LifecycleVisibility::FreshDeletedGraphs(HashSet::from([
                 deleted_record.graph_iri.clone(),
             ])),

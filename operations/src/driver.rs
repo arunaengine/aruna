@@ -13,7 +13,7 @@ use std::any::{type_name, type_name_of_val};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use tracing::{Instrument, debug_span, error, trace, warn};
+use tracing::{Instrument, debug, debug_span, error, trace, warn};
 
 use crate::metadata::MetadataHandle;
 use crate::task_persistence::persist_task_effect;
@@ -324,6 +324,12 @@ pub async fn drive<O: Operation>(
             event = "operation.completed",
             operation = %operation_name,
             "Completed operation"
+        ),
+        Err(error) if O::expected_error(error) => debug!(
+            event = "operation.rejected",
+            operation = %operation_name,
+            error = ?error,
+            "Operation rejected"
         ),
         Err(error) => error!(
             event = "operation.failed",

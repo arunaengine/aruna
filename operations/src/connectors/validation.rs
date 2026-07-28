@@ -35,7 +35,13 @@ pub enum ValidationError {
     EmptyPublicValue { key: String },
     #[error("secret config key `{key}` must not be empty")]
     EmptySecretValue { key: String },
+    #[error("public config key `{key}` must be `true` or `false`")]
+    InvalidBoolValue { key: String },
+    #[error("credentials must not be set when `skip_signature` is enabled")]
+    CredentialsWithSkipSignature,
 }
+
+pub const S3_SKIP_SIGNATURE: &str = "skip_signature";
 
 pub fn validate_connector_input(
     name: &str,
@@ -94,6 +100,17 @@ pub fn validate_connector_input(
         }
     }
 
+    if let Some(value) = public_config.get(S3_SKIP_SIGNATURE) {
+        if value != "true" && value != "false" {
+            return Err(ValidationError::InvalidBoolValue {
+                key: S3_SKIP_SIGNATURE.to_string(),
+            });
+        }
+        if value == "true" && !secret_config.is_empty() {
+            return Err(ValidationError::CredentialsWithSkipSignature);
+        }
+    }
+
     Ok(())
 }
 
@@ -106,7 +123,7 @@ pub const fn rules_for_kind(kind: SourceConnectorKind) -> SourceConnectorValidat
         },
         SourceConnectorKind::S3 => SourceConnectorValidationRules {
             required_public_keys: &["bucket", "endpoint"],
-            allowed_public_keys: &["bucket", "endpoint", "region", "root"],
+            allowed_public_keys: &["bucket", "endpoint", "region", "root", S3_SKIP_SIGNATURE],
             allowed_secret_keys: &["access_key_id", "secret_access_key"],
         },
         SourceConnectorKind::Webdav => SourceConnectorValidationRules {
@@ -225,6 +242,65 @@ mod tests {
             ]),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn accepts_skip_signature() {
+        // A public bucket needs no credentials at all.
+        validate_connector_input(
+            "public-s3",
+            SourceConnectorKind::S3,
+            &HashMap::from([
+                ("bucket".to_string(), "ngi-igenomes".to_string()),
+                (
+                    "endpoint".to_string(),
+                    "https://s3.amazonaws.com".to_string(),
+                ),
+                (S3_SKIP_SIGNATURE.to_string(), "true".to_string()),
+            ]),
+            &HashMap::new(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn skip_forbids_credentials() {
+        // Unsigned requests would silently ignore the stored secrets.
+        let err = validate_connector_input(
+            "public-s3",
+            SourceConnectorKind::S3,
+            &HashMap::from([
+                ("bucket".to_string(), "reads".to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+                (S3_SKIP_SIGNATURE.to_string(), "true".to_string()),
+            ]),
+            &HashMap::from([("access_key_id".to_string(), "AKIA".to_string())]),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, ValidationError::CredentialsWithSkipSignature);
+    }
+
+    #[test]
+    fn rejects_bad_skip() {
+        let err = validate_connector_input(
+            "public-s3",
+            SourceConnectorKind::S3,
+            &HashMap::from([
+                ("bucket".to_string(), "reads".to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+                (S3_SKIP_SIGNATURE.to_string(), "yes".to_string()),
+            ]),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ValidationError::InvalidBoolValue {
+                key: S3_SKIP_SIGNATURE.to_string(),
+            }
+        );
     }
 
     #[test]

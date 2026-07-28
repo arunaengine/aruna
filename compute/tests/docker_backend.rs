@@ -49,6 +49,11 @@ trait DockerTestExt {
         attempt: &AttemptRef,
         path: &str,
     ) -> Result<TaskOutput, BackendError>;
+    async fn list_outputs(
+        &self,
+        attempt: &AttemptRef,
+        pattern: &str,
+    ) -> Result<Vec<String>, BackendError>;
     async fn reconcile(&self, attempt: &AttemptRef) -> ReconcileEvidence;
     async fn cleanup(&self, attempt: &AttemptRef) -> Result<(), BackendError>;
 }
@@ -130,6 +135,14 @@ impl DockerTestExt for DockerBackend {
         path: &str,
     ) -> Result<TaskOutput, BackendError> {
         aruna_compute::ExecutorBackend::fetch_output(self, &fence(attempt), path).await
+    }
+
+    async fn list_outputs(
+        &self,
+        attempt: &AttemptRef,
+        pattern: &str,
+    ) -> Result<Vec<String>, BackendError> {
+        aruna_compute::ExecutorBackend::list_outputs(self, &fence(attempt), pattern).await
     }
 
     async fn reconcile(&self, attempt: &AttemptRef) -> ReconcileEvidence {
@@ -285,6 +298,40 @@ async fn file_transfer() {
     assert_eq!(
         read_output(&backend, &attempt, "/output/aruna.txt").await,
         b"hello from aruna"
+    );
+
+    let _ = backend.cleanup(&attempt).await;
+}
+
+#[tokio::test]
+async fn wildcard_outputs() {
+    // A pattern selects the matching files of the terminal container only.
+    let backend = backend_or_skip!();
+    let cancel = CancellationToken::new();
+    let mut spec = sh(
+        &unique("wildcard"),
+        "mkdir -p /output/sub && echo a > /output/a.txt && echo b > /output/b.txt \
+         && echo c > /output/report.csv && echo d > /output/sub/deep.txt",
+    );
+    spec.output_paths.push("/output/*.txt".to_string());
+    let attempt = spec.attempt.clone();
+
+    backend.submit(&spec, &cancel).await.unwrap();
+    let status = backend.wait(&attempt, &cancel).await.unwrap();
+    assert_eq!(status.phase, AttemptPhase::Exited { code: 0 });
+
+    let matched = backend
+        .list_outputs(&attempt, "/output/*.txt")
+        .await
+        .unwrap();
+    assert_eq!(matched, vec!["/output/a.txt", "/output/b.txt"]);
+    assert_eq!(read_output(&backend, &attempt, &matched[0]).await, b"a\n");
+    assert!(
+        backend
+            .list_outputs(&attempt, "/absent/*.txt")
+            .await
+            .unwrap()
+            .is_empty()
     );
 
     let _ = backend.cleanup(&attempt).await;

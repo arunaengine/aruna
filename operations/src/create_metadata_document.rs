@@ -162,6 +162,21 @@ impl CreateMetadataDocumentOperation {
         &self.config
     }
 
+    /// A pristine operation with the same inputs, for a conflict retry.
+    fn fresh_copy(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            skip_existing_check: self.skip_existing_check,
+            forwarded: self.forwarded,
+            conflict_recheck: false,
+            txn_id: None,
+            state: CreateMetadataDocumentState::Init,
+            record: None,
+            create_event: None,
+            output: None,
+        }
+    }
+
     fn graph_iri(&self) -> String {
         MetadataRegistryRecord::graph_iri_for(self.config.document_id)
     }
@@ -363,6 +378,9 @@ impl CreateMetadataDocumentOperation {
         })]
     }
 
+    /// The realm config joins the fence read set read-only: it is never written
+    /// back, so concurrent creates stay conflict-free, while a real config change
+    /// conflicts the commit and makes the retry re-choose its placement.
     fn read_create_fence_effect(&mut self, txn_id: TxnId) -> Effects {
         self.txn_id = Some(txn_id);
         self.state = CreateMetadataDocumentState::ReadCreateFence;
@@ -458,16 +476,12 @@ impl CreateMetadataDocumentOperation {
             None => None,
         };
         match self.choose_placement(config.as_ref()) {
-            Ok(placement) => self.append_create_event_effect(placement, realm_config_value),
+            Ok(placement) => self.append_create_event_effect(placement),
             Err(error) => self.fail(error),
         }
     }
 
-    fn append_create_event_effect(
-        &mut self,
-        placement: PlacementRef,
-        realm_config_value: Option<Value>,
-    ) -> Effects {
+    fn append_create_event_effect(&mut self, placement: PlacementRef) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.fail(CreateMetadataDocumentError::MissingTransaction);
         };
@@ -483,17 +497,7 @@ impl CreateMetadataDocumentOperation {
                 Ok(writes)
             });
         match writes {
-            Ok(mut writes) => {
-                if let Some(value) = realm_config_value {
-                    let target = DocumentSyncTarget::RealmConfig {
-                        realm_id: self.config.actor.realm_id,
-                    };
-                    writes.push((
-                        target.storage_keyspace().to_string(),
-                        target.storage_key(),
-                        value,
-                    ));
-                }
+            Ok(writes) => {
                 smallvec![Effect::Storage(StorageEffect::BatchWrite {
                     writes,
                     txn_id: Some(txn_id),
@@ -532,11 +536,36 @@ impl CreateMetadataDocumentOperation {
     }
 }
 
+const CREATE_CONFLICT_RETRIES: usize = 3;
+
+// Deterministic per-document jitter decorrelates overlapping create retries so a
+// genuine realm-config mutation does not make them all retry in lockstep.
+fn create_retry_backoff(attempt: usize, document_id: Ulid) -> std::time::Duration {
+    let base = crate::queue_backoff::retry_after_ms(attempt as u32, 25, 250);
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&document_id.to_bytes()[..8]);
+    let jitter = u64::from_le_bytes(head) % base;
+    std::time::Duration::from_millis(base.saturating_add(jitter))
+}
+
 pub async fn create_metadata_document(
-    operation: CreateMetadataDocumentOperation,
+    template: CreateMetadataDocumentOperation,
     context: Arc<DriverContext>,
 ) -> Result<CreateMetadataDocumentResult, CreateMetadataDocumentError> {
-    let created = drive(operation, context.as_ref()).await?;
+    let mut attempt = 0usize;
+    let created = loop {
+        match drive(template.fresh_copy(), context.as_ref()).await {
+            Ok(created) => break created,
+            Err(CreateMetadataDocumentError::StorageError(StorageError::TransactionConflict))
+                if attempt < CREATE_CONFLICT_RETRIES =>
+            {
+                tokio::time::sleep(create_retry_backoff(attempt, template.config.document_id))
+                    .await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    };
     schedule_pending_metadata_projection_drain(context.as_ref(), std::time::Duration::ZERO)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
@@ -613,7 +642,7 @@ impl Operation for CreateMetadataDocumentOperation {
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.fail_without_cleanup(error.into())
                 }
-                other => self.unexpected_event("realm config read result", format!("{other:?}")),
+                other => self.unexpected_event("create fence read result", format!("{other:?}")),
             },
             CreateMetadataDocumentState::AppendCreateEvent => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
@@ -689,10 +718,13 @@ impl Operation for CreateMetadataDocumentOperation {
 mod tests {
     use super::{
         CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-        CreateMetadataDocumentPayload,
+        CreateMetadataDocumentPayload, create_metadata_document, create_retry_backoff,
     };
 
+    use std::sync::Arc;
+
     use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
@@ -711,8 +743,12 @@ mod tests {
         Actor, MetadataRegistryRecord, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
     };
     use aruna_core::types::{Effects, GroupId, Key};
+    use aruna_storage::storage::EffectReceiver;
+    use aruna_storage::{FjallStorage, StorageHandle};
     use ulid::Ulid;
 
+    use crate::driver::DriverContext;
+    use crate::metadata::MetadataHandle;
     use crate::placement::resolve_shard_holders;
 
     fn actor(realm_id: RealmId, key_byte: u8) -> Actor {
@@ -738,11 +774,11 @@ mod tests {
         config
     }
 
-    fn realm_config_read(
-        config: Option<&RealmConfigDocument>,
+    fn create_fence_read(
         actor: &Actor,
         group_id: GroupId,
         document_id: Ulid,
+        config: Option<&RealmConfigDocument>,
     ) -> Event {
         Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
@@ -765,7 +801,7 @@ mod tests {
         })
     }
 
-    fn assert_realm_config_read(effects: &[Effect]) {
+    fn assert_fence_read(effects: &[Effect]) {
         let [
             Effect::Storage(StorageEffect::BatchRead {
                 reads,
@@ -774,7 +810,7 @@ mod tests {
             }),
         ] = effects
         else {
-            panic!("expected realm config read");
+            panic!("expected create fence read");
         };
         assert_eq!(reads.len(), 3);
         assert_eq!(reads[0].0, METADATA_CREATE_ACCEPTANCE_KEYSPACE);
@@ -816,27 +852,23 @@ mod tests {
 
         let txn_id = Ulid::from_bytes([32; 16]);
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert_fence_read(effects.as_slice());
         let [
             Effect::Storage(StorageEffect::BatchRead {
-                reads,
                 txn_id: Some(read_txn),
                 ..
             }),
         ] = effects.as_slice()
         else {
-            panic!("expected transactional realm config read");
+            panic!("expected transactional create fence read");
         };
-        assert_eq!(reads.len(), 3);
-        assert_eq!(reads[0].0, METADATA_CREATE_ACCEPTANCE_KEYSPACE);
-        assert_eq!(reads[1].0, METADATA_CREATE_ACCEPTANCE_KEYSPACE);
-        assert_eq!(reads[2].0, REALM_CONFIG_KEYSPACE);
         assert_eq!(*read_txn, txn_id);
 
-        let effects = operation.step(realm_config_read(
-            Some(&realm_config),
+        let effects = operation.step(create_fence_read(
             &actor,
             group_id,
             document_id,
+            Some(&realm_config),
         ));
         let [
             Effect::Storage(StorageEffect::BatchWrite {
@@ -848,9 +880,11 @@ mod tests {
             panic!("expected transactional create append");
         };
         assert_eq!(*write_txn, txn_id);
-        assert!(writes.iter().any(|(key_space, key, _)| {
-            key_space == REALM_CONFIG_KEYSPACE && key.as_ref() == actor.realm_id.as_bytes()
-        }));
+        assert!(
+            !writes
+                .iter()
+                .any(|(key_space, _, _)| { key_space == REALM_CONFIG_KEYSPACE })
+        );
         assert!(
             writes
                 .iter()
@@ -897,7 +931,7 @@ mod tests {
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: retry_txn,
         }));
-        assert_realm_config_read(effects.as_slice());
+        assert_fence_read(effects.as_slice());
         let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
                 (
@@ -945,7 +979,7 @@ mod tests {
         operation.start();
         let effects = operation.step(validation_result(document_id));
         let effects = begin_transaction(&mut operation, effects.as_slice());
-        assert_realm_config_read(effects.as_slice());
+        assert_fence_read(effects.as_slice());
         let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
                 (metadata_create_acceptance_key(document_id), None),
@@ -965,6 +999,31 @@ mod tests {
             operation.finalize(),
             Err(CreateMetadataDocumentError::DocumentAlreadyExists)
         );
+    }
+
+    #[test]
+    fn fresh_copy_resets() {
+        let realm_id = RealmId([41u8; 32]);
+        let actor = actor(realm_id, 11);
+        let group_id = GroupId::generate();
+        let document_id = Ulid::from_bytes([41; 16]);
+        let mut operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
+            actor.clone(),
+            group_id,
+            document_id,
+        ));
+
+        operation.start();
+        let effects = operation.step(validation_result(document_id));
+        begin_transaction(&mut operation, effects.as_slice());
+        operation.conflict_recheck = true;
+
+        let expected = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
+            actor,
+            group_id,
+            document_id,
+        ));
+        assert_eq!(operation.fresh_copy(), expected);
     }
 
     fn config(actor: Actor, group_id: GroupId, document_id: Ulid) -> CreateMetadataDocumentConfig {
@@ -1117,9 +1176,30 @@ mod tests {
         assert_validation_effect(effects.as_slice(), document_id);
         let effects = operation.step(validation_result(document_id));
         let effects = begin_transaction(&mut operation, effects.as_slice());
-        assert_realm_config_read(effects.as_slice());
-        let effects = operation.step(realm_config_read(None, &actor, group_id, document_id));
+        assert_fence_read(effects.as_slice());
+        let effects = operation.step(create_fence_read(&actor, group_id, document_id, None));
         assert_create_event_append(effects.as_slice(), document_id, &actor);
+    }
+
+    #[test]
+    fn config_joins_fence() {
+        // The stamped bucket decides the document's sync topic, so the config it
+        // came from must be in the commit's read set: no read precedes the
+        // transaction, and the fence read carries the realm config.
+        let realm_id = RealmId([22u8; 32]);
+        let actor = actor(realm_id, 5);
+        let group_id = GroupId::generate();
+        let document_id = Ulid::generate();
+        let mut operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
+            actor,
+            group_id,
+            document_id,
+        ));
+
+        operation.start();
+        let effects = operation.step(validation_result(document_id));
+        let effects = begin_transaction(&mut operation, effects.as_slice());
+        assert_fence_read(effects.as_slice());
     }
 
     #[test]
@@ -1140,12 +1220,20 @@ mod tests {
         operation.start();
         let effects = operation.step(validation_result(document_id));
         begin_transaction(&mut operation, effects.as_slice());
-        operation.step(realm_config_read(
-            Some(&realm_config),
+        let effects = operation.step(create_fence_read(
             &actor,
             group_id,
             document_id,
+            Some(&realm_config),
         ));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected transactional create append");
+        };
+        assert!(
+            !writes
+                .iter()
+                .any(|(key_space, _, _)| key_space == REALM_CONFIG_KEYSPACE)
+        );
 
         let placement = operation
             .record
@@ -1174,8 +1262,8 @@ mod tests {
             value: None,
         }));
         let effects = begin_transaction(&mut operation, effects.as_slice());
-        assert_realm_config_read(effects.as_slice());
-        let effects = operation.step(realm_config_read(None, &actor, group_id, document_id));
+        assert_fence_read(effects.as_slice());
+        let effects = operation.step(create_fence_read(&actor, group_id, document_id, None));
         let create_event_key = assert_create_event_append(effects.as_slice(), document_id, &actor);
         assert_eq!(
             operation
@@ -1215,8 +1303,8 @@ mod tests {
         assert_validation_effect(operation.start().as_slice(), document_id);
         let effects = operation.step(validation_result(document_id));
         let effects = begin_transaction(&mut operation, effects.as_slice());
-        assert_realm_config_read(effects.as_slice());
-        let effects = operation.step(realm_config_read(None, &actor, group_id, document_id));
+        assert_fence_read(effects.as_slice());
+        let effects = operation.step(create_fence_read(&actor, group_id, document_id, None));
         let create_event_key = assert_create_event_append(effects.as_slice(), document_id, &actor);
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: vec![(METADATA_EVENT_LOG_KEYSPACE.to_string(), create_event_key)],
@@ -1271,13 +1359,13 @@ mod tests {
 
         assert_validation_effect(operation.start().as_slice(), document_id);
         assert_existing_read(operation.step(validation_result(document_id)).as_slice());
-        let config_read = operation.step(Event::Storage(StorageEvent::ReadResult {
+        let existing_read = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: document_id.to_bytes().to_vec().into(),
             value: None,
         }));
-        let config_read = begin_transaction(&mut operation, config_read.as_slice());
-        assert_realm_config_read(config_read.as_slice());
-        let append = operation.step(realm_config_read(None, &actor, group_id, document_id));
+        let fence_read = begin_transaction(&mut operation, existing_read.as_slice());
+        assert_fence_read(fence_read.as_slice());
+        let append = operation.step(create_fence_read(&actor, group_id, document_id, None));
         assert_create_event_append(append.as_slice(), document_id, &actor);
 
         let effects = operation.step(Event::Storage(StorageEvent::Error {
@@ -1294,5 +1382,145 @@ mod tests {
                 aruna_core::errors::StorageError::WriteError,
             ))
         );
+    }
+
+    // Answers each storage effect of the create flow; the first `conflict_commits`
+    // commits fail with a conflict and the rest succeed. Returns StartTransaction
+    // count so tests can prove a retry occurred.
+    fn scripted_conflict_actor(
+        receiver: EffectReceiver,
+        conflict_commits: u32,
+    ) -> std::thread::JoinHandle<u32> {
+        std::thread::spawn(move || {
+            let mut starts = 0u32;
+            let mut commits = 0u32;
+            while let Ok((effect, response_tx, _span, _at, _guard)) = receiver.recv() {
+                let event = match effect {
+                    StorageEffect::StartTransaction { .. } => {
+                        starts += 1;
+                        StorageEvent::TransactionStarted {
+                            txn_id: Ulid::from_parts(u64::from(starts), 1),
+                        }
+                    }
+                    StorageEffect::Read { key, .. } => {
+                        StorageEvent::ReadResult { key, value: None }
+                    }
+                    StorageEffect::BatchRead { .. } => StorageEvent::BatchReadResult {
+                        values: vec![
+                            (Key::from(vec![0u8]), None),
+                            (Key::from(vec![1u8]), None),
+                            (Key::from(vec![2u8]), None),
+                        ],
+                    },
+                    StorageEffect::BatchWrite { .. } => StorageEvent::BatchWriteResult {
+                        entries: Vec::new(),
+                    },
+                    StorageEffect::CommitTransaction { txn_id } => {
+                        commits += 1;
+                        if commits <= conflict_commits {
+                            StorageEvent::Error {
+                                error: StorageError::TransactionConflict,
+                            }
+                        } else {
+                            StorageEvent::TransactionCommitted { txn_id }
+                        }
+                    }
+                    StorageEffect::AbortTransaction { txn_id } => {
+                        StorageEvent::TransactionAborted { txn_id }
+                    }
+                    StorageEffect::Write { key, .. } => StorageEvent::WriteResult { key },
+                    other => panic!("unexpected storage effect: {other:?}"),
+                };
+                response_tx.send(event);
+            }
+            starts
+        })
+    }
+
+    fn conflict_test_context(storage: StorageHandle, temp: &std::path::Path) -> Arc<DriverContext> {
+        let node_id = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+        let metadata_storage =
+            FjallStorage::open(temp.join("meta-store").to_str().unwrap()).unwrap();
+        let metadata_handle = MetadataHandle::new(
+            temp.join("meta"),
+            node_id,
+            metadata_storage,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: Some(metadata_handle),
+            task_handle: None,
+            compute_handle: None,
+        })
+    }
+
+    #[test]
+    fn backoff_jitters() {
+        // Backoff is deterministic per document and stays within [base, 2*base).
+        let id = Ulid::from_bytes([7u8; 16]);
+        let base = crate::queue_backoff::retry_after_ms(0, 25, 250);
+        let first = create_retry_backoff(0, id);
+        assert_eq!(first, create_retry_backoff(0, id));
+        let ms = first.as_millis() as u64;
+        assert!(ms >= base && ms < base.saturating_mul(2));
+    }
+
+    // Real timers: the scripted storage runs on an OS thread, so a paused clock
+    // would auto-advance the storage request timeout before it can respond.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_recovers_conflict() {
+        // A commit conflict on the first drive is retried; the fresh transaction
+        // then commits, so the wrapper returns Ok.
+        let temp = tempfile::tempdir().unwrap();
+        let (storage, receivers) = StorageHandle::new();
+        let actor_thread = scripted_conflict_actor(receivers.foreground, 1);
+        let context = conflict_test_context(storage, temp.path());
+
+        let realm_id = RealmId([61u8; 32]);
+        let operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
+            actor(realm_id, 9),
+            GroupId::generate(),
+            Ulid::generate(),
+        ));
+        let result = create_metadata_document(operation, context.clone()).await;
+        assert!(result.is_ok(), "retry recovers conflict: {result:?}");
+
+        drop(context);
+        let starts = actor_thread.join().unwrap();
+        assert_eq!(starts, 3, "attempt 1 opens two txns, the retry opens one");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_exhausts_conflict() {
+        // Every commit conflicts, so the wrapper exhausts its retries and returns
+        // the conflict; each drive opens two txns via the internal recheck.
+        let temp = tempfile::tempdir().unwrap();
+        let (storage, receivers) = StorageHandle::new();
+        let actor_thread = scripted_conflict_actor(receivers.foreground, u32::MAX);
+        let context = conflict_test_context(storage, temp.path());
+
+        let realm_id = RealmId([62u8; 32]);
+        let operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
+            actor(realm_id, 9),
+            GroupId::generate(),
+            Ulid::generate(),
+        ));
+        let result = create_metadata_document(operation, context.clone()).await;
+        assert!(matches!(
+            result,
+            Err(CreateMetadataDocumentError::StorageError(
+                StorageError::TransactionConflict
+            ))
+        ));
+
+        drop(context);
+        let starts = actor_thread.join().unwrap();
+        assert_eq!(starts, 8, "four drive attempts each open two txns");
     }
 }
