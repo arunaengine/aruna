@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::effects::{DhtEffect, Effect, NetEffect};
@@ -10,6 +11,12 @@ use aruna_core::structs::RealmId;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
+
+// Ceiling for driving this operation in an interactive request path. The DHT
+// lookup has no wall-clock deadline of its own and can walk offline peers for
+// minutes; callers race the drive against this and fall back to local-only
+// presence, keeping realm endpoints responsive while nodes are down.
+pub const REALM_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Debug, PartialEq)]
 pub struct GetRealmNodesOperation {

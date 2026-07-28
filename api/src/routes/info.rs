@@ -14,7 +14,7 @@ use aruna_core::structs::{USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
+use aruna_operations::get_realm_nodes::{GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT};
 use aruna_operations::metadata::stats::count_realm_documents;
 use aruna_operations::mutate_realm_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementError, RealmPlacementMutation,
@@ -1310,18 +1310,27 @@ fn map_realm_nodes(
 }
 
 async fn load_realm_presence_best_effort(state: &ServerState) -> HashSet<aruna_core::NodeId> {
-    match drive(
-        GetRealmNodesOperation::new(state.get_realm_id()),
-        &state.get_ctx(),
+    // Race discovery against REALM_DISCOVERY_TIMEOUT: a realm with offline
+    // nodes must degrade to local-only presence, not stall the dashboard.
+    let discovery = tokio::time::timeout(
+        REALM_DISCOVERY_TIMEOUT,
+        drive(
+            GetRealmNodesOperation::new(state.get_realm_id()),
+            &state.get_ctx(),
+        ),
     )
-    .await
-    {
-        Ok(mut nodes) => {
+    .await;
+    match discovery {
+        Ok(Ok(mut nodes)) => {
             nodes.insert(state.get_node_id());
             nodes
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             warn!(error = %error, "realm node discovery failed for realm info response");
+            HashSet::from([state.get_node_id()])
+        }
+        Err(_) => {
+            warn!("realm node discovery timed out for realm info response");
             HashSet::from([state.get_node_id()])
         }
     }
