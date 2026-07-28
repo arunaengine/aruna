@@ -17,7 +17,6 @@ bao-tree = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
 crc-fast = { workspace = true }
-crossfire = { workspace = true }
 futures = { workspace = true }
 iroh-io = { workspace = true }
 md5 = { workspace = true }

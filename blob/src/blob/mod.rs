@@ -1,15 +1,13 @@
 use aruna_core::NodeId;
-use aruna_core::effects::BlobEffect;
-use aruna_core::events::BlobEvent;
 use aruna_core::structs::BackendConfig;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use aruna_storage::storage::StorageHandle;
 use bao_tree::BlockSize;
-use crossfire::{mpsc, oneshot};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use std::sync::atomic::AtomicUsize;
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use ulid::Ulid;
 
 mod backend;
@@ -24,9 +22,6 @@ mod tests;
 
 pub const BAO_BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(16); // 2^16 bytes
 
-pub type EffectHandle = (BlobEffect, oneshot::TxOneshot<BlobEvent>);
-pub type EffectSender = crossfire::MAsyncTx<mpsc::Array<EffectHandle>>;
-pub type EffectReceiver = crossfire::AsyncRx<mpsc::Array<EffectHandle>>;
 type SharedBiStream = Arc<Mutex<BiStream>>;
 
 #[derive(Clone, Debug)]
@@ -49,10 +44,11 @@ pub struct BlobHandler {
     net: NetHandle,
     connections: Arc<Mutex<HashMap<Ulid, Connection>>>,
     operator_status: Arc<RwLock<aruna_core::structs::Status>>,
+    transfer_slots: Arc<Semaphore>,
+    inflight: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Debug)]
 pub struct BlobHandle {
     handler: BlobHandler,
-    write_channel: EffectSender,
 }

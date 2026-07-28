@@ -1,4 +1,5 @@
-use super::{BlobEvent, BlobHandler, ControlPlaneTimeoutKind};
+use super::{BlobHandler, ControlPlaneTimeoutKind};
+use aruna_core::events::BlobEvent;
 use crate::framing::{MAX_CONTROL_PLANE_FRAME, read_frame, write_frame};
 use crate::messages::{MessageType, ReplicationMessage};
 use aruna_core::errors::BlobError;

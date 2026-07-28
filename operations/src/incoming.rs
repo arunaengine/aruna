@@ -307,7 +307,7 @@ impl InboundEventHandler for OperationsInboundHandler {
             trace!(event = "stream.received", peer = %node_id, alpn = ?alpn, "Received inbound stream");
             match alpn {
                 Alpn::Bao => {
-                    if let Some(mut blob_handle) = self.context.blob_handle.clone() {
+                    if let Some(blob_handle) = self.context.blob_handle.clone() {
                         let stream_id = match blob_handle.store_connection(node_id, stream).await {
                             Ok(stream_id) => stream_id,
                             Err(err) => {

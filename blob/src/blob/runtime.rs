@@ -1,4 +1,4 @@
-use super::{BlobHandle, BlobHandler, EffectReceiver};
+use super::{BlobHandle, BlobHandler};
 use crate::error::BlobLibError;
 use crate::opendal::init_operator;
 use aruna_core::NodeId;
@@ -12,12 +12,59 @@ use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use aruna_storage::storage::StorageHandle;
 use async_trait::async_trait;
-use crossfire::{mpsc, oneshot};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
-use tokio::time::{Duration, interval, timeout};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::time::{Duration, Instant, interval, timeout};
 use ulid::Ulid;
+
+// Bounds concurrent transfers so overload queues instead of exhausting fds.
+pub(super) const TRANSFER_SLOTS: usize = 256;
+const QUEUE_WAIT_WARN: Duration = Duration::from_millis(100);
+const SLOW_LOCAL_EFFECT: Duration = Duration::from_secs(1);
+const SLOW_CONTROL_EFFECT: Duration = Duration::from_secs(120);
+const SLOW_TRANSFER_EFFECT: Duration = Duration::from_secs(600);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EffectClass {
+    Local,
+    Control,
+    Transfer,
+}
+
+impl EffectClass {
+    fn slow_threshold(self) -> Duration {
+        match self {
+            EffectClass::Local => SLOW_LOCAL_EFFECT,
+            EffectClass::Control => SLOW_CONTROL_EFFECT,
+            EffectClass::Transfer => SLOW_TRANSFER_EFFECT,
+        }
+    }
+}
+
+fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
+    match effect {
+        BlobEffect::Write { .. } => (EffectClass::Transfer, "write"),
+        BlobEffect::WritePart { .. } => (EffectClass::Transfer, "write_part"),
+        BlobEffect::Compose { .. } => (EffectClass::Transfer, "compose"),
+        BlobEffect::SpoolHidden { .. } => (EffectClass::Transfer, "spool_hidden"),
+        BlobEffect::Replicate { .. } => (EffectClass::Transfer, "replicate"),
+        BlobEffect::HandleReplication { .. } => (EffectClass::Transfer, "handle_replication"),
+        BlobEffect::ServeRead { .. } => (EffectClass::Transfer, "serve_read"),
+        BlobEffect::ReceiveRead { .. } => (EffectClass::Transfer, "receive_read"),
+        BlobEffect::OpenConnection { .. } => (EffectClass::Control, "open_connection"),
+        BlobEffect::SendMessage { .. } => (EffectClass::Control, "send_message"),
+        BlobEffect::ReadMessage { .. } => (EffectClass::Control, "read_message"),
+        BlobEffect::CloseConnection { .. } => (EffectClass::Control, "close_connection"),
+        BlobEffect::Read { .. } => (EffectClass::Local, "read"),
+        BlobEffect::ReadRange { .. } => (EffectClass::Local, "read_range"),
+        BlobEffect::ReadHiddenRange { .. } => (EffectClass::Local, "read_hidden_range"),
+        BlobEffect::Delete { .. } => (EffectClass::Local, "delete"),
+        BlobEffect::DeleteHidden { .. } => (EffectClass::Local, "delete_hidden"),
+        BlobEffect::ListHidden { .. } => (EffectClass::Local, "list_hidden"),
+    }
+}
 
 #[async_trait]
 impl Handle for BlobHandle {
@@ -33,56 +80,44 @@ impl Handle for BlobHandle {
 }
 
 impl BlobHandle {
-    pub fn new(handler: BlobHandler) -> (Self, EffectReceiver) {
-        let (sender, receiver) = mpsc::bounded_async(2048);
-        (
-            BlobHandle {
-                handler,
-                write_channel: sender,
-            },
-            receiver,
-        )
+    pub fn new(handler: BlobHandler) -> Self {
+        BlobHandle { handler }
     }
 
     pub async fn send_blob_effect(&self, effect: BlobEffect) -> Event {
-        // Hidden spools may consume streams that request further blob effects.
-        let effect = match effect {
-            BlobEffect::SpoolHidden {
-                namespace,
-                name,
-                created_by,
-                max_bytes,
-                blob,
-            } => {
-                return Event::Blob(
-                    Box::pin(
-                        self.handler
-                            .spool_hidden_blob(namespace, &name, created_by, max_bytes, blob),
-                    )
-                    .await,
+        let (class, kind) = classify_effect(&effect);
+        let _permit = if class == EffectClass::Transfer {
+            let queued = Instant::now();
+            let permit = self.handler.transfer_slots.clone().acquire_owned().await;
+            let queue_wait = queued.elapsed();
+            if queue_wait >= QUEUE_WAIT_WARN {
+                tracing::warn!(
+                    event = "blob.queue.lag",
+                    effect = kind,
+                    queue_wait_ms = queue_wait.as_millis() as u64,
+                    in_flight = self.handler.inflight.load(Ordering::Relaxed),
+                    "Blob transfer slots saturated"
                 );
             }
-            BlobEffect::ReadHiddenRange { location, range } => {
-                return Event::Blob(
-                    Box::pin(self.handler.read_hidden_range(location, range)).await,
-                );
-            }
-            effect => effect,
+            permit.ok()
+        } else {
+            None
         };
-        let blob_event = {
-            let (response_tx, response_rx) = oneshot::oneshot();
-            if self
-                .write_channel
-                .send((effect, response_tx))
-                .await
-                .is_err()
-            {
-                return Event::Blob(BlobEvent::Error(BlobError::ChannelClosed));
-            }
-            response_rx
-                .await
-                .unwrap_or_else(|_| BlobEvent::Error(BlobError::ChannelClosed))
-        };
+
+        let in_flight = self.handler.inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        let started = Instant::now();
+        let blob_event = self.handler.execute_effect(effect).await;
+        self.handler.inflight.fetch_sub(1, Ordering::Relaxed);
+        let service = started.elapsed();
+        if service >= class.slow_threshold() {
+            tracing::warn!(
+                event = "blob.effect.slow",
+                effect = kind,
+                service_ms = service.as_millis() as u64,
+                in_flight,
+                "Slow blob effect"
+            );
+        }
         Event::Blob(blob_event)
     }
 
@@ -112,7 +147,7 @@ impl BlobHandle {
     }
 
     pub async fn store_connection(
-        &mut self,
+        &self,
         peer: NodeId,
         stream: BiStream,
     ) -> Result<Ulid, BlobError> {
@@ -140,134 +175,118 @@ impl BlobHandler {
         storage: StorageHandle,
         net: NetHandle,
     ) -> Result<BlobHandle, BlobLibError> {
-        let mut blob_handler = BlobHandler {
+        let blob_handler = BlobHandler {
             backend_config: config,
             storage,
             net,
             connections: Arc::new(Mutex::new(HashMap::new())),
             operator_status: Arc::new(RwLock::new(Status::Unavailable)),
+            transfer_slots: Arc::new(Semaphore::new(TRANSFER_SLOTS)),
+            inflight: Arc::new(AtomicUsize::new(0)),
         };
         let initial_status = blob_handler.probe_operator_status().await;
         *blob_handler.operator_status.write().await = initial_status;
         blob_handler.ensure_multipart_bucket().await?;
         *blob_handler.operator_status.write().await = Status::Available;
-        let (blob_handle, rx) = BlobHandle::new(blob_handler.clone());
         let status_handler = blob_handler.clone();
         tokio::spawn(async move {
             status_handler.monitor_operator_status().await;
         });
-        tokio::spawn(async move {
-            blob_handler.receive_loop(rx).await;
-        });
 
-        Ok(blob_handle)
+        Ok(BlobHandle::new(blob_handler))
     }
 
-    pub async fn receive_loop(&mut self, receiver: EffectReceiver) -> ! {
-        loop {
-            match receiver.recv().await {
-                Ok((effect, response_tx)) => {
-                    let event = match effect {
-                        BlobEffect::Write {
-                            bucket,
-                            key,
-                            created_by,
-                            blob,
-                        } => self.write_blob(&bucket, &key, created_by, blob).await,
-                        BlobEffect::WritePart {
-                            upload_id,
-                            part_number,
-                            created_by,
-                            compressed,
-                            encrypted,
-                            blob,
-                        } => {
-                            self.write_blob_part(
-                                upload_id,
-                                part_number,
-                                created_by,
-                                compressed,
-                                encrypted,
-                                blob,
-                            )
-                            .await
-                        }
-                        BlobEffect::Compose {
-                            bucket,
-                            key,
-                            created_by,
-                            parts,
-                        } => self.compose_blob(&bucket, &key, created_by, parts).await,
-                        BlobEffect::Read { location } => self.read_blob(location).await,
-                        BlobEffect::ReadRange { location, range } => {
-                            self.read_blob_range(location, range).await
-                        }
-                        BlobEffect::Delete { location } => self.delete_blob(location).await,
-                        BlobEffect::SpoolHidden {
-                            namespace,
-                            name,
-                            created_by,
-                            max_bytes,
-                            blob,
-                        } => {
-                            self.spool_hidden_blob(namespace, &name, created_by, max_bytes, blob)
-                                .await
-                        }
-                        BlobEffect::ReadHiddenRange { location, range } => {
-                            self.read_hidden_range(location, range).await
-                        }
-                        BlobEffect::DeleteHidden { key } => self.delete_hidden_blob(key).await,
-                        BlobEffect::ListHidden { namespace } => {
-                            self.list_hidden_blobs(namespace).await
-                        }
-                        BlobEffect::OpenConnection { node_id } => {
-                            self.open_connection(node_id).await
-                        }
-                        BlobEffect::SendMessage { stream_id, payload } => {
-                            self.send_message(stream_id, payload).await
-                        }
-                        BlobEffect::ReadMessage { stream_id } => self.read_message(stream_id).await,
-                        BlobEffect::CloseConnection { stream_id } => {
-                            self.close_connection(stream_id).await
-                        }
-                        BlobEffect::Replicate {
-                            replication_id,
-                            stream_id,
-                            location,
-                            keep_alive,
-                        } => {
-                            self.replicate_blob(replication_id, stream_id, location, keep_alive)
-                                .await
-                        }
-                        BlobEffect::HandleReplication {
-                            replication_id,
-                            stream_id,
-                            keep_alive,
-                        } => {
-                            self.handle_incoming_replication(replication_id, stream_id, keep_alive)
-                                .await
-                        }
-                        BlobEffect::ServeRead {
-                            stream_id,
-                            location,
-                            expected_blake3,
-                        } => self.serve_read(stream_id, location, expected_blake3).await,
-                        BlobEffect::ReceiveRead {
-                            stream_id,
-                            size,
-                            expected_blake3,
-                        } => self.receive_read(stream_id, size, expected_blake3).await,
-                    };
-                    response_tx.send(event);
-                }
-                Err(_) => {
-                    tracing::warn!("Blob receiver channel closed, shutting down blob thread.");
-                }
+    // Effects run concurrently on their caller's task; per-operation ordering
+    // is preserved by the driver awaiting each effect before the next.
+    pub(super) async fn execute_effect(&self, effect: BlobEffect) -> BlobEvent {
+        match effect {
+            BlobEffect::Write {
+                bucket,
+                key,
+                created_by,
+                blob,
+            } => self.write_blob(&bucket, &key, created_by, blob).await,
+            BlobEffect::WritePart {
+                upload_id,
+                part_number,
+                created_by,
+                compressed,
+                encrypted,
+                blob,
+            } => {
+                self.write_blob_part(
+                    upload_id,
+                    part_number,
+                    created_by,
+                    compressed,
+                    encrypted,
+                    blob,
+                )
+                .await
             }
+            BlobEffect::Compose {
+                bucket,
+                key,
+                created_by,
+                parts,
+            } => self.compose_blob(&bucket, &key, created_by, parts).await,
+            BlobEffect::Read { location } => self.read_blob(location).await,
+            BlobEffect::ReadRange { location, range } => {
+                self.read_blob_range(location, range).await
+            }
+            BlobEffect::Delete { location } => self.delete_blob(location).await,
+            BlobEffect::SpoolHidden {
+                namespace,
+                name,
+                created_by,
+                max_bytes,
+                blob,
+            } => {
+                self.spool_hidden_blob(namespace, &name, created_by, max_bytes, blob)
+                    .await
+            }
+            BlobEffect::ReadHiddenRange { location, range } => {
+                self.read_hidden_range(location, range).await
+            }
+            BlobEffect::DeleteHidden { key } => self.delete_hidden_blob(key).await,
+            BlobEffect::ListHidden { namespace } => self.list_hidden_blobs(namespace).await,
+            BlobEffect::OpenConnection { node_id } => self.open_connection(node_id).await,
+            BlobEffect::SendMessage { stream_id, payload } => {
+                self.send_message(stream_id, payload).await
+            }
+            BlobEffect::ReadMessage { stream_id } => self.read_message(stream_id).await,
+            BlobEffect::CloseConnection { stream_id } => self.close_connection(stream_id).await,
+            BlobEffect::Replicate {
+                replication_id,
+                stream_id,
+                location,
+                keep_alive,
+            } => {
+                self.replicate_blob(replication_id, stream_id, location, keep_alive)
+                    .await
+            }
+            BlobEffect::HandleReplication {
+                replication_id,
+                stream_id,
+                keep_alive,
+            } => {
+                self.handle_incoming_replication(replication_id, stream_id, keep_alive)
+                    .await
+            }
+            BlobEffect::ServeRead {
+                stream_id,
+                location,
+                expected_blake3,
+            } => self.serve_read(stream_id, location, expected_blake3).await,
+            BlobEffect::ReceiveRead {
+                stream_id,
+                size,
+                expected_blake3,
+            } => self.receive_read(stream_id, size, expected_blake3).await,
         }
     }
 
-    pub async fn open_connection(&mut self, node_id: NodeId) -> BlobEvent {
+    pub async fn open_connection(&self, node_id: NodeId) -> BlobEvent {
         match super::control_plane::with_control_plane_timeout(
             self.net.open_stream(node_id, Alpn::Bao),
             self.control_plane_connect_timeout(),
@@ -285,7 +304,7 @@ impl BlobHandler {
         }
     }
 
-    pub async fn send_message(&mut self, stream_id: Ulid, payload: Vec<u8>) -> BlobEvent {
+    pub async fn send_message(&self, stream_id: Ulid, payload: Vec<u8>) -> BlobEvent {
         let stream = match self.connection_handle(stream_id).await {
             Ok(stream) => stream,
             Err(event) => return event,
@@ -307,7 +326,7 @@ impl BlobHandler {
         BlobEvent::MessageSent { stream_id }
     }
 
-    pub async fn read_message(&mut self, stream_id: Ulid) -> BlobEvent {
+    pub async fn read_message(&self, stream_id: Ulid) -> BlobEvent {
         let stream = match self.connection_handle(stream_id).await {
             Ok(stream) => stream,
             Err(event) => return event,
@@ -333,7 +352,7 @@ impl BlobHandler {
     }
 
     pub async fn add_connection(
-        &mut self,
+        &self,
         stream_id: Option<Ulid>,
         peer: NodeId,
         stream: BiStream,
@@ -371,7 +390,7 @@ impl BlobHandler {
         Ok(stream_id)
     }
 
-    pub async fn close_connection(&mut self, stream_id: Ulid) -> BlobEvent {
+    pub async fn close_connection(&self, stream_id: Ulid) -> BlobEvent {
         let connection = self.connections.lock().await.remove(&stream_id);
         let Some(connection) = connection else {
             return BlobEvent::ConnectionClosed { stream_id };
@@ -406,6 +425,26 @@ impl BlobHandler {
             interval.tick().await;
             let status = self.probe_operator_status().await;
             *self.operator_status.write().await = status;
+            self.report_pressure();
+        }
+    }
+
+    fn report_pressure(&self) {
+        let in_flight = self.inflight.load(Ordering::Relaxed);
+        let free_slots = self.transfer_slots.available_permits();
+        if free_slots == 0 {
+            tracing::warn!(
+                event = "blob.slots.exhausted",
+                in_flight,
+                "All blob transfer slots are busy"
+            );
+        } else if in_flight > 0 {
+            tracing::debug!(
+                event = "blob.pressure",
+                in_flight,
+                free_slots,
+                "Blob effects in flight"
+            );
         }
     }
 

@@ -24,7 +24,7 @@ use super::BAO_BLOCK_SIZE;
 
 impl BlobHandler {
     pub async fn serve_read(
-        &mut self,
+        &self,
         stream_id: Ulid,
         location: BackendLocation,
         expected_blake3: [u8; 32],
@@ -89,7 +89,7 @@ impl BlobHandler {
     }
 
     pub async fn receive_read(
-        &mut self,
+        &self,
         stream_id: Ulid,
         size: u64,
         expected_blake3: [u8; 32],
@@ -143,7 +143,7 @@ impl BlobHandler {
     }
 
     pub async fn replicate_blob(
-        &mut self,
+        &self,
         replication_id: Ulid,
         stream_id: Ulid,
         location: BackendLocation,
@@ -247,7 +247,7 @@ impl BlobHandler {
     }
 
     pub async fn handle_incoming_replication(
-        &mut self,
+        &self,
         replication_id: Option<Ulid>,
         stream_id: Ulid,
         keep_alive: bool,
