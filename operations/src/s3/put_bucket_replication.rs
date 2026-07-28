@@ -187,9 +187,11 @@ impl Operation for PutBucketReplicationOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id.map_or_else(smallvec::SmallVec::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
+        self.txn_id
+            .take()
+            .map_or_else(smallvec::SmallVec::new, |txn_id| {
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            })
     }
 }
 
@@ -497,9 +499,11 @@ impl Operation for DeleteBucketReplicationOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id.map_or_else(smallvec::SmallVec::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
+        self.txn_id
+            .take()
+            .map_or_else(smallvec::SmallVec::new, |txn_id| {
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            })
     }
 }
 
@@ -510,9 +514,10 @@ mod tests {
         PutBucketReplicationOperation,
     };
     use crate::driver::{DriverContext, drive};
-    use aruna_core::effects::StorageEffect;
+    use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+    use aruna_core::operation::Operation;
     use aruna_core::structs::{
         ArunaArn, BucketInfo, BucketReplicationConfig, BucketReplicationTarget, RealmId,
     };
@@ -652,9 +657,26 @@ mod tests {
             &context,
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap_err();
         assert_eq!(error, PutBucketReplicationError::NoSuchBucket);
+    }
+
+    #[test]
+    fn aborts_once() {
+        // A repeated abort must not re-enqueue AbortTransaction forever.
+        let mut op = PutBucketReplicationOperation::new("missing".to_string(), Vec::new());
+        op.start();
+        op.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::generate(),
+        }));
+        let aborting = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"missing".to_vec().into(),
+            value: None,
+        }));
+        assert!(matches!(
+            aborting.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert!(op.abort().is_empty());
     }
 }

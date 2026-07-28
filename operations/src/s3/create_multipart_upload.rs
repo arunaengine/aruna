@@ -204,8 +204,10 @@ impl Operation for CreateMultipartUploadOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id.map_or_else(smallvec::SmallVec::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
+        self.txn_id
+            .take()
+            .map_or_else(smallvec::SmallVec::new, |txn_id| {
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            })
     }
 }
