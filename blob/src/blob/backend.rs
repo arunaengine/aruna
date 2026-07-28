@@ -3,7 +3,8 @@ use crate::error::BlobLibError;
 use crate::opendal::init_operator;
 use crate::s3::make_bucket;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::{BlobError, ConversionError};
+use aruna_core::types::TxnId;
+use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::BUCKET_STATS_DB;
@@ -14,6 +15,8 @@ use aruna_core::structs::{
 use opendal::Operator;
 use std::path::PathBuf;
 use ulid::Ulid;
+
+const BUCKET_STATS_RETRIES: usize = 16;
 
 impl BlobHandler {
     pub(super) async fn ensure_multipart_bucket(&self) -> Result<(), BlobLibError> {
@@ -110,29 +113,6 @@ impl BlobHandler {
         Ok(buckets)
     }
 
-    pub(super) async fn bucket_load(&self, bucket: &str) -> Result<u64, BlobError> {
-        let event = self
-            .storage
-            .send_effect(Effect::Storage(StorageEffect::Read {
-                key_space: BUCKET_STATS_DB.to_string(),
-                key: bucket.as_bytes().to_vec().into(),
-                txn_id: None,
-            }))
-            .await;
-
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return Err(BlobError::ReadError(
-                "failed to read bucket stats".to_string(),
-            ));
-        };
-
-        match value {
-            Some(value) => Ok(u64::from_le_bytes(
-                value.as_ref().try_into().map_err(ConversionError::from)?,
-            )),
-            None => Ok(0),
-        }
-    }
 
     pub(super) async fn write_bucket_load(&self, bucket: &str, load: u64) -> Result<(), BlobError> {
         let event = self
@@ -161,21 +141,125 @@ impl BlobHandler {
     }
 
     pub(super) async fn increment_bucket_load(&self, bucket: &str) -> Result<(), BlobError> {
-        if !self.is_stats_managed_bucket(bucket) {
-            return Ok(());
-        }
-
-        let load = self.bucket_load(bucket).await?;
-        self.write_bucket_load(bucket, load.saturating_add(1)).await
+        self.adjust_bucket_load(bucket, 1).await
     }
 
     pub(super) async fn decrement_bucket_load(&self, bucket: &str) -> Result<(), BlobError> {
+        self.adjust_bucket_load(bucket, -1).await
+    }
+
+    // Lock-free read-modify-write: a storage transaction detects racing
+    // updates from concurrent effects and the conflicting side retries.
+    async fn adjust_bucket_load(&self, bucket: &str, delta: i64) -> Result<(), BlobError> {
         if !self.is_stats_managed_bucket(bucket) {
             return Ok(());
         }
 
-        let load = self.bucket_load(bucket).await?;
-        self.write_bucket_load(bucket, load.saturating_sub(1)).await
+        for _ in 0..BUCKET_STATS_RETRIES {
+            if self.try_adjust_load(bucket, delta).await? {
+                return Ok(());
+            }
+        }
+        Err(BlobError::ReadError(format!(
+            "bucket stats update for {bucket} kept conflicting"
+        )))
+    }
+
+    async fn try_adjust_load(&self, bucket: &str, delta: i64) -> Result<bool, BlobError> {
+        let event = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::StartTransaction {
+                read: false,
+            }))
+            .await;
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
+            return Err(BlobError::ReadError(
+                "failed to start bucket stats transaction".to_string(),
+            ));
+        };
+
+        let load = match self.bucket_load_txn(bucket, txn_id).await {
+            Ok(load) => load,
+            Err(error) => {
+                self.abort_stats_txn(txn_id).await;
+                return Err(error);
+            }
+        };
+        let adjusted = if delta >= 0 {
+            load.saturating_add(delta.unsigned_abs())
+        } else {
+            load.saturating_sub(delta.unsigned_abs())
+        };
+
+        let event = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: BUCKET_STATS_DB.to_string(),
+                key: bucket.as_bytes().to_vec().into(),
+                value: adjusted.to_le_bytes().to_vec().into(),
+                txn_id: Some(txn_id),
+            }))
+            .await;
+        if !matches!(event, Event::Storage(StorageEvent::WriteResult { .. })) {
+            self.abort_stats_txn(txn_id).await;
+            return Err(BlobError::ReadError(
+                "failed to write bucket stats".to_string(),
+            ));
+        }
+
+        let event = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::CommitTransaction {
+                txn_id,
+            }))
+            .await;
+        match event {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(true),
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            }) => Ok(false),
+            Event::Storage(StorageEvent::Error { error }) => Err(BlobError::ReadError(format!(
+                "failed to commit bucket stats: {error}"
+            ))),
+            _ => Err(BlobError::ReadError(
+                "unexpected storage event while committing bucket stats".to_string(),
+            )),
+        }
+    }
+
+    async fn bucket_load_txn(&self, bucket: &str, txn_id: TxnId) -> Result<u64, BlobError> {
+        let event = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: BUCKET_STATS_DB.to_string(),
+                key: bucket.as_bytes().to_vec().into(),
+                txn_id: Some(txn_id),
+            }))
+            .await;
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return Err(BlobError::ReadError(
+                "failed to read bucket stats".to_string(),
+            ));
+        };
+        match value {
+            Some(value) => Ok(u64::from_le_bytes(
+                value.as_ref().try_into().map_err(ConversionError::from)?,
+            )),
+            None => Ok(0),
+        }
+    }
+
+    async fn abort_stats_txn(&self, txn_id: TxnId) {
+        let event = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::AbortTransaction { txn_id }))
+            .await;
+        if !matches!(
+            event,
+            Event::Storage(StorageEvent::TransactionAborted { .. })
+        ) {
+            tracing::warn!(%txn_id, "failed to abort bucket stats transaction");
+        }
     }
 
     pub(super) fn operator_from_location(
