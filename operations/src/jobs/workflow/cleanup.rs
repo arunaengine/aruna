@@ -505,6 +505,7 @@ mod tests {
                     created_at: SystemTime::now(),
                     created_by: user_id,
                     cors_configuration: None,
+                    replication: None,
                 },
             ),
             &ctx.driver,

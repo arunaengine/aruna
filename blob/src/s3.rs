@@ -1,7 +1,12 @@
 use aruna_core::errors::BlobError;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region, RequestChecksumCalculation};
+use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
 use std::collections::HashMap;
+
+const DEFAULT_REGION: &str = "eu-central-1";
+// AWS rejects CreateBucket requests that name us-east-1 explicitly.
+const IMPLICIT_REGION: &str = "us-east-1";
 
 pub async fn create_s3_client(
     endpoint: &str,
@@ -18,7 +23,9 @@ pub async fn create_s3_client(
         .load()
         .await;
     let s3_config = aws_sdk_s3::config::Builder::from(&client_config)
-        .region(Region::new(region.unwrap_or("eu-central-1".to_string())))
+        .region(Region::new(
+            region.unwrap_or_else(|| DEFAULT_REGION.to_string()),
+        ))
         .endpoint_url(endpoint)
         .force_path_style(force_path_style)
         .build();
@@ -26,32 +33,67 @@ pub async fn create_s3_client(
     Ok(Client::from_conf(s3_config))
 }
 
+fn required_key<'a>(config: &'a HashMap<String, String>, key: &str) -> Result<&'a str, BlobError> {
+    config.get(key).map(String::as_str).ok_or_else(|| {
+        BlobError::OperatorCreationFailed(format!("blob backend config is missing {key}"))
+    })
+}
+
 pub async fn make_bucket(bucket: &str, config: &HashMap<String, String>) -> Result<(), BlobError> {
+    let region = config
+        .get("region")
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_REGION.to_string());
     let s3_client = create_s3_client(
-        config
-            .get("endpoint")
-            .expect("Config is missing endpoint URL"),
-        config.get("region").cloned(),
-        config
-            .get("access_key_id")
-            .expect("Config is missing access key id"),
-        config
-            .get("secret_access_key")
-            .expect("Config is missing secret access key"),
+        required_key(config, "endpoint")?,
+        Some(region.clone()),
+        required_key(config, "access_key_id")?,
+        required_key(config, "secret_access_key")?,
         config
             .get("force_path_style")
-            .map(|val| val.parse::<bool>().unwrap_or(false))
-            .unwrap_or(false),
+            .map(|val| val.parse::<bool>().unwrap_or(true))
+            .unwrap_or(true),
     )
     .await?;
 
-    match s3_client.get_bucket_location().bucket(bucket).send().await {
+    if s3_client
+        .get_bucket_location()
+        .bucket(bucket)
+        .send()
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    let mut request = s3_client.create_bucket().bucket(bucket);
+    if let Some(constraint) = location_constraint(&region) {
+        request = request.create_bucket_configuration(
+            CreateBucketConfiguration::builder()
+                .location_constraint(constraint)
+                .build(),
+        );
+    }
+
+    match request.send().await {
         Ok(_) => Ok(()),
-        Err(_) => match s3_client.create_bucket().bucket(bucket).send().await {
-            Ok(_) => Ok(()),
-            Err(err) => Err(BlobError::MakeBucketError(err.to_string())),
+        Err(err) => match err.as_service_error() {
+            // A racing creator won: the bucket is ours, or at least reachable.
+            Some(service) if service.is_bucket_already_owned_by_you() => Ok(()),
+            Some(service) if service.is_bucket_already_exists() => s3_client
+                .get_bucket_location()
+                .bucket(bucket)
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|_| BlobError::MakeBucketError(err.to_string())),
+            _ => Err(BlobError::MakeBucketError(err.to_string())),
         },
     }
+}
+
+fn location_constraint(region: &str) -> Option<BucketLocationConstraint> {
+    (region != IMPLICIT_REGION).then(|| BucketLocationConstraint::from(region))
 }
 
 #[cfg(test)]
@@ -86,5 +128,15 @@ mod tests {
             .expect_err("handshake against a closed socket must fail");
 
         assert!(matches!(err, SdkError::DispatchFailure(_)), "{err:?}");
+    }
+
+    #[test]
+    fn omits_default_constraint() {
+        // us-east-1 must stay implicit; every other region must be named.
+        assert!(location_constraint("us-east-1").is_none());
+        assert_eq!(
+            location_constraint("eu-central-1"),
+            Some(BucketLocationConstraint::EuCentral1)
+        );
     }
 }

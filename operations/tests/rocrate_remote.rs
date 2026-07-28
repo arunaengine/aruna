@@ -1,3 +1,5 @@
+// Fresh builds overflow the default query depth in nested async layouts.
+#![recursion_limit = "256"]
 //! Driven two-node remote (Bao read) RO-Crate export integration.
 //!
 //! The exporter node holds only the metadata document; the payload version lives
@@ -345,6 +347,7 @@ async fn seed_holder(
         created_at: SystemTime::UNIX_EPOCH,
         created_by: owner,
         cors_configuration: None,
+        replication: None,
     };
     let hash: [u8; 32] = location
         .get_blake3()

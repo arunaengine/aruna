@@ -1,3 +1,5 @@
+// Fresh builds overflow the default query depth in nested async layouts.
+#![recursion_limit = "256"]
 //! End-to-end compute-layer tests against a real Docker daemon and a real S3
 //! endpoint. Each test skips with a written message when no daemon is reachable,
 //! so a CI box without Docker records the skip rather than failing.

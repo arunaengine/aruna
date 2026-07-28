@@ -3063,6 +3063,97 @@ mod tests {
         assert!(listed.documents[0].rocrate_summary.is_some());
     }
 
+    #[tokio::test]
+    async fn list_with_summary_withholds_replaced_content_until_materialized() {
+        let test = setup_state().await;
+
+        let (_, Json(created)) = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Extension(None),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/replaced-summary".to_string(),
+                    name: "Original Dataset".to_string(),
+                    description: "before the replace".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        let document_id = created.summary.document_id.clone();
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let summary_query = ListMetadataQuery {
+            include: Some("summary".to_string()),
+            ..ListMetadataQuery::default()
+        };
+        // Prime the summary cache with the pre-update revision.
+        let (_, Json(listed)) = list_metadata_documents(
+            State(test.state.clone()),
+            Extension(None),
+            Path(test.group_id.to_string()),
+            Query(summary_query.clone()),
+        )
+        .await
+        .unwrap();
+        let primed = serde_json::to_string(&listed.documents[0].rocrate_summary).unwrap();
+        assert!(primed.contains("Original Dataset"));
+
+        let rocrate = format!(
+            r#"{{"@context":"https://w3id.org/ro/crate/1.2/context","@graph":[{{"@id":"ro-crate-metadata.json","@type":"CreativeWork","conformsTo":{{"@id":"https://w3id.org/ro/crate/1.2"}},"about":{{"@id":"https://w3id.org/aruna/{document_id}"}}}},{{"@id":"https://w3id.org/aruna/{document_id}","@type":"Dataset","name":"Renamed Dataset","description":"after the replace","datePublished":"2026-01-01","license":{{"@id":"https://creativecommons.org/licenses/by/4.0/"}}}}]}}"#
+        );
+        let _ = replace_metadata_rocrate(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Extension(None),
+            Path(document_id),
+            Json(ReplaceMetadataRoCrateRequest {
+                rocrate: serde_json::from_str(&rocrate).unwrap(),
+                public: Some(true),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // No drain: re-materialization is pending, and the graph still holds
+        // the replaced revision. Listing must withhold the summary rather than
+        // export the old content, which would also cache it under the new
+        // cursor and keep serving it after materialization.
+        let (_, Json(listed)) = list_metadata_documents(
+            State(test.state.clone()),
+            Extension(None),
+            Path(test.group_id.to_string()),
+            Query(summary_query.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(listed.documents.len(), 1);
+        assert!(
+            listed.documents[0].rocrate_summary.is_none(),
+            "a pending update must list without a summary, not the replaced content"
+        );
+
+        drain_metadata_background(test.state.as_ref()).await;
+        let (_, Json(listed)) = list_metadata_documents(
+            State(test.state.clone()),
+            Extension(None),
+            Path(test.group_id.to_string()),
+            Query(summary_query),
+        )
+        .await
+        .unwrap();
+        let refreshed = serde_json::to_string(&listed.documents[0].rocrate_summary).unwrap();
+        assert!(
+            refreshed.contains("Renamed Dataset"),
+            "the materialized summary must carry the new revision, got: {refreshed}"
+        );
+    }
+
     #[test]
     fn metadata_openapi_includes_examples_and_public_field_names() {
         let openapi = serde_json::to_value(MetadataApiDoc::openapi()).unwrap();

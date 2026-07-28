@@ -190,9 +190,11 @@ impl Operation for PutBucketCorsOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id.map_or_else(smallvec::SmallVec::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
+        self.txn_id
+            .take()
+            .map_or_else(smallvec::SmallVec::new, |txn_id| {
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            })
     }
 }
 
@@ -497,9 +499,11 @@ impl Operation for DeleteBucketCorsOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id.map_or_else(smallvec::SmallVec::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
+        self.txn_id
+            .take()
+            .map_or_else(smallvec::SmallVec::new, |txn_id| {
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            })
     }
 }
 
@@ -540,6 +544,7 @@ mod tests {
             created_at: SystemTime::UNIX_EPOCH,
             created_by: Default::default(),
             cors_configuration,
+            replication: None,
         }
     }
 

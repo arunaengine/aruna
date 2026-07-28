@@ -411,6 +411,7 @@ mod tests {
                     created_at: SystemTime::UNIX_EPOCH,
                     created_by: owner,
                     cors_configuration: None,
+                    replication: None,
                 }
                 .to_bytes()
                 .unwrap(),

@@ -1,3 +1,5 @@
+// Fresh builds overflow the default query depth in nested async layouts.
+#![recursion_limit = "256"]
 //! Debug probe (not a release gate): measures create-path latency with the
 //! materialization drain running concurrently vs. left idle. Run pinned to a
 //! few cores to mimic a cluster pod:

@@ -1,3 +1,5 @@
+// Fresh builds overflow the default query depth in nested async layouts.
+#![recursion_limit = "256"]
 mod shared;
 
 use aws_sdk_s3::primitives::ByteStream;

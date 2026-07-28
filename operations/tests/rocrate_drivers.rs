@@ -1,3 +1,5 @@
+// Fresh builds overflow the default query depth in nested async layouts.
+#![recursion_limit = "256"]
 use std::io::{Cursor, Read};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1352,6 +1354,7 @@ async fn create_bucket(
                 created_at: SystemTime::now(),
                 created_by: actor.user_id,
                 cors_configuration: None,
+                replication: None,
             },
         ),
         context,

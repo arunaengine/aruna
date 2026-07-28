@@ -1,3 +1,5 @@
+// Fresh builds overflow the default query depth in nested async layouts.
+#![recursion_limit = "256"]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -60,6 +62,7 @@ async fn node_usage_snapshot_reaches_peer_realm_aggregate() -> Result<(), Box<dy
                 created_at: std::time::SystemTime::now(),
                 created_by: Default::default(),
                 cors_configuration: None,
+                replication: None,
             },
         ),
         node_a.context.as_ref(),
@@ -261,6 +264,7 @@ async fn steady_state_write_publishes_snapshot_without_restart()
                 created_at: std::time::SystemTime::now(),
                 created_by: Default::default(),
                 cors_configuration: None,
+                replication: None,
             },
         ),
         node.context.as_ref(),

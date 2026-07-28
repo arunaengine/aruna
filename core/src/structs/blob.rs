@@ -1,6 +1,8 @@
 use crate::errors::{BlobError, ConversionError};
 use crate::structs::checksum::HASH_BLAKE3;
-use crate::structs::{PathRestriction, RealmId, SourceMetadata, VersionSourceBinding};
+use crate::structs::{
+    BucketReplicationConfig, PathRestriction, RealmId, SourceMetadata, VersionSourceBinding,
+};
 use crate::types::{GroupId, NodeId, UserId};
 use byteview::ByteView;
 use core::fmt;
@@ -130,6 +132,30 @@ impl TryFrom<(ByteView, ByteView)> for BackendBucket {
 impl From<(String, u64)> for BackendBucket {
     fn from((name, size): (String, u64)) -> Self {
         Self { name, load: size }
+    }
+}
+
+/// Deferred blob housekeeping written atomically with a completed upload and
+/// drained outside the request path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BlobCleanupWork {
+    DeleteBlob {
+        location: BackendLocation,
+    },
+    RegisterDht {
+        blake3: [u8; 32],
+        realm_id: RealmId,
+        ttl_ms: u64,
+    },
+}
+
+impl BlobCleanupWork {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
     }
 }
 
@@ -306,6 +332,7 @@ pub struct BucketInfo {
     pub created_at: SystemTime,
     pub created_by: UserId,
     pub cors_configuration: Option<BucketCorsConfiguration>,
+    pub replication: Option<BucketReplicationConfig>,
 }
 
 impl BucketInfo {

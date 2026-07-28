@@ -1302,7 +1302,6 @@ mod tests {
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
         BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE,
-        S3_BUCKET_REPLICATION_KEYSPACE,
     };
     use aruna_core::structs::{
         Actor, BackendLocation, BlobHeadKey, BlobVersion, CurrentVersionPointer, Group,
@@ -1495,7 +1494,7 @@ mod tests {
         let version_id = Ulid::generate();
         write_doc(
             &test.state.get_ctx(),
-            S3_BUCKET_REPLICATION_KEYSPACE,
+            S3_BUCKET_KEYSPACE,
             test.bucket.as_bytes().to_vec().into(),
             b"not a bucket replication config".to_vec().into(),
         )
@@ -1938,6 +1937,7 @@ mod tests {
             created_at: std::time::SystemTime::UNIX_EPOCH,
             created_by: user_with_source_read,
             cors_configuration: None,
+            replication: None,
         };
         write_doc(
             &driver_ctx,

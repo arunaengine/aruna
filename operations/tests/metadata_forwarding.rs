@@ -1,3 +1,5 @@
+// Fresh builds overflow the default query depth in nested async layouts.
+#![recursion_limit = "256"]
 use aruna_core::keys::generate_signing_key;
 use std::collections::HashSet;
 use std::sync::Arc;

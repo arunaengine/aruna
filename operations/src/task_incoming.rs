@@ -24,6 +24,7 @@ use tracing::{debug, error, info, warn};
 use crate::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation, REALM_PRESENCE_REFRESH_AFTER,
 };
+use crate::blob::cleanup::{BLOB_CLEANUP_AFTER, BLOB_CLEANUP_RETRY, process_cleanup_batch};
 use crate::blob::hidden::{
     HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, process_hidden_sweep, restore_hidden_sweep,
 };
@@ -1756,6 +1757,19 @@ impl OperationsTaskHandler {
         self.reschedule_timer(TaskKey::PruneJobs, after).await;
     }
 
+    async fn drain_blob_cleanup(&self) {
+        let after = match process_cleanup_batch(&self.context).await {
+            Ok(outcome) if outcome.failed > 0 => BLOB_CLEANUP_RETRY,
+            Ok(_) => BLOB_CLEANUP_AFTER,
+            Err(error) => {
+                warn!(task_id = ?TaskKey::DrainBlobCleanupQueue, error = %error, "Failed to drain blob cleanup");
+                BLOB_CLEANUP_RETRY
+            }
+        };
+        self.reschedule_timer(TaskKey::DrainBlobCleanupQueue, after)
+            .await;
+    }
+
     async fn sweep_hidden_blobs(&self) {
         let after = match process_hidden_sweep(&self.context).await {
             Ok(_) => HIDDEN_SWEEP_AFTER,
@@ -1911,6 +1925,9 @@ async fn initialize_task_handler(
     restore_mirror_timer(&context.storage_handle, &task_handle).await;
     if context.blob_handle.is_some() {
         restore_hidden_sweep(&context.storage_handle, &task_handle).await;
+        handler
+            .reschedule_timer(TaskKey::DrainBlobCleanupQueue, Duration::ZERO)
+            .await;
     }
     if refresh_holders {
         handler
@@ -2009,6 +2026,9 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::SweepHiddenBlobs => {
                 self.sweep_hidden_blobs().await;
+            }
+            TaskKey::DrainBlobCleanupQueue => {
+                self.drain_blob_cleanup().await;
             }
             TaskKey::RefreshBlobHolders => {
                 self.refresh_blob_holders().await;

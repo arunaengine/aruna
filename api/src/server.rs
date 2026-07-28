@@ -5,15 +5,28 @@ use crate::portal;
 use crate::routes::rest_router;
 pub(crate) use crate::server_state::{ServerState, swagger_ui};
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::{Method, Uri, header};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
+use axum::http::{Method, StatusCode, Uri, header};
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Redirect, Response};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 
 pub const DEFAULT_MAX_HTTP_BODY_SIZE: usize = 1024 * 1024;
+
+// Backstop only, far above any legitimate request: the interactive bounds live
+// in the discovery/fanout/open_stream deadlines. This catches handler paths
+// that would otherwise hold the connection for unbounded peer I/O. Streaming
+// response bodies (SSE, archive downloads) are not covered — the layer bounds
+// the time to produce the response, not the body. Routes that read the request
+// body inside the handler are exempt, see TIMEOUT_EXEMPT_ROUTES.
+const REST_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+// Body-streaming routes: upload duration counts against the handler, so a
+// deadline here truncates legitimate slow transfers.
+const TIMEOUT_EXEMPT_ROUTES: &[&str] = &["/metadata/rocrate/uploads"];
 
 #[derive(Clone, Debug)]
 pub struct Server {
@@ -45,7 +58,9 @@ impl Server {
     }
     pub fn build_router(&self) -> Router {
         // Build the main API router
-        let api_v1 = Router::new().merge(rest_router(self.state.clone()));
+        let api_v1 = Router::new()
+            .merge(rest_router(self.state.clone()))
+            .layer(from_fn(rest_timeout));
         let api_authority = self
             .api_public_url
             .as_deref()
@@ -93,6 +108,28 @@ impl Server {
     }
 }
 
+fn is_exempt(matched: Option<&str>) -> bool {
+    matched.is_some_and(|path| {
+        TIMEOUT_EXEMPT_ROUTES
+            .iter()
+            .any(|route| path == *route || path.ends_with(route))
+    })
+}
+
+async fn rest_timeout(request: Request, next: Next) -> Response {
+    let matched = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|matched| matched.as_str().to_string());
+    if is_exempt(matched.as_deref()) {
+        return next.run(request).await;
+    }
+    match tokio::time::timeout(REST_REQUEST_TIMEOUT, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
+    }
+}
+
 async fn redirect_swagger(
     State(api_authority): State<Option<String>>,
     request: Request,
@@ -115,4 +152,61 @@ async fn redirect_swagger(
     }
 
     next.run(request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TIMEOUT_EXEMPT_ROUTES, is_exempt};
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::MatchedPath;
+    use axum::http::{Method, Request, StatusCode};
+    use axum::middleware::{Next, from_fn};
+    use axum::routing::post;
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    #[test]
+    fn matches_exempt_route() {
+        assert!(is_exempt(Some("/metadata/rocrate/uploads")));
+        assert!(is_exempt(Some("/api/v1/metadata/rocrate/uploads")));
+        assert!(!is_exempt(Some("/api/v1/metadata/rocrate/imports")));
+        assert!(!is_exempt(None));
+    }
+
+    #[tokio::test]
+    async fn nested_matched_path() {
+        // The timeout layer sits inside the /api/v1 nest and must still see the
+        // route template that drives the exemption.
+        let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let probe = seen.clone();
+        let inner = Router::new()
+            .route(TIMEOUT_EXEMPT_ROUTES[0], post(|| async { StatusCode::OK }))
+            .layer(from_fn(move |request: Request<Body>, next: Next| {
+                let probe = probe.clone();
+                async move {
+                    let matched = request
+                        .extensions()
+                        .get::<MatchedPath>()
+                        .map(|matched| matched.as_str().to_string());
+                    *probe.lock().unwrap() = matched;
+                    next.run(request).await
+                }
+            }));
+
+        let response = Router::new()
+            .nest("/api/v1", inner)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/metadata/rocrate/uploads")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(is_exempt(seen.lock().unwrap().as_deref()));
+    }
 }

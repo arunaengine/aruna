@@ -37,12 +37,12 @@ pub const USER_SUBJECT_CLAIMS_KEYSPACE: &str = "user_subject_claims";
 
 // Blob + S3 keyspaces
 pub const BLOB_LOCATIONS_KEYSPACE: &str = "blob_locations";
+pub const BLOB_CLEANUP_KEYSPACE: &str = "blob_pending_cleanups";
 pub const BLOB_HEAD_KEYSPACE: &str = "blob_heads";
 pub const BLOB_VERSIONS_KEYSPACE: &str = "blob_versions";
 pub const HASH_PATHS_INDEX_KEYSPACE: &str = "hash_paths_index";
 pub const USER_ACCESS_KEYSPACE: &str = "user_access";
 pub const S3_BUCKET_KEYSPACE: &str = "s3_buckets";
-pub const S3_BUCKET_REPLICATION_KEYSPACE: &str = "s3_bucket_replication";
 pub const SYNC_RELATIONSHIP_OUT_KEYSPACE: &str = "sync_relationship_out";
 pub const SYNC_RELATIONSHIP_IN_KEYSPACE: &str = "sync_relationship_in";
 pub const SYNC_MIRROR_REPAIR_KEYSPACE: &str = "sync_mirror_repair";

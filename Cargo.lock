@@ -303,7 +303,6 @@ dependencies = [
  "blake3",
  "bytes",
  "crc-fast",
- "crossfire",
  "futures",
  "iroh-io",
  "md5",

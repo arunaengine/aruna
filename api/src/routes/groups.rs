@@ -1664,6 +1664,7 @@ mod tests {
             created_at: SystemTime::now(),
             created_by: Default::default(),
             cors_configuration: None,
+            replication: None,
         };
         store_bytes(
             state,

@@ -11,17 +11,17 @@ use aruna_core::keyspaces::{
     CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE,
     HASH_PATHS_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
     METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
-    S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
-    S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
-    SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+    SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
+    USER_ACCESS_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
-    BlobHeadKey, BlobVersion, BucketInfo, BucketReplicationConfig, CurrentVersionPointer, Group,
-    GroupAuthorizationDocument, HashPathIndexKey, MultipartObjectMetadataKey, MultipartObjectPart,
-    MultipartObjectSummary, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess, VersionKey,
+    BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument,
+    HashPathIndexKey, MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
+    MultipartUpload, MultipartUploadPart, MultipartUploadPartKey, RealmAuthorizationDocument,
+    RealmConfigDocument, RealmId, UserAccess, VersionKey,
 };
 use aruna_net::dht::storage::StoredEntry;
 use chrono::{DateTime, Utc};
@@ -168,9 +168,6 @@ enum DecodedValue {
     },
     BucketInfo {
         data: BucketInfo,
-    },
-    BucketReplicationConfig {
-        data: BucketReplicationConfig,
     },
     CurrentVersionPointer {
         data: CurrentVersionPointer,
@@ -932,7 +929,7 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
     })
 }
 
-fn defined_keyspaces() -> [&'static str; 32] {
+fn defined_keyspaces() -> [&'static str; 31] {
     [
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
         ADMIN_DOCUMENT_STATE_KEYSPACE,
@@ -958,7 +955,6 @@ fn defined_keyspaces() -> [&'static str; 32] {
         ONBOARDING_KEYSPACE,
         REALM_CONFIG_KEYSPACE,
         S3_BUCKET_KEYSPACE,
-        S3_BUCKET_REPLICATION_KEYSPACE,
         S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
         S3_MULTIPART_UPLOAD_KEYSPACE,
         S3_MULTIPART_UPLOAD_PART_KEYSPACE,
@@ -1115,7 +1111,6 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
             .unwrap_or_else(|_| raw_field(key)),
         USER_ACCESS_KEYSPACE
         | S3_BUCKET_KEYSPACE
-        | S3_BUCKET_REPLICATION_KEYSPACE
         | API_STATE_KEYSPACE
         | DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE
         | NODE_STATE_KEYSPACE
@@ -1162,11 +1157,6 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         S3_BUCKET_KEYSPACE => decode_value_with(value, BucketInfo::from_bytes, |data| {
             DecodedValue::BucketInfo { data }
         }),
-        S3_BUCKET_REPLICATION_KEYSPACE => {
-            decode_value_with(value, BucketReplicationConfig::from_bytes, |data| {
-                DecodedValue::BucketReplicationConfig { data }
-            })
-        }
         BLOB_HEAD_KEYSPACE => decode_value_with(value, CurrentVersionPointer::from_bytes, |data| {
             DecodedValue::CurrentVersionPointer { data }
         }),
@@ -1381,14 +1371,13 @@ mod tests {
         HASH_PATHS_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
         METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE,
         ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
-        S3_BUCKET_REPLICATION_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
-        S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
-        SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
-        USER_ACCESS_KEYSPACE,
+        S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
+        S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
+        SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingSecretRecord};
     use aruna_core::structs::{
-        Actor, BackendLocation, BlobHeadKey, BlobVersion, BucketReplicationConfig,
+        Actor, BackendLocation, BlobHeadKey, BlobVersion, BucketInfo, BucketReplicationConfig,
         BucketReplicationTarget, Group, HashPathIndexKey, MultipartChecksumType,
         MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
         MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus, RealmConfigDocument,
@@ -1463,7 +1452,6 @@ mod tests {
             ONBOARDING_KEYSPACE.to_string(),
             REALM_CONFIG_KEYSPACE.to_string(),
             S3_BUCKET_KEYSPACE.to_string(),
-            S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
             S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
             S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
             S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
@@ -1477,7 +1465,8 @@ mod tests {
     }
 
     #[test]
-    fn decodes_bucket_replication_entry() {
+    fn decodes_bucket_replication() {
+        // The replication config decodes as part of the bucket record.
         let realm_id = RealmId::from_bytes([4_u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[6_u8; 32]).public();
         let config = BucketReplicationConfig {
@@ -1489,11 +1478,18 @@ mod tests {
                 replicate_delete_markers: true,
             }],
         };
+        let info = BucketInfo {
+            group_id: Ulid::generate(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            cors_configuration: None,
+            replication: Some(config.clone()),
+        };
 
         let decoded = decode_entry(
-            S3_BUCKET_REPLICATION_KEYSPACE,
+            S3_BUCKET_KEYSPACE,
             b"primary-bucket",
-            &config.to_bytes().unwrap(),
+            &info.to_bytes().unwrap(),
         );
         assert_eq!(
             decoded.key,
@@ -1502,8 +1498,8 @@ mod tests {
             }
         );
         match decoded.value {
-            DecodedValue::BucketReplicationConfig { data } => assert_eq!(data, config),
-            other => panic!("expected bucket replication config, got {other:?}"),
+            DecodedValue::BucketInfo { data } => assert_eq!(data.replication, Some(config)),
+            other => panic!("expected bucket info, got {other:?}"),
         }
     }
 

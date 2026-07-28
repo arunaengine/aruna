@@ -129,6 +129,7 @@ pub async fn ensure_workspace_bucket(
         created_at: SystemTime::now(),
         created_by: record.created_by,
         cors_configuration: None,
+        replication: None,
     };
     match drive(
         CreateBucketOperation::new(bucket.to_string(), bucket_info),

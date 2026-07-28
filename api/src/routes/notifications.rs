@@ -1238,6 +1238,7 @@ mod tests {
             created_at: SystemTime::now(),
             created_by,
             cors_configuration: None,
+            replication: None,
         };
         write_fixture(
             state,

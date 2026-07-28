@@ -24,7 +24,7 @@ use super::BAO_BLOCK_SIZE;
 
 impl BlobHandler {
     pub async fn serve_read(
-        &mut self,
+        &self,
         stream_id: Ulid,
         location: BackendLocation,
         expected_blake3: [u8; 32],
@@ -89,7 +89,7 @@ impl BlobHandler {
     }
 
     pub async fn receive_read(
-        &mut self,
+        &self,
         stream_id: Ulid,
         size: u64,
         expected_blake3: [u8; 32],
@@ -143,7 +143,7 @@ impl BlobHandler {
     }
 
     pub async fn replicate_blob(
-        &mut self,
+        &self,
         replication_id: Ulid,
         stream_id: Ulid,
         location: BackendLocation,
@@ -247,7 +247,7 @@ impl BlobHandler {
     }
 
     pub async fn handle_incoming_replication(
-        &mut self,
+        &self,
         replication_id: Option<Ulid>,
         stream_id: Ulid,
         keep_alive: bool,
@@ -289,7 +289,9 @@ impl BlobHandler {
             }
         };
 
-        let backend_bucket = match self.eval_backend_bucket().await {
+        // Reserved before the replica is written so a stats failure never
+        // orphans bytes a retry would rewrite under a fresh ulid.
+        let backend_bucket = match self.reserve_bucket().await {
             Ok(bucket) => bucket,
             Err(err) => return BlobEvent::Error(err),
         };
@@ -298,27 +300,37 @@ impl BlobHandler {
         location.storage_bucket = backend_bucket.clone();
         location.backend_path = match rebuild_backend_path(&location.backend_path, ulid) {
             Ok(path) => path,
-            Err(err) => return BlobEvent::Error(BlobError::ConversionError(err)),
+            Err(err) => {
+                self.release_bucket(&backend_bucket).await;
+                return BlobEvent::Error(BlobError::ConversionError(err));
+            }
         };
         location.ulid = ulid;
 
         let operator = match self.operator_from_location(&location) {
             Ok(op) => op,
             Err(err) => {
+                self.release_bucket(&backend_bucket).await;
                 return BlobEvent::Error(BlobError::OperatorCreationFailed(err.to_string()));
             }
         };
 
         let stream = match self.connection_handle(stream_id).await {
             Ok(stream) => stream,
-            Err(event) => return event,
+            Err(event) => {
+                self.release_bucket(&backend_bucket).await;
+                return event;
+            }
         };
         let mut stream = stream.lock().await;
         let rx = &mut stream.1;
         let rx_wrapper = RecvStreamWrapper::new(rx, self.transfer_idle_timeout());
         let storage_path = match location.get_storage_path() {
             Ok(storage_path) => storage_path,
-            Err(e) => return BlobEvent::Error(e),
+            Err(e) => {
+                self.release_bucket(&backend_bucket).await;
+                return BlobEvent::Error(e);
+            }
         };
         let mut writer = match OpenDalWriter::new(
             &operator,
@@ -329,6 +341,7 @@ impl BlobHandler {
         {
             Ok(writer) => writer,
             Err(err) => {
+                self.release_bucket(&backend_bucket).await;
                 return BlobEvent::Error(BlobError::OperatorCreationFailed(err.to_string()));
             }
         };
@@ -347,13 +360,17 @@ impl BlobHandler {
         let event = match decode_result {
             Err(err) => {
                 writer.abort().await;
+                self.release_bucket(&backend_bucket).await;
                 BlobEvent::Error(BlobError::ReplicationFailed(err.to_string()))
             }
             Ok(()) => {
                 let hashes = writer.hasher.to_map();
                 let actual_blake3 = writer.hasher.finalize().blake3;
                 match writer.finalize().await {
-                    Err(err) => BlobEvent::Error(BlobError::ReplicationFailed(err.to_string())),
+                    Err(err) => {
+                        self.release_bucket(&backend_bucket).await;
+                        BlobEvent::Error(BlobError::ReplicationFailed(err.to_string()))
+                    }
                     Ok(()) => {
                         debug!("Decoded all chunks and wrote them into the backend");
                         if actual_blake3 != root {
@@ -363,15 +380,13 @@ impl BlobHandler {
                                     "failed to delete hash-mismatched replicated blob"
                                 );
                             }
+                            self.release_bucket(&backend_bucket).await;
                             BlobEvent::Error(BlobError::IntegrityCheckFailed(
                                 "replicated content hash mismatch".to_string(),
                             ))
                         } else {
                             location.hashes = hashes;
-                            match self.increment_bucket_load(&location.storage_bucket).await {
-                                Err(err) => BlobEvent::Error(err),
-                                Ok(()) => BlobEvent::ReplicationFinished { location },
-                            }
+                            BlobEvent::ReplicationFinished { location }
                         }
                     }
                 }

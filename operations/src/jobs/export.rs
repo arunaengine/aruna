@@ -2310,6 +2310,7 @@ mod tests {
             created_at: std::time::SystemTime::UNIX_EPOCH,
             created_by: owner,
             cors_configuration: None,
+            replication: None,
         };
         let hash: [u8; 32] = location.get_blake3().unwrap().try_into().unwrap();
         let version =

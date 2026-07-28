@@ -940,15 +940,10 @@ impl Operation for PutObjectOperation {
     fn abort(&mut self) -> Effects {
         // Rollback blob io and transaction
         let mut actions = smallvec![];
-        if let Some(output) = self.get_written_location() {
-            actions.insert(
-                0,
-                Effect::Blob(BlobEffect::Delete {
-                    location: output.clone(),
-                }),
-            )
+        if let Some(location) = self.written_location.take() {
+            actions.insert(0, Effect::Blob(BlobEffect::Delete { location }))
         }
-        if let Some(txn_id) = self.txn_id {
+        if let Some(txn_id) = self.txn_id.take() {
             actions.insert(
                 1,
                 Effect::Storage(StorageEffect::AbortTransaction { txn_id }),
@@ -1070,6 +1065,7 @@ mod test {
             created_at: std::time::SystemTime::UNIX_EPOCH,
             created_by: config.user_id,
             cors_configuration: None,
+            replication: None,
         };
         let recreated = BucketInfo {
             created_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),

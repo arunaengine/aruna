@@ -47,7 +47,7 @@ use crate::get_metadata_document::{
     is_metadata_record_materialized_for_graph_read, load_metadata_record_by_document,
 };
 use crate::get_realm_config::GetRealmConfigOperation;
-use crate::get_realm_nodes::GetRealmNodesOperation;
+use crate::get_realm_nodes::{GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT};
 use crate::list_groups::ListGroupOperation;
 use crate::list_metadata_documents::ListMetadataDocumentsOperation;
 use crate::metadata::repository::{LIST_METADATA_PAGE_SIZE, StorageReadError};
@@ -420,8 +420,15 @@ pub async fn list_visible_metadata_documents(
     if request.include_summary {
         let exports = selected
             .iter()
-            .map(|record| {
+            .map(|record| async move {
+                // The registry cursor advances at event acceptance, but the
+                // graph only at materialization. Exporting inside that window
+                // would hand out the content (and cache it under the new cursor)
+                // the event just replaced, so a pending document lists without
+                // a summary instead.
+                ensure_record_materialized_for_graph_read(context, record).await?;
                 export_rocrate_summary_jsonld(context, &record.graph_iri, record.last_event_id)
+                    .await
             })
             .collect::<Vec<_>>();
         let summaries = stream::iter(exports)
@@ -908,8 +915,15 @@ async fn load_metadata_realm_nodes_with_status(
             failed: true,
         };
     };
-    let nodes = match drive(GetRealmNodesOperation::new(realm_id), context).await {
-        Ok(nodes) => match authorized_realm_nodes(&config, nodes) {
+    // Race discovery against REALM_DISCOVERY_TIMEOUT so fanout queries degrade
+    // to reachable/local partitions instead of stalling behind offline peers.
+    let discovery = tokio::time::timeout(
+        REALM_DISCOVERY_TIMEOUT,
+        drive(GetRealmNodesOperation::new(realm_id), context),
+    )
+    .await;
+    let nodes = match discovery {
+        Ok(Ok(nodes)) => match authorized_realm_nodes(&config, nodes) {
             Ok(nodes) => (nodes, false),
             Err(error) => {
                 warn!(error = %error, "realm config contains invalid node ids; using local-only metadata results");
@@ -919,11 +933,15 @@ async fn load_metadata_realm_nodes_with_status(
                 };
             }
         },
-        Err(error) => {
+        Ok(Err(error)) => {
             warn!(
                 error = %error,
                 "realm node discovery failed, using best-effort local-only metadata results"
             );
+            (HashSet::new(), true)
+        }
+        Err(_) => {
+            warn!("realm node discovery timed out, using best-effort local-only metadata results");
             (HashSet::new(), true)
         }
     };
@@ -1787,11 +1805,10 @@ where
                 .map(|(index, node_id)| (node_id, index))
                 .collect::<HashMap<_, _>>();
             let mut outstanding = nodes.iter().copied().collect::<HashSet<_>>();
-            let deadline = matches!(
-                operation,
-                MetadataFanoutOperation::Query | MetadataFanoutOperation::BucketSearch
-            )
-            .then(|| tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE);
+            // Every interactive fanout gets the overall deadline; offline
+            // partitions land in failed_partitions and partial-tolerant
+            // callers (search) still answer from the reachable nodes.
+            let deadline = Some(tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE);
 
             let pending =
                 stream::iter(nodes.into_iter().enumerate().map(|(node_index, node_id)| {
@@ -3302,6 +3319,58 @@ mod tests {
         assert_eq!(stats.nodes_queried, 3);
         assert_eq!(stats.nodes_failed, 1);
         assert_eq!(stats.failed_partitions, vec![failed]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn search_deadline_partial() {
+        // A node that never answers must not stall search fanout: the overall
+        // deadline fails its partition and the reachable nodes still answer.
+        let directory = tempdir().unwrap();
+        let context = DriverContext {
+            storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap())
+                .unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let local = iroh::SecretKey::from_bytes(&[44u8; 32]).public();
+        let healthy = iroh::SecretKey::from_bytes(&[45u8; 32]).public();
+        let hanging = iroh::SecretKey::from_bytes(&[46u8; 32]).public();
+        let local_call: MetadataNodeCall<usize> =
+            metadata_node_call((), |(), _| async move { Ok(1) });
+        let remote_call: MetadataNodeCall<usize> =
+            metadata_node_call(hanging, |hanging, node_id| async move {
+                if node_id == hanging {
+                    std::future::pending::<Result<usize, MetadataError>>().await
+                } else {
+                    Ok(2)
+                }
+            });
+
+        let (parts, stats) = run_metadata_fanout(
+            &context,
+            RealmId::from_bytes([10u8; 32]),
+            local,
+            MetadataFanoutScope::new(
+                Some(MetadataApiQueryMode::Distributed),
+                Some(vec![local, healthy, hanging]),
+                true,
+            ),
+            MetadataFanoutOperation::Search,
+            local_call,
+            remote_call,
+            |_, _| {},
+            map_metadata_internal_error,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(parts, vec![(local, 1), (healthy, 2)]);
+        assert_eq!(stats.nodes_queried, 3);
+        assert_eq!(stats.nodes_failed, 1);
+        assert_eq!(stats.failed_partitions, vec![hanging]);
     }
 
     #[test]

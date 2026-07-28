@@ -235,6 +235,7 @@ mod test {
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
                     cors_configuration: None,
+                    replication: None,
                 },
             ),
             (
@@ -244,6 +245,7 @@ mod test {
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
                     cors_configuration: None,
+                    replication: None,
                 },
             ),
             (
@@ -253,6 +255,7 @@ mod test {
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
                     cors_configuration: None,
+                    replication: None,
                 },
             ),
         ] {
@@ -303,6 +306,7 @@ mod test {
             created_at: SystemTime::now(),
             created_by: Default::default(),
             cors_configuration: None,
+            replication: None,
         };
         let entry = |name: &str, group_id| {
             (

@@ -1,9 +1,9 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::S3_BUCKET_REPLICATION_KEYSPACE;
+use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{BucketReplicationConfig, BucketReplicationTarget};
+use aruna_core::structs::{BucketInfo, BucketReplicationConfig, BucketReplicationTarget};
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -12,7 +12,8 @@ use thiserror::Error;
 enum PutBucketReplicationState {
     Init,
     StartTransaction,
-    WriteConfig,
+    ReadBucket,
+    WriteBucket,
     CommitTransaction,
     Finish,
     Error,
@@ -24,6 +25,8 @@ pub enum PutBucketReplicationError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error("The specified bucket does not exist.")]
+    NoSuchBucket,
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]
@@ -68,7 +71,8 @@ impl PutBucketReplicationOperation {
         match self.state {
             PutBucketReplicationState::Init => "Init",
             PutBucketReplicationState::StartTransaction => "StartTransaction",
-            PutBucketReplicationState::WriteConfig => "WriteConfig",
+            PutBucketReplicationState::ReadBucket => "ReadBucket",
+            PutBucketReplicationState::WriteBucket => "WriteBucket",
             PutBucketReplicationState::CommitTransaction => "CommitTransaction",
             PutBucketReplicationState::Finish => "Finish",
             PutBucketReplicationState::Error => "Error",
@@ -99,19 +103,42 @@ impl Operation for PutBucketReplicationOperation {
                     });
                 };
                 self.txn_id = Some(txn_id);
-                self.state = PutBucketReplicationState::WriteConfig;
-                let value = match self.config.to_bytes() {
-                    Ok(value) => value,
-                    Err(err) => return self.fail(err.into()),
-                };
-                smallvec![Effect::Storage(StorageEffect::Write {
-                    key_space: S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
+                self.state = PutBucketReplicationState::ReadBucket;
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: S3_BUCKET_KEYSPACE.to_string(),
                     key: self.write_key(),
-                    value: value.into(),
                     txn_id: Some(txn_id),
                 })]
             }
-            PutBucketReplicationState::WriteConfig => {
+            PutBucketReplicationState::ReadBucket => {
+                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+                    return self.fail(PutBucketReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::ReadResult)",
+                        received: event,
+                    });
+                };
+                let Some(value) = value else {
+                    return self.fail(PutBucketReplicationError::NoSuchBucket);
+                };
+                let mut info = match BucketInfo::from_bytes(value.as_ref()) {
+                    Ok(info) => info,
+                    Err(err) => return self.fail(err.into()),
+                };
+                info.replication = Some(self.config.clone());
+                let value = match info.to_bytes() {
+                    Ok(value) => value,
+                    Err(err) => return self.fail(err.into()),
+                };
+                self.state = PutBucketReplicationState::WriteBucket;
+                smallvec![Effect::Storage(StorageEffect::Write {
+                    key_space: S3_BUCKET_KEYSPACE.to_string(),
+                    key: self.write_key(),
+                    value: value.into(),
+                    txn_id: self.txn_id,
+                })]
+            }
+            PutBucketReplicationState::WriteBucket => {
                 let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
                     return self.fail(PutBucketReplicationError::InvalidStateEvent {
                         state: self.state_name(),
@@ -160,16 +187,18 @@ impl Operation for PutBucketReplicationOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id.map_or_else(smallvec::SmallVec::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
+        self.txn_id
+            .take()
+            .map_or_else(smallvec::SmallVec::new, |txn_id| {
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            })
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum GetBucketReplicationState {
     Init,
-    ReadConfig,
+    ReadBucket,
     Finish,
     Error,
 }
@@ -206,19 +235,19 @@ impl GetBucketReplicationOperation {
         }
     }
 
+    fn state_name(&self) -> &'static str {
+        match self.state {
+            GetBucketReplicationState::Init => "Init",
+            GetBucketReplicationState::ReadBucket => "ReadBucket",
+            GetBucketReplicationState::Finish => "Finish",
+            GetBucketReplicationState::Error => "Error",
+        }
+    }
+
     fn fail(&mut self, err: GetBucketReplicationError) -> Effects {
         self.state = GetBucketReplicationState::Error;
         self.output = Some(Err(err));
         smallvec![]
-    }
-
-    fn state_name(&self) -> &'static str {
-        match self.state {
-            GetBucketReplicationState::Init => "Init",
-            GetBucketReplicationState::ReadConfig => "ReadConfig",
-            GetBucketReplicationState::Finish => "Finish",
-            GetBucketReplicationState::Error => "Error",
-        }
     }
 }
 
@@ -227,9 +256,9 @@ impl Operation for GetBucketReplicationOperation {
     type Error = GetBucketReplicationError;
 
     fn start(&mut self) -> Effects {
-        self.state = GetBucketReplicationState::ReadConfig;
+        self.state = GetBucketReplicationState::ReadBucket;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
             key: self.bucket.as_bytes().to_vec().into(),
             txn_id: None,
         })]
@@ -238,7 +267,7 @@ impl Operation for GetBucketReplicationOperation {
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             GetBucketReplicationState::Init => self.start(),
-            GetBucketReplicationState::ReadConfig => {
+            GetBucketReplicationState::ReadBucket => {
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
                     return self.fail(GetBucketReplicationError::InvalidStateEvent {
                         state: self.state_name(),
@@ -249,8 +278,11 @@ impl Operation for GetBucketReplicationOperation {
 
                 self.state = GetBucketReplicationState::Finish;
                 self.output = Some(match value {
-                    Some(value) => BucketReplicationConfig::from_bytes(value.as_ref())
-                        .map_err(GetBucketReplicationError::ConversionError),
+                    Some(value) => BucketInfo::from_bytes(value.as_ref())
+                        .map_err(GetBucketReplicationError::ConversionError)
+                        .and_then(|info| {
+                            info.replication.ok_or(GetBucketReplicationError::NotFound)
+                        }),
                     None => Err(GetBucketReplicationError::NotFound),
                 });
                 smallvec![]
@@ -285,7 +317,8 @@ impl Operation for GetBucketReplicationOperation {
 enum DeleteBucketReplicationState {
     Init,
     StartTransaction,
-    DeleteConfig,
+    ReadBucket,
+    WriteBucket,
     CommitTransaction,
     Finish,
     Error,
@@ -295,6 +328,8 @@ enum DeleteBucketReplicationState {
 pub enum DeleteBucketReplicationError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
+    #[error(transparent)]
+    ConversionError(#[from] ConversionError),
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]
@@ -333,7 +368,8 @@ impl DeleteBucketReplicationOperation {
         match self.state {
             DeleteBucketReplicationState::Init => "Init",
             DeleteBucketReplicationState::StartTransaction => "StartTransaction",
-            DeleteBucketReplicationState::DeleteConfig => "DeleteConfig",
+            DeleteBucketReplicationState::ReadBucket => "ReadBucket",
+            DeleteBucketReplicationState::WriteBucket => "WriteBucket",
             DeleteBucketReplicationState::CommitTransaction => "CommitTransaction",
             DeleteBucketReplicationState::Finish => "Finish",
             DeleteBucketReplicationState::Error => "Error",
@@ -364,18 +400,61 @@ impl Operation for DeleteBucketReplicationOperation {
                     });
                 };
                 self.txn_id = Some(txn_id);
-                self.state = DeleteBucketReplicationState::DeleteConfig;
-                smallvec![Effect::Storage(StorageEffect::Delete {
-                    key_space: S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
+                self.state = DeleteBucketReplicationState::ReadBucket;
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: S3_BUCKET_KEYSPACE.to_string(),
                     key: self.bucket.as_bytes().to_vec().into(),
                     txn_id: Some(txn_id),
                 })]
             }
-            DeleteBucketReplicationState::DeleteConfig => {
-                let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
+            DeleteBucketReplicationState::ReadBucket => {
+                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
                     return self.fail(DeleteBucketReplicationError::InvalidStateEvent {
                         state: self.state_name(),
-                        expected: "Event::Storage(StorageEvent::DeleteResult)",
+                        expected: "Event::Storage(StorageEvent::ReadResult)",
+                        received: event,
+                    });
+                };
+                let Some(txn_id) = self.txn_id else {
+                    return self.fail(DeleteBucketReplicationError::NoTransactionFound);
+                };
+                // A missing bucket or config leaves nothing to clear; commit as a no-op.
+                let cleared = match value {
+                    Some(value) => match BucketInfo::from_bytes(value.as_ref()) {
+                        Ok(info) if info.replication.is_some() => Some(BucketInfo {
+                            replication: None,
+                            ..info
+                        }),
+                        Ok(_) => None,
+                        Err(err) => return self.fail(err.into()),
+                    },
+                    None => None,
+                };
+                match cleared {
+                    Some(info) => {
+                        let value = match info.to_bytes() {
+                            Ok(value) => value,
+                            Err(err) => return self.fail(err.into()),
+                        };
+                        self.state = DeleteBucketReplicationState::WriteBucket;
+                        smallvec![Effect::Storage(StorageEffect::Write {
+                            key_space: S3_BUCKET_KEYSPACE.to_string(),
+                            key: self.bucket.as_bytes().to_vec().into(),
+                            value: value.into(),
+                            txn_id: Some(txn_id),
+                        })]
+                    }
+                    None => {
+                        self.state = DeleteBucketReplicationState::CommitTransaction;
+                        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                    }
+                }
+            }
+            DeleteBucketReplicationState::WriteBucket => {
+                let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+                    return self.fail(DeleteBucketReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::WriteResult)",
                         received: event,
                     });
                 };
@@ -420,27 +499,33 @@ impl Operation for DeleteBucketReplicationOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id.map_or_else(smallvec::SmallVec::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
+        self.txn_id
+            .take()
+            .map_or_else(smallvec::SmallVec::new, |txn_id| {
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DeleteBucketReplicationOperation, GetBucketReplicationOperation,
+        DeleteBucketReplicationOperation, GetBucketReplicationOperation, PutBucketReplicationError,
         PutBucketReplicationOperation,
     };
     use crate::driver::{DriverContext, drive};
-    use aruna_core::effects::StorageEffect;
+    use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::S3_BUCKET_REPLICATION_KEYSPACE;
+    use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+    use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        ArunaArn, BucketReplicationConfig, BucketReplicationTarget, RealmId,
+        ArunaArn, BucketInfo, BucketReplicationConfig, BucketReplicationTarget, RealmId,
     };
+    use aruna_core::types::UserId;
     use aruna_storage::storage;
+    use std::time::SystemTime;
     use tempfile::tempdir;
+    use ulid::Ulid;
 
     fn make_target(bucket: &str) -> BucketReplicationTarget {
         let node_id = iroh::SecretKey::generate().public();
@@ -455,21 +540,66 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn roundtrips_bucket_replication_config() {
-        let temp_dir = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
-        let context = DriverContext {
-            storage_handle: storage_handle.clone(),
+    async fn write_bucket(storage_handle: &storage::StorageHandle, bucket: &str) {
+        let info = BucketInfo {
+            group_id: Ulid::generate(),
+            created_at: SystemTime::now(),
+            created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([9u8; 32])),
+            cors_configuration: None,
+            replication: None,
+        };
+        let event = storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: bucket.as_bytes().to_vec().into(),
+                value: info.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    async fn read_bucket(storage_handle: &storage::StorageHandle, bucket: &str) -> BucketInfo {
+        let event = storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: bucket.as_bytes().to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) = event
+        else {
+            panic!("bucket record missing");
+        };
+        BucketInfo::from_bytes(value.as_ref()).unwrap()
+    }
+
+    fn make_context(storage_handle: storage::StorageHandle) -> DriverContext {
+        DriverContext {
+            storage_handle,
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn roundtrips_replication_config() {
+        // The config lives on the bucket record, not in a separate keyspace.
+        let temp_dir = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
+        let context = make_context(storage_handle.clone());
 
         let bucket = "my-bucket".to_string();
+        write_bucket(&storage_handle, &bucket).await;
         let targets = vec![make_target(&bucket)];
         let stored = drive(
             PutBucketReplicationOperation::new(bucket.clone(), targets.clone()),
@@ -480,6 +610,12 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(stored.targets, targets);
+        assert!(
+            read_bucket(&storage_handle, &bucket)
+                .await
+                .replication
+                .is_some()
+        );
 
         let fetched = drive(GetBucketReplicationOperation::new(bucket.clone()), &context)
             .await
@@ -497,24 +633,50 @@ mod tests {
         .unwrap();
         assert_eq!(deleted, Ok(()));
 
+        let info = read_bucket(&storage_handle, &bucket).await;
+        assert!(info.replication.is_none());
+
         let missing = drive(GetBucketReplicationOperation::new(bucket), &context)
             .await
             .unwrap()
             .unwrap()
             .unwrap_err();
         assert_eq!(missing.to_string(), "Replication config not found");
+    }
 
-        let event = storage_handle
-            .send_storage_effect(StorageEffect::Read {
-                key_space: S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
-                key: b"my-bucket".to_vec().into(),
-                txn_id: None,
-            })
-            .await;
-        if let Event::Storage(StorageEvent::ReadResult { value, .. }) = event {
-            assert!(value.is_none());
-        } else {
-            panic!("unexpected event");
-        }
+    #[tokio::test]
+    async fn rejects_missing_bucket() {
+        // Attaching replication to a bucket that does not exist must fail.
+        let temp_dir = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
+        let context = make_context(storage_handle);
+
+        let error = drive(
+            PutBucketReplicationOperation::new("missing".to_string(), vec![make_target("missing")]),
+            &context,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, PutBucketReplicationError::NoSuchBucket);
+    }
+
+    #[test]
+    fn aborts_once() {
+        // A repeated abort must not re-enqueue AbortTransaction forever.
+        let mut op = PutBucketReplicationOperation::new("missing".to_string(), Vec::new());
+        op.start();
+        op.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::generate(),
+        }));
+        let aborting = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"missing".to_vec().into(),
+            value: None,
+        }));
+        assert!(matches!(
+            aborting.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert!(op.abort().is_empty());
     }
 }

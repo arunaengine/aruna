@@ -1080,6 +1080,7 @@ impl S3 for ArunaS3Service {
                 created_at: SystemTime::now(),
                 created_by: user_access.user_identity,
                 cors_configuration: None,
+                replication: None,
             },
         );
 
@@ -3333,7 +3334,7 @@ mod tests {
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
         BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
-        REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
+        REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
     use aruna_core::structs::{
         Actor, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
@@ -3522,7 +3523,7 @@ mod tests {
 
         write_storage_value(
             &storage_handle,
-            S3_BUCKET_REPLICATION_KEYSPACE,
+            S3_BUCKET_KEYSPACE,
             bucket.as_bytes().to_vec(),
             b"not a bucket replication config".to_vec(),
         )
@@ -4250,6 +4251,7 @@ mod tests {
             created_at: UNIX_EPOCH,
             created_by,
             cors_configuration: None,
+            replication: None,
         }
     }
 

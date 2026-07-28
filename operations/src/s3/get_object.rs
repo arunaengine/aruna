@@ -694,7 +694,7 @@ impl Operation for GetObjectOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id.map_or_else(SmallVec::new, |txn_id| {
+        self.txn_id.take().map_or_else(SmallVec::new, |txn_id| {
             smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
         })
     }

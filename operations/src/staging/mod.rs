@@ -174,6 +174,7 @@ pub(crate) mod test_utils {
             created_at: std::time::SystemTime::UNIX_EPOCH,
             created_by,
             cors_configuration: None,
+            replication: None,
         };
         drive(
             CreateBucketOperation::new(bucket.to_string(), info.clone()),

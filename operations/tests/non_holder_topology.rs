@@ -1,3 +1,5 @@
+// Fresh builds overflow the default query depth in nested async layouts.
+#![recursion_limit = "256"]
 //! Holder and non-holder coverage on a realm sized above the replication factor.
 //!
 //! Every other multi-node fixture in this workspace runs at `node_count <= RF`,

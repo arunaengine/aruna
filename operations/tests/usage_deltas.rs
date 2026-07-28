@@ -1,3 +1,5 @@
+// Fresh builds overflow the default query depth in nested async layouts.
+#![recursion_limit = "256"]
 use std::collections::{BTreeMap, HashMap};
 
 use aruna_blob::blob::BlobHandler;
@@ -105,6 +107,7 @@ async fn create_bucket(h: &Harness, bucket: &str, group_id: Ulid) {
                 created_at: std::time::SystemTime::now(),
                 created_by: h.created_by,
                 cors_configuration: None,
+                replication: None,
             },
         ),
         &h.driver,
