@@ -167,14 +167,18 @@ impl BlobHandler {
         created_by: UserId,
         blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
-        let backend_bucket = match self.eval_backend_bucket().await {
+        // Reserved before the write so a stats failure never orphans bytes.
+        let backend_bucket = match self.reserve_bucket().await {
             Ok(bucket) => bucket,
             Err(err) => return BlobEvent::Error(err),
         };
         let ulid = Ulid::generate();
         let backend_path = match build_backend_path(request_bucket, request_key, ulid) {
             Ok(path) => path,
-            Err(err) => return BlobEvent::Error(BlobError::ConversionError(err)),
+            Err(err) => {
+                self.release_bucket(&backend_bucket).await;
+                return BlobEvent::Error(BlobError::ConversionError(err));
+            }
         };
         let location = BackendLocation {
             root: self.backend_config.root.clone(),
@@ -191,22 +195,23 @@ impl BlobHandler {
             hashes: HashMap::new(),
         };
 
-        let operator = match init_backend_operator(self.backend_config.clone(), backend_bucket) {
-            Ok(op) => op,
-            Err(err) => return BlobEvent::Error(err),
-        };
+        let operator =
+            match init_backend_operator(self.backend_config.clone(), backend_bucket.clone()) {
+                Ok(op) => op,
+                Err(err) => {
+                    self.release_bucket(&backend_bucket).await;
+                    return BlobEvent::Error(err);
+                }
+            };
         match self
             .write_stream_to_location(location, operator, blob)
             .await
         {
-            BlobEvent::WriteFinished { location } => {
-                if let Err(err) = self.increment_bucket_load(&location.storage_bucket).await {
-                    BlobEvent::Error(err)
-                } else {
-                    BlobEvent::WriteFinished { location }
-                }
+            BlobEvent::WriteFinished { location } => BlobEvent::WriteFinished { location },
+            other => {
+                self.release_bucket(&backend_bucket).await;
+                other
             }
-            other => other,
         }
     }
 
@@ -253,14 +258,18 @@ impl BlobHandler {
         created_by: UserId,
         parts: Vec<BackendLocation>,
     ) -> BlobEvent {
-        let backend_bucket = match self.eval_backend_bucket().await {
+        // Reserved before the compose so a stats failure never orphans bytes.
+        let backend_bucket = match self.reserve_bucket().await {
             Ok(bucket) => bucket,
             Err(err) => return BlobEvent::Error(err),
         };
         let ulid = Ulid::generate();
         let backend_path = match build_backend_path(request_bucket, request_key, ulid) {
             Ok(path) => path,
-            Err(err) => return BlobEvent::Error(BlobError::ConversionError(err)),
+            Err(err) => {
+                self.release_bucket(&backend_bucket).await;
+                return BlobEvent::Error(BlobError::ConversionError(err));
+            }
         };
         let location = BackendLocation {
             root: self.backend_config.root.clone(),
@@ -276,22 +285,23 @@ impl BlobHandler {
             blob_size: 0,
             hashes: HashMap::new(),
         };
-        let operator = match init_backend_operator(self.backend_config.clone(), backend_bucket) {
-            Ok(op) => op,
-            Err(err) => return BlobEvent::Error(err),
-        };
+        let operator =
+            match init_backend_operator(self.backend_config.clone(), backend_bucket.clone()) {
+                Ok(op) => op,
+                Err(err) => {
+                    self.release_bucket(&backend_bucket).await;
+                    return BlobEvent::Error(err);
+                }
+            };
         match self
             .compose_parts_to_location(location, operator, parts)
             .await
         {
-            BlobEvent::WriteFinished { location } => {
-                if let Err(err) = self.increment_bucket_load(&location.storage_bucket).await {
-                    BlobEvent::Error(err)
-                } else {
-                    BlobEvent::WriteFinished { location }
-                }
+            BlobEvent::WriteFinished { location } => BlobEvent::WriteFinished { location },
+            other => {
+                self.release_bucket(&backend_bucket).await;
+                other
             }
-            other => other,
         }
     }
 

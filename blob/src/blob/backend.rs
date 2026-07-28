@@ -14,9 +14,32 @@ use aruna_core::structs::{
 use aruna_core::types::TxnId;
 use opendal::Operator;
 use std::path::PathBuf;
+use std::time::Duration;
 use ulid::Ulid;
 
-const BUCKET_STATS_RETRIES: usize = 16;
+const BUCKET_STATS_RETRIES: u32 = 32;
+const BUCKET_STATS_BACKOFF: Duration = Duration::from_millis(1);
+const BUCKET_STATS_BACKOFF_CAP: Duration = Duration::from_millis(50);
+// A fresh bucket is private to the reserving writer, so a second round only
+// happens when another writer filled the bucket we picked.
+const BUCKET_RESERVE_ROUNDS: usize = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoadUpdate {
+    Applied,
+    Conflict,
+    Full,
+}
+
+// Ulid randomness spreads retry storms without pulling in an rng dependency.
+fn conflict_backoff(attempt: u32) -> Duration {
+    let base = BUCKET_STATS_BACKOFF
+        .saturating_mul(1u32 << attempt.min(6))
+        .min(BUCKET_STATS_BACKOFF_CAP);
+    let micros = base.as_micros() as u64;
+    let spread = u64::from(Ulid::generate().to_bytes()[15]);
+    Duration::from_micros(micros / 2 + micros * spread / 510)
+}
 
 impl BlobHandler {
     pub(super) async fn ensure_multipart_bucket(&self) -> Result<(), BlobLibError> {
@@ -43,11 +66,19 @@ impl BlobHandler {
     }
 
     pub(super) async fn eval_backend_bucket(&self) -> Result<String, BlobError> {
+        self.select_backend_bucket(&[]).await
+    }
+
+    async fn select_backend_bucket(&self, skip: &[String]) -> Result<String, BlobError> {
         if let Some(bucket) = self.backend_config.service_config.get("bucket") {
             return Ok(bucket.clone());
         }
 
-        let buckets = self.fetch_bucket_stats().await?;
+        let buckets = self
+            .fetch_bucket_stats()
+            .await?
+            .into_iter()
+            .filter(|bucket| !skip.contains(&bucket.name));
         if let Some(bucket_max_size) = self.backend_config.max_bucket_size {
             for bucket in buckets {
                 if bucket.load < bucket_max_size {
@@ -68,7 +99,39 @@ impl BlobHandler {
         Ok(bucket_name)
     }
 
-    pub(super) async fn fetch_bucket_stats(&self) -> Result<Vec<BackendBucket>, ConversionError> {
+    // Reserves one slot before any bytes exist, so a stats failure cannot orphan
+    // a written object and concurrent writers cannot overshoot max_bucket_size.
+    pub(super) async fn reserve_bucket(&self) -> Result<String, BlobError> {
+        let Some(max_bucket_size) = self.backend_config.max_bucket_size else {
+            let bucket = self.eval_backend_bucket().await?;
+            self.increment_bucket_load(&bucket).await?;
+            return Ok(bucket);
+        };
+        if let Some(bucket) = self.backend_config.service_config.get("bucket") {
+            self.increment_bucket_load(bucket).await?;
+            return Ok(bucket.clone());
+        }
+
+        let mut full = Vec::new();
+        for _ in 0..BUCKET_RESERVE_ROUNDS {
+            let bucket = self.select_backend_bucket(&full).await?;
+            if self.try_reserve_slot(&bucket, max_bucket_size).await? {
+                return Ok(bucket);
+            }
+            full.push(bucket);
+        }
+        Err(BlobError::WriteError(
+            "no backend bucket had free capacity".to_string(),
+        ))
+    }
+
+    pub(super) async fn release_bucket(&self, bucket: &str) {
+        if let Err(error) = self.decrement_bucket_load(bucket).await {
+            tracing::warn!(bucket, %error, "failed to release bucket reservation");
+        }
+    }
+
+    pub(super) async fn fetch_bucket_stats(&self) -> Result<Vec<BackendBucket>, BlobError> {
         let mut buckets = Vec::new();
         let mut start_after = None;
 
@@ -93,7 +156,9 @@ impl BlobHandler {
                 next_start_after,
             }) = event
             else {
-                return Ok(Vec::new());
+                return Err(BlobError::ReadError(
+                    "unexpected storage event while reading bucket stats".to_string(),
+                ));
             };
 
             buckets.extend(
@@ -150,21 +215,55 @@ impl BlobHandler {
     // Lock-free read-modify-write: a storage transaction detects racing
     // updates from concurrent effects and the conflicting side retries.
     async fn adjust_bucket_load(&self, bucket: &str, delta: i64) -> Result<(), BlobError> {
-        if !self.is_stats_managed_bucket(bucket) {
-            return Ok(());
-        }
-
-        for _ in 0..BUCKET_STATS_RETRIES {
-            if self.try_adjust_load(bucket, delta).await? {
-                return Ok(());
-            }
-        }
-        Err(BlobError::ReadError(format!(
-            "bucket stats update for {bucket} kept conflicting"
-        )))
+        matches!(
+            self.retry_load_update(bucket, delta, None).await?,
+            LoadUpdate::Applied
+        )
+        .then_some(())
+        .ok_or_else(|| {
+            BlobError::ReadError(format!("bucket stats update for {bucket} kept conflicting"))
+        })
     }
 
-    async fn try_adjust_load(&self, bucket: &str, delta: i64) -> Result<bool, BlobError> {
+    // Increments one slot unless the bucket already sits at its capacity.
+    async fn try_reserve_slot(&self, bucket: &str, capacity: u64) -> Result<bool, BlobError> {
+        match self.retry_load_update(bucket, 1, Some(capacity)).await? {
+            LoadUpdate::Applied => Ok(true),
+            LoadUpdate::Full => Ok(false),
+            LoadUpdate::Conflict => Err(BlobError::ReadError(format!(
+                "bucket stats update for {bucket} kept conflicting"
+            ))),
+        }
+    }
+
+    async fn retry_load_update(
+        &self,
+        bucket: &str,
+        delta: i64,
+        capacity: Option<u64>,
+    ) -> Result<LoadUpdate, BlobError> {
+        if !self.is_stats_managed_bucket(bucket) {
+            return Ok(LoadUpdate::Applied);
+        }
+
+        for attempt in 0..BUCKET_STATS_RETRIES {
+            match self.try_adjust_load(bucket, delta, capacity).await? {
+                LoadUpdate::Conflict => {}
+                outcome => return Ok(outcome),
+            }
+            if attempt + 1 < BUCKET_STATS_RETRIES {
+                tokio::time::sleep(conflict_backoff(attempt)).await;
+            }
+        }
+        Ok(LoadUpdate::Conflict)
+    }
+
+    async fn try_adjust_load(
+        &self,
+        bucket: &str,
+        delta: i64,
+        capacity: Option<u64>,
+    ) -> Result<LoadUpdate, BlobError> {
         let event = self
             .storage
             .send_effect(Effect::Storage(StorageEffect::StartTransaction {
@@ -184,6 +283,13 @@ impl BlobHandler {
                 return Err(error);
             }
         };
+        if delta > 0
+            && let Some(capacity) = capacity
+            && load >= capacity
+        {
+            self.abort_stats_txn(txn_id).await;
+            return Ok(LoadUpdate::Full);
+        }
         let adjusted = if delta >= 0 {
             load.saturating_add(delta.unsigned_abs())
         } else {
@@ -211,10 +317,10 @@ impl BlobHandler {
             .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
             .await;
         match event {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(true),
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(LoadUpdate::Applied),
             Event::Storage(StorageEvent::Error {
                 error: StorageError::TransactionConflict,
-            }) => Ok(false),
+            }) => Ok(LoadUpdate::Conflict),
             Event::Storage(StorageEvent::Error { error }) => Err(BlobError::ReadError(format!(
                 "failed to commit bucket stats: {error}"
             ))),
@@ -288,8 +394,7 @@ impl BlobHandler {
         }
         Ok(self
             .fetch_bucket_stats()
-            .await
-            .map_err(BlobError::ConversionError)?
+            .await?
             .into_iter()
             .map(|bucket| bucket.name)
             .collect())

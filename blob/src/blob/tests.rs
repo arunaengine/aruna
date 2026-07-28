@@ -1191,3 +1191,49 @@ fn get_storage_path_rejects_replicated_traversal_path() {
         Err(BlobError::ConversionError(ConversionError::UnsafePath(_)))
     ));
 }
+#[tokio::test]
+async fn reservation_forces_rollover() {
+    // With one slot per bucket, concurrent writers must roll over instead of
+    // all landing in the bucket they read as free.
+    let context = setup_blob_handle(1).await;
+    let writers = 4;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(writers));
+    let mut tasks = Vec::new();
+    for index in 0..writers {
+        let handle = context.blob_handle.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            let body = BackendStream::new(futures::stream::once(async move {
+                barrier.wait().await;
+                Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"payload"))
+            }));
+            handle
+                .send_blob_effect(BlobEffect::Write {
+                    bucket: "bucket".to_string(),
+                    key: format!("object-{index}"),
+                    created_by: test_user_id(),
+                    blob: body,
+                })
+                .await
+        }));
+    }
+
+    let mut buckets = Vec::new();
+    for task in tasks {
+        let event = tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("write starved")
+            .unwrap();
+        let Event::Blob(BlobEvent::WriteFinished { location }) = event else {
+            panic!("write failed: {event:?}")
+        };
+        buckets.push(location.storage_bucket);
+    }
+
+    buckets.sort();
+    buckets.dedup();
+    assert_eq!(buckets.len(), writers);
+    for bucket in buckets {
+        assert_eq!(bucket_load(&context.storage_handle, &bucket).await, 1);
+    }
+}
