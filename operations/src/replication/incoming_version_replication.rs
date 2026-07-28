@@ -453,6 +453,7 @@ impl IncomingVersionReplicationOperation {
             created_at: self.manifest.created_at,
             created_by: self.manifest.created_by,
             cors_configuration: None,
+            replication: None,
         }
     }
 
@@ -2072,6 +2073,7 @@ mod tests {
             created_at: SystemTime::now(),
             created_by: test_user_id(),
             cors_configuration: None,
+            replication: None,
         }
     }
 

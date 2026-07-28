@@ -395,7 +395,10 @@ impl IntoS3Error for DeleteBucketError {
 
 impl IntoS3Error for PutBucketReplicationError {
     fn into_s3_error(self) -> S3Error {
-        internal_error(self)
+        match self {
+            PutBucketReplicationError::NoSuchBucket => bucket_not_found_error(),
+            err => internal_error(err),
+        }
     }
 }
 

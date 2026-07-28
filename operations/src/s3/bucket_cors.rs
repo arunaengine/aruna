@@ -540,6 +540,7 @@ mod tests {
             created_at: SystemTime::UNIX_EPOCH,
             created_by: Default::default(),
             cors_configuration,
+            replication: None,
         }
     }
 

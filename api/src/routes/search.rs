@@ -678,6 +678,7 @@ mod tests {
                 created_at: SystemTime::UNIX_EPOCH,
                 created_by: user_id,
                 cors_configuration: None,
+                replication: None,
             }
             .to_bytes()
             .unwrap(),

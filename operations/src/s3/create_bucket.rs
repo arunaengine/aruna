@@ -273,6 +273,7 @@ mod test {
             created_at: SystemTime::now(),
             created_by: Default::default(),
             cors_configuration: None,
+            replication: None,
         };
 
         let result = drive(
@@ -306,6 +307,7 @@ mod test {
             created_at: SystemTime::now(),
             created_by: Default::default(),
             cors_configuration: None,
+            replication: None,
         };
 
         drive(

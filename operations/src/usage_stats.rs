@@ -1877,6 +1877,7 @@ mod tests {
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
                     cors_configuration: None,
+                    replication: None,
                 },
             ),
             &ctx,
@@ -1978,6 +1979,7 @@ mod tests {
                 created_at: SystemTime::now(),
                 created_by: Default::default(),
                 cors_configuration: None,
+                replication: None,
             };
             ctx.storage_handle
                 .send_storage_effect(StorageEffect::Write {
@@ -2296,6 +2298,7 @@ mod tests {
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
                     cors_configuration: None,
+                    replication: None,
                 },
             ),
             &ctx,

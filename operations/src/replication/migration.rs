@@ -2,9 +2,7 @@ use aruna_core::NodeId;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    API_STATE_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
-};
+use aruna_core::keyspaces::{API_STATE_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::structs::{
     ArunaArn, BucketInfo, BucketReplicationConfig, RealmId, SyncMode, SyncRelationship, SyncState,
     SyncStatusSnapshot,
@@ -257,7 +255,7 @@ async fn read_legacy_configs(
     loop {
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
                 prefix: None,
                 start: start_after.take().map(IterStart::After),
                 limit: MIGRATION_PAGE_SIZE,
@@ -273,17 +271,14 @@ async fn read_legacy_configs(
             other => return Err(LegacySyncMigrationError::UnexpectedEvent(other)),
         };
         for (key, value) in values {
-            match (
-                String::from_utf8(key.to_vec()),
-                BucketReplicationConfig::from_bytes(&value),
-            ) {
-                (Ok(bucket), Ok(config)) => configs.push((bucket, config)),
-                (bucket, config) => {
-                    warn!(
-                        ?bucket,
-                        ?config,
-                        "Skipping malformed legacy replication config"
-                    );
+            match (String::from_utf8(key.to_vec()), BucketInfo::from_bytes(&value)) {
+                (Ok(bucket), Ok(info)) => {
+                    if let Some(config) = info.replication {
+                        configs.push((bucket, config));
+                    }
+                }
+                (bucket, info) => {
+                    warn!(?bucket, ?info, "Skipping malformed bucket record");
                     malformed = malformed.saturating_add(1);
                 }
             }
@@ -323,28 +318,20 @@ async fn prune_legacy_target(
     target: &aruna_core::structs::BucketReplicationTarget,
 ) -> Result<(), LegacySyncMigrationError> {
     config.targets.retain(|candidate| candidate != target);
-    let event = if config.targets.is_empty() {
-        storage
-            .send_storage_effect(StorageEffect::Delete {
-                key_space: S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
-                key: bucket.as_bytes().to_vec().into(),
-                txn_id: None,
-            })
-            .await
-    } else {
-        storage
-            .send_storage_effect(StorageEffect::Write {
-                key_space: S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
-                key: bucket.as_bytes().to_vec().into(),
-                value: config.to_bytes()?.into(),
-                txn_id: None,
-            })
-            .await
+    let Some(mut info) = read_bucket_info(storage, bucket).await? else {
+        return Ok(());
     };
+    info.replication = (!config.targets.is_empty()).then(|| config.clone());
+    let event = storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: bucket.as_bytes().to_vec().into(),
+            value: info.to_bytes()?.into(),
+            txn_id: None,
+        })
+        .await;
     match event {
-        Event::Storage(StorageEvent::DeleteResult { .. } | StorageEvent::WriteResult { .. }) => {
-            Ok(())
-        }
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(LegacySyncMigrationError::UnexpectedEvent(other)),
     }
@@ -355,7 +342,7 @@ mod tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
+        AUTH_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
     };
     use aruna_core::structs::{
         Actor, BucketReplicationTarget, GroupAuthorizationDocument, RealmAuthorizationDocument,
@@ -431,17 +418,31 @@ mod tests {
                 .unwrap(),
         )
         .await;
+        let target_arn = ArunaArn::s3_bucket(realm_id, target_node, "target-bucket").unwrap();
         let bucket_info = BucketInfo {
             group_id,
             created_at: SystemTime::UNIX_EPOCH,
             created_by: owner,
             cors_configuration: None,
+            replication: None,
+        };
+        let source_info = BucketInfo {
+            replication: Some(BucketReplicationConfig {
+                targets: vec![BucketReplicationTarget {
+                    node_id: target_node,
+                    realm_id,
+                    bucket: "target-bucket".to_string(),
+                    arn: target_arn.to_string(),
+                    replicate_delete_markers: true,
+                }],
+            }),
+            ..bucket_info.clone()
         };
         write_value(
             &context.storage_handle,
             S3_BUCKET_KEYSPACE,
             bucket.as_bytes().to_vec(),
-            bucket_info.to_bytes().unwrap(),
+            source_info.to_bytes().unwrap(),
         )
         .await;
         if target_node == source_node {
@@ -453,38 +454,19 @@ mod tests {
             )
             .await;
         }
-        let target_arn = ArunaArn::s3_bucket(realm_id, target_node, "target-bucket").unwrap();
-        write_value(
-            &context.storage_handle,
-            S3_BUCKET_REPLICATION_KEYSPACE,
-            bucket.as_bytes().to_vec(),
-            BucketReplicationConfig {
-                targets: vec![BucketReplicationTarget {
-                    node_id: target_node,
-                    realm_id,
-                    bucket: "target-bucket".to_string(),
-                    arn: target_arn.to_string(),
-                    replicate_delete_markers: true,
-                }],
-            }
-            .to_bytes()
-            .unwrap(),
-        )
-        .await;
     }
 
     async fn read_legacy(storage: &StorageHandle, bucket: &str) -> Option<BucketReplicationConfig> {
         match storage
             .send_storage_effect(StorageEffect::Read {
-                key_space: S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
                 key: bucket.as_bytes().to_vec().into(),
                 txn_id: None,
             })
             .await
         {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                value.map(|value| BucketReplicationConfig::from_bytes(&value).unwrap())
-            }
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+                .and_then(|value| BucketInfo::from_bytes(&value).unwrap().replication),
             event => panic!("unexpected event: {event:?}"),
         }
     }
@@ -637,11 +619,16 @@ mod tests {
             .await
             .unwrap();
         config.targets.push(failed_target.clone());
+        let mut info = read_bucket_info(&context.storage_handle, "source-bucket")
+            .await
+            .unwrap()
+            .unwrap();
+        info.replication = Some(config);
         write_value(
             &context.storage_handle,
-            S3_BUCKET_REPLICATION_KEYSPACE,
+            S3_BUCKET_KEYSPACE,
             b"source-bucket".to_vec(),
-            config.to_bytes().unwrap(),
+            info.to_bytes().unwrap(),
         )
         .await;
 

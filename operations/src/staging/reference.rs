@@ -743,6 +743,7 @@ mod tests {
             created_at: SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
             cors_configuration: None,
+            replication: None,
         };
         let recreated = BucketInfo {
             created_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),

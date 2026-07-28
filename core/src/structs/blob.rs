@@ -1,6 +1,8 @@
 use crate::errors::{BlobError, ConversionError};
 use crate::structs::checksum::HASH_BLAKE3;
-use crate::structs::{PathRestriction, RealmId, SourceMetadata, VersionSourceBinding};
+use crate::structs::{
+    BucketReplicationConfig, PathRestriction, RealmId, SourceMetadata, VersionSourceBinding,
+};
 use crate::types::{GroupId, NodeId, UserId};
 use byteview::ByteView;
 use core::fmt;
@@ -330,6 +332,7 @@ pub struct BucketInfo {
     pub created_at: SystemTime,
     pub created_by: UserId,
     pub cors_configuration: Option<BucketCorsConfiguration>,
+    pub replication: Option<BucketReplicationConfig>,
 }
 
 impl BucketInfo {

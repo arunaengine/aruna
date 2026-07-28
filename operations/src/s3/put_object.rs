@@ -1070,6 +1070,7 @@ mod test {
             created_at: std::time::SystemTime::UNIX_EPOCH,
             created_by: config.user_id,
             cors_configuration: None,
+            replication: None,
         };
         let recreated = BucketInfo {
             created_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),

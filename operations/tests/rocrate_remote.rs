@@ -345,6 +345,7 @@ async fn seed_holder(
         created_at: SystemTime::UNIX_EPOCH,
         created_by: owner,
         cors_configuration: None,
+        replication: None,
     };
     let hash: [u8; 32] = location
         .get_blake3()

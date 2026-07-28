@@ -6,12 +6,13 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_REPLICATION_JOB_KEYSPACE,
-    S3_BUCKET_REPLICATION_KEYSPACE, SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
+    BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_REPLICATION_JOB_KEYSPACE, S3_BUCKET_KEYSPACE,
+    SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    ArunaArn, AuthContext, BucketReplicationConfig, Permission, SyncMode, SyncRelationship,
+    ArunaArn, AuthContext, BucketInfo, BucketReplicationConfig, Permission, SyncMode,
+    SyncRelationship,
     SyncState, WatchEvent, WatchEventDetail, WatchEventKind, blob_bucket_permission_path,
     data_watch_resource_path, sync_relationship_key, sync_relationship_prefix,
 };
@@ -696,7 +697,7 @@ impl QueueLiveVersionReplicationOperation {
     fn read_config(&mut self) -> Effects {
         self.state = QueueLiveVersionReplicationState::ReadConfig;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
             key: self.input.bucket.as_bytes().to_vec().into(),
             txn_id: None,
         })]
@@ -878,9 +879,9 @@ impl Operation for QueueLiveVersionReplicationOperation {
                 }
                 Event::Storage(StorageEvent::ReadResult {
                     value: Some(value), ..
-                }) => match BucketReplicationConfig::from_bytes(value.as_ref()) {
-                    Ok(config) => {
-                        let jobs = self.merge_config(Some(config));
+                }) => match BucketInfo::from_bytes(value.as_ref()) {
+                    Ok(info) => {
+                        let jobs = self.merge_config(info.replication);
                         self.read_existing_jobs(jobs)
                     }
                     Err(error) => self.fail(error.into()),
@@ -1656,7 +1657,7 @@ async fn read_bucket_replication_config(
 ) -> Result<Option<BucketReplicationConfig>, BlobReplicationQueueError> {
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
             key: bucket.as_bytes().to_vec().into(),
             txn_id: None,
         })
@@ -1665,7 +1666,7 @@ async fn read_bucket_replication_config(
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
         Event::Storage(StorageEvent::ReadResult {
             value: Some(value), ..
-        }) => Ok(Some(BucketReplicationConfig::from_bytes(value.as_ref())?)),
+        }) => Ok(BucketInfo::from_bytes(value.as_ref())?.replication),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
             "{other:?}"
@@ -2309,6 +2310,7 @@ mod tests {
             created_at: SystemTime::UNIX_EPOCH,
             created_by: user(),
             cors_configuration: None,
+            replication: None,
         };
         match storage
             .send_storage_effect(StorageEffect::Write {
@@ -2376,11 +2378,18 @@ mod tests {
                 },
             ],
         };
+        let info = BucketInfo {
+            group_id: Ulid::generate(),
+            created_at: SystemTime::now(),
+            created_by: user(),
+            cors_configuration: None,
+            replication: Some(config),
+        };
         match storage
             .send_storage_effect(StorageEffect::Write {
-                key_space: S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
                 key: bucket.as_bytes().to_vec().into(),
-                value: config.to_bytes().expect("config serializes").into(),
+                value: info.to_bytes().expect("bucket info serializes").into(),
                 txn_id: None,
             })
             .await

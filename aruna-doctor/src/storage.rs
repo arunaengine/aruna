@@ -727,6 +727,7 @@ mod tests {
                         created_at: SystemTime::now(),
                         created_by: realm_admin,
                         cors_configuration: None,
+                        replication: None,
                     },
                 ),
                 context.as_ref(),

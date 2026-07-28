@@ -756,6 +756,7 @@ mod tests {
             created_at: SystemTime::UNIX_EPOCH,
             created_by: user,
             cors_configuration: None,
+            replication: None,
         };
         write_doc(
             state,

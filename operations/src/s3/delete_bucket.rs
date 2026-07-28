@@ -5,8 +5,8 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
-    S3_MULTIPART_UPLOAD_KEYSPACE, SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
+    SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
@@ -323,10 +323,6 @@ impl DeleteBucketOperation {
                 S3_BUCKET_KEYSPACE.to_string(),
                 self.bucket.as_bytes().to_vec().into(),
             ),
-            (
-                S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
-                self.bucket.as_bytes().to_vec().into(),
-            ),
         ];
         deletes.append(&mut self.relationship_deletes);
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
@@ -477,8 +473,8 @@ mod test {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
-        SYNC_MIRROR_REPAIR_KEYSPACE, SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
+        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, SYNC_MIRROR_REPAIR_KEYSPACE,
+        SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
     };
     use aruna_core::structs::{
         ArunaArn, BlobVersion, BucketReplicationConfig, BucketReplicationTarget,
@@ -528,6 +524,7 @@ mod test {
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
                     cors_configuration: None,
+                    replication: None,
                 },
             ),
             &driver_ctx,
@@ -552,18 +549,6 @@ mod test {
             .await
         else {
             panic!("missing read result");
-        };
-        assert!(value.is_none());
-
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
-            .send_storage_effect(StorageEffect::Read {
-                key_space: S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
-                key: b"bucket-a".to_vec().into(),
-                txn_id: None,
-            })
-            .await
-        else {
-            panic!("missing replication config read result");
         };
         assert!(value.is_none());
     }
@@ -591,6 +576,9 @@ mod test {
                     created_at: SystemTime::now(),
                     created_by: aruna_core::UserId::nil(RealmId::from_bytes([0u8; 32])),
                     cors_configuration: None,
+                    replication: Some(BucketReplicationConfig {
+                        targets: vec![make_replication_target(&bucket)],
+                    }),
                 },
             ),
             &driver_ctx,
@@ -599,19 +587,6 @@ mod test {
         .unwrap()
         .unwrap()
         .unwrap();
-        let _ = storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
-                key: bucket.clone().into(),
-                value: BucketReplicationConfig {
-                    targets: vec![make_replication_target(&bucket)],
-                }
-                .to_bytes()
-                .unwrap()
-                .into(),
-                txn_id: None,
-            })
-            .await;
 
         let result = drive(DeleteBucketOperation::new(bucket.clone()), &driver_ctx)
             .await
@@ -628,18 +603,6 @@ mod test {
             .await
         else {
             panic!("missing bucket read result");
-        };
-        assert!(value.is_none());
-
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
-            .send_storage_effect(StorageEffect::Read {
-                key_space: S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
-                key: bucket.into(),
-                txn_id: None,
-            })
-            .await
-        else {
-            panic!("missing replication config read result");
         };
         assert!(value.is_none());
     }
@@ -666,6 +629,7 @@ mod test {
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
                     cors_configuration: None,
+                    replication: None,
                 },
             ),
             &driver_ctx,
@@ -787,6 +751,7 @@ mod test {
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
                     cors_configuration: None,
+                    replication: None,
                 }
                 .to_bytes()
                 .unwrap()
@@ -850,6 +815,7 @@ mod test {
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
                     cors_configuration: None,
+                    replication: None,
                 }
                 .to_bytes()
                 .unwrap()
