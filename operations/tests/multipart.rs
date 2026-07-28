@@ -18,6 +18,7 @@ use aruna_core::structs::{
 };
 use aruna_net::dht::storage::decode_entries;
 use aruna_net::{NetConfig, NetHandle};
+use aruna_operations::blob::cleanup::process_cleanup_batch;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::abort_multipart_upload::{
     AbortMultipartUploadInput, AbortMultipartUploadOperation,
@@ -113,6 +114,14 @@ async fn read_value(
     };
 
     value
+}
+
+// Completion defers part and duplicate deletes to the blob cleanup queue, which
+// production drains on a timer; tests drive that drain explicitly.
+async fn drain_cleanup(context: &TestContext) {
+    let outcome = process_cleanup_batch(&context.driver).await.unwrap();
+    assert_eq!(outcome.failed, 0);
+    assert_eq!(outcome.dropped, 0);
 }
 
 fn count_blob_files(root: &str) -> usize {
@@ -442,6 +451,9 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
         .is_none()
     );
 
+    assert!(exists(uploaded_part1.location.get_full_path().unwrap()).unwrap());
+    assert!(exists(uploaded_part2.location.get_full_path().unwrap()).unwrap());
+    drain_cleanup(&context).await;
     assert!(!exists(uploaded_part1.location.get_full_path().unwrap()).unwrap());
     assert!(!exists(uploaded_part2.location.get_full_path().unwrap()).unwrap());
 
@@ -919,8 +931,12 @@ async fn multipart_completion_deduplicates_against_existing_multipart_object() {
         std::fs::read(second_complete.location.get_full_path().unwrap()).unwrap(),
         [part1.as_slice(), part2].concat()
     );
+    assert!(exists(second_part1.location.get_full_path().unwrap()).unwrap());
+    assert!(exists(second_part2.location.get_full_path().unwrap()).unwrap());
+    drain_cleanup(&context).await;
     assert!(!exists(second_part1.location.get_full_path().unwrap()).unwrap());
     assert!(!exists(second_part2.location.get_full_path().unwrap()).unwrap());
+    // The composed duplicate is queued for deletion alongside the parts.
     assert_eq!(count_blob_files(&context.blob_root), 1);
 
     let blob_hash: [u8; 32] = second_complete
@@ -1011,8 +1027,12 @@ async fn multipart_completion_deduplicates_against_existing_put_object() {
     .await;
 
     assert_eq!(complete.location, put.location);
+    assert!(exists(uploaded_part1.location.get_full_path().unwrap()).unwrap());
+    assert!(exists(uploaded_part2.location.get_full_path().unwrap()).unwrap());
+    drain_cleanup(&context).await;
     assert!(!exists(uploaded_part1.location.get_full_path().unwrap()).unwrap());
     assert!(!exists(uploaded_part2.location.get_full_path().unwrap()).unwrap());
+    // The composed duplicate is queued for deletion alongside the parts.
     assert_eq!(count_blob_files(&context.blob_root), 1);
 
     let blob_head = read_value(
@@ -1114,8 +1134,12 @@ async fn multipart_completion_same_key_same_content_bumps_generation_and_reuses_
 
     assert_eq!(replacement_complete.location, initial_complete.location);
     assert_ne!(replacement_complete.version_id, initial_complete.version_id);
+    assert!(exists(replacement_part1.location.get_full_path().unwrap()).unwrap());
+    assert!(exists(replacement_part2.location.get_full_path().unwrap()).unwrap());
+    drain_cleanup(&context).await;
     assert!(!exists(replacement_part1.location.get_full_path().unwrap()).unwrap());
     assert!(!exists(replacement_part2.location.get_full_path().unwrap()).unwrap());
+    // The composed duplicate is queued for deletion alongside the parts.
     assert_eq!(count_blob_files(&context.blob_root), 1);
 
     let blob_head = read_value(
