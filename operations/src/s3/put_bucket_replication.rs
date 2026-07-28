@@ -506,8 +506,8 @@ impl Operation for DeleteBucketReplicationOperation {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeleteBucketReplicationOperation, GetBucketReplicationOperation,
-        PutBucketReplicationError, PutBucketReplicationOperation,
+        DeleteBucketReplicationOperation, GetBucketReplicationOperation, PutBucketReplicationError,
+        PutBucketReplicationOperation,
     };
     use crate::driver::{DriverContext, drive};
     use aruna_core::effects::StorageEffect;
@@ -605,7 +605,12 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(stored.targets, targets);
-        assert!(read_bucket(&storage_handle, &bucket).await.replication.is_some());
+        assert!(
+            read_bucket(&storage_handle, &bucket)
+                .await
+                .replication
+                .is_some()
+        );
 
         let fetched = drive(GetBucketReplicationOperation::new(bucket.clone()), &context)
             .await
@@ -643,10 +648,7 @@ mod tests {
         let context = make_context(storage_handle);
 
         let error = drive(
-            PutBucketReplicationOperation::new(
-                "missing".to_string(),
-                vec![make_target("missing")],
-            ),
+            PutBucketReplicationOperation::new("missing".to_string(), vec![make_target("missing")]),
             &context,
         )
         .await

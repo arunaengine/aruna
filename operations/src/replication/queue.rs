@@ -12,9 +12,9 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     ArunaArn, AuthContext, BucketInfo, BucketReplicationConfig, Permission, SyncMode,
-    SyncRelationship,
-    SyncState, WatchEvent, WatchEventDetail, WatchEventKind, blob_bucket_permission_path,
-    data_watch_resource_path, sync_relationship_key, sync_relationship_prefix,
+    SyncRelationship, SyncState, WatchEvent, WatchEventDetail, WatchEventKind,
+    blob_bucket_permission_path, data_watch_resource_path, sync_relationship_key,
+    sync_relationship_prefix,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;

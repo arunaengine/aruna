@@ -2,8 +2,8 @@ use crate::blob::blob_keyspace_helper::{
     HeadAliasContext, add_hash_path_index_effect, write_blob_head_effect,
     write_blob_location_effect, write_blob_version_effect,
 };
-use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::blob::cleanup::schedule_blob_cleanup_effect;
+use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::usage_stats::{
     QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError,
     schedule_usage_snapshot_publish_effect,
@@ -13,8 +13,7 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE,
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
     S3_MULTIPART_UPLOAD_PART_KEYSPACE,
 };
@@ -873,9 +872,10 @@ impl CompleteMultipartUploadOperation {
                 location: record.location.clone(),
             })
             .collect();
-        if let (Some(composed), Some(chosen)) =
-            (self.composed_location.as_ref(), self.final_location.as_ref())
-            && composed != chosen
+        if let (Some(composed), Some(chosen)) = (
+            self.composed_location.as_ref(),
+            self.final_location.as_ref(),
+        ) && composed != chosen
         {
             works.push(BlobCleanupWork::DeleteBlob {
                 location: composed.clone(),
@@ -1224,9 +1224,7 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::DeleteUploadRecords => {
                 self.handle_upload_records_deleted(event)
             }
-            CompleteMultipartUploadState::WriteCleanupRecords => {
-                self.handle_cleanup_written(event)
-            }
+            CompleteMultipartUploadState::WriteCleanupRecords => self.handle_cleanup_written(event),
             CompleteMultipartUploadState::WriteLiveReplicationObligation => {
                 self.handle_live_replication_obligation_written(event)
             }
@@ -1623,8 +1621,7 @@ mod tests {
         op.resolved_parts = vec![requested.clone()];
 
         let effects = op.write_cleanup_records();
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice()
-        else {
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected cleanup batch write");
         };
         let works: Vec<BlobCleanupWork> = writes

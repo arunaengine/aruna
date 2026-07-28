@@ -840,7 +840,10 @@ async fn interlocked_writes_complete() {
             .await
             .expect("write starved")
             .unwrap();
-        assert!(matches!(event, Event::Blob(BlobEvent::WriteFinished { .. })));
+        assert!(matches!(
+            event,
+            Event::Blob(BlobEvent::WriteFinished { .. })
+        ));
     }
 }
 
@@ -886,7 +889,10 @@ async fn tracks_concurrent_loads() {
             .await
             .expect("write starved")
             .unwrap();
-        assert!(matches!(event, Event::Blob(BlobEvent::WriteFinished { .. })));
+        assert!(matches!(
+            event,
+            Event::Blob(BlobEvent::WriteFinished { .. })
+        ));
     }
     let load = bucket_load(&context.storage_handle, &location.storage_bucket).await;
     assert_eq!(load, 1 + writers as u64);

@@ -3,7 +3,6 @@ use crate::error::BlobLibError;
 use crate::opendal::init_operator;
 use crate::s3::make_bucket;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::types::TxnId;
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -12,6 +11,7 @@ use aruna_core::structs::{
     Backend, BackendBucket, BackendLocation, HIDDEN_BLOB_PREFIX, HiddenBlobKey,
     ensure_confined_relative_path,
 };
+use aruna_core::types::TxnId;
 use opendal::Operator;
 use std::path::PathBuf;
 use ulid::Ulid;
@@ -113,7 +113,6 @@ impl BlobHandler {
         Ok(buckets)
     }
 
-
     pub(super) async fn write_bucket_load(&self, bucket: &str, load: u64) -> Result<(), BlobError> {
         let event = self
             .storage
@@ -209,9 +208,7 @@ impl BlobHandler {
 
         let event = self
             .storage
-            .send_effect(Effect::Storage(StorageEffect::CommitTransaction {
-                txn_id,
-            }))
+            .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
             .await;
         match event {
             Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(true),

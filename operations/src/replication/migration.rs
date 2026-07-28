@@ -271,7 +271,10 @@ async fn read_legacy_configs(
             other => return Err(LegacySyncMigrationError::UnexpectedEvent(other)),
         };
         for (key, value) in values {
-            match (String::from_utf8(key.to_vec()), BucketInfo::from_bytes(&value)) {
+            match (
+                String::from_utf8(key.to_vec()),
+                BucketInfo::from_bytes(&value),
+            ) {
                 (Ok(bucket), Ok(info)) => {
                     if let Some(config) = info.replication {
                         configs.push((bucket, config));
@@ -341,9 +344,7 @@ async fn prune_legacy_target(
 mod tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
-    };
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE};
     use aruna_core::structs::{
         Actor, BucketReplicationTarget, GroupAuthorizationDocument, RealmAuthorizationDocument,
     };
@@ -465,8 +466,9 @@ mod tests {
             })
             .await
         {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-                .and_then(|value| BucketInfo::from_bytes(&value).unwrap().replication),
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                value.and_then(|value| BucketInfo::from_bytes(&value).unwrap().replication)
+            }
             event => panic!("unexpected event: {event:?}"),
         }
     }

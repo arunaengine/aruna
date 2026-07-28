@@ -318,12 +318,10 @@ impl DeleteBucketOperation {
 
     fn delete_bucket_records(&mut self) -> Effects {
         self.state = DeleteBucketState::DeleteBucket;
-        let mut deletes = vec![
-            (
-                S3_BUCKET_KEYSPACE.to_string(),
-                self.bucket.as_bytes().to_vec().into(),
-            ),
-        ];
+        let mut deletes = vec![(
+            S3_BUCKET_KEYSPACE.to_string(),
+            self.bucket.as_bytes().to_vec().into(),
+        )];
         deletes.append(&mut self.relationship_deletes);
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
             deletes,

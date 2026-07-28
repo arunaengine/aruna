@@ -31,9 +31,7 @@ pub struct BlobCleanupOutcome {
     pub has_more: bool,
 }
 
-pub async fn process_cleanup_batch(
-    context: &DriverContext,
-) -> Result<BlobCleanupOutcome, String> {
+pub async fn process_cleanup_batch(context: &DriverContext) -> Result<BlobCleanupOutcome, String> {
     let (values, next) = iter_prefix_page(
         &context.storage_handle,
         BLOB_CLEANUP_KEYSPACE,

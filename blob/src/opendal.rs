@@ -370,8 +370,14 @@ mod tests {
             ("secret_access_key".to_string(), "secret".to_string()),
             ("force_path_style".to_string(), "false".to_string()),
         ]));
-        assert_eq!(config.get("disable_config_load").map(String::as_str), Some("true"));
-        assert_eq!(config.get("disable_ec2_metadata").map(String::as_str), Some("true"));
+        assert_eq!(
+            config.get("disable_config_load").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            config.get("disable_ec2_metadata").map(String::as_str),
+            Some("true")
+        );
         assert_eq!(
             config.get("enable_virtual_host_style").map(String::as_str),
             Some("true")
