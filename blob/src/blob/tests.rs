@@ -921,7 +921,7 @@ async fn staging_source_effect_dispatches_via_blob_handle() {
 #[tokio::test]
 async fn concurrent_connections_receive_distinct_non_nil_ids() {
     let context = setup_blob_handle(1).await;
-    let mut handler = context.blob_handle.handler.clone();
+    let handler = context.blob_handle.handler.clone();
     let (net_a, _dir_a, net_b, _dir_b) = connected_stream_pair().await;
     let peer_id = net_b.node_id();
 
@@ -952,7 +952,7 @@ async fn concurrent_connections_receive_distinct_non_nil_ids() {
 #[tokio::test]
 async fn add_connection_rejects_nil_and_duplicate_ids() {
     let context = setup_blob_handle(1).await;
-    let mut handler = context.blob_handle.handler.clone();
+    let handler = context.blob_handle.handler.clone();
     let (net_a, _dir_a, net_b, _dir_b) = connected_stream_pair().await;
     let peer_id = net_b.node_id();
 

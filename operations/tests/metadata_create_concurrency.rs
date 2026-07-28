@@ -1,3 +1,5 @@
+// Fresh builds overflow the default query depth in nested async layouts.
+#![recursion_limit = "256"]
 //! Regression coverage for parallel metadata creates in one realm.
 
 use std::sync::Arc;
