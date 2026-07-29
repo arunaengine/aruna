@@ -1,7 +1,8 @@
 use crate::errors::{BlobError, ConversionError};
 use crate::structs::checksum::HASH_BLAKE3;
 use crate::structs::{
-    BucketReplicationConfig, PathRestriction, RealmId, SourceMetadata, VersionSourceBinding,
+    BucketReplicationConfig, PathRestriction, RealmId, SourceMetadata, StorageRoutingRule,
+    VersionSourceBinding,
 };
 use crate::types::{GroupId, NodeId, UserId};
 use byteview::ByteView;
@@ -389,6 +390,9 @@ pub struct BucketInfo {
     pub created_by: UserId,
     pub cors_configuration: Option<BucketCorsConfiguration>,
     pub replication: Option<BucketReplicationConfig>,
+    /// Bucket, prefix and exact-key write routing rules, most specific first at
+    /// resolution time. Empty means the group default decides.
+    pub storage_routing: Vec<StorageRoutingRule>,
 }
 
 impl BucketInfo {

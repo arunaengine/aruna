@@ -2311,6 +2311,7 @@ mod tests {
             created_by: owner,
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         };
         let hash: [u8; 32] = location.get_blake3().unwrap().try_into().unwrap();
         let version =

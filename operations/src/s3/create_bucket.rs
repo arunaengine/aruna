@@ -274,6 +274,7 @@ mod test {
             created_by: Default::default(),
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         };
 
         let result = drive(
@@ -308,6 +309,7 @@ mod test {
             created_by: Default::default(),
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         };
 
         drive(

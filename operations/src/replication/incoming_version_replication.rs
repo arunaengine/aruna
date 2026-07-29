@@ -27,8 +27,8 @@ use aruna_core::structs::{
     AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
     CurrentVersionPointer, MultipartObjectMetadataKey, NodeRouting, Permission,
     RealmConfigDocument, RealmId, ReplicationItemKind, ReplicationNegotiationResult, RoCrateLimits,
-    RoutingError, UsageDelta, VersionKey, blob_bucket_permission_path, blob_object_permission_path,
-    resolve_backend,
+    RoutingError, StorageRoutingRule, UsageDelta, VersionKey, blob_bucket_permission_path,
+    blob_object_permission_path, resolve_backend,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, NodeId};
@@ -151,6 +151,9 @@ pub struct IncomingVersionReplicationOperation {
     manifest: VersionReplicationManifest,
     txn_id: Option<Ulid>,
     destination_group_id: Option<GroupId>,
+    /// The destination bucket's own rules, so this receiver routes its replica
+    /// with the tenant's rules and its own class table.
+    destination_rules: Vec<StorageRoutingRule>,
     create_attempted: bool,
     negotiation_result: Option<ReplicationNegotiationResult>,
     quota_ceiling: Option<u64>,
@@ -189,6 +192,7 @@ impl IncomingVersionReplicationOperation {
             manifest,
             txn_id: None,
             destination_group_id: None,
+            destination_rules: Vec::new(),
             create_attempted: false,
             negotiation_result: None,
             quota_ceiling: None,
@@ -465,6 +469,7 @@ impl IncomingVersionReplicationOperation {
             created_by: self.manifest.created_by,
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         }
     }
 
@@ -618,11 +623,11 @@ impl IncomingVersionReplicationOperation {
     fn receive_blob(&mut self) -> Effects {
         // The receiver routes with its own snapshot; the sender's stamped
         // backend crossed the wire but is ignored.
-        let resolved = match resolve_backend(
-            &self.routing.snapshot(self.manifest.group_id),
-            &self.manifest.bucket,
-            &self.manifest.key,
-        ) {
+        let snapshot = self
+            .routing
+            .snapshot(self.destination_group_id.unwrap_or(self.manifest.group_id))
+            .with_bucket_rules(self.destination_rules.clone());
+        let resolved = match resolve_backend(&snapshot, &self.manifest.bucket, &self.manifest.key) {
             Ok(resolved) => resolved,
             Err(error) => return self.fail(IncomingVersionReplicationError::RoutingFailed(error)),
         };
@@ -1277,6 +1282,7 @@ impl Operation for IncomingVersionReplicationOperation {
                 );
 
                 self.destination_group_id = Some(bucket_info.group_id);
+                self.destination_rules = bucket_info.storage_routing;
                 self.check_write_permission(bucket_info.group_id)
             }
             IncomingVersionReplicationState::CreateDestinationBucket => {
@@ -2098,6 +2104,7 @@ mod tests {
             created_by: test_user_id(),
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         }
     }
 

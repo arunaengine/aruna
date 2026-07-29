@@ -883,6 +883,7 @@ mod tests {
             created_by: UserId::nil(test_realm()),
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         }
         .to_bytes()
         .unwrap()

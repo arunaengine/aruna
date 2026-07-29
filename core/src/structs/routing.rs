@@ -22,6 +22,8 @@ pub enum RoutingError {
     DuplicateRule(String),
     #[error("invalid storage class `{0}`")]
     InvalidClass(String),
+    #[error("routing rules may not name an operator backend")]
+    OperatorBackendTarget,
 }
 
 /// A storage class identifier is `[a-z0-9-]` of 1..=32 characters.
@@ -402,11 +404,54 @@ pub fn validate_rule_set(rules: &[StorageRoutingRule]) -> Result<(), RoutingErro
     Ok(())
 }
 
+/// Tenants may name their own group backend or a storage class, never an
+/// operator backend: node topology must not be bound into replicated records.
+pub fn validate_tenant_target(target: &RoutingTarget) -> Result<(), RoutingError> {
+    match target {
+        RoutingTarget::Backend(BackendRef::Node(_)) => Err(RoutingError::OperatorBackendTarget),
+        RoutingTarget::Backend(BackendRef::Group(_)) => Ok(()),
+        RoutingTarget::Class(class) => validate_storage_class(class),
+    }
+}
+
+pub fn validate_tenant_rules(rules: &[StorageRoutingRule]) -> Result<(), RoutingError> {
+    validate_rule_set(rules)?;
+    rules
+        .iter()
+        .try_for_each(|rule| validate_tenant_target(&rule.target))
+}
+
+/// Advisory only. A rule may name a class or backend this node does not have,
+/// because the record replicates to nodes with their own class tables.
+pub fn target_warnings<'a>(
+    catalog: &BackendCatalog,
+    targets: impl IntoIterator<Item = &'a RoutingTarget>,
+) -> Vec<String> {
+    targets
+        .into_iter()
+        .filter_map(
+            |target| match catalog.resolve_target(target, RuleSource::Tenant) {
+                Ok(Some(_)) => None,
+                Ok(None) => Some(match target {
+                    RoutingTarget::Class(class) => {
+                        format!("storage class `{class}` is not offered to tenants by this node")
+                    }
+                    RoutingTarget::Backend(backend) => {
+                        format!("backend {backend} does not resolve")
+                    }
+                }),
+                Err(error) => Some(error.to_string()),
+            },
+        )
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         BackendCatalog, NodeRoutingRule, RoutingError, RoutingSnapshot, RoutingTarget,
-        StorageRoutingRule, resolve_backend, validate_rule_set, validate_storage_class,
+        StorageRoutingRule, resolve_backend, target_warnings, validate_rule_set,
+        validate_storage_class, validate_tenant_rules, validate_tenant_target,
     };
     use crate::structs::{BackendRef, ResolvedBackend};
     use ulid::Ulid;
@@ -771,6 +816,42 @@ mod tests {
                 Err(RoutingError::InvalidClass(bad.to_string()))
             );
         }
+    }
+
+    #[test]
+    fn rejects_operator_target() {
+        // Tenant records must never bind an operator backend name.
+        assert_eq!(
+            validate_tenant_rules(&[rule("a/", false, "cold")]),
+            Err(RoutingError::OperatorBackendTarget)
+        );
+        validate_tenant_rules(&[class_rule("a/", "cold")]).unwrap();
+        validate_tenant_target(&RoutingTarget::Backend(BackendRef::Group(
+            Ulid::from_bytes([5u8; 16]),
+        )))
+        .unwrap();
+        assert_eq!(
+            validate_tenant_rules(&[class_rule("a/", "COLD")]),
+            Err(RoutingError::InvalidClass("COLD".to_string()))
+        );
+    }
+
+    #[test]
+    fn warns_unserved_target() {
+        let catalog = catalog().with_reserved("tape", Some("archive".to_string()));
+        let targets = [
+            RoutingTarget::Class("cold".to_string()),
+            RoutingTarget::Class("archive".to_string()),
+            RoutingTarget::Class("glacier".to_string()),
+            RoutingTarget::Backend(BackendRef::Group(Ulid::from_bytes([5u8; 16]))),
+        ];
+
+        let warnings = target_warnings(&catalog, targets.iter());
+
+        assert_eq!(warnings.len(), 3);
+        assert!(warnings[0].contains("archive"));
+        assert!(warnings[1].contains("glacier"));
+        assert!(warnings[2].contains("not registered"));
     }
 
     #[test]

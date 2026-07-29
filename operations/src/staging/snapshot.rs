@@ -101,6 +101,7 @@ pub async fn materialize_snapshot(
             version_id,
         });
     }
+    let routing = routing_snapshot(context, input.group_id, &input.bucket).await;
     let put_result = drive(
         PutObjectOperation::new(PutObjectConfig {
             user_id: input.user_id,
@@ -119,7 +120,7 @@ pub async fn materialize_snapshot(
             version_source: Some(version_source.clone()),
             preassigned_version_id: None,
             quota_ceiling: input.quota_ceiling,
-            routing: routing_snapshot(context, input.group_id),
+            routing,
         })
         .with_bucket_guard(input.expected_bucket),
         context,

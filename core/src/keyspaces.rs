@@ -62,6 +62,8 @@ pub const NOTIFICATION_OUTBOX_KEYSPACE: &str = "notification_outbox";
 pub const NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE: &str = "notification_watch_subscriptions";
 pub const NOTIFICATION_WATCH_INTEREST_KEYSPACE: &str = "notification_watch_interest";
 
+pub const GROUP_STORAGE_ROUTING_KEYSPACE: &str = "group_storage_routing";
+
 pub const SOURCE_CONNECTOR_INDEX_KEYSPACE: &str = "source_connector_index";
 pub const SOURCE_CONNECTOR_SECRET_KEYSPACE: &str = "source_connector_secret";
 

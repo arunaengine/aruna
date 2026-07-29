@@ -63,7 +63,7 @@ use crate::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentPayload,
 };
-use crate::driver::{drive, routing_snapshot};
+use crate::driver::{bucket_snapshot, drive};
 use crate::get_realm_config::GetRealmConfigOperation;
 use crate::list_metadata_documents::ListMetadataDocumentsOperation;
 use crate::metadata::MetadataAuthToken;
@@ -843,6 +843,7 @@ async fn write_next(
     .map_err(|error| ImportFailure::Retryable(error.to_string()))?
     .quota
     .effective_group_ceiling(&bucket_info.group_id);
+    let routing = bucket_snapshot(&ctx.driver, &bucket_info).await;
     let result = drive(
         PutObjectOperation::new(PutObjectConfig {
             user_id: spec.auth_context.user_id,
@@ -864,7 +865,7 @@ async fn write_next(
             version_source: None,
             preassigned_version_id: Some(entry.version_id),
             quota_ceiling: quota,
-            routing: routing_snapshot(&ctx.driver, bucket_info.group_id),
+            routing,
         })
         .with_bucket_guard(bucket_info)
         .with_rocrate_limits(spec.limits.clone()),

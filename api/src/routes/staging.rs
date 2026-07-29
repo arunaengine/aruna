@@ -1940,6 +1940,7 @@ mod tests {
             created_by: user_with_source_read,
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         };
         write_doc(
             &driver_ctx,

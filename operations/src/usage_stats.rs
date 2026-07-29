@@ -1880,6 +1880,7 @@ mod tests {
                     created_by: Default::default(),
                     cors_configuration: None,
                     replication: None,
+                    storage_routing: Vec::new(),
                 },
             ),
             &ctx,
@@ -1982,6 +1983,7 @@ mod tests {
                 created_by: Default::default(),
                 cors_configuration: None,
                 replication: None,
+                storage_routing: Vec::new(),
             };
             ctx.storage_handle
                 .send_storage_effect(StorageEffect::Write {
@@ -2301,6 +2303,7 @@ mod tests {
                     created_by: Default::default(),
                     cors_configuration: None,
                     replication: None,
+                    storage_routing: Vec::new(),
                 },
             ),
             &ctx,

@@ -178,6 +178,7 @@ pub async fn copy_object(
     };
     let metadata = input.metadata.unwrap_or(source.metadata);
 
+    let routing = routing_snapshot(context, input.group_id, &input.dest_bucket).await;
     let put_result = drive(
         PutObjectOperation::new(PutObjectConfig {
             user_id: input.user_id,
@@ -196,7 +197,7 @@ pub async fn copy_object(
             version_source,
             preassigned_version_id: None,
             quota_ceiling: input.quota_ceiling,
-            routing: routing_snapshot(context, input.group_id),
+            routing,
         })
         .with_metadata(metadata),
         context,

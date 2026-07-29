@@ -133,6 +133,7 @@ pub async fn ensure_workspace_bucket(
         created_by: record.created_by,
         cors_configuration: None,
         replication: None,
+        storage_routing: Vec::new(),
     };
     match Box::pin(drive(
         CreateBucketOperation::new(bucket.to_string(), bucket_info),
@@ -646,6 +647,7 @@ async fn put_file_output(
             Err(std::io::Error::other(error))
         }
     }));
+    let routing = routing_snapshot(context, spec.group_id, bucket).await;
     Box::pin(drive(
         PutObjectOperation::new(PutObjectConfig {
             user_id: record.created_by,
@@ -664,7 +666,7 @@ async fn put_file_output(
             version_source: None,
             preassigned_version_id: None,
             quota_ceiling,
-            routing: routing_snapshot(context, spec.group_id),
+            routing,
         }),
         context,
     ))
@@ -841,6 +843,7 @@ async fn stage_one_input(
     .await
     .map_err(|error| JobError::retryable(format!("quota lookup failed: {error}")))?;
     let quota_ceiling = realm_config.quota.effective_group_ceiling(&spec.group_id);
+    let routing = routing_snapshot(context, spec.group_id, bucket).await;
     Box::pin(drive(
         PutObjectOperation::new(PutObjectConfig {
             user_id: record.created_by,
@@ -859,7 +862,7 @@ async fn stage_one_input(
             version_source: None,
             preassigned_version_id: None,
             quota_ceiling,
-            routing: routing_snapshot(context, spec.group_id),
+            routing,
         }),
         context,
     ))

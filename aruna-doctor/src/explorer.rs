@@ -1484,6 +1484,7 @@ mod tests {
             created_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
             cors_configuration: None,
             replication: Some(config.clone()),
+            storage_routing: Vec::new(),
         };
 
         let decoded = decode_entry(

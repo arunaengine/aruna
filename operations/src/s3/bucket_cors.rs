@@ -545,6 +545,7 @@ mod tests {
             created_by: Default::default(),
             cors_configuration,
             replication: None,
+            storage_routing: Vec::new(),
         }
     }
 

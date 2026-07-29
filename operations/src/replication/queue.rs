@@ -2312,6 +2312,7 @@ mod tests {
             created_by: user(),
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         };
         match storage
             .send_storage_effect(StorageEffect::Write {
@@ -2385,6 +2386,7 @@ mod tests {
             created_by: user(),
             cors_configuration: None,
             replication: Some(config),
+            storage_routing: Vec::new(),
         };
         match storage
             .send_storage_effect(StorageEffect::Write {

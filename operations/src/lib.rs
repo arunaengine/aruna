@@ -36,6 +36,7 @@ pub mod get_oidc_user;
 pub mod get_realm_config;
 pub mod get_realm_nodes;
 pub mod get_user;
+pub mod group_routing;
 pub mod incoming;
 pub mod inspect_onboarding_secret;
 pub mod issue_onboarding_sync_ticket;

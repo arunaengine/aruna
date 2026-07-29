@@ -757,6 +757,7 @@ mod tests {
             created_by: user,
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         };
         write_doc(
             state,

@@ -108,6 +108,7 @@ async fn create_bucket(h: &Harness, bucket: &str, group_id: Ulid) {
                 created_by: h.created_by,
                 cors_configuration: None,
                 replication: None,
+                storage_routing: Vec::new(),
             },
         ),
         &h.driver,

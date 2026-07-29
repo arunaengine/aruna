@@ -523,6 +523,7 @@ mod test {
                     created_by: Default::default(),
                     cors_configuration: None,
                     replication: None,
+                    storage_routing: Vec::new(),
                 },
             ),
             &driver_ctx,
@@ -577,6 +578,7 @@ mod test {
                     replication: Some(BucketReplicationConfig {
                         targets: vec![make_replication_target(&bucket)],
                     }),
+                    storage_routing: Vec::new(),
                 },
             ),
             &driver_ctx,
@@ -628,6 +630,7 @@ mod test {
                     created_by: Default::default(),
                     cors_configuration: None,
                     replication: None,
+                    storage_routing: Vec::new(),
                 },
             ),
             &driver_ctx,
@@ -750,6 +753,7 @@ mod test {
                     created_by: Default::default(),
                     cors_configuration: None,
                     replication: None,
+                    storage_routing: Vec::new(),
                 }
                 .to_bytes()
                 .unwrap()
@@ -814,6 +818,7 @@ mod test {
                     created_by: Default::default(),
                     cors_configuration: None,
                     replication: None,
+                    storage_routing: Vec::new(),
                 }
                 .to_bytes()
                 .unwrap()

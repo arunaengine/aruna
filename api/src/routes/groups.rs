@@ -1665,6 +1665,7 @@ mod tests {
             created_by: Default::default(),
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         };
         store_bytes(
             state,

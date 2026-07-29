@@ -728,6 +728,7 @@ mod tests {
                         created_by: realm_admin,
                         cors_configuration: None,
                         replication: None,
+                        storage_routing: Vec::new(),
                     },
                 ),
                 context.as_ref(),
@@ -738,6 +739,7 @@ mod tests {
             .unwrap();
 
             let data = b"tiny snapshot object";
+            let routing = routing_snapshot(context.as_ref(), group.0.group_id, &bucket_name).await;
             let upload = drive(
                 PutObjectOperation::new(PutObjectConfig {
                     user_id: realm_admin,
@@ -756,7 +758,7 @@ mod tests {
                     preassigned_version_id: None,
                     quota_ceiling: None,
                     exists: false,
-                    routing: routing_snapshot(context.as_ref(), group.0.group_id),
+                    routing,
                 }),
                 context.as_ref(),
             )

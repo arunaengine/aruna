@@ -4,9 +4,14 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, NetEvent, SubOperationEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::keyspaces::{
+    GROUP_STORAGE_ROUTING_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
 use aruna_core::operation::{Operation, SubOperation};
-use aruna_core::structs::{NodeRouting, RoutingSnapshot};
+use aruna_core::structs::{
+    BucketInfo, GroupStorageRouting, NodeRouting, RoutingSnapshot, RoutingTarget,
+    StorageRoutingRule,
+};
 use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
 use aruna_storage::storage;
@@ -34,8 +39,75 @@ pub fn node_routing(context: &DriverContext) -> NodeRouting {
         .unwrap_or_default()
 }
 
-pub fn routing_snapshot(context: &DriverContext, group_id: GroupId) -> RoutingSnapshot {
-    node_routing(context).snapshot(group_id)
+/// The group's default write target. A read failure leaves the group default
+/// unset, so the write still lands on the node default instead of failing.
+async fn group_default(context: &DriverContext, group_id: GroupId) -> Option<RoutingTarget> {
+    let event = read_record(context, GROUP_STORAGE_ROUTING_KEYSPACE, group_id.to_bytes()).await?;
+    match GroupStorageRouting::from_bytes(event.as_ref()) {
+        Ok(record) => record.default_target,
+        Err(error) => {
+            warn!(error = %error, group_id = %group_id, "Failed to decode group storage routing");
+            None
+        }
+    }
+}
+
+/// Bucket rules for callers that do not already hold the bucket record.
+async fn bucket_rules(context: &DriverContext, bucket: &str) -> Vec<StorageRoutingRule> {
+    let Some(value) = read_record(context, S3_BUCKET_KEYSPACE, bucket.as_bytes().to_vec()).await
+    else {
+        return Vec::new();
+    };
+    match BucketInfo::from_bytes(value.as_ref()) {
+        Ok(info) => info.storage_routing,
+        Err(error) => {
+            warn!(error = %error, bucket = %bucket, "Failed to decode bucket record for routing");
+            Vec::new()
+        }
+    }
+}
+
+async fn read_record(
+    context: &DriverContext,
+    key_space: &str,
+    key: impl Into<Vec<u8>>,
+) -> Option<aruna_core::types::Value> {
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key: key.into().into(),
+            txn_id: None,
+        })
+        .await;
+    match event {
+        Event::Storage(aruna_core::events::StorageEvent::ReadResult { value, .. }) => value,
+        other => {
+            warn!(key_space = key_space, event = ?other, "Routing input read failed");
+            None
+        }
+    }
+}
+
+/// Routing inputs for one bucket write, assembled before the operation starts.
+pub async fn routing_snapshot(
+    context: &DriverContext,
+    group_id: GroupId,
+    bucket: &str,
+) -> RoutingSnapshot {
+    node_routing(context)
+        .snapshot(group_id)
+        .with_group_default(group_default(context, group_id).await)
+        .with_bucket_rules(bucket_rules(context, bucket).await)
+}
+
+/// The same inputs when the caller already holds the bucket record, as the S3
+/// surface does from its auth middleware.
+pub async fn bucket_snapshot(context: &DriverContext, bucket: &BucketInfo) -> RoutingSnapshot {
+    node_routing(context)
+        .snapshot(bucket.group_id)
+        .with_group_default(group_default(context, bucket.group_id).await)
+        .with_bucket_rules(bucket.storage_routing.clone())
 }
 
 #[derive(Clone)]
@@ -393,6 +465,90 @@ mod test {
     use byteview::ByteView;
     use std::convert::Infallible;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn snapshot_reads_rules() {
+        // The snapshot seam has to pick up both stored scopes, not stay empty.
+        use crate::driver::{bucket_snapshot, routing_snapshot};
+        use aruna_core::keyspaces::{GROUP_STORAGE_ROUTING_KEYSPACE, S3_BUCKET_KEYSPACE};
+        use aruna_core::structs::{
+            BucketInfo, GroupStorageRouting, RoutingTarget, StorageRoutingRule,
+        };
+        use std::time::SystemTime;
+
+        let dir = tempdir().unwrap();
+        let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let group_id = ulid::Ulid::generate();
+        let rule = StorageRoutingRule {
+            key_prefix: "archive/".to_string(),
+            exact: false,
+            target: RoutingTarget::Class("cold".to_string()),
+        };
+        let info = BucketInfo {
+            group_id,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: aruna_core::UserId::default(),
+            cors_configuration: None,
+            replication: None,
+            storage_routing: vec![rule.clone()],
+        };
+        let record = GroupStorageRouting {
+            group_id,
+            default_target: Some(RoutingTarget::Class("archive".to_string())),
+            updated_at: SystemTime::UNIX_EPOCH,
+            updated_by: aruna_core::UserId::default(),
+        };
+        write_value(
+            &context,
+            S3_BUCKET_KEYSPACE,
+            b"routed".to_vec(),
+            info.to_bytes().unwrap(),
+        )
+        .await;
+        write_value(
+            &context,
+            GROUP_STORAGE_ROUTING_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            record.to_bytes().unwrap(),
+        )
+        .await;
+
+        let snapshot = routing_snapshot(&context, group_id, "routed").await;
+        assert_eq!(snapshot.bucket_rules, vec![rule.clone()]);
+        assert_eq!(snapshot.group_default, record.default_target);
+
+        let known = bucket_snapshot(&context, &info).await;
+        assert_eq!(known.bucket_rules, vec![rule]);
+        assert_eq!(known.group_default, record.default_target);
+
+        let absent = routing_snapshot(&context, ulid::Ulid::generate(), "missing").await;
+        assert!(absent.bucket_rules.is_empty());
+        assert_eq!(absent.group_default, None);
+    }
+
+    async fn write_value(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key: key.into(),
+                value: value.into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
 
     #[derive(Debug, PartialEq)]
     pub struct TestOperation {

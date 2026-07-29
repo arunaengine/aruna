@@ -2074,6 +2074,7 @@ mod tests {
             created_by: test_user_id(),
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         }
     }
 
