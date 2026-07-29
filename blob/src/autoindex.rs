@@ -6,6 +6,7 @@
 //! source entries. Responses that do not look like a directory index are
 //! rejected with a clear error instead of being guessed at.
 
+use crate::egress::EgressGuard;
 use aruna_core::errors::StagingSourceError;
 use aruna_core::structs::{SourceEntry, SourceEntryKind};
 use reqwest::StatusCode;
@@ -35,6 +36,7 @@ struct Anchor {
 /// by parsing autoindex pages, mirroring `list_operator` semantics for
 /// limits, truncation, and the `files_only` filter.
 pub(crate) async fn list_http_autoindex(
+    guard: &EgressGuard,
     config: &HashMap<String, String>,
     path: &str,
     offset: usize,
@@ -42,7 +44,7 @@ pub(crate) async fn list_http_autoindex(
     recursive: bool,
     files_only: bool,
 ) -> Result<(Vec<SourceEntry>, bool), StagingSourceError> {
-    let client = HttpIndexClient::from_config(config)?;
+    let client = HttpIndexClient::from_config(guard, config)?;
     let mut queue = VecDeque::from([path.trim_matches('/').to_string()]);
     let mut entries = Vec::new();
     let mut fetches = 0usize;
@@ -104,16 +106,19 @@ pub(crate) async fn list_http_autoindex(
     Ok((entries, false))
 }
 
-struct HttpIndexClient {
-    client: reqwest::Client,
+struct HttpIndexClient<'guard> {
+    guard: &'guard EgressGuard,
     base: reqwest::Url,
     username: Option<String>,
     password: Option<String>,
     token: Option<String>,
 }
 
-impl HttpIndexClient {
-    fn from_config(config: &HashMap<String, String>) -> Result<Self, StagingSourceError> {
+impl<'guard> HttpIndexClient<'guard> {
+    fn from_config(
+        guard: &'guard EgressGuard,
+        config: &HashMap<String, String>,
+    ) -> Result<Self, StagingSourceError> {
         let endpoint = config.get("endpoint").ok_or_else(|| {
             StagingSourceError::OperatorCreationFailed(
                 "http connector endpoint is missing".to_string(),
@@ -129,12 +134,8 @@ impl HttpIndexClient {
         if let Some(root) = config.get("root") {
             base = join_directory(&base, root)?;
         }
-        let client = reqwest::Client::builder()
-            .timeout(FETCH_TIMEOUT)
-            .build()
-            .map_err(|error| StagingSourceError::OperatorCreationFailed(error.to_string()))?;
         Ok(Self {
-            client,
+            guard,
             base,
             username: config.get("username").cloned(),
             password: config.get("password").cloned(),
@@ -144,7 +145,11 @@ impl HttpIndexClient {
 
     async fn fetch_index(&self, path: &str) -> Result<(String, String), StagingSourceError> {
         let url = join_directory(&self.base, path)?;
-        let mut request = self.client.get(url).header(ACCEPT, "text/html");
+        let mut request = self
+            .guard
+            .request(url)?
+            .timeout(FETCH_TIMEOUT)
+            .header(ACCEPT, "text/html");
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
         } else if let Some(username) = &self.username {
@@ -631,8 +636,13 @@ fn civil_to_system_time(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::egress::EgressPolicy;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn test_guard() -> EgressGuard {
+        EgressGuard::new(EgressPolicy::loopback()).unwrap()
+    }
 
     const NGINX_FIXTURE: &str = include_str!("../fixtures/autoindex_nginx.html");
     const APACHE_PRE_FIXTURE: &str = include_str!("../fixtures/autoindex_apache_pre.html");
@@ -814,9 +824,10 @@ mod tests {
             ("root".to_string(), "data".to_string()),
         ]);
 
-        let (entries, truncated) = list_http_autoindex(&config, "", 0, 2, false, false)
-            .await
-            .unwrap();
+        let (entries, truncated) =
+            list_http_autoindex(&test_guard(), &config, "", 0, 2, false, false)
+                .await
+                .unwrap();
 
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "sub");
@@ -826,9 +837,10 @@ mod tests {
         assert_eq!(entries[1].size, Some(10));
         assert!(truncated);
 
-        let (entries, truncated) = list_http_autoindex(&config, "", 2, 2, false, false)
-            .await
-            .unwrap();
+        let (entries, truncated) =
+            list_http_autoindex(&test_guard(), &config, "", 2, 2, false, false)
+                .await
+                .unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "b.txt");
         assert!(!truncated);
@@ -851,9 +863,10 @@ mod tests {
         .await;
         let config = HashMap::from([("endpoint".to_string(), endpoint)]);
 
-        let (entries, truncated) = list_http_autoindex(&config, "", 0, 10, true, true)
-            .await
-            .unwrap();
+        let (entries, truncated) =
+            list_http_autoindex(&test_guard(), &config, "", 0, 10, true, true)
+                .await
+                .unwrap();
 
         let paths = entries
             .iter()
@@ -876,10 +889,28 @@ mod tests {
         .await;
         let config = HashMap::from([("endpoint".to_string(), endpoint)]);
 
-        let error = list_http_autoindex(&config, "", 0, 10, false, false)
+        let error = list_http_autoindex(&test_guard(), &config, "", 0, 10, false, false)
             .await
             .unwrap_err();
         assert!(matches!(error, StagingSourceError::ListError(_)));
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn strict_blocks_index() {
+        // The autoindex client is no longer a raw reqwest client.
+        let (server, endpoint) =
+            spawn_index_server(vec![("/", "text/html", index_page("/", ""))]).await;
+        let guard = EgressGuard::new(EgressPolicy::strict()).unwrap();
+        let config = HashMap::from([("endpoint".to_string(), endpoint)]);
+
+        let error = list_http_autoindex(&guard, &config, "", 0, 10, false, false)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, StagingSourceError::EgressDenied(_)));
 
         server.abort();
         let _ = server.await;
@@ -890,7 +921,7 @@ mod tests {
         let (server, endpoint) = spawn_index_server(Vec::new()).await;
         let config = HashMap::from([("endpoint".to_string(), endpoint)]);
 
-        let error = list_http_autoindex(&config, "missing", 0, 10, false, false)
+        let error = list_http_autoindex(&test_guard(), &config, "missing", 0, 10, false, false)
             .await
             .unwrap_err();
         assert_eq!(error, StagingSourceError::NotFound);

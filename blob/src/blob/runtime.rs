@@ -1,9 +1,11 @@
 use super::{BlobHandle, BlobHandler};
+use crate::egress::EgressGuard;
 use crate::error::BlobLibError;
 use crate::opendal::init_operator;
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect};
+use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
@@ -243,8 +245,21 @@ impl BlobHandler {
         storage: StorageHandle,
         net: NetHandle,
     ) -> Result<BlobHandle, BlobLibError> {
+        Self::with_egress(config, storage, net, EgressPolicy::strict()).await
+    }
+
+    /// Constructor seam for the egress policy. Production wiring calls `new`,
+    /// which pins the strict policy; fixtures pass a loopback-permitting one.
+    #[allow(clippy::new_ret_no_self)]
+    pub async fn with_egress(
+        config: BackendConfig,
+        storage: StorageHandle,
+        net: NetHandle,
+        policy: EgressPolicy,
+    ) -> Result<BlobHandle, BlobLibError> {
         let blob_handler = BlobHandler {
             backend_config: config,
+            egress: EgressGuard::new(policy)?,
             storage,
             net,
             connections: Arc::new(Mutex::new(HashMap::new())),

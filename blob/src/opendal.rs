@@ -138,6 +138,7 @@ pub(crate) async fn read_staging_source(
 }
 
 pub(crate) async fn list_staging_source(
+    guard: &crate::egress::EgressGuard,
     access: &ResolvedSourceAccess,
     offset: usize,
     limit: usize,
@@ -150,7 +151,7 @@ pub(crate) async fn list_staging_source(
     if *kind == SourceConnectorKind::Http {
         // opendal's Http service cannot list; walk autoindex pages instead.
         return crate::autoindex::list_http_autoindex(
-            config, path, offset, limit, recursive, files_only,
+            guard, config, path, offset, limit, recursive, files_only,
         )
         .await;
     }

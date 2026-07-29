@@ -45,7 +45,8 @@ impl BlobHandler {
         recursive: bool,
         files_only: bool,
     ) -> StagingSourceEvent {
-        match list_staging_source(&access, offset, limit, recursive, files_only).await {
+        match list_staging_source(&self.egress, &access, offset, limit, recursive, files_only).await
+        {
             Ok((entries, truncated)) => StagingSourceEvent::ListResult { entries, truncated },
             Err(error) => StagingSourceEvent::Error { error },
         }

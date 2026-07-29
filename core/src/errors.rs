@@ -96,6 +96,8 @@ pub enum StagingSourceError {
     ListError(String),
     #[error("Read error: {0}")]
     ReadError(String),
+    #[error(transparent)]
+    EgressDenied(#[from] crate::egress::EgressError),
 }
 
 #[derive(Debug, Error, PartialEq)]

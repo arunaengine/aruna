@@ -1,3 +1,4 @@
+use crate::egress::EgressGuard;
 use aruna_core::NodeId;
 use aruna_core::structs::BackendConfig;
 use aruna_net::NetHandle;
@@ -40,6 +41,7 @@ enum ControlPlaneTimeoutKind {
 #[derive(Clone, Debug)]
 pub struct BlobHandler {
     backend_config: BackendConfig,
+    egress: EgressGuard,
     storage: StorageHandle,
     net: NetHandle,
     connections: Arc<Mutex<HashMap<Ulid, Connection>>>,
