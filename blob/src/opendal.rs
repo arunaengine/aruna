@@ -5,7 +5,7 @@ use aruna_core::structs::{
 };
 use bytes::Bytes;
 use futures::TryStreamExt;
-use opendal::layers::{LoggingLayer, RetryLayer};
+use opendal::layers::{HttpClientLayer, LoggingLayer, RetryLayer};
 use opendal::{Builder, EntryMode, Operator, services};
 use std::collections::HashMap;
 
@@ -33,14 +33,14 @@ pub(crate) fn init_backend_operator(
     match config.backend_type {
         Backend::S3 => {
             config.service_config.insert("bucket".to_string(), bucket);
-            build_service::<services::S3>(s3_operator_config(config.service_config))
+            build_service::<services::S3>(s3_operator_config(config.service_config), None)
                 .map_err(blob_operator_creation_error)
         }
-        Backend::HTTP => build_service::<services::Http>(config.service_config)
+        Backend::HTTP => build_service::<services::Http>(config.service_config, None)
             .map_err(blob_operator_creation_error),
-        Backend::Postgres => build_service::<services::Postgresql>(config.service_config)
+        Backend::Postgres => build_service::<services::Postgresql>(config.service_config, None)
             .map_err(blob_operator_creation_error),
-        Backend::FileSystem => build_service::<services::Fs>(config.service_config)
+        Backend::FileSystem => build_service::<services::Fs>(config.service_config, None)
             .map_err(blob_operator_creation_error),
     }
 }
@@ -50,16 +50,15 @@ pub(crate) fn init_operator(
     config: HashMap<String, String>,
 ) -> Result<Operator, BlobError> {
     match backend_type {
-        Backend::S3 => build_service::<services::S3>(s3_operator_config(config))
+        Backend::S3 => build_service::<services::S3>(s3_operator_config(config), None)
             .map_err(blob_operator_creation_error),
         Backend::HTTP => {
-            build_service::<services::Http>(config).map_err(blob_operator_creation_error)
+            build_service::<services::Http>(config, None).map_err(blob_operator_creation_error)
         }
-        Backend::Postgres => {
-            build_service::<services::Postgresql>(config).map_err(blob_operator_creation_error)
-        }
+        Backend::Postgres => build_service::<services::Postgresql>(config, None)
+            .map_err(blob_operator_creation_error),
         Backend::FileSystem => {
-            build_service::<services::Fs>(config).map_err(blob_operator_creation_error)
+            build_service::<services::Fs>(config, None).map_err(blob_operator_creation_error)
         }
     }
 }
@@ -222,15 +221,17 @@ fn build_staging_source_operator(
             version,
         } => {
             let operator = match kind {
-                SourceConnectorKind::Http => build_service::<services::Http>(config.clone())
+                SourceConnectorKind::Http => build_service::<services::Http>(config.clone(), None)
                     .map_err(staging_operator_creation_error)?,
                 SourceConnectorKind::S3 => {
-                    build_service::<services::S3>(s3_operator_config(config.clone()))
+                    build_service::<services::S3>(s3_operator_config(config.clone()), None)
                         .map_err(staging_operator_creation_error)?
                 }
-                SourceConnectorKind::Webdav => build_service::<services::Webdav>(config.clone())
-                    .map_err(staging_operator_creation_error)?,
-                SourceConnectorKind::Ftp => build_service::<services::Ftp>(config.clone())
+                SourceConnectorKind::Webdav => {
+                    build_service::<services::Webdav>(config.clone(), None)
+                        .map_err(staging_operator_creation_error)?
+                }
+                SourceConnectorKind::Ftp => build_service::<services::Ftp>(config.clone(), None)
                     .map_err(staging_operator_creation_error)?,
                 SourceConnectorKind::ArunaNative => {
                     return Err(StagingSourceError::UnsupportedKind(kind.to_string()));
@@ -241,15 +242,21 @@ fn build_staging_source_operator(
     }
 }
 
-fn build_service<B>(config: HashMap<String, String>) -> Result<Operator, String>
+fn build_service<B>(
+    config: HashMap<String, String>,
+    guard: Option<HttpClientLayer>,
+) -> Result<Operator, String>
 where
     B: Builder,
 {
-    Ok(Operator::from_iter::<B>(config)
+    let builder = Operator::from_iter::<B>(config)
         .map_err(|error| error.to_string())?
         .layer(LoggingLayer::default())
-        .layer(RetryLayer::new())
-        .finish())
+        .layer(RetryLayer::new());
+    Ok(match guard {
+        Some(guard) => builder.layer(guard).finish(),
+        None => builder.finish(),
+    })
 }
 
 // reqsign resolves credentials lazily on the first request and on every retry,
@@ -465,7 +472,8 @@ mod tests {
             .unwrap();
 
         let operator =
-            build_service::<services::Fs>(HashMap::from([("root".to_string(), root)])).unwrap();
+            build_service::<services::Fs>(HashMap::from([("root".to_string(), root)]), None)
+                .unwrap();
         let metadata = operator.stat("hello.txt").await.unwrap();
         assert_eq!(metadata.content_length(), 11);
     }
@@ -473,20 +481,26 @@ mod tests {
     #[tokio::test]
     async fn builds_unsigned_s3() {
         // `skip_signature` must stay a valid S3 config key across opendal upgrades.
-        build_service::<services::S3>(HashMap::from([
-            ("bucket".to_string(), "public-data".to_string()),
-            ("endpoint".to_string(), "https://s3.example.org".to_string()),
-            ("region".to_string(), "eu-central-1".to_string()),
-            ("skip_signature".to_string(), "true".to_string()),
-        ]))
+        build_service::<services::S3>(
+            HashMap::from([
+                ("bucket".to_string(), "public-data".to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+                ("region".to_string(), "eu-central-1".to_string()),
+                ("skip_signature".to_string(), "true".to_string()),
+            ]),
+            None,
+        )
         .unwrap();
 
-        build_service::<services::S3>(HashMap::from([
-            ("bucket".to_string(), "public-data".to_string()),
-            ("endpoint".to_string(), "https://s3.example.org".to_string()),
-            ("region".to_string(), "eu-central-1".to_string()),
-            ("skip_signature".to_string(), "nope".to_string()),
-        ]))
+        build_service::<services::S3>(
+            HashMap::from([
+                ("bucket".to_string(), "public-data".to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+                ("region".to_string(), "eu-central-1".to_string()),
+                ("skip_signature".to_string(), "nope".to_string()),
+            ]),
+            None,
+        )
         .unwrap_err();
     }
 
@@ -514,16 +528,16 @@ mod tests {
             Some("true")
         );
         assert!(!config.contains_key("force_path_style"));
-        build_service::<services::S3>(config).unwrap();
+        build_service::<services::S3>(config, None).unwrap();
     }
 
     #[tokio::test]
     async fn check_reports_success() {
         let dir = tempdir().unwrap();
-        let operator = build_service::<services::Fs>(HashMap::from([(
-            "root".to_string(),
-            dir.path().to_str().unwrap().to_string(),
-        )]))
+        let operator = build_service::<services::Fs>(
+            HashMap::from([("root".to_string(), dir.path().to_str().unwrap().to_string())]),
+            None,
+        )
         .unwrap();
 
         check_operator(&operator, SourceConnectorKind::S3)
@@ -543,10 +557,10 @@ mod tests {
         tokio::fs::write(dir.path().join("prefix/b.txt"), b"bb")
             .await
             .unwrap();
-        let operator = build_service::<services::Fs>(HashMap::from([(
-            "root".to_string(),
-            dir.path().to_str().unwrap().to_string(),
-        )]))
+        let operator = build_service::<services::Fs>(
+            HashMap::from([("root".to_string(), dir.path().to_str().unwrap().to_string())]),
+            None,
+        )
         .unwrap();
 
         let (entries, truncated) = list_operator(&operator, "prefix/", 0, 1, false, false)
@@ -573,10 +587,10 @@ mod tests {
         tokio::fs::write(dir.path().join("prefix/nested/file.txt"), b"data")
             .await
             .unwrap();
-        let operator = build_service::<services::Fs>(HashMap::from([(
-            "root".to_string(),
-            dir.path().to_str().unwrap().to_string(),
-        )]))
+        let operator = build_service::<services::Fs>(
+            HashMap::from([("root".to_string(), dir.path().to_str().unwrap().to_string())]),
+            None,
+        )
         .unwrap();
 
         let (entries, truncated) = list_operator(&operator, "prefix/", 0, 10, true, true)
@@ -600,10 +614,10 @@ mod tests {
         tokio::fs::write(dir.path().join("prefix/nested/b.txt"), b"b")
             .await
             .unwrap();
-        let operator = build_service::<services::Fs>(HashMap::from([(
-            "root".to_string(),
-            dir.path().to_str().unwrap().to_string(),
-        )]))
+        let operator = build_service::<services::Fs>(
+            HashMap::from([("root".to_string(), dir.path().to_str().unwrap().to_string())]),
+            None,
+        )
         .unwrap();
 
         let (entries, truncated) = list_operator(&operator, "prefix/", 0, 1, true, true)

@@ -4,6 +4,7 @@
 mod autoindex;
 pub mod bao_tree;
 pub mod blob;
+pub mod egress;
 pub mod error;
 mod framing;
 pub mod hash;
