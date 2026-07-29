@@ -1030,18 +1030,17 @@ pub async fn requeue_job(
                 return Ok(JobMutation::Skip);
             }
         }
+        if let Some(error) = error.clone() {
+            record.last_error = Some(error);
+        }
+        record.attempts = record.attempts.saturating_add(1);
+        record.updated_at_ms = now_ms;
         // Checked AFTER the expired-lease re-check: a live renewed attempt is a
-        // plain Skip and must not be routed to the reconciler.
+        // plain Skip and must not be routed to the reconciler. Re-queuing would
+        // double-run the container, so a charged attempt goes to reconcile instead.
         if record.execution_class == JobExecutionClass::ExternalAttempt
             && record.attempt_intent.is_some()
         {
-            if let Some(error) = error.clone() {
-                record.last_error = Some(error);
-            }
-            // Re-queuing would double-run the container, so the attempt is charged
-            // and routed to reconcile instead. The cap still terminalizes it.
-            record.attempts = record.attempts.saturating_add(1);
-            record.updated_at_ms = now_ms;
             if record.attempts >= JOB_MAX_ATTEMPTS {
                 fail_capped(record, now_ms);
             } else {
@@ -1050,11 +1049,6 @@ pub async fn requeue_job(
             persisted = true;
             return Ok(JobMutation::Persist);
         }
-        if let Some(error) = error.clone() {
-            record.last_error = Some(error);
-        }
-        record.attempts = record.attempts.saturating_add(1);
-        record.updated_at_ms = now_ms;
         record.claim = None;
         if record.attempts >= JOB_MAX_ATTEMPTS
             && !matches!(&record.payload, JobPayload::TerminalCleanup { .. })
