@@ -1978,11 +1978,16 @@ async fn stream_output<R: AsyncRead + Unpin>(
             .unwrap_or(usize::MAX)
             .min(buffer.len());
         match stdout.read(&mut buffer[..limit]).await {
+            // kube-rs reports a websocket failure or an unexpected close as a plain
+            // EOF, so the real cause survives only in the exec status.
             Ok(0) => {
+                let transferred = size - remaining;
                 let _ = tx
-                    .send(Err(BackendError::Api(
-                        "fetch archive ended before its declared size".to_string(),
-                    )))
+                    .send(Err(join_exec(attached).await.err().unwrap_or_else(|| {
+                        BackendError::Api(format!(
+                            "fetch archive ended after {transferred} of {size} bytes"
+                        ))
+                    })))
                     .await;
                 return;
             }
@@ -1997,7 +2002,12 @@ async fn stream_output<R: AsyncRead + Unpin>(
                 }
             }
             Err(error) => {
-                let _ = tx.send(Err(io_error(error))).await;
+                let _ = tx
+                    .send(Err(join_exec(attached)
+                        .await
+                        .err()
+                        .unwrap_or_else(|| io_error(error))))
+                    .await;
                 return;
             }
         }
