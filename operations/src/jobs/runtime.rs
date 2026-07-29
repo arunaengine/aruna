@@ -568,7 +568,7 @@ async fn run_job(
     // hands the lease back through `JobsRuntime::shutdown`, so the attempt is adopted
     // rather than re-run.
     if record.execution_class == JobExecutionClass::ExternalAttempt {
-        super::workflow::run_execution_job(context, record, cancel).await;
+        Box::pin(super::workflow::run_execution_job(context, record, cancel)).await;
         return;
     }
 

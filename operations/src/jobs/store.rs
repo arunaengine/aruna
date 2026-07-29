@@ -252,7 +252,7 @@ where
         let txn_id = start_write_txn(storage)
             .await
             .map_err(JobMutationError::Storage)?;
-        match mutate_in_txn(storage, txn_id, job_id, &mut mutate).await {
+        match Box::pin(mutate_in_txn(storage, txn_id, job_id, &mut mutate)).await {
             Ok(record) => match commit_txn(storage, txn_id).await {
                 CommitResult::Committed => return Ok(record),
                 CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => {

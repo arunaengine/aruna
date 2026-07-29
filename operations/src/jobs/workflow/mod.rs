@@ -74,7 +74,7 @@ pub async fn run_execution_job(
     // terminalize directly (Claimed -> Cancelled).
     if record.cancel_requested && record.attempt_intent.is_none() {
         match cancel_running_job(storage, job_id, token, unix_timestamp_millis()).await {
-            Ok(record) => cleanup_and_crate(&context, job_id, Some(record)).await,
+            Ok(record) => Box::pin(cleanup_and_crate(&context, job_id, Some(record))).await,
             Err(error) => {
                 warn!(job_id = %job_id, error = %error, "Fresh cancellation write failed")
             }
@@ -83,13 +83,13 @@ pub async fn run_execution_job(
     }
 
     let Some(node_id) = context.net_handle.as_ref().map(|net| net.node_id()) else {
-        fail_and_crate(
+        Box::pin(fail_and_crate(
             &context,
             job_id,
             token,
             &record,
             JobError::permanent("execution needs a net handle"),
-        )
+        ))
         .await;
         return;
     };
@@ -97,7 +97,7 @@ pub async fn run_execution_job(
     let backend = match resolve_backend(&context, &spec) {
         Ok(backend) => backend,
         Err(error) => {
-            fail_and_crate(&context, job_id, token, &record, error).await;
+            Box::pin(fail_and_crate(&context, job_id, token, &record, error)).await;
             return;
         }
     };
@@ -121,11 +121,19 @@ pub async fn run_execution_job(
     ));
     tokio::pin!(heartbeat);
 
-    let prepare_and_submit = async {
-        let prepared = match prepare_task(&context, &spec, &record, node_id, &bucket, token).await {
+    // Boxed so the large per-stage futures never inflate caller stacks.
+    let mut prepare_and_submit = Box::pin(async {
+        let prepared = match Box::pin(prepare_task(
+            &context, &spec, &record, node_id, &bucket, token,
+        ))
+        .await
+        {
             Ok(prepared) => prepared,
             Err(error) => {
-                requeue_or_fail_pre_submit(&context, job_id, token, &record, error, false).await;
+                Box::pin(requeue_or_fail_pre_submit(
+                    &context, job_id, token, &record, error, false,
+                ))
+                .await;
                 return None;
             }
         };
@@ -150,7 +158,10 @@ pub async fn run_execution_job(
                 } else {
                     JobError::permanent(format!("image resolution failed: {error}"))
                 };
-                requeue_or_fail_pre_submit(&context, job_id, token, &record, job_error, true).await;
+                Box::pin(requeue_or_fail_pre_submit(
+                    &context, job_id, token, &record, job_error, true,
+                ))
+                .await;
                 return None;
             }
         };
@@ -170,13 +181,13 @@ pub async fn run_execution_job(
             pinned_image,
             attempt_epoch: 0,
         };
-        let intent_commit = match record_attempt_intent(
+        let intent_commit = match Box::pin(record_attempt_intent(
             storage,
             job_id,
             token,
             intent,
             unix_timestamp_millis(),
-        )
+        ))
         .await
         {
             Ok(record) => record,
@@ -189,7 +200,9 @@ pub async fn run_execution_job(
                 {
                     match cancel_running_job(storage, job_id, token, unix_timestamp_millis()).await
                     {
-                        Ok(record) => cleanup_and_crate(&context, job_id, Some(record)).await,
+                        Ok(record) => {
+                            Box::pin(cleanup_and_crate(&context, job_id, Some(record))).await
+                        }
                         Err(error) => {
                             warn!(job_id = %job_id, error = %error, "Pre-submit cancellation write failed")
                         }
@@ -201,7 +214,7 @@ pub async fn run_execution_job(
         };
         if intent_commit.record.cancel_requested {
             match cancel_running_job(storage, job_id, token, unix_timestamp_millis()).await {
-                Ok(record) => cleanup_and_crate(&context, job_id, Some(record)).await,
+                Ok(record) => Box::pin(cleanup_and_crate(&context, job_id, Some(record))).await,
                 Err(error) => {
                     warn!(job_id = %job_id, error = %error, "Pre-submit cancellation write failed")
                 }
@@ -221,7 +234,10 @@ pub async fn run_execution_job(
         let submitted = match backend.submit(&fence, &task_spec, &cancel).await {
             Ok(status) => status,
             Err(BackendError::Cancelled) => {
-                finalize_cancel(&context, job_id, token, &backend, &fence, &spec, &bucket).await;
+                Box::pin(finalize_cancel(
+                    &context, job_id, token, &backend, &fence, &spec, &bucket,
+                ))
+                .await;
                 return None;
             }
             Err(error) => {
@@ -243,13 +259,15 @@ pub async fn run_execution_job(
             Err(_) => return None,
         };
         if running.cancel_requested {
-            finalize_cancel(&context, job_id, token, &backend, &fence, &spec, &bucket).await;
+            Box::pin(finalize_cancel(
+                &context, job_id, token, &backend, &fence, &spec, &bucket,
+            ))
+            .await;
             return None;
         }
 
         Some(Ok((backend, fence, spec, bucket, cancel)))
-    };
-    tokio::pin!(prepare_and_submit);
+    });
 
     let prepared = tokio::select! {
         result = &mut prepare_and_submit => result,
@@ -264,7 +282,7 @@ pub async fn run_execution_job(
         Ok((backend, fence, spec, bucket, cancel)) => {
             stop.cancel();
             let _ = (&mut heartbeat).await;
-            supervise_and_finalize(
+            Box::pin(supervise_and_finalize(
                 context.clone(),
                 job_id,
                 token,
@@ -273,15 +291,14 @@ pub async fn run_execution_job(
                 spec,
                 bucket,
                 cancel,
-            )
+            ))
             .await;
         }
         Err((backend, fence, spec, bucket, cancel, error)) => {
             let resumed = {
-                let recovery = recover_failed_submit(
+                let mut recovery = Box::pin(recover_failed_submit(
                     &context, job_id, token, &backend, &fence, &spec, &bucket, &cancel, error,
-                );
-                tokio::pin!(recovery);
+                ));
                 tokio::select! {
                     result = &mut recovery => {
                         stop.cancel();
@@ -292,7 +309,7 @@ pub async fn run_execution_job(
                 }
             };
             if resumed == Some(true) {
-                supervise_and_finalize(
+                Box::pin(supervise_and_finalize(
                     context.clone(),
                     job_id,
                     token,
@@ -301,7 +318,7 @@ pub async fn run_execution_job(
                     spec,
                     bucket,
                     cancel,
-                )
+                ))
                 .await;
             }
         }
@@ -334,8 +351,11 @@ async fn prepare_workspace(
     bucket: &str,
     token: ulid::Ulid,
 ) -> Result<Vec<TaskInput>, JobError> {
-    ensure_group_write(context, spec, record, node_id).await?;
-    ensure_workspace_bucket(context, spec, record, node_id, bucket).await?;
+    Box::pin(ensure_group_write(context, spec, record, node_id)).await?;
+    Box::pin(ensure_workspace_bucket(
+        context, spec, record, node_id, bucket,
+    ))
+    .await?;
     set_workspace_bucket(
         &context.storage_handle,
         record.job_id,
@@ -345,8 +365,8 @@ async fn prepare_workspace(
     )
     .await
     .map_err(|error| JobError::retryable(format!("workspace bucket record failed: {error}")))?;
-    stage_inputs(context, spec, record, bucket, node_id).await?;
-    load_inputs(context, spec, record, bucket).await
+    Box::pin(stage_inputs(context, spec, record, bucket, node_id)).await?;
+    Box::pin(load_inputs(context, spec, record, bucket)).await
 }
 
 pub(super) struct PreparedTask {
@@ -370,14 +390,17 @@ async fn mounted_task(
     record: &JobRecord,
     node_id: NodeId,
 ) -> Result<PreparedTask, JobError> {
-    let mounts = prepare_mounts(context, spec, record, node_id).await?;
+    let mounts = Box::pin(prepare_mounts(context, spec, record, node_id)).await?;
     let mut secrets = BTreeMap::new();
     if !mounts.is_empty() {
         let buckets = mounts
             .iter()
             .map(|mount| mount.bucket.clone())
             .collect::<BTreeSet<_>>();
-        let credential = mint_input_credential(context, spec, record, node_id, &buckets).await?;
+        let credential = Box::pin(mint_input_credential(
+            context, spec, record, node_id, &buckets,
+        ))
+        .await?;
         secrets.insert(
             "access_key_id".to_string(),
             Secret::new(credential.access_key),
@@ -404,10 +427,13 @@ async fn prepare_task(
     token: ulid::Ulid,
 ) -> Result<PreparedTask, JobError> {
     if record.workspace_mode == WorkspaceMode::None {
-        return mounted_task(context, spec, record, node_id).await;
+        return Box::pin(mounted_task(context, spec, record, node_id)).await;
     }
     Ok(PreparedTask {
-        inputs: prepare_workspace(context, spec, record, node_id, bucket, token).await?,
+        inputs: Box::pin(prepare_workspace(
+            context, spec, record, node_id, bucket, token,
+        ))
+        .await?,
         mounts: Vec::new(),
         secrets: BTreeMap::new(),
         staging: StagingMode::Files,
@@ -422,10 +448,10 @@ pub(super) async fn reload_task(
     bucket: &str,
 ) -> Result<PreparedTask, JobError> {
     if record.workspace_mode == WorkspaceMode::None {
-        return mounted_task(context, spec, record, node_id).await;
+        return Box::pin(mounted_task(context, spec, record, node_id)).await;
     }
     Ok(PreparedTask {
-        inputs: load_inputs(context, spec, record, bucket).await?,
+        inputs: Box::pin(load_inputs(context, spec, record, bucket)).await?,
         mounts: Vec::new(),
         secrets: BTreeMap::new(),
         staging: StagingMode::Files,
@@ -517,7 +543,10 @@ async fn recover_failed_submit(
             .flatten()
             .is_some_and(|record| record.cancel_requested)
     {
-        finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
+        Box::pin(finalize_cancel(
+            context, job_id, token, backend, fence, spec, bucket,
+        ))
+        .await;
         return false;
     }
     let record = match read_job_record(storage, job_id, None).await {
@@ -546,10 +575,13 @@ async fn recover_failed_submit(
                     Err(_) => return false,
                 };
                 if running.cancel_requested {
-                    finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
+                    Box::pin(finalize_cancel(
+                        context, job_id, token, backend, fence, spec, bucket,
+                    ))
+                    .await;
                     return false;
                 }
-                finalize_attempt(
+                Box::pin(finalize_attempt(
                     context,
                     job_id,
                     token,
@@ -558,7 +590,7 @@ async fn recover_failed_submit(
                     spec,
                     bucket,
                     Ok(status),
-                )
+                ))
                 .await;
                 return false;
             }
@@ -575,28 +607,34 @@ async fn recover_failed_submit(
                 Err(_) => return false,
             };
             if running.cancel_requested {
-                finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
+                Box::pin(finalize_cancel(
+                    context, job_id, token, backend, fence, spec, bucket,
+                ))
+                .await;
                 return false;
             }
             true
         }
         RecoveryAction::RetrySame => {
-            let status = match retry_same_submit(
+            let status = match Box::pin(retry_same_submit(
                 context, backend, fence, spec, bucket, record, cancel,
-            )
+            ))
             .await
             {
                 Ok(status) => status,
                 Err(BackendError::Cancelled) => {
-                    finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
+                    Box::pin(finalize_cancel(
+                        context, job_id, token, backend, fence, spec, bucket,
+                    ))
+                    .await;
                     return false;
                 }
                 Err(retry_error) if retry_error.retryable() => {
-                    park_failed_submit(context, job_id, token, &retry_error).await;
+                    Box::pin(park_failed_submit(context, job_id, token, &retry_error)).await;
                     return false;
                 }
                 Err(retry_error) => {
-                    retire_failed_submit(
+                    Box::pin(retire_failed_submit(
                         context,
                         job_id,
                         token,
@@ -604,7 +642,7 @@ async fn recover_failed_submit(
                         fence,
                         record,
                         &retry_error,
-                    )
+                    ))
                     .await;
                     return false;
                 }
@@ -622,14 +660,17 @@ async fn recover_failed_submit(
                 Err(_) => return false,
             };
             if running.cancel_requested {
-                finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
+                Box::pin(finalize_cancel(
+                    context, job_id, token, backend, fence, spec, bucket,
+                ))
+                .await;
                 return false;
             }
             true
         }
         RecoveryAction::Cleanup => {
             let _ = backend.cancel(fence).await;
-            park_failed_submit(context, job_id, token, &error).await;
+            Box::pin(park_failed_submit(context, job_id, token, &error)).await;
             false
         }
         RecoveryAction::Retire => {
@@ -648,11 +689,14 @@ async fn recover_failed_submit(
             {
                 return false;
             }
-            requeue_after_tombstone(context, job_id, token, record, &error).await;
+            Box::pin(requeue_after_tombstone(
+                context, job_id, token, record, &error,
+            ))
+            .await;
             false
         }
         RecoveryAction::Park => {
-            park_failed_submit(context, job_id, token, &error).await;
+            Box::pin(park_failed_submit(context, job_id, token, &error)).await;
             false
         }
     }
@@ -672,7 +716,7 @@ async fn retry_same_submit(
         .as_ref()
         .map(|net| net.node_id())
         .ok_or_else(|| BackendError::Unavailable("execution needs a net handle".to_string()))?;
-    let prepared = reload_task(context, spec, record, node_id, bucket)
+    let prepared = Box::pin(reload_task(context, spec, record, node_id, bucket))
         .await
         .map_err(|error| BackendError::Unavailable(error.message))?;
     let pinned_image = record
@@ -704,7 +748,7 @@ async fn retire_failed_submit(
         .tombstone(fence, &TombstoneSpec { terminal_ref: None })
         .await
     else {
-        park_failed_submit(context, job_id, token, error).await;
+        Box::pin(park_failed_submit(context, job_id, token, error)).await;
         return;
     };
     if record_attempt_tombstone(
@@ -719,7 +763,10 @@ async fn retire_failed_submit(
     {
         return;
     }
-    requeue_after_tombstone(context, job_id, token, record, error).await;
+    Box::pin(requeue_after_tombstone(
+        context, job_id, token, record, error,
+    ))
+    .await;
 }
 
 pub(super) async fn requeue_after_tombstone(
@@ -734,7 +781,10 @@ pub(super) async fn requeue_after_tombstone(
     } else {
         JobError::permanent(format!("submit failed: {error}"))
     };
-    requeue_or_fail_pre_submit(context, job_id, token, record, job_error, false).await;
+    Box::pin(requeue_or_fail_pre_submit(
+        context, job_id, token, record, job_error, false,
+    ))
+    .await;
 }
 
 async fn park_failed_submit(
@@ -771,7 +821,7 @@ pub async fn supervise_and_finalize(
         .resources
         .max_walltime_ms
         .unwrap_or(DEFAULT_WALLTIME.as_millis() as u64);
-    let started_at_ms = walltime_anchor(&storage, job_id, token).await;
+    let started_at_ms = Box::pin(walltime_anchor(&storage, job_id, token)).await;
     let walltime_left = Duration::from_millis(
         started_at_ms
             .saturating_add(walltime_ms)
@@ -783,17 +833,26 @@ pub async fn supervise_and_finalize(
             _ = tokio::time::sleep(walltime_left) => None,
         };
         if let Some(result) = result {
-            finalize_attempt(
+            Box::pin(finalize_attempt(
                 &context, job_id, token, &backend, &fence, &spec, &bucket, result,
-            )
+            ))
             .await;
         } else {
-            finalize_walltime(&context, job_id, token, &backend, &fence, &bucket).await;
+            Box::pin(finalize_walltime(
+                &context, job_id, token, &backend, &fence, &bucket,
+            ))
+            .await;
         }
     };
-    if with_execution_heartbeat(storage, job_id, token, cancel.clone(), wait_and_finalize)
-        .await
-        .is_none()
+    if with_execution_heartbeat(
+        storage,
+        job_id,
+        token,
+        cancel.clone(),
+        Box::pin(wait_and_finalize),
+    )
+    .await
+    .is_none()
     {
         info!(job_id = %job_id, "Execution supervisor superseded; abandoning");
     }
@@ -837,7 +896,9 @@ async fn finalize_walltime(
     let _ = transition_to_cancelling(storage, job_id, token, unix_timestamp_millis()).await;
     let logs = match backend.cancel(fence).await {
         Ok(CancelEvidence::Stopped(_)) => {
-            let Some(logs) = capture_or_park(context, job_id, token, backend, fence).await else {
+            let Some(logs) =
+                Box::pin(capture_or_park(context, job_id, token, backend, fence)).await
+            else {
                 return;
             };
             logs
@@ -856,15 +917,15 @@ async fn finalize_walltime(
         }
     };
     let result = execution_result_for(bucket, None, Vec::new(), logs);
-    let record = terminal_fail(
+    let record = Box::pin(terminal_fail(
         storage,
         job_id,
         token,
         JobError::permanent("walltime limit exceeded"),
         result,
-    )
+    ))
     .await;
-    cleanup_and_crate(context, job_id, record).await;
+    Box::pin(cleanup_and_crate(context, job_id, record)).await;
 }
 
 pub(super) async fn with_execution_heartbeat<T>(
@@ -966,75 +1027,102 @@ pub(crate) async fn finalize_attempt(
     }
 
     if cancel_requested {
-        finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
+        Box::pin(finalize_cancel(
+            context, job_id, token, backend, fence, spec, bucket,
+        ))
+        .await;
         return;
     }
 
     match status.phase {
         AttemptPhase::Exited { code: 0 } => {
-            let Some(inventoried) = collect_or_park(context, job_id, token, spec, bucket).await
+            let Some(inventoried) =
+                Box::pin(collect_or_park(context, job_id, token, spec, bucket)).await
             else {
                 return;
             };
-            let Some(captured) =
-                export_or_park(context, job_id, token, backend, fence, spec, bucket).await
+            let Some(captured) = Box::pin(export_or_park(
+                context, job_id, token, backend, fence, spec, bucket,
+            ))
+            .await
             else {
                 return;
             };
-            let Some(outputs) =
-                merge_or_park(context, job_id, token, bucket, inventoried, captured).await
+            let Some(outputs) = Box::pin(merge_or_park(
+                context,
+                job_id,
+                token,
+                bucket,
+                inventoried,
+                captured,
+            ))
+            .await
             else {
                 return;
             };
-            let Some(logs) = capture_or_park(context, job_id, token, backend, fence).await else {
+            let Some(logs) =
+                Box::pin(capture_or_park(context, job_id, token, backend, fence)).await
+            else {
                 return;
             };
             let result = execution_result_for(bucket, Some(0), outputs, logs);
-            match terminal_execution(storage, job_id, token, result).await {
+            match Box::pin(terminal_execution(storage, job_id, token, result)).await {
                 Some(ExecutionCompleteOutcome::Completed(record)) => {
-                    cleanup_and_crate(context, job_id, Some(record)).await;
+                    Box::pin(cleanup_and_crate(context, job_id, Some(record))).await;
                 }
                 Some(ExecutionCompleteOutcome::CancelRequested(_)) => {
-                    finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
+                    Box::pin(finalize_cancel(
+                        context, job_id, token, backend, fence, spec, bucket,
+                    ))
+                    .await;
                 }
                 None => {}
             }
         }
         AttemptPhase::Exited { code } => {
-            let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await else {
+            let Some(outputs) =
+                Box::pin(collect_or_park(context, job_id, token, spec, bucket)).await
+            else {
                 return;
             };
-            let Some(logs) = capture_or_park(context, job_id, token, backend, fence).await else {
+            let Some(logs) =
+                Box::pin(capture_or_park(context, job_id, token, backend, fence)).await
+            else {
                 return;
             };
             let result = execution_result_for(bucket, Some(code), outputs, logs);
-            let record = terminal_fail(
+            let record = Box::pin(terminal_fail(
                 storage,
                 job_id,
                 token,
                 JobError::permanent(format!("container exited with code {code}")),
                 result,
-            )
+            ))
             .await;
-            cleanup_and_crate(context, job_id, record).await;
+            Box::pin(cleanup_and_crate(context, job_id, record)).await;
         }
         AttemptPhase::Failed { reason } => {
-            let Some(logs) = capture_or_park(context, job_id, token, backend, fence).await else {
+            let Some(logs) =
+                Box::pin(capture_or_park(context, job_id, token, backend, fence)).await
+            else {
                 return;
             };
             let result = execution_result_for(bucket, None, Vec::new(), logs);
-            let record = terminal_fail(
+            let record = Box::pin(terminal_fail(
                 storage,
                 job_id,
                 token,
                 JobError::permanent(format!("backend failure: {reason}")),
                 result,
-            )
+            ))
             .await;
-            cleanup_and_crate(context, job_id, record).await;
+            Box::pin(cleanup_and_crate(context, job_id, record)).await;
         }
         AttemptPhase::Cancelled => {
-            finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
+            Box::pin(finalize_cancel(
+                context, job_id, token, backend, fence, spec, bucket,
+            ))
+            .await;
         }
         AttemptPhase::Submitted | AttemptPhase::Running => {
             let _ = mark_indeterminate(
@@ -1064,76 +1152,91 @@ async fn finalize_cancel(
     let evidence = backend.cancel(fence).await;
     match evidence {
         Ok(CancelEvidence::Stopped(status)) => {
-            let Some(logs) = capture_or_park(context, job_id, token, backend, fence).await else {
+            let Some(logs) =
+                Box::pin(capture_or_park(context, job_id, token, backend, fence)).await
+            else {
                 return;
             };
             match status.phase {
                 AttemptPhase::Exited { code: 0 } => {
                     let Some(inventoried) =
-                        collect_or_park(context, job_id, token, spec, bucket).await
+                        Box::pin(collect_or_park(context, job_id, token, spec, bucket)).await
                     else {
                         return;
                     };
-                    let Some(captured) =
-                        export_or_park(context, job_id, token, backend, fence, spec, bucket).await
+                    let Some(captured) = Box::pin(export_or_park(
+                        context, job_id, token, backend, fence, spec, bucket,
+                    ))
+                    .await
                     else {
                         return;
                     };
-                    let Some(outputs) =
-                        merge_or_park(context, job_id, token, bucket, inventoried, captured).await
+                    let Some(outputs) = Box::pin(merge_or_park(
+                        context,
+                        job_id,
+                        token,
+                        bucket,
+                        inventoried,
+                        captured,
+                    ))
+                    .await
                     else {
                         return;
                     };
                     let result = execution_result_for(bucket, Some(0), outputs, logs);
-                    let record = terminal_complete(storage, job_id, token, result).await;
-                    cleanup_and_crate(context, job_id, record).await;
+                    let record = Box::pin(terminal_complete(storage, job_id, token, result)).await;
+                    Box::pin(cleanup_and_crate(context, job_id, record)).await;
                 }
                 AttemptPhase::Exited { code } => {
-                    let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await
+                    let Some(outputs) =
+                        Box::pin(collect_or_park(context, job_id, token, spec, bucket)).await
                     else {
                         return;
                     };
                     let result = execution_result_for(bucket, Some(code), outputs, logs);
-                    let record = terminal_fail(
+                    let record = Box::pin(terminal_fail(
                         storage,
                         job_id,
                         token,
                         JobError::permanent(format!("container exited with code {code}")),
                         result,
-                    )
+                    ))
                     .await;
-                    cleanup_and_crate(context, job_id, record).await;
+                    Box::pin(cleanup_and_crate(context, job_id, record)).await;
                 }
                 AttemptPhase::Failed { reason } => {
                     let result = execution_result_for(bucket, None, Vec::new(), logs);
-                    let record = terminal_fail(
+                    let record = Box::pin(terminal_fail(
                         storage,
                         job_id,
                         token,
                         JobError::permanent(format!("backend failure: {reason}")),
                         result,
-                    )
+                    ))
                     .await;
-                    cleanup_and_crate(context, job_id, record).await;
+                    Box::pin(cleanup_and_crate(context, job_id, record)).await;
                 }
                 AttemptPhase::Cancelled | AttemptPhase::Submitted | AttemptPhase::Running => {
-                    let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await
+                    let Some(outputs) =
+                        Box::pin(collect_or_park(context, job_id, token, spec, bucket)).await
                     else {
                         return;
                     };
                     let result = execution_result_for(bucket, None, outputs, logs);
-                    let record = terminal_cancel(storage, job_id, token, result).await;
-                    cleanup_and_crate(context, job_id, record).await;
+                    let record = Box::pin(terminal_cancel(storage, job_id, token, result)).await;
+                    Box::pin(cleanup_and_crate(context, job_id, record)).await;
                 }
             }
         }
         Ok(CancelEvidence::AlreadyGone) => {
-            let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await else {
+            let Some(outputs) =
+                Box::pin(collect_or_park(context, job_id, token, spec, bucket)).await
+            else {
                 return;
             };
             let result = execution_result_for(bucket, None, outputs, LogTails::default());
-            let record = terminal_cancel(storage, job_id, token, result).await;
-            cleanup_and_crate(context, job_id, record).await;
+            let record = Box::pin(terminal_cancel(storage, job_id, token, result)).await;
+            Box::pin(cleanup_and_crate(context, job_id, record)).await;
         }
         // No definitive stop evidence yet: park in Indeterminate.
         Ok(CancelEvidence::Requested) | Err(_) => {
@@ -1308,8 +1411,15 @@ async fn fail_and_crate(
     error: JobError,
 ) {
     let result = execution_result(record, None, Vec::new());
-    let terminal = terminal_fail(&context.storage_handle, job_id, token, error, result).await;
-    cleanup_and_crate(context, job_id, terminal).await;
+    let terminal = Box::pin(terminal_fail(
+        &context.storage_handle,
+        job_id,
+        token,
+        error,
+        result,
+    ))
+    .await;
+    Box::pin(cleanup_and_crate(context, job_id, terminal)).await;
 }
 
 async fn requeue_or_fail_pre_submit(
@@ -1324,7 +1434,7 @@ async fn requeue_or_fail_pre_submit(
         if !error_logged {
             warn!(job_id = %job_id, error = ?error, "Permanent pre-submit failure");
         }
-        fail_and_crate(context, job_id, token, record, error).await;
+        Box::pin(fail_and_crate(context, job_id, token, record, error)).await;
         return;
     }
     match requeue_before_attempt(
@@ -1337,7 +1447,7 @@ async fn requeue_or_fail_pre_submit(
     .await
     {
         Ok(record) if record.state == aruna_core::structs::JobState::Failed => {
-            cleanup_and_crate(context, job_id, Some(record)).await;
+            Box::pin(cleanup_and_crate(context, job_id, Some(record))).await;
         }
         Ok(_) => {}
         Err(error) => warn!(job_id = %job_id, error = %error, "Pre-submit requeue failed"),
@@ -1354,11 +1464,11 @@ async fn collect_or_park(
     spec: &ExecutionSpec,
     bucket: &str,
 ) -> Option<Vec<OutputObject>> {
-    match collect_outputs(context, spec, bucket).await {
+    match Box::pin(collect_outputs(context, spec, bucket)).await {
         Ok(outputs) => Some(outputs),
         Err(error) if error.kind == aruna_core::structs::JobErrorKind::Permanent => {
             warn!(job_id = %job_id, bucket = %bucket, error = ?error, "Output inventory failed permanently; failing");
-            fail_or_park(context, job_id, token, error).await;
+            Box::pin(fail_or_park(context, job_id, token, error)).await;
             None
         }
         Err(error) => {
@@ -1380,7 +1490,7 @@ async fn collect_or_park(
 /// cannot be read is parked instead, leaving the terminal write to a later pass.
 async fn fail_or_park(context: &DriverContext, job_id: JobId, token: ulid::Ulid, error: JobError) {
     match read_job_record(&context.storage_handle, job_id, None).await {
-        Ok(Some(record)) => fail_and_crate(context, job_id, token, &record, error).await,
+        Ok(Some(record)) => Box::pin(fail_and_crate(context, job_id, token, &record, error)).await,
         _ => {
             let _ = mark_indeterminate(
                 &context.storage_handle,
@@ -1408,7 +1518,7 @@ async fn merge_or_park(
         Ok(outputs) => Some(outputs),
         Err(error) => {
             warn!(job_id = %job_id, bucket = %bucket, error = ?error, "Output manifest merge failed permanently; failing");
-            fail_or_park(context, job_id, token, error).await;
+            Box::pin(fail_or_park(context, job_id, token, error)).await;
             None
         }
     }
@@ -1444,11 +1554,22 @@ async fn export_or_park(
     let Some(node_id) = context.net_handle.as_ref().map(|net| net.node_id()) else {
         let error = JobError::permanent("output capture needs a net handle");
         let result = execution_result_for(bucket, Some(0), Vec::new(), LogTails::default());
-        let terminal = terminal_fail(&context.storage_handle, job_id, token, error, result).await;
-        cleanup_and_crate(context, job_id, terminal).await;
+        let terminal = Box::pin(terminal_fail(
+            &context.storage_handle,
+            job_id,
+            token,
+            error,
+            result,
+        ))
+        .await;
+        Box::pin(cleanup_and_crate(context, job_id, terminal)).await;
         return None;
     };
-    match capture_outputs(context, backend, fence, spec, &record, node_id).await {
+    match Box::pin(capture_outputs(
+        context, backend, fence, spec, &record, node_id,
+    ))
+    .await
+    {
         Ok(outputs) => Some(outputs),
         Err(error) if error.kind == aruna_core::structs::JobErrorKind::Retryable => {
             warn!(job_id = %job_id, error = ?error, "Output capture failed; parking");
@@ -1464,9 +1585,15 @@ async fn export_or_park(
         }
         Err(error) => {
             let result = execution_result_for(bucket, Some(0), Vec::new(), LogTails::default());
-            let terminal =
-                terminal_fail(&context.storage_handle, job_id, token, error, result).await;
-            cleanup_and_crate(context, job_id, terminal).await;
+            let terminal = Box::pin(terminal_fail(
+                &context.storage_handle,
+                job_id,
+                token,
+                error,
+                result,
+            ))
+            .await;
+            Box::pin(cleanup_and_crate(context, job_id, terminal)).await;
             None
         }
     }
@@ -1767,8 +1894,14 @@ mod tests {
             "authorization must fail before workspace creation"
         );
 
-        let Err(error) =
-            mint_workspace_credential(&context, &spec, &record, node_id(7), &bucket).await
+        let Err(error) = Box::pin(mint_workspace_credential(
+            &context,
+            &spec,
+            &record,
+            node_id(7),
+            &bucket,
+        ))
+        .await
         else {
             panic!("workspace credential mint unexpectedly succeeded");
         };
@@ -1886,7 +2019,7 @@ mod tests {
         let backend: Arc<dyn ExecutorBackend> = StubBackend::new(StubReconcile::NotFound);
         let mut spec = execution_spec();
         spec.output_prefixes = vec!["poison".to_string()];
-        finalize_attempt(
+        Box::pin(finalize_attempt(
             &ctx,
             job_id,
             token,
@@ -1900,7 +2033,7 @@ mod tests {
                 started_at_ms: Some(1),
                 finished_at_ms: Some(2),
             }),
-        )
+        ))
         .await;
 
         let stored = read_job_record(&storage, job_id, None)
@@ -2091,19 +2224,25 @@ mod tests {
         let job_id = record.job_id;
         assert!(record.started_at_ms.is_none());
 
-        let first = walltime_anchor(&storage, job_id, token).await;
+        let first = Box::pin(walltime_anchor(&storage, job_id, token)).await;
 
         let stored = read_job_record(&storage, job_id, None)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(stored.started_at_ms, Some(first));
-        assert_eq!(walltime_anchor(&storage, job_id, token).await, first);
+        assert_eq!(
+            Box::pin(walltime_anchor(&storage, job_id, token)).await,
+            first
+        );
         // Backend start evidence never moves an anchor that already exists.
         record_attempt_started(&storage, job_id, token, first.saturating_add(60_000))
             .await
             .unwrap();
-        assert_eq!(walltime_anchor(&storage, job_id, token).await, first);
+        assert_eq!(
+            Box::pin(walltime_anchor(&storage, job_id, token)).await,
+            first
+        );
     }
 
     #[tokio::test]

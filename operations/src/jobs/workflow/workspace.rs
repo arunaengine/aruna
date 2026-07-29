@@ -50,7 +50,7 @@ pub async fn ensure_group_write(
     record: &JobRecord,
     node_id: NodeId,
 ) -> Result<(), JobError> {
-    let allowed = drive(
+    let allowed = Box::pin(drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: AuthContext {
                 user_id: record.created_by,
@@ -61,7 +61,7 @@ pub async fn ensure_group_write(
             required_permission: Permission::WRITE,
         }),
         context,
-    )
+    ))
     .await
     .map_err(|error| match error {
         AuthorizationError::InvalidRealmId
@@ -89,17 +89,20 @@ pub async fn ensure_workspace_bucket(
     bucket: &str,
 ) -> Result<(), JobError> {
     if record.workspace_mode == WorkspaceMode::Existing {
-        let info = drive(GetBucketInfoOperation::new(bucket.to_string()), context)
-            .await
-            .and_then(|result| result.transpose())
-            .map_err(|error| bucket_lookup_error("workspace", error))?
-            .ok_or_else(|| JobError::permanent("existing workspace bucket not found"))?;
+        let info = Box::pin(drive(
+            GetBucketInfoOperation::new(bucket.to_string()),
+            context,
+        ))
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(|error| bucket_lookup_error("workspace", error))?
+        .ok_or_else(|| JobError::permanent("existing workspace bucket not found"))?;
         if info.group_id != spec.group_id {
             return Err(JobError::permanent(
                 "existing workspace bucket is outside the execution group",
             ));
         }
-        let allowed = drive(
+        let allowed = Box::pin(drive(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
                 auth_context: AuthContext {
                     user_id: record.created_by,
@@ -115,7 +118,7 @@ pub async fn ensure_workspace_bucket(
                 required_permission: Permission::WRITE,
             }),
             context,
-        )
+        ))
         .await
         .map_err(|error| authorization_error("workspace", error))?;
         return if allowed {
@@ -131,10 +134,10 @@ pub async fn ensure_workspace_bucket(
         cors_configuration: None,
         replication: None,
     };
-    match drive(
+    match Box::pin(drive(
         CreateBucketOperation::new(bucket.to_string(), bucket_info),
         context,
-    )
+    ))
     .await
     {
         Ok(_) => Ok(()),
@@ -210,7 +213,12 @@ async fn mint_credential(
     let access_key = UserAccess::build_access_key(&key_id).map_err(|error| {
         JobError::permanent(format!("workspace credential key failed: {error}"))
     })?;
-    match drive(GetUserAccessOperation::new(access_key.clone()), context).await {
+    match Box::pin(drive(
+        GetUserAccessOperation::new(access_key.clone()),
+        context,
+    ))
+    .await
+    {
         Ok(Some(Ok(access))) => {
             let matches_job = access.access_key == access_key
                 && access.user_identity == record.created_by
@@ -245,7 +253,7 @@ async fn mint_credential(
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_WALLTIME);
     let expiry = SystemTime::now() + walltime + CREDENTIAL_SLACK;
-    let (_, access) = drive(
+    let (_, access) = Box::pin(drive(
         CreateUserAccessOperation::new_with_key(
             CreateUserAccessConfig {
                 user_identity: record.created_by,
@@ -257,7 +265,7 @@ async fn mint_credential(
             key_id,
         ),
         context,
-    )
+    ))
     .await
     .map_err(|error| JobError::retryable(format!("workspace credential mint failed: {error}")))?
     .map_err(|error| JobError::retryable(format!("workspace credential mint failed: {error}")))?;
@@ -295,7 +303,7 @@ pub async fn prepare_mounts(
             .container_path
             .clone()
             .ok_or_else(|| JobError::permanent("mounted input has no container path"))?;
-        let bucket_info = drive(GetBucketInfoOperation::new(bucket.clone()), context)
+        let bucket_info = Box::pin(drive(GetBucketInfoOperation::new(bucket.clone()), context))
             .await
             .and_then(|result| result.transpose())
             .map_err(|error| bucket_lookup_error("input", error))?
@@ -305,7 +313,7 @@ pub async fn prepare_mounts(
                 "input bucket is outside the execution group",
             ));
         }
-        let allowed = drive(
+        let allowed = Box::pin(drive(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
                 auth_context: AuthContext {
                     user_id: record.created_by,
@@ -322,7 +330,7 @@ pub async fn prepare_mounts(
                 required_permission: Permission::READ,
             }),
             context,
-        )
+        ))
         .await
         .map_err(|error| authorization_error("input", error))?;
         if !allowed {
@@ -330,14 +338,14 @@ pub async fn prepare_mounts(
                 "input {bucket}/{key} access denied"
             )));
         }
-        match drive(
+        match Box::pin(drive(
             HeadObjectOperation::new(HeadObjectInput {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: None,
             }),
             context,
-        )
+        ))
         .await
         .and_then(|result| result.transpose())
         {
@@ -375,7 +383,10 @@ pub async fn stage_inputs(
     node_id: NodeId,
 ) -> Result<(), JobError> {
     for input in &spec.inputs {
-        stage_one_input(context, spec, record, bucket, node_id, input).await?;
+        Box::pin(stage_one_input(
+            context, spec, record, bucket, node_id, input,
+        ))
+        .await?;
     }
     Ok(())
 }
@@ -394,7 +405,7 @@ pub async fn load_inputs(
         let Some(path) = input.container_path.clone() else {
             continue;
         };
-        let get = drive(
+        let get = Box::pin(drive(
             GetObjectOperation::new(GetObjectInput {
                 bucket: bucket.to_string(),
                 key: input.dest_key.clone(),
@@ -404,7 +415,7 @@ pub async fn load_inputs(
                 user_identity: record.created_by,
             }),
             context,
-        )
+        ))
         .await
         .and_then(|result| result.transpose())
         .map_err(staged_input_error)?
@@ -448,7 +459,10 @@ pub async fn capture_outputs(
     for declared in &spec.file_outputs {
         for output in resolve_output(backend, fence, declared).await? {
             outputs.push(
-                put_file_output(context, backend, fence, spec, record, node_id, &output).await?,
+                Box::pin(put_file_output(
+                    context, backend, fence, spec, record, node_id, &output,
+                ))
+                .await?,
             );
         }
     }
@@ -533,7 +547,7 @@ async fn put_file_output(
     output: &OutputSelection,
 ) -> Result<OutputObject, JobError> {
     let OutputDestination::S3 { bucket, key } = &output.destination;
-    let bucket_info = drive(GetBucketInfoOperation::new(bucket.clone()), context)
+    let bucket_info = Box::pin(drive(GetBucketInfoOperation::new(bucket.clone()), context))
         .await
         .and_then(|result| result.transpose())
         .map_err(|error| bucket_lookup_error("output", error))?
@@ -543,7 +557,7 @@ async fn put_file_output(
             "output bucket is outside the execution group",
         ));
     }
-    let allowed = drive(
+    let allowed = Box::pin(drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: AuthContext {
                 user_id: record.created_by,
@@ -560,7 +574,7 @@ async fn put_file_output(
             required_permission: Permission::WRITE,
         }),
         context,
-    )
+    ))
     .await
     .map_err(|error| authorization_error("output", error))?;
     if !allowed {
@@ -569,14 +583,14 @@ async fn put_file_output(
         )));
     }
 
-    let existing = match drive(
+    let existing = match Box::pin(drive(
         HeadObjectOperation::new(HeadObjectInput {
             bucket: bucket.clone(),
             key: key.clone(),
             version_id: None,
         }),
         context,
-    )
+    ))
     .await
     .and_then(|result| result.transpose())
     {
@@ -601,10 +615,10 @@ async fn put_file_output(
         }
     }
 
-    let realm_config = drive(
+    let realm_config = Box::pin(drive(
         GetRealmConfigOperation::new(record.created_by.realm_id),
         context,
-    )
+    ))
     .await
     .map_err(|error| JobError::retryable(format!("output quota lookup failed: {error}")))?;
     let quota_ceiling = realm_config.quota.effective_group_ceiling(&spec.group_id);
@@ -632,7 +646,7 @@ async fn put_file_output(
             Err(std::io::Error::other(error))
         }
     }));
-    drive(
+    Box::pin(drive(
         PutObjectOperation::new(PutObjectConfig {
             user_id: record.created_by,
             group_id: spec.group_id,
@@ -652,7 +666,7 @@ async fn put_file_output(
             quota_ceiling,
         }),
         context,
-    )
+    ))
     .await
     .and_then(|result| result.transpose())
     // A failure caused by the container-side stream keeps its own
@@ -738,12 +752,15 @@ async fn stage_one_input(
                 "invalid input version_id for {src_bucket}/{src_key}"
             ))
         })?;
-    let bucket_info = drive(GetBucketInfoOperation::new(src_bucket.clone()), context)
-        .await
-        .and_then(|result| result.transpose())
-        .map_err(|error| bucket_lookup_error("input", error))?
-        .ok_or_else(|| JobError::permanent(format!("input bucket {src_bucket} not found")))?;
-    let allowed = drive(
+    let bucket_info = Box::pin(drive(
+        GetBucketInfoOperation::new(src_bucket.clone()),
+        context,
+    ))
+    .await
+    .and_then(|result| result.transpose())
+    .map_err(|error| bucket_lookup_error("input", error))?
+    .ok_or_else(|| JobError::permanent(format!("input bucket {src_bucket} not found")))?;
+    let allowed = Box::pin(drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: AuthContext {
                 user_id: record.created_by,
@@ -760,7 +777,7 @@ async fn stage_one_input(
             required_permission: Permission::READ,
         }),
         context,
-    )
+    ))
     .await
     .map_err(|error| authorization_error("input", error))?;
     if !allowed {
@@ -768,7 +785,7 @@ async fn stage_one_input(
             "input {src_bucket}/{src_key} access denied"
         )));
     }
-    let get = drive(
+    let get = Box::pin(drive(
         GetObjectOperation::new(GetObjectInput {
             bucket: src_bucket.clone(),
             key: src_key.clone(),
@@ -778,20 +795,20 @@ async fn stage_one_input(
             user_identity: record.created_by,
         }),
         context,
-    )
+    ))
     .await
     .and_then(|result| result.transpose())
     .map_err(source_input_error)?
     .ok_or_else(|| JobError::permanent(format!("input {src_bucket}/{src_key} not found")))?;
 
-    let destination = match drive(
+    let destination = match Box::pin(drive(
         HeadObjectOperation::new(HeadObjectInput {
             bucket: bucket.to_string(),
             key: input.dest_key.clone(),
             version_id: None,
         }),
         context,
-    )
+    ))
     .await
     .and_then(|result| result.transpose())
     {
@@ -816,14 +833,14 @@ async fn stage_one_input(
     }
 
     let content_length = get.location.as_ref().map(|location| location.blob_size);
-    let realm_config = drive(
+    let realm_config = Box::pin(drive(
         GetRealmConfigOperation::new(record.created_by.realm_id),
         context,
-    )
+    ))
     .await
     .map_err(|error| JobError::retryable(format!("quota lookup failed: {error}")))?;
     let quota_ceiling = realm_config.quota.effective_group_ceiling(&spec.group_id);
-    drive(
+    Box::pin(drive(
         PutObjectOperation::new(PutObjectConfig {
             user_id: record.created_by,
             group_id: spec.group_id,
@@ -843,7 +860,7 @@ async fn stage_one_input(
             quota_ceiling,
         }),
         context,
-    )
+    ))
     .await
     .and_then(|result| result.transpose())
     .map_err(|error| put_object_error("input stage", error))?;
@@ -942,7 +959,7 @@ pub async fn collect_outputs(
     for prefix in &spec.output_prefixes {
         let mut continuation = None;
         loop {
-            let result = drive(
+            let result = Box::pin(drive(
                 ListObjectsV2Operation::new(ListObjectsV2Input {
                     bucket: bucket.to_string(),
                     group_id: spec.group_id,
@@ -953,7 +970,7 @@ pub async fn collect_outputs(
                     start_after: None,
                 }),
                 context,
-            )
+            ))
             .await
             .and_then(|result| result.transpose())
             .map_err(|error| JobError::retryable(format!("output inventory failed: {error}")))?;
@@ -1197,10 +1214,10 @@ mod tests {
         assert_eq!(second.access_key, first.access_key);
         assert_eq!(second.secret, first.secret);
 
-        let access = drive(
+        let access = Box::pin(drive(
             GetUserAccessOperation::new(first.access_key.clone()),
             &context,
-        )
+        ))
         .await
         .unwrap()
         .unwrap()

@@ -71,7 +71,7 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
     let event = match effect {
         Effect::Blob(blob_effect) => {
             if let Some(blob_handle) = &context.blob_handle {
-                blob_handle.send_blob_effect(blob_effect).await
+                Box::pin(blob_handle.send_blob_effect(blob_effect)).await
             } else {
                 Event::Blob(BlobEvent::Error(BlobError::HandleMissing))
             }
@@ -84,9 +84,7 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
                 ))
                 .await
             } else if let Some(blob_handle) = &context.blob_handle {
-                blob_handle
-                    .send_staging_source_effect(staging_source_effect)
-                    .await
+                Box::pin(blob_handle.send_staging_source_effect(staging_source_effect)).await
             } else {
                 Event::StagingSource(aruna_core::events::StagingSourceEvent::Error {
                     error: aruna_core::errors::StagingSourceError::HandleMissing,
@@ -105,17 +103,15 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
             };
             let refresh_after_commit =
                 matches!(&storage_effect, StorageEffect::CommitTransaction { .. });
-            let event = context
-                .storage_handle
-                .send_storage_effect(storage_effect)
-                .await;
+            let event = Box::pin(context.storage_handle.send_storage_effect(storage_effect)).await;
             if let Some(net_handle) = context.net_handle.as_ref() {
                 match (&event, realm_config_write) {
                     (
                         Event::Storage(aruna_core::events::StorageEvent::WriteResult { .. }),
                         Some(bytes),
                     ) => {
-                        if let Err(error) = net_handle.refresh_realm_peers_from_bytes(&bytes).await
+                        if let Err(error) =
+                            Box::pin(net_handle.refresh_realm_peers_from_bytes(&bytes)).await
                         {
                             warn!(error = %error, "Failed to refresh realm peers from written realm config");
                         }
@@ -126,7 +122,7 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
                         }),
                         _,
                     ) if refresh_after_commit => {
-                        if let Err(error) = net_handle.reload_realm_peers().await {
+                        if let Err(error) = Box::pin(net_handle.reload_realm_peers()).await {
                             warn!(error = %error, "Failed to refresh realm peers after storage commit");
                         }
                     }
@@ -137,7 +133,7 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
         }
         Effect::Net(net_effect) => {
             if let Some(net_handle) = &context.net_handle {
-                net_handle.send_effect(Effect::Net(net_effect)).await
+                Box::pin(net_handle.send_effect(Effect::Net(net_effect))).await
             } else {
                 match net_effect {
                     aruna_core::effects::NetEffect::DocumentSync(
@@ -156,9 +152,7 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
         }
         Effect::Metadata(metadata_effect) => {
             if let Some(metadata_handle) = &context.metadata_handle {
-                metadata_handle
-                    .send_effect(Effect::Metadata(metadata_effect))
-                    .await
+                Box::pin(metadata_handle.send_effect(Effect::Metadata(metadata_effect))).await
             } else {
                 Event::Metadata(MetadataEvent::Error {
                     graph_iri: None,
@@ -188,7 +182,7 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
                 });
             }
             if let Some(task_handle) = &context.task_handle {
-                task_handle.send_effect(Effect::Task(task_effect)).await
+                Box::pin(task_handle.send_effect(Effect::Task(task_effect))).await
             } else {
                 Event::Task(TaskEvent::Error {
                     key: None,
@@ -307,7 +301,7 @@ pub async fn drive<O: Operation>(
 
     while !operation.is_complete() {
         while let Some(effect) = queue.pop_front() {
-            let event = dispatch_effect(effect, context, 0).await;
+            let event = Box::pin(dispatch_effect(effect, context, 0)).await;
             queue.extend(operation.step(event));
         }
 

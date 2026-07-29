@@ -1136,7 +1136,7 @@ impl ExecutorBackend for KubernetesBackend {
         validate_output(&job, path)?;
         self.save_logs(context).await?;
         self.delete_tasks(context).await?;
-        self.fetch_archive(context, path).await
+        Box::pin(self.fetch_archive(context, path)).await
     }
 
     async fn list_outputs(
@@ -1157,8 +1157,7 @@ impl ExecutorBackend for KubernetesBackend {
         // until they are reaped.
         self.save_logs(context).await?;
         self.delete_tasks(context).await?;
-        self.list_archive(context, &prefix.to_string_lossy(), &glob)
-            .await
+        Box::pin(self.list_archive(context, &prefix.to_string_lossy(), &glob)).await
     }
 
     async fn reconcile(&self, context: &FenceContext) -> ReconcileEvidence {

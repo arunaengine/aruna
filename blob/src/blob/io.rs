@@ -24,8 +24,7 @@ impl BlobHandler {
         operator: Operator,
         blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
-        self.write_stream_limit(location, operator, blob, None)
-            .await
+        Box::pin(self.write_stream_limit(location, operator, blob, None)).await
     }
 
     async fn write_stream_limit(
@@ -168,7 +167,7 @@ impl BlobHandler {
         blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
         // Reserved before the write so a stats failure never orphans bytes.
-        let backend_bucket = match self.reserve_bucket().await {
+        let backend_bucket = match Box::pin(self.reserve_bucket()).await {
             Ok(bucket) => bucket,
             Err(err) => return BlobEvent::Error(err),
         };
@@ -247,8 +246,7 @@ impl BlobHandler {
             Ok(op) => op,
             Err(err) => return BlobEvent::Error(err),
         };
-        self.write_stream_to_location(location, operator, blob)
-            .await
+        Box::pin(self.write_stream_to_location(location, operator, blob)).await
     }
 
     pub async fn compose_blob(
@@ -259,7 +257,7 @@ impl BlobHandler {
         parts: Vec<BackendLocation>,
     ) -> BlobEvent {
         // Reserved before the compose so a stats failure never orphans bytes.
-        let backend_bucket = match self.reserve_bucket().await {
+        let backend_bucket = match Box::pin(self.reserve_bucket()).await {
             Ok(bucket) => bucket,
             Err(err) => return BlobEvent::Error(err),
         };

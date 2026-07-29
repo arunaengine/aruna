@@ -103,7 +103,7 @@ impl BlobHandler {
     // a written object and concurrent writers cannot overshoot max_bucket_size.
     pub(super) async fn reserve_bucket(&self) -> Result<String, BlobError> {
         let Some(max_bucket_size) = self.backend_config.max_bucket_size else {
-            let bucket = self.eval_backend_bucket().await?;
+            let bucket = Box::pin(self.eval_backend_bucket()).await?;
             self.increment_bucket_load(&bucket).await?;
             return Ok(bucket);
         };
@@ -114,7 +114,7 @@ impl BlobHandler {
 
         let mut full = Vec::new();
         for _ in 0..BUCKET_RESERVE_ROUNDS {
-            let bucket = self.select_backend_bucket(&full).await?;
+            let bucket = Box::pin(self.select_backend_bucket(&full)).await?;
             if self.try_reserve_slot(&bucket, max_bucket_size).await? {
                 return Ok(bucket);
             }

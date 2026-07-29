@@ -121,7 +121,7 @@ impl ExternalReconciler for ComputeReconciler {
                 job_id,
                 token,
                 CancellationToken::new(),
-                finalize_cancel(
+                Box::pin(finalize_cancel(
                     &self.context,
                     job_id,
                     token,
@@ -129,7 +129,7 @@ impl ExternalReconciler for ComputeReconciler {
                     &fence,
                     &spec,
                     &bucket,
-                ),
+                )),
             )
             .await;
             return;
@@ -170,7 +170,7 @@ impl ExternalReconciler for ComputeReconciler {
                     job_id,
                     token,
                     CancellationToken::new(),
-                    finalize_cancel(
+                    Box::pin(finalize_cancel(
                         &self.context,
                         job_id,
                         token,
@@ -178,7 +178,7 @@ impl ExternalReconciler for ComputeReconciler {
                         &fence,
                         &spec,
                         &bucket,
-                    ),
+                    )),
                 )
                 .await;
                 return;
@@ -218,7 +218,7 @@ impl ExternalReconciler for ComputeReconciler {
                     job_id,
                     token,
                     CancellationToken::new(),
-                    finalize_attempt(
+                    Box::pin(finalize_attempt(
                         &self.context,
                         job_id,
                         token,
@@ -227,7 +227,7 @@ impl ExternalReconciler for ComputeReconciler {
                         &spec,
                         &bucket,
                         Ok(status),
-                    ),
+                    )),
                 )
                 .await;
                 if finalized.is_none() {
@@ -371,7 +371,9 @@ pub(super) async fn resume_attempt(
             job_id,
             token,
             cancel,
-            finalize_cancel(&context, job_id, token, &backend, &fence, &spec, &bucket),
+            Box::pin(finalize_cancel(
+                &context, job_id, token, &backend, &fence, &spec, &bucket,
+            )),
         )
         .await;
         return;
@@ -382,25 +384,26 @@ pub(super) async fn resume_attempt(
             job_id,
             token,
             cancel.clone(),
-            async {
+            Box::pin(async {
                 let Some(node_id) = context.net_handle.as_ref().map(|net| net.node_id()) else {
-                    fail_or_park(
+                    Box::pin(fail_or_park(
                         &context,
                         job_id,
                         token,
                         &record,
                         JobError::permanent("execution needs a net handle"),
-                    )
+                    ))
                     .await;
                     return false;
                 };
-                let prepared = match reload_task(&context, &spec, &record, node_id, &bucket).await {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        fail_or_park(&context, job_id, token, &record, error).await;
-                        return false;
-                    }
-                };
+                let prepared =
+                    match Box::pin(reload_task(&context, &spec, &record, node_id, &bucket)).await {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            Box::pin(fail_or_park(&context, job_id, token, &record, error)).await;
+                            return false;
+                        }
+                    };
                 let Some(pinned_image) = record
                     .attempt_intent
                     .as_ref()
@@ -427,8 +430,10 @@ pub(super) async fn resume_attempt(
                 let status = match backend.submit(&fence, &task_spec, &cancel).await {
                     Ok(status) => status,
                     Err(aruna_core::compute::BackendError::Cancelled) => {
-                        finalize_cancel(&context, job_id, token, &backend, &fence, &spec, &bucket)
-                            .await;
+                        Box::pin(finalize_cancel(
+                            &context, job_id, token, &backend, &fence, &spec, &bucket,
+                        ))
+                        .await;
                         return false;
                     }
                     Err(error) => {
@@ -437,7 +442,7 @@ pub(super) async fn resume_attempt(
                         } else {
                             JobError::permanent(format!("resubmit failed: {error}"))
                         };
-                        fail_or_park(&context, job_id, token, &record, error).await;
+                        Box::pin(fail_or_park(&context, job_id, token, &record, error)).await;
                         return false;
                     }
                 };
@@ -461,19 +466,24 @@ pub(super) async fn resume_attempt(
                     Err(_) => return false,
                 };
                 if running.cancel_requested {
-                    finalize_cancel(&context, job_id, token, &backend, &fence, &spec, &bucket)
-                        .await;
+                    Box::pin(finalize_cancel(
+                        &context, job_id, token, &backend, &fence, &spec, &bucket,
+                    ))
+                    .await;
                     return false;
                 }
                 true
-            },
+            }),
         )
         .await;
         if resumed != Some(true) {
             return;
         }
     }
-    supervise_and_finalize(context, job_id, token, backend, fence, spec, bucket, cancel).await;
+    Box::pin(supervise_and_finalize(
+        context, job_id, token, backend, fence, spec, bucket, cancel,
+    ))
+    .await;
 }
 
 async fn fail_or_park(

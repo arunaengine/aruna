@@ -275,7 +275,7 @@ impl BlobHandler {
                 key,
                 created_by,
                 blob,
-            } => self.write_blob(&bucket, &key, created_by, blob).await,
+            } => Box::pin(self.write_blob(&bucket, &key, created_by, blob)).await,
             BlobEffect::WritePart {
                 upload_id,
                 part_number,
@@ -284,14 +284,14 @@ impl BlobHandler {
                 encrypted,
                 blob,
             } => {
-                self.write_blob_part(
+                Box::pin(self.write_blob_part(
                     upload_id,
                     part_number,
                     created_by,
                     compressed,
                     encrypted,
                     blob,
-                )
+                ))
                 .await
             }
             BlobEffect::Compose {
@@ -299,12 +299,12 @@ impl BlobHandler {
                 key,
                 created_by,
                 parts,
-            } => self.compose_blob(&bucket, &key, created_by, parts).await,
-            BlobEffect::Read { location } => self.read_blob(location).await,
+            } => Box::pin(self.compose_blob(&bucket, &key, created_by, parts)).await,
+            BlobEffect::Read { location } => Box::pin(self.read_blob(location)).await,
             BlobEffect::ReadRange { location, range } => {
-                self.read_blob_range(location, range).await
+                Box::pin(self.read_blob_range(location, range)).await
             }
-            BlobEffect::Delete { location } => self.delete_blob(location).await,
+            BlobEffect::Delete { location } => Box::pin(self.delete_blob(location)).await,
             BlobEffect::SpoolHidden {
                 namespace,
                 name,
@@ -312,15 +312,17 @@ impl BlobHandler {
                 max_bytes,
                 blob,
             } => {
-                self.spool_hidden_blob(namespace, &name, created_by, max_bytes, blob)
+                Box::pin(self.spool_hidden_blob(namespace, &name, created_by, max_bytes, blob))
                     .await
             }
             BlobEffect::ReadHiddenRange { location, range } => {
-                self.read_hidden_range(location, range).await
+                Box::pin(self.read_hidden_range(location, range)).await
             }
-            BlobEffect::DeleteHidden { key } => self.delete_hidden_blob(key).await,
-            BlobEffect::ListHidden { namespace } => self.list_hidden_blobs(namespace).await,
-            BlobEffect::OpenConnection { node_id } => self.open_connection(node_id).await,
+            BlobEffect::DeleteHidden { key } => Box::pin(self.delete_hidden_blob(key)).await,
+            BlobEffect::ListHidden { namespace } => {
+                Box::pin(self.list_hidden_blobs(namespace)).await
+            }
+            BlobEffect::OpenConnection { node_id } => Box::pin(self.open_connection(node_id)).await,
             BlobEffect::SendMessage { stream_id, payload } => {
                 self.send_message(stream_id, payload).await
             }
@@ -332,27 +334,26 @@ impl BlobHandler {
                 location,
                 keep_alive,
             } => {
-                self.replicate_blob(replication_id, stream_id, location, keep_alive)
-                    .await
+                Box::pin(self.replicate_blob(replication_id, stream_id, location, keep_alive)).await
             }
             BlobEffect::HandleReplication {
                 replication_id,
                 stream_id,
                 keep_alive,
             } => {
-                self.handle_incoming_replication(replication_id, stream_id, keep_alive)
+                Box::pin(self.handle_incoming_replication(replication_id, stream_id, keep_alive))
                     .await
             }
             BlobEffect::ServeRead {
                 stream_id,
                 location,
                 expected_blake3,
-            } => self.serve_read(stream_id, location, expected_blake3).await,
+            } => Box::pin(self.serve_read(stream_id, location, expected_blake3)).await,
             BlobEffect::ReceiveRead {
                 stream_id,
                 size,
                 expected_blake3,
-            } => self.receive_read(stream_id, size, expected_blake3).await,
+            } => Box::pin(self.receive_read(stream_id, size, expected_blake3)).await,
         }
     }
 
