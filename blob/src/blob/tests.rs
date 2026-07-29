@@ -1,6 +1,6 @@
 use super::backend::{build_backend_path, rebuild_backend_path};
 use super::{
-    BlobHandle, BlobHandler, ControlPlaneTimeoutKind,
+    BackendRegistry, BlobHandle, BlobHandler, ControlPlaneTimeoutKind, NodeBackend,
     control_plane::control_plane_timeout_event,
     control_plane::{
         parse_replication_init, validate_replication_init_ack, with_control_plane_timeout,
@@ -10,13 +10,16 @@ use crate::messages::{MessageType, ReplicationMessage};
 use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{BlobEffect, StagingSourceEffect, StorageEffect};
+use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB, HASH_PATHS_INDEX_KEYSPACE};
 use aruna_core::stream::BackendStream;
+use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::{
-    Backend, BackendConfig, BackendLocation, BackendRef, BlobTimeoutConfig, HiddenBlobKey, RealmId,
-    ResolvedSourceAccess, SourceConnectorKind,
+    Backend, BackendConfig, BackendLocation, BackendRef, BlobTimeoutConfig, HiddenBlobKey,
+    MultipartUploadPartKey, RealmId, ResolvedBackend, ResolvedSourceAccess, SourceConnectorKind,
+    Status,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::storage;
@@ -192,11 +195,18 @@ fn stream_from_bytes(
     )))
 }
 
-async fn bucket_load(storage_handle: &storage::StorageHandle, bucket: &str) -> u64 {
+async fn bucket_load(
+    storage_handle: &storage::StorageHandle,
+    backend: &BackendRef,
+    bucket: &str,
+) -> u64 {
+    let mut key = backend.key_bytes();
+    key.push(0);
+    key.extend_from_slice(bucket.as_bytes());
     let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: BUCKET_STATS_DB.to_string(),
-            key: bucket.as_bytes().to_vec().into(),
+            key: key.into(),
             txn_id: None,
         })
         .await
@@ -246,6 +256,198 @@ fn make_test_location() -> BackendLocation {
         blob_size: 32,
         hashes: HashMap::new(),
     }
+}
+
+fn filesystem_backend(root: &str, prefix: &str, parts: &str) -> BackendConfig {
+    std::fs::create_dir_all(root).unwrap();
+    BackendConfig {
+        backend_type: Backend::FileSystem,
+        root: root.to_string(),
+        service_config: HashMap::new(),
+        bucket_prefix: Some(prefix.to_string()),
+        max_bucket_size: Some(4),
+        multipart_bucket: Some(parts.to_string()),
+        timeouts: Default::default(),
+    }
+}
+
+// Two filesystem backends with distinct roots are the multi-backend fixture:
+// deterministic, hermetic, and enough to prove registry dispatch.
+async fn setup_two_backends() -> TestContext {
+    let temp_dir = tempdir().unwrap();
+    let temp_root = temp_dir.path().to_str().unwrap().to_string();
+    let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
+    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+        .await
+        .unwrap();
+    let mut backends = std::collections::BTreeMap::new();
+    backends.insert(
+        "default".to_string(),
+        NodeBackend::new(
+            filesystem_backend(&format!("{temp_root}/hot"), "hot-", "hot-parts"),
+            None,
+        ),
+    );
+    backends.insert(
+        "cold".to_string(),
+        NodeBackend::new(
+            filesystem_backend(&format!("{temp_root}/cold"), "cold-", "cold-parts"),
+            Some("cold".to_string()),
+        ),
+    );
+    let registry = BackendRegistry::new(backends, "default".to_string()).unwrap();
+    let blob_handle = BlobHandler::with_registry(
+        registry,
+        storage_handle.clone(),
+        net_handle,
+        EgressPolicy::loopback(),
+    )
+    .await
+    .unwrap();
+
+    TestContext {
+        _temp_dir: temp_dir,
+        blob_handle,
+        storage_handle,
+    }
+}
+
+fn cold_backend() -> ResolvedBackend {
+    ResolvedBackend::new(
+        BackendRef::Node("cold".to_string()),
+        Some("cold".to_string()),
+    )
+}
+
+#[tokio::test]
+async fn write_lands_on_backend() {
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+
+    let BlobEvent::WriteFinished { location } = handler
+        .write_blob(
+            "bucket",
+            "cold.bin",
+            cold_backend(),
+            test_user_id(),
+            stream_from_bytes(b"cold"),
+        )
+        .await
+    else {
+        panic!("cold write failed")
+    };
+
+    assert_eq!(location.backend, BackendRef::Node("cold".to_string()));
+    assert_eq!(location.storage_class.as_deref(), Some("cold"));
+    assert!(location.storage_bucket.starts_with("cold-"));
+    assert!(std::path::Path::new(&location.get_full_path().unwrap()).exists());
+    assert!(matches!(
+        handler.read_blob(location).await,
+        BlobEvent::ReadFinished { .. }
+    ));
+}
+
+#[tokio::test]
+async fn stats_keys_qualify() {
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+
+    let BlobEvent::WriteFinished { location: hot } = handler
+        .write_blob(
+            "bucket",
+            "hot.bin",
+            handler.registry.default_resolved(),
+            test_user_id(),
+            stream_from_bytes(b"hot"),
+        )
+        .await
+    else {
+        panic!("hot write failed")
+    };
+    let BlobEvent::WriteFinished { location: cold } = handler
+        .write_blob(
+            "bucket",
+            "cold.bin",
+            cold_backend(),
+            test_user_id(),
+            stream_from_bytes(b"cold"),
+        )
+        .await
+    else {
+        panic!("cold write failed")
+    };
+
+    assert_ne!(hot.storage_bucket, cold.storage_bucket);
+    assert_eq!(
+        bucket_load(&context.storage_handle, &hot.backend, &hot.storage_bucket).await,
+        1
+    );
+    assert_eq!(
+        bucket_load(&context.storage_handle, &cold.backend, &cold.storage_bucket).await,
+        1
+    );
+    // The other backend's qualifier must not see the same bucket name.
+    assert_eq!(
+        bucket_load(&context.storage_handle, &cold.backend, &hot.storage_bucket).await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn read_rejects_unknown() {
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+
+    let mut location = make_test_location();
+    location.backend = BackendRef::Node("removed".to_string());
+    location
+        .hashes
+        .insert(HASH_BLAKE3.to_string(), vec![0u8; 32]);
+
+    assert!(matches!(
+        handler.read_blob(location.clone()).await,
+        BlobEvent::Error(BlobError::UnknownBackend(_))
+    ));
+    assert!(matches!(
+        handler.delete_blob(location).await,
+        BlobEvent::Error(BlobError::UnknownBackend(_))
+    ));
+}
+
+#[tokio::test]
+async fn backends_track_health() {
+    let context = setup_two_backends().await;
+    let registry = context.blob_handle.handler.registry.clone();
+
+    assert_eq!(registry.entries().count(), 2);
+    for (_, backend) in registry.entries() {
+        assert_eq!(*backend.status.read().await, Status::Available);
+    }
+    assert_eq!(registry.catalog().class_of("cold"), Some("cold"));
+    assert!(registry.catalog().class_of("default").is_none());
+}
+
+#[tokio::test]
+async fn parts_use_pinned_area() {
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+
+    let BlobEvent::WriteFinished { location } = handler
+        .write_blob_part(
+            MultipartUploadPartKey::new(Ulid::generate(), 1),
+            cold_backend(),
+            test_user_id(),
+            false,
+            false,
+            stream_from_bytes(b"part"),
+        )
+        .await
+    else {
+        panic!("part write failed")
+    };
+
+    assert_eq!(location.backend, BackendRef::Node("cold".to_string()));
+    assert_eq!(location.storage_bucket, "cold-parts");
 }
 
 #[test]
@@ -443,7 +645,12 @@ async fn reuses_bucket_until_max_object_count_is_reached() {
     assert_eq!(first.storage_bucket, second.storage_bucket);
     assert!(first.storage_bucket.starts_with("aruna-test-"));
     assert_eq!(
-        bucket_load(&context.storage_handle, &first.storage_bucket).await,
+        bucket_load(
+            &context.storage_handle,
+            &BackendRef::node_default(),
+            &first.storage_bucket
+        )
+        .await,
         2
     );
 }
@@ -503,11 +710,21 @@ async fn creates_new_bucket_after_reaching_max_object_count() {
 
     assert_ne!(first.storage_bucket, second.storage_bucket);
     assert_eq!(
-        bucket_load(&context.storage_handle, &first.storage_bucket).await,
+        bucket_load(
+            &context.storage_handle,
+            &BackendRef::node_default(),
+            &first.storage_bucket
+        )
+        .await,
         1
     );
     assert_eq!(
-        bucket_load(&context.storage_handle, &second.storage_bucket).await,
+        bucket_load(
+            &context.storage_handle,
+            &BackendRef::node_default(),
+            &second.storage_bucket
+        )
+        .await,
         1
     );
 }
@@ -540,7 +757,12 @@ async fn deleting_last_object_keeps_bucket_stat_row_at_zero_for_reuse() {
     };
 
     assert_eq!(
-        bucket_load(&context.storage_handle, &first.storage_bucket).await,
+        bucket_load(
+            &context.storage_handle,
+            &BackendRef::node_default(),
+            &first.storage_bucket
+        )
+        .await,
         0
     );
 
@@ -559,7 +781,12 @@ async fn deleting_last_object_keeps_bucket_stat_row_at_zero_for_reuse() {
 
     assert_eq!(first.storage_bucket, second.storage_bucket);
     assert_eq!(
-        bucket_load(&context.storage_handle, &first.storage_bucket).await,
+        bucket_load(
+            &context.storage_handle,
+            &BackendRef::node_default(),
+            &first.storage_bucket
+        )
+        .await,
         1
     );
 }
@@ -585,7 +812,12 @@ async fn multipart_part_bucket_is_excluded_from_bucket_stats() {
 
     assert_eq!(location.storage_bucket, "uploaded-parts");
     assert_eq!(
-        bucket_load(&context.storage_handle, "uploaded-parts").await,
+        bucket_load(
+            &context.storage_handle,
+            &BackendRef::node_default(),
+            "uploaded-parts"
+        )
+        .await,
         0
     );
 }
@@ -896,7 +1128,12 @@ async fn tracks_concurrent_loads() {
             Event::Blob(BlobEvent::WriteFinished { .. })
         ));
     }
-    let load = bucket_load(&context.storage_handle, &location.storage_bucket).await;
+    let load = bucket_load(
+        &context.storage_handle,
+        &BackendRef::node_default(),
+        &location.storage_bucket,
+    )
+    .await;
     assert_eq!(load, 1 + writers as u64);
 }
 
@@ -1023,7 +1260,12 @@ async fn write_finalization_failure_emits_no_success_or_load() {
         "close failure must surface as an error, got {event:?}"
     );
     assert_eq!(
-        bucket_load(&context.storage_handle, &location.storage_bucket).await,
+        bucket_load(
+            &context.storage_handle,
+            &BackendRef::node_default(),
+            &location.storage_bucket
+        )
+        .await,
         0
     );
     assert_eq!(aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -1123,7 +1365,12 @@ async fn compose_close_fails() {
         "compose close failure must surface as an error, got {event:?}"
     );
     assert_eq!(
-        bucket_load(&context.storage_handle, &target.storage_bucket).await,
+        bucket_load(
+            &context.storage_handle,
+            &BackendRef::node_default(),
+            &target.storage_bucket
+        )
+        .await,
         0
     );
     assert_eq!(aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -1275,6 +1522,14 @@ async fn reservation_forces_rollover() {
     buckets.dedup();
     assert_eq!(buckets.len(), writers);
     for bucket in buckets {
-        assert_eq!(bucket_load(&context.storage_handle, &bucket).await, 1);
+        assert_eq!(
+            bucket_load(
+                &context.storage_handle,
+                &BackendRef::node_default(),
+                &bucket
+            )
+            .await,
+            1
+        );
     }
 }

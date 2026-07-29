@@ -159,14 +159,14 @@ pub(super) fn parse_replication_init(
 
 impl BlobHandler {
     pub(super) fn control_plane_connect_timeout(&self) -> Duration {
-        self.backend_config.timeouts.control_plane_connect_timeout
+        self.registry.timeouts().control_plane_connect_timeout
     }
 
     pub(super) fn control_plane_io_timeout(&self) -> Duration {
-        self.backend_config.timeouts.control_plane_io_timeout
+        self.registry.timeouts().control_plane_io_timeout
     }
 
     pub(super) fn transfer_idle_timeout(&self) -> Duration {
-        self.backend_config.timeouts.transfer_idle_timeout
+        self.registry.timeouts().transfer_idle_timeout
     }
 }

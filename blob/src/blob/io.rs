@@ -1,13 +1,14 @@
 use super::BlobHandler;
 use super::backend::{build_backend_path, build_hidden_path, build_multipart_part_path};
 use crate::hash::Hasher;
-use crate::opendal::{abort_partial_writer, init_backend_operator};
+use crate::opendal::abort_partial_writer;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::BackendStream;
 use aruna_core::stream::StreamError;
 use aruna_core::structs::{
-    BackendLocation, BackendRef, HIDDEN_BLOB_PREFIX, HiddenBlobEntry, HiddenBlobKey,
+    BackendLocation, HIDDEN_BLOB_PREFIX, HiddenBlobEntry, HiddenBlobKey, MultipartUploadPartKey,
+    ResolvedBackend,
 };
 use aruna_core::types::UserId;
 use bytes::Bytes;
@@ -93,7 +94,13 @@ impl BlobHandler {
         max_bytes: Option<u64>,
         blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
-        let backend_bucket = match self.eval_backend_bucket().await {
+        // Hidden blobs are job spool, never routed: they always use the default.
+        let resolved = self.registry.default_resolved();
+        let root = match self.registry.config_for(&resolved.backend) {
+            Ok(config) => config.root.clone(),
+            Err(err) => return BlobEvent::Error(err),
+        };
+        let backend_bucket = match self.eval_backend_bucket(&resolved.backend).await {
             Ok(bucket) => bucket,
             Err(err) => return BlobEvent::Error(err),
         };
@@ -103,9 +110,9 @@ impl BlobHandler {
             Err(err) => return BlobEvent::Error(BlobError::ConversionError(err)),
         };
         let location = BackendLocation {
-            backend: BackendRef::node_default(),
-            storage_class: None,
-            root: self.backend_config.root.clone(),
+            backend: resolved.backend.clone(),
+            storage_class: resolved.storage_class.clone(),
+            root,
             storage_bucket: backend_bucket.clone(),
             backend_path,
             ulid,
@@ -118,7 +125,10 @@ impl BlobHandler {
             blob_size: 0,
             hashes: HashMap::new(),
         };
-        let operator = match init_backend_operator(self.backend_config.clone(), backend_bucket) {
+        let operator = match self
+            .registry
+            .bucket_operator(&resolved.backend, &backend_bucket)
+        {
             Ok(operator) => operator,
             Err(err) => return BlobEvent::Error(err),
         };
@@ -141,7 +151,10 @@ impl BlobHandler {
                 "hidden blob hash has an invalid length".to_string(),
             ));
         };
-        if let Err(err) = self.increment_bucket_load(&location.storage_bucket).await {
+        if let Err(err) = self
+            .increment_bucket_load(&location.backend, &location.storage_bucket)
+            .await
+        {
             if let Err(cleanup) = self.discard_hidden(&location).await {
                 return BlobEvent::Error(cleanup);
             }
@@ -167,11 +180,16 @@ impl BlobHandler {
         &self,
         request_bucket: &str,
         request_key: &str,
+        resolved: ResolvedBackend,
         created_by: UserId,
         blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
+        let root = match self.registry.config_for(&resolved.backend) {
+            Ok(config) => config.root.clone(),
+            Err(err) => return BlobEvent::Error(err),
+        };
         // Reserved before the write so a stats failure never orphans bytes.
-        let backend_bucket = match Box::pin(self.reserve_bucket()).await {
+        let backend_bucket = match Box::pin(self.reserve_bucket(&resolved.backend)).await {
             Ok(bucket) => bucket,
             Err(err) => return BlobEvent::Error(err),
         };
@@ -179,14 +197,15 @@ impl BlobHandler {
         let backend_path = match build_backend_path(request_bucket, request_key, ulid) {
             Ok(path) => path,
             Err(err) => {
-                self.release_bucket(&backend_bucket).await;
+                self.release_bucket(&resolved.backend, &backend_bucket)
+                    .await;
                 return BlobEvent::Error(BlobError::ConversionError(err));
             }
         };
         let location = BackendLocation {
-            backend: BackendRef::node_default(),
-            storage_class: None,
-            root: self.backend_config.root.clone(),
+            backend: resolved.backend.clone(),
+            storage_class: resolved.storage_class.clone(),
+            root,
             storage_bucket: backend_bucket.clone(),
             backend_path,
             ulid,
@@ -200,21 +219,25 @@ impl BlobHandler {
             hashes: HashMap::new(),
         };
 
-        let operator =
-            match init_backend_operator(self.backend_config.clone(), backend_bucket.clone()) {
-                Ok(op) => op,
-                Err(err) => {
-                    self.release_bucket(&backend_bucket).await;
-                    return BlobEvent::Error(err);
-                }
-            };
+        let operator = match self
+            .registry
+            .bucket_operator(&resolved.backend, &backend_bucket)
+        {
+            Ok(op) => op,
+            Err(err) => {
+                self.release_bucket(&resolved.backend, &backend_bucket)
+                    .await;
+                return BlobEvent::Error(err);
+            }
+        };
         match self
             .write_stream_to_location(location, operator, blob)
             .await
         {
             BlobEvent::WriteFinished { location } => BlobEvent::WriteFinished { location },
             other => {
-                self.release_bucket(&backend_bucket).await;
+                self.release_bucket(&resolved.backend, &backend_bucket)
+                    .await;
                 other
             }
         }
@@ -222,24 +245,28 @@ impl BlobHandler {
 
     pub async fn write_blob_part(
         &self,
-        upload_id: Ulid,
-        part_number: u16,
+        part: MultipartUploadPartKey,
+        resolved: ResolvedBackend,
         created_by: UserId,
         compressed: bool,
         encrypted: bool,
         blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
-        let multipart_bucket = match self.multipart_bucket() {
-            Ok(bucket) => bucket.to_string(),
+        let root = match self.registry.config_for(&resolved.backend) {
+            Ok(config) => config.root.clone(),
+            Err(err) => return BlobEvent::Error(err),
+        };
+        let multipart_bucket = match self.multipart_bucket(&resolved.backend) {
+            Ok(bucket) => bucket,
             Err(err) => return BlobEvent::Error(err),
         };
         let ulid = Ulid::generate();
         let location = BackendLocation {
-            backend: BackendRef::node_default(),
-            storage_class: None,
-            root: self.backend_config.root.clone(),
+            backend: resolved.backend.clone(),
+            storage_class: resolved.storage_class.clone(),
+            root,
             storage_bucket: multipart_bucket.clone(),
-            backend_path: build_multipart_part_path(upload_id, part_number, ulid),
+            backend_path: build_multipart_part_path(part.upload_id, part.part_number, ulid),
             ulid,
             compressed,
             encrypted,
@@ -250,7 +277,10 @@ impl BlobHandler {
             blob_size: 0,
             hashes: HashMap::new(),
         };
-        let operator = match init_backend_operator(self.backend_config.clone(), multipart_bucket) {
+        let operator = match self
+            .registry
+            .bucket_operator(&resolved.backend, &multipart_bucket)
+        {
             Ok(op) => op,
             Err(err) => return BlobEvent::Error(err),
         };
@@ -261,11 +291,16 @@ impl BlobHandler {
         &self,
         request_bucket: &str,
         request_key: &str,
+        resolved: ResolvedBackend,
         created_by: UserId,
         parts: Vec<BackendLocation>,
     ) -> BlobEvent {
+        let root = match self.registry.config_for(&resolved.backend) {
+            Ok(config) => config.root.clone(),
+            Err(err) => return BlobEvent::Error(err),
+        };
         // Reserved before the compose so a stats failure never orphans bytes.
-        let backend_bucket = match Box::pin(self.reserve_bucket()).await {
+        let backend_bucket = match Box::pin(self.reserve_bucket(&resolved.backend)).await {
             Ok(bucket) => bucket,
             Err(err) => return BlobEvent::Error(err),
         };
@@ -273,14 +308,15 @@ impl BlobHandler {
         let backend_path = match build_backend_path(request_bucket, request_key, ulid) {
             Ok(path) => path,
             Err(err) => {
-                self.release_bucket(&backend_bucket).await;
+                self.release_bucket(&resolved.backend, &backend_bucket)
+                    .await;
                 return BlobEvent::Error(BlobError::ConversionError(err));
             }
         };
         let location = BackendLocation {
-            backend: BackendRef::node_default(),
-            storage_class: None,
-            root: self.backend_config.root.clone(),
+            backend: resolved.backend.clone(),
+            storage_class: resolved.storage_class.clone(),
+            root,
             storage_bucket: backend_bucket.clone(),
             backend_path,
             ulid,
@@ -293,21 +329,25 @@ impl BlobHandler {
             blob_size: 0,
             hashes: HashMap::new(),
         };
-        let operator =
-            match init_backend_operator(self.backend_config.clone(), backend_bucket.clone()) {
-                Ok(op) => op,
-                Err(err) => {
-                    self.release_bucket(&backend_bucket).await;
-                    return BlobEvent::Error(err);
-                }
-            };
+        let operator = match self
+            .registry
+            .bucket_operator(&resolved.backend, &backend_bucket)
+        {
+            Ok(op) => op,
+            Err(err) => {
+                self.release_bucket(&resolved.backend, &backend_bucket)
+                    .await;
+                return BlobEvent::Error(err);
+            }
+        };
         match self
             .compose_parts_to_location(location, operator, parts)
             .await
         {
             BlobEvent::WriteFinished { location } => BlobEvent::WriteFinished { location },
             other => {
-                self.release_bucket(&backend_bucket).await;
+                self.release_bucket(&resolved.backend, &backend_bucket)
+                    .await;
                 other
             }
         }
@@ -394,9 +434,7 @@ impl BlobHandler {
 
         let operator = match self.operator_from_location(&location) {
             Ok(op) => op,
-            Err(err) => {
-                return BlobEvent::Error(BlobError::OperatorCreationFailed(err.to_string()));
-            }
+            Err(err) => return BlobEvent::Error(err),
         };
 
         let storage_path = match location.get_storage_path() {
@@ -455,9 +493,7 @@ impl BlobHandler {
     ) -> BlobEvent {
         let operator = match self.operator_from_location(&location) {
             Ok(op) => op,
-            Err(err) => {
-                return BlobEvent::Error(BlobError::OperatorCreationFailed(err.to_string()));
-            }
+            Err(err) => return BlobEvent::Error(err),
         };
 
         let storage_path = match location.get_storage_path() {
@@ -517,22 +553,29 @@ impl BlobHandler {
         if let Err(error) = operator.delete(&storage_path).await {
             return BlobEvent::Error(BlobError::DeleteError(error.to_string()));
         }
-        if let Err(error) = self.decrement_bucket_load(&key.storage_bucket).await {
+        if let Err(error) = self
+            .decrement_bucket_load(&key.backend, &key.storage_bucket)
+            .await
+        {
             return BlobEvent::Error(error);
         }
         BlobEvent::HiddenDeleted
     }
 
     pub async fn list_hidden_blobs(&self, namespace: Option<Ulid>) -> BlobEvent {
-        let buckets = match self.hidden_buckets().await {
+        let backend = self.registry.default_ref();
+        let root = match self.registry.config_for(&backend) {
+            Ok(config) => config.root.clone(),
+            Err(error) => return BlobEvent::Error(error),
+        };
+        let buckets = match self.hidden_buckets(&backend).await {
             Ok(buckets) => buckets,
             Err(error) => return BlobEvent::Error(error),
         };
         let prefix = hidden_prefix(namespace);
         let mut entries = Vec::new();
         for bucket in buckets {
-            let operator = match init_backend_operator(self.backend_config.clone(), bucket.clone())
-            {
+            let operator = match self.registry.bucket_operator(&backend, &bucket) {
                 Ok(operator) => operator,
                 Err(error) => return BlobEvent::Error(error),
             };
@@ -572,8 +615,8 @@ impl BlobHandler {
                     }
                 };
                 let key = match HiddenBlobKey::new(
-                    BackendRef::node_default(),
-                    self.backend_config.root.clone(),
+                    backend.clone(),
+                    root.clone(),
                     bucket.clone(),
                     backend_path,
                 ) {
@@ -598,9 +641,7 @@ impl BlobHandler {
     pub async fn delete_blob(&self, location: BackendLocation) -> BlobEvent {
         let operator = match self.operator_from_location(&location) {
             Ok(op) => op,
-            Err(err) => {
-                return BlobEvent::Error(BlobError::OperatorCreationFailed(err.to_string()));
-            }
+            Err(err) => return BlobEvent::Error(err),
         };
 
         let storage_path = match location.get_storage_path() {
@@ -619,7 +660,10 @@ impl BlobHandler {
         if let Err(e) = operator.delete(&storage_path).await {
             return BlobEvent::Error(BlobError::DeleteError(e.to_string()));
         }
-        if let Err(err) = self.decrement_bucket_load(&location.storage_bucket).await {
+        if let Err(err) = self
+            .decrement_bucket_load(&location.backend, &location.storage_bucket)
+            .await
+        {
             return BlobEvent::Error(err);
         }
         BlobEvent::DeleteFinished

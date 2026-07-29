@@ -46,6 +46,9 @@ pub enum BlobError {
     MakeBucketError(String),
     #[error("Operator creation failed: {0}")]
     OperatorCreationFailed(String),
+    /// A stored record names a backend this node does not have registered.
+    #[error("unknown storage backend {0}")]
+    UnknownBackend(String),
     #[error("Outboard creation failed: {0}")]
     OutboardCreationFailed(String),
     #[error("Failed to open connection: {0}")]

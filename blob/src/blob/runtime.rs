@@ -1,4 +1,4 @@
-use super::{BlobHandle, BlobHandler};
+use super::{BackendRegistry, BlobHandle, BlobHandler};
 use crate::egress::EgressGuard;
 use crate::error::BlobLibError;
 use crate::opendal::init_operator;
@@ -10,7 +10,7 @@ use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{BackendConfig, BlobState, Status};
+use aruna_core::structs::{BackendConfig, BlobState, MultipartUploadPartKey, Status};
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use aruna_storage::storage::StorageHandle;
@@ -22,7 +22,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Duration, Instant, interval, timeout};
 use ulid::Ulid;
 
@@ -224,15 +224,24 @@ impl BlobHandle {
         self.handler.add_connection(None, peer, stream).await
     }
 
+    /// The headline signal stays the default backend's, so existing consumers
+    /// keep one status while the registry tracks each backend separately.
     pub async fn get_status(&self) -> BlobState {
-        let backend_type = self.handler.backend_config.backend_type.clone();
-        let status = *self.handler.operator_status.read().await;
+        let registry = &self.handler.registry;
+        let config = registry.default_config().clone();
+        let status = registry
+            .backend(&registry.default_ref())
+            .map(|backend| backend.status.clone());
+        let status = match status {
+            Ok(status) => *status.read().await,
+            Err(_) => Status::NotConfigured,
+        };
 
         BlobState {
-            backend_type,
-            max_bucket_size: self.handler.backend_config.max_bucket_size,
-            multipart_bucket: self.handler.backend_config.multipart_bucket.clone(),
-            timeouts: self.handler.backend_config.timeouts,
+            backend_type: config.backend_type,
+            max_bucket_size: config.max_bucket_size,
+            multipart_bucket: config.multipart_bucket,
+            timeouts: config.timeouts,
             status,
         }
     }
@@ -257,25 +266,35 @@ impl BlobHandler {
         net: NetHandle,
         policy: EgressPolicy,
     ) -> Result<BlobHandle, BlobLibError> {
+        Self::with_registry(BackendRegistry::single(config), storage, net, policy).await
+    }
+
+    #[allow(clippy::new_ret_no_self)]
+    pub async fn with_registry(
+        registry: BackendRegistry,
+        storage: StorageHandle,
+        net: NetHandle,
+        policy: EgressPolicy,
+    ) -> Result<BlobHandle, BlobLibError> {
         let blob_handler = BlobHandler {
-            backend_config: config,
+            registry,
             egress: EgressGuard::new(policy)?,
             storage,
             net,
             connections: Arc::new(Mutex::new(HashMap::new())),
-            operator_status: Arc::new(RwLock::new(Status::Unavailable)),
             transfer_slots: Arc::new(Semaphore::new(TRANSFER_SLOTS)),
             read_slots: Arc::new(Semaphore::new(READ_SLOTS)),
             spool_slots: Arc::new(Semaphore::new(SPOOL_SLOTS)),
             inflight: Arc::new(AtomicUsize::new(0)),
         };
-        let initial_status = blob_handler.probe_operator_status().await;
-        *blob_handler.operator_status.write().await = initial_status;
+        blob_handler.probe_all_backends().await;
         blob_handler.ensure_multipart_bucket().await?;
-        *blob_handler.operator_status.write().await = Status::Available;
+        for (_, backend) in blob_handler.registry.entries() {
+            *backend.status.write().await = Status::Available;
+        }
         let status_handler = blob_handler.clone();
         tokio::spawn(async move {
-            status_handler.monitor_operator_status().await;
+            status_handler.monitor_backend_status().await;
         });
 
         Ok(BlobHandle::new(blob_handler))
@@ -290,7 +309,10 @@ impl BlobHandler {
                 key,
                 created_by,
                 blob,
-            } => Box::pin(self.write_blob(&bucket, &key, created_by, blob)).await,
+            } => {
+                let resolved = self.registry.default_resolved();
+                Box::pin(self.write_blob(&bucket, &key, resolved, created_by, blob)).await
+            }
             BlobEffect::WritePart {
                 upload_id,
                 part_number,
@@ -299,9 +321,10 @@ impl BlobHandler {
                 encrypted,
                 blob,
             } => {
+                let resolved = self.registry.default_resolved();
                 Box::pin(self.write_blob_part(
-                    upload_id,
-                    part_number,
+                    MultipartUploadPartKey::new(upload_id, part_number),
+                    resolved,
                     created_by,
                     compressed,
                     encrypted,
@@ -314,7 +337,10 @@ impl BlobHandler {
                 key,
                 created_by,
                 parts,
-            } => Box::pin(self.compose_blob(&bucket, &key, created_by, parts)).await,
+            } => {
+                let resolved = self.registry.default_resolved();
+                Box::pin(self.compose_blob(&bucket, &key, resolved, created_by, parts)).await
+            }
             BlobEffect::Read { location } => Box::pin(self.read_blob(location)).await,
             BlobEffect::ReadRange { location, range } => {
                 Box::pin(self.read_blob_range(location, range)).await
@@ -505,13 +531,19 @@ impl BlobHandler {
             })
     }
 
-    async fn monitor_operator_status(&self) {
+    async fn monitor_backend_status(&self) {
         let mut interval = interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
-            let status = self.probe_operator_status().await;
-            *self.operator_status.write().await = status;
+            self.probe_all_backends().await;
             self.report_pressure();
+        }
+    }
+
+    async fn probe_all_backends(&self) {
+        for (_, backend) in self.registry.entries() {
+            let status = self.probe_backend_status(&backend.config).await;
+            *backend.status.write().await = status;
         }
     }
 
@@ -541,16 +573,16 @@ impl BlobHandler {
         }
     }
 
-    async fn probe_operator_status(&self) -> Status {
-        let backend_type = self.backend_config.backend_type.clone();
-        let mut config = self.backend_config.service_config.clone();
-        if !self.backend_config.root.trim().is_empty() {
-            config.insert("root".to_string(), self.backend_config.root.clone());
+    async fn probe_backend_status(&self, backend: &BackendConfig) -> Status {
+        let backend_type = backend.backend_type.clone();
+        let mut config = backend.service_config.clone();
+        if !backend.root.trim().is_empty() {
+            config.insert("root".to_string(), backend.root.clone());
         }
         // S3 operators need a bucket; without a pinned one, probe the multipart
         // bucket that startup guarantees.
         if backend_type == aruna_core::structs::Backend::S3 && !config.contains_key("bucket") {
-            match self.backend_config.multipart_bucket.as_deref() {
+            match backend.multipart_bucket.as_deref() {
                 Some(bucket) => {
                     config.insert("bucket".to_string(), bucket.to_string());
                 }
@@ -572,8 +604,8 @@ impl BlobHandler {
     }
 
     fn handler_probe_timeout(&self) -> Duration {
-        self.backend_config
-            .timeouts
+        self.registry
+            .timeouts()
             .control_plane_io_timeout
             .min(Duration::from_secs(5))
     }

@@ -1,6 +1,5 @@
 use super::BlobHandler;
 use crate::error::BlobLibError;
-use crate::opendal::init_operator;
 use crate::s3::make_bucket;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
@@ -8,7 +7,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::BUCKET_STATS_DB;
 use aruna_core::structs::{
-    Backend, BackendBucket, BackendLocation, HIDDEN_BLOB_PREFIX, HiddenBlobKey,
+    Backend, BackendBucket, BackendLocation, BackendRef, HIDDEN_BLOB_PREFIX, HiddenBlobKey,
     ensure_confined_relative_path,
 };
 use aruna_core::types::TxnId;
@@ -43,43 +42,53 @@ fn conflict_backoff(attempt: u32) -> Duration {
 
 impl BlobHandler {
     pub(super) async fn ensure_multipart_bucket(&self) -> Result<(), BlobLibError> {
-        if self.backend_config.backend_type != Backend::S3 {
-            return Ok(());
+        for (_, backend) in self.registry.entries() {
+            if backend.config.backend_type != Backend::S3 {
+                continue;
+            }
+            let Some(bucket) = backend.config.multipart_bucket.as_deref() else {
+                continue;
+            };
+            make_bucket(bucket, &backend.config.service_config)
+                .await
+                .map_err(|err| BlobLibError::IoError(std::io::Error::other(err.to_string())))?;
         }
-
-        let Some(bucket) = self.backend_config.multipart_bucket.as_deref() else {
-            return Ok(());
-        };
-
-        make_bucket(bucket, &self.backend_config.service_config)
-            .await
-            .map_err(|err| BlobLibError::IoError(std::io::Error::other(err.to_string())))
+        Ok(())
     }
 
-    pub(super) fn multipart_bucket(&self) -> Result<&str, BlobError> {
-        self.backend_config
+    pub(super) fn multipart_bucket(&self, backend: &BackendRef) -> Result<String, BlobError> {
+        self.registry
+            .config_for(backend)?
             .multipart_bucket
-            .as_deref()
+            .clone()
             .ok_or_else(|| {
                 BlobError::OperatorCreationFailed("multipart bucket not configured".to_string())
             })
     }
 
-    pub(super) async fn eval_backend_bucket(&self) -> Result<String, BlobError> {
-        self.select_backend_bucket(&[]).await
+    pub(super) async fn eval_backend_bucket(
+        &self,
+        backend: &BackendRef,
+    ) -> Result<String, BlobError> {
+        self.select_backend_bucket(backend, &[]).await
     }
 
-    async fn select_backend_bucket(&self, skip: &[String]) -> Result<String, BlobError> {
-        if let Some(bucket) = self.backend_config.service_config.get("bucket") {
+    async fn select_backend_bucket(
+        &self,
+        backend: &BackendRef,
+        skip: &[String],
+    ) -> Result<String, BlobError> {
+        let config = self.registry.config_for(backend)?.clone();
+        if let Some(bucket) = config.service_config.get("bucket") {
             return Ok(bucket.clone());
         }
 
         let buckets = self
-            .fetch_bucket_stats()
+            .fetch_bucket_stats(backend)
             .await?
             .into_iter()
             .filter(|bucket| !skip.contains(&bucket.name));
-        if let Some(bucket_max_size) = self.backend_config.max_bucket_size {
+        if let Some(bucket_max_size) = config.max_bucket_size {
             for bucket in buckets {
                 if bucket.load < bucket_max_size {
                     return Ok(bucket.name);
@@ -89,33 +98,37 @@ impl BlobHandler {
             return Ok(bucket.name);
         }
 
-        let bucket_name = generate_bucket_name(self.backend_config.bucket_prefix.as_deref());
+        let bucket_name = generate_bucket_name(config.bucket_prefix.as_deref());
 
-        if Backend::S3 == self.backend_config.backend_type {
-            make_bucket(&bucket_name, &self.backend_config.service_config).await?;
+        if Backend::S3 == config.backend_type {
+            make_bucket(&bucket_name, &config.service_config).await?;
         }
 
-        self.write_bucket_load(&bucket_name, 0).await?;
+        self.write_bucket_load(backend, &bucket_name, 0).await?;
         Ok(bucket_name)
     }
 
     // Reserves one slot before any bytes exist, so a stats failure cannot orphan
     // a written object and concurrent writers cannot overshoot max_bucket_size.
-    pub(super) async fn reserve_bucket(&self) -> Result<String, BlobError> {
-        let Some(max_bucket_size) = self.backend_config.max_bucket_size else {
-            let bucket = Box::pin(self.eval_backend_bucket()).await?;
-            self.increment_bucket_load(&bucket).await?;
+    pub(super) async fn reserve_bucket(&self, backend: &BackendRef) -> Result<String, BlobError> {
+        let config = self.registry.config_for(backend)?.clone();
+        let Some(max_bucket_size) = config.max_bucket_size else {
+            let bucket = Box::pin(self.eval_backend_bucket(backend)).await?;
+            self.increment_bucket_load(backend, &bucket).await?;
             return Ok(bucket);
         };
-        if let Some(bucket) = self.backend_config.service_config.get("bucket") {
-            self.increment_bucket_load(bucket).await?;
+        if let Some(bucket) = config.service_config.get("bucket") {
+            self.increment_bucket_load(backend, bucket).await?;
             return Ok(bucket.clone());
         }
 
         let mut full = Vec::new();
         for _ in 0..BUCKET_RESERVE_ROUNDS {
-            let bucket = Box::pin(self.select_backend_bucket(&full)).await?;
-            if self.try_reserve_slot(&bucket, max_bucket_size).await? {
+            let bucket = Box::pin(self.select_backend_bucket(backend, &full)).await?;
+            if self
+                .try_reserve_slot(backend, &bucket, max_bucket_size)
+                .await?
+            {
                 return Ok(bucket);
             }
             full.push(bucket);
@@ -125,13 +138,19 @@ impl BlobHandler {
         ))
     }
 
-    pub(super) async fn release_bucket(&self, bucket: &str) {
-        if let Err(error) = self.decrement_bucket_load(bucket).await {
-            tracing::warn!(bucket, %error, "failed to release bucket reservation");
+    pub(super) async fn release_bucket(&self, backend: &BackendRef, bucket: &str) {
+        if let Err(error) = self.decrement_bucket_load(backend, bucket).await {
+            tracing::warn!(%backend, bucket, %error, "failed to release bucket reservation");
         }
     }
 
-    pub(super) async fn fetch_bucket_stats(&self) -> Result<Vec<BackendBucket>, BlobError> {
+    pub(super) async fn fetch_bucket_stats(
+        &self,
+        backend: &BackendRef,
+    ) -> Result<Vec<BackendBucket>, BlobError> {
+        let config = self.registry.config_for(backend)?;
+        let prefix = stats_prefix(backend, config.bucket_prefix.as_deref());
+        let qualifier = stats_prefix(backend, None).len();
         let mut buckets = Vec::new();
         let mut start_after = None;
 
@@ -140,11 +159,7 @@ impl BlobHandler {
                 .storage
                 .send_effect(Effect::Storage(StorageEffect::Iter {
                     key_space: BUCKET_STATS_DB.to_string(),
-                    prefix: self
-                        .backend_config
-                        .bucket_prefix
-                        .clone()
-                        .map(|prefix| prefix.into()),
+                    prefix: Some(prefix.clone().into()),
                     start: start_after.clone().map(IterStart::After),
                     limit: 1024,
                     txn_id: None,
@@ -161,12 +176,14 @@ impl BlobHandler {
                 ));
             };
 
-            buckets.extend(
-                values
-                    .into_iter()
-                    .map(BackendBucket::try_from)
-                    .collect::<Result<Vec<BackendBucket>, ConversionError>>()?,
-            );
+            for (key, value) in values {
+                let name =
+                    String::from_utf8(key.as_ref().get(qualifier..).unwrap_or_default().to_vec())
+                        .map_err(ConversionError::from)?;
+                let load =
+                    u64::from_le_bytes(value.as_ref().try_into().map_err(ConversionError::from)?);
+                buckets.push(BackendBucket::from((name, load)));
+            }
 
             if let Some(next_start_after) = next_start_after {
                 start_after = Some(next_start_after);
@@ -178,12 +195,17 @@ impl BlobHandler {
         Ok(buckets)
     }
 
-    pub(super) async fn write_bucket_load(&self, bucket: &str, load: u64) -> Result<(), BlobError> {
+    pub(super) async fn write_bucket_load(
+        &self,
+        backend: &BackendRef,
+        bucket: &str,
+        load: u64,
+    ) -> Result<(), BlobError> {
         let event = self
             .storage
             .send_effect(Effect::Storage(StorageEffect::Write {
                 key_space: BUCKET_STATS_DB.to_string(),
-                key: bucket.as_bytes().to_vec().into(),
+                key: stats_key(backend, bucket).into(),
                 value: load.to_le_bytes().to_vec().into(),
                 txn_id: None,
             }))
@@ -200,23 +222,40 @@ impl BlobHandler {
         }
     }
 
-    pub(super) fn is_stats_managed_bucket(&self, bucket: &str) -> bool {
-        self.backend_config.multipart_bucket.as_deref() != Some(bucket)
+    pub(super) fn stats_managed(&self, backend: &BackendRef, bucket: &str) -> bool {
+        self.registry
+            .config_for(backend)
+            .ok()
+            .and_then(|config| config.multipart_bucket.as_deref())
+            != Some(bucket)
     }
 
-    pub(super) async fn increment_bucket_load(&self, bucket: &str) -> Result<(), BlobError> {
-        self.adjust_bucket_load(bucket, 1).await
+    pub(super) async fn increment_bucket_load(
+        &self,
+        backend: &BackendRef,
+        bucket: &str,
+    ) -> Result<(), BlobError> {
+        self.adjust_bucket_load(backend, bucket, 1).await
     }
 
-    pub(super) async fn decrement_bucket_load(&self, bucket: &str) -> Result<(), BlobError> {
-        self.adjust_bucket_load(bucket, -1).await
+    pub(super) async fn decrement_bucket_load(
+        &self,
+        backend: &BackendRef,
+        bucket: &str,
+    ) -> Result<(), BlobError> {
+        self.adjust_bucket_load(backend, bucket, -1).await
     }
 
     // Lock-free read-modify-write: a storage transaction detects racing
     // updates from concurrent effects and the conflicting side retries.
-    async fn adjust_bucket_load(&self, bucket: &str, delta: i64) -> Result<(), BlobError> {
+    async fn adjust_bucket_load(
+        &self,
+        backend: &BackendRef,
+        bucket: &str,
+        delta: i64,
+    ) -> Result<(), BlobError> {
         matches!(
-            self.retry_load_update(bucket, delta, None).await?,
+            self.retry_load_update(backend, bucket, delta, None).await?,
             LoadUpdate::Applied
         )
         .then_some(())
@@ -226,8 +265,16 @@ impl BlobHandler {
     }
 
     // Increments one slot unless the bucket already sits at its capacity.
-    async fn try_reserve_slot(&self, bucket: &str, capacity: u64) -> Result<bool, BlobError> {
-        match self.retry_load_update(bucket, 1, Some(capacity)).await? {
+    async fn try_reserve_slot(
+        &self,
+        backend: &BackendRef,
+        bucket: &str,
+        capacity: u64,
+    ) -> Result<bool, BlobError> {
+        match self
+            .retry_load_update(backend, bucket, 1, Some(capacity))
+            .await?
+        {
             LoadUpdate::Applied => Ok(true),
             LoadUpdate::Full => Ok(false),
             LoadUpdate::Conflict => Err(BlobError::ReadError(format!(
@@ -238,16 +285,20 @@ impl BlobHandler {
 
     async fn retry_load_update(
         &self,
+        backend: &BackendRef,
         bucket: &str,
         delta: i64,
         capacity: Option<u64>,
     ) -> Result<LoadUpdate, BlobError> {
-        if !self.is_stats_managed_bucket(bucket) {
+        if !self.stats_managed(backend, bucket) {
             return Ok(LoadUpdate::Applied);
         }
 
         for attempt in 0..BUCKET_STATS_RETRIES {
-            match self.try_adjust_load(bucket, delta, capacity).await? {
+            match self
+                .try_adjust_load(backend, bucket, delta, capacity)
+                .await?
+            {
                 LoadUpdate::Conflict => {}
                 outcome => return Ok(outcome),
             }
@@ -260,6 +311,7 @@ impl BlobHandler {
 
     async fn try_adjust_load(
         &self,
+        backend: &BackendRef,
         bucket: &str,
         delta: i64,
         capacity: Option<u64>,
@@ -276,7 +328,7 @@ impl BlobHandler {
             ));
         };
 
-        let load = match self.bucket_load_txn(bucket, txn_id).await {
+        let load = match self.bucket_load_txn(backend, bucket, txn_id).await {
             Ok(load) => load,
             Err(error) => {
                 self.abort_stats_txn(txn_id).await;
@@ -300,7 +352,7 @@ impl BlobHandler {
             .storage
             .send_effect(Effect::Storage(StorageEffect::Write {
                 key_space: BUCKET_STATS_DB.to_string(),
-                key: bucket.as_bytes().to_vec().into(),
+                key: stats_key(backend, bucket).into(),
                 value: adjusted.to_le_bytes().to_vec().into(),
                 txn_id: Some(txn_id),
             }))
@@ -330,12 +382,17 @@ impl BlobHandler {
         }
     }
 
-    async fn bucket_load_txn(&self, bucket: &str, txn_id: TxnId) -> Result<u64, BlobError> {
+    async fn bucket_load_txn(
+        &self,
+        backend: &BackendRef,
+        bucket: &str,
+        txn_id: TxnId,
+    ) -> Result<u64, BlobError> {
         let event = self
             .storage
             .send_effect(Effect::Storage(StorageEffect::Read {
                 key_space: BUCKET_STATS_DB.to_string(),
-                key: bucket.as_bytes().to_vec().into(),
+                key: stats_key(backend, bucket).into(),
                 txn_id: Some(txn_id),
             }))
             .await;
@@ -369,36 +426,51 @@ impl BlobHandler {
         &self,
         location: &BackendLocation,
     ) -> Result<Operator, BlobError> {
-        let mut config = self.backend_config.service_config.clone();
-        config.insert("root".to_string(), location.root.clone());
-        if Backend::S3 == self.backend_config.backend_type {
-            config.insert("bucket".to_string(), location.storage_bucket.clone());
-        }
-
-        init_operator(self.backend_config.backend_type.clone(), config)
+        self.registry
+            .operator_for(&location.backend, &location.root, &location.storage_bucket)
     }
 
     pub(super) fn operator_from_hidden(&self, key: &HiddenBlobKey) -> Result<Operator, BlobError> {
-        let mut config = self.backend_config.service_config.clone();
-        config.insert("root".to_string(), key.root.clone());
-        if Backend::S3 == self.backend_config.backend_type {
-            config.insert("bucket".to_string(), key.storage_bucket.clone());
-        }
-
-        init_operator(self.backend_config.backend_type.clone(), config)
+        self.registry
+            .operator_for(&key.backend, &key.root, &key.storage_bucket)
     }
 
-    pub(super) async fn hidden_buckets(&self) -> Result<Vec<String>, BlobError> {
-        if let Some(bucket) = self.backend_config.service_config.get("bucket") {
+    pub(super) async fn hidden_buckets(
+        &self,
+        backend: &BackendRef,
+    ) -> Result<Vec<String>, BlobError> {
+        if let Some(bucket) = self
+            .registry
+            .config_for(backend)?
+            .service_config
+            .get("bucket")
+        {
             return Ok(vec![bucket.clone()]);
         }
         Ok(self
-            .fetch_bucket_stats()
+            .fetch_bucket_stats(backend)
             .await?
             .into_iter()
             .map(|bucket| bucket.name)
             .collect())
     }
+}
+
+/// Bucket stats are per backend: the key is the backend discriminator, a NUL
+/// separator, then the bucket name.
+fn stats_key(backend: &BackendRef, bucket: &str) -> Vec<u8> {
+    let mut key = stats_prefix(backend, None);
+    key.extend_from_slice(bucket.as_bytes());
+    key
+}
+
+fn stats_prefix(backend: &BackendRef, bucket_prefix: Option<&str>) -> Vec<u8> {
+    let mut prefix = backend.key_bytes();
+    prefix.push(0);
+    if let Some(bucket_prefix) = bucket_prefix {
+        prefix.extend_from_slice(bucket_prefix.as_bytes());
+    }
+    prefix
 }
 
 pub(super) fn generate_bucket_name(prefix: Option<&str>) -> String {

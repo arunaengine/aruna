@@ -1,9 +1,7 @@
 use crate::egress::EgressGuard;
 use aruna_core::errors::{BlobError, StagingSourceError};
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::{
-    Backend, BackendConfig, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata,
-};
+use aruna_core::structs::{Backend, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata};
 use bytes::Bytes;
 use futures::TryStreamExt;
 use opendal::layers::{HttpClientLayer, LoggingLayer, RetryLayer};
@@ -20,25 +18,6 @@ pub(crate) async fn abort_partial_writer(
         if let Err(delete_err) = operator.delete(storage_path).await {
             tracing::warn!(error = %delete_err, "failed to delete partial blob output");
         }
-    }
-}
-
-pub(crate) fn init_backend_operator(
-    mut config: BackendConfig,
-    bucket: String,
-) -> Result<Operator, BlobError> {
-    config
-        .service_config
-        .insert("root".to_string(), config.root);
-
-    match config.backend_type {
-        Backend::S3 => {
-            config.service_config.insert("bucket".to_string(), bucket);
-            build_service::<services::S3>(s3_operator_config(config.service_config), None)
-                .map_err(blob_operator_creation_error)
-        }
-        Backend::FileSystem => build_service::<services::Fs>(config.service_config, None)
-            .map_err(blob_operator_creation_error),
     }
 }
 
