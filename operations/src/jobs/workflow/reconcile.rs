@@ -12,13 +12,12 @@ use tracing::{info, warn};
 use super::super::reconcile::ExternalReconciler;
 use super::super::runtime::JobsRuntime;
 use super::super::store::{
-    AdoptOutcome, adopt_external_attempt, handoff_external_attempt, mark_indeterminate,
-    read_job_record, record_attempt_started, record_attempt_tombstone, release_job,
-    transition_external_to_running,
+    AdoptOutcome, adopt_external_attempt, handoff_external_attempt, read_job_record,
+    record_attempt_started, record_attempt_tombstone, release_job, transition_external_to_running,
 };
 use super::{
     DEFAULT_WALLTIME, build_task_spec, fail_and_crate, finalize_attempt, finalize_cancel,
-    job_bucket, reload_task, requeue_after_tombstone, supervise_and_finalize,
+    job_bucket, park_attempt, reload_task, requeue_after_tombstone, supervise_and_finalize,
     with_execution_heartbeat,
 };
 use crate::driver::DriverContext;
@@ -86,15 +85,14 @@ impl ExternalReconciler for ComputeReconciler {
             .cloned()
         else {
             warn!(job_id = %job_id, kind = %intent.executor_kind, "Reconcile backend unavailable; parking");
-            let _ = mark_indeterminate(
-                storage,
+            park_attempt(
+                &self.context,
                 job_id,
                 token,
                 JobError::retryable(format!(
                     "reconcile backend unavailable: {}",
                     intent.executor_kind
                 )),
-                unix_timestamp_millis(),
             )
             .await;
             return;
@@ -249,12 +247,11 @@ impl ExternalReconciler for ComputeReconciler {
                 .await;
             }
             ReconcileEvidence::Unavailable(error) => {
-                let _ = mark_indeterminate(
-                    storage,
+                park_attempt(
+                    &self.context,
                     job_id,
                     token,
                     JobError::retryable(format!("backend unavailable: {error}")),
-                    unix_timestamp_millis(),
                 )
                 .await;
             }
@@ -262,12 +259,11 @@ impl ExternalReconciler for ComputeReconciler {
                 if artifact.exact_identity {
                     let _ = backend.cancel(&fence).await;
                 }
-                let _ = mark_indeterminate(
-                    storage,
+                park_attempt(
+                    &self.context,
                     job_id,
                     token,
                     JobError::retryable("backend artifact is not adoptable"),
-                    unix_timestamp_millis(),
                 )
                 .await;
             }
@@ -410,13 +406,12 @@ pub(super) async fn resume_attempt(
                     .filter(|intent| intent.attempt_epoch == fence.attempt_epoch)
                     .map(|intent| intent.pinned_image.as_str())
                 else {
-                    let _ = mark_indeterminate(
-                        &context.storage_handle,
+                    Box::pin(park_attempt(
+                        &context,
                         job_id,
                         token,
                         JobError::retryable("attempt intent mismatch"),
-                        unix_timestamp_millis(),
-                    )
+                    ))
                     .await;
                     return false;
                 };
@@ -496,14 +491,7 @@ async fn fail_or_park(
     if error.kind == JobErrorKind::Permanent {
         fail_and_crate(context, job_id, token, record, error).await;
     } else {
-        let _ = mark_indeterminate(
-            &context.storage_handle,
-            job_id,
-            token,
-            error,
-            unix_timestamp_millis(),
-        )
-        .await;
+        park_attempt(context, job_id, token, error).await;
     }
 }
 

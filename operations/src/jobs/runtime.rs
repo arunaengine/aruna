@@ -1699,7 +1699,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(after.state, JobState::Running, "not requeued");
-        assert_eq!(after.attempts, 0);
+        assert_eq!(after.attempts, 1, "the restart still spends an attempt");
         assert!(after.claim.is_some());
         assert_eq!(recorder.seen.lock().unwrap().as_slice(), &[job_id]);
     }

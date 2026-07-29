@@ -978,6 +978,25 @@ pub enum RequeueOutcome {
     Skipped,
 }
 
+/// Terminal `Failed` once `JOB_MAX_ATTEMPTS` is spent. An execution keeps a result
+/// payload so terminal cleanup and the run crate still see its workspace.
+fn fail_capped(record: &mut JobRecord, now_ms: u64) {
+    record.state = JobState::Failed;
+    record.finished_at_ms = Some(now_ms);
+    record.claim = None;
+    if record.result.is_some() || !matches!(record.payload, JobPayload::Execution(_)) {
+        return;
+    }
+    let result = JobResultPayload::Execution {
+        exit_code: None,
+        workspace_bucket: record.workspace_bucket.clone(),
+        outputs: Vec::new(),
+        stdout: String::new(),
+        stderr: String::new(),
+    };
+    record.result = Some(result);
+}
+
 /// Re-queue with backoff, or fail once `JOB_MAX_ATTEMPTS` is spent. `token` is `None`
 /// for the lease sweep and startup recovery. `require_expired_before` makes the sweep
 /// re-check, in-txn, that the job still holds an expired lease: a revived renew is not
@@ -1016,8 +1035,20 @@ pub async fn requeue_job(
         if record.execution_class == JobExecutionClass::ExternalAttempt
             && record.attempt_intent.is_some()
         {
-            needs_reconcile = true;
-            return Ok(JobMutation::Skip);
+            if let Some(error) = error.clone() {
+                record.last_error = Some(error);
+            }
+            // Re-queuing would double-run the container, so the attempt is charged
+            // and routed to reconcile instead. The cap still terminalizes it.
+            record.attempts = record.attempts.saturating_add(1);
+            record.updated_at_ms = now_ms;
+            if record.attempts >= JOB_MAX_ATTEMPTS {
+                fail_capped(record, now_ms);
+            } else {
+                needs_reconcile = true;
+            }
+            persisted = true;
+            return Ok(JobMutation::Persist);
         }
         if let Some(error) = error.clone() {
             record.last_error = Some(error);
@@ -1527,23 +1558,47 @@ pub async fn transition_to_cancelling(
     .await
 }
 
+#[derive(Debug)]
+pub enum ParkOutcome {
+    Parked(JobRecord),
+    /// The park spent the last attempt, so the job is terminal `Failed` instead.
+    Failed(JobRecord),
+}
+
 /// Park an ambiguous external attempt in `Indeterminate`, keeping the claim so the
-/// lease sweep later re-routes it to reconciliation. Exits only on evidence.
+/// lease sweep later re-routes it to reconciliation. Exits only on evidence, or on
+/// the attempt cap: charging an attempt is what stops a condition that parks on
+/// every reconcile pass from retrying forever.
 pub async fn mark_indeterminate(
     storage: &StorageHandle,
     job_id: JobId,
     token: Ulid,
     error: JobError,
     now_ms: u64,
-) -> Result<JobRecord, JobMutationError> {
-    mutate_job(storage, job_id, |record| {
+) -> Result<ParkOutcome, JobMutationError> {
+    let mut capped = false;
+    let record = mutate_job(storage, job_id, |record| {
+        capped = false;
         guard_token(record, token)?;
-        record.state = JobState::Indeterminate;
-        record.updated_at_ms = now_ms;
         record.last_error = Some(error.clone());
+        record.attempts = record.attempts.saturating_add(1);
+        record.updated_at_ms = now_ms;
+        if record.attempts >= JOB_MAX_ATTEMPTS {
+            fail_capped(record, now_ms);
+            capped = true;
+        } else {
+            record.state = JobState::Indeterminate;
+            record.due_at_ms = now_ms.saturating_add(queue_retry_after_ms(record.attempts));
+        }
         Ok(JobMutation::Persist)
     })
-    .await
+    .await?;
+
+    Ok(if capped {
+        ParkOutcome::Failed(record)
+    } else {
+        ParkOutcome::Parked(record)
+    })
 }
 
 /// Terminal `Failed` for an execution job, capturing the exit evidence in the
@@ -3248,7 +3303,8 @@ mod tests {
         );
     }
 
-    // An external attempt with an expired lease is never requeued; it is reconciled.
+    // An external attempt with an expired lease is never requeued; it is reconciled,
+    // but the sweep still charges the attempt so the cap can terminalize it.
     #[tokio::test]
     async fn external_never_requeued() {
         let (_dir, storage) = temp_storage();
@@ -3273,8 +3329,98 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.state, JobState::Running, "not requeued");
-        assert_eq!(stored.attempts, 0, "attempt count untouched");
+        assert_eq!(stored.attempts, 1, "attempt charged");
         assert!(stored.claim.is_some(), "claim untouched");
+    }
+
+    // The reconcile route must not exempt an attempt from the cap: once the last
+    // attempt is spent the sweep terminalizes it instead of routing it again.
+    #[tokio::test]
+    async fn external_sweep_caps() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0xE4; 16]);
+        let mut record = execution_record(job_id, Ulid::generate(), JobState::Running);
+        record.claim.as_mut().unwrap().lease_expires_at_ms = 1;
+        record.attempts = JOB_MAX_ATTEMPTS - 1;
+        record.workspace_bucket = Some("ws-test".to_string());
+        record.attempt_intent = Some(AttemptIntent {
+            attempt_no: 1,
+            external_name: "attempt".to_string(),
+            executor_kind: "docker".to_string(),
+            pinned_image: "alpine@sha256:digest".to_string(),
+            attempt_epoch: 1,
+        });
+        insert_job(&storage, &record).await.unwrap();
+
+        let outcome = requeue_job(&storage, job_id, None, 9_000, Some(9_000), None)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, RequeueOutcome::Failed(_)));
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Failed);
+        assert_eq!(stored.attempts, JOB_MAX_ATTEMPTS);
+        assert!(stored.claim.is_none());
+        assert!(
+            matches!(stored.result, Some(JobResultPayload::Execution { .. })),
+            "cleanup and the run crate need a result"
+        );
+    }
+
+    // Parking spends an attempt and terminalizes at the cap; without that a failure
+    // repeating on every reconcile pass re-drives the job forever.
+    #[tokio::test]
+    async fn park_spends_attempt() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0xE5; 16]);
+        let token = Ulid::generate();
+        let mut record = execution_record(job_id, token, JobState::Running);
+        record.workspace_bucket = Some("ws-test".to_string());
+        insert_job(&storage, &record).await.unwrap();
+
+        for attempt in 1..JOB_MAX_ATTEMPTS {
+            let ParkOutcome::Parked(parked) = mark_indeterminate(
+                &storage,
+                job_id,
+                token,
+                JobError::retryable("output capture failed"),
+                6_000,
+            )
+            .await
+            .unwrap() else {
+                panic!("a park below the cap must stay Indeterminate");
+            };
+            assert_eq!(parked.state, JobState::Indeterminate);
+            assert_eq!(parked.attempts, attempt);
+            assert_eq!(
+                parked.due_at_ms,
+                6_000 + queue_retry_after_ms(attempt),
+                "each park backs the retry off"
+            );
+        }
+
+        let ParkOutcome::Failed(failed) = mark_indeterminate(
+            &storage,
+            job_id,
+            token,
+            JobError::retryable("output capture failed"),
+            7_000,
+        )
+        .await
+        .unwrap() else {
+            panic!("the capped park must terminalize");
+        };
+        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(failed.attempts, JOB_MAX_ATTEMPTS);
+        assert_eq!(failed.finished_at_ms, Some(7_000));
+        assert!(failed.claim.is_none());
+        assert!(
+            matches!(failed.result, Some(JobResultPayload::Execution { .. })),
+            "cleanup and the run crate need a result"
+        );
     }
 
     #[tokio::test]

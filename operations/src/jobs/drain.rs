@@ -572,8 +572,9 @@ mod tests {
     }
 
     // An external attempt with an expired lease routes to the reconcile hook and is
-    // NOT requeued: no second container can be spawned. Its lease row stays in place,
-    // so the re-arm must be floored to a non-zero delay instead of busy-looping.
+    // NOT requeued: no second container can be spawned. It still spends an attempt,
+    // and its lease row stays in place, so the re-arm must be floored to a non-zero
+    // delay instead of busy-looping.
     #[tokio::test]
     async fn external_lease_reconciled() {
         let dir = tempdir().unwrap();
@@ -614,7 +615,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.state, JobState::Running, "not requeued");
-        assert_eq!(stored.attempts, 0);
+        assert_eq!(stored.attempts, 1, "the sweep charges the attempt");
         assert!(stored.claim.is_some());
         // The hook saw exactly this job, proving no blind re-run path was taken.
         assert_eq!(recorder.seen.lock().unwrap().as_slice(), &[job_id]);
