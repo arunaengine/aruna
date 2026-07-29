@@ -20,7 +20,7 @@ use tracing::warn;
 use super::reconcile::ExternalReconciler;
 use super::store::{
     ClaimOutcome, JobMutationError, RequeueOutcome, batch_delete, claim_job, first_schedule_entry,
-    iter_prefix_page, park_unreconciled, read_job_record, requeue_job,
+    iter_prefix_page, read_job_record, requeue_job,
 };
 use super::{JOB_DRAIN_BATCH_SIZE, JOB_RECONCILE_REARM};
 
@@ -108,12 +108,12 @@ pub async fn process_job_queue_batch(
                         )
                         .await
                         {
+                            // A node without a reconciler leaves the attempt for one that
+                            // has it: charging here would terminalize a healthy container
+                            // this node cannot even observe.
                             Ok(RequeueOutcome::NeedsReconcile(record)) => {
-                                match reconciler {
-                                    Some(reconciler) => {
-                                        reconciler.reconcile_lost_attempt(storage, record).await;
-                                    }
-                                    None => park_unreconciled(storage, &record, now_ms).await,
+                                if let Some(reconciler) = reconciler {
+                                    reconciler.reconcile_lost_attempt(storage, record).await;
                                 }
                                 result.reconciled = result.reconciled.saturating_add(1);
                             }

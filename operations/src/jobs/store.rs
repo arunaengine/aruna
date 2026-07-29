@@ -1589,25 +1589,6 @@ pub async fn mark_indeterminate(
     })
 }
 
-/// Park an external attempt this node has no reconciler for. Without the charge its
-/// expired lease would be re-routed by every sweep forever.
-pub async fn park_unreconciled(storage: &StorageHandle, record: &JobRecord, now_ms: u64) {
-    let Some(token) = record.claim.as_ref().map(|claim| claim.claim_token) else {
-        return;
-    };
-    if let Err(error) = mark_indeterminate(
-        storage,
-        record.job_id,
-        token,
-        JobError::retryable("no external reconciler is available"),
-        now_ms,
-    )
-    .await
-    {
-        warn!(job_id = %record.job_id, error = %error, "Unreconciled attempt park failed");
-    }
-}
-
 /// Terminal `Failed` for an execution job, capturing the exit evidence in the
 /// result so a failed run still yields a crate.
 pub async fn fail_execution(

@@ -26,8 +26,8 @@ use super::executor::{JobContext, JobRunOutcome, ProgressReporter, dispatch_payl
 use super::reconcile::ExternalReconciler;
 use super::store::{
     JobMutationError, ReleaseOutcome, RequeueOutcome, cancel_running_job, complete_job, fail_job,
-    flush_progress, handoff_external_attempt, iter_prefix_page, park_unreconciled, read_job_record,
-    release_job, renew_lease, requeue_job, transition_to_running,
+    flush_progress, handoff_external_attempt, iter_prefix_page, read_job_record, release_job,
+    renew_lease, requeue_job, transition_to_running,
 };
 use super::submit::schedule_job_drain_effect;
 use super::{
@@ -535,10 +535,11 @@ impl JobsRuntime {
             )
             .await
             {
-                Ok(RequeueOutcome::NeedsReconcile(record)) => match self.reconciler() {
-                    Some(reconciler) => reconciler.reconcile_lost_attempt(storage, record).await,
-                    None => park_unreconciled(storage, &record, now_ms).await,
-                },
+                Ok(RequeueOutcome::NeedsReconcile(record)) => {
+                    if let Some(reconciler) = self.reconciler() {
+                        reconciler.reconcile_lost_attempt(storage, record).await;
+                    }
+                }
                 Ok(_) => recovered += 1,
                 Err(JobMutationError::NotFound) => {}
                 Err(error) => return Err(error.to_string()),
