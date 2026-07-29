@@ -93,6 +93,7 @@ hyper-util = { version = "0.1.20", features = [
     "tokio",
     "service",
 ] }
+ipnet = "2.12.0"
 iroh = "1.0.3"
 iroh-base = "1.0.3"
 irokle = { git = "https://github.com/arunaengine/irokle.git", branch = "main", features = [

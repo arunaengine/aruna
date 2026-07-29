@@ -373,6 +373,7 @@ dependencies = [
  "getrandom 0.4.3",
  "globset",
  "hex",
+ "ipnet",
  "iroh",
  "irokle",
  "nix",
