@@ -60,10 +60,10 @@ const DEFAULT_WORKSPACE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const MAX_LISTING_BYTES: u64 = 16 * 1024 * 1024;
 /// Bounds the wait for an exec status so a stalled helper cannot hang a capture.
 const EXEC_JOIN_TIMEOUT: Duration = Duration::from_secs(120);
-/// Attach buffer for helper standard output, several times the archive read size.
-/// kube-rs otherwise defaults to 1 KiB, which throttles a transfer to a trickle and
-/// blocks the frame reader that also drives its keepalive ping.
-const EXEC_STDOUT_BUF_BYTES: usize = 512 * 1024;
+/// Attach buffer for the helper standard streams, several times the archive read
+/// size. kube-rs otherwise defaults to 1 KiB, which throttles a transfer to a trickle
+/// and, on the read side, blocks the frame loop that drives its keepalive ping.
+const EXEC_STREAM_BUF_BYTES: usize = 512 * 1024;
 
 #[derive(Clone)]
 pub struct KubernetesBackend {
@@ -486,7 +486,8 @@ impl KubernetesBackend {
             .container("helper")
             .stdin(true)
             .stdout(false)
-            .stderr(false);
+            .stderr(false)
+            .max_stdin_buf_size(EXEC_STREAM_BUF_BYTES);
         let mut attached = self
             .pods()
             .exec(
@@ -732,7 +733,7 @@ impl KubernetesBackend {
             .stdin(false)
             .stdout(true)
             .stderr(false)
-            .max_stdout_buf_size(EXEC_STDOUT_BUF_BYTES);
+            .max_stdout_buf_size(EXEC_STREAM_BUF_BYTES);
         let listed = async {
             let mut attached = self
                 .pods()
@@ -785,7 +786,7 @@ impl KubernetesBackend {
             .stdin(false)
             .stdout(true)
             .stderr(false)
-            .max_stdout_buf_size(EXEC_STDOUT_BUF_BYTES);
+            .max_stdout_buf_size(EXEC_STREAM_BUF_BYTES);
         let mut attached = self
             .pods()
             .exec(
