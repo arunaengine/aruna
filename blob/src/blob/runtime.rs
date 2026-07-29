@@ -10,7 +10,7 @@ use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{BackendConfig, BlobState, MultipartUploadPartKey, Status};
+use aruna_core::structs::{BackendConfig, BackendState, BlobState, MultipartUploadPartKey, Status};
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use aruna_storage::storage::StorageHandle;
@@ -216,6 +216,26 @@ impl BlobHandle {
         Event::StagingSource(staging_source_event)
     }
 
+    /// Node-local routing inputs for callers assembling an operation config.
+    pub fn routing(&self) -> aruna_core::structs::NodeRouting {
+        self.handler.registry.routing()
+    }
+
+    /// Per-backend health for `/info`.
+    pub async fn backend_states(&self) -> Vec<BackendState> {
+        let mut states = Vec::new();
+        for (name, backend) in self.handler.registry.entries() {
+            states.push(BackendState {
+                name: name.clone(),
+                backend_type: backend.config.backend_type.clone(),
+                class: backend.class.clone(),
+                default: name == self.handler.registry.default_name(),
+                status: *backend.status.read().await,
+            });
+        }
+        states
+    }
+
     pub async fn store_connection(
         &self,
         peer: NodeId,
@@ -243,6 +263,7 @@ impl BlobHandle {
             multipart_bucket: config.multipart_bucket,
             timeouts: config.timeouts,
             status,
+            backends: self.backend_states().await,
         }
     }
 }

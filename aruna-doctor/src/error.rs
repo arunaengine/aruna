@@ -62,6 +62,8 @@ pub enum CliError {
     ExplorerError(#[from] ExplorerError),
     #[error(transparent)]
     PortalArtifactError(#[from] PortalArtifactError),
+    #[error("invalid backends file: {0}")]
+    BackendsFile(String),
     #[error("portal config value {0} is required")]
     MissingPortalConfig(&'static str),
     #[error("no prerelease in {repo} contains portal artifact {asset}")]

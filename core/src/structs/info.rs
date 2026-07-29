@@ -93,12 +93,23 @@ pub struct NetState {
     pub warnings: Vec<String>,
 }
 
+/// One registered backend's headline state, reported by `/info`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackendState {
+    pub name: String,
+    pub backend_type: Backend,
+    pub class: Option<String>,
+    pub default: bool,
+    pub status: Status,
+}
+
 pub struct BlobState {
     pub backend_type: Backend,
     pub max_bucket_size: Option<u64>,
     pub multipart_bucket: Option<String>,
     pub timeouts: BlobTimeoutConfig,
     pub status: Status,
+    pub backends: Vec<BackendState>,
 }
 
 pub struct InterfaceState {

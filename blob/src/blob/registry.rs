@@ -2,7 +2,8 @@ use crate::error::BlobLibError;
 use crate::opendal::init_operator;
 use aruna_core::errors::BlobError;
 use aruna_core::structs::{
-    Backend, BackendCatalog, BackendConfig, BackendRef, BlobTimeoutConfig, ResolvedBackend, Status,
+    Backend, BackendCatalog, BackendConfig, BackendRef, BlobTimeoutConfig, NodeBackendsConfig,
+    NodeRouting, NodeRoutingRule, ResolvedBackend, Status,
 };
 use opendal::Operator;
 use std::collections::BTreeMap;
@@ -33,6 +34,8 @@ impl NodeBackend {
 pub struct BackendRegistry {
     node: Arc<BTreeMap<String, NodeBackend>>,
     default_name: String,
+    rules: Arc<[NodeRoutingRule]>,
+    serve_group_backends: bool,
 }
 
 impl BackendRegistry {
@@ -46,7 +49,29 @@ impl BackendRegistry {
         Self {
             node: Arc::new(node),
             default_name: BackendRef::DEFAULT_NODE_NAME.to_string(),
+            rules: Arc::from([]),
+            serve_group_backends: true,
         }
+    }
+
+    /// Builds the registry from the node's parsed backends file.
+    pub fn from_config(config: &NodeBackendsConfig) -> Result<Self, BlobLibError> {
+        let node = config
+            .backends
+            .iter()
+            .map(|entry| {
+                (
+                    entry.name.clone(),
+                    NodeBackend::new(entry.config.clone(), entry.class.clone()),
+                )
+            })
+            .collect();
+        let registry = Self::new(node, config.default_name.clone())?;
+        Ok(Self {
+            rules: Arc::from(config.rules.clone()),
+            serve_group_backends: config.serve_group_backends,
+            ..registry
+        })
     }
 
     pub fn new(
@@ -61,6 +86,8 @@ impl BackendRegistry {
         Ok(Self {
             node: Arc::new(node),
             default_name,
+            rules: Arc::from([]),
+            serve_group_backends: true,
         })
     }
 
@@ -139,9 +166,23 @@ impl BackendRegistry {
     /// Credential-free view handed to operations so they can turn a routing
     /// class into a concrete backend without touching the adapter.
     pub fn catalog(&self) -> BackendCatalog {
-        self.node.iter().fold(
+        let catalog = self.node.iter().fold(
             BackendCatalog::new(self.default_name.clone()),
             |catalog, (name, backend)| catalog.with_backend(name.clone(), backend.class.clone()),
-        )
+        );
+        if self.serve_group_backends {
+            catalog
+        } else {
+            catalog.without_group_egress()
+        }
+    }
+
+    /// The node-wide routing inputs. Operations resolve against this snapshot
+    /// synchronously; the adapter itself never chooses a backend.
+    pub fn routing(&self) -> NodeRouting {
+        NodeRouting {
+            rules: self.rules.to_vec(),
+            catalog: self.catalog(),
+        }
     }
 }

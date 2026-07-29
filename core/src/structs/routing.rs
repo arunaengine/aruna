@@ -184,6 +184,30 @@ impl BackendCatalog {
     }
 }
 
+/// The node-wide half of routing: operator rules plus the backend catalog.
+/// Cloned out of node state per write, never re-read from disk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeRouting {
+    pub rules: Vec<NodeRoutingRule>,
+    pub catalog: BackendCatalog,
+}
+
+impl Default for NodeRouting {
+    fn default() -> Self {
+        Self {
+            rules: Vec::new(),
+            catalog: BackendCatalog::new(BackendRef::DEFAULT_NODE_NAME)
+                .with_backend(BackendRef::DEFAULT_NODE_NAME, None),
+        }
+    }
+}
+
+impl NodeRouting {
+    pub fn snapshot(&self, group_id: GroupId) -> RoutingSnapshot {
+        RoutingSnapshot::new(group_id, self.catalog.clone()).with_node_rules(self.rules.clone())
+    }
+}
+
 /// Everything resolution needs, assembled by the caller before the operation
 /// starts so `start`/`step` stay free of I/O.
 #[derive(Clone, Debug, Eq, PartialEq)]

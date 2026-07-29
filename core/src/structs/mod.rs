@@ -1,3 +1,4 @@
+mod backends;
 mod blob;
 pub mod checksum;
 mod group;
@@ -20,6 +21,7 @@ mod structs;
 mod sync_relationship;
 mod usage;
 
+pub use backends::*;
 pub use blob::*;
 pub use group::*;
 pub use info::*;

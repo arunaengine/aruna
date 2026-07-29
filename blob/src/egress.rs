@@ -34,7 +34,7 @@ fn system_lookup() -> Lookup {
 
 /// Screens a literal host. A name returns `Ok` here and is screened again
 /// against its resolved addresses when the connection is opened.
-fn screen_host(policy: EgressPolicy, host: &str) -> Result<(), EgressError> {
+fn screen_host(policy: &EgressPolicy, host: &str) -> Result<(), EgressError> {
     let host = host.trim_start_matches('[').trim_end_matches(']');
     match host.parse::<IpAddr>() {
         Ok(address) => policy.check(address),
@@ -49,7 +49,7 @@ struct ScreenedResolver {
 
 impl Resolve for ScreenedResolver {
     fn resolve(&self, name: Name) -> Resolving {
-        let policy = self.policy;
+        let policy = self.policy.clone();
         let lookup = self.lookup.clone();
         let host = name.as_str().to_string();
         Box::pin(async move {
@@ -85,7 +85,7 @@ impl HttpFetch for ScreenedFetch {
         request: http::Request<Buffer>,
     ) -> opendal::Result<http::Response<HttpBody>> {
         if let Some(host) = request.uri().host() {
-            screen_host(self.policy, host).map_err(|error| {
+            screen_host(&self.policy, host).map_err(|error| {
                 opendal::Error::new(
                     ErrorKind::PermissionDenied,
                     "egress policy denied the target",
@@ -122,9 +122,9 @@ impl EgressGuard {
 
     fn build(policy: EgressPolicy, lookup: Lookup) -> Result<Self, BlobLibError> {
         Ok(Self {
+            opendal: guarded_client(policy.clone(), lookup.clone(), None)?,
+            plain: guarded_client(policy.clone(), lookup.clone(), Some(REDIRECT_HOPS))?,
             policy,
-            opendal: guarded_client(policy, lookup.clone(), None)?,
-            plain: guarded_client(policy, lookup.clone(), Some(REDIRECT_HOPS))?,
             lookup,
         })
     }
@@ -134,7 +134,7 @@ impl EgressGuard {
     pub fn layer(&self) -> HttpClientLayer {
         HttpClientLayer::new(HttpClient::with(ScreenedFetch {
             client: self.opendal.clone(),
-            policy: self.policy,
+            policy: self.policy.clone(),
         }))
     }
 
@@ -143,7 +143,7 @@ impl EgressGuard {
         let host = url
             .host_str()
             .ok_or_else(|| EgressError::MissingHost(url.to_string()))?;
-        screen_host(self.policy, host)?;
+        screen_host(&self.policy, host)?;
         Ok(self.plain.get(url))
     }
 
@@ -182,6 +182,7 @@ fn guarded_client(
     lookup: Lookup,
     hops: Option<usize>,
 ) -> Result<reqwest::Client, BlobLibError> {
+    let screen_policy = policy.clone();
     let redirect = match hops {
         None => redirect::Policy::none(),
         Some(hops) => redirect::Policy::custom(move |attempt| {
@@ -189,7 +190,7 @@ fn guarded_client(
                 return attempt.stop();
             }
             let verdict = match attempt.url().host_str() {
-                Some(host) => screen_host(policy, host),
+                Some(host) => screen_host(&screen_policy, host),
                 None => Err(EgressError::MissingHost(attempt.url().to_string())),
             };
             match verdict {

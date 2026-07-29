@@ -3,8 +3,9 @@
 //! The deny table is a constant: no realm config, node config, or API input can
 //! remove an entry from it. Every consumer of a tenant endpoint screens here.
 
-use ipnet::{Ipv4Net, Ipv6Net};
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -94,9 +95,10 @@ fn denied(address: IpAddr) -> bool {
 }
 
 /// Decides whether the node may open a connection to an address.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EgressPolicy {
     loopback: bool,
+    extra_deny: Arc<[IpNet]>,
 }
 
 impl Default for EgressPolicy {
@@ -108,18 +110,34 @@ impl Default for EgressPolicy {
 impl EgressPolicy {
     /// Public unicast destinations only. Production wiring uses this and only
     /// this; no configuration surface selects anything weaker.
-    pub const fn strict() -> Self {
-        Self { loopback: false }
+    pub fn strict() -> Self {
+        Self {
+            loopback: false,
+            extra_deny: Arc::from([]),
+        }
     }
 
     /// Additionally permits loopback destinations. Test fixtures pass this
     /// through the same constructor seam production uses.
-    pub const fn loopback() -> Self {
-        Self { loopback: true }
+    pub fn loopback() -> Self {
+        Self {
+            loopback: true,
+            extra_deny: Arc::from([]),
+        }
+    }
+
+    /// Node-local narrowing from the backends file. Denies only add; the
+    /// compiled table below can never be reduced by configuration.
+    pub fn with_deny(mut self, networks: Vec<IpNet>) -> Self {
+        self.extra_deny = Arc::from(networks);
+        self
     }
 
     pub fn check(&self, address: IpAddr) -> Result<(), EgressError> {
         let normalized = normalize(address);
+        if self.extra_deny.iter().any(|net| net.contains(&normalized)) {
+            return Err(EgressError::BlockedAddress(normalized));
+        }
         if self.loopback && (address.is_loopback() || normalized.is_loopback()) {
             return Ok(());
         }
@@ -277,5 +295,25 @@ mod tests {
                 .check(IpAddr::from_str(address).unwrap())
                 .unwrap_err();
         }
+    }
+
+    #[test]
+    fn denies_only_narrow() {
+        // A node-local deny adds rows; it can never open a compiled-in one.
+        let narrowed =
+            EgressPolicy::strict().with_deny(vec![IpNet::from_str("8.8.8.0/24").unwrap()]);
+
+        narrowed
+            .check(IpAddr::from_str("8.8.8.8").unwrap())
+            .unwrap_err();
+        narrowed
+            .check(IpAddr::from_str("9.9.9.9").unwrap())
+            .unwrap();
+
+        let widened =
+            EgressPolicy::loopback().with_deny(vec![IpNet::from_str("127.0.0.0/8").unwrap()]);
+        widened
+            .check(IpAddr::from_str("127.0.0.1").unwrap())
+            .unwrap_err();
     }
 }

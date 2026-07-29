@@ -319,6 +319,65 @@ fn cold_backend() -> ResolvedBackend {
     )
 }
 
+#[test]
+fn registry_reads_config() {
+    // The parsed backends file is the only source of names, classes and rules.
+    let file = aruna_core::structs::BackendsFile::parse(
+        r#"
+[backend.hot]
+type = "filesystem"
+root = "/data/hot"
+default = true
+
+[backend.cold]
+type = "filesystem"
+class = "cold"
+root = "/data/cold"
+
+[[routing]]
+key_prefix = "archive/"
+target = { class = "cold" }
+
+[egress]
+serve_group_backends = false
+"#,
+    )
+    .unwrap();
+    let config = file
+        .resolve(&|_| None, BlobTimeoutConfig::default())
+        .unwrap();
+
+    let registry = BackendRegistry::from_config(&config).unwrap();
+    let routing = registry.routing();
+
+    assert_eq!(registry.default_name(), "hot");
+    assert_eq!(registry.entries().count(), 2);
+    assert_eq!(routing.rules.len(), 1);
+    assert_eq!(routing.catalog.class_of("cold"), Some("cold"));
+    let snapshot = routing.snapshot(Ulid::from_bytes([1u8; 16]));
+    assert_eq!(
+        aruna_core::structs::resolve_backend(&snapshot, "bucket", "archive/one").unwrap(),
+        ResolvedBackend::new(
+            BackendRef::Node("cold".to_string()),
+            Some("cold".to_string())
+        )
+    );
+    assert_eq!(
+        aruna_core::structs::resolve_backend(&snapshot, "bucket", "other").unwrap(),
+        ResolvedBackend::new(BackendRef::Node("hot".to_string()), None)
+    );
+    assert_eq!(
+        aruna_core::structs::resolve_backend(
+            &snapshot.with_group_default(Some(aruna_core::structs::RoutingTarget::Backend(
+                BackendRef::Group(Ulid::from_bytes([2u8; 16]))
+            ))),
+            "bucket",
+            "other"
+        ),
+        Err(aruna_core::structs::RoutingError::GroupEgressDisabled)
+    );
+}
+
 #[tokio::test]
 async fn write_lands_on_backend() {
     let context = setup_two_backends().await;

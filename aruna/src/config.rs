@@ -11,9 +11,9 @@ use aruna_core::onboarding::{
     bootstrap_node_proof_message,
 };
 use aruna_core::structs::{
-    Backend, BlobTimeoutConfig, DynamicDiscoveryMethod, KIND_LABEL_KEY, NodeCapabilities,
-    OidcProviderConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
-    RoCrateLimits,
+    Backend, BackendConfig, BackendsFile, BlobTimeoutConfig, DynamicDiscoveryMethod,
+    KIND_LABEL_KEY, NodeBackendsConfig, NodeCapabilities, OidcProviderConfig, RealmConfigDocument,
+    RealmDiscoveryConfig, RealmId, RelayPolicy, RoCrateLimits,
 };
 use aruna_core::util::unix_timestamp_secs;
 use aruna_net::{
@@ -56,8 +56,7 @@ pub struct Config {
     pub fjall_persist_policy: FjallPersistPolicy,
     pub document_sync_storage_path: PathBuf,
     pub blob_root: String,
-    pub blob_backend: Backend,
-    pub blob_service_config: HashMap<String, String>,
+    pub blob_backends: NodeBackendsConfig,
     pub blob_bucket_prefix: Option<String>,
     pub blob_max_bucket_size: Option<u64>,
     pub blob_multipart_bucket: Option<String>,
@@ -187,6 +186,8 @@ pub enum SetupError {
     OnboardingSecretError(#[from] OnboardingSecretError),
     #[error(transparent)]
     ReqwestError(#[from] reqwest::Error),
+    #[error("failed to read the backends file: {0}")]
+    BackendsFileError(#[from] std::io::Error),
     #[error(transparent)]
     Utf8Error(#[from] std::string::FromUtf8Error),
     #[error("onboarding bootstrap failed: {0}")]
@@ -227,38 +228,35 @@ impl Config {
     }
 }
 
-// S3 credentials come exclusively from these variables; the opendal layer
-// additionally disables ambient AWS config and IMDS lookups.
-fn blob_service_config_env(backend: &Backend) -> Result<HashMap<String, String>, SetupError> {
-    let mut config = HashMap::new();
-    if *backend != Backend::S3 {
-        return Ok(config);
-    }
-    config.insert("endpoint".to_string(), dotenvy::var("BLOB_S3_ENDPOINT")?);
-    config.insert(
-        "access_key_id".to_string(),
-        dotenvy::var("BLOB_S3_ACCESS_KEY_ID")?,
-    );
-    config.insert(
-        "secret_access_key".to_string(),
-        dotenvy::var("BLOB_S3_SECRET_ACCESS_KEY")?,
-    );
-    if let Ok(region) = dotenvy::var("BLOB_S3_REGION") {
-        config.insert("region".to_string(), region);
-    }
-    let path_style = dotenvy::var("BLOB_S3_FORCE_PATH_STYLE")
-        .ok()
-        .map(|value| value.trim().parse::<bool>())
-        .transpose()
-        .map_err(|error| ConversionError::FromStrError(error.to_string()))?
-        .unwrap_or(true);
-    config.insert("force_path_style".to_string(), path_style.to_string());
-    if let Ok(bucket) = dotenvy::var("BLOB_S3_BUCKET")
-        && !bucket.trim().is_empty()
-    {
-        config.insert("bucket".to_string(), bucket.trim().to_string());
-    }
-    Ok(config)
+/// Per-backend S3 credentials. The backends file never holds secrets; this is
+/// the one lookup a node-local vault will replace later.
+fn backend_credentials(name: &str) -> Option<(String, String)> {
+    let upper: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let key = dotenvy::var(format!("BLOB_BACKEND_{upper}_ACCESS_KEY_ID")).ok()?;
+    let secret = dotenvy::var(format!("BLOB_BACKEND_{upper}_SECRET_ACCESS_KEY")).ok()?;
+    Some((key, secret))
+}
+
+/// Reads the operator's backends file, or synthesises the implicit single
+/// filesystem backend so a zero-config node keeps working.
+fn load_backends_config(
+    implicit: BackendConfig,
+    timeouts: BlobTimeoutConfig,
+) -> Result<NodeBackendsConfig, SetupError> {
+    let Ok(path) = dotenvy::var("BLOB_BACKENDS_PATH") else {
+        return Ok(NodeBackendsConfig::single(implicit));
+    };
+    let text = std::fs::read_to_string(&path)?;
+    Ok(BackendsFile::parse(&text)?.resolve(&backend_credentials, timeouts)?)
 }
 
 pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
@@ -274,11 +272,6 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     let blob_root =
         dotenvy::var("BLOB_ROOT").unwrap_or_else(|_| format!("{storage_path}/blobstore"));
     let blob_bucket_prefix = dotenvy::var("BLOB_BUCKET_PREFIX").ok();
-    let blob_backend = match dotenvy::var("BLOB_BACKEND").ok() {
-        Some(value) => Backend::from_str(value.trim())?,
-        None => Backend::FileSystem,
-    };
-    let blob_service_config = blob_service_config_env(&blob_backend)?;
 
     let max_concurrent_uni_streams = dotenvy::var("MAX_CONCURRENT_UNI_STREAMS")
         .ok()
@@ -314,6 +307,23 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         .map(|value| value.parse::<u64>())
         .transpose()?
         .unwrap_or(30 * 60);
+    let blob_timeouts = BlobTimeoutConfig {
+        control_plane_connect_timeout: Duration::from_secs(blob_control_plane_connect_timeout_secs),
+        control_plane_io_timeout: Duration::from_secs(blob_control_plane_io_timeout_secs),
+        transfer_idle_timeout: Duration::from_secs(blob_transfer_idle_timeout_secs),
+    };
+    let blob_backends = load_backends_config(
+        BackendConfig {
+            backend_type: Backend::FileSystem,
+            root: blob_root.clone(),
+            service_config: HashMap::new(),
+            bucket_prefix: blob_bucket_prefix.clone(),
+            max_bucket_size: blob_max_bucket_size,
+            multipart_bucket: blob_multipart_bucket.clone(),
+            timeouts: blob_timeouts,
+        },
+        blob_timeouts,
+    )?;
     let http_socket_addr = SocketAddr::from_str(&dotenvy::var("SOCKET_ADDRESS")?)?;
     let ops_socket_addr = dotenvy::var("OPS_SOCKET_ADDRESS")
         .ok()
@@ -452,8 +462,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             fjall_persist_policy,
             document_sync_storage_path,
             blob_root,
-            blob_backend,
-            blob_service_config,
+            blob_backends,
             blob_bucket_prefix,
             blob_max_bucket_size,
             blob_multipart_bucket,

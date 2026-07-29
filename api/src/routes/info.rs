@@ -221,6 +221,18 @@ pub struct BlobServiceStatus {
     pub max_bucket_size: Option<u64>,
     pub multipart_bucket: Option<String>,
     pub timeouts_secs: Option<TimeoutConfigSecs>,
+    /// Every registered backend. The aggregate `status` above is the default
+    /// backend's, so single-backend consumers keep one headline signal.
+    pub backends: Vec<BackendStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BackendStatus {
+    pub name: String,
+    pub backend: String,
+    pub class: Option<String>,
+    pub default: bool,
+    pub status: ServiceStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -1471,6 +1483,17 @@ pub async fn get_info(
                     io: info.timeouts.control_plane_io_timeout.as_secs(),
                     transfer_idle: info.timeouts.transfer_idle_timeout.as_secs(),
                 }),
+                backends: info
+                    .backends
+                    .into_iter()
+                    .map(|backend| BackendStatus {
+                        name: backend.name,
+                        backend: backend.backend_type.to_string(),
+                        class: backend.class,
+                        default: backend.default,
+                        status: ServiceStatus::from(backend.status),
+                    })
+                    .collect(),
             },
             None => BlobServiceStatus {
                 status: ServiceStatus::NotConfigured,
@@ -1478,6 +1501,7 @@ pub async fn get_info(
                 max_bucket_size: None,
                 multipart_bucket: None,
                 timeouts_secs: None,
+                backends: Vec::new(),
             },
         };
         response.services.blob = Some(blob);
