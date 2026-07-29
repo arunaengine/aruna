@@ -26,10 +26,6 @@ jobs:
       CARGO_BUILD_JOBS: 2
       RUSTFLAGS: -Cinstrument-coverage -Cdebuginfo=0
       LLVM_PROFILE_FILE: cargo-test-%p-%m.profraw
-      # Coverage counters inflate async poll frames past the default 2 MiB test
-      # stacks (execution_end_to_end); uninstrumented jobs keep defaults so real
-      # stack regressions still surface there. Reservation is virtual, not RSS.
-      RUST_MIN_STACK: 16777216
 
     steps:
       - name: Check out repository
