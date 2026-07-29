@@ -99,6 +99,8 @@ pub struct BackendState {
     pub name: String,
     pub backend_type: Backend,
     pub class: Option<String>,
+    pub allow_tenants: bool,
+    pub quota_bytes: Option<u64>,
     pub default: bool,
     pub status: Status,
 }

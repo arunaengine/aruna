@@ -231,6 +231,10 @@ pub struct BackendStatus {
     pub name: String,
     pub backend: String,
     pub class: Option<String>,
+    /// Whether tenant routing rules may target this backend's class.
+    pub allow_tenants: bool,
+    /// Operator allowance for user data on this backend; not enforced yet.
+    pub quota_bytes: Option<u64>,
     pub default: bool,
     pub status: ServiceStatus,
 }
@@ -1490,6 +1494,8 @@ pub async fn get_info(
                         name: backend.name,
                         backend: backend.backend_type.to_string(),
                         class: backend.class,
+                        allow_tenants: backend.allow_tenants,
+                        quota_bytes: backend.quota_bytes,
                         default: backend.default,
                         status: ServiceStatus::from(backend.status),
                     })

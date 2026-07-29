@@ -229,6 +229,8 @@ impl BlobHandle {
                 name: name.clone(),
                 backend_type: backend.config.backend_type.clone(),
                 class: backend.class.clone(),
+                allow_tenants: backend.allow_tenants,
+                quota_bytes: backend.quota_bytes,
                 default: name == self.handler.registry.default_name(),
                 status: *backend.status.read().await,
             });

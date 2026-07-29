@@ -2,6 +2,7 @@ use crate::errors::ConversionError;
 use crate::structs::{BackendRef, ResolvedBackend};
 use crate::types::{GroupId, UserId};
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 use thiserror::Error;
@@ -13,8 +14,6 @@ pub const STORAGE_CLASS_MAX_LEN: usize = 32;
 
 #[derive(Debug, Clone, Eq, PartialEq, Error)]
 pub enum RoutingError {
-    #[error("no backend of storage class `{0}` is registered on this node")]
-    ClassUnavailable(String),
     #[error("backend {0} is not registered on this node")]
     UnknownBackend(BackendRef),
     #[error("group-defined storage backends are disabled on this node")]
@@ -41,6 +40,14 @@ pub fn validate_storage_class(class: &str) -> Result<(), RoutingError> {
 pub enum RoutingTarget {
     Backend(BackendRef),
     Class(String),
+}
+
+/// Who authored a rule. Operator rules reach every class in the node's table;
+/// tenant rules only reach the classes the operator opened to them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuleSource {
+    Tenant,
+    Operator,
 }
 
 /// A rule scoped to one bucket. `key_prefix` is a literal S3 key prefix, or the
@@ -99,11 +106,18 @@ impl NodeRoutingRule {
     }
 }
 
+/// One row of a node's class table, without credentials.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CatalogEntry {
+    class: Option<String>,
+    allow_tenants: bool,
+}
+
 /// The node's registered backends and the group's own backend ids, without any
 /// credentials, so an operation can turn a class into a concrete backend.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackendCatalog {
-    backends: BTreeMap<String, Option<String>>,
+    backends: BTreeMap<String, CatalogEntry>,
     default_name: String,
     group_backends: BTreeSet<Ulid>,
     serve_group_backends: bool,
@@ -120,7 +134,26 @@ impl BackendCatalog {
     }
 
     pub fn with_backend(mut self, name: impl Into<String>, class: Option<String>) -> Self {
-        self.backends.insert(name.into(), class);
+        self.backends.insert(
+            name.into(),
+            CatalogEntry {
+                class,
+                allow_tenants: true,
+            },
+        );
+        self
+    }
+
+    /// A backend whose class is reserved for operator rules and the node
+    /// default; tenant rules naming that class miss instead of binding.
+    pub fn with_reserved(mut self, name: impl Into<String>, class: Option<String>) -> Self {
+        self.backends.insert(
+            name.into(),
+            CatalogEntry {
+                class,
+                allow_tenants: false,
+            },
+        );
         self
     }
 
@@ -140,7 +173,16 @@ impl BackendCatalog {
     }
 
     pub fn class_of(&self, name: &str) -> Option<&str> {
-        self.backends.get(name).and_then(Option::as_deref)
+        self.backends
+            .get(name)
+            .and_then(|entry| entry.class.as_deref())
+    }
+
+    /// Whether tenant-authored rules may target this backend's class.
+    pub fn allows_tenants(&self, name: &str) -> bool {
+        self.backends
+            .get(name)
+            .is_some_and(|entry| entry.allow_tenants)
     }
 
     pub fn default_backend(&self) -> Result<ResolvedBackend, RoutingError> {
@@ -148,21 +190,26 @@ impl BackendCatalog {
     }
 
     fn resolve_node(&self, name: &str) -> Result<ResolvedBackend, RoutingError> {
-        let class = self
+        let entry = self
             .backends
             .get(name)
             .ok_or_else(|| RoutingError::UnknownBackend(BackendRef::Node(name.to_string())))?;
         Ok(ResolvedBackend::new(
             BackendRef::Node(name.to_string()),
-            class.clone(),
+            entry.class.clone(),
         ))
     }
 
-    /// Turns a rule target into a concrete backend. Missing classes and
-    /// unregistered backends fail loudly; there is no fallback to the default.
-    pub fn resolve_target(&self, target: &RoutingTarget) -> Result<ResolvedBackend, RoutingError> {
+    /// Turns a rule target into a concrete backend. A named backend is binding
+    /// and its absence is an error; a class is a preference and a node that
+    /// does not offer it answers `None`, a miss the caller continues past.
+    pub fn resolve_target(
+        &self,
+        target: &RoutingTarget,
+        source: RuleSource,
+    ) -> Result<Option<ResolvedBackend>, RoutingError> {
         match target {
-            RoutingTarget::Backend(BackendRef::Node(name)) => self.resolve_node(name),
+            RoutingTarget::Backend(BackendRef::Node(name)) => self.resolve_node(name).map(Some),
             RoutingTarget::Backend(BackendRef::Group(id)) => {
                 if !self.serve_group_backends {
                     return Err(RoutingError::GroupEgressDisabled);
@@ -170,16 +217,18 @@ impl BackendCatalog {
                 if !self.group_backends.contains(id) {
                     return Err(RoutingError::UnknownBackend(BackendRef::Group(*id)));
                 }
-                Ok(ResolvedBackend::new(BackendRef::Group(*id), None))
+                Ok(Some(ResolvedBackend::new(BackendRef::Group(*id), None)))
             }
-            RoutingTarget::Class(class) => self
+            RoutingTarget::Class(class) => Ok(self
                 .backends
                 .iter()
-                .find(|(_, entry)| entry.as_deref() == Some(class.as_str()))
-                .map(|(name, entry)| {
-                    ResolvedBackend::new(BackendRef::Node(name.clone()), entry.clone())
+                .find(|(_, entry)| {
+                    entry.class.as_deref() == Some(class.as_str())
+                        && (entry.allow_tenants || source == RuleSource::Operator)
                 })
-                .ok_or_else(|| RoutingError::ClassUnavailable(class.clone())),
+                .map(|(name, entry)| {
+                    ResolvedBackend::new(BackendRef::Node(name.clone()), entry.class.clone())
+                })),
         }
     }
 }
@@ -251,45 +300,91 @@ impl RoutingSnapshot {
     }
 }
 
-/// Picks the target for one write, most specific rule first: exact key, longest
-/// bucket prefix, bucket default, group default, node rules, node default.
+/// One rule that could decide a write, with the provenance class lookup needs.
+struct Candidate<'a> {
+    target: &'a RoutingTarget,
+    source: RuleSource,
+}
+
+/// Every rule that could apply, most specific first: exact key, longest bucket
+/// prefix, bucket default, group default, node rules. Stable sorts keep record
+/// and file order as the last tie-breaker, so the ladder is a total order.
+fn candidates<'a>(snapshot: &'a RoutingSnapshot, bucket: &str, key: &str) -> Vec<Candidate<'a>> {
+    let tenant = |target| Candidate {
+        target,
+        source: RuleSource::Tenant,
+    };
+    let mut ordered: Vec<Candidate<'a>> = snapshot
+        .bucket_rules
+        .iter()
+        .filter(|rule| rule.exact && rule.key_prefix == key)
+        .map(|rule| tenant(&rule.target))
+        .collect();
+
+    // An empty prefix is the bucket default, so longest-prefix covers it too.
+    let mut prefixed: Vec<&StorageRoutingRule> = snapshot
+        .bucket_rules
+        .iter()
+        .filter(|rule| !rule.exact && key.starts_with(&rule.key_prefix))
+        .collect();
+    prefixed.sort_by_key(|rule| Reverse(rule.key_prefix.len()));
+    ordered.extend(prefixed.into_iter().map(|rule| tenant(&rule.target)));
+
+    ordered.extend(snapshot.group_default.as_ref().map(tenant));
+
+    let mut scoped: Vec<&NodeRoutingRule> = snapshot
+        .node_rules
+        .iter()
+        .filter(|rule| rule.matches(snapshot.group_id, bucket, key))
+        .collect();
+    scoped.sort_by_key(|rule| Reverse(rule.specificity()));
+    ordered.extend(scoped.into_iter().map(|rule| Candidate {
+        target: &rule.target,
+        source: RuleSource::Operator,
+    }));
+
+    ordered
+}
+
+/// A class this node does not offer reroutes the write, so record it rather
+/// than let the specificity ladder degrade silently.
+fn warn_missed(missed: &[&str], chosen: &ResolvedBackend) {
+    if missed.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        missed_classes = ?missed,
+        backend = %chosen.backend,
+        storage_class = ?chosen.storage_class,
+        "storage class not offered on this node, routing fell through"
+    );
+}
+
+/// Picks the target for one write. Candidates are tried in strict specificity
+/// order and the first that resolves wins; a named backend that does not
+/// resolve aborts, while a class this node does not offer is only a miss.
 pub fn resolve_backend(
     snapshot: &RoutingSnapshot,
     bucket: &str,
     key: &str,
 ) -> Result<ResolvedBackend, RoutingError> {
-    if let Some(rule) = snapshot
-        .bucket_rules
-        .iter()
-        .find(|rule| rule.exact && rule.key_prefix == key)
-    {
-        return snapshot.catalog.resolve_target(&rule.target);
+    let mut missed = Vec::new();
+    for candidate in candidates(snapshot, bucket, key) {
+        if let Some(resolved) = snapshot
+            .catalog
+            .resolve_target(candidate.target, candidate.source)?
+        {
+            warn_missed(&missed, &resolved);
+            return Ok(resolved);
+        }
+        if let RoutingTarget::Class(class) = candidate.target {
+            missed.push(class.as_str());
+        }
     }
 
-    // An empty prefix is the bucket default, so longest-prefix covers it too.
-    if let Some(rule) = snapshot
-        .bucket_rules
-        .iter()
-        .filter(|rule| !rule.exact && key.starts_with(&rule.key_prefix))
-        .max_by_key(|rule| rule.key_prefix.len())
-    {
-        return snapshot.catalog.resolve_target(&rule.target);
-    }
-
-    if let Some(target) = snapshot.group_default.as_ref() {
-        return snapshot.catalog.resolve_target(target);
-    }
-
-    if let Some(rule) = snapshot
-        .node_rules
-        .iter()
-        .filter(|rule| rule.matches(snapshot.group_id, bucket, key))
-        .max_by_key(|rule| rule.specificity())
-    {
-        return snapshot.catalog.resolve_target(&rule.target);
-    }
-
-    snapshot.catalog.default_backend()
+    let resolved = snapshot.catalog.default_backend()?;
+    warn_missed(&missed, &resolved);
+    Ok(resolved)
 }
 
 /// Rejects two rules in one scope sharing `(exact, key_prefix)`, so the
@@ -332,6 +427,14 @@ mod tests {
             key_prefix: prefix.to_string(),
             exact,
             target: RoutingTarget::Backend(BackendRef::Node(backend.to_string())),
+        }
+    }
+
+    fn class_rule(prefix: &str, class: &str) -> StorageRoutingRule {
+        StorageRoutingRule {
+            key_prefix: prefix.to_string(),
+            exact: false,
+            target: RoutingTarget::Class(class.to_string()),
         }
     }
 
@@ -494,16 +597,76 @@ mod tests {
     }
 
     #[test]
-    fn missing_class_fails() {
-        let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
-            key_prefix: String::new(),
-            exact: false,
-            target: RoutingTarget::Class("glacier".to_string()),
+    fn missing_class_falls_through() {
+        // A class this node does not offer is a miss, not a failure.
+        let snapshot = snapshot().with_bucket_rules(vec![class_rule("", "glacier")]);
+
+        assert_eq!(
+            resolve_backend(&snapshot, "b", "k").unwrap(),
+            node("default")
+        );
+    }
+
+    #[test]
+    fn miss_tries_next_rule() {
+        // The miss skips one rung only; the next-most-specific rule decides.
+        let snapshot = snapshot().with_bucket_rules(vec![
+            StorageRoutingRule {
+                key_prefix: "a/one".to_string(),
+                exact: true,
+                target: RoutingTarget::Class("glacier".to_string()),
+            },
+            class_rule("a/", "cold"),
+            rule("", false, "tape"),
+        ]);
+
+        assert_eq!(
+            resolve_backend(&snapshot, "b", "a/one").unwrap(),
+            node("cold")
+        );
+    }
+
+    #[test]
+    fn miss_reaches_node_rules() {
+        let snapshot = snapshot()
+            .with_group_default(Some(RoutingTarget::Class("glacier".to_string())))
+            .with_node_rules(vec![NodeRoutingRule {
+                group: None,
+                bucket: None,
+                key_prefix: None,
+                target: RoutingTarget::Backend(BackendRef::Node("tape".to_string())),
+            }]);
+
+        assert_eq!(resolve_backend(&snapshot, "b", "k").unwrap(), node("tape"));
+    }
+
+    #[test]
+    fn reserved_class_skips_tenants() {
+        // `allow_tenants = false` hides the class from tenant rules only.
+        let catalog = BackendCatalog::new("default")
+            .with_backend("default", None)
+            .with_reserved("tape", Some("archive".to_string()));
+        let snapshot = RoutingSnapshot::new(Ulid::from_bytes([1u8; 16]), catalog)
+            .with_bucket_rules(vec![class_rule("", "archive")]);
+
+        assert_eq!(
+            resolve_backend(&snapshot, "b", "k").unwrap(),
+            ResolvedBackend::new(BackendRef::Node("default".to_string()), None)
+        );
+
+        let operator = snapshot.clone().with_node_rules(vec![NodeRoutingRule {
+            group: None,
+            bucket: None,
+            key_prefix: None,
+            target: RoutingTarget::Class("archive".to_string()),
         }]);
 
         assert_eq!(
-            resolve_backend(&snapshot, "b", "k"),
-            Err(RoutingError::ClassUnavailable("glacier".to_string()))
+            resolve_backend(&operator, "b", "k").unwrap(),
+            ResolvedBackend::new(
+                BackendRef::Node("tape".to_string()),
+                Some("archive".to_string())
+            )
         );
     }
 
@@ -513,6 +676,20 @@ mod tests {
 
         assert_eq!(
             resolve_backend(&snapshot, "b", "k"),
+            Err(RoutingError::UnknownBackend(BackendRef::Node(
+                "ghost".to_string()
+            )))
+        );
+    }
+
+    #[test]
+    fn binding_failure_aborts() {
+        // A broken named backend wins over any less specific rule that works.
+        let snapshot = snapshot()
+            .with_bucket_rules(vec![rule("a/one", true, "ghost"), class_rule("a/", "cold")]);
+
+        assert_eq!(
+            resolve_backend(&snapshot, "b", "a/one"),
             Err(RoutingError::UnknownBackend(BackendRef::Node(
                 "ghost".to_string()
             )))

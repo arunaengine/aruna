@@ -289,8 +289,31 @@ mod tests {
     }
 
     #[test]
-    fn missing_class_aborts() {
+    fn missing_class_pins_default() {
+        // The pin records where the parts actually land, not what was asked.
         let snapshot = snapshot().with_bucket_rules(vec![rule("glacier")]);
+        let mut operation = CreateMultipartUploadOperation::new(input(snapshot));
+        operation.start();
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected one record write, got {effects:?}")
+        };
+        let record = MultipartUpload::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(record.backend, BackendRef::Node("default".to_string()));
+        assert_eq!(record.storage_class, None);
+    }
+
+    #[test]
+    fn unknown_backend_aborts() {
+        let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
+            key_prefix: String::new(),
+            exact: false,
+            target: RoutingTarget::Backend(BackendRef::Node("ghost".to_string())),
+        }]);
         let mut operation = CreateMultipartUploadOperation::new(input(snapshot));
         operation.start();
 
@@ -303,7 +326,7 @@ mod tests {
         assert!(matches!(
             operation.finalize(),
             Err(CreateMultipartUploadError::RoutingFailed(
-                RoutingError::ClassUnavailable(_)
+                RoutingError::UnknownBackend(_)
             ))
         ));
     }

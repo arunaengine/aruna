@@ -47,6 +47,8 @@ struct BackendView {
     name: String,
     backend: String,
     class: Option<String>,
+    allow_tenants: bool,
+    quota_bytes: Option<u64>,
     default: bool,
 }
 
@@ -66,6 +68,8 @@ fn backend_views() -> Result<Vec<BackendView>, CliError> {
             name,
             backend: entry.kind,
             class: entry.class,
+            allow_tenants: entry.allow_tenants,
+            quota_bytes: entry.quota_bytes,
             default: entry.default,
         })
         .collect())

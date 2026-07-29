@@ -2,8 +2,8 @@ use crate::error::BlobLibError;
 use crate::opendal::init_operator;
 use aruna_core::errors::BlobError;
 use aruna_core::structs::{
-    Backend, BackendCatalog, BackendConfig, BackendRef, BlobTimeoutConfig, NodeBackendsConfig,
-    NodeRouting, NodeRoutingRule, ResolvedBackend, Status,
+    Backend, BackendCatalog, BackendConfig, BackendRef, BlobTimeoutConfig, NodeBackendEntry,
+    NodeBackendsConfig, NodeRouting, NodeRoutingRule, ResolvedBackend, Status,
 };
 use opendal::Operator;
 use std::collections::BTreeMap;
@@ -15,6 +15,8 @@ use tokio::sync::RwLock;
 pub struct NodeBackend {
     pub config: BackendConfig,
     pub class: Option<String>,
+    pub allow_tenants: bool,
+    pub quota_bytes: Option<u64>,
     pub status: Arc<RwLock<Status>>,
 }
 
@@ -23,7 +25,19 @@ impl NodeBackend {
         Self {
             config,
             class,
+            allow_tenants: true,
+            quota_bytes: None,
             status: Arc::new(RwLock::new(Status::Unavailable)),
+        }
+    }
+
+    /// The operator's class table row, including the tenant allowance the
+    /// catalog projection needs and the allowance `/info` reports.
+    pub fn from_entry(entry: &NodeBackendEntry) -> Self {
+        Self {
+            allow_tenants: entry.allow_tenants,
+            quota_bytes: entry.quota_bytes,
+            ..Self::new(entry.config.clone(), entry.class.clone())
         }
     }
 }
@@ -59,12 +73,7 @@ impl BackendRegistry {
         let node = config
             .backends
             .iter()
-            .map(|entry| {
-                (
-                    entry.name.clone(),
-                    NodeBackend::new(entry.config.clone(), entry.class.clone()),
-                )
-            })
+            .map(|entry| (entry.name.clone(), NodeBackend::from_entry(entry)))
             .collect();
         let registry = Self::new(node, config.default_name.clone())?;
         Ok(Self {
@@ -168,7 +177,13 @@ impl BackendRegistry {
     pub fn catalog(&self) -> BackendCatalog {
         let catalog = self.node.iter().fold(
             BackendCatalog::new(self.default_name.clone()),
-            |catalog, (name, backend)| catalog.with_backend(name.clone(), backend.class.clone()),
+            |catalog, (name, backend)| {
+                if backend.allow_tenants {
+                    catalog.with_backend(name.clone(), backend.class.clone())
+                } else {
+                    catalog.with_reserved(name.clone(), backend.class.clone())
+                }
+            },
         );
         if self.serve_group_backends {
             catalog

@@ -1034,12 +1034,30 @@ mod routing_test {
     }
 
     #[test]
-    fn missing_class_aborts() {
-        // Nothing may be written when a rule names a class this node lacks.
+    fn missing_class_stamps_default() {
+        // A class this node does not offer reroutes the write, never fails it.
         let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
             key_prefix: String::new(),
             exact: false,
             target: RoutingTarget::Class("glacier".to_string()),
+        }]);
+
+        let effects = PutObjectOperation::new(config(snapshot)).start();
+
+        let [Effect::Blob(BlobEffect::Write { resolved, .. })] = effects.as_slice() else {
+            panic!("expected one blob write, got {effects:?}")
+        };
+        assert_eq!(resolved.backend, BackendRef::Node("default".to_string()));
+        assert_eq!(resolved.storage_class, None);
+    }
+
+    #[test]
+    fn unknown_backend_aborts() {
+        // A named backend is binding: nothing may be written when it is gone.
+        let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
+            key_prefix: String::new(),
+            exact: false,
+            target: RoutingTarget::Backend(BackendRef::Node("ghost".to_string())),
         }]);
 
         let mut operation = PutObjectOperation::new(config(snapshot));
@@ -1049,9 +1067,9 @@ mod routing_test {
         assert!(operation.is_complete());
         assert!(matches!(
             operation.finalize(),
-            Err(PutObjectError::RoutingFailed(
-                RoutingError::ClassUnavailable(_)
-            ))
+            Err(PutObjectError::RoutingFailed(RoutingError::UnknownBackend(
+                _
+            )))
         ));
     }
 }

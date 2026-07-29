@@ -29,6 +29,13 @@ pub struct BackendEntry {
     pub kind: String,
     #[serde(default)]
     pub class: Option<String>,
+    /// Whether tenant-authored rules may target this entry's class.
+    #[serde(default = "tenants_allowed")]
+    pub allow_tenants: bool,
+    /// Operator allowance for user data on this backend. Stored and reported
+    /// only; enforcement belongs to the quota arc.
+    #[serde(default)]
+    pub quota_bytes: Option<u64>,
     #[serde(default)]
     pub default: bool,
     #[serde(default)]
@@ -47,6 +54,10 @@ pub struct BackendEntry {
     pub multipart_bucket: Option<String>,
     #[serde(default)]
     pub force_path_style: Option<bool>,
+}
+
+fn tenants_allowed() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -95,6 +106,8 @@ pub struct NodeBackendEntry {
     pub name: String,
     pub config: BackendConfig,
     pub class: Option<String>,
+    pub allow_tenants: bool,
+    pub quota_bytes: Option<u64>,
 }
 
 /// The whole storage configuration of one node.
@@ -115,6 +128,8 @@ impl NodeBackendsConfig {
                 name: BackendRef::DEFAULT_NODE_NAME.to_string(),
                 config,
                 class: None,
+                allow_tenants: true,
+                quota_bytes: None,
             }],
             default_name: BackendRef::DEFAULT_NODE_NAME.to_string(),
             rules: Vec::new(),
@@ -172,10 +187,17 @@ impl BackendsFile {
                     )));
                 }
             }
+            if entry.quota_bytes == Some(0) {
+                return Err(ConversionError::FromStrError(format!(
+                    "backend `{name}` sets quota_bytes = 0, which allows no user data"
+                )));
+            }
             backends.push(NodeBackendEntry {
                 name: name.clone(),
                 config: entry.to_config(credentials(name), timeouts)?,
                 class: entry.class.clone(),
+                allow_tenants: entry.allow_tenants,
+                quota_bytes: entry.quota_bytes,
             });
         }
 
@@ -307,6 +329,8 @@ default = true
 [backend.cold]
 type = "s3"
 class = "cold"
+allow_tenants = false
+quota_bytes = 10995116277760
 root = ""
 endpoint = "https://s3.example.org"
 region = "eu-central-1"
@@ -348,6 +372,15 @@ deny = ["203.0.113.0/24"]
             .find(|entry| entry.name == "cold")
             .unwrap();
         assert_eq!(cold.class.as_deref(), Some("cold"));
+        assert!(!cold.allow_tenants);
+        assert_eq!(cold.quota_bytes, Some(10_995_116_277_760));
+        assert!(
+            config
+                .backends
+                .iter()
+                .find(|entry| entry.name == "default")
+                .is_some_and(|entry| entry.allow_tenants && entry.quota_bytes.is_none())
+        );
         assert_eq!(
             cold.config
                 .service_config
@@ -459,6 +492,24 @@ default = true
 
         assert!(
             file.resolve(&|_| None, BlobTimeoutConfig::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_zero_quota() {
+        let file = BackendsFile::parse(
+            r#"
+[backend.a]
+type = "filesystem"
+default = true
+quota_bytes = 0
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            file.resolve(&secrets, BlobTimeoutConfig::default())
                 .is_err()
         );
     }
