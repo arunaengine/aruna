@@ -1,3 +1,4 @@
+use crate::egress::EgressGuard;
 use aruna_core::errors::{BlobError, StagingSourceError};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
@@ -64,9 +65,10 @@ pub(crate) fn init_operator(
 }
 
 pub(crate) async fn check_staging_source(
+    guard: &EgressGuard,
     access: &ResolvedSourceAccess,
 ) -> Result<(), StagingSourceError> {
-    let (operator, ..) = build_staging_source_operator(access)?;
+    let (operator, ..) = build_staging_source_operator(guard, access).await?;
     let ResolvedSourceAccess::OpenDal { kind, .. } = access;
     check_operator(&operator, *kind).await
 }
@@ -88,9 +90,10 @@ async fn check_operator(
 }
 
 pub(crate) async fn head_staging_source(
+    guard: &EgressGuard,
     access: &ResolvedSourceAccess,
 ) -> Result<SourceMetadata, StagingSourceError> {
-    let (operator, path, version) = build_staging_source_operator(access)?;
+    let (operator, path, version) = build_staging_source_operator(guard, access).await?;
     let metadata = match version {
         Some(version) => operator.stat_with(path).version(version).await,
         None => operator.stat(path).await,
@@ -107,6 +110,7 @@ pub(crate) async fn head_staging_source(
 }
 
 pub(crate) async fn read_staging_source(
+    guard: &EgressGuard,
     access: &ResolvedSourceAccess,
     range: Option<std::ops::Range<u64>>,
 ) -> Result<
@@ -116,8 +120,8 @@ pub(crate) async fn read_staging_source(
     ),
     StagingSourceError,
 > {
-    let (operator, path, version) = build_staging_source_operator(access)?;
-    let metadata = head_staging_source(access).await?;
+    let (operator, path, version) = build_staging_source_operator(guard, access).await?;
+    let metadata = head_staging_source(guard, access).await?;
     let reader = match version {
         Some(version) => operator.reader_with(path).version(version).await,
         None => operator.reader(path).await,
@@ -138,7 +142,7 @@ pub(crate) async fn read_staging_source(
 }
 
 pub(crate) async fn list_staging_source(
-    guard: &crate::egress::EgressGuard,
+    guard: &EgressGuard,
     access: &ResolvedSourceAccess,
     offset: usize,
     limit: usize,
@@ -155,7 +159,7 @@ pub(crate) async fn list_staging_source(
         )
         .await;
     }
-    let (operator, path, ..) = build_staging_source_operator(access)?;
+    let (operator, path, ..) = build_staging_source_operator(guard, access).await?;
     list_operator(&operator, path, offset, limit, recursive, files_only).await
 }
 
@@ -211,9 +215,10 @@ async fn list_operator(
     Ok((entries, false))
 }
 
-fn build_staging_source_operator(
-    access: &ResolvedSourceAccess,
-) -> Result<(Operator, &str, Option<&str>), StagingSourceError> {
+async fn build_staging_source_operator<'access>(
+    guard: &EgressGuard,
+    access: &'access ResolvedSourceAccess,
+) -> Result<(Operator, &'access str, Option<&'access str>), StagingSourceError> {
     match access {
         ResolvedSourceAccess::OpenDal {
             kind,
@@ -222,18 +227,31 @@ fn build_staging_source_operator(
             version,
         } => {
             let operator = match kind {
-                SourceConnectorKind::Http => build_service::<services::Http>(config.clone(), None)
-                    .map_err(staging_operator_creation_error)?,
-                SourceConnectorKind::S3 => {
-                    build_service::<services::S3>(s3_operator_config(config.clone()), None)
+                SourceConnectorKind::Http => {
+                    build_service::<services::Http>(config.clone(), Some(guard.layer()))
                         .map_err(staging_operator_creation_error)?
                 }
+                SourceConnectorKind::S3 => build_service::<services::S3>(
+                    s3_operator_config(config.clone()),
+                    Some(guard.layer()),
+                )
+                .map_err(staging_operator_creation_error)?,
                 SourceConnectorKind::Webdav => {
-                    build_service::<services::Webdav>(config.clone(), None)
+                    build_service::<services::Webdav>(config.clone(), Some(guard.layer()))
                         .map_err(staging_operator_creation_error)?
                 }
-                SourceConnectorKind::Ftp => build_service::<services::Ftp>(config.clone(), None)
-                    .map_err(staging_operator_creation_error)?,
+                // opendal's ftp service never touches an http client, so a
+                // preflight screen is the only control available here.
+                SourceConnectorKind::Ftp => {
+                    let endpoint = config.get("endpoint").ok_or_else(|| {
+                        StagingSourceError::OperatorCreationFailed(
+                            "ftp connector endpoint is missing".to_string(),
+                        )
+                    })?;
+                    guard.screen(endpoint).await?;
+                    build_service::<services::Ftp>(config.clone(), None)
+                        .map_err(staging_operator_creation_error)?
+                }
                 SourceConnectorKind::ArunaNative => {
                     return Err(StagingSourceError::UnsupportedKind(kind.to_string()));
                 }
@@ -300,6 +318,7 @@ fn map_staging_source_error(error: opendal::Error, stat: bool) -> StagingSourceE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::egress::EgressPolicy;
     use std::sync::Arc;
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -307,6 +326,10 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
+
+    fn test_guard() -> EgressGuard {
+        EgressGuard::new(EgressPolicy::loopback()).unwrap()
+    }
 
     /// Ambient AWS inputs cleared before a zero-connect proof, so no provider
     /// ahead of the metadata slot can short-circuit the chain.
@@ -424,11 +447,75 @@ mod tests {
             path: "file.txt".to_string(),
             version: None,
         };
-        let (operator, path, ..) = build_staging_source_operator(&access).unwrap();
+        let (operator, path, ..) = build_staging_source_operator(&test_guard(), &access)
+            .await
+            .unwrap();
         let _ = operator.stat(path).await;
 
         restore_env(previous);
         assert_eq!(metadata.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn staging_refuses_denied() {
+        // Every http-family kind must fail before a socket is opened.
+        let listener = CountingListener::bind().await;
+        let guard = EgressGuard::new(EgressPolicy::strict()).unwrap();
+
+        for kind in [
+            SourceConnectorKind::Http,
+            SourceConnectorKind::S3,
+            SourceConnectorKind::Webdav,
+        ] {
+            let mut config = HashMap::from([("endpoint".to_string(), listener.endpoint.clone())]);
+            if kind == SourceConnectorKind::S3 {
+                config.insert("bucket".to_string(), "reads".to_string());
+                config.insert("region".to_string(), "eu-central-1".to_string());
+                config.insert("access_key_id".to_string(), "AKIA".to_string());
+                config.insert("secret_access_key".to_string(), "secret".to_string());
+            }
+            let access = ResolvedSourceAccess::OpenDal {
+                kind,
+                config,
+                path: "file.txt".to_string(),
+                version: None,
+            };
+
+            let (operator, path, ..) = build_staging_source_operator(&guard, &access)
+                .await
+                .unwrap();
+            let error = operator.stat(path).await.unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("egress policy denied the target"),
+                "{kind}: {error}"
+            );
+        }
+
+        assert_eq!(listener.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn ftp_screens_endpoint() {
+        // ftp never reaches an http client, so the preflight screen is the control.
+        let listener = CountingListener::bind().await;
+        let endpoint = listener.endpoint.replace("http://", "ftp://");
+        let access = ResolvedSourceAccess::OpenDal {
+            kind: SourceConnectorKind::Ftp,
+            config: HashMap::from([("endpoint".to_string(), endpoint)]),
+            path: "file.txt".to_string(),
+            version: None,
+        };
+        let guard = EgressGuard::new(EgressPolicy::strict()).unwrap();
+
+        let error = build_staging_source_operator(&guard, &access)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, StagingSourceError::EgressDenied(_)));
+        assert_eq!(listener.hits(), 0);
     }
 
     #[tokio::test]
@@ -440,7 +527,9 @@ mod tests {
             version: Some("v42".to_string()),
         };
 
-        let (.., path, version) = build_staging_source_operator(&access).unwrap();
+        let (.., path, version) = build_staging_source_operator(&test_guard(), &access)
+            .await
+            .unwrap();
         assert_eq!(path, "file.txt");
         assert_eq!(version, Some("v42"));
     }
@@ -450,7 +539,7 @@ mod tests {
         let access = ResolvedSourceAccess::OpenDal {
             kind: SourceConnectorKind::Ftp,
             config: HashMap::from([
-                ("endpoint".to_string(), "ftp://example.org:21".to_string()),
+                ("endpoint".to_string(), "ftp://127.0.0.1:21".to_string()),
                 ("root".to_string(), "/datasets".to_string()),
                 ("user".to_string(), "alice".to_string()),
                 ("password".to_string(), "secret".to_string()),
@@ -459,7 +548,9 @@ mod tests {
             version: None,
         };
 
-        let (.., path, version) = build_staging_source_operator(&access).unwrap();
+        let (.., path, version) = build_staging_source_operator(&test_guard(), &access)
+            .await
+            .unwrap();
         assert_eq!(path, "run-1/data.txt");
         assert_eq!(version, None);
     }

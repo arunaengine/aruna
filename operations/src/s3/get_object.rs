@@ -710,6 +710,7 @@ mod test {
     use aruna_blob::hash::Hasher;
     use aruna_core::UserId;
     use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
+    use aruna_core::egress::EgressPolicy;
     use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
@@ -960,7 +961,7 @@ mod test {
         let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
             .await
             .unwrap();
-        let blob_handle = BlobHandler::new(
+        let blob_handle = BlobHandler::with_egress(
             BackendConfig {
                 backend_type: Backend::FileSystem,
                 bucket_prefix: Some("aruna_".to_string()),
@@ -972,6 +973,7 @@ mod test {
             },
             storage_handle.clone(),
             net_handle.clone(),
+            EgressPolicy::loopback(),
         )
         .await
         .unwrap();
@@ -1107,7 +1109,7 @@ mod test {
         let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
             .await
             .unwrap();
-        let blob_handle = BlobHandler::new(
+        let blob_handle = BlobHandler::with_egress(
             BackendConfig {
                 backend_type: Backend::FileSystem,
                 bucket_prefix: Some("aruna_".to_string()),
@@ -1119,6 +1121,7 @@ mod test {
             },
             storage_handle.clone(),
             net_handle.clone(),
+            EgressPolicy::loopback(),
         )
         .await
         .unwrap();
@@ -1256,7 +1259,7 @@ mod test {
         let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
             .await
             .unwrap();
-        let blob_handle = BlobHandler::new(
+        let blob_handle = BlobHandler::with_egress(
             BackendConfig {
                 backend_type: Backend::FileSystem,
                 bucket_prefix: Some("aruna_".to_string()),
@@ -1268,6 +1271,7 @@ mod test {
             },
             storage_handle.clone(),
             net_handle.clone(),
+            EgressPolicy::loopback(),
         )
         .await
         .unwrap();
@@ -1424,7 +1428,7 @@ mod test {
         let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
             .await
             .unwrap();
-        let blob_handle = BlobHandler::new(
+        let blob_handle = BlobHandler::with_egress(
             BackendConfig {
                 backend_type: Backend::FileSystem,
                 bucket_prefix: Some("aruna_".to_string()),
@@ -1436,6 +1440,7 @@ mod test {
             },
             storage_handle.clone(),
             net_handle.clone(),
+            EgressPolicy::loopback(),
         )
         .await
         .unwrap();

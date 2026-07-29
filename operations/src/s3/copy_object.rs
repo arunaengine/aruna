@@ -224,6 +224,7 @@ mod test {
     use crate::s3::get_object::GetObjectOperation;
     use aruna_blob::blob::BlobHandler;
     use aruna_core::effects::StorageEffect;
+    use aruna_core::egress::EgressPolicy;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
     use aruna_core::stream::BackendStream;
@@ -249,7 +250,7 @@ mod test {
         let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
             .await
             .unwrap();
-        let blob_handle = BlobHandler::new(
+        let blob_handle = BlobHandler::with_egress(
             BackendConfig {
                 backend_type: Backend::FileSystem,
                 bucket_prefix: Some("aruna_".to_string()),
@@ -261,6 +262,7 @@ mod test {
             },
             storage_handle.clone(),
             net_handle.clone(),
+            EgressPolicy::loopback(),
         )
         .await
         .unwrap();
