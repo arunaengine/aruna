@@ -26,8 +26,8 @@ use super::executor::{JobContext, JobRunOutcome, ProgressReporter, dispatch_payl
 use super::reconcile::ExternalReconciler;
 use super::store::{
     JobMutationError, ReleaseOutcome, RequeueOutcome, cancel_running_job, complete_job, fail_job,
-    flush_progress, handoff_external_attempt, iter_prefix_page, read_job_record, release_job,
-    renew_lease, requeue_job, transition_to_running,
+    flush_progress, handoff_external_attempt, iter_prefix_page, park_unreconciled, read_job_record,
+    release_job, renew_lease, requeue_job, transition_to_running,
 };
 use super::submit::schedule_job_drain_effect;
 use super::{
@@ -480,6 +480,7 @@ impl JobsRuntime {
     /// At startup every claimed/running holder is definitionally dead: re-queue the
     /// in-process ones. External attempts route to the reconcile hook instead, since a
     /// blind requeue would spawn a second container for a job that may still be running.
+    /// The restart itself costs them no attempt; only an adoption that fails does.
     pub async fn recover_stale_jobs(&self, storage: &StorageHandle) -> Result<usize, String> {
         let now_ms = unix_timestamp_millis();
         let mut job_ids = Vec::new();
@@ -534,11 +535,10 @@ impl JobsRuntime {
             )
             .await
             {
-                Ok(RequeueOutcome::NeedsReconcile(record)) => {
-                    if let Some(reconciler) = self.reconciler() {
-                        reconciler.reconcile_lost_attempt(storage, record).await;
-                    }
-                }
+                Ok(RequeueOutcome::NeedsReconcile(record)) => match self.reconciler() {
+                    Some(reconciler) => reconciler.reconcile_lost_attempt(storage, record).await,
+                    None => park_unreconciled(storage, &record, now_ms).await,
+                },
                 Ok(_) => recovered += 1,
                 Err(JobMutationError::NotFound) => {}
                 Err(error) => return Err(error.to_string()),
@@ -838,7 +838,8 @@ mod tests {
     use super::*;
     use crate::jobs::JOB_MAX_ATTEMPTS;
     use crate::jobs::store::{
-        ClaimOutcome, claim_job, complete_job, insert_job, list_job_entries, set_cancel_requested,
+        AdoptOutcome, ClaimOutcome, JobMutation, adopt_external_attempt, claim_job, complete_job,
+        insert_job, list_job_entries, mutate_job, record_attempt_intent, set_cancel_requested,
     };
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::ROCRATE_JOB_STATE_KEYSPACE;
@@ -1699,8 +1700,82 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(after.state, JobState::Running, "not requeued");
-        assert_eq!(after.attempts, 1, "the restart still spends an attempt");
+        assert_eq!(after.attempts, 0, "the restart spends no attempt");
         assert!(after.claim.is_some());
         assert_eq!(recorder.seen.lock().unwrap().as_slice(), &[job_id]);
+    }
+
+    struct AdoptingReconciler;
+
+    #[async_trait::async_trait]
+    impl ExternalReconciler for AdoptingReconciler {
+        async fn reconcile_lost_attempt(&self, storage: &StorageHandle, record: JobRecord) {
+            let outcome = adopt_external_attempt(
+                storage,
+                record.job_id,
+                record.owner_node_id,
+                unix_timestamp_millis(),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, AdoptOutcome::Adopted(..)), "must adopt");
+        }
+    }
+
+    // Rolling restarts must never exhaust JOB_MAX_ATTEMPTS on an external attempt whose
+    // container is still healthy and gets re-adopted every time.
+    #[tokio::test]
+    async fn recovery_spares_attempts() {
+        let (_dir, storage) = temp_storage();
+        let runtime = JobsRuntime::with_reconciler(Arc::new(AdoptingReconciler));
+        let job_id = JobId::from_bytes([0xE8; 16]);
+        let token = Ulid::generate();
+        let mut record = probe_record(job_id, 3, 0, None);
+        record.execution_class = JobExecutionClass::ExternalAttempt;
+        record.state = JobState::Running;
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id(3),
+            claim_token: token,
+            lease_expires_at_ms: unix_timestamp_millis() + 60_000,
+        });
+        insert_job(&storage, &record).await.unwrap();
+        record_attempt_intent(
+            &storage,
+            job_id,
+            token,
+            AttemptIntent {
+                attempt_no: 1,
+                external_name: "attempt".to_string(),
+                executor_kind: "docker".to_string(),
+                pinned_image: "alpine@sha256:digest".to_string(),
+                attempt_epoch: 0,
+            },
+            unix_timestamp_millis(),
+        )
+        .await
+        .unwrap();
+
+        for restart in 0..(JOB_MAX_ATTEMPTS + 2) {
+            expire_lease(&storage, job_id).await;
+            assert_eq!(runtime.recover_stale_jobs(&storage).await.unwrap(), 0);
+            let after = read_job_record(&storage, job_id, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.state, JobState::Running, "restart {restart}");
+            assert_eq!(after.attempts, 0, "restart {restart}");
+            assert!(after.claim.is_some(), "restart {restart}");
+        }
+    }
+
+    async fn expire_lease(storage: &StorageHandle, job_id: JobId) {
+        mutate_job(storage, job_id, |record| {
+            if let Some(claim) = record.claim.as_mut() {
+                claim.lease_expires_at_ms = 1;
+            }
+            Ok(JobMutation::Persist)
+        })
+        .await
+        .unwrap();
     }
 }

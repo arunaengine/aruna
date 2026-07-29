@@ -1001,8 +1001,10 @@ fn fail_capped(record: &mut JobRecord, now_ms: u64) {
 /// for the lease sweep and startup recovery. `require_expired_before` makes the sweep
 /// re-check, in-txn, that the job still holds an expired lease: a revived renew is not
 /// revoked, and a claim-less record (already requeued) is not charged a second attempt.
-/// A submitted external attempt that passes those checks is never requeued here; it
-/// returns `NeedsReconcile` untouched.
+/// A submitted external attempt that passes those checks is never requeued or charged
+/// here; it returns `NeedsReconcile` untouched, so a restart or hand-off whose adoption
+/// succeeds costs it nothing. Its cap is spent by the park that follows a failed
+/// adoption, which is what bounds a repeating failure.
 pub async fn requeue_job(
     storage: &StorageHandle,
     job_id: JobId,
@@ -1030,25 +1032,19 @@ pub async fn requeue_job(
                 return Ok(JobMutation::Skip);
             }
         }
+        // Checked AFTER the expired-lease re-check: a live renewed attempt is a
+        // plain Skip and must not be routed to the reconciler.
+        if record.execution_class == JobExecutionClass::ExternalAttempt
+            && record.attempt_intent.is_some()
+        {
+            needs_reconcile = true;
+            return Ok(JobMutation::Skip);
+        }
         if let Some(error) = error.clone() {
             record.last_error = Some(error);
         }
         record.attempts = record.attempts.saturating_add(1);
         record.updated_at_ms = now_ms;
-        // Checked AFTER the expired-lease re-check: a live renewed attempt is a
-        // plain Skip and must not be routed to the reconciler. Re-queuing would
-        // double-run the container, so a charged attempt goes to reconcile instead.
-        if record.execution_class == JobExecutionClass::ExternalAttempt
-            && record.attempt_intent.is_some()
-        {
-            if record.attempts >= JOB_MAX_ATTEMPTS {
-                fail_capped(record, now_ms);
-            } else {
-                needs_reconcile = true;
-            }
-            persisted = true;
-            return Ok(JobMutation::Persist);
-        }
         record.claim = None;
         if record.attempts >= JOB_MAX_ATTEMPTS
             && !matches!(&record.payload, JobPayload::TerminalCleanup { .. })
@@ -1561,8 +1557,8 @@ pub enum ParkOutcome {
 
 /// Park an ambiguous external attempt in `Indeterminate`, keeping the claim so the
 /// lease sweep later re-routes it to reconciliation. Exits only on evidence, or on
-/// the attempt cap: charging an attempt is what stops a condition that parks on
-/// every reconcile pass from retrying forever.
+/// the attempt cap. The park is the single charge point of a supervision cycle: an
+/// adoption that resumes supervision is free, one that fails here terminalizes.
 pub async fn mark_indeterminate(
     storage: &StorageHandle,
     job_id: JobId,
@@ -1582,7 +1578,6 @@ pub async fn mark_indeterminate(
             capped = true;
         } else {
             record.state = JobState::Indeterminate;
-            record.due_at_ms = now_ms.saturating_add(queue_retry_after_ms(record.attempts));
         }
         Ok(JobMutation::Persist)
     })
@@ -1593,6 +1588,25 @@ pub async fn mark_indeterminate(
     } else {
         ParkOutcome::Parked(record)
     })
+}
+
+/// Park an external attempt this node has no reconciler for. Without the charge its
+/// expired lease would be re-routed by every sweep forever.
+pub async fn park_unreconciled(storage: &StorageHandle, record: &JobRecord, now_ms: u64) {
+    let Some(token) = record.claim.as_ref().map(|claim| claim.claim_token) else {
+        return;
+    };
+    if let Err(error) = mark_indeterminate(
+        storage,
+        record.job_id,
+        token,
+        JobError::retryable("no external reconciler is available"),
+        now_ms,
+    )
+    .await
+    {
+        warn!(job_id = %record.job_id, error = %error, "Unreconciled attempt park failed");
+    }
 }
 
 /// Terminal `Failed` for an execution job, capturing the exit evidence in the
@@ -3298,7 +3312,7 @@ mod tests {
     }
 
     // An external attempt with an expired lease is never requeued; it is reconciled,
-    // but the sweep still charges the attempt so the cap can terminalize it.
+    // and the sweep leaves it untouched so a restart whose adoption succeeds is free.
     #[tokio::test]
     async fn external_never_requeued() {
         let (_dir, storage) = temp_storage();
@@ -3323,19 +3337,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.state, JobState::Running, "not requeued");
-        assert_eq!(stored.attempts, 1, "attempt charged");
+        assert_eq!(stored.attempts, 0, "attempt untouched");
         assert!(stored.claim.is_some(), "claim untouched");
     }
 
-    // The reconcile route must not exempt an attempt from the cap: once the last
-    // attempt is spent the sweep terminalizes it instead of routing it again.
+    // The effective retry budget of a park that repeats: one attempt per supervision
+    // cycle, because the sweep that re-routes the parked job never charges a second.
     #[tokio::test]
-    async fn external_sweep_caps() {
+    async fn park_sweep_budget() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([0xE4; 16]);
-        let mut record = execution_record(job_id, Ulid::generate(), JobState::Running);
+        let token = Ulid::generate();
+        let mut record = execution_record(job_id, token, JobState::Running);
         record.claim.as_mut().unwrap().lease_expires_at_ms = 1;
-        record.attempts = JOB_MAX_ATTEMPTS - 1;
         record.workspace_bucket = Some("ws-test".to_string());
         record.attempt_intent = Some(AttemptIntent {
             attempt_no: 1,
@@ -3346,25 +3360,49 @@ mod tests {
         });
         insert_job(&storage, &record).await.unwrap();
 
-        let outcome = requeue_job(&storage, job_id, None, 9_000, Some(9_000), None)
+        for cycle in 1..JOB_MAX_ATTEMPTS {
+            let parked = mark_indeterminate(
+                &storage,
+                job_id,
+                token,
+                JobError::retryable("attempt unobservable"),
+                6_000,
+            )
             .await
             .unwrap();
+            assert!(matches!(parked, ParkOutcome::Parked(_)), "cycle {cycle}");
+            let swept = requeue_job(&storage, job_id, None, 9_000, Some(9_000), None)
+                .await
+                .unwrap();
+            assert!(
+                matches!(swept, RequeueOutcome::NeedsReconcile(_)),
+                "cycle {cycle}"
+            );
+            let stored = read_job_record(&storage, job_id, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.attempts, cycle, "one charge per cycle");
+            assert_eq!(stored.state, JobState::Indeterminate);
+        }
 
-        assert!(matches!(outcome, RequeueOutcome::Failed(_)));
-        let stored = read_job_record(&storage, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored.state, JobState::Failed);
-        assert_eq!(stored.attempts, JOB_MAX_ATTEMPTS);
-        assert!(stored.claim.is_none());
-        assert!(
-            matches!(stored.result, Some(JobResultPayload::Execution { .. })),
-            "cleanup and the run crate need a result"
-        );
+        let capped = mark_indeterminate(
+            &storage,
+            job_id,
+            token,
+            JobError::retryable("attempt unobservable"),
+            7_000,
+        )
+        .await
+        .unwrap();
+        let ParkOutcome::Failed(failed) = capped else {
+            panic!("the last cycle must terminalize");
+        };
+        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(failed.attempts, JOB_MAX_ATTEMPTS);
     }
 
-    // Parking spends an attempt and terminalizes at the cap; without that a failure
+    // Parking spends the attempt and terminalizes at the cap; without that a failure
     // repeating on every reconcile pass re-drives the job forever.
     #[tokio::test]
     async fn park_spends_attempt() {
@@ -3389,11 +3427,6 @@ mod tests {
             };
             assert_eq!(parked.state, JobState::Indeterminate);
             assert_eq!(parked.attempts, attempt);
-            assert_eq!(
-                parked.due_at_ms,
-                6_000 + queue_retry_after_ms(attempt),
-                "each park backs the retry off"
-            );
         }
 
         let ParkOutcome::Failed(failed) = mark_indeterminate(

@@ -20,7 +20,7 @@ use tracing::warn;
 use super::reconcile::ExternalReconciler;
 use super::store::{
     ClaimOutcome, JobMutationError, RequeueOutcome, batch_delete, claim_job, first_schedule_entry,
-    iter_prefix_page, read_job_record, requeue_job,
+    iter_prefix_page, park_unreconciled, read_job_record, requeue_job,
 };
 use super::{JOB_DRAIN_BATCH_SIZE, JOB_RECONCILE_REARM};
 
@@ -109,8 +109,11 @@ pub async fn process_job_queue_batch(
                         .await
                         {
                             Ok(RequeueOutcome::NeedsReconcile(record)) => {
-                                if let Some(reconciler) = reconciler {
-                                    reconciler.reconcile_lost_attempt(storage, record).await;
+                                match reconciler {
+                                    Some(reconciler) => {
+                                        reconciler.reconcile_lost_attempt(storage, record).await;
+                                    }
+                                    None => park_unreconciled(storage, &record, now_ms).await,
                                 }
                                 result.reconciled = result.reconciled.saturating_add(1);
                             }
@@ -572,9 +575,8 @@ mod tests {
     }
 
     // An external attempt with an expired lease routes to the reconcile hook and is
-    // NOT requeued: no second container can be spawned. It still spends an attempt,
-    // and its lease row stays in place, so the re-arm must be floored to a non-zero
-    // delay instead of busy-looping.
+    // NOT requeued: no second container can be spawned. Its lease row stays in place,
+    // so the re-arm must be floored to a non-zero delay instead of busy-looping.
     #[tokio::test]
     async fn external_lease_reconciled() {
         let dir = tempdir().unwrap();
@@ -615,7 +617,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.state, JobState::Running, "not requeued");
-        assert_eq!(stored.attempts, 1, "the sweep charges the attempt");
+        assert_eq!(stored.attempts, 0, "the sweep charges nothing");
         assert!(stored.claim.is_some());
         // The hook saw exactly this job, proving no blind re-run path was taken.
         assert_eq!(recorder.seen.lock().unwrap().as_slice(), &[job_id]);

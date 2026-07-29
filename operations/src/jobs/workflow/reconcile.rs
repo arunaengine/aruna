@@ -108,8 +108,17 @@ impl ExternalReconciler for ComputeReconciler {
             attempt_epoch: intent.attempt_epoch,
             controller_generation: control.controller_generation,
         };
+        // Every unresolved exit below parks: the sweep that routed us here spends no
+        // attempt, so the park is what bounds a condition that never resolves.
         if let Err(error) = backend.fence(&fence).await {
             warn!(job_id = %job_id, error = %error, "Backend fence failed");
+            park_attempt(
+                &self.context,
+                job_id,
+                token,
+                JobError::retryable(format!("reconcile fence failed: {error}")),
+            )
+            .await;
             return;
         }
 
@@ -142,6 +151,13 @@ impl ExternalReconciler for ComputeReconciler {
             && let Err(error) = record_attempt_started(storage, job_id, token, started_at_ms).await
         {
             warn!(job_id = %job_id, error = %error, "Attempt start evidence write failed during adoption");
+            park_attempt(
+                &self.context,
+                job_id,
+                token,
+                JobError::retryable(format!("start evidence write failed: {error}")),
+            )
+            .await;
             return;
         }
         if matches!(
@@ -160,7 +176,16 @@ impl ExternalReconciler for ComputeReconciler {
             .await
             {
                 Ok(record) => record,
-                Err(_) => return,
+                Err(error) => {
+                    park_attempt(
+                        &self.context,
+                        job_id,
+                        token,
+                        JobError::retryable(format!("adopted attempt cannot run: {error}")),
+                    )
+                    .await;
+                    return;
+                }
             };
             if running.cancel_requested {
                 let _ = with_execution_heartbeat(
