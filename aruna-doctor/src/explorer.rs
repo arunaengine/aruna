@@ -1377,11 +1377,11 @@ mod tests {
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingSecretRecord};
     use aruna_core::structs::{
-        Actor, BackendLocation, BlobHeadKey, BlobVersion, BucketInfo, BucketReplicationConfig,
-        BucketReplicationTarget, Group, HashPathIndexKey, MultipartChecksumType,
-        MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
-        MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus, RealmConfigDocument,
-        RealmId,
+        Actor, BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,
+        BucketReplicationConfig, BucketReplicationTarget, Group, HashPathIndexKey,
+        MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
+        MultipartObjectSummary, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
+        MultipartUploadStatus, RealmConfigDocument, RealmId,
     };
     use aruna_net::dht::storage::StoredEntry;
     use chrono::{DateTime, Utc};
@@ -1748,6 +1748,8 @@ mod tests {
         let realm_id = RealmId::from_bytes([3_u8; 32]);
         let created_by = aruna_core::UserId::local(Ulid::generate(), realm_id);
         let upload = MultipartUpload {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             upload_id: Ulid::from_bytes([7_u8; 16]),
             bucket: "bucket-a".to_string(),
             key: "parts/big.bin".to_string(),
@@ -1784,6 +1786,8 @@ mod tests {
         let part = MultipartUploadPart {
             part_number: 5,
             location: BackendLocation {
+                backend: BackendRef::node_default(),
+                storage_class: None,
                 root: "/tmp".to_string(),
                 storage_bucket: "blob-bucket".to_string(),
                 backend_path: "multipart/part-5.bin".to_string(),
@@ -2080,6 +2084,8 @@ mod tests {
         .to_bytes()
         .unwrap();
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "blob-bucket".to_string(),
             backend_path: "path/blob.bin".to_string(),

@@ -687,8 +687,8 @@ mod test {
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     };
     use aruna_core::structs::{
-        BlobVersion, CurrentVersionPointer, PortableSourceDescriptor, RealmId, SourceConnectorKind,
-        StagingStrategy, VersionSourceBinding,
+        BackendRef, BlobVersion, CurrentVersionPointer, PortableSourceDescriptor, RealmId,
+        SourceConnectorKind, StagingStrategy, VersionSourceBinding,
     };
     use aruna_storage::storage;
     use std::collections::HashMap;
@@ -754,6 +754,8 @@ mod test {
         }
 
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: "path".to_string(),
@@ -1236,6 +1238,8 @@ mod test {
                     key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
                     key: hash.to_vec().into(),
                     value: BackendLocation {
+                        backend: BackendRef::node_default(),
+                        storage_class: None,
                         root: "/tmp".to_string(),
                         storage_bucket: "objects".to_string(),
                         backend_path: format!("path/{key}"),

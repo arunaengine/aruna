@@ -823,9 +823,9 @@ mod tests {
         AUTH_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
     use aruna_core::structs::{
-        Actor, AuthContext, BackendLocation, BlobVersion, BucketInfo, GroupAuthorizationDocument,
-        NodeCapabilities, RealmAuthorizationDocument, RealmId, SourceMetadata, VersionKey,
-        VersionedObjectArn,
+        Actor, AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo,
+        GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument, RealmId,
+        SourceMetadata, VersionKey, VersionedObjectArn,
     };
     use aruna_core::{NodeId, UserId};
     use aruna_operations::driver::DriverContext;
@@ -856,6 +856,8 @@ mod tests {
         hashes.insert("blake3".to_string(), blake3.to_vec());
         hashes.insert("sha256".to_string(), vec![0xabu8; 32]);
         BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: "blob.bin".to_string(),

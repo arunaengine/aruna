@@ -189,8 +189,8 @@ mod test {
     use aruna_core::keyspaces::{S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE};
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
-        Backend, BackendConfig, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
-        MultipartUploadStatus, RealmId,
+        Backend, BackendConfig, BackendRef, MultipartUpload, MultipartUploadPart,
+        MultipartUploadPartKey, MultipartUploadStatus, RealmId,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -277,6 +277,8 @@ mod test {
         user_id: UserId,
     ) {
         let record = MultipartUpload {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             upload_id,
             bucket: bucket.to_string(),
             key: key.to_string(),

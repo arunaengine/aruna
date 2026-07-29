@@ -1993,7 +1993,7 @@ mod tests {
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BlobVersion, BucketInfo, CurrentVersionPointer,
+        AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, CurrentVersionPointer,
         MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
         MultipartObjectSummary, PortableSourceDescriptor, RealmId, ReferenceHandling,
         ReplicationItemKind, ReplicationNegotiationResult, ReplicationSuboperationResult,
@@ -2126,6 +2126,8 @@ mod tests {
         let mut hashes = HashMap::new();
         hashes.insert("blake3".to_string(), vec![1u8; 32]);
         BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "blob-bucket".to_string(),
             backend_path: format!("bucket/key_{}", Ulid::generate()),

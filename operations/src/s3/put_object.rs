@@ -972,7 +972,7 @@ mod test {
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
     use aruna_core::structs::{
-        Backend, BackendConfig, BackendLocation, BlobHeadKey, BlobVersion, BucketInfo,
+        Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,
         CurrentVersionPointer, HashPathIndexKey, RealmId, UsageDelta, VersionKey,
     };
     use aruna_net::dht::storage::decode_entries;
@@ -1014,6 +1014,8 @@ mod test {
 
     fn test_location(created_by: aruna_core::UserId) -> BackendLocation {
         BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "bucket".to_string(),
             backend_path: "path".to_string(),
@@ -1693,6 +1695,8 @@ mod test {
         let version_id = Ulid::generate();
         op.version_id = Some(version_id);
         op.output = Some(Ok(BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "bucket".to_string(),
             backend_path: "path".to_string(),

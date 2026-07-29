@@ -6,7 +6,9 @@ use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::BackendStream;
 use aruna_core::stream::StreamError;
-use aruna_core::structs::{BackendLocation, HIDDEN_BLOB_PREFIX, HiddenBlobEntry, HiddenBlobKey};
+use aruna_core::structs::{
+    BackendLocation, BackendRef, HIDDEN_BLOB_PREFIX, HiddenBlobEntry, HiddenBlobKey,
+};
 use aruna_core::types::UserId;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
@@ -101,6 +103,8 @@ impl BlobHandler {
             Err(err) => return BlobEvent::Error(BlobError::ConversionError(err)),
         };
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: self.backend_config.root.clone(),
             storage_bucket: backend_bucket.clone(),
             backend_path,
@@ -180,6 +184,8 @@ impl BlobHandler {
             }
         };
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: self.backend_config.root.clone(),
             storage_bucket: backend_bucket.clone(),
             backend_path,
@@ -229,6 +235,8 @@ impl BlobHandler {
         };
         let ulid = Ulid::generate();
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: self.backend_config.root.clone(),
             storage_bucket: multipart_bucket.clone(),
             backend_path: build_multipart_part_path(upload_id, part_number, ulid),
@@ -270,6 +278,8 @@ impl BlobHandler {
             }
         };
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: self.backend_config.root.clone(),
             storage_bucket: backend_bucket.clone(),
             backend_path,
@@ -562,6 +572,7 @@ impl BlobHandler {
                     }
                 };
                 let key = match HiddenBlobKey::new(
+                    BackendRef::node_default(),
                     self.backend_config.root.clone(),
                     bucket.clone(),
                     backend_path,

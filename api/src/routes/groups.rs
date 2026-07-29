@@ -1394,7 +1394,7 @@ mod tests {
         GROUP_KEYSPACE, S3_BUCKET_KEYSPACE, USER_KEYSPACE,
     };
     use aruna_core::structs::{
-        Actor, AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BucketInfo,
+        Actor, AuthContext, BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,
         CurrentVersionPointer, Group, GroupAuthorizationDocument, NodeCapabilities,
         RealmAuthorizationDocument, RealmId, Role, User, VersionKey, blob_bucket_permission_path,
         blob_object_permission_path,
@@ -1700,6 +1700,8 @@ mod tests {
             BLOB_LOCATIONS_KEYSPACE,
             hash.to_vec(),
             BackendLocation {
+                backend: BackendRef::node_default(),
+                storage_class: None,
                 root: "/tmp".to_string(),
                 storage_bucket: "objects".to_string(),
                 backend_path: format!("path/{key}"),

@@ -3337,11 +3337,11 @@ mod tests {
         REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
     use aruna_core::structs::{
-        Actor, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
-        GroupAuthorizationDocument, NotificationClass, NotificationKind, NotificationRecord,
-        PortableSourceDescriptor, RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
-        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
-        WatchEventMask, WatchInterestEntry, WatchInterestTable,
+        Actor, BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BlobVersionState,
+        CurrentVersionPointer, GroupAuthorizationDocument, NotificationClass, NotificationKind,
+        NotificationRecord, PortableSourceDescriptor, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmNodeKind, SourceConnectorKind, SourceMetadata, StagingStrategy,
+        VersionKey, VersionSourceBinding, WatchEventMask, WatchInterestEntry, WatchInterestTable,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::{DriverContext, drive};
@@ -3958,6 +3958,8 @@ mod tests {
         hashes.insert(HASH_MD5.to_string(), vec![1u8; 16]);
 
         BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: "bucket/object".to_string(),
@@ -4166,6 +4168,8 @@ mod tests {
             .await;
 
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: format!("path/{key}"),

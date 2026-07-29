@@ -815,8 +815,8 @@ mod tests {
     use aruna_core::operation::Operation;
     use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BlobVersion, BucketInfo, RealmConfigDocument, RealmId,
-        RealmNodeKind, VersionedObjectArn,
+        AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, RealmConfigDocument,
+        RealmId, RealmNodeKind, VersionedObjectArn,
     };
     use aruna_core::types::Effects;
     use ulid::Ulid;
@@ -891,6 +891,8 @@ mod tests {
 
     fn location_value(hash: [u8; 32]) -> (BackendLocation, byteview::ByteView) {
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/data".to_string(),
             storage_bucket: "blob-0".to_string(),
             backend_path: "object".to_string(),

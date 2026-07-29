@@ -1,6 +1,6 @@
 use crate::errors::ConversionError;
-use crate::structs::BackendLocation;
 use crate::structs::checksum::{ChecksumAlgorithm, HASH_MD5};
+use crate::structs::{BackendLocation, BackendRef};
 use crate::types::{GroupId, UserId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -38,6 +38,10 @@ pub enum MultipartUploadStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MultipartUpload {
     pub upload_id: Ulid,
+    /// Backend pinned at CreateMultipartUpload; every part and the composed
+    /// object land here, so no later step re-runs routing.
+    pub backend: BackendRef,
+    pub storage_class: Option<String>,
     pub bucket: String,
     pub key: String,
     pub group_id: GroupId,

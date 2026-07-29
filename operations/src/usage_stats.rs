@@ -1719,7 +1719,7 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::s3::create_bucket::CreateBucketOperation;
     use aruna_core::structs::{
-        BlobHeadKey, BucketInfo, CurrentVersionPointer, PortableSourceDescriptor,
+        BackendRef, BlobHeadKey, BucketInfo, CurrentVersionPointer, PortableSourceDescriptor,
         SourceConnectorKind, SourceMetadata, StagingStrategy, VersionSourceBinding,
         usage_global_shard_keys,
     };
@@ -1740,6 +1740,8 @@ mod tests {
 
     fn location(blob_size: u64, staging: bool, partial: bool) -> BackendLocation {
         BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "bucket".to_string(),
             backend_path: "path".to_string(),

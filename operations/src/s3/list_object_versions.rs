@@ -701,7 +701,7 @@ mod test {
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::checksum::HASH_MD5;
     use aruna_core::structs::{
-        PortableSourceDescriptor, RealmId, SourceConnectorKind, StagingStrategy,
+        BackendRef, PortableSourceDescriptor, RealmId, SourceConnectorKind, StagingStrategy,
         VersionSourceBinding,
     };
     use aruna_storage::storage;
@@ -734,6 +734,8 @@ mod test {
         let mut hashes = HashMap::new();
         hashes.insert(HASH_MD5.to_string(), hash[..16].to_vec());
         BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: "path".to_string(),

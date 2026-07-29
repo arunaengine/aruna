@@ -3,7 +3,9 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_MULTIPART_UPLOAD_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{MultipartUpload, MultipartUploadChecksumHint, MultipartUploadStatus};
+use aruna_core::structs::{
+    BackendRef, MultipartUpload, MultipartUploadChecksumHint, MultipartUploadStatus,
+};
 use aruna_core::types::{Effects, GroupId, TxnId, UserId};
 use smallvec::smallvec;
 use std::collections::HashMap;
@@ -103,6 +105,8 @@ impl CreateMultipartUploadOperation {
         };
 
         let record = MultipartUpload {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             upload_id: Ulid::generate(),
             bucket: self.input.bucket.clone(),
             key: self.input.key.clone(),

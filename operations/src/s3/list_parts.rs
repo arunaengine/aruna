@@ -281,7 +281,7 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::structs::{BackendLocation, RealmId};
+    use aruna_core::structs::{BackendLocation, BackendRef, RealmId};
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -300,6 +300,8 @@ mod test {
 
     fn part_location() -> BackendLocation {
         BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "parts".to_string(),
             backend_path: "path".to_string(),
@@ -317,6 +319,8 @@ mod test {
 
     fn upload_record(upload_id: Ulid, bucket: &str, key: &str) -> MultipartUpload {
         MultipartUpload {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             upload_id,
             bucket: bucket.to_string(),
             key: key.to_string(),

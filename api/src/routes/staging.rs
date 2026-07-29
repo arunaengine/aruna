@@ -1304,7 +1304,7 @@ mod tests {
         BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
     use aruna_core::structs::{
-        Actor, BackendLocation, BlobHeadKey, BlobVersion, CurrentVersionPointer, Group,
+        Actor, BackendLocation, BackendRef, BlobHeadKey, BlobVersion, CurrentVersionPointer, Group,
         GroupAuthorizationDocument, NodeCapabilities, PathRestriction, PortableSourceDescriptor,
         RealmAuthorizationDocument, RealmConfigDocument, SourceConnectorKind, SourceMetadata,
         StagingStrategy, VersionKey, VersionSourceBinding,
@@ -1700,6 +1700,8 @@ mod tests {
         let created_by = test.auth_with_bucket_read.user_id;
         let materialized_hash = [21u8; 32];
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: "materialized".to_string(),

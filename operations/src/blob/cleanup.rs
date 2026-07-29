@@ -149,7 +149,7 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
-    use aruna_core::structs::{BackendLocation, BlobCleanupWork};
+    use aruna_core::structs::{BackendLocation, BackendRef, BlobCleanupWork};
     use aruna_core::types::UserId;
     use aruna_storage::storage::{FjallStorage, StorageHandle};
     use std::collections::HashMap;
@@ -175,6 +175,8 @@ mod tests {
         let realm_id = aruna_core::structs::RealmId::from_bytes([3u8; 32]);
         BlobCleanupWork::DeleteBlob {
             location: BackendLocation {
+                backend: BackendRef::node_default(),
+                storage_class: None,
                 root: "root".to_string(),
                 storage_bucket: "bucket".to_string(),
                 backend_path: "bucket/object".to_string(),

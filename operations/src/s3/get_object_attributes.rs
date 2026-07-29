@@ -464,8 +464,8 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
-    use aruna_core::structs::RealmId;
     use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5, HASH_SHA256};
+    use aruna_core::structs::{BackendRef, RealmId};
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -488,6 +488,8 @@ mod tests {
         hashes.insert(HASH_MD5.to_string(), vec![1; 16]);
         hashes.insert(HASH_SHA256.to_string(), vec![2; 32]);
         BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "mybucket".to_string(),
             backend_path: "hello.txt".to_string(),

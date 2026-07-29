@@ -15,7 +15,7 @@ use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB, HASH_PATHS_INDEX_KEYSPACE};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
-    Backend, BackendConfig, BackendLocation, BlobTimeoutConfig, HiddenBlobKey, RealmId,
+    Backend, BackendConfig, BackendLocation, BackendRef, BlobTimeoutConfig, HiddenBlobKey, RealmId,
     ResolvedSourceAccess, SourceConnectorKind,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -231,6 +231,8 @@ fn test_user_id() -> UserId {
 
 fn make_test_location() -> BackendLocation {
     BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
         root: "/tmp".to_string(),
         storage_bucket: "bucket".to_string(),
         backend_path: format!("blob/{}", Ulid::generate()),
@@ -995,6 +997,8 @@ async fn write_finalization_failure_emits_no_success_or_load() {
     let context = setup_blob_handle(1).await;
     let handler = context.blob_handle.handler.clone();
     let location = BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
         root: "/tmp".to_string(),
         storage_bucket: "finalization-bucket".to_string(),
         backend_path: format!("obj/{}", Ulid::generate()),
@@ -1030,6 +1034,8 @@ async fn failed_write_cleans() {
     let context = setup_blob_handle(1).await;
     let root = tempdir().unwrap();
     let location = BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
         root: root.path().to_str().unwrap().to_string(),
         storage_bucket: "bucket".to_string(),
         backend_path: "partial.bin".to_string(),
@@ -1091,6 +1097,8 @@ async fn compose_close_fails() {
     };
 
     let target = BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
         root: "/tmp".to_string(),
         storage_bucket: "compose-target".to_string(),
         backend_path: format!("obj/{}", Ulid::generate()),

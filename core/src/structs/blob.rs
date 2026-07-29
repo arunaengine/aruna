@@ -209,6 +209,10 @@ impl BlobCleanupWork {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BackendLocation {
+    pub backend: BackendRef,
+    /// Storage class resolved at write time. Stamped so no later recount ever
+    /// re-derives it from the node's current backends file.
+    pub storage_class: Option<String>,
     pub root: String,
     pub storage_bucket: String,
     pub backend_path: String,
@@ -276,6 +280,7 @@ impl BackendLocation {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct HiddenBlobKey {
+    pub backend: BackendRef,
     pub root: String,
     pub storage_bucket: String,
     pub backend_path: String,
@@ -283,11 +288,13 @@ pub struct HiddenBlobKey {
 
 impl HiddenBlobKey {
     pub fn new(
+        backend: BackendRef,
         root: String,
         storage_bucket: String,
         backend_path: String,
     ) -> Result<Self, ConversionError> {
         let key = Self {
+            backend,
             root,
             storage_bucket,
             backend_path,
@@ -336,6 +343,7 @@ impl TryFrom<&BackendLocation> for HiddenBlobKey {
 
     fn try_from(location: &BackendLocation) -> Result<Self, Self::Error> {
         Self::new(
+            location.backend.clone(),
             location.root.clone(),
             location.storage_bucket.clone(),
             location.backend_path.clone(),
@@ -793,7 +801,7 @@ impl UserAccess {
 #[cfg(test)]
 mod tests {
     use super::{
-        Backend, BlobHeadKey, BlobVersion, BucketCorsConfiguration, BucketCorsRule,
+        Backend, BackendRef, BlobHeadKey, BlobVersion, BucketCorsConfiguration, BucketCorsRule,
         CurrentVersionPointer, HashPathIndexKey, HiddenBlobKey, blob_bucket_permission_path,
         blob_group_permission_path, blob_object_permission_path,
     };
@@ -1046,6 +1054,8 @@ mod tests {
         use crate::structs::BackendLocation;
 
         let mut location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/data".to_string(),
             storage_bucket: "bucket".to_string(),
             backend_path: "object.bin".to_string(),
@@ -1074,9 +1084,36 @@ mod tests {
     }
 
     #[test]
+    fn location_keeps_stamp() {
+        use crate::structs::BackendLocation;
+
+        let location = BackendLocation {
+            backend: BackendRef::Group(Ulid::from_bytes([6u8; 16])),
+            storage_class: Some("cold".to_string()),
+            root: "/data".to_string(),
+            storage_bucket: "bucket".to_string(),
+            backend_path: "object.bin".to_string(),
+            ulid: Ulid::from_bytes([2u8; 16]),
+            compressed: false,
+            encrypted: false,
+            created_by: UserId::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 7,
+            hashes: HashMap::new(),
+        };
+
+        let restored = BackendLocation::from_bytes(&location.to_bytes().unwrap()).unwrap();
+
+        assert_eq!(location, restored);
+    }
+
+    #[test]
     fn hidden_key_validates() {
         let namespace = Ulid::from_bytes([4u8; 16]);
         let key = HiddenBlobKey::new(
+            BackendRef::node_default(),
             "/data".to_string(),
             "storage".to_string(),
             format!("_jobs/{namespace}/input_01"),
@@ -1099,8 +1136,13 @@ mod tests {
             "_jobs/01ARZ3NDEKTSV4RRFFQ69G5FAV/../escape",
         ] {
             assert!(
-                HiddenBlobKey::new("/data".to_string(), "storage".to_string(), path.to_string(),)
-                    .is_err()
+                HiddenBlobKey::new(
+                    BackendRef::node_default(),
+                    "/data".to_string(),
+                    "storage".to_string(),
+                    path.to_string(),
+                )
+                .is_err()
             );
         }
     }

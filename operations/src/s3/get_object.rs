@@ -717,10 +717,10 @@ mod test {
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        Backend, BackendConfig, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState,
-        CurrentVersionPointer, MultipartChecksumType, PortableSourceDescriptor, RealmId,
-        ResolvedSourceAccess, SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey,
-        VersionSourceBinding,
+        Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobVersion,
+        BlobVersionState, CurrentVersionPointer, MultipartChecksumType, PortableSourceDescriptor,
+        RealmId, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata, StagingStrategy,
+        VersionKey, VersionSourceBinding,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -809,6 +809,8 @@ mod test {
         });
         let txn_id = Ulid::generate();
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "aruna_test".to_string(),
             backend_path: "s3test/range.txt".to_string(),
@@ -986,6 +988,8 @@ mod test {
         let key = "test.txt".to_string();
         let blob_ulid = Ulid::generate();
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: temp_root.to_string(),
             storage_bucket: format!("aruna_{}", Ulid::generate()),
             backend_path: format!("{bucket}/{key}_{blob_ulid}"),
@@ -1135,6 +1139,8 @@ mod test {
         let key = "test.txt".to_string();
         let blob_ulid = Ulid::generate();
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: temp_root.to_string(),
             storage_bucket: format!("aruna_{}", Ulid::generate()),
             backend_path: format!("{bucket}/{key}_{blob_ulid}"),

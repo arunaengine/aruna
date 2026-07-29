@@ -536,9 +536,9 @@ mod tests {
     use aruna_core::structs::BackendLocation;
     use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5};
     use aruna_core::structs::{
-        Backend, BlobHeadKey, BlobVersion, CurrentVersionPointer, PortableSourceDescriptor,
-        ResolvedSourceAccess, SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey,
-        VersionSourceBinding,
+        Backend, BackendRef, BlobHeadKey, BlobVersion, CurrentVersionPointer,
+        PortableSourceDescriptor, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata,
+        StagingStrategy, VersionKey, VersionSourceBinding,
     };
     use aruna_net::{NetConfig, NetHandle};
     use std::collections::HashMap;
@@ -550,6 +550,8 @@ mod tests {
         hashes.insert(HASH_BLAKE3.to_string(), vec![2; 32]);
         hashes.insert(HASH_MD5.to_string(), vec![1; 16]);
         BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "mybucket".to_string(),
             backend_path: "hello.txt".to_string(),

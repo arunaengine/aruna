@@ -1365,7 +1365,7 @@ fn composite_digest_for_algorithm(algorithm: ChecksumAlgorithm, bytes: &[u8]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::MultipartUploadChecksumHint;
+    use aruna_core::structs::{BackendRef, MultipartUploadChecksumHint};
     use aruna_core::task::{TaskEffect, TaskKey};
 
     fn finalize_input() -> CompleteMultipartUploadInput {
@@ -1389,6 +1389,8 @@ mod tests {
 
     fn open_upload_record(input: &CompleteMultipartUploadInput) -> MultipartUpload {
         MultipartUpload {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             upload_id: input.upload_id,
             bucket: input.bucket.clone(),
             key: input.key.clone(),
@@ -1405,6 +1407,8 @@ mod tests {
         MultipartUploadPart {
             part_number,
             location: BackendLocation {
+                backend: BackendRef::node_default(),
+                storage_class: None,
                 root: "/tmp".to_string(),
                 storage_bucket: "multipart".to_string(),
                 backend_path: format!("part-{part_number}"),
@@ -1605,6 +1609,8 @@ mod tests {
         let requested = part_record(1, 10);
         let omitted = part_record(2, 20);
         op.final_location = Some(BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: "object".to_string(),
@@ -1647,6 +1653,8 @@ mod tests {
         let input = finalize_input();
         let mut op = CompleteMultipartUploadOperation::new(input);
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: "object".to_string(),
