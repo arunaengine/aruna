@@ -1049,8 +1049,7 @@ pub async fn requeue_job(
         if record.attempts >= JOB_MAX_ATTEMPTS
             && !matches!(&record.payload, JobPayload::TerminalCleanup { .. })
         {
-            record.state = JobState::Failed;
-            record.finished_at_ms = Some(now_ms);
+            fail_capped(record, now_ms);
         } else {
             record.state = JobState::Queued;
             record.due_at_ms = now_ms.saturating_add(queue_retry_after_ms(record.attempts));
@@ -1722,8 +1721,7 @@ pub async fn requeue_before_attempt(
         record.claim = None;
         record.attempt_intent = None;
         if record.attempts >= JOB_MAX_ATTEMPTS {
-            record.state = JobState::Failed;
-            record.finished_at_ms = Some(now_ms);
+            fail_capped(record, now_ms);
         } else {
             record.state = JobState::Queued;
             record.due_at_ms = now_ms.saturating_add(queue_retry_after_ms(record.attempts));
@@ -3448,6 +3446,52 @@ mod tests {
             matches!(failed.result, Some(JobResultPayload::Execution { .. })),
             "cleanup and the run crate need a result"
         );
+    }
+
+    // Every cap site must leave the result payload terminal cleanup and the run crate
+    // read, not just the park that `fail_capped` was introduced for.
+    #[tokio::test]
+    async fn cap_sites_result() {
+        let (_dir, storage) = temp_storage();
+        let swept = JobId::from_bytes([0xE6; 16]);
+        let token = Ulid::generate();
+        let mut record = execution_record(swept, token, JobState::Ready);
+        record.claim.as_mut().unwrap().lease_expires_at_ms = 1;
+        record.attempts = JOB_MAX_ATTEMPTS - 1;
+        record.workspace_bucket = Some("ws-test".to_string());
+        insert_job(&storage, &record).await.unwrap();
+        let presubmit = JobId::from_bytes([0xE9; 16]);
+        let mut record = execution_record(presubmit, token, JobState::Ready);
+        record.attempts = JOB_MAX_ATTEMPTS - 1;
+        record.workspace_bucket = Some("ws-test".to_string());
+        insert_job(&storage, &record).await.unwrap();
+
+        let RequeueOutcome::Failed(failed) =
+            requeue_job(&storage, swept, None, 9_000, Some(9_000), None)
+                .await
+                .unwrap()
+        else {
+            panic!("the sweep must terminalize at the cap");
+        };
+        assert!(matches!(
+            failed.result,
+            Some(JobResultPayload::Execution { .. })
+        ));
+
+        let failed = requeue_before_attempt(
+            &storage,
+            presubmit,
+            token,
+            9_000,
+            JobError::retryable("image pull failed"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed.state, JobState::Failed);
+        assert!(matches!(
+            failed.result,
+            Some(JobResultPayload::Execution { .. })
+        ));
     }
 
     #[tokio::test]
