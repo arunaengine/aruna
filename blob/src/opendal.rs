@@ -37,10 +37,6 @@ pub(crate) fn init_backend_operator(
             build_service::<services::S3>(s3_operator_config(config.service_config), None)
                 .map_err(blob_operator_creation_error)
         }
-        Backend::HTTP => build_service::<services::Http>(config.service_config, None)
-            .map_err(blob_operator_creation_error),
-        Backend::Postgres => build_service::<services::Postgresql>(config.service_config, None)
-            .map_err(blob_operator_creation_error),
         Backend::FileSystem => build_service::<services::Fs>(config.service_config, None)
             .map_err(blob_operator_creation_error),
     }
@@ -52,11 +48,6 @@ pub(crate) fn init_operator(
 ) -> Result<Operator, BlobError> {
     match backend_type {
         Backend::S3 => build_service::<services::S3>(s3_operator_config(config), None)
-            .map_err(blob_operator_creation_error),
-        Backend::HTTP => {
-            build_service::<services::Http>(config, None).map_err(blob_operator_creation_error)
-        }
-        Backend::Postgres => build_service::<services::Postgresql>(config, None)
             .map_err(blob_operator_creation_error),
         Backend::FileSystem => {
             build_service::<services::Fs>(config, None).map_err(blob_operator_creation_error)

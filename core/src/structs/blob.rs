@@ -49,8 +49,6 @@ pub fn ensure_confined_relative_path(path: &Path) -> Result<(), ConversionError>
 pub enum Backend {
     #[default]
     S3,
-    HTTP,
-    Postgres,
     FileSystem,
 }
 
@@ -60,8 +58,6 @@ impl FromStr for Backend {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "s3" => Ok(Backend::S3),
-            "http" => Ok(Backend::HTTP),
-            "postgres" => Ok(Backend::Postgres),
             "filesystem" => Ok(Backend::FileSystem),
             _ => Err(ConversionError::FromStrError(format!(
                 "unknown backend {}",
@@ -75,8 +71,6 @@ impl Display for Backend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Backend::S3 => write!(f, "s3"),
-            Backend::HTTP => write!(f, "http"),
-            Backend::Postgres => write!(f, "postgres"),
             Backend::FileSystem => write!(f, "filesystem"),
         }
     }
@@ -745,9 +739,9 @@ impl UserAccess {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlobHeadKey, BlobVersion, BucketCorsConfiguration, BucketCorsRule, CurrentVersionPointer,
-        HashPathIndexKey, HiddenBlobKey, blob_bucket_permission_path, blob_group_permission_path,
-        blob_object_permission_path,
+        Backend, BlobHeadKey, BlobVersion, BucketCorsConfiguration, BucketCorsRule,
+        CurrentVersionPointer, HashPathIndexKey, HiddenBlobKey, blob_bucket_permission_path,
+        blob_group_permission_path, blob_object_permission_path,
     };
     use crate::NodeId;
     use crate::structs::{
@@ -759,6 +753,20 @@ mod tests {
     use std::str::FromStr;
     use std::time::SystemTime;
     use ulid::Ulid;
+
+    #[test]
+    fn parses_backend_names() {
+        // The backends file accepts these two spellings and nothing else.
+        assert_eq!(Backend::from_str("s3").unwrap(), Backend::S3);
+        assert_eq!(
+            Backend::from_str("filesystem").unwrap(),
+            Backend::FileSystem
+        );
+        assert_eq!(Backend::S3.to_string(), "s3");
+        assert_eq!(Backend::FileSystem.to_string(), "filesystem");
+        Backend::from_str("http").unwrap_err();
+        Backend::from_str("postgres").unwrap_err();
+    }
 
     // The S3 auth layer rejects revoked/expired credentials via these predicates.
     #[test]
