@@ -67,7 +67,7 @@ mod test {
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::{Backend, BackendConfig, RealmId};
+    use aruna_core::structs::{Backend, BackendConfig, RealmId, RoutingSnapshot};
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use std::collections::HashMap;
@@ -139,6 +139,7 @@ mod test {
                 version_source: None,
                 preassigned_version_id: None,
                 quota_ceiling: None,
+                routing: RoutingSnapshot::single(group_id),
             }),
             context,
         )

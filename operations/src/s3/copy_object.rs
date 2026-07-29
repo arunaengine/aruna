@@ -1,4 +1,4 @@
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, routing_snapshot};
 use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use aruna_core::UserId;
@@ -196,6 +196,7 @@ pub async fn copy_object(
             version_source,
             preassigned_version_id: None,
             quota_ceiling: input.quota_ceiling,
+            routing: routing_snapshot(context, input.group_id),
         })
         .with_metadata(metadata),
         context,
@@ -317,6 +318,7 @@ mod test {
             version_source: None,
             preassigned_version_id: None,
             quota_ceiling: None,
+            routing: aruna_core::structs::RoutingSnapshot::single(group_id),
         }
     }
 

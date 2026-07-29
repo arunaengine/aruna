@@ -328,21 +328,19 @@ impl BlobHandler {
             BlobEffect::Write {
                 bucket,
                 key,
+                resolved,
                 created_by,
                 blob,
-            } => {
-                let resolved = self.registry.default_resolved();
-                Box::pin(self.write_blob(&bucket, &key, resolved, created_by, blob)).await
-            }
+            } => Box::pin(self.write_blob(&bucket, &key, resolved, created_by, blob)).await,
             BlobEffect::WritePart {
                 upload_id,
                 part_number,
+                resolved,
                 created_by,
                 compressed,
                 encrypted,
                 blob,
             } => {
-                let resolved = self.registry.default_resolved();
                 Box::pin(self.write_blob_part(
                     MultipartUploadPartKey::new(upload_id, part_number),
                     resolved,
@@ -356,12 +354,10 @@ impl BlobHandler {
             BlobEffect::Compose {
                 bucket,
                 key,
+                resolved,
                 created_by,
                 parts,
-            } => {
-                let resolved = self.registry.default_resolved();
-                Box::pin(self.compose_blob(&bucket, &key, resolved, created_by, parts)).await
-            }
+            } => Box::pin(self.compose_blob(&bucket, &key, resolved, created_by, parts)).await,
             BlobEffect::Read { location } => Box::pin(self.read_blob(location)).await,
             BlobEffect::ReadRange { location, range } => {
                 Box::pin(self.read_blob_range(location, range)).await
@@ -401,10 +397,16 @@ impl BlobHandler {
             BlobEffect::HandleReplication {
                 replication_id,
                 stream_id,
+                resolved,
                 keep_alive,
             } => {
-                Box::pin(self.handle_incoming_replication(replication_id, stream_id, keep_alive))
-                    .await
+                Box::pin(self.handle_incoming_replication(
+                    replication_id,
+                    stream_id,
+                    resolved,
+                    keep_alive,
+                ))
+                .await
             }
             BlobEffect::ServeRead {
                 stream_id,

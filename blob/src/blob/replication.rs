@@ -11,7 +11,7 @@ use crate::messages::{MessageType, ReplicationMessage};
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::BackendLocation;
+use aruna_core::structs::{BackendLocation, ResolvedBackend};
 use bao_tree::io::fsm::{CreateOutboard, decode_ranges, encode_ranges_validated};
 use bao_tree::io::outboard::PreOrderOutboard;
 use bao_tree::io::round_up_to_chunks;
@@ -246,6 +246,7 @@ impl BlobHandler {
         &self,
         replication_id: Option<Ulid>,
         stream_id: Ulid,
+        resolved: ResolvedBackend,
         keep_alive: bool,
     ) -> BlobEvent {
         let (_replication_id, root, mut location) = {
@@ -287,8 +288,6 @@ impl BlobHandler {
 
         // Reserved before the replica is written so a stats failure never
         // orphans bytes a retry would rewrite under a fresh ulid.
-        // A receiver never adopts the sender's backend; it writes to its own.
-        let resolved = self.registry.default_resolved();
         let backend_root = match self.registry.config_for(&resolved.backend) {
             Ok(config) => config.root.clone(),
             Err(err) => return BlobEvent::Error(err),

@@ -19,9 +19,11 @@ use aruna_core::structs::{
     ArunaArn, AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
     CurrentVersionPointer, MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
     PortableSourceDescriptor, ReferenceHandling, ReplicationItemKind, ReplicationNegotiationResult,
-    ReplicationSuboperationResult, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata,
-    StagingStrategy, SyncMode, SyncRelationship, VersionKey, VersionSourceBinding, sync_state_key,
+    ReplicationSuboperationResult, ResolvedSourceAccess, RoutingError, SourceConnectorKind,
+    SourceMetadata, StagingStrategy, SyncMode, SyncRelationship, VersionKey, VersionSourceBinding,
+    sync_state_key,
 };
+use aruna_core::structs::{NodeRouting, resolve_backend};
 use aruna_core::types::{Effects, GroupId, Key, NodeId};
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
@@ -180,6 +182,7 @@ pub struct ReplicateScopeOperation {
     source_group_id: Option<GroupId>,
     sync: Option<SyncTransferContext>,
     pending_versions: Vec<VersionReplicationRequest>,
+    routing: NodeRouting,
     result: ReplicateScopeResult,
     output: Option<Result<ReplicateScopeResult, ReplicateScopeError>>,
 }
@@ -195,6 +198,7 @@ impl ReplicateScopeOperation {
             source_group_id: None,
             sync: None,
             pending_versions: Vec::new(),
+            routing: NodeRouting::default(),
             result: ReplicateScopeResult {
                 replicated: 0,
                 replicated_bytes: 0,
@@ -204,6 +208,12 @@ impl ReplicateScopeOperation {
             },
             output: None,
         }
+    }
+
+    /// Node-local routing, forwarded to every version sub-operation.
+    pub fn with_routing(mut self, routing: NodeRouting) -> Self {
+        self.routing = routing;
+        self
     }
 
     pub fn with_relationship(
@@ -437,9 +447,13 @@ impl ReplicateScopeOperation {
                     return self.run_next_replication();
                 };
                 sync.target_prefix = Some(target_key);
-                ReplicateObjectVersionOperation::new(request).with_sync(sync)
+                ReplicateObjectVersionOperation::new(request)
+                    .with_routing(self.routing.clone())
+                    .with_sync(sync)
             }
-            None => ReplicateObjectVersionOperation::new(request),
+            None => {
+                ReplicateObjectVersionOperation::new(request).with_routing(self.routing.clone())
+            }
         };
         smallvec![Effect::SubOperation(boxed_suboperation(
             operation,
@@ -709,6 +723,8 @@ impl Operation for ReplicateScopeOperation {
 #[derive(Debug, Error, PartialEq)]
 pub enum ReplicateObjectVersionError {
     #[error(transparent)]
+    RoutingFailed(#[from] RoutingError),
+    #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
@@ -772,6 +788,7 @@ pub struct ReplicateObjectVersionOperation {
     reference_access: Option<ResolvedSourceAccess>,
     reference_metadata: Option<SourceMetadata>,
     sync: Option<SyncTransferContext>,
+    routing: NodeRouting,
     result: Result<ReplicationSuboperationResult, ReplicateObjectVersionError>,
 }
 
@@ -793,8 +810,14 @@ impl ReplicateObjectVersionOperation {
             reference_access: None,
             reference_metadata: None,
             sync: None,
+            routing: NodeRouting::default(),
             result: Ok(ReplicationSuboperationResult::Replicated),
         }
+    }
+
+    pub fn with_routing(mut self, routing: NodeRouting) -> Self {
+        self.routing = routing;
+        self
     }
 
     fn with_sync(mut self, sync: SyncTransferContext) -> Self {
@@ -1160,12 +1183,26 @@ impl ReplicateObjectVersionOperation {
                     "Read on-demand reference source content"
                 );
 
+                let created_by = *created_by;
+                // This node materializes the reference locally, so it routes
+                // with its own snapshot, never the peer's.
+                let resolved = match resolve_backend(
+                    &self.routing.snapshot(self.request.source_group_id),
+                    &self.request.bucket,
+                    &self.request.key,
+                ) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        return self.fail(ReplicateObjectVersionError::RoutingFailed(error));
+                    }
+                };
                 self.reference_metadata = Some(source_metadata);
                 self.state = ReplicateObjectVersionState::WriteReferenceBlob;
                 smallvec![Effect::Blob(BlobEffect::Write {
                     bucket: self.request.bucket.clone(),
                     key: self.request.key.clone(),
-                    created_by: *created_by,
+                    resolved,
+                    created_by,
                     blob: stream,
                 })]
             }

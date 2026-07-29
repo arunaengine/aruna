@@ -190,7 +190,7 @@ mod test {
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
         Backend, BackendConfig, BackendRef, MultipartUpload, MultipartUploadPart,
-        MultipartUploadPartKey, MultipartUploadStatus, RealmId,
+        MultipartUploadPartKey, MultipartUploadStatus, RealmId, RoutingSnapshot,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -259,6 +259,7 @@ mod test {
                 version_source: None,
                 preassigned_version_id: None,
                 quota_ceiling: None,
+                routing: RoutingSnapshot::single(group_id),
             }),
             context,
         )

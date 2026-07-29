@@ -846,8 +846,8 @@ mod test {
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
         Backend, BackendConfig, BlobHeadKey, BlobVersion, CurrentVersionPointer, HashPathIndexKey,
-        PortableSourceDescriptor, RealmId, SourceConnectorKind, SourceMetadata, StagingStrategy,
-        VersionKey, VersionSourceBinding,
+        PortableSourceDescriptor, RealmId, RoutingSnapshot, SourceConnectorKind, SourceMetadata,
+        StagingStrategy, VersionKey, VersionSourceBinding,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -1168,6 +1168,7 @@ mod test {
                 version_source: None,
                 preassigned_version_id: None,
                 quota_ceiling: None,
+                routing: RoutingSnapshot::single(group_id),
             }),
             &context,
         )
@@ -1321,6 +1322,7 @@ mod test {
                 version_source: None,
                 preassigned_version_id: None,
                 quota_ceiling: None,
+                routing: RoutingSnapshot::single(group_id),
             }),
             &context,
         )

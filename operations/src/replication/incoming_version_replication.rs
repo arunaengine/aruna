@@ -25,9 +25,10 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
-    CurrentVersionPointer, MultipartObjectMetadataKey, Permission, RealmConfigDocument, RealmId,
-    ReplicationItemKind, ReplicationNegotiationResult, RoCrateLimits, UsageDelta, VersionKey,
-    blob_bucket_permission_path, blob_object_permission_path,
+    CurrentVersionPointer, MultipartObjectMetadataKey, NodeRouting, Permission,
+    RealmConfigDocument, RealmId, ReplicationItemKind, ReplicationNegotiationResult, RoCrateLimits,
+    RoutingError, UsageDelta, VersionKey, blob_bucket_permission_path, blob_object_permission_path,
+    resolve_backend,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, NodeId};
@@ -81,6 +82,8 @@ enum IncomingVersionReplicationState {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum IncomingVersionReplicationError {
+    #[error(transparent)]
+    RoutingFailed(#[from] RoutingError),
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -168,6 +171,7 @@ pub struct IncomingVersionReplicationOperation {
     apply_committed: bool,
     output: Option<Result<IncomingVersionReplicationResult, IncomingVersionReplicationError>>,
     rocrate_limits: RoCrateLimits,
+    routing: NodeRouting,
 }
 
 impl IncomingVersionReplicationOperation {
@@ -205,7 +209,14 @@ impl IncomingVersionReplicationOperation {
             apply_committed: false,
             output: None,
             rocrate_limits: RoCrateLimits::default(),
+            routing: NodeRouting::default(),
         }
+    }
+
+    /// Node-local routing, so this receiver picks its own backend.
+    pub fn with_routing(mut self, routing: NodeRouting) -> Self {
+        self.routing = routing;
+        self
     }
 
     pub fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
@@ -605,10 +616,21 @@ impl IncomingVersionReplicationOperation {
     }
 
     fn receive_blob(&mut self) -> Effects {
+        // The receiver routes with its own snapshot; the sender's stamped
+        // backend crossed the wire but is ignored.
+        let resolved = match resolve_backend(
+            &self.routing.snapshot(self.manifest.group_id),
+            &self.manifest.bucket,
+            &self.manifest.key,
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => return self.fail(IncomingVersionReplicationError::RoutingFailed(error)),
+        };
         self.state = IncomingVersionReplicationState::ReceiveBlob;
         smallvec![Effect::Blob(BlobEffect::HandleReplication {
             replication_id: None,
             stream_id: self.stream_id,
+            resolved,
             keep_alive: true,
         })]
     }

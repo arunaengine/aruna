@@ -479,8 +479,9 @@ mod tests {
     };
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
-        BlobHeadKey, BlobVersion, CurrentVersionPointer, HashPathIndexKey, SourceConnectorKind,
-        SourceConnectorSecret, UsageCounters, usage_global_key_for_group, usage_group_key,
+        BlobHeadKey, BlobVersion, CurrentVersionPointer, HashPathIndexKey, RoutingSnapshot,
+        SourceConnectorKind, SourceConnectorSecret, UsageCounters, usage_global_key_for_group,
+        usage_group_key,
     };
     use aruna_storage::storage;
     use axum::{Router, routing::get};
@@ -799,6 +800,7 @@ mod tests {
                 version_source: None,
                 preassigned_version_id: None,
                 quota_ceiling: None,
+                routing: RoutingSnapshot::single(group_id),
             }),
             context,
         )

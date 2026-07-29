@@ -4,7 +4,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_MULTIPART_UPLOAD_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    BackendRef, MultipartUpload, MultipartUploadChecksumHint, MultipartUploadStatus,
+    MultipartUpload, MultipartUploadChecksumHint, MultipartUploadStatus, RoutingError,
+    RoutingSnapshot, resolve_backend,
 };
 use aruna_core::types::{Effects, GroupId, TxnId, UserId};
 use smallvec::smallvec;
@@ -37,6 +38,8 @@ pub enum CreateMultipartUploadError {
         expected: &'static str,
         received: Event,
     },
+    #[error(transparent)]
+    RoutingFailed(#[from] RoutingError),
     #[error("CreateMultipartUpload failed")]
     CreateMultipartUploadFailed,
 }
@@ -48,6 +51,9 @@ pub struct CreateMultipartUploadInput {
     pub group_id: GroupId,
     pub created_by: UserId,
     pub checksum_hint: Option<MultipartUploadChecksumHint>,
+    /// Routing inputs; the resolved backend is pinned on the upload record so
+    /// every part and the composed object follow it.
+    pub routing: RoutingSnapshot,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,9 +110,14 @@ impl CreateMultipartUploadOperation {
             });
         };
 
+        let resolved =
+            match resolve_backend(&self.input.routing, &self.input.bucket, &self.input.key) {
+                Ok(resolved) => resolved,
+                Err(error) => return self.emit_error(error.into()),
+            };
         let record = MultipartUpload {
-            backend: BackendRef::node_default(),
-            storage_class: None,
+            backend: resolved.backend,
+            storage_class: resolved.storage_class,
             upload_id: Ulid::generate(),
             bucket: self.input.bucket.clone(),
             key: self.input.key.clone(),
@@ -213,5 +224,87 @@ impl Operation for CreateMultipartUploadOperation {
             .map_or_else(smallvec::SmallVec::new, |txn_id| {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CreateMultipartUploadError, CreateMultipartUploadInput, CreateMultipartUploadOperation,
+    };
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::operation::Operation;
+    use aruna_core::structs::{
+        BackendCatalog, BackendRef, MultipartUpload, RoutingError, RoutingSnapshot, RoutingTarget,
+        StorageRoutingRule,
+    };
+    use aruna_core::types::TxnId;
+    use ulid::Ulid;
+
+    fn input(snapshot: RoutingSnapshot) -> CreateMultipartUploadInput {
+        CreateMultipartUploadInput {
+            bucket: "bucket".to_string(),
+            key: "archive/one".to_string(),
+            group_id: snapshot.group_id,
+            created_by: aruna_core::UserId::default(),
+            checksum_hint: None,
+            routing: snapshot,
+        }
+    }
+
+    fn snapshot() -> RoutingSnapshot {
+        RoutingSnapshot::new(
+            Ulid::generate(),
+            BackendCatalog::new("default")
+                .with_backend("default", None)
+                .with_backend("tape", Some("archive".to_string())),
+        )
+    }
+
+    fn rule(class: &str) -> StorageRoutingRule {
+        StorageRoutingRule {
+            key_prefix: String::new(),
+            exact: false,
+            target: RoutingTarget::Class(class.to_string()),
+        }
+    }
+
+    #[test]
+    fn pins_backend_on_record() {
+        let snapshot = snapshot().with_bucket_rules(vec![rule("archive")]);
+        let mut operation = CreateMultipartUploadOperation::new(input(snapshot));
+        operation.start();
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected one record write, got {effects:?}")
+        };
+        let record = MultipartUpload::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(record.backend, BackendRef::Node("tape".to_string()));
+        assert_eq!(record.storage_class.as_deref(), Some("archive"));
+    }
+
+    #[test]
+    fn missing_class_aborts() {
+        let snapshot = snapshot().with_bucket_rules(vec![rule("glacier")]);
+        let mut operation = CreateMultipartUploadOperation::new(input(snapshot));
+        operation.start();
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(CreateMultipartUploadError::RoutingFailed(
+                RoutingError::ClassUnavailable(_)
+            ))
+        ));
     }
 }

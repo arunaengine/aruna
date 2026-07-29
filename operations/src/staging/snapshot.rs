@@ -1,4 +1,4 @@
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, routing_snapshot};
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::descriptor::build_version_source_binding;
 use crate::staging::read_source::{
@@ -119,6 +119,7 @@ pub async fn materialize_snapshot(
             version_source: Some(version_source.clone()),
             preassigned_version_id: None,
             quota_ceiling: input.quota_ceiling,
+            routing: routing_snapshot(context, input.group_id),
         })
         .with_bucket_guard(input.expected_bucket),
         context,

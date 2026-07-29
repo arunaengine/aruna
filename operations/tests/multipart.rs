@@ -14,7 +14,7 @@ use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::{
     Backend, BackendConfig, BlobHeadKey, BlobVersion, CurrentVersionPointer, HashPathIndexKey,
     MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
-    MultipartUploadChecksumHint, MultipartUploadPartKey, RealmId, VersionKey,
+    MultipartUploadChecksumHint, MultipartUploadPartKey, RealmId, RoutingSnapshot, VersionKey,
 };
 use aruna_net::dht::storage::decode_entries;
 use aruna_net::{NetConfig, NetHandle};
@@ -150,6 +150,7 @@ async fn create_upload(
             group_id,
             created_by,
             checksum_hint: None,
+            routing: RoutingSnapshot::single(group_id),
         }),
         &context.driver,
     )
@@ -252,6 +253,7 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
                 algorithm: Some(ChecksumAlgorithm::Sha256),
                 checksum_type: MultipartChecksumType::Composite,
             }),
+            routing: RoutingSnapshot::single(group_id),
         }),
         &context.driver,
     )
@@ -542,6 +544,7 @@ async fn rejects_missing_checksum() {
                 algorithm: Some(ChecksumAlgorithm::Sha256),
                 checksum_type: MultipartChecksumType::Composite,
             }),
+            routing: RoutingSnapshot::single(Ulid::generate()),
         }),
         &context.driver,
     )
@@ -602,6 +605,7 @@ async fn upload_part_overwrites_existing_part_and_cleans_old_blob() {
             group_id: Ulid::generate(),
             created_by,
             checksum_hint: None,
+            routing: RoutingSnapshot::single(Ulid::generate()),
         }),
         &context.driver,
     )
@@ -683,6 +687,7 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
             version_source: None,
             preassigned_version_id: None,
             quota_ceiling: None,
+            routing: RoutingSnapshot::single(group_id),
         }),
         &context.driver,
     )
@@ -698,6 +703,7 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
             group_id,
             created_by,
             checksum_hint: None,
+            routing: RoutingSnapshot::single(group_id),
         }),
         &context.driver,
     )
@@ -983,6 +989,7 @@ async fn multipart_completion_deduplicates_against_existing_put_object() {
             version_source: None,
             preassigned_version_id: None,
             quota_ceiling: None,
+            routing: RoutingSnapshot::single(group_id),
         }),
         &context.driver,
     )
@@ -1188,6 +1195,7 @@ async fn abort_multipart_upload_removes_metadata_and_part_blobs() {
             group_id: Ulid::generate(),
             created_by,
             checksum_hint: None,
+            routing: RoutingSnapshot::single(Ulid::generate()),
         }),
         &context.driver,
     )
@@ -1264,6 +1272,7 @@ async fn upload_part_checksum_mismatch_cleans_up_raw_part() {
             group_id: Ulid::generate(),
             created_by,
             checksum_hint: None,
+            routing: RoutingSnapshot::single(Ulid::generate()),
         }),
         &context.driver,
     )
@@ -1332,6 +1341,7 @@ async fn delete_object_removes_completed_multipart_metadata() {
             group_id: Ulid::generate(),
             created_by,
             checksum_hint: None,
+            routing: RoutingSnapshot::single(Ulid::generate()),
         }),
         &context.driver,
     )

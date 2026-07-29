@@ -23,7 +23,7 @@ use aruna_core::structs::{
     ImportRoCrateSpec, ImportRoCrateTarget, JobId, JobPayload, JobRecord, JobResultPayload,
     MetadataRegistryRecord, PathRestriction, Permission, RealmAuthorizationDocument,
     RealmConfigDocument, RealmId, RealmNodeKind, ReasonCode, RoCrateLimits, RoCrateMediaType,
-    RoCrateUploadRecord, SourceConnectorKind, VersionKey,
+    RoCrateUploadRecord, RoutingSnapshot, SourceConnectorKind, VersionKey,
 };
 use aruna_core::types::{GroupId, UserId};
 use aruna_core::util::unix_timestamp_millis;
@@ -1713,6 +1713,7 @@ async fn put_object(
             version_source: None,
             preassigned_version_id: None,
             quota_ceiling: None,
+            routing: RoutingSnapshot::single(Ulid::generate()),
         }),
         fixture.context.as_ref(),
     )

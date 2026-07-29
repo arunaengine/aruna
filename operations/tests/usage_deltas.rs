@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     Backend, BackendConfig, BucketInfo, GroupQuotaOverride, MultipartChecksumType,
-    NodeUsageSnapshot, QuotaConfig, RealmId, UsageCounters, node_usage_group_key,
+    NodeUsageSnapshot, QuotaConfig, RealmId, RoutingSnapshot, UsageCounters, node_usage_group_key,
     usage_global_shard_keys, usage_group_key,
 };
 use aruna_core::types::NodeId;
@@ -143,6 +143,7 @@ async fn put_object(
             version_source: None,
             preassigned_version_id: None,
             quota_ceiling: None,
+            routing: RoutingSnapshot::single(group_id),
         }),
         &h.driver,
     )
@@ -185,6 +186,7 @@ async fn create_upload(h: &Harness, bucket: &str, key: &str, group_id: Ulid) -> 
             group_id,
             created_by: h.created_by,
             checksum_hint: None,
+            routing: RoutingSnapshot::single(group_id),
         }),
         &h.driver,
     )
@@ -638,6 +640,7 @@ async fn try_put_object(
             version_source: None,
             preassigned_version_id: None,
             quota_ceiling,
+            routing: RoutingSnapshot::single(group_id),
         }),
         &h.driver,
     )

@@ -518,7 +518,7 @@ mod tests {
     };
     use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::driver::{DriverContext, drive, routing_snapshot};
     use aruna_operations::incoming::initialize_net_incoming;
     use aruna_operations::s3::create_bucket::CreateBucketOperation;
     use aruna_operations::s3::create_user_access::{
@@ -756,6 +756,7 @@ mod tests {
                     preassigned_version_id: None,
                     quota_ceiling: None,
                     exists: false,
+                    routing: routing_snapshot(context.as_ref(), group.0.group_id),
                 }),
                 context.as_ref(),
             )

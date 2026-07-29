@@ -311,6 +311,7 @@ async fn write_payload(
         .as_ref()
         .ok_or("holder blob handle is missing")?
         .send_blob_effect(BlobEffect::Write {
+            resolved: aruna_core::structs::ResolvedBackend::node_default(),
             bucket: BUCKET.to_string(),
             key: KEY.to_string(),
             created_by: owner,

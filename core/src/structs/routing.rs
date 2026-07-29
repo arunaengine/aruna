@@ -230,6 +230,11 @@ impl RoutingSnapshot {
         }
     }
 
+    /// Snapshot of a node with only the implicit default backend.
+    pub fn single(group_id: GroupId) -> Self {
+        Self::new(group_id, NodeRouting::default().catalog)
+    }
+
     pub fn with_node_rules(mut self, rules: Vec<NodeRoutingRule>) -> Self {
         self.node_rules = rules;
         self

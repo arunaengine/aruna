@@ -2807,6 +2807,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .send_blob_effect(BlobEffect::Write {
+                resolved: aruna_core::structs::ResolvedBackend::node_default(),
                 bucket: "remote".to_string(),
                 key: "payload".to_string(),
                 created_by: owner,

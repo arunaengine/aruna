@@ -19,7 +19,8 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
-    RealmId, RoCrateLimits, UsageDelta, VersionKey, VersionSourceBinding,
+    RealmId, RoCrateLimits, RoutingError, RoutingSnapshot, UsageDelta, VersionKey,
+    VersionSourceBinding, resolve_backend,
 };
 use aruna_core::types::{Effects, GroupId, NodeId, UserId};
 use bytes::Bytes;
@@ -88,6 +89,8 @@ pub enum PutObjectError {
     UsageUpdateError(#[from] UsageUpdateError),
     #[error(transparent)]
     QuotaGateError(#[from] QuotaGateError),
+    #[error(transparent)]
+    RoutingFailed(#[from] RoutingError),
     #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
     QuotaExceeded { limit: u64, usage: u64 },
     #[error("Something went wrong ...")]
@@ -120,6 +123,9 @@ pub struct PutObjectConfig {
     /// resolved from the realm quota config at the request surface. `None` =
     /// unlimited, so no gate is enforced.
     pub quota_ceiling: Option<u64>,
+    /// Routing inputs assembled by the caller, so resolution stays a pure
+    /// synchronous step inside the operation.
+    pub routing: RoutingSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -247,11 +253,21 @@ impl PutObjectOperation {
     }
 
     fn handle_init(&mut self) -> Effects {
+        // Resolution runs before any bytes move; a failure is terminal.
+        let resolved = match resolve_backend(
+            &self.config.routing,
+            &self.config.request.bucket,
+            &self.config.request.key,
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => return self.emit_error(error.into()),
+        };
         self.state = PutObjectState::WriteBlob;
         if let Some(blob) = self.config.request.body.take() {
             smallvec![Effect::Blob(BlobEffect::Write {
                 bucket: self.config.request.bucket.clone(),
                 key: self.config.request.key.clone(),
+                resolved,
                 created_by: self.config.user_id,
                 blob
             })]
@@ -954,6 +970,93 @@ impl Operation for PutObjectOperation {
 }
 
 #[cfg(test)]
+mod routing_test {
+    use super::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+    use aruna_core::effects::{BlobEffect, Effect};
+    use aruna_core::operation::Operation;
+    use aruna_core::stream::BackendStream;
+    use aruna_core::structs::RealmId;
+    use aruna_core::structs::{
+        BackendCatalog, BackendRef, RoutingError, RoutingSnapshot, RoutingTarget,
+        StorageRoutingRule,
+    };
+    use ulid::Ulid;
+
+    fn config(snapshot: RoutingSnapshot) -> PutObjectConfig {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        PutObjectConfig {
+            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            group_id: snapshot.group_id,
+            realm_id,
+            node_id: iroh::SecretKey::generate().public(),
+            request: PutObjectInput {
+                bucket: "bucket".to_string(),
+                key: "archive/one".to_string(),
+                content_length: Some(3),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+                    &b"abc"[..],
+                ))),
+            },
+            expected_checksums: Vec::new(),
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: snapshot,
+        }
+    }
+
+    fn snapshot() -> RoutingSnapshot {
+        RoutingSnapshot::new(
+            Ulid::generate(),
+            BackendCatalog::new("default")
+                .with_backend("default", None)
+                .with_backend("tape", Some("archive".to_string())),
+        )
+    }
+
+    #[test]
+    fn stamps_resolved_backend() {
+        let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
+            key_prefix: "archive/".to_string(),
+            exact: false,
+            target: RoutingTarget::Class("archive".to_string()),
+        }]);
+
+        let effects = PutObjectOperation::new(config(snapshot)).start();
+
+        let [Effect::Blob(BlobEffect::Write { resolved, .. })] = effects.as_slice() else {
+            panic!("expected one blob write, got {effects:?}")
+        };
+        assert_eq!(resolved.backend, BackendRef::Node("tape".to_string()));
+        assert_eq!(resolved.storage_class.as_deref(), Some("archive"));
+    }
+
+    #[test]
+    fn missing_class_aborts() {
+        // Nothing may be written when a rule names a class this node lacks.
+        let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
+            key_prefix: String::new(),
+            exact: false,
+            target: RoutingTarget::Class("glacier".to_string()),
+        }]);
+
+        let mut operation = PutObjectOperation::new(config(snapshot));
+        let effects = operation.start();
+
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutObjectError::RoutingFailed(
+                RoutingError::ClassUnavailable(_)
+            ))
+        ));
+    }
+}
+
+#[cfg(test)]
 mod test {
     use crate::driver::{DriverContext, drive};
     use crate::s3::put_object::{
@@ -970,6 +1073,7 @@ mod test {
     };
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
+    use aruna_core::structs::RoutingSnapshot;
     use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
     use aruna_core::structs::{
         Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,
@@ -1053,6 +1157,7 @@ mod test {
             version_source: None,
             preassigned_version_id: None,
             quota_ceiling: Some(1),
+            routing: RoutingSnapshot::single(group_id),
         }
     }
 
@@ -1316,6 +1421,7 @@ mod test {
             version_source: None,
             preassigned_version_id: Some(preassigned_version_id),
             quota_ceiling: None,
+            routing: RoutingSnapshot::single(group_id),
         };
         let put_operation = PutObjectOperation::new(put_config);
 
@@ -1474,6 +1580,7 @@ mod test {
                 version_source: None,
                 preassigned_version_id: Some(preassigned_version_id),
                 quota_ceiling: None,
+                routing: RoutingSnapshot::single(group_id),
             }),
             &context,
         )
@@ -1570,6 +1677,7 @@ mod test {
                 version_source: None,
                 preassigned_version_id: None,
                 quota_ceiling: None,
+                routing: RoutingSnapshot::single(group_id),
             }),
             &context,
         )
@@ -1598,6 +1706,7 @@ mod test {
                 version_source: None,
                 preassigned_version_id: None,
                 quota_ceiling: None,
+                routing: RoutingSnapshot::single(group_id),
             }),
             &context,
         )
@@ -1691,6 +1800,7 @@ mod test {
             version_source: None,
             preassigned_version_id: None,
             quota_ceiling: None,
+            routing: RoutingSnapshot::single(Ulid::generate()),
         });
         let version_id = Ulid::generate();
         op.version_id = Some(version_id);
@@ -1794,6 +1904,7 @@ mod test {
                 version_source: None,
                 preassigned_version_id: None,
                 quota_ceiling: None,
+                routing: RoutingSnapshot::single(group_id),
             }),
             &context,
         )
@@ -1822,6 +1933,7 @@ mod test {
                 version_source: None,
                 preassigned_version_id: None,
                 quota_ceiling: None,
+                routing: RoutingSnapshot::single(group_id),
             }),
             &context,
         )
@@ -1983,6 +2095,7 @@ mod test {
                 version_source: None,
                 preassigned_version_id: None,
                 quota_ceiling: None,
+                routing: RoutingSnapshot::single(Ulid::generate()),
             }),
             &context,
         )

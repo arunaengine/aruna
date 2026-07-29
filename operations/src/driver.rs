@@ -6,6 +6,8 @@ use aruna_core::events::{BlobEvent, Event, NetEvent, SubOperationEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{Operation, SubOperation};
+use aruna_core::structs::{NodeRouting, RoutingSnapshot};
+use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
@@ -21,6 +23,20 @@ use aruna_core::events::NetError;
 use aruna_core::metadata::{MetadataError, MetadataEvent};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
+
+/// Node-local routing inputs for a caller assembling an operation config.
+/// Pure in-memory state: operations never fetch this from inside a step.
+pub fn node_routing(context: &DriverContext) -> NodeRouting {
+    context
+        .blob_handle
+        .as_ref()
+        .map(|handle| handle.routing())
+        .unwrap_or_default()
+}
+
+pub fn routing_snapshot(context: &DriverContext, group_id: GroupId) -> RoutingSnapshot {
+    node_routing(context).snapshot(group_id)
+}
 
 #[derive(Clone)]
 pub struct DriverContext {

@@ -23,7 +23,7 @@ use aruna_core::structs::{
     AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobVersion, CurrentVersionPointer,
     MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
     MultipartUpload, MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus, RealmId,
-    RoCrateLimits, UsageDelta, VersionKey,
+    ResolvedBackend, RoCrateLimits, UsageDelta, VersionKey,
 };
 use aruna_core::types::{Effects, NodeId, TxnId, UserId};
 use smallvec::smallvec;
@@ -74,6 +74,8 @@ pub enum CompleteMultipartUploadError {
     ConversionError(#[from] ConversionError),
     #[error("Invalid operation state")]
     InvalidOperationState,
+    #[error("stored part does not live on the upload's pinned backend")]
+    BackendMismatch,
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("The specified upload does not exist.")]
@@ -432,6 +434,12 @@ impl CompleteMultipartUploadOperation {
             let Some(record) = all_parts.get(&requested.part_number).cloned() else {
                 return Err(CompleteMultipartUploadError::InvalidPart);
             };
+            // Compose stays same-backend: a part elsewhere means a routing bug.
+            if let Some(upload) = self.upload_record.as_ref()
+                && record.location.backend != upload.backend
+            {
+                return Err(CompleteMultipartUploadError::BackendMismatch);
+            }
             validate_requested_part(requested, &record, required_checksum_algorithm)?;
             resolved.push(record);
         }
@@ -472,10 +480,15 @@ impl CompleteMultipartUploadOperation {
         self.upload_parts = upload_parts;
         self.resolved_parts = resolved.clone();
 
+        let Some(upload) = self.upload_record.as_ref() else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+        let pinned = ResolvedBackend::new(upload.backend.clone(), upload.storage_class.clone());
         self.state = CompleteMultipartUploadState::ComposeBlob;
         smallvec![Effect::Blob(BlobEffect::Compose {
             bucket: self.input.bucket.clone(),
             key: self.input.key.clone(),
+            resolved: pinned,
             created_by: self.input.created_by,
             parts: resolved.into_iter().map(|part| part.location).collect(),
         })]
@@ -1424,6 +1437,30 @@ mod tests {
             },
             created_at: SystemTime::now(),
         }
+    }
+
+    #[test]
+    fn rejects_foreign_part() {
+        // A part stored elsewhere means routing was re-run; compose must fail.
+        let mut input = finalize_input();
+        input.completed_parts = vec![CompleteMultipartPart {
+            part_number: 1,
+            etag: None,
+            expected_checksums: Vec::new(),
+        }];
+        let mut operation = CompleteMultipartUploadOperation::new(input);
+        let record = open_upload_record(&operation.input);
+        let upload_id = record.upload_id;
+        operation.upload_record = Some(record);
+        let mut part = part_record(1, 10);
+        part.location.backend = BackendRef::Node("elsewhere".to_string());
+
+        let result = operation.extract_requested_parts(part_values(upload_id, vec![part]));
+
+        assert!(matches!(
+            result,
+            Err(CompleteMultipartUploadError::BackendMismatch)
+        ));
     }
 
     fn part_values(

@@ -23,7 +23,7 @@ use ulid::Ulid;
 
 use super::DEFAULT_WALLTIME;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, routing_snapshot};
 use crate::get_realm_config::GetRealmConfigOperation;
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::create_user_access::{CreateUserAccessConfig, CreateUserAccessOperation};
@@ -664,6 +664,7 @@ async fn put_file_output(
             version_source: None,
             preassigned_version_id: None,
             quota_ceiling,
+            routing: routing_snapshot(context, spec.group_id),
         }),
         context,
     ))
@@ -858,6 +859,7 @@ async fn stage_one_input(
             version_source: None,
             preassigned_version_id: None,
             quota_ceiling,
+            routing: routing_snapshot(context, spec.group_id),
         }),
         context,
     ))

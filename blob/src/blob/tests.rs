@@ -678,6 +678,7 @@ async fn reuses_bucket_until_max_object_count_is_reached() {
     let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
             bucket: "bucket-a".to_string(),
             key: "one.bin".to_string(),
             created_by: test_user_id(),
@@ -691,6 +692,7 @@ async fn reuses_bucket_until_max_object_count_is_reached() {
     let Event::Blob(BlobEvent::WriteFinished { location: second }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
             bucket: "bucket-a".to_string(),
             key: "two.bin".to_string(),
             created_by: test_user_id(),
@@ -744,6 +746,7 @@ async fn creates_new_bucket_after_reaching_max_object_count() {
     let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
             bucket: "bucket-a".to_string(),
             key: "one.bin".to_string(),
             created_by: test_user_id(),
@@ -757,6 +760,7 @@ async fn creates_new_bucket_after_reaching_max_object_count() {
     let Event::Blob(BlobEvent::WriteFinished { location: second }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
             bucket: "bucket-a".to_string(),
             key: "two.bin".to_string(),
             created_by: test_user_id(),
@@ -795,6 +799,7 @@ async fn deleting_last_object_keeps_bucket_stat_row_at_zero_for_reuse() {
     let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
             bucket: "bucket-a".to_string(),
             key: "one.bin".to_string(),
             created_by: test_user_id(),
@@ -828,6 +833,7 @@ async fn deleting_last_object_keeps_bucket_stat_row_at_zero_for_reuse() {
     let Event::Blob(BlobEvent::WriteFinished { location: second }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
             bucket: "bucket-a".to_string(),
             key: "two.bin".to_string(),
             created_by: test_user_id(),
@@ -857,6 +863,7 @@ async fn multipart_part_bucket_is_excluded_from_bucket_stats() {
     let Event::Blob(BlobEvent::WriteFinished { location }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::WritePart {
+            resolved: ResolvedBackend::node_default(),
             upload_id: Ulid::generate(),
             part_number: 1,
             created_by: test_user_id(),
@@ -1060,6 +1067,7 @@ async fn range_passes_writes() {
     let write_task = tokio::spawn(async move {
         write_handle
             .send_blob_effect(BlobEffect::Write {
+                resolved: ResolvedBackend::node_default(),
                 bucket: "target".to_string(),
                 key: "object".to_string(),
                 created_by: test_user_id(),
@@ -1120,6 +1128,7 @@ async fn interlocked_writes_complete() {
             }));
             handle
                 .send_blob_effect(BlobEffect::Write {
+                    resolved: ResolvedBackend::node_default(),
                     bucket: "bucket".to_string(),
                     key: format!("object-{index}"),
                     created_by: test_user_id(),
@@ -1147,6 +1156,7 @@ async fn tracks_concurrent_loads() {
     let Event::Blob(BlobEvent::WriteFinished { location }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
             bucket: "bucket".to_string(),
             key: "seed".to_string(),
             created_by: test_user_id(),
@@ -1169,6 +1179,7 @@ async fn tracks_concurrent_loads() {
             }));
             handle
                 .send_blob_effect(BlobEffect::Write {
+                    resolved: ResolvedBackend::node_default(),
                     bucket: "bucket".to_string(),
                     key: format!("object-{index}"),
                     created_by: test_user_id(),
@@ -1387,6 +1398,7 @@ async fn compose_close_fails() {
     let Event::Blob(BlobEvent::WriteFinished { location: part }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
             bucket: "bucket-a".to_string(),
             key: "part.bin".to_string(),
             created_by: test_user_id(),
@@ -1513,6 +1525,7 @@ async fn read_holds_permit() {
     let Event::Blob(BlobEvent::WriteFinished { location }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
             bucket: "bucket".to_string(),
             key: "object".to_string(),
             created_by: test_user_id(),
@@ -1556,6 +1569,7 @@ async fn reservation_forces_rollover() {
             }));
             handle
                 .send_blob_effect(BlobEffect::Write {
+                    resolved: ResolvedBackend::node_default(),
                     bucket: "bucket".to_string(),
                     key: format!("object-{index}"),
                     created_by: test_user_id(),

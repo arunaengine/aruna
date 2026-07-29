@@ -7,7 +7,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
     BackendLocation, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
-    MultipartUploadStatus,
+    MultipartUploadStatus, ResolvedBackend,
 };
 use aruna_core::types::{Effects, TxnId, UserId};
 use bytes::Bytes;
@@ -155,6 +155,7 @@ impl UploadPartOperation {
         smallvec![Effect::Blob(BlobEffect::WritePart {
             upload_id: self.input.upload_id,
             part_number: self.input.part_number,
+            resolved: ResolvedBackend::new(record.backend, record.storage_class),
             created_by: self.input.created_by,
             compressed: self.input.compressed,
             encrypted: self.input.encrypted,
@@ -424,6 +425,51 @@ mod test {
 
     fn test_user_id() -> UserId {
         UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]))
+    }
+
+    #[test]
+    fn part_follows_pin() {
+        // The pinned backend on the upload record reaches WritePart unchanged.
+        let upload_id = Ulid::generate();
+        let mut op = UploadPartOperation::new(UploadPartInput {
+            bucket: "mybucket".to_string(),
+            key: "object.txt".to_string(),
+            upload_id,
+            part_number: 2,
+            content_length: None,
+            body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+                &b"part"[..],
+            ))),
+            created_by: test_user_id(),
+            compressed: false,
+            encrypted: false,
+            expected_checksums: Vec::new(),
+        });
+        op.state = UploadPartState::ReadUpload;
+        let record = MultipartUpload {
+            upload_id,
+            backend: aruna_core::structs::BackendRef::Node("cold".to_string()),
+            storage_class: Some("cold".to_string()),
+            bucket: "mybucket".to_string(),
+            key: "object.txt".to_string(),
+            group_id: Ulid::generate(),
+            created_by: test_user_id(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            status: MultipartUploadStatus::Open,
+            checksum_hint: None,
+            metadata: std::collections::HashMap::new(),
+        };
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            value: Some(record.to_bytes().unwrap().into()),
+            key: upload_id.to_bytes().to_vec().into(),
+        }));
+
+        let [Effect::Blob(BlobEffect::WritePart { resolved, .. })] = effects.as_slice() else {
+            panic!("expected one part write, got {effects:?}")
+        };
+        assert_eq!(resolved.backend, record.backend);
+        assert_eq!(resolved.storage_class, record.storage_class);
     }
 
     #[test]

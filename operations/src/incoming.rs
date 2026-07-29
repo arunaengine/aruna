@@ -6,7 +6,7 @@ use crate::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, schedule_outbox_drain_effect, write_outbox_effect,
 };
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, node_routing};
 use crate::metadata::MetadataHandle;
 use crate::metadata::projector::{
     METADATA_PROJECTION_RETRY_AFTER, project_metadata_create_events,
@@ -344,6 +344,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                                             *net_handle.realm_id(),
                                             manifest,
                                         )
+                                        .with_routing(node_routing(self.context.as_ref()))
                                         .with_rocrate_limits(self.rocrate_limits.clone());
                                         match drive(op, self.context.as_ref()).await {
                                             Ok(Ok(result)) => {

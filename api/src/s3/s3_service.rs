@@ -28,7 +28,7 @@ use aruna_core::structs::{
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::driver::{DriverContext, drive, routing_snapshot};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::metadata::MetadataAuthToken;
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
@@ -1587,6 +1587,7 @@ impl S3 for ArunaS3Service {
             preassigned_version_id: None,
             exists: false,
             quota_ceiling,
+            routing: routing_snapshot(&self.state, group_id),
         })
         .with_rocrate_limits(self.rocrate_limits.clone())
         .with_metadata(metadata);
@@ -1814,15 +1815,17 @@ impl S3 for ArunaS3Service {
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let checksum_hint = parse_multipart_checksum_hint(&req.input)?;
 
+        let group_id = bucket_info
+            .as_ref()
+            .map(|bucket_info| bucket_info.group_id)
+            .unwrap_or(user_access.group_id);
         let operation = CreateMultipartUploadOperation::new(CMPI {
             bucket: req.input.bucket.clone(),
             key: req.input.key.clone(),
-            group_id: bucket_info
-                .as_ref()
-                .map(|bucket_info| bucket_info.group_id)
-                .unwrap_or(user_access.group_id),
+            group_id,
             created_by: user_access.user_identity,
             checksum_hint: checksum_hint.clone(),
+            routing: routing_snapshot(&self.state, group_id),
         })
         .with_metadata(object_metadata(
             req.input.metadata.clone().unwrap_or_default(),
