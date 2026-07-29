@@ -76,6 +76,60 @@ impl Display for Backend {
     }
 }
 
+/// Names the storage backend a stored record lives on. Node backends are named
+/// by the operator's backends file; group backends by their record id.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub enum BackendRef {
+    Node(String),
+    Group(Ulid),
+}
+
+impl BackendRef {
+    pub const DEFAULT_NODE_NAME: &str = "default";
+
+    pub fn node_default() -> Self {
+        Self::Node(Self::DEFAULT_NODE_NAME.to_string())
+    }
+
+    /// Stable byte encoding used to qualify keyspace entries per backend.
+    pub fn key_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Node(name) => format!("n:{name}").into_bytes(),
+            Self::Group(id) => format!("g:{id}").into_bytes(),
+        }
+    }
+}
+
+impl Display for BackendRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Node(name) => write!(f, "node:{name}"),
+            Self::Group(id) => write!(f, "group:{id}"),
+        }
+    }
+}
+
+/// Outcome of routing resolution: the chosen backend plus the storage class it
+/// carried at that moment. Both are stamped on the record, never re-derived.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedBackend {
+    pub backend: BackendRef,
+    pub storage_class: Option<String>,
+}
+
+impl ResolvedBackend {
+    pub fn new(backend: BackendRef, storage_class: Option<String>) -> Self {
+        Self {
+            backend,
+            storage_class,
+        }
+    }
+
+    pub fn node_default() -> Self {
+        Self::new(BackendRef::node_default(), None)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlobTimeoutConfig {
     pub control_plane_connect_timeout: Duration,
