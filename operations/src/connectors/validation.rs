@@ -39,9 +39,13 @@ pub enum ValidationError {
     InvalidBoolValue { key: String },
     #[error("credentials must not be set when `skip_signature` is enabled")]
     CredentialsWithSkipSignature,
+    #[error("signed s3 connectors require `{ACCESS_KEY_ID}` and `{SECRET_ACCESS_KEY}`")]
+    MissingCredentials,
 }
 
 pub const S3_SKIP_SIGNATURE: &str = "skip_signature";
+const ACCESS_KEY_ID: &str = "access_key_id";
+const SECRET_ACCESS_KEY: &str = "secret_access_key";
 
 pub fn validate_connector_input(
     name: &str,
@@ -100,15 +104,27 @@ pub fn validate_connector_input(
         }
     }
 
+    let mut anonymous = false;
     if let Some(value) = public_config.get(S3_SKIP_SIGNATURE) {
         if value != "true" && value != "false" {
             return Err(ValidationError::InvalidBoolValue {
                 key: S3_SKIP_SIGNATURE.to_string(),
             });
         }
-        if value == "true" && !secret_config.is_empty() {
+        anonymous = value == "true";
+        if anonymous && !secret_config.is_empty() {
             return Err(ValidationError::CredentialsWithSkipSignature);
         }
+    }
+
+    // Without static keys a signed connector makes reqsign walk the node's own
+    // ambient credential chain against a tenant-chosen endpoint.
+    if kind == SourceConnectorKind::S3
+        && !anonymous
+        && !(secret_config.contains_key(ACCESS_KEY_ID)
+            && secret_config.contains_key(SECRET_ACCESS_KEY))
+    {
+        return Err(ValidationError::MissingCredentials);
     }
 
     Ok(())
@@ -279,6 +295,63 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err, ValidationError::CredentialsWithSkipSignature);
+    }
+
+    #[test]
+    fn signed_requires_credentials() {
+        // Both an absent and an explicitly disabled `skip_signature` sign requests.
+        for skip in [None, Some("false")] {
+            let mut public = HashMap::from([
+                ("bucket".to_string(), "reads".to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+            ]);
+            if let Some(skip) = skip {
+                public.insert(S3_SKIP_SIGNATURE.to_string(), skip.to_string());
+            }
+
+            let err = validate_connector_input(
+                "signed-s3",
+                SourceConnectorKind::S3,
+                &public,
+                &HashMap::new(),
+            )
+            .unwrap_err();
+
+            assert_eq!(err, ValidationError::MissingCredentials);
+        }
+    }
+
+    #[test]
+    fn requires_both_keys() {
+        let err = validate_connector_input(
+            "signed-s3",
+            SourceConnectorKind::S3,
+            &HashMap::from([
+                ("bucket".to_string(), "reads".to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+            ]),
+            &HashMap::from([("access_key_id".to_string(), "AKIA".to_string())]),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, ValidationError::MissingCredentials);
+    }
+
+    #[test]
+    fn accepts_signed_s3() {
+        validate_connector_input(
+            "signed-s3",
+            SourceConnectorKind::S3,
+            &HashMap::from([
+                ("bucket".to_string(), "reads".to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+            ]),
+            &HashMap::from([
+                ("access_key_id".to_string(), "AKIA".to_string()),
+                ("secret_access_key".to_string(), "secret".to_string()),
+            ]),
+        )
+        .unwrap();
     }
 
     #[test]

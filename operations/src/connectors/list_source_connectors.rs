@@ -179,6 +179,7 @@ mod tests {
                 public_config: HashMap::from([
                     ("bucket".to_string(), "reads".to_string()),
                     ("endpoint".to_string(), "https://s3.example.org".to_string()),
+                    ("skip_signature".to_string(), "true".to_string()),
                 ]),
                 secret_config: HashMap::new(),
             }),

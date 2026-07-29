@@ -224,8 +224,10 @@ fn build_staging_source_operator(
             let operator = match kind {
                 SourceConnectorKind::Http => build_service::<services::Http>(config.clone())
                     .map_err(staging_operator_creation_error)?,
-                SourceConnectorKind::S3 => build_service::<services::S3>(config.clone())
-                    .map_err(staging_operator_creation_error)?,
+                SourceConnectorKind::S3 => {
+                    build_service::<services::S3>(s3_operator_config(config.clone()))
+                        .map_err(staging_operator_creation_error)?
+                }
                 SourceConnectorKind::Webdav => build_service::<services::Webdav>(config.clone())
                     .map_err(staging_operator_creation_error)?,
                 SourceConnectorKind::Ftp => build_service::<services::Ftp>(config.clone())
@@ -250,9 +252,9 @@ where
         .finish())
 }
 
-// reqsign resolves credentials when the operator is built, so ambient AWS
-// config and EC2 metadata lookups must be disabled up front. `force_path_style`
-// is our canonical key; opendal speaks `enable_virtual_host_style`.
+// reqsign resolves credentials lazily on the first request and on every retry,
+// so ambient AWS config and EC2 metadata lookups must be disabled in the config
+// itself. `force_path_style` is our key; opendal speaks `enable_virtual_host_style`.
 fn s3_operator_config(mut config: HashMap<String, String>) -> HashMap<String, String> {
     config.insert("disable_config_load".to_string(), "true".to_string());
     config.insert("disable_ec2_metadata".to_string(), "true".to_string());
@@ -290,7 +292,136 @@ fn map_staging_source_error(error: opendal::Error, stat: bool) -> StagingSourceE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
+
+    /// Ambient AWS inputs cleared before a zero-connect proof, so no provider
+    /// ahead of the metadata slot can short-circuit the chain.
+    const AWS_ENV_KEYS: [&str; 11] = [
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_ROLE_ARN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+        "AWS_EC2_METADATA_DISABLED",
+    ];
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn swap_env(entries: &[(&str, Option<String>)]) -> Vec<(String, Option<String>)> {
+        entries
+            .iter()
+            .map(|(key, value)| {
+                let previous = std::env::var(key).ok();
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+                ((*key).to_string(), previous)
+            })
+            .collect()
+    }
+
+    fn restore_env(previous: Vec<(String, Option<String>)>) {
+        for (key, value) in previous {
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+    }
+
+    /// Loopback endpoint that counts inbound connections and answers 404, so a
+    /// credential fetch that escapes hardening is observable as an accept.
+    struct CountingListener {
+        endpoint: String,
+        hits: Arc<AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl CountingListener {
+        async fn bind() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counter = hits.clone();
+            let task = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = socket.shutdown().await;
+                }
+            });
+            Self {
+                endpoint,
+                hits,
+                task,
+            }
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for CountingListener {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_skips_imds() {
+        // Counterfactual: without the lockdown keys the metadata port accepts.
+        let _guard = env_lock().lock().await;
+        let metadata = CountingListener::bind().await;
+        let data = CountingListener::bind().await;
+        let empty = tempdir().unwrap();
+        let missing = empty.path().join("absent").to_string_lossy().into_owned();
+
+        let mut entries: Vec<(&str, Option<String>)> =
+            AWS_ENV_KEYS.iter().map(|key| (*key, None)).collect();
+        entries.push(("AWS_CONFIG_FILE", Some(missing.clone())));
+        entries.push(("AWS_SHARED_CREDENTIALS_FILE", Some(missing)));
+        entries.push((
+            "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+            Some(metadata.endpoint.clone()),
+        ));
+        let previous = swap_env(&entries);
+
+        let access = ResolvedSourceAccess::OpenDal {
+            kind: SourceConnectorKind::S3,
+            config: HashMap::from([
+                ("bucket".to_string(), "reads".to_string()),
+                ("endpoint".to_string(), data.endpoint.clone()),
+                ("region".to_string(), "eu-central-1".to_string()),
+            ]),
+            path: "file.txt".to_string(),
+            version: None,
+        };
+        let (operator, path, ..) = build_staging_source_operator(&access).unwrap();
+        let _ = operator.stat(path).await;
+
+        restore_env(previous);
+        assert_eq!(metadata.hits(), 0);
+    }
 
     #[tokio::test]
     async fn filesystem_like_http_config_is_not_required_for_build_helper_tests() {

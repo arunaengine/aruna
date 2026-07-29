@@ -832,10 +832,10 @@ mod tests {
                     ("bucket".to_string(), "reads".to_string()),
                     ("endpoint".to_string(), "https://s3.example.org".to_string()),
                 ]),
-                secret_config: HashMap::from([(
-                    "access_key_id".to_string(),
-                    "super-secret".to_string(),
-                )]),
+                secret_config: HashMap::from([
+                    ("access_key_id".to_string(), "AKIA".to_string()),
+                    ("secret_access_key".to_string(), "super-secret".to_string()),
+                ]),
             }),
         )
         .await
@@ -876,6 +876,7 @@ mod tests {
                 public_config: HashMap::from([
                     ("bucket".to_string(), "reads-v2".to_string()),
                     ("endpoint".to_string(), "https://s3.example.org".to_string()),
+                    ("skip_signature".to_string(), "true".to_string()),
                 ]),
                 secret_config: HashMap::new(),
             }),
@@ -1001,10 +1002,10 @@ mod tests {
                     ("bucket".to_string(), "reads".to_string()),
                     ("endpoint".to_string(), "https://s3.example.org".to_string()),
                 ]),
-                secret_config: HashMap::from([(
-                    "access_key_id".to_string(),
-                    "stored-secret".to_string(),
-                )]),
+                secret_config: HashMap::from([
+                    ("access_key_id".to_string(), "AKIA".to_string()),
+                    ("secret_access_key".to_string(), "stored-secret".to_string()),
+                ]),
             }),
         )
         .await
