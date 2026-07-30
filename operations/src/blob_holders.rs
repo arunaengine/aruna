@@ -312,6 +312,17 @@ mod tests {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
+    use aruna_core::structs::BackendRef;
+
+    fn location_key(seed: u8) -> Vec<u8> {
+        BlobLocationKey::new([seed; 32], BackendRef::node_default()).to_bytes()
+    }
+
+    /// A second copy of the same hash, so the scan must publish it only once.
+    fn cold_key(seed: u8) -> Vec<u8> {
+        BlobLocationKey::new([seed; 32], BackendRef::Node("cold".to_string())).to_bytes()
+    }
+
     fn entry(node_id: NodeId, realm_id: RealmId) -> DhtEntry {
         DhtEntry {
             node_id,
@@ -374,9 +385,12 @@ mod tests {
             })] if key_space == BLOB_LOCATIONS_KEYSPACE
         ));
 
-        let cursor: Key = vec![1; 32].into();
+        let cursor: Key = location_key(1).into();
         let publish = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(vec![1; 32].into(), Vec::<u8>::new().into())],
+            values: vec![
+                (location_key(1).into(), Vec::<u8>::new().into()),
+                (cold_key(1).into(), Vec::<u8>::new().into()),
+            ],
             next_start_after: Some(cursor.clone()),
         }));
         assert!(matches!(
@@ -401,7 +415,7 @@ mod tests {
         ));
 
         let publish = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(vec![2; 32].into(), Vec::<u8>::new().into())],
+            values: vec![(location_key(2).into(), Vec::<u8>::new().into())],
             next_start_after: None,
         }));
         assert_eq!(publish.len(), 1);
