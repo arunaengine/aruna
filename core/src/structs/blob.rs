@@ -410,6 +410,13 @@ impl BucketInfo {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
     }
+
+    /// What makes this the same bucket record: what a write authorized against
+    /// must not have changed. The mutable configuration is excluded on purpose,
+    /// so an admin edit cannot abort a long-running write.
+    pub fn identity(&self) -> (Ulid, SystemTime, UserId) {
+        (self.group_id, self.created_at, self.created_by)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

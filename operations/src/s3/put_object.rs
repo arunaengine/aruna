@@ -352,7 +352,8 @@ impl PutObjectOperation {
             Ok(current) => current,
             Err(error) => return self.emit_error(error.into()),
         };
-        if current.as_ref() != self.expected_bucket.as_ref()
+        if current.as_ref().map(BucketInfo::identity)
+            != self.expected_bucket.as_ref().map(BucketInfo::identity)
             || current.is_none_or(|bucket| bucket.group_id != self.config.group_id)
         {
             return self.emit_error(StorageError::TransactionConflict.into());
@@ -1177,6 +1178,50 @@ mod test {
             quota_ceiling: Some(1),
             routing: RoutingSnapshot::single(group_id),
         }
+    }
+
+    #[test]
+    fn bucket_guard_allows_edit() {
+        // A routing or CORS edit is prospective policy, not a different bucket:
+        // it must not discard a write that already landed.
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = iroh::SecretKey::generate().public();
+        let config = put_config(realm_id, group_id, node_id);
+        let expected = BucketInfo {
+            group_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: config.user_id,
+            cors_configuration: None,
+            replication: None,
+            storage_routing: Vec::new(),
+        };
+        let edited = BucketInfo {
+            storage_routing: vec![aruna_core::structs::StorageRoutingRule {
+                key_prefix: String::new(),
+                exact: false,
+                target: aruna_core::structs::RoutingTarget::Class("cold".to_string()),
+            }],
+            ..expected.clone()
+        };
+        let mut op = PutObjectOperation::new(config).with_bucket_guard(expected);
+        op.state = PutObjectState::StartTransaction;
+        op.written_location = Some(test_location(op.config.user_id));
+        op.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::generate(),
+        }));
+
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"mybucket".to_vec().into(),
+            value: Some(edited.to_bytes().unwrap().into()),
+        }));
+
+        assert_ne!(
+            op.finalize(),
+            Err(PutObjectError::StorageError(
+                StorageError::TransactionConflict
+            ))
+        );
     }
 
     #[test]

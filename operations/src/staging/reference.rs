@@ -458,7 +458,9 @@ async fn guard_expected_bucket(
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         _ => return Err(StorageError::ReadError.into()),
     };
-    if expected.group_id != group_id || current.as_ref() != Some(expected) {
+    if expected.group_id != group_id
+        || current.as_ref().map(BucketInfo::identity) != Some(expected.identity())
+    {
         return Err(StorageError::TransactionConflict.into());
     }
     Ok(())
