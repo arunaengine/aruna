@@ -32,8 +32,8 @@ pub struct BackendEntry {
     /// Whether tenant-authored rules may target this entry's class.
     #[serde(default = "tenants_allowed")]
     pub allow_tenants: bool,
-    /// Operator allowance for user data on this backend. Stored and reported
-    /// only; enforcement belongs to the quota arc.
+    /// Advisory operator allowance for user data on this backend. Recorded and
+    /// reported, never enforced: no write is rejected for exceeding it.
     #[serde(default)]
     pub quota_bytes: Option<u64>,
     #[serde(default)]

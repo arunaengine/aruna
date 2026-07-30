@@ -233,7 +233,8 @@ pub struct BackendStatus {
     pub class: Option<String>,
     /// Whether tenant routing rules may target this backend's class.
     pub allow_tenants: bool,
-    /// Operator allowance for user data on this backend; not enforced yet.
+    /// Advisory operator allowance for user data on this backend. Never
+    /// enforced: no write is rejected for exceeding it.
     pub quota_bytes: Option<u64>,
     pub default: bool,
     pub status: ServiceStatus,

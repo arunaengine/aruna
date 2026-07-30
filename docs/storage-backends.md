@@ -25,7 +25,7 @@ bucket_prefix = "aruna-cold-"
 multipart_bucket = "aruna-cold-parts"
 class = "cold"
 allow_tenants = true
-quota_bytes = 20000000000000
+quota_bytes = 20000000000000 # advisory only, never enforced
 
 [backend.archive]
 type = "s3"
@@ -57,9 +57,15 @@ that in mind.
 
 `allow_tenants = false` reserves a class for operator rules and the node
 default; a tenant rule naming that class misses and falls through instead of
-binding. `quota_bytes` records the total user-data bytes intended for that
-backend across all groups. It is stored and reported, and it is not enforced
-in this release.
+binding.
+
+`quota_bytes` is **advisory and never enforced**. It records the total
+user-data bytes an operator intends for that backend across all groups, and it
+is validated, stored and reported back by `/info` and by the doctor. Nothing
+reads it at write time: no upload is rejected, throttled or rerouted when a
+backend passes it, and no alert fires. Treat it as a note to other operators
+until per-backend allowances are enforced. The only live storage limits are the
+realm and group quotas.
 
 A class a node does not offer is a preference, not a demand: resolution falls
 through to the next rule and finally to the node default, and each
@@ -162,6 +168,6 @@ group-backend records.
 Stored formats changed with this feature. Deployments upgrading from an
 earlier alpha wipe and redeploy; there is no migration path.
 
-Editing a bucket's routing rules while a write to that bucket is in flight
-aborts the write with a conflict. This is rare and consistent with the
-existing bucket-record semantics: retry the write.
+Editing a bucket's routing rules never disturbs a write already in flight. The
+bucket guard compares identity only, not mutable configuration, so an admin
+edit lands on new writes and leaves running ones alone.

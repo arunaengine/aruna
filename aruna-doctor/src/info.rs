@@ -48,6 +48,7 @@ struct BackendView {
     backend: String,
     class: Option<String>,
     allow_tenants: bool,
+    /// Advisory only; never enforced against writes.
     quota_bytes: Option<u64>,
     default: bool,
 }

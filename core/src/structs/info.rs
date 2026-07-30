@@ -100,6 +100,7 @@ pub struct BackendState {
     pub backend_type: Backend,
     pub class: Option<String>,
     pub allow_tenants: bool,
+    /// Advisory only; never enforced against writes.
     pub quota_bytes: Option<u64>,
     pub default: bool,
     pub status: Status,
