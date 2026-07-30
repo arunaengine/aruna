@@ -2,6 +2,7 @@ use crate::connectors::resolver::ARUNA_NATIVE_RELATIONSHIP_ID;
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
 };
+use crate::group_routing::load_group_inputs;
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{
     MaterializedBlobInfo, MultipartObjectReplicationMetadata, ReplicationMode, SyncOrigin,
@@ -17,13 +18,13 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     ArunaArn, AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
-    CurrentVersionPointer, MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
-    PortableSourceDescriptor, ReferenceHandling, ReplicationItemKind, ReplicationNegotiationResult,
-    ReplicationSuboperationResult, ResolvedSourceAccess, RoutingError, SourceConnectorKind,
-    SourceMetadata, StagingStrategy, SyncMode, SyncRelationship, VersionKey, VersionSourceBinding,
-    sync_state_key,
+    CurrentVersionPointer, GroupRoutingInputs, MultipartObjectMetadataKey, MultipartObjectPart,
+    MultipartObjectSummary, PortableSourceDescriptor, ReferenceHandling, ReplicationItemKind,
+    ReplicationNegotiationResult, ReplicationSuboperationResult, ResolvedSourceAccess,
+    RoutingError, SourceConnectorKind, SourceMetadata, StagingStrategy, SyncMode, SyncRelationship,
+    VersionKey, VersionSourceBinding, sync_state_key,
 };
-use aruna_core::structs::{NodeRouting, resolve_backend};
+use aruna_core::structs::{NodeRouting, StorageRoutingRule, resolve_backend};
 use aruna_core::types::{Effects, GroupId, Key, NodeId};
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
@@ -724,6 +725,8 @@ impl Operation for ReplicateScopeOperation {
 pub enum ReplicateObjectVersionError {
     #[error(transparent)]
     RoutingFailed(#[from] RoutingError),
+    #[error("could not load the group's routing inputs: {0}")]
+    RoutingInputsFailed(String),
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -754,6 +757,8 @@ enum ReplicateObjectVersionState {
     ResolveReferenceAccess,
     HeadReferenceSource,
     ReadReferenceState,
+    LoadRouting,
+    ReadBucketRules,
     ReadReferenceSource,
     WriteReferenceBlob,
     CleanupReferenceBlob,
@@ -787,6 +792,8 @@ pub struct ReplicateObjectVersionOperation {
     preserve_reference: bool,
     reference_access: Option<ResolvedSourceAccess>,
     reference_metadata: Option<SourceMetadata>,
+    group_inputs: GroupRoutingInputs,
+    bucket_rules: Vec<StorageRoutingRule>,
     sync: Option<SyncTransferContext>,
     routing: NodeRouting,
     result: Result<ReplicationSuboperationResult, ReplicateObjectVersionError>,
@@ -809,6 +816,8 @@ impl ReplicateObjectVersionOperation {
             preserve_reference: false,
             reference_access: None,
             reference_metadata: None,
+            group_inputs: GroupRoutingInputs::default(),
+            bucket_rules: Vec::new(),
             sync: None,
             routing: NodeRouting::default(),
             result: Ok(ReplicationSuboperationResult::Replicated),
@@ -833,6 +842,8 @@ impl ReplicateObjectVersionOperation {
             ReplicateObjectVersionState::ResolveReferenceAccess => "ResolveReferenceAccess",
             ReplicateObjectVersionState::HeadReferenceSource => "HeadReferenceSource",
             ReplicateObjectVersionState::ReadReferenceState => "ReadReferenceState",
+            ReplicateObjectVersionState::LoadRouting => "LoadRouting",
+            ReplicateObjectVersionState::ReadBucketRules => "ReadBucketRules",
             ReplicateObjectVersionState::ReadReferenceSource => "ReadReferenceSource",
             ReplicateObjectVersionState::WriteReferenceBlob => "WriteReferenceBlob",
             ReplicateObjectVersionState::CleanupReferenceBlob => "CleanupReferenceBlob",
@@ -1035,11 +1046,7 @@ impl ReplicateObjectVersionOperation {
                     "Resolved on-demand reference access"
                 );
                 if self.sync.is_none() {
-                    self.state = ReplicateObjectVersionState::ReadReferenceSource;
-                    return smallvec![Effect::StagingSource(StagingSourceEffect::Read {
-                        access,
-                        range: None,
-                    })];
+                    return self.load_routing(access);
                 }
                 self.reference_access = Some(access.clone());
                 self.state = ReplicateObjectVersionState::HeadReferenceSource;
@@ -1153,6 +1160,65 @@ impl ReplicateObjectVersionOperation {
         let Some(access) = self.reference_access.take() else {
             return self.fail(ReplicateObjectVersionError::UnresolvedReferenceVersion);
         };
+        self.load_routing(access)
+    }
+
+    /// This node materializes the reference locally, so it routes with its own
+    /// snapshot: the group default and bucket rules load before the read.
+    fn load_routing(&mut self, access: ResolvedSourceAccess) -> Effects {
+        self.reference_access = Some(access);
+        self.state = ReplicateObjectVersionState::LoadRouting;
+        smallvec![load_group_inputs(self.request.source_group_id)]
+    }
+
+    fn read_bucket_rules(&mut self) -> Effects {
+        self.state = ReplicateObjectVersionState::ReadBucketRules;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: self.request.bucket.as_bytes().to_vec().into(),
+            txn_id: None,
+        })]
+    }
+
+    fn handle_routing_loaded(&mut self, event: Event) -> Effects {
+        let Event::SubOperation(SubOperationEvent::GroupRoutingLoaded { result }) = event else {
+            return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::SubOperation(SubOperationEvent::GroupRoutingLoaded)",
+                received: event,
+            });
+        };
+        match result {
+            Ok(inputs) => self.group_inputs = inputs,
+            Err(error) => {
+                return self.fail(ReplicateObjectVersionError::RoutingInputsFailed(error));
+            }
+        }
+        self.read_bucket_rules()
+    }
+
+    /// An unreadable bucket record leaves the rules empty: the write still
+    /// lands on the group or node default instead of failing.
+    fn handle_bucket_rules(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        self.bucket_rules = value
+            .as_ref()
+            .and_then(|value| BucketInfo::from_bytes(value.as_ref()).ok())
+            .map(|info| info.storage_routing)
+            .unwrap_or_default();
+        self.read_reference_source()
+    }
+
+    fn read_reference_source(&mut self) -> Effects {
+        let Some(access) = self.reference_access.take() else {
+            return self.fail(ReplicateObjectVersionError::UnresolvedReferenceVersion);
+        };
         self.state = ReplicateObjectVersionState::ReadReferenceSource;
         smallvec![Effect::StagingSource(StagingSourceEffect::Read {
             access,
@@ -1184,18 +1250,20 @@ impl ReplicateObjectVersionOperation {
                 );
 
                 let created_by = *created_by;
-                // This node materializes the reference locally, so it routes
-                // with its own snapshot, never the peer's.
-                let resolved = match resolve_backend(
-                    &self.routing.snapshot(self.request.source_group_id),
-                    &self.request.bucket,
-                    &self.request.key,
-                ) {
-                    Ok(resolved) => resolved,
-                    Err(error) => {
-                        return self.fail(ReplicateObjectVersionError::RoutingFailed(error));
-                    }
-                };
+                // Routed with this node's own snapshot, never the peer's, but
+                // with the full specificity ladder the local write would use.
+                let snapshot = self
+                    .routing
+                    .snapshot(self.request.source_group_id)
+                    .with_group_inputs(self.group_inputs.clone())
+                    .with_bucket_rules(self.bucket_rules.clone());
+                let resolved =
+                    match resolve_backend(&snapshot, &self.request.bucket, &self.request.key) {
+                        Ok(resolved) => resolved,
+                        Err(error) => {
+                            return self.fail(ReplicateObjectVersionError::RoutingFailed(error));
+                        }
+                    };
                 self.reference_metadata = Some(source_metadata);
                 self.state = ReplicateObjectVersionState::WriteReferenceBlob;
                 smallvec![Effect::Blob(BlobEffect::Write {
@@ -1666,6 +1734,8 @@ impl Operation for ReplicateObjectVersionOperation {
             }
             ReplicateObjectVersionState::HeadReferenceSource => self.handle_reference_head(event),
             ReplicateObjectVersionState::ReadReferenceState => self.handle_reference_state(event),
+            ReplicateObjectVersionState::LoadRouting => self.handle_routing_loaded(event),
+            ReplicateObjectVersionState::ReadBucketRules => self.handle_bucket_rules(event),
             ReplicateObjectVersionState::ReadReferenceSource => {
                 self.handle_reference_source_read(event)
             }
@@ -2031,17 +2101,29 @@ mod tests {
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
         AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, CurrentVersionPointer,
-        MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
+        GroupRoutingInputs, MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
         MultipartObjectSummary, PortableSourceDescriptor, RealmId, ReferenceHandling,
         ReplicationItemKind, ReplicationNegotiationResult, ReplicationSuboperationResult,
         ResolvedSourceAccess, SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey,
         VersionSourceBinding,
     };
+    use aruna_core::types::Effects;
     use bytes::Bytes;
     use futures_util::stream;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;
+
+    /// Replays the routing loader and bucket-rules read the reference path adds.
+    fn load_routing(op: &mut ReplicateObjectVersionOperation) -> Effects {
+        op.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
+            result: Ok(GroupRoutingInputs::default()),
+        }));
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8].into(),
+            value: None,
+        }))
+    }
 
     #[test]
     fn maps_sync_prefix() {
@@ -2765,6 +2847,8 @@ mod tests {
                 result: Ok(access.clone()),
             },
         ));
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let effects = load_routing(&mut op);
         assert!(matches!(
             effects.as_slice(),
             [Effect::StagingSource(StagingSourceEffect::Read { access: emitted, range })]
@@ -2833,6 +2917,7 @@ mod tests {
         op.step(Event::SubOperation(
             SubOperationEvent::VersionSourceAccessResolved { result: Ok(access) },
         ));
+        load_routing(&mut op);
         op.step(Event::StagingSource(StagingSourceEvent::ReadResult {
             metadata: SourceMetadata {
                 content_length: 3,

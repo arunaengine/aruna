@@ -3,6 +3,7 @@ use crate::blob::blob_keyspace_helper::{
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::group_routing::load_group_inputs;
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
 use crate::replication::queue::{
@@ -25,7 +26,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
-    CurrentVersionPointer, MultipartObjectMetadataKey, NodeRouting, Permission,
+    CurrentVersionPointer, GroupRoutingInputs, MultipartObjectMetadataKey, NodeRouting, Permission,
     RealmConfigDocument, RealmId, ReplicationItemKind, ReplicationNegotiationResult, RoCrateLimits,
     RoutingError, StorageRoutingRule, UsageDelta, VersionKey, blob_bucket_permission_path,
     blob_object_permission_path, resolve_backend,
@@ -43,6 +44,7 @@ enum IncomingVersionReplicationState {
     Init,
     ReadDestinationBucket,
     CreateDestinationBucket,
+    LoadDestinationRouting,
     CheckPermissions,
     CheckWriterPermissions,
     ReadExistingVersion,
@@ -96,6 +98,8 @@ pub enum IncomingVersionReplicationError {
     RealmMismatch,
     #[error("Destination bucket not found")]
     DestinationBucketNotFound,
+    #[error("could not load the destination group's routing inputs: {0}")]
+    RoutingInputsFailed(String),
     #[error("Replication requires WRITE permission on the destination path")]
     WritePermissionDenied,
     #[error("writer_access_denied")]
@@ -154,6 +158,7 @@ pub struct IncomingVersionReplicationOperation {
     /// The destination bucket's own rules, so this receiver routes its replica
     /// with the tenant's rules and its own class table.
     destination_rules: Vec<StorageRoutingRule>,
+    destination_inputs: GroupRoutingInputs,
     create_attempted: bool,
     negotiation_result: Option<ReplicationNegotiationResult>,
     quota_ceiling: Option<u64>,
@@ -193,6 +198,7 @@ impl IncomingVersionReplicationOperation {
             txn_id: None,
             destination_group_id: None,
             destination_rules: Vec::new(),
+            destination_inputs: GroupRoutingInputs::default(),
             create_attempted: false,
             negotiation_result: None,
             quota_ceiling: None,
@@ -233,6 +239,7 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::Init => "Init",
             IncomingVersionReplicationState::ReadDestinationBucket => "ReadDestinationBucket",
             IncomingVersionReplicationState::CreateDestinationBucket => "CreateDestinationBucket",
+            IncomingVersionReplicationState::LoadDestinationRouting => "LoadDestinationRouting",
             IncomingVersionReplicationState::CheckPermissions => "CheckPermissions",
             IncomingVersionReplicationState::CheckWriterPermissions => "CheckWriterPermissions",
             IncomingVersionReplicationState::ReadExistingVersion => "ReadExistingVersion",
@@ -492,6 +499,16 @@ impl IncomingVersionReplicationOperation {
         ))]
     }
 
+    /// The receiver's own group default and registered backend ids, loaded on
+    /// the one path that routes a blob. Without them a group default is ignored
+    /// and a `Group` target cannot resolve.
+    fn load_destination_routing(&mut self) -> Effects {
+        self.state = IncomingVersionReplicationState::LoadDestinationRouting;
+        smallvec![load_group_inputs(
+            self.destination_group_id.unwrap_or(self.manifest.group_id)
+        )]
+    }
+
     fn check_write_permission(&mut self, group_id: Ulid) -> Effects {
         self.state = IncomingVersionReplicationState::CheckPermissions;
         smallvec![Effect::SubOperation(boxed_suboperation(
@@ -626,6 +643,7 @@ impl IncomingVersionReplicationOperation {
         let snapshot = self
             .routing
             .snapshot(self.destination_group_id.unwrap_or(self.manifest.group_id))
+            .with_group_inputs(self.destination_inputs.clone())
             .with_bucket_rules(self.destination_rules.clone());
         let resolved = match resolve_backend(&snapshot, &self.manifest.bucket, &self.manifest.key) {
             Ok(resolved) => resolved,
@@ -1285,6 +1303,24 @@ impl Operation for IncomingVersionReplicationOperation {
                 self.destination_rules = bucket_info.storage_routing;
                 self.check_write_permission(bucket_info.group_id)
             }
+            IncomingVersionReplicationState::LoadDestinationRouting => {
+                let Event::SubOperation(SubOperationEvent::GroupRoutingLoaded { result }) = event
+                else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::SubOperation(SubOperationEvent::GroupRoutingLoaded)",
+                        received: event,
+                    });
+                };
+                match result {
+                    Ok(inputs) => self.destination_inputs = inputs,
+                    Err(error) => {
+                        return self
+                            .fail(IncomingVersionReplicationError::RoutingInputsFailed(error));
+                    }
+                }
+                self.receive_blob()
+            }
             IncomingVersionReplicationState::CreateDestinationBucket => {
                 let Event::SubOperation(SubOperationEvent::BucketCreated { result }) = event else {
                     return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
@@ -1619,7 +1655,7 @@ impl Operation for IncomingVersionReplicationOperation {
                             decision = ?self.negotiation_result,
                             "Negotiation sent; awaiting blob transfer"
                         );
-                        self.receive_blob()
+                        self.load_destination_routing()
                     }
                     None => self.fail(IncomingVersionReplicationError::ReplicationError(
                         ReplicationError::ReplicationFailed,
