@@ -112,9 +112,8 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
 
 impl BlobHandler {
     /// Refreshes any tenant backend the effect names before the synchronous
-    /// lookup path needs it. Records change while the process runs, so this
-    /// re-reads rather than caching: a deleted record drops the entry and the
-    /// effect then fails loudly instead of using stale credentials.
+    /// lookup path needs it. Re-reading rather than caching keeps a deleted
+    /// record from being served with stale credentials.
     pub(super) async fn load_group_backends(&self, effect: &BlobEffect) {
         for backend_id in group_ids(effect) {
             match self.read_group_backend(backend_id).await {

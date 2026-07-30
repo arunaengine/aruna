@@ -71,7 +71,7 @@ pub(crate) async fn check_staging_source(
     guard: &EgressGuard,
     access: &ResolvedSourceAccess,
 ) -> Result<(), StagingSourceError> {
-    let (operator, ..) = build_staging_source_operator(guard, access).await?;
+    let (operator, ..) = build_source_operator(guard, access).await?;
     let ResolvedSourceAccess::OpenDal { kind, .. } = access;
     check_operator(&operator, *kind).await
 }
@@ -96,7 +96,7 @@ pub(crate) async fn head_staging_source(
     guard: &EgressGuard,
     access: &ResolvedSourceAccess,
 ) -> Result<SourceMetadata, StagingSourceError> {
-    let (operator, path, version) = build_staging_source_operator(guard, access).await?;
+    let (operator, path, version) = build_source_operator(guard, access).await?;
     let metadata = match version {
         Some(version) => operator.stat_with(path).version(version).await,
         None => operator.stat(path).await,
@@ -123,7 +123,7 @@ pub(crate) async fn read_staging_source(
     ),
     StagingSourceError,
 > {
-    let (operator, path, version) = build_staging_source_operator(guard, access).await?;
+    let (operator, path, version) = build_source_operator(guard, access).await?;
     let metadata = head_staging_source(guard, access).await?;
     let reader = match version {
         Some(version) => operator.reader_with(path).version(version).await,
@@ -162,7 +162,7 @@ pub(crate) async fn list_staging_source(
         )
         .await;
     }
-    let (operator, path, ..) = build_staging_source_operator(guard, access).await?;
+    let (operator, path, ..) = build_source_operator(guard, access).await?;
     list_operator(&operator, path, offset, limit, recursive, files_only).await
 }
 
@@ -218,7 +218,8 @@ async fn list_operator(
     Ok((entries, false))
 }
 
-async fn build_staging_source_operator<'access>(
+/// Builds the guarded opendal operator for one resolved staging source.
+async fn build_source_operator<'access>(
     guard: &EgressGuard,
     access: &'access ResolvedSourceAccess,
 ) -> Result<(Operator, &'access str, Option<&'access str>), StagingSourceError> {
@@ -450,9 +451,7 @@ mod tests {
             path: "file.txt".to_string(),
             version: None,
         };
-        let (operator, path, ..) = build_staging_source_operator(&test_guard(), &access)
-            .await
-            .unwrap();
+        let (operator, path, ..) = build_source_operator(&test_guard(), &access).await.unwrap();
         let _ = operator.stat(path).await;
 
         restore_env(previous);
@@ -597,9 +596,7 @@ mod tests {
                 version: None,
             };
 
-            let (operator, path, ..) = build_staging_source_operator(&guard, &access)
-                .await
-                .unwrap();
+            let (operator, path, ..) = build_source_operator(&guard, &access).await.unwrap();
             let error = operator.stat(path).await.unwrap_err();
 
             assert!(
@@ -626,9 +623,7 @@ mod tests {
         };
         let guard = EgressGuard::new(EgressPolicy::strict()).unwrap();
 
-        let error = build_staging_source_operator(&guard, &access)
-            .await
-            .unwrap_err();
+        let error = build_source_operator(&guard, &access).await.unwrap_err();
 
         assert!(matches!(error, StagingSourceError::EgressDenied(_)));
         assert_eq!(listener.hits(), 0);
@@ -643,9 +638,7 @@ mod tests {
             version: Some("v42".to_string()),
         };
 
-        let (.., path, version) = build_staging_source_operator(&test_guard(), &access)
-            .await
-            .unwrap();
+        let (.., path, version) = build_source_operator(&test_guard(), &access).await.unwrap();
         assert_eq!(path, "file.txt");
         assert_eq!(version, Some("v42"));
     }
@@ -664,9 +657,7 @@ mod tests {
             version: None,
         };
 
-        let (.., path, version) = build_staging_source_operator(&test_guard(), &access)
-            .await
-            .unwrap();
+        let (.., path, version) = build_source_operator(&test_guard(), &access).await.unwrap();
         assert_eq!(path, "run-1/data.txt");
         assert_eq!(version, None);
     }

@@ -498,8 +498,7 @@ pub fn validate_node_rules(rules: &[NodeRoutingRule]) -> Result<(), RoutingError
 
 /// Tenants may name a backend their own group registered or a storage class,
 /// never an operator backend: node topology must not be bound into replicated
-/// records, and a foreign id would route the group's bytes to another tenant's
-/// endpoint and credentials.
+/// records, and a foreign id would reach another tenant's credentials.
 pub fn validate_tenant_target(
     target: &RoutingTarget,
     owned: &BTreeSet<Ulid>,

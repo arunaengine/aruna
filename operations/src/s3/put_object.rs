@@ -1181,7 +1181,7 @@ mod test {
     }
 
     #[test]
-    fn bucket_guard_allows_edit() {
+    fn guard_allows_edit() {
         // A routing or CORS edit is prospective policy, not a different bucket:
         // it must not discard a write that already landed.
         let realm_id = RealmId::from_bytes([1u8; 32]);

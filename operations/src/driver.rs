@@ -1039,7 +1039,7 @@ mod routing_tests {
     }
 
     #[tokio::test]
-    async fn scopes_catalog_to_group() {
+    async fn scopes_catalog() {
         // Another group's backend must never enter this group's catalog.
         let test = setup_driver_context().await;
         let group_id = Ulid::generate();
@@ -1054,7 +1054,9 @@ mod routing_tests {
     }
 
     #[tokio::test]
-    async fn bucket_snapshot_loads_group() {
+    async fn snapshot_loads_group() {
+        // A caller holding the bucket record still has to pick up the group's
+        // default target and backend ids.
         let test = setup_driver_context().await;
         let group_id = Ulid::generate();
         let backend_id = register(&test.driver_context, group_id).await;
