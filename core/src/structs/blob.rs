@@ -901,9 +901,9 @@ impl UserAccess {
 #[cfg(test)]
 mod tests {
     use super::{
-        Backend, BackendRef, BlobHeadKey, BlobVersion, BucketCorsConfiguration, BucketCorsRule,
-        CurrentVersionPointer, HashPathIndexKey, HiddenBlobKey, blob_bucket_permission_path,
-        blob_group_permission_path, blob_object_permission_path,
+        Backend, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketCorsConfiguration,
+        BucketCorsRule, CurrentVersionPointer, HashPathIndexKey, HiddenBlobKey,
+        blob_bucket_permission_path, blob_group_permission_path, blob_object_permission_path,
     };
     use crate::NodeId;
     use crate::structs::{
@@ -1010,6 +1010,30 @@ mod tests {
         assert!(inside.starts_with(&prefix));
         assert!(!outside.starts_with(&prefix));
         assert!(outside > inside);
+    }
+
+    #[test]
+    fn location_key_separates_backends() {
+        // One hash on two backends must produce two distinct, decodable keys.
+        let node = BlobLocationKey::new([7u8; 32], BackendRef::node_default());
+        let group = BlobLocationKey::new([7u8; 32], BackendRef::Group(Ulid::from_bytes([4u8; 16])));
+
+        assert_ne!(node.to_bytes(), group.to_bytes());
+        assert_eq!(BlobLocationKey::from_bytes(&node.to_bytes()).unwrap(), node);
+        assert_eq!(
+            BlobLocationKey::from_bytes(&group.to_bytes()).unwrap(),
+            group
+        );
+        assert!(node.to_bytes().starts_with(&[7u8; 32]));
+        assert!(group.to_bytes().starts_with(&[7u8; 32]));
+    }
+
+    #[test]
+    fn location_key_rejects_garbage() {
+        assert!(BlobLocationKey::from_bytes(&[1u8; 20]).is_err());
+        let mut unknown = [2u8; 32].to_vec();
+        unknown.extend_from_slice(b"x:name");
+        assert!(BlobLocationKey::from_bytes(&unknown).is_err());
     }
 
     #[test]

@@ -1188,7 +1188,9 @@ mod test {
     };
     use crate::usage_stats::{QuotaGate, UsageCounterUpdate};
     use aruna_blob::blob::BlobHandler;
+    use aruna_blob::blob::{BackendRegistry, NodeBackend};
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+    use aruna_core::egress::EgressPolicy;
     use aruna_core::errors::{BlobError, StorageError};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::keyspaces::{
@@ -1197,13 +1199,13 @@ mod test {
     };
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::RoutingSnapshot;
     use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
     use aruna_core::structs::{
         Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey,
         BlobVersion, BucketInfo, CurrentVersionPointer, HashPathIndexKey, RealmId, UsageDelta,
         VersionKey,
     };
+    use aruna_core::structs::{BackendCatalog, NodeRoutingRule, RoutingSnapshot, RoutingTarget};
     use aruna_net::dht::storage::decode_entries;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -1956,6 +1958,225 @@ mod test {
             .expect("missing hash path index entry");
             assert!(hash_path_value.is_empty());
         }
+    }
+
+    /// Two filesystem node backends with distinct roots: enough to prove that a
+    /// routed write never adopts a copy sitting on the other backend.
+    async fn setup_two_backends(temp_root: &str) -> (DriverContext, String, String) {
+        let hot_root = format!("{temp_root}/hot");
+        let cold_root = format!("{temp_root}/cold");
+        std::fs::create_dir_all(&hot_root).unwrap();
+        std::fs::create_dir_all(&cold_root).unwrap();
+        let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+        let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+            .await
+            .unwrap();
+
+        let backend = |root: &str, prefix: &str, class: Option<String>| {
+            std::sync::Arc::new(NodeBackend::new(
+                BackendConfig {
+                    backend_type: Backend::FileSystem,
+                    bucket_prefix: Some(prefix.to_string()),
+                    max_bucket_size: Some(100_000),
+                    multipart_bucket: Some(format!("{prefix}parts")),
+                    root: root.to_string(),
+                    service_config: HashMap::new(),
+                    timeouts: Default::default(),
+                },
+                class,
+            ))
+        };
+        let mut backends = std::collections::BTreeMap::new();
+        backends.insert("default".to_string(), backend(&hot_root, "hot-", None));
+        backends.insert(
+            "cold".to_string(),
+            backend(&cold_root, "cold-", Some("cold".to_string())),
+        );
+        let registry = BackendRegistry::new(backends, "default".to_string()).unwrap();
+        let blob_handle = BlobHandler::with_registry(
+            registry,
+            storage_handle.clone(),
+            net_handle.clone(),
+            EgressPolicy::loopback(),
+        )
+        .await
+        .unwrap();
+
+        (
+            DriverContext {
+                storage_handle,
+                net_handle: Some(net_handle),
+                blob_handle: Some(blob_handle),
+                metadata_handle: None,
+                task_handle: None,
+                compute_handle: None,
+            },
+            hot_root,
+            cold_root,
+        )
+    }
+
+    fn archive_routing(group_id: Ulid) -> RoutingSnapshot {
+        let catalog = BackendCatalog::new("default")
+            .with_backend("default", None)
+            .with_backend("cold", Some("cold".to_string()));
+        RoutingSnapshot::new(group_id, catalog).with_node_rules(vec![NodeRoutingRule {
+            group: None,
+            bucket: None,
+            key_prefix: Some("archive/".to_string()),
+            target: RoutingTarget::Class("cold".to_string()),
+        }])
+    }
+
+    async fn put_routed(
+        context: &DriverContext,
+        group_id: Ulid,
+        realm_id: RealmId,
+        key: &str,
+        data: &'static [u8],
+    ) -> super::PutObjectResult {
+        drive(
+            PutObjectOperation::new(PutObjectConfig {
+                user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+                group_id,
+                realm_id,
+                node_id: context.net_handle.as_ref().unwrap().node_id(),
+                request: PutObjectInput {
+                    bucket: "mybucket".to_string(),
+                    key: key.to_string(),
+                    content_length: Some(data.len() as u64),
+                    body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(data))),
+                },
+                expected_checksums: vec![],
+                checksum_type: None,
+                exists: false,
+                version_source: None,
+                preassigned_version_id: None,
+                quota_ceiling: None,
+                routing: archive_routing(group_id),
+            }),
+            context,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn dedup_stays_inside_backend() {
+        let temp_handle = tempdir().unwrap();
+        let temp_root = temp_handle.path().to_str().unwrap();
+        let (context, hot_root, cold_root) = setup_two_backends(temp_root).await;
+
+        let data = b"identical bytes";
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::generate();
+
+        let hot = put_routed(&context, group_id, realm_id, "hot.txt", data).await;
+        let cold = put_routed(&context, group_id, realm_id, "archive/cold.txt", data).await;
+
+        assert_eq!(hot.location.backend, BackendRef::node_default());
+        assert_eq!(cold.location.backend, BackendRef::Node("cold".to_string()));
+        assert_eq!(count_files(Path::new(&hot_root)), 1);
+        assert_eq!(count_files(Path::new(&cold_root)), 1);
+
+        let hash: [u8; 32] = hot.location.get_blake3().unwrap().try_into().unwrap();
+        assert_eq!(cold.location.get_blake3().unwrap(), hash);
+
+        for (key, result) in [("hot.txt", &hot), ("archive/cold.txt", &cold)] {
+            let version_value = read_value(
+                &context,
+                BLOB_VERSIONS_KEYSPACE,
+                VersionKey::new("mybucket", key, result.version_id)
+                    .to_bytes()
+                    .unwrap(),
+            )
+            .await
+            .expect("missing blob version entry");
+            let version = BlobVersion::from_bytes(version_value.as_ref()).unwrap();
+            assert_eq!(version.blob_backend(), Some(&result.location.backend));
+
+            let location_value = read_value(
+                &context,
+                BLOB_LOCATIONS_KEYSPACE,
+                version.location_key().unwrap().to_bytes(),
+            )
+            .await
+            .expect("missing blob location entry");
+            assert_eq!(
+                BackendLocation::from_bytes(location_value.as_ref()).unwrap(),
+                result.location
+            );
+            assert!(exists(result.location.get_full_path().unwrap()).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn dedup_repeats_inside_backend() {
+        // A rewrite onto the same backend must still adopt the stored copy.
+        let temp_handle = tempdir().unwrap();
+        let temp_root = temp_handle.path().to_str().unwrap();
+        let (context, _hot_root, cold_root) = setup_two_backends(temp_root).await;
+
+        let data = b"identical bytes";
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::generate();
+
+        let first = put_routed(&context, group_id, realm_id, "archive/one.txt", data).await;
+        let second = put_routed(&context, group_id, realm_id, "archive/two.txt", data).await;
+
+        assert_eq!(first.location, second.location);
+        assert_eq!(count_files(Path::new(&cold_root)), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_keeps_other_backend_copy() {
+        let temp_handle = tempdir().unwrap();
+        let temp_root = temp_handle.path().to_str().unwrap();
+        let (context, _hot_root, cold_root) = setup_two_backends(temp_root).await;
+
+        let data = b"identical bytes";
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::generate();
+
+        let hot = put_routed(&context, group_id, realm_id, "hot.txt", data).await;
+        let cold = put_routed(&context, group_id, realm_id, "archive/cold.txt", data).await;
+
+        let deleted = drive(
+            crate::s3::delete_object::DeleteObjectOperation::new(
+                crate::s3::delete_object::DeleteObjectInput {
+                    bucket: "mybucket".to_string(),
+                    key: "hot.txt".to_string(),
+                    version_id: Some(hot.version_id),
+                    group_id,
+                    realm_id,
+                    node_id: context.net_handle.as_ref().unwrap().node_id(),
+                    deleted_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
+                },
+            ),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(deleted.is_some_and(|result| result.is_ok()));
+
+        let location_value = read_value(
+            &context,
+            BLOB_LOCATIONS_KEYSPACE,
+            BlobLocationKey::new(
+                cold.location.get_blake3().unwrap().try_into().unwrap(),
+                cold.location.backend.clone(),
+            )
+            .to_bytes(),
+        )
+        .await
+        .expect("cold copy was removed with the hot object");
+        assert_eq!(
+            BackendLocation::from_bytes(location_value.as_ref()).unwrap(),
+            cold.location
+        );
+        assert_eq!(count_files(Path::new(&cold_root)), 1);
     }
 
     #[test]
