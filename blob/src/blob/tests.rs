@@ -14,18 +14,22 @@ use aruna_core::effects::{BlobEffect, StagingSourceEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
-use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB, HASH_PATHS_INDEX_KEYSPACE};
+use aruna_core::keyspaces::{
+    BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB, GROUP_STORAGE_BACKEND_KEYSPACE,
+    GROUP_STORAGE_BACKEND_SECRET_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::{
     Backend, BackendConfig, BackendLocation, BackendRef, BlobTimeoutConfig, GroupBackendKind,
-    HiddenBlobKey, MultipartUploadPartKey, RealmId, ResolvedBackend, ResolvedSourceAccess,
-    SourceConnectorKind, Status,
+    GroupStorageBackend, GroupStorageBackendSecret, HiddenBlobKey, MultipartUploadPartKey, RealmId,
+    ResolvedBackend, ResolvedSourceAccess, SourceConnectorKind, Status,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::storage;
 use futures::TryStreamExt;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tempfile::tempdir;
 use ulid::Ulid;
@@ -1861,31 +1865,128 @@ async fn s3_multipart_compose() {
     assert_eq!(read_back(&handler, location).await, b"first-second");
 }
 
+async fn write_group_backend(context: &TestContext, backend_id: Ulid, paired: bool) {
+    let key: aruna_core::types::Key = backend_id.to_bytes().to_vec().into();
+    let record = GroupStorageBackend {
+        backend_id,
+        group_id: Ulid::generate(),
+        name: "tenant".to_string(),
+        kind: GroupBackendKind::S3,
+        public_config: HashMap::from([
+            ("bucket".to_string(), "data".to_string()),
+            ("endpoint".to_string(), "https://s3.example.com".to_string()),
+        ]),
+        created_at: SystemTime::UNIX_EPOCH,
+        updated_at: SystemTime::UNIX_EPOCH,
+        created_by: UserId::default(),
+    };
+    let mut writes = vec![(
+        GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+        key.clone(),
+        record.to_bytes().unwrap().into(),
+    )];
+    if paired {
+        let secret = GroupStorageBackendSecret {
+            backend_id,
+            secret_config: HashMap::from([("access_key_id".to_string(), "id".to_string())]),
+            updated_at: SystemTime::UNIX_EPOCH,
+        };
+        writes.push((
+            GROUP_STORAGE_BACKEND_SECRET_KEYSPACE.to_string(),
+            key,
+            secret.to_bytes().unwrap().into(),
+        ));
+    }
+    context
+        .storage_handle
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        })
+        .await;
+}
+
+fn group_effect(backend_id: Ulid) -> BlobEffect {
+    BlobEffect::HandleReplication {
+        replication_id: None,
+        stream_id: Ulid::generate(),
+        resolved: ResolvedBackend::new(BackendRef::Group(backend_id), None),
+        keep_alive: false,
+    }
+}
+
+#[tokio::test]
+async fn pins_effect_snapshot() {
+    // A shared entry could be replaced or dropped while this effect still runs.
+    let context = setup_blob_handle(4).await;
+    let backend_id = Ulid::generate();
+    write_group_backend(&context, backend_id, true).await;
+    let handler = context.blob_handle.handler.clone();
+
+    let scoped = handler
+        .with_group_backends(&group_effect(backend_id))
+        .await
+        .unwrap();
+
+    assert!(
+        scoped
+            .registry
+            .backend(&BackendRef::Group(backend_id))
+            .is_ok()
+    );
+    assert!(
+        handler
+            .registry
+            .backend(&BackendRef::Group(backend_id))
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn needs_paired_secret() {
+    // Half a backend must fail loudly instead of building an operator.
+    let context = setup_blob_handle(4).await;
+    let backend_id = Ulid::generate();
+    write_group_backend(&context, backend_id, false).await;
+
+    let loaded = context
+        .blob_handle
+        .handler
+        .with_group_backends(&group_effect(backend_id))
+        .await;
+
+    assert!(loaded.is_err(), "expected a load failure");
+}
+
 #[tokio::test]
 async fn serves_group_backend() {
     // The tenant endpoint path: MinIO stands in for a group-owned store.
     let Some(env) = s3_env() else { return };
     let context = setup_s3_mixed(&env).await;
-    let handler = context.blob_handle.handler.clone();
     let bucket = unique_name("tenant-");
     make_bucket(&bucket, &s3_config(&env, None)).await.unwrap();
 
     let backend_id = Ulid::generate();
-    context.blob_handle.handler.registry.insert_group(
-        backend_id,
-        NodeBackend::new(
-            BackendConfig {
-                backend_type: Backend::Group(GroupBackendKind::S3),
-                root: String::new(),
-                service_config: s3_config(&env, Some(&bucket)),
-                bucket_prefix: None,
-                max_bucket_size: None,
-                multipart_bucket: Some(bucket.clone()),
-                timeouts: Default::default(),
-            },
-            None,
-        ),
+    let entry = NodeBackend::new(
+        BackendConfig {
+            backend_type: Backend::Group(GroupBackendKind::S3),
+            root: String::new(),
+            service_config: s3_config(&env, Some(&bucket)),
+            bucket_prefix: None,
+            max_bucket_size: None,
+            multipart_bucket: Some(bucket.clone()),
+            timeouts: Default::default(),
+        },
+        None,
     );
+    let handler = BlobHandler {
+        registry: context
+            .blob_handle
+            .handler
+            .registry
+            .with_groups(HashMap::from([(backend_id, Arc::new(entry))])),
+        ..context.blob_handle.handler.clone()
+    };
 
     let resolved = ResolvedBackend::new(BackendRef::Group(backend_id), None);
     let BlobEvent::WriteFinished { location } = handler

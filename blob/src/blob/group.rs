@@ -10,7 +10,9 @@ use aruna_core::structs::{
     Backend, BackendConfig, BackendRef, GroupBackendKind, GroupStorageBackend,
     GroupStorageBackendSecret,
 };
+use aruna_core::types::Key;
 use std::collections::HashMap;
+use std::sync::Arc;
 use ulid::Ulid;
 
 /// Uniform tenant write chunk. azblob and azdls declare no minimum, so without
@@ -111,69 +113,63 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
 }
 
 impl BlobHandler {
-    /// Refreshes any tenant backend the effect names before the synchronous
-    /// lookup path needs it. Re-reading rather than caching keeps a deleted
-    /// record from being served with stale credentials.
-    pub(super) async fn load_group_backends(&self, effect: &BlobEffect) {
+    /// Loads every tenant backend the effect names into a handler of its own.
+    /// The snapshot never enters shared state, so a concurrent replacement or
+    /// deletion cannot swap the backend an executing effect resolves.
+    pub(super) async fn with_group_backends(&self, effect: &BlobEffect) -> Result<Self, BlobError> {
+        let mut groups = HashMap::new();
         for backend_id in group_ids(effect) {
-            match self.read_group_backend(backend_id).await {
-                Ok(Some(entry)) => self.registry.insert_group(backend_id, entry),
-                Ok(None) => {
-                    self.registry.forget_group(&backend_id);
-                    tracing::warn!(%backend_id, "group storage backend record is missing");
-                }
-                Err(error) => {
-                    self.registry.forget_group(&backend_id);
-                    tracing::warn!(%backend_id, error = %error, "failed to load group backend");
-                }
+            if groups.contains_key(&backend_id) {
+                continue;
             }
+            groups.insert(
+                backend_id,
+                Arc::new(self.read_group_backend(backend_id).await?),
+            );
         }
+        if groups.is_empty() {
+            return Ok(self.clone());
+        }
+        Ok(Self {
+            registry: self.registry.with_groups(groups),
+            ..self.clone()
+        })
     }
 
-    async fn read_group_backend(&self, backend_id: Ulid) -> Result<Option<NodeBackend>, BlobError> {
-        let Some(record) = self
-            .read_record(GROUP_STORAGE_BACKEND_KEYSPACE, backend_id)
-            .await
-        else {
-            return Ok(None);
-        };
-        let record =
-            GroupStorageBackend::from_bytes(record.as_ref()).map_err(BlobError::ConversionError)?;
-        let secret = match self
-            .read_record(GROUP_STORAGE_BACKEND_SECRET_KEYSPACE, backend_id)
-            .await
-        {
-            Some(value) => GroupStorageBackendSecret::from_bytes(value.as_ref())
-                .map_err(BlobError::ConversionError)?,
-            None => {
-                return Err(BlobError::OperatorCreationFailed(format!(
-                    "group backend {backend_id} has no stored credentials"
-                )));
-            }
-        };
-        group_entry(&record, &secret, self.registry.timeouts()).map(Some)
-    }
-
-    async fn read_record(
-        &self,
-        key_space: &str,
-        backend_id: Ulid,
-    ) -> Option<aruna_core::types::Value> {
+    /// Both records are read from one snapshot: a replacement committing between
+    /// separate reads would pair the old endpoint with the new credentials.
+    async fn read_group_backend(&self, backend_id: Ulid) -> Result<NodeBackend, BlobError> {
+        let key: Key = backend_id.to_bytes().to_vec().into();
         let event = self
             .storage
-            .send_storage_effect(StorageEffect::Read {
-                key_space: key_space.to_string(),
-                key: backend_id.to_bytes().to_vec().into(),
+            .send_storage_effect(StorageEffect::BatchRead {
+                reads: vec![
+                    (GROUP_STORAGE_BACKEND_KEYSPACE.to_string(), key.clone()),
+                    (GROUP_STORAGE_BACKEND_SECRET_KEYSPACE.to_string(), key),
+                ],
                 txn_id: None,
             })
             .await;
-        match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-            other => {
-                tracing::warn!(key_space, event = ?other, "group backend read failed");
-                None
-            }
-        }
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return Err(BlobError::ReadError(format!(
+                "group backend {backend_id} could not be read"
+            )));
+        };
+        let [(_, record), (_, secret)] = values.as_slice() else {
+            return Err(BlobError::ReadError(format!(
+                "group backend {backend_id} returned an incomplete read"
+            )));
+        };
+        let (Some(record), Some(secret)) = (record, secret) else {
+            return Err(BlobError::UnknownBackend(format!(
+                "group backend {backend_id} is not registered"
+            )));
+        };
+        let record =
+            GroupStorageBackend::from_bytes(record.as_ref()).map_err(BlobError::ConversionError)?;
+        let secret = GroupStorageBackendSecret::from_bytes(secret.as_ref())
+            .map_err(BlobError::ConversionError)?;
+        group_entry(&record, &secret, self.registry.timeouts())
     }
 
     /// Create-time proof that the credentials work and the endpoint is

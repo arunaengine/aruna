@@ -8,7 +8,7 @@ use aruna_core::structs::{
 };
 use opendal::Operator;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, RwLock as SyncRwLock};
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use ulid::Ulid;
 
@@ -49,9 +49,9 @@ impl NodeBackend {
 #[derive(Clone, Debug)]
 pub struct BackendRegistry {
     node: Arc<BTreeMap<String, Arc<NodeBackend>>>,
-    /// Tenant backends, loaded from storage on first use. Unlike node backends
-    /// these are created and deleted while the process runs.
-    group: Arc<SyncRwLock<HashMap<Ulid, Arc<NodeBackend>>>>,
+    /// Tenant backends the executing effect loaded. Effect-local by design:
+    /// they are created, replaced and deleted while the process runs.
+    group: Arc<HashMap<Ulid, Arc<NodeBackend>>>,
     default_name: String,
     rules: Arc<[NodeRoutingRule]>,
     serve_group_backends: bool,
@@ -107,17 +107,12 @@ impl BackendRegistry {
         })
     }
 
-    /// Caches a tenant backend synthesized from its stored record, so the sync
+    /// Pins tenant backends synthesized from their stored records, so the sync
     /// lookup path works for `BackendRef::Group` exactly as for node backends.
-    pub fn insert_group(&self, backend_id: Ulid, backend: NodeBackend) {
-        if let Ok(mut group) = self.group.write() {
-            group.insert(backend_id, Arc::new(backend));
-        }
-    }
-
-    pub fn forget_group(&self, backend_id: &Ulid) {
-        if let Ok(mut group) = self.group.write() {
-            group.remove(backend_id);
+    pub fn with_groups(&self, group: HashMap<Ulid, Arc<NodeBackend>>) -> Self {
+        Self {
+            group: Arc::new(group),
+            ..self.clone()
         }
     }
 
@@ -158,11 +153,7 @@ impl BackendRegistry {
     pub fn backend(&self, backend: &BackendRef) -> Result<Arc<NodeBackend>, BlobError> {
         match backend {
             BackendRef::Node(name) => self.node.get(name).cloned(),
-            BackendRef::Group(backend_id) => self
-                .group
-                .read()
-                .ok()
-                .and_then(|group| group.get(backend_id).cloned()),
+            BackendRef::Group(backend_id) => self.group.get(backend_id).cloned(),
         }
         .ok_or_else(|| BlobError::UnknownBackend(backend.to_string()))
     }

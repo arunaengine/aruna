@@ -324,7 +324,14 @@ impl BlobHandler {
     // Effects run concurrently on their caller's task; per-operation ordering
     // is preserved by the driver awaiting each effect before the next.
     pub(super) async fn execute_effect(&self, effect: BlobEffect) -> BlobEvent {
-        self.load_group_backends(&effect).await;
+        let handler = match self.with_group_backends(&effect).await {
+            Ok(handler) => handler,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        handler.dispatch_effect(effect).await
+    }
+
+    async fn dispatch_effect(&self, effect: BlobEffect) -> BlobEvent {
         match effect {
             BlobEffect::Write {
                 bucket,
