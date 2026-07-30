@@ -1796,7 +1796,7 @@ mod tests {
         }
     }
 
-    fn node_id(seed: u8) -> NodeId {
+    pub(super) fn node_id(seed: u8) -> NodeId {
         let mut bytes = [0u8; 32];
         bytes[0] = seed;
         iroh::SecretKey::from_bytes(&bytes).public()
@@ -1821,7 +1821,7 @@ mod tests {
         })
     }
 
-    fn execution_spec() -> ExecutionSpec {
+    pub(super) fn execution_spec() -> ExecutionSpec {
         ExecutionSpec {
             group_id: Ulid::from_bytes([3u8; 16]),
             name: None,

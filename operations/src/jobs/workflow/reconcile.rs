@@ -84,17 +84,15 @@ impl ExternalReconciler for ComputeReconciler {
             .and_then(|registry| registry.get(&kind))
             .cloned()
         else {
-            warn!(job_id = %job_id, kind = %intent.executor_kind, "Reconcile backend unavailable; parking");
-            park_attempt(
-                &self.context,
-                job_id,
-                token,
-                JobError::retryable(format!(
-                    "reconcile backend unavailable: {}",
-                    intent.executor_kind
-                )),
-            )
-            .await;
+            // A node without this backend cannot observe the attempt: charging here
+            // would terminalize a healthy container it can never see. Hand it back
+            // with an expired lease so a node that has the backend can reconcile it.
+            warn!(job_id = %job_id, kind = %intent.executor_kind, "Reconcile backend unavailable; handing back");
+            if let Err(error) =
+                handoff_external_attempt(storage, job_id, token, unix_timestamp_millis()).await
+            {
+                warn!(job_id = %job_id, error = %error, "Failed to hand back an unreconciled attempt");
+            }
             return;
         };
 
@@ -526,4 +524,85 @@ fn holder(context: &DriverContext) -> aruna_core::types::NodeId {
         .as_ref()
         .map(|net| net.node_id())
         .unwrap_or_else(|| iroh::SecretKey::from_bytes(&[0u8; 32]).public())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::JOB_MAX_ATTEMPTS;
+    use crate::jobs::store::{insert_job, record_attempt_intent};
+    use crate::jobs::workflow::tests::{execution_spec, node_id};
+    use aruna_compute::ExecutorRegistry;
+    use aruna_core::structs::{AttemptIntent, JobClaim, JobId, RealmId};
+    use aruna_core::types::UserId;
+    use aruna_storage::FjallStorage;
+    use aruna_tasks::TaskHandle;
+    use tempfile::tempdir;
+    use ulid::Ulid;
+
+    // A node whose registry lacks the executor cannot observe the container, so no
+    // number of sweeps by it may spend an attempt or terminalize the job.
+    #[tokio::test]
+    async fn missing_backend_spares() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(TaskHandle::new()),
+            compute_handle: Some(Arc::new(ExecutorRegistry::new())),
+        });
+        let job_id = JobId::new();
+        let token = Ulid::generate();
+        let mut record = JobRecord::new(
+            job_id,
+            JobPayload::Execution(execution_spec()),
+            UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
+            node_id(7),
+            1,
+            1,
+            None,
+        );
+        record.state = JobState::Running;
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id(7),
+            claim_token: token,
+            lease_expires_at_ms: 1,
+        });
+        insert_job(&storage, &record).await.unwrap();
+        record_attempt_intent(
+            &storage,
+            job_id,
+            token,
+            AttemptIntent {
+                attempt_no: 1,
+                external_name: job_id.to_string().to_lowercase(),
+                executor_kind: "kubernetes".to_string(),
+                pinned_image: "alpine@sha256:digest".to_string(),
+                attempt_epoch: 0,
+            },
+            unix_timestamp_millis(),
+        )
+        .await
+        .unwrap();
+
+        let runtime = JobsRuntime::new();
+        let reconciler = ComputeReconciler::new(context, Arc::downgrade(&runtime));
+        for sweep in 0..(JOB_MAX_ATTEMPTS + 2) {
+            let lost = read_job_record(&storage, job_id, None)
+                .await
+                .unwrap()
+                .unwrap();
+            reconciler.reconcile_lost_attempt(&storage, lost).await;
+            let after = read_job_record(&storage, job_id, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.state, JobState::Running, "sweep {sweep}");
+            assert_eq!(after.attempts, 0, "sweep {sweep}");
+            assert!(after.attempt_intent.is_some(), "sweep {sweep}");
+        }
+    }
 }
