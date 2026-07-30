@@ -108,6 +108,9 @@ pub async fn process_job_queue_batch(
                         )
                         .await
                         {
+                            // A node without a reconciler leaves the attempt for one that
+                            // has it: charging here would terminalize a healthy container
+                            // this node cannot even observe.
                             Ok(RequeueOutcome::NeedsReconcile(record)) => {
                                 if let Some(reconciler) = reconciler {
                                     reconciler.reconcile_lost_attempt(storage, record).await;
@@ -614,7 +617,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.state, JobState::Running, "not requeued");
-        assert_eq!(stored.attempts, 0);
+        assert_eq!(stored.attempts, 0, "the sweep charges nothing");
         assert!(stored.claim.is_some());
         // The hook saw exactly this job, proving no blind re-run path was taken.
         assert_eq!(recorder.seen.lock().unwrap().as_slice(), &[job_id]);

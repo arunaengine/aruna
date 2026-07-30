@@ -29,7 +29,7 @@ use tracing::{info, warn};
 
 use super::JOB_HEARTBEAT_MS;
 use super::store::{
-    ExecutionCompleteOutcome, JobMutationError, cancel_execution, cancel_running_job,
+    ExecutionCompleteOutcome, JobMutationError, ParkOutcome, cancel_execution, cancel_running_job,
     complete_execution, complete_job, fail_execution, mark_indeterminate, read_job_record,
     record_attempt_intent, record_attempt_started, record_attempt_tombstone, renew_lease,
     requeue_before_attempt, set_workspace_bucket, transition_external_to_running,
@@ -793,14 +793,35 @@ async fn park_failed_submit(
     token: ulid::Ulid,
     error: &BackendError,
 ) {
-    let _ = mark_indeterminate(
-        &context.storage_handle,
+    park_attempt(
+        context,
         job_id,
         token,
         JobError::retryable(format!("submit failed ambiguously: {error}")),
-        unix_timestamp_millis(),
     )
     .await;
+}
+
+/// Park an ambiguous attempt for a later reconcile pass. The park charges an
+/// attempt, so a failure that repeats on every pass terminalizes at the cap
+/// instead of re-driving the job forever.
+async fn park_attempt(context: &DriverContext, job_id: JobId, token: ulid::Ulid, error: JobError) {
+    match mark_indeterminate(
+        &context.storage_handle,
+        job_id,
+        token,
+        error,
+        unix_timestamp_millis(),
+    )
+    .await
+    {
+        Ok(ParkOutcome::Parked(_)) => {}
+        Ok(ParkOutcome::Failed(record)) => {
+            warn!(job_id = %job_id, "Indeterminate attempts exhausted; failing job");
+            Box::pin(cleanup_and_crate(context, job_id, Some(record))).await;
+        }
+        Err(error) => warn!(job_id = %job_id, error = %error, "Attempt park write failed"),
+    }
 }
 
 /// Heartbeat + backend wait race, then evidence-based terminalization. Shared by
@@ -905,13 +926,12 @@ async fn finalize_walltime(
         }
         Ok(CancelEvidence::AlreadyGone) => LogTails::default(),
         Ok(CancelEvidence::Requested) | Err(_) => {
-            let _ = mark_indeterminate(
-                storage,
+            Box::pin(park_attempt(
+                context,
                 job_id,
                 token,
                 JobError::retryable("walltime stop lacks evidence"),
-                unix_timestamp_millis(),
-            )
+            ))
             .await;
             return;
         }
@@ -1007,13 +1027,12 @@ pub(crate) async fn finalize_attempt(
         // Post-submit NotFound / unreachable backend is ambiguous: park in
         // Indeterminate, never requeue (spec 16.7).
         Err(error) => {
-            let _ = mark_indeterminate(
-                storage,
+            Box::pin(park_attempt(
+                context,
                 job_id,
                 token,
                 JobError::retryable(format!("attempt unobservable: {error}")),
-                unix_timestamp_millis(),
-            )
+            ))
             .await;
             return;
         }
@@ -1125,13 +1144,12 @@ pub(crate) async fn finalize_attempt(
             .await;
         }
         AttemptPhase::Submitted | AttemptPhase::Running => {
-            let _ = mark_indeterminate(
-                storage,
+            Box::pin(park_attempt(
+                context,
                 job_id,
                 token,
                 JobError::retryable("attempt returned non-terminal"),
-                unix_timestamp_millis(),
-            )
+            ))
             .await;
         }
     }
@@ -1240,13 +1258,12 @@ async fn finalize_cancel(
         }
         // No definitive stop evidence yet: park in Indeterminate.
         Ok(CancelEvidence::Requested) | Err(_) => {
-            let _ = mark_indeterminate(
-                storage,
+            Box::pin(park_attempt(
+                context,
                 job_id,
                 token,
                 JobError::retryable("cancel requested without stop evidence"),
-                unix_timestamp_millis(),
-            )
+            ))
             .await;
         }
     }
@@ -1473,14 +1490,7 @@ async fn collect_or_park(
         }
         Err(error) => {
             warn!(job_id = %job_id, bucket = %bucket, error = ?error, "Output inventory failed; parking");
-            let _ = mark_indeterminate(
-                &context.storage_handle,
-                job_id,
-                token,
-                error,
-                unix_timestamp_millis(),
-            )
-            .await;
+            Box::pin(park_attempt(context, job_id, token, error)).await;
             None
         }
     }
@@ -1491,16 +1501,7 @@ async fn collect_or_park(
 async fn fail_or_park(context: &DriverContext, job_id: JobId, token: ulid::Ulid, error: JobError) {
     match read_job_record(&context.storage_handle, job_id, None).await {
         Ok(Some(record)) => Box::pin(fail_and_crate(context, job_id, token, &record, error)).await,
-        _ => {
-            let _ = mark_indeterminate(
-                &context.storage_handle,
-                job_id,
-                token,
-                error,
-                unix_timestamp_millis(),
-            )
-            .await;
-        }
+        _ => Box::pin(park_attempt(context, job_id, token, error)).await,
     }
 }
 
@@ -1540,13 +1541,12 @@ async fn export_or_park(
         Ok(Some(record)) => record,
         Ok(None) => return None,
         Err(error) => {
-            let _ = mark_indeterminate(
-                &context.storage_handle,
+            Box::pin(park_attempt(
+                context,
                 job_id,
                 token,
                 JobError::retryable(format!("output job lookup failed: {error}")),
-                unix_timestamp_millis(),
-            )
+            ))
             .await;
             return None;
         }
@@ -1573,14 +1573,7 @@ async fn export_or_park(
         Ok(outputs) => Some(outputs),
         Err(error) if error.kind == aruna_core::structs::JobErrorKind::Retryable => {
             warn!(job_id = %job_id, error = ?error, "Output capture failed; parking");
-            let _ = mark_indeterminate(
-                &context.storage_handle,
-                job_id,
-                token,
-                error,
-                unix_timestamp_millis(),
-            )
-            .await;
+            Box::pin(park_attempt(context, job_id, token, error)).await;
             None
         }
         Err(error) => {
@@ -1639,13 +1632,12 @@ async fn capture_or_park(
         Ok(logs) => Some(logs),
         Err(error) => {
             warn!(job_id = %job_id, error = %error, "Container log capture failed");
-            let _ = mark_indeterminate(
-                &context.storage_handle,
+            Box::pin(park_attempt(
+                context,
                 job_id,
                 token,
                 JobError::retryable(format!("container log capture failed: {error}")),
-                unix_timestamp_millis(),
-            )
+            ))
             .await;
             None
         }
@@ -1665,6 +1657,7 @@ fn log_tail(bytes: Vec<u8>, truncated: bool) -> String {
 mod tests {
     use super::*;
     use crate::driver::drive;
+    use crate::jobs::JOB_MAX_ATTEMPTS;
     use crate::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
     use crate::jobs::store::{
         ClaimOutcome, claim_job, insert_job, put_run_crate_status, set_cancel_requested,
@@ -1678,7 +1671,7 @@ mod tests {
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::tempdir;
     use tokio::sync::Notify;
     use ulid::Ulid;
@@ -1694,6 +1687,7 @@ mod tests {
         submits: Mutex<Vec<String>>,
         logs_started: Notify,
         logs_release: Notify,
+        logs_fail: AtomicBool,
         cancels: AtomicUsize,
     }
 
@@ -1704,6 +1698,7 @@ mod tests {
                 submits: Mutex::new(Vec::new()),
                 logs_started: Notify::new(),
                 logs_release: Notify::new(),
+                logs_fail: AtomicBool::new(false),
                 cancels: AtomicUsize::new(0),
             })
         }
@@ -1773,6 +1768,9 @@ mod tests {
             _limits: &LogLimits,
             _sink: &dyn LogSink,
         ) -> Result<LogTails, BackendError> {
+            if self.logs_fail.load(Ordering::Relaxed) {
+                return Err(BackendError::Api("log stream truncated".to_string()));
+            }
             self.logs_started.notify_one();
             self.logs_release.notified().await;
             Ok(LogTails::default())
@@ -1798,7 +1796,7 @@ mod tests {
         }
     }
 
-    fn node_id(seed: u8) -> NodeId {
+    pub(super) fn node_id(seed: u8) -> NodeId {
         let mut bytes = [0u8; 32];
         bytes[0] = seed;
         iroh::SecretKey::from_bytes(&bytes).public()
@@ -1823,7 +1821,7 @@ mod tests {
         })
     }
 
-    fn execution_spec() -> ExecutionSpec {
+    pub(super) fn execution_spec() -> ExecutionSpec {
         ExecutionSpec {
             group_id: Ulid::from_bytes([3u8; 16]),
             name: None,
@@ -1979,7 +1977,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.state, JobState::Indeterminate);
-        assert_eq!(stored.attempts, 0, "no attempt charged");
+        assert_eq!(stored.attempts, 1, "the park charges an attempt");
         let intent = stored.attempt_intent.expect("intent retained");
         assert_eq!(intent.external_name, attempt.external_name());
     }
@@ -2042,6 +2040,56 @@ mod tests {
             .unwrap();
         assert_eq!(stored.state, JobState::Indeterminate);
         assert!(stored.result.is_none(), "no false-empty manifest recorded");
+    }
+
+    // A capture failing retryably on every pass must terminalize at the attempt cap.
+    // Without the charge it parks Indeterminate forever and the lease sweep re-drives
+    // the same attempt at the lease cadence.
+    #[tokio::test]
+    async fn capture_failure_caps() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let mut ctx = context(storage.clone());
+        Arc::get_mut(&mut ctx).unwrap().task_handle = None;
+        let (record, token, attempt) = ready_with_intent(&storage).await;
+        let job_id = record.job_id;
+        transition_external_to_running(&storage, job_id, token, Some(1), 6)
+            .await
+            .unwrap();
+        let stub = StubBackend::new(StubReconcile::NotFound);
+        stub.logs_fail.store(true, Ordering::Relaxed);
+        let backend: Arc<dyn ExecutorBackend> = stub;
+
+        for _ in 0..JOB_MAX_ATTEMPTS {
+            Box::pin(finalize_attempt(
+                &ctx,
+                job_id,
+                token,
+                &backend,
+                &fence(&attempt),
+                &execution_spec(),
+                "ws-test",
+                Ok(AttemptStatus {
+                    phase: AttemptPhase::Exited { code: 0 },
+                    backend_ref: "c1".to_string(),
+                    started_at_ms: Some(1),
+                    finished_at_ms: Some(2),
+                }),
+            ))
+            .await;
+        }
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Failed);
+        assert_eq!(stored.attempts, JOB_MAX_ATTEMPTS);
+        assert!(stored.claim.is_none());
+        assert!(
+            matches!(stored.result, Some(JobResultPayload::Execution { .. })),
+            "cleanup and the run crate need a result"
+        );
     }
 
     #[tokio::test]
@@ -2305,7 +2353,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.state, JobState::Indeterminate);
-        assert_eq!(stored.attempts, 0);
+        assert_eq!(stored.attempts, 1);
         assert!(stored.attempt_intent.is_some());
     }
 

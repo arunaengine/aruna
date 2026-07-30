@@ -1,4 +1,5 @@
 use std::fmt::Debug;
+use std::future::Future;
 use std::io::{self, Read, Write};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -59,6 +60,10 @@ const DEFAULT_WORKSPACE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const MAX_LISTING_BYTES: u64 = 16 * 1024 * 1024;
 /// Bounds the wait for an exec status so a stalled helper cannot hang a capture.
 const EXEC_JOIN_TIMEOUT: Duration = Duration::from_secs(120);
+/// Attach buffer for the helper standard streams, several times the archive read
+/// size. kube-rs otherwise defaults to 1 KiB, which throttles a transfer to a trickle
+/// and, on the read side, blocks the frame loop that drives its keepalive ping.
+const EXEC_STREAM_BUF_BYTES: usize = 512 * 1024;
 
 #[derive(Clone)]
 pub struct KubernetesBackend {
@@ -481,7 +486,8 @@ impl KubernetesBackend {
             .container("helper")
             .stdin(true)
             .stdout(false)
-            .stderr(false);
+            .stderr(false)
+            .max_stdin_buf_size(EXEC_STREAM_BUF_BYTES);
         let mut attached = self
             .pods()
             .exec(
@@ -726,7 +732,8 @@ impl KubernetesBackend {
             .container("helper")
             .stdin(false)
             .stdout(true)
-            .stderr(false);
+            .stderr(false)
+            .max_stdout_buf_size(EXEC_STREAM_BUF_BYTES);
         let listed = async {
             let mut attached = self
                 .pods()
@@ -749,13 +756,15 @@ impl KubernetesBackend {
             })?;
             let mut listing = Vec::new();
             // A helper wedged mid-listing must not stall the capture forever.
-            tokio::time::timeout(
+            let read = tokio::time::timeout(
                 EXEC_JOIN_TIMEOUT,
                 stdout.take(MAX_LISTING_BYTES).read_to_end(&mut listing),
             )
             .await
-            .map_err(|_| BackendError::Timeout("output listing read timed out".to_string()))?
-            .map_err(io_error)?;
+            .map_err(|_| BackendError::Timeout("output listing read timed out".to_string()))?;
+            if let Err(error) = read {
+                return Err(joined_error(join_exec(attached), io_error(error)).await);
+            }
             join_exec(attached).await?;
             select_listed(&listing, glob)
         }
@@ -776,7 +785,8 @@ impl KubernetesBackend {
             .container("helper")
             .stdin(false)
             .stdout(true)
-            .stderr(false);
+            .stderr(false)
+            .max_stdout_buf_size(EXEC_STREAM_BUF_BYTES);
         let mut attached = self
             .pods()
             .exec(
@@ -796,33 +806,18 @@ impl KubernetesBackend {
         let mut stdout = attached.stdout().ok_or_else(|| {
             BackendError::Api("fetch exec did not expose standard output".to_string())
         })?;
-        let mut header_bytes = [0u8; 512];
-        stdout
-            .read_exact(&mut header_bytes)
-            .await
-            .map_err(io_error)?;
-        let header = tar::Header::from_byte_slice(&header_bytes);
-        let size = header
-            .size()
-            .map_err(|error| BackendError::Api(format!("invalid fetch archive size: {error}")))?;
-        if size > MAX_TRANSFER_BYTES || !header.entry_type().is_file() {
-            return Err(BackendError::InvalidSpec(
-                "fetch archive is not a bounded regular file".to_string(),
-            ));
-        }
-        let archive_path = header
-            .path()
-            .map_err(|error| BackendError::Api(format!("invalid fetch archive path: {error}")))?;
-        let expected = normalize_container_path(path).map_err(BackendError::InvalidSpec)?;
-        if archive_path.as_ref() != expected.strip_prefix("/").unwrap_or(&expected) {
-            return Err(BackendError::Conflict(
-                "fetch helper returned a different output path".to_string(),
-            ));
-        }
+        // The helper Pod still has to go on either failure.
+        let (size, join) = match read_header(&mut stdout, path, join_exec(attached)).await {
+            Ok(header) => header,
+            Err(error) => {
+                let _ = self.delete_pod(&pod).await;
+                return Err(error);
+            }
+        };
         let (tx, rx) = mpsc::channel(4);
         let backend = self.clone();
         tokio::spawn(async move {
-            stream_output(stdout, attached, size, tx).await;
+            stream_output(stdout, join, size, tx).await;
             let _ = backend.delete_pod(&pod).await;
         });
         Ok(TaskOutput {
@@ -1965,9 +1960,47 @@ fn select_listed(listing: &[u8], glob: &OutputMatcher) -> Result<Vec<String>, Ba
     Ok(matched)
 }
 
+/// Read the leading tar header the fetch helper emits, returning the unpolled `join`
+/// beside the declared body size. A torn read reports the exec status, which holds
+/// its real cause; an intact but invalid header keeps its own error and drops `join`.
+async fn read_header<R, F>(stdout: &mut R, path: &str, join: F) -> Result<(u64, F), BackendError>
+where
+    R: AsyncRead + Unpin,
+    F: Future<Output = Result<(), BackendError>>,
+{
+    let mut header_bytes = [0u8; 512];
+    if let Err(error) = stdout.read_exact(&mut header_bytes).await {
+        return Err(joined_error(join, io_error(error)).await);
+    }
+    Ok((parse_header(&header_bytes, path)?, join))
+}
+
+/// Check the header describes the requested file within the transfer bound.
+fn parse_header(header_bytes: &[u8; 512], path: &str) -> Result<u64, BackendError> {
+    let header = tar::Header::from_byte_slice(header_bytes);
+    let size = header
+        .size()
+        .map_err(|error| BackendError::Api(format!("invalid fetch archive size: {error}")))?;
+    if size > MAX_TRANSFER_BYTES || !header.entry_type().is_file() {
+        return Err(BackendError::InvalidSpec(
+            "fetch archive is not a bounded regular file".to_string(),
+        ));
+    }
+    let archive_path = header
+        .path()
+        .map_err(|error| BackendError::Api(format!("invalid fetch archive path: {error}")))?;
+    let expected = normalize_container_path(path).map_err(BackendError::InvalidSpec)?;
+    if archive_path.as_ref() != expected.strip_prefix("/").unwrap_or(&expected) {
+        return Err(BackendError::Conflict(
+            "fetch helper returned a different output path".to_string(),
+        ));
+    }
+    Ok(size)
+}
+
 async fn stream_output<R: AsyncRead + Unpin>(
     mut stdout: R,
-    attached: kube::api::AttachedProcess,
+    join: impl Future<Output = Result<(), BackendError>>,
     size: u64,
     tx: mpsc::Sender<Result<Bytes, BackendError>>,
 ) {
@@ -1979,11 +2012,11 @@ async fn stream_output<R: AsyncRead + Unpin>(
             .min(buffer.len());
         match stdout.read(&mut buffer[..limit]).await {
             Ok(0) => {
-                let _ = tx
-                    .send(Err(BackendError::Api(
-                        "fetch archive ended before its declared size".to_string(),
-                    )))
-                    .await;
+                let transferred = size - remaining;
+                let short = BackendError::Api(format!(
+                    "fetch archive ended after {transferred} of {size} bytes"
+                ));
+                let _ = tx.send(Err(joined_error(join, short).await)).await;
                 return;
             }
             Ok(read) => {
@@ -1997,15 +2030,27 @@ async fn stream_output<R: AsyncRead + Unpin>(
                 }
             }
             Err(error) => {
-                let _ = tx.send(Err(io_error(error))).await;
+                let _ = tx
+                    .send(Err(joined_error(join, io_error(error)).await))
+                    .await;
                 return;
             }
         }
     }
     let _ = tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await;
-    if let Err(error) = join_exec(attached).await {
+    if let Err(error) = join.await {
         let _ = tx.send(Err(error)).await;
     }
+}
+
+/// kube-rs reports a websocket failure or an unexpected close as a plain EOF or IO
+/// error, so the real cause survives only in the exec status. `fallback` is reported
+/// when the status itself is clean.
+async fn joined_error(
+    join: impl Future<Output = Result<(), BackendError>>,
+    fallback: BackendError,
+) -> BackendError {
+    join.await.err().unwrap_or(fallback)
 }
 
 async fn join_exec(mut attached: kube::api::AttachedProcess) -> Result<(), BackendError> {
@@ -2740,5 +2785,115 @@ mod tests {
 
         assert!(tails.stdout.is_empty());
         assert_eq!(tails.stdout_total, 0);
+    }
+
+    async fn drain_stream(
+        mut rx: mpsc::Receiver<Result<Bytes, BackendError>>,
+    ) -> Vec<Result<Bytes, BackendError>> {
+        let mut items = Vec::new();
+        while let Some(item) = rx.recv().await {
+            items.push(item);
+        }
+        items
+    }
+
+    // A dead websocket reaches the reader as a plain EOF, so the exec status must win
+    // over the truncation the reader sees.
+    #[tokio::test]
+    async fn truncation_prefers_status() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer.write_all(b"abc").await.unwrap();
+        drop(writer);
+        let (tx, rx) = mpsc::channel(4);
+
+        let join = std::future::ready(Err(BackendError::Api("websocket reset".to_string())));
+        stream_output(reader, join, 8, tx).await;
+
+        let items = drain_stream(rx).await;
+        assert_eq!(items.len(), 2);
+        assert!(items[0].is_ok());
+        match items[1].as_ref().expect_err("the stream must fail") {
+            BackendError::Api(message) => assert_eq!(message, "websocket reset"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    // A clean exec status leaves the shortfall as the only evidence.
+    #[tokio::test]
+    async fn truncation_reports_shortfall() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer.write_all(b"abc").await.unwrap();
+        drop(writer);
+        let (tx, rx) = mpsc::channel(4);
+
+        stream_output(reader, std::future::ready(Ok(())), 8, tx).await;
+
+        let items = drain_stream(rx).await;
+        match items[1].as_ref().expect_err("the stream must fail") {
+            BackendError::Api(message) => {
+                assert_eq!(message, "fetch archive ended after 3 of 8 bytes")
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    // A complete body still fails when the helper exits non-zero afterwards.
+    #[tokio::test]
+    async fn complete_reports_status() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer.write_all(b"abcdefgh").await.unwrap();
+        drop(writer);
+        let (tx, rx) = mpsc::channel(4);
+
+        let join = std::future::ready(Err(BackendError::Api("helper exited 1".to_string())));
+        stream_output(reader, join, 8, tx).await;
+
+        let items = drain_stream(rx).await;
+        assert!(items[..items.len() - 1].iter().all(Result::is_ok));
+        assert!(
+            items.last().unwrap().is_err(),
+            "the exec status must surface"
+        );
+    }
+
+    fn header_bytes(path: &str, size: u64) -> [u8; 512] {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(size);
+        header.set_path(path).expect("header path");
+        header.set_cksum();
+        *header.as_bytes()
+    }
+
+    // A deterministic protocol mismatch must keep its own error: joining an undrained
+    // exec would block until the timeout and reclassify it as retryable.
+    #[tokio::test(start_paused = true)]
+    async fn invalid_header_survives() {
+        let bytes = header_bytes("workspace/other.txt", 4);
+        let join = std::future::pending::<Result<(), BackendError>>();
+        let read = tokio::time::timeout(
+            EXEC_JOIN_TIMEOUT * 4,
+            read_header(&mut &bytes[..], "/workspace/data.txt", join),
+        )
+        .await
+        .expect("validation must not wait on the exec");
+
+        let Err(error) = read else {
+            panic!("a mismatched archive path must fail");
+        };
+        assert!(matches!(error, BackendError::Conflict(_)));
+    }
+
+    // A header that never arrives in full is a transport failure: the exec status
+    // holds the real cause.
+    #[tokio::test]
+    async fn torn_header_joins() {
+        let bytes = header_bytes("workspace/data.txt", 4);
+        let join = std::future::ready(Err(BackendError::Api("websocket closed".to_string())));
+
+        let Err(error) = read_header(&mut &bytes[..16], "/workspace/data.txt", join).await else {
+            panic!("a short header must fail");
+        };
+        assert!(matches!(&error, BackendError::Api(message) if message == "websocket closed"));
     }
 }

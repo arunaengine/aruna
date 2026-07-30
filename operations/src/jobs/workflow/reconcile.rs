@@ -12,13 +12,12 @@ use tracing::{info, warn};
 use super::super::reconcile::ExternalReconciler;
 use super::super::runtime::JobsRuntime;
 use super::super::store::{
-    AdoptOutcome, adopt_external_attempt, handoff_external_attempt, mark_indeterminate,
-    read_job_record, record_attempt_started, record_attempt_tombstone, release_job,
-    transition_external_to_running,
+    AdoptOutcome, adopt_external_attempt, handoff_external_attempt, read_job_record,
+    record_attempt_started, record_attempt_tombstone, release_job, transition_external_to_running,
 };
 use super::{
     DEFAULT_WALLTIME, build_task_spec, fail_and_crate, finalize_attempt, finalize_cancel,
-    job_bucket, reload_task, requeue_after_tombstone, supervise_and_finalize,
+    job_bucket, park_attempt, reload_task, requeue_after_tombstone, supervise_and_finalize,
     with_execution_heartbeat,
 };
 use crate::driver::DriverContext;
@@ -85,18 +84,15 @@ impl ExternalReconciler for ComputeReconciler {
             .and_then(|registry| registry.get(&kind))
             .cloned()
         else {
-            warn!(job_id = %job_id, kind = %intent.executor_kind, "Reconcile backend unavailable; parking");
-            let _ = mark_indeterminate(
-                storage,
-                job_id,
-                token,
-                JobError::retryable(format!(
-                    "reconcile backend unavailable: {}",
-                    intent.executor_kind
-                )),
-                unix_timestamp_millis(),
-            )
-            .await;
+            // A node without this backend cannot observe the attempt: charging here
+            // would terminalize a healthy container it can never see. Hand it back
+            // with an expired lease so a node that has the backend can reconcile it.
+            warn!(job_id = %job_id, kind = %intent.executor_kind, "Reconcile backend unavailable; handing back");
+            if let Err(error) =
+                handoff_external_attempt(storage, job_id, token, unix_timestamp_millis()).await
+            {
+                warn!(job_id = %job_id, error = %error, "Failed to hand back an unreconciled attempt");
+            }
             return;
         };
 
@@ -110,8 +106,17 @@ impl ExternalReconciler for ComputeReconciler {
             attempt_epoch: intent.attempt_epoch,
             controller_generation: control.controller_generation,
         };
+        // Every unresolved exit below parks: the sweep that routed us here spends no
+        // attempt, so the park is what bounds a condition that never resolves.
         if let Err(error) = backend.fence(&fence).await {
             warn!(job_id = %job_id, error = %error, "Backend fence failed");
+            park_attempt(
+                &self.context,
+                job_id,
+                token,
+                JobError::retryable(format!("reconcile fence failed: {error}")),
+            )
+            .await;
             return;
         }
 
@@ -144,6 +149,13 @@ impl ExternalReconciler for ComputeReconciler {
             && let Err(error) = record_attempt_started(storage, job_id, token, started_at_ms).await
         {
             warn!(job_id = %job_id, error = %error, "Attempt start evidence write failed during adoption");
+            park_attempt(
+                &self.context,
+                job_id,
+                token,
+                JobError::retryable(format!("start evidence write failed: {error}")),
+            )
+            .await;
             return;
         }
         if matches!(
@@ -162,7 +174,16 @@ impl ExternalReconciler for ComputeReconciler {
             .await
             {
                 Ok(record) => record,
-                Err(_) => return,
+                Err(error) => {
+                    park_attempt(
+                        &self.context,
+                        job_id,
+                        token,
+                        JobError::retryable(format!("adopted attempt cannot run: {error}")),
+                    )
+                    .await;
+                    return;
+                }
             };
             if running.cancel_requested {
                 let _ = with_execution_heartbeat(
@@ -249,12 +270,11 @@ impl ExternalReconciler for ComputeReconciler {
                 .await;
             }
             ReconcileEvidence::Unavailable(error) => {
-                let _ = mark_indeterminate(
-                    storage,
+                park_attempt(
+                    &self.context,
                     job_id,
                     token,
                     JobError::retryable(format!("backend unavailable: {error}")),
-                    unix_timestamp_millis(),
                 )
                 .await;
             }
@@ -262,12 +282,11 @@ impl ExternalReconciler for ComputeReconciler {
                 if artifact.exact_identity {
                     let _ = backend.cancel(&fence).await;
                 }
-                let _ = mark_indeterminate(
-                    storage,
+                park_attempt(
+                    &self.context,
                     job_id,
                     token,
                     JobError::retryable("backend artifact is not adoptable"),
-                    unix_timestamp_millis(),
                 )
                 .await;
             }
@@ -410,13 +429,12 @@ pub(super) async fn resume_attempt(
                     .filter(|intent| intent.attempt_epoch == fence.attempt_epoch)
                     .map(|intent| intent.pinned_image.as_str())
                 else {
-                    let _ = mark_indeterminate(
-                        &context.storage_handle,
+                    Box::pin(park_attempt(
+                        &context,
                         job_id,
                         token,
                         JobError::retryable("attempt intent mismatch"),
-                        unix_timestamp_millis(),
-                    )
+                    ))
                     .await;
                     return false;
                 };
@@ -496,14 +514,7 @@ async fn fail_or_park(
     if error.kind == JobErrorKind::Permanent {
         fail_and_crate(context, job_id, token, record, error).await;
     } else {
-        let _ = mark_indeterminate(
-            &context.storage_handle,
-            job_id,
-            token,
-            error,
-            unix_timestamp_millis(),
-        )
-        .await;
+        park_attempt(context, job_id, token, error).await;
     }
 }
 
@@ -513,4 +524,85 @@ fn holder(context: &DriverContext) -> aruna_core::types::NodeId {
         .as_ref()
         .map(|net| net.node_id())
         .unwrap_or_else(|| iroh::SecretKey::from_bytes(&[0u8; 32]).public())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::JOB_MAX_ATTEMPTS;
+    use crate::jobs::store::{insert_job, record_attempt_intent};
+    use crate::jobs::workflow::tests::{execution_spec, node_id};
+    use aruna_compute::ExecutorRegistry;
+    use aruna_core::structs::{AttemptIntent, JobClaim, JobId, RealmId};
+    use aruna_core::types::UserId;
+    use aruna_storage::FjallStorage;
+    use aruna_tasks::TaskHandle;
+    use tempfile::tempdir;
+    use ulid::Ulid;
+
+    // A node whose registry lacks the executor cannot observe the container, so no
+    // number of sweeps by it may spend an attempt or terminalize the job.
+    #[tokio::test]
+    async fn missing_backend_spares() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(TaskHandle::new()),
+            compute_handle: Some(Arc::new(ExecutorRegistry::new())),
+        });
+        let job_id = JobId::new();
+        let token = Ulid::generate();
+        let mut record = JobRecord::new(
+            job_id,
+            JobPayload::Execution(execution_spec()),
+            UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
+            node_id(7),
+            1,
+            1,
+            None,
+        );
+        record.state = JobState::Running;
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id(7),
+            claim_token: token,
+            lease_expires_at_ms: 1,
+        });
+        insert_job(&storage, &record).await.unwrap();
+        record_attempt_intent(
+            &storage,
+            job_id,
+            token,
+            AttemptIntent {
+                attempt_no: 1,
+                external_name: job_id.to_string().to_lowercase(),
+                executor_kind: "kubernetes".to_string(),
+                pinned_image: "alpine@sha256:digest".to_string(),
+                attempt_epoch: 0,
+            },
+            unix_timestamp_millis(),
+        )
+        .await
+        .unwrap();
+
+        let runtime = JobsRuntime::new();
+        let reconciler = ComputeReconciler::new(context, Arc::downgrade(&runtime));
+        for sweep in 0..(JOB_MAX_ATTEMPTS + 2) {
+            let lost = read_job_record(&storage, job_id, None)
+                .await
+                .unwrap()
+                .unwrap();
+            reconciler.reconcile_lost_attempt(&storage, lost).await;
+            let after = read_job_record(&storage, job_id, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.state, JobState::Running, "sweep {sweep}");
+            assert_eq!(after.attempts, 0, "sweep {sweep}");
+            assert!(after.attempt_intent.is_some(), "sweep {sweep}");
+        }
+    }
 }
