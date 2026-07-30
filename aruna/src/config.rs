@@ -13,7 +13,7 @@ use aruna_core::onboarding::{
 use aruna_core::structs::{
     Backend, BackendConfig, BackendsFile, BlobTimeoutConfig, DynamicDiscoveryMethod,
     KIND_LABEL_KEY, NodeBackendsConfig, NodeCapabilities, OidcProviderConfig, RealmConfigDocument,
-    RealmDiscoveryConfig, RealmId, RelayPolicy, RoCrateLimits,
+    RealmDiscoveryConfig, RealmId, RelayPolicy, RoCrateLimits, STORAGE_CLASS_LABEL_PREFIX,
 };
 use aruna_core::util::unix_timestamp_secs;
 use aruna_net::{
@@ -750,6 +750,13 @@ fn parse_node_labels_env() -> Result<BTreeMap<String, String>, SetupError> {
                 KEY,
                 pair,
                 format!("{KIND_LABEL_KEY} is a reserved derived label"),
+            ));
+        }
+        if label_key.starts_with(STORAGE_CLASS_LABEL_PREFIX) {
+            return Err(invalid_config_value(
+                KEY,
+                pair,
+                format!("{STORAGE_CLASS_LABEL_PREFIX}* labels are derived from the backends file"),
             ));
         }
         labels.insert(label_key.to_string(), label_value.to_string());
@@ -1722,6 +1729,26 @@ mod tests {
         unsafe { std::env::set_var(key, "aruna-engine.org/kind=Server") };
 
         let error = parse_node_labels_env().expect_err("reserved key should fail");
+        assert!(matches!(
+            error,
+            super::SetupError::InvalidConfigValue {
+                key: "ARUNA_NODE_LABELS",
+                ..
+            }
+        ));
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn labels_env_rejects_class() {
+        // Class labels are derived from the backends file, never claimed by hand.
+        let _guard = env_lock().lock().await;
+        let key = "ARUNA_NODE_LABELS";
+        let previous = vec![(key.to_string(), std::env::var(key).ok())];
+        unsafe { std::env::set_var(key, "aruna-engine.org/storage-class/cold=true") };
+
+        let error = parse_node_labels_env().expect_err("derived class label should fail");
         assert!(matches!(
             error,
             super::SetupError::InvalidConfigValue {

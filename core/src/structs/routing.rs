@@ -180,6 +180,15 @@ impl BackendCatalog {
             .and_then(|entry| entry.class.as_deref())
     }
 
+    /// Every class this node registered, operator-only ones included: the node
+    /// labels advertise capability, not tenant availability.
+    pub fn classes(&self) -> BTreeSet<&str> {
+        self.backends
+            .values()
+            .filter_map(|entry| entry.class.as_deref())
+            .collect()
+    }
+
     /// Whether tenant-authored rules may target this backend's class.
     pub fn allows_tenants(&self, name: &str) -> bool {
         self.backends
