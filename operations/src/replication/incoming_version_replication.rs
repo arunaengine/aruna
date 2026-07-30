@@ -3,6 +3,7 @@ use crate::blob::blob_keyspace_helper::{
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::group_routing::load_group_inputs;
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
@@ -60,6 +61,7 @@ enum IncomingVersionReplicationState {
     VerifyReplaced,
     ReadReplacedMetadata,
     DeleteReplacedMetadata,
+    FenceBackend,
     WriteBlobLocation,
     ReadObjectLookup,
     ReadCurrentVersion,
@@ -86,6 +88,8 @@ enum IncomingVersionReplicationState {
 pub enum IncomingVersionReplicationError {
     #[error(transparent)]
     RoutingFailed(#[from] RoutingError),
+    #[error(transparent)]
+    BackendFenceError(#[from] BackendFenceError),
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -255,6 +259,7 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::VerifyReplaced => "VerifyReplaced",
             IncomingVersionReplicationState::ReadReplacedMetadata => "ReadReplacedMetadata",
             IncomingVersionReplicationState::DeleteReplacedMetadata => "DeleteReplacedMetadata",
+            IncomingVersionReplicationState::FenceBackend => "FenceBackend",
             IncomingVersionReplicationState::WriteBlobLocation => "WriteBlobLocation",
             IncomingVersionReplicationState::ReadObjectLookup => "ReadObjectLookup",
             IncomingVersionReplicationState::ReadCurrentVersion => "ReadCurrentVersion",
@@ -793,6 +798,17 @@ impl IncomingVersionReplicationOperation {
     }
 
     fn write_blob_location_or_continue(&mut self) -> Effects {
+        let Ok(location) = self.effective_materialized_location() else {
+            return self.write_object_lookup_or_continue();
+        };
+        if let Some(effect) = fence_backend(&location.backend, self.txn_id) {
+            self.state = IncomingVersionReplicationState::FenceBackend;
+            return smallvec![effect];
+        }
+        self.write_blob_location()
+    }
+
+    fn write_blob_location(&mut self) -> Effects {
         let Ok(location) = self.effective_materialized_location() else {
             return self.write_object_lookup_or_continue();
         };
@@ -1758,6 +1774,10 @@ impl Operation for IncomingVersionReplicationOperation {
                 self.replaced_version = None;
                 self.write_hash_lookup_or_continue()
             }
+            IncomingVersionReplicationState::FenceBackend => match check_fence(event) {
+                Ok(()) => self.write_blob_location(),
+                Err(error) => self.fail(error.into()),
+            },
             IncomingVersionReplicationState::WriteBlobLocation => {
                 let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
                     return self.fail(IncomingVersionReplicationError::InvalidStateEvent {

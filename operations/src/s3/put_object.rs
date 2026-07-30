@@ -2,6 +2,7 @@ use crate::blob::blob_keyspace_helper::{
     HeadAliasContext, add_hash_path_index_effect, write_blob_head_effect,
     write_blob_location_effect, write_blob_version_effect,
 };
+use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::replication::util::dht_registration_effect;
 use crate::usage_stats::{
@@ -39,6 +40,7 @@ pub enum PutObjectState {
     CleanupFailedWrite,
     StartTransaction,
     CheckBucket,
+    FenceBackend,
     CheckHashLookup,
     CreateBlobLocation,
     ReadObjectLookup,
@@ -91,6 +93,8 @@ pub enum PutObjectError {
     QuotaGateError(#[from] QuotaGateError),
     #[error(transparent)]
     RoutingFailed(#[from] RoutingError),
+    #[error(transparent)]
+    BackendFenceError(#[from] BackendFenceError),
     #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
     QuotaExceeded { limit: u64, usage: u64 },
     #[error("Something went wrong ...")]
@@ -333,10 +337,34 @@ impl PutObjectOperation {
                     txn_id: self.txn_id,
                 })]
             } else {
-                self.start_hash_lookup()
+                self.start_fence()
             }
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
+        }
+    }
+
+    fn start_fence(&mut self) -> Effects {
+        let Some(location) = self.get_written_location() else {
+            return self.emit_error(PutObjectError::MissingOutput);
+        };
+        match fence_backend(&location.backend, self.txn_id) {
+            Some(effect) => {
+                self.state = PutObjectState::FenceBackend;
+                smallvec![effect]
+            }
+            None => self.start_hash_lookup(),
+        }
+    }
+
+    fn handle_backend_fenced(&mut self, event: Event) -> Effects {
+        match check_fence(event) {
+            Ok(()) => self.start_hash_lookup(),
+            Err(error) => {
+                self.output = Some(Err(error.into()));
+                self.state = PutObjectState::Error;
+                self.abort()
+            }
         }
     }
 
@@ -358,7 +386,7 @@ impl PutObjectOperation {
         {
             return self.emit_error(StorageError::TransactionConflict.into());
         }
-        self.start_hash_lookup()
+        self.start_fence()
     }
 
     fn start_hash_lookup(&mut self) -> Effects {
@@ -908,6 +936,7 @@ impl Operation for PutObjectOperation {
             PutObjectState::CleanupFailedWrite => self.handle_failed_write_cleanup(event),
             PutObjectState::StartTransaction => self.handle_transaction_started(event),
             PutObjectState::CheckBucket => self.handle_bucket_checked(event),
+            PutObjectState::FenceBackend => self.handle_backend_fenced(event),
             PutObjectState::CheckHashLookup => self.handle_hash_lookup_checked(event),
             PutObjectState::CreateBlobLocation => self.handle_blob_location_created(event),
             PutObjectState::ReadObjectLookup => self.handle_object_lookup_read(event),
@@ -973,14 +1002,18 @@ impl Operation for PutObjectOperation {
 #[cfg(test)]
 mod routing_test {
     use super::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-    use aruna_core::effects::{BlobEffect, Effect};
+    use crate::group_backends::BackendFenceError;
+    use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+    use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::RealmId;
     use aruna_core::structs::{
-        BackendCatalog, BackendRef, RoutingError, RoutingSnapshot, RoutingTarget,
-        StorageRoutingRule,
+        BackendCatalog, BackendLocation, BackendRef, GroupBackendKind, GroupRoutingInputs,
+        GroupStorageBackend, RoutingError, RoutingSnapshot, RoutingTarget, StorageRoutingRule,
     };
+    use aruna_core::types::TxnId;
+    use std::collections::{BTreeSet, HashMap};
     use ulid::Ulid;
 
     fn config(snapshot: RoutingSnapshot) -> PutObjectConfig {
@@ -1072,6 +1105,82 @@ mod routing_test {
                 _
             )))
         ));
+    }
+
+    #[test]
+    fn refuses_retiring_backend() {
+        // Deletion retires the record before it scans, so this write must not
+        // commit a location the deletion would then strand.
+        let backend_id = Ulid::from_bytes([5u8; 16]);
+        let snapshot = snapshot()
+            .with_group_inputs(GroupRoutingInputs {
+                default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
+                backend_ids: BTreeSet::from([backend_id]),
+            })
+            .with_bucket_rules(Vec::new());
+        let mut operation = PutObjectOperation::new(config(snapshot));
+        operation.start();
+        operation.step(Event::Blob(BlobEvent::WriteFinished {
+            location: written(backend_id),
+        }));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::from(3),
+        }));
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(retiring(backend_id).to_bytes().unwrap().into()),
+        }));
+
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::Blob(BlobEffect::Delete { .. }),
+                    Effect::Storage(StorageEffect::AbortTransaction { .. })
+                ]
+            ),
+            "expected cleanup and abort, got {effects:?}"
+        );
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutObjectError::BackendFenceError(
+                BackendFenceError::Unavailable
+            ))
+        ));
+    }
+
+    fn written(backend_id: Ulid) -> BackendLocation {
+        BackendLocation {
+            backend: BackendRef::Group(backend_id),
+            storage_class: None,
+            root: "root".to_string(),
+            storage_bucket: "bucket".to_string(),
+            backend_path: "bucket/object".to_string(),
+            ulid: Ulid::from_bytes([6u8; 16]),
+            compressed: false,
+            encrypted: false,
+            created_by: aruna_core::UserId::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 3,
+            hashes: HashMap::new(),
+        }
+    }
+
+    fn retiring(backend_id: Ulid) -> GroupStorageBackend {
+        GroupStorageBackend {
+            backend_id,
+            group_id: Ulid::from_bytes([7u8; 16]),
+            name: "tenant".to_string(),
+            kind: GroupBackendKind::S3,
+            public_config: HashMap::new(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            updated_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: aruna_core::UserId::default(),
+            retiring: true,
+        }
     }
 }
 

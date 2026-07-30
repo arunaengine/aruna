@@ -67,6 +67,10 @@ pub struct GroupStorageBackend {
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
     pub created_by: UserId,
+    /// Set while a deletion drains its writers: routing stops choosing the
+    /// backend and every write that reads this record in its own transaction
+    /// refuses or conflicts.
+    pub retiring: bool,
 }
 
 impl GroupStorageBackend {
@@ -130,6 +134,7 @@ mod tests {
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
             created_by: UserId::local(Ulid::from_bytes([3u8; 16]), RealmId([4u8; 32])),
+            retiring: false,
         };
         let secret = GroupStorageBackendSecret {
             backend_id,

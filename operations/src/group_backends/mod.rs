@@ -4,9 +4,12 @@ pub mod query;
 pub mod replace;
 pub mod validation;
 
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::types::Key;
+use aruna_core::keyspaces::GROUP_STORAGE_BACKEND_KEYSPACE;
+use aruna_core::structs::{BackendRef, GroupStorageBackend};
+use aruna_core::types::{Key, TxnId};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -14,6 +17,35 @@ use ulid::Ulid;
 /// stored `BackendRef::Group` without knowing the owning group.
 pub fn backend_key(backend_id: Ulid) -> Key {
     backend_id.to_bytes().to_vec().into()
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum BackendFenceError {
+    #[error(transparent)]
+    Read(#[from] RecordReadError),
+    #[error("storage backend is not available for writes")]
+    Unavailable,
+}
+
+/// Joins a tenant backend's record to the transaction that commits a reference
+/// to it. Deletion retires the record before it scans, so a writer that already
+/// resolved the backend either reads the retirement or loses its commit.
+pub fn fence_backend(backend: &BackendRef, txn_id: Option<TxnId>) -> Option<Effect> {
+    let BackendRef::Group(backend_id) = backend else {
+        return None;
+    };
+    Some(Effect::Storage(StorageEffect::Read {
+        key_space: GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+        key: backend_key(*backend_id),
+        txn_id,
+    }))
+}
+
+pub fn check_fence(event: Event) -> Result<(), BackendFenceError> {
+    match parse_read(event, GroupStorageBackend::from_bytes)? {
+        Some(record) if !record.retiring => Ok(()),
+        _ => Err(BackendFenceError::Unavailable),
+    }
 }
 
 #[derive(Debug, Error, PartialEq)]

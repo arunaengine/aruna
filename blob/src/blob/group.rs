@@ -226,6 +226,7 @@ mod tests {
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::default(),
+            retiring: false,
         }
     }
 

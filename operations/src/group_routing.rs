@@ -108,7 +108,9 @@ impl Operation for GroupRoutingInputsOperation {
                         self.inputs.backend_ids.extend(
                             records
                                 .into_iter()
-                                .filter(|record| record.group_id == self.group_id)
+                                .filter(|record| {
+                                    record.group_id == self.group_id && !record.retiring
+                                })
                                 .map(|record| record.backend_id),
                         );
                         if let Some(start_after) = next_start_after {
@@ -448,6 +450,7 @@ mod tests {
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::default(),
+            retiring: false,
         }
     }
 

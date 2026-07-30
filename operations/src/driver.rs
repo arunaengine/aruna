@@ -981,6 +981,7 @@ mod routing_tests {
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
             created_by: Default::default(),
+            retiring: false,
         };
         write(
             context,

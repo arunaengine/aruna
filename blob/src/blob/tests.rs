@@ -1879,6 +1879,7 @@ async fn write_group_backend(context: &TestContext, backend_id: Ulid, paired: bo
         created_at: SystemTime::UNIX_EPOCH,
         updated_at: SystemTime::UNIX_EPOCH,
         created_by: UserId::default(),
+        retiring: false,
     };
     let mut writes = vec![(
         GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),

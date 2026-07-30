@@ -108,6 +108,7 @@ impl CreateGroupBackendOperation {
             created_at: now,
             updated_at: now,
             created_by: self.input.created_by,
+            retiring: false,
         };
         let secret = GroupStorageBackendSecret {
             backend_id,
