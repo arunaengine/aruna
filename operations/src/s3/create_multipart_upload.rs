@@ -4,8 +4,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_MULTIPART_UPLOAD_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    MultipartUpload, MultipartUploadChecksumHint, MultipartUploadStatus, RoutingError,
-    RoutingSnapshot, resolve_backend,
+    MultipartUpload, MultipartUploadChecksumHint, MultipartUploadStatus, ResolvedBackend,
+    RoutingError, RoutingSnapshot, resolve_backend,
 };
 use aruna_core::types::{Effects, GroupId, TxnId, UserId};
 use smallvec::smallvec;
@@ -66,6 +66,7 @@ pub struct CreateMultipartUploadOperation {
     input: CreateMultipartUploadInput,
     state: CreateMultipartUploadState,
     txn_id: Option<TxnId>,
+    resolved: Option<ResolvedBackend>,
     record: Option<MultipartUpload>,
     metadata: HashMap<String, String>,
     output: Option<Result<CreateMultipartUploadResult, CreateMultipartUploadError>>,
@@ -77,6 +78,7 @@ impl CreateMultipartUploadOperation {
             input,
             state: CreateMultipartUploadState::Init,
             txn_id: None,
+            resolved: None,
             record: None,
             metadata: HashMap::new(),
             output: None,
@@ -95,6 +97,14 @@ impl CreateMultipartUploadOperation {
     }
 
     fn handle_init(&mut self) -> Effects {
+        // Routing is fallible, so it resolves before a transaction exists to
+        // abort.
+        let resolved =
+            match resolve_backend(&self.input.routing, &self.input.bucket, &self.input.key) {
+                Ok(resolved) => resolved,
+                Err(error) => return self.emit_error(error.into()),
+            };
+        self.resolved = Some(resolved);
         self.state = CreateMultipartUploadState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
@@ -110,11 +120,10 @@ impl CreateMultipartUploadOperation {
             });
         };
 
-        let resolved =
-            match resolve_backend(&self.input.routing, &self.input.bucket, &self.input.key) {
-                Ok(resolved) => resolved,
-                Err(error) => return self.emit_error(error.into()),
-            };
+        self.txn_id = Some(txn_id);
+        let Some(resolved) = self.resolved.take() else {
+            return self.emit_error(CreateMultipartUploadError::CreateMultipartUploadFailed);
+        };
         let record = MultipartUpload {
             backend: resolved.backend,
             storage_class: resolved.storage_class,
@@ -133,7 +142,6 @@ impl CreateMultipartUploadOperation {
             Err(err) => return self.emit_error(err.into()),
         };
 
-        self.txn_id = Some(txn_id);
         self.record = Some(record.clone());
         self.state = CreateMultipartUploadState::WriteUpload;
         smallvec![Effect::Storage(StorageEffect::Write {
@@ -309,19 +317,17 @@ mod tests {
 
     #[test]
     fn unknown_backend_aborts() {
+        // A refused backend must fail before a transaction exists to leak.
         let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
             key_prefix: String::new(),
             exact: false,
             target: RoutingTarget::Backend(BackendRef::Node("ghost".to_string())),
         }]);
         let mut operation = CreateMultipartUploadOperation::new(input(snapshot));
-        operation.start();
 
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::default(),
-        }));
+        let effects = operation.start();
 
-        assert!(effects.is_empty());
+        assert!(effects.is_empty(), "expected no effects, got {effects:?}");
         assert!(operation.is_complete());
         assert!(matches!(
             operation.finalize(),
