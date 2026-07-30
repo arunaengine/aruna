@@ -311,11 +311,8 @@ impl BlobHandler {
             spool_slots: Arc::new(Semaphore::new(SPOOL_SLOTS)),
             inflight: Arc::new(AtomicUsize::new(0)),
         };
-        blob_handler.probe_all_backends().await;
         blob_handler.ensure_multipart_bucket().await?;
-        for (_, backend) in blob_handler.registry.entries() {
-            *backend.status.write().await = Status::Available;
-        }
+        blob_handler.probe_all_backends().await;
         let status_handler = blob_handler.clone();
         tokio::spawn(async move {
             status_handler.monitor_backend_status().await;
