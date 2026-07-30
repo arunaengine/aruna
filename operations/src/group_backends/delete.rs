@@ -80,6 +80,9 @@ impl DeleteGroupBackendOperation {
         smallvec![]
     }
 
+    /// The scan spans the whole locations keyspace, so it stays outside the
+    /// write transaction: joining it to the read set would conflict with every
+    /// concurrent blob write.
     fn scan_locations(&mut self, start_after: Option<Key>) -> Effects {
         self.state = DeleteState::ScanLocations;
         smallvec![Effect::Storage(StorageEffect::Iter {
@@ -87,7 +90,7 @@ impl DeleteGroupBackendOperation {
             prefix: None,
             start: start_after.map(IterStart::After),
             limit: LOCATION_SCAN_PAGE_SIZE,
-            txn_id: self.txn_id,
+            txn_id: None,
         })]
     }
 
@@ -100,6 +103,10 @@ impl DeleteGroupBackendOperation {
             Some(record) if record.group_id == self.group_id => {}
             _ => return self.fail(DeleteGroupBackendError::NotFound),
         }
+        self.scan_locations(None)
+    }
+
+    fn start_transaction(&mut self) -> Effects {
         self.state = DeleteState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
@@ -110,7 +117,7 @@ impl DeleteGroupBackendOperation {
         match event {
             Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                 self.txn_id = Some(txn_id);
-                self.scan_locations(None)
+                self.delete_records()
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
             received => self.fail(DeleteGroupBackendError::InvalidStateEvent {
@@ -138,7 +145,7 @@ impl DeleteGroupBackendOperation {
             return self.scan_locations(Some(start_after));
         }
 
-        self.delete_records()
+        self.start_transaction()
     }
 
     fn delete_records(&mut self) -> Effects {
@@ -311,9 +318,6 @@ mod tests {
             key: b"x".to_vec().into(),
             value: Some(record(group_id).to_bytes().unwrap().into()),
         }));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::from(7),
-        }));
         operation
     }
 
@@ -328,18 +332,36 @@ mod tests {
     }
 
     #[test]
+    fn scan_avoids_transaction() {
+        // A keyspace-wide read set would conflict with every concurrent write.
+        let mut operation =
+            DeleteGroupBackendOperation::new(Ulid::from_bytes([1u8; 16]), backend_id());
+        operation.start();
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(
+                record(Ulid::from_bytes([1u8; 16]))
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            ),
+        }));
+
+        let [Effect::Storage(StorageEffect::Iter { txn_id: None, .. })] = effects.as_slice() else {
+            panic!("expected an untransacted location scan, got {effects:?}")
+        };
+    }
+
+    #[test]
     fn refuses_referenced_backend() {
         let group_id = Ulid::from_bytes([1u8; 16]);
         let mut operation = scanning(group_id);
 
         let effects = operation.step(page(vec![location(BackendRef::Group(backend_id()))]));
 
-        let [Effect::Storage(StorageEffect::AbortTransaction { .. })] = effects.as_slice() else {
-            panic!("expected the scan to abort its transaction, got {effects:?}")
-        };
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: TxnId::from(7),
-        }));
+        assert!(effects.is_empty(), "expected no cleanup, got {effects:?}");
+        assert!(operation.is_complete());
         assert_eq!(
             operation.finalize(),
             Err(DeleteGroupBackendError::StillReferenced)
@@ -355,6 +377,16 @@ mod tests {
             location(BackendRef::node_default()),
             location(BackendRef::Group(Ulid::from_bytes([8u8; 16]))),
         ]));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::from(7),
+        }));
 
         let [Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id })] = effects.as_slice()
         else {
