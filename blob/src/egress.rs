@@ -20,6 +20,9 @@ use std::time::Duration;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Idle bound, not a deadline: it resets on every byte, so a stalled tenant
+/// endpoint is dropped while a multi-gigabyte transfer keeps running.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
 const REDIRECT_HOPS: usize = 5;
 
 type LookupFuture = Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>>;
@@ -122,8 +125,13 @@ impl EgressGuard {
 
     fn build(policy: EgressPolicy, lookup: Lookup) -> Result<Self, BlobLibError> {
         Ok(Self {
-            opendal: guarded_client(policy.clone(), lookup.clone(), None)?,
-            plain: guarded_client(policy.clone(), lookup.clone(), Some(REDIRECT_HOPS))?,
+            opendal: guarded_client(policy.clone(), lookup.clone(), None, READ_TIMEOUT)?,
+            plain: guarded_client(
+                policy.clone(),
+                lookup.clone(),
+                Some(REDIRECT_HOPS),
+                READ_TIMEOUT,
+            )?,
             policy,
             lookup,
         })
@@ -181,6 +189,7 @@ fn guarded_client(
     policy: EgressPolicy,
     lookup: Lookup,
     hops: Option<usize>,
+    read_timeout: Duration,
 ) -> Result<reqwest::Client, BlobLibError> {
     let screen_policy = policy.clone();
     let redirect = match hops {
@@ -205,6 +214,7 @@ fn guarded_client(
         .redirect(redirect)
         .no_proxy()
         .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(read_timeout)
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)
         .build()?)
 }
@@ -470,6 +480,35 @@ mod tests {
 
         assert_eq!(error.kind(), ErrorKind::PermissionDenied);
         assert_eq!(server.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn drops_stalled_peer() {
+        // The peer accepts and then never answers, so only a read bound ends it.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let client = guarded_client(
+            EgressPolicy::loopback(),
+            fixed_lookup(address),
+            None,
+            Duration::from_millis(50),
+        )
+        .unwrap();
+
+        let error = client
+            .get(Url::parse(&format!("http://backend.test:{}/probe", address.port())).unwrap())
+            .send()
+            .await
+            .unwrap_err();
+
+        assert!(error.is_timeout(), "expected a timeout, got {error:?}");
+        task.abort();
     }
 
     #[tokio::test]
