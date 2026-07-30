@@ -52,6 +52,9 @@ pub(super) fn group_entry(
     // service does not know it.
     service_config.insert("bucket".to_string(), container.clone());
 
+    // Invariant: the kind stays `Backend::Group` here. `Backend::S3` would build
+    // through the unguarded operator path and the raw AWS SDK client, both of
+    // which bypass the egress guard a tenant endpoint depends on.
     Ok(NodeBackend::new(
         BackendConfig {
             backend_type: Backend::Group(record.kind),
