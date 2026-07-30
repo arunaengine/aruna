@@ -18,8 +18,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
-    BackendLocation, BackendRef, BackendsFile, BlobHeadKey, BlobVersion, BucketInfo,
-    CurrentVersionPointer, Group, GroupAuthorizationDocument, HashPathIndexKey,
+    BackendLocation, BackendRef, BackendsFile, BlobHeadKey, BlobLocationKey, BlobVersion,
+    BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument, HashPathIndexKey,
     MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
     MultipartUploadPart, MultipartUploadPartKey, RealmAuthorizationDocument, RealmConfigDocument,
     RealmId, UserAccess, VersionKey,
@@ -153,6 +153,8 @@ enum DecodedField {
     BlobHeadKey { value: BlobHeadKey },
     #[serde(rename = "hash_path_index_key")]
     HashPathIndexKey { value: HashPathIndexKey },
+    #[serde(rename = "blob_location_key")]
+    BlobLocationKey { blake3: String, backend: String },
     #[serde(rename = "version_key")]
     VersionKey { value: VersionKey },
     #[serde(rename = "multipart_upload_part_key")]
@@ -1246,6 +1248,12 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
         BLOB_VERSIONS_KEYSPACE => VersionKey::from_bytes(key)
             .map(|value| DecodedField::VersionKey { value })
             .unwrap_or_else(|_| raw_field(key)),
+        BLOB_LOCATIONS_KEYSPACE => BlobLocationKey::from_bytes(key)
+            .map(|value| DecodedField::BlobLocationKey {
+                blake3: hex::encode(value.blake3_hash),
+                backend: value.backend.to_string(),
+            })
+            .unwrap_or_else(|_| raw_field(key)),
         _ => raw_field(key),
     }
 }
@@ -1490,7 +1498,7 @@ mod tests {
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingSecretRecord};
     use aruna_core::structs::{
-        Actor, BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,
+        Actor, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
         BucketReplicationConfig, BucketReplicationTarget, Group, HashPathIndexKey,
         MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
         MultipartObjectSummary, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
@@ -2339,12 +2347,18 @@ mod tests {
             other => panic!("expected current version pointer, got {other:?}"),
         }
 
-        let mut location_key = [9_u8; 32].to_vec();
-        location_key.extend_from_slice(&location.backend.key_bytes());
+        let location_key = BlobLocationKey::new([9_u8; 32], location.backend.clone());
         let decoded_location = decode_entry(
             BLOB_LOCATIONS_KEYSPACE,
-            &location_key,
+            &location_key.to_bytes(),
             &location.to_bytes().unwrap(),
+        );
+        assert_eq!(
+            decoded_location.key,
+            DecodedField::BlobLocationKey {
+                blake3: hex::encode([9_u8; 32]),
+                backend: location.backend.to_string(),
+            }
         );
         match decoded_location.value {
             DecodedValue::BackendLocation { data } => assert_eq!(data, location),
