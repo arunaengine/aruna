@@ -21,6 +21,7 @@ use crate::replication::bao_read::IncomingBaoReadOperation;
 use crate::replication::incoming_version_replication::{
     IncomingVersionReplicationOperation, IncomingVersionReplicationResult,
 };
+use crate::replication::location_summary::LocationSummaryOperation;
 use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
 use crate::usage_stats::refresh_realm_usage_summary_for_targets;
 use aruna_core::alpn::Alpn;
@@ -377,6 +378,24 @@ impl InboundEventHandler for OperationsInboundHandler {
                                                 stream_id = %stream_id,
                                                 error = ?error,
                                                 "Failed to process inbound bao read"
+                                            );
+                                        }
+                                    }
+                                    Ok(VersionReplicationMessage::LocationSummaryRequest(
+                                        request,
+                                    )) => {
+                                        let op = LocationSummaryOperation::new_incoming(
+                                            node_id,
+                                            net_handle.node_id(),
+                                            stream_id,
+                                            request,
+                                        );
+                                        if let Err(error) = drive(op, self.context.as_ref()).await {
+                                            error!(
+                                                peer = %node_id,
+                                                stream_id = %stream_id,
+                                                error = ?error,
+                                                "Failed to answer inbound location summary"
                                             );
                                         }
                                     }
