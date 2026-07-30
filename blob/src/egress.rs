@@ -416,7 +416,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strips_cross_host_auth() {
+    async fn strips_redirect_auth() {
         // reqwest drops Authorization across hosts; pin it instead of assuming it.
         let target = TestServer::spawn(ok_body("data")).await;
         let entry = TestServer::spawn(redirect_to(&format!(

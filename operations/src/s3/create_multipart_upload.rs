@@ -271,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn pins_backend_on_record() {
+    fn pins_record_backend() {
         let snapshot = snapshot().with_bucket_rules(vec![rule("archive")]);
         let mut operation = CreateMultipartUploadOperation::new(input(snapshot));
         operation.start();
@@ -289,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_class_pins_default() {
+    fn missing_class_pins() {
         // The pin records where the parts actually land, not what was asked.
         let snapshot = snapshot().with_bucket_rules(vec![rule("glacier")]);
         let mut operation = CreateMultipartUploadOperation::new(input(snapshot));

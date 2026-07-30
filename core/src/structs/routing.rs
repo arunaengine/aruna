@@ -689,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_class_falls_through() {
+    fn class_miss_continues() {
         // A class this node does not offer is a miss, not a failure.
         let snapshot = snapshot().with_bucket_rules(vec![class_rule("", "glacier")]);
 
@@ -700,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn miss_tries_next_rule() {
+    fn miss_tries_next() {
         // The miss skips one rung only; the next-most-specific rule decides.
         let snapshot = snapshot().with_bucket_rules(vec![
             StorageRoutingRule {
@@ -719,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn miss_reaches_node_rules() {
+    fn miss_reaches_node() {
         let snapshot = snapshot()
             .with_group_default(Some(RoutingTarget::Class("glacier".to_string())))
             .with_node_rules(vec![NodeRoutingRule {
@@ -733,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn reserved_class_skips_tenants() {
+    fn reserved_skips_tenants() {
         // `allow_tenants = false` hides the class from tenant rules only.
         let catalog = BackendCatalog::new("default")
             .with_backend("default", None)

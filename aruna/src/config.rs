@@ -1741,7 +1741,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn labels_env_rejects_class() {
+    async fn rejects_class_label() {
         // Class labels are derived from the backends file, never claimed by hand.
         let _guard = env_lock().lock().await;
         let key = "ARUNA_NODE_LABELS";

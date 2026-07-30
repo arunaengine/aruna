@@ -445,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn node_copy_hides_backend_name() {
+    fn hides_backend_name() {
         // Node-managed copies expose the class only; backend names stay operator-side.
         let copy = copy_response(
             node_id(),
@@ -466,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn group_copy_names_backend() {
+    fn names_group_backend() {
         let backend_id = Ulid::from_bytes([9u8; 16]);
         let copy = copy_response(
             node_id(),
@@ -491,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_copy_is_pending() {
+    fn absent_copy_pends() {
         let copy = copy_response(node_id(), false, LocationSummary::absent());
 
         assert_eq!(copy.state, BlobCopyState::Pending);
@@ -503,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn openapi_includes_blob_locations() {
+    fn openapi_lists_locations() {
         let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
 
         assert!(openapi["paths"].get("/blobs/locations").is_some());

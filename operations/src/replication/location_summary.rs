@@ -776,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_class_of_copy() {
+    fn reports_copy_class() {
         let version_id = Ulid::from_bytes([3u8; 16]);
         let mut operation = LocationSummaryOperation::new_local(request(Some(version_id)));
         operation.start();
@@ -799,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn names_group_backend_copy() {
+    fn names_group_backend() {
         // Tenant-owned storage is the durability signal, so id and name ship.
         let backend_id = Ulid::from_bytes([9u8; 16]);
         let mut operation =
@@ -824,7 +824,8 @@ mod tests {
     }
 
     #[test]
-    fn unknown_version_has_no_copy() {
+    fn unknown_version_empty() {
+        // An unknown version is no copy anywhere, not a copy in an unknown state.
         let mut operation =
             LocationSummaryOperation::new_local(request(Some(Ulid::from_bytes([3u8; 16]))));
         operation.start();
@@ -836,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn incoming_answers_on_stream() {
+    fn answers_on_stream() {
         // The peer path must never reply before the permission check passed.
         let stream_id = Ulid::from_bytes([5u8; 16]);
         let mut operation = LocationSummaryOperation::new_incoming(
@@ -869,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_jobs_name_nodes() {
+    fn names_queued_nodes() {
         let version_id = Ulid::from_bytes([3u8; 16]);
         let wanted = node_id(6);
         let mut operation =

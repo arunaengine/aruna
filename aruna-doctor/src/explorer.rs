@@ -1529,7 +1529,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_reports_unknown_backend() {
+    fn reports_unknown_backend() {
         // A removed backend must be discoverable without a blob backend.
         let temp = tempdir().unwrap();
         let backends_path = temp.path().join("backends.toml");

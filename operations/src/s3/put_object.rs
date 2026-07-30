@@ -1035,7 +1035,7 @@ mod routing_test {
     }
 
     #[test]
-    fn missing_class_stamps_default() {
+    fn missing_class_stamps() {
         // A class this node does not offer reroutes the write, never fails it.
         let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
             key_prefix: String::new(),

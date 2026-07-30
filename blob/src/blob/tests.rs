@@ -331,7 +331,7 @@ async fn read_back(handler: &BlobHandler, location: BackendLocation) -> Vec<u8> 
 }
 
 #[tokio::test]
-async fn part_copy_crosses_backends() {
+async fn copies_across_backends() {
     // UploadPartCopy shape: source on the default backend, part pinned to cold.
     let context = setup_two_backends().await;
     let handler = context.blob_handle.handler.clone();
@@ -447,7 +447,7 @@ serve_group_backends = false
 }
 
 #[tokio::test]
-async fn write_lands_on_backend() {
+async fn routes_write_backend() {
     let context = setup_two_backends().await;
     let handler = context.blob_handle.handler.clone();
 
@@ -555,7 +555,7 @@ async fn backends_track_health() {
 }
 
 #[tokio::test]
-async fn parts_use_pinned_area() {
+async fn pins_part_area() {
     let context = setup_two_backends().await;
     let handler = context.blob_handle.handler.clone();
 
@@ -1560,7 +1560,7 @@ fn reserved_bucket_rejected() {
 }
 
 #[test]
-fn parts_stay_out_of_tenant_keys() {
+fn isolates_tenant_parts() {
     // In-flight parts must not share the container namespace with objects.
     let upload_id = Ulid::generate();
     let path = build_multipart_part_path(upload_id, 1, Ulid::generate());
@@ -1775,7 +1775,7 @@ async fn setup_s3_mixed(env: &S3Env) -> TestContext {
 }
 
 #[tokio::test]
-async fn s3_roundtrip_and_range() {
+async fn s3_roundtrip_range() {
     let Some(env) = s3_env() else { return };
     let context = setup_s3_mixed(&env).await;
     let handler = context.blob_handle.handler.clone();
@@ -1862,7 +1862,7 @@ async fn s3_multipart_compose() {
 }
 
 #[tokio::test]
-async fn s3_serves_group_backend() {
+async fn serves_group_backend() {
     // The tenant endpoint path: MinIO stands in for a group-owned store.
     let Some(env) = s3_env() else { return };
     let context = setup_s3_mixed(&env).await;
@@ -1907,7 +1907,8 @@ async fn s3_serves_group_backend() {
 }
 
 #[tokio::test]
-async fn s3_and_fs_route_apart() {
+async fn routes_backends_apart() {
+    // A cold-class rule pins to S3 while the default stays on the filesystem.
     let Some(env) = s3_env() else { return };
     let context = setup_s3_mixed(&env).await;
     let handler = context.blob_handle.handler.clone();
