@@ -1,4 +1,4 @@
-use super::backend::{build_backend_path, rebuild_backend_path};
+use super::backend::{build_backend_path, build_multipart_part_path, rebuild_backend_path};
 use super::{
     BackendRegistry, BlobHandle, BlobHandler, ControlPlaneTimeoutKind, NodeBackend,
     control_plane::control_plane_timeout_event,
@@ -1483,12 +1483,25 @@ fn build_backend_path_rejects_traversal_keys() {
 #[test]
 fn reserved_bucket_rejected() {
     let ulid = Ulid::generate();
-    for bucket in ["_jobs", "./_jobs"] {
+    for bucket in ["_jobs", "./_jobs", "_parts", "./_parts"] {
         assert!(matches!(
             build_backend_path(bucket, "object", ulid),
             Err(ConversionError::UnsafePath(_))
         ));
     }
+}
+
+#[test]
+fn parts_stay_out_of_tenant_keys() {
+    // In-flight parts must not share the container namespace with objects.
+    let upload_id = Ulid::generate();
+    let path = build_multipart_part_path(upload_id, 1, Ulid::generate());
+
+    assert!(path.starts_with(&format!("_parts/{upload_id}/")));
+    assert!(matches!(
+        build_backend_path("_parts", "object", Ulid::generate()),
+        Err(ConversionError::UnsafePath(_))
+    ));
 }
 
 #[test]

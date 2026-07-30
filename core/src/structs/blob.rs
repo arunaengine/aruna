@@ -17,6 +17,9 @@ use ulid::Ulid;
 
 const ACCESS_KEY_MAX_LEN: usize = 128;
 pub const HIDDEN_BLOB_PREFIX: &str = "_jobs";
+/// Reserved container prefix holding in-flight multipart parts, so parts never
+/// share a namespace with tenant-written keys.
+pub const MULTIPART_PART_PREFIX: &str = "_parts";
 pub const OBJECT_CONTENT_TYPE_KEY: &str = "aruna.internal.content-type";
 
 pub fn ensure_confined_relative_path(path: &Path) -> Result<(), ConversionError> {

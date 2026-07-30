@@ -8,7 +8,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::BUCKET_STATS_DB;
 use aruna_core::structs::{
     Backend, BackendBucket, BackendLocation, BackendRef, HIDDEN_BLOB_PREFIX, HiddenBlobKey,
-    ensure_confined_relative_path,
+    MULTIPART_PART_PREFIX, ensure_confined_relative_path,
 };
 use aruna_core::types::TxnId;
 use opendal::Operator;
@@ -494,9 +494,9 @@ pub(super) fn build_backend_path(
         std::path::Component::Normal(part) => part.to_str(),
         _ => None,
     });
-    if first == Some(HIDDEN_BLOB_PREFIX) {
+    if first == Some(HIDDEN_BLOB_PREFIX) || first == Some(MULTIPART_PART_PREFIX) {
         return Err(ConversionError::UnsafePath(
-            "bucket collides with the hidden blob namespace".to_string(),
+            "bucket collides with a reserved backend namespace".to_string(),
         ));
     }
     path.into_os_string()
@@ -524,7 +524,8 @@ pub(super) fn build_hidden_path(
 }
 
 pub(super) fn build_multipart_part_path(upload_id: Ulid, part_number: u16, ulid: Ulid) -> String {
-    PathBuf::from(upload_id.to_string())
+    PathBuf::from(MULTIPART_PART_PREFIX)
+        .join(upload_id.to_string())
         .join(format!("{:05}_{}", part_number, ulid))
         .into_os_string()
         .into_string()
