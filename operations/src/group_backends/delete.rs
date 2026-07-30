@@ -1,4 +1,4 @@
-use super::{RecordReadError, backend_key, parse_iter, parse_read};
+use super::{RecordReadError, backend_key, parse_pairs, parse_read};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -9,7 +9,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    BackendLocation, BackendRef, BlobCleanupWork, GroupStorageBackend, MultipartUpload,
+    BackendRef, BlobCleanupWork, BlobLocationKey, GroupStorageBackend, MultipartUpload,
     MultipartUploadPart,
 };
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
@@ -50,11 +50,17 @@ impl Scan {
     }
 }
 
-fn names_backend(scan: Scan, value: &[u8], backend: &BackendRef) -> Result<bool, ConversionError> {
+fn names_backend(
+    scan: Scan,
+    key: &Key,
+    value: &[u8],
+    backend: &BackendRef,
+) -> Result<bool, ConversionError> {
     Ok(match scan {
         Scan::Uploads => &MultipartUpload::from_bytes(value)?.backend == backend,
         Scan::Parts => &MultipartUploadPart::from_bytes(value)?.location.backend == backend,
-        Scan::Locations => &BackendLocation::from_bytes(value)?.backend == backend,
+        // The key already names the backend, so no location value is decoded.
+        Scan::Locations => &BlobLocationKey::from_bytes(key.as_ref())?.backend == backend,
         Scan::Cleanup => match BlobCleanupWork::from_bytes(value)? {
             BlobCleanupWork::DeleteBlob { location } => &location.backend == backend,
             BlobCleanupWork::RegisterDht { .. } => false,
@@ -193,11 +199,12 @@ impl DeleteGroupBackendOperation {
 
     fn handle_scanned(&mut self, scan: Scan, event: Event) -> Effects {
         let backend = BackendRef::Group(self.backend_id);
-        let (found, next_start_after) =
-            match parse_iter(event, |value| names_backend(scan, value, &backend)) {
-                Ok(page) => page,
-                Err(error) => return self.fail(error.into()),
-            };
+        let (found, next_start_after) = match parse_pairs(event, |key, value| {
+            names_backend(scan, key, value, &backend)
+        }) {
+            Ok(page) => page,
+            Err(error) => return self.fail(error.into()),
+        };
 
         if found.into_iter().any(|referenced| referenced) {
             return self.restore(DeleteGroupBackendError::StillReferenced);
@@ -397,8 +404,8 @@ mod tests {
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        BackendLocation, BackendRef, BlobCleanupWork, GroupBackendKind, GroupStorageBackend,
-        MultipartUpload, MultipartUploadPart, MultipartUploadStatus,
+        BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, GroupBackendKind,
+        GroupStorageBackend, MultipartUpload, MultipartUploadPart, MultipartUploadStatus,
     };
     use aruna_core::types::TxnId;
     use std::collections::HashMap;
@@ -492,6 +499,24 @@ mod tests {
         operation
     }
 
+    /// Location entries answer from the key, so the page must carry real keys.
+    fn location_page(locations: Vec<BackendLocation>) -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values: locations
+                .into_iter()
+                .map(|location| {
+                    (
+                        BlobLocationKey::new([5u8; 32], location.backend.clone())
+                            .to_bytes()
+                            .into(),
+                        location.to_bytes().unwrap().into(),
+                    )
+                })
+                .collect(),
+            next_start_after: None,
+        })
+    }
+
     fn page(values: Vec<Vec<u8>>) -> Event {
         Event::Storage(StorageEvent::IterResult {
             values: values
@@ -541,22 +566,30 @@ mod tests {
         let group_id = Ulid::from_bytes([1u8; 16]);
         let ours = BackendRef::Group(backend_id());
         let cases = [
-            (S3_MULTIPART_UPLOAD_KEYSPACE, upload(ours.clone()), 0),
-            (S3_MULTIPART_UPLOAD_PART_KEYSPACE, part(ours.clone()), 1),
+            (
+                S3_MULTIPART_UPLOAD_KEYSPACE,
+                page(vec![upload(ours.clone())]),
+                0,
+            ),
+            (
+                S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+                page(vec![part(ours.clone())]),
+                1,
+            ),
             (
                 BLOB_LOCATIONS_KEYSPACE,
-                location(ours.clone()).to_bytes().unwrap(),
+                location_page(vec![location(ours.clone())]),
                 2,
             ),
-            (BLOB_CLEANUP_KEYSPACE, cleanup(ours), 3),
+            (BLOB_CLEANUP_KEYSPACE, page(vec![cleanup(ours)]), 3),
         ];
 
-        for (key_space, value, skipped) in cases {
+        for (key_space, found, skipped) in cases {
             let mut operation = scanning(group_id);
             for _ in 0..skipped {
                 operation.step(empty());
             }
-            let effects = operation.step(page(vec![value]));
+            let effects = operation.step(found);
 
             let [Effect::Storage(StorageEffect::Write { .. })] = effects.as_slice() else {
                 panic!("expected a restore write for {key_space}, got {effects:?}")
@@ -581,9 +614,9 @@ mod tests {
 
         operation.step(page(vec![upload(other.clone())]));
         operation.step(page(vec![part(other.clone())]));
-        operation.step(page(vec![
-            location(BackendRef::node_default()).to_bytes().unwrap(),
-            location(other.clone()).to_bytes().unwrap(),
+        operation.step(location_page(vec![
+            location(BackendRef::node_default()),
+            location(other.clone()),
         ]));
         let effects = operation.step(page(vec![cleanup(other)]));
 

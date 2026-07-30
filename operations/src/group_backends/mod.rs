@@ -72,6 +72,30 @@ pub fn parse_read<T>(
     }
 }
 
+/// Like [`parse_iter`], but hands the stored key to the decoder as well, so a
+/// scan can answer from the key alone.
+pub fn parse_pairs<T>(
+    event: Event,
+    decode: impl Fn(&Key, &[u8]) -> Result<T, ConversionError>,
+) -> Result<(Vec<T>, Option<Key>), RecordReadError> {
+    match event {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) => {
+            let records = values
+                .iter()
+                .map(|(key, value)| {
+                    decode(key, value.as_ref()).map_err(RecordReadError::Conversion)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((records, next_start_after))
+        }
+        Event::Storage(StorageEvent::Error { error }) => Err(RecordReadError::Storage(error)),
+        _ => Err(RecordReadError::Unexpected),
+    }
+}
+
 pub fn parse_iter<T>(
     event: Event,
     decode: impl Fn(&[u8]) -> Result<T, ConversionError>,
