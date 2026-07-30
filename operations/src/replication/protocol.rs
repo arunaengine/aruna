@@ -148,10 +148,16 @@ pub enum VersionReplicationMessage {
     VersionApplyComplete,
     VersionApplyRejected(String),
     BaoReadRequest(BaoReadRequest),
-    BaoReadAccepted { size: u64, blake3: [u8; 32] },
+    BaoReadAccepted {
+        size: u64,
+        blake3: [u8; 32],
+    },
     BaoReadRefused(BaoReadRefusal),
     LocationSummaryRequest(LocationSummaryRequest),
     LocationSummaryResponse(LocationSummary),
+    /// The asking user has no read access to the bucket this node holds the
+    /// copy under, so the caller learns nothing except that it was refused.
+    LocationSummaryDenied,
 }
 
 /// Read-only question a node asks a peer: do you hold this version, and on

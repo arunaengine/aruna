@@ -111,6 +111,16 @@ current version.
 - `unreachable` means the node did not answer within the deadline. The
   endpoint never waits on an offline node beyond that deadline, and the local
   entry is always returned.
+- `denied` means the node refused to answer because you may not read the
+  bucket it would hold that copy under.
+
+`denied` is not a bug. A replication target may write into a different bucket,
+sometimes owned by a different group, and each node authorizes you against the
+bucket it actually holds. READ on the source object is what gets you the
+question asked; READ on the destination bucket is what gets it answered. A
+caller without it sees the node listed as `denied` and learns nothing else
+about it, not even whether a copy exists there. Ask a destination-bucket
+reader, or have the destination bucket's admin grant you READ.
 
 Node-managed copies report their storage class, not the operator's backend
 name. Group-backend copies report the backend's id and name, because that copy

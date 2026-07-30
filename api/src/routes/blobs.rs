@@ -7,7 +7,8 @@ use aruna_core::structs::{
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::replication::location_summary::{
-    LocationSummaryOperation, QueuedReplicaNodesOperation, RemoteLocationSummaryOperation,
+    LocationSummaryError, LocationSummaryOperation, QueuedReplicaNodesOperation,
+    RemoteLocationSummaryOperation,
 };
 use aruna_operations::replication::protocol::{
     LocationCopyStorage, LocationSummary, LocationSummaryRequest, ReplicationMode,
@@ -207,6 +208,9 @@ pub enum BlobCopyState {
     Present,
     Pending,
     Unreachable,
+    /// The node holds this bucket under access rules the caller does not pass,
+    /// so it refused to say whether a copy is there.
+    Denied,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -412,6 +416,9 @@ pub async fn blob_locations(
     for (node_id, answer) in answers {
         copies.push(match answer {
             Ok(Ok(summary)) => copy_response(node_id, false, summary),
+            Ok(Err(LocationSummaryError::Denied)) => {
+                pending_copy(node_id, BlobCopyState::Denied)
+            }
             Ok(Err(error)) => {
                 warn!(node = %node_id, error = %error, "Location summary peer answered with an error");
                 pending_copy(node_id, BlobCopyState::Unreachable)

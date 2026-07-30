@@ -38,6 +38,7 @@ enum SummaryState {
     ReadLocation,
     ReadBackend,
     SendSummary,
+    SendDenial,
     Close,
     Finish,
     Error,
@@ -119,6 +120,7 @@ impl LocationSummaryOperation {
             SummaryState::ReadLocation => "read_location",
             SummaryState::ReadBackend => "read_backend",
             SummaryState::SendSummary => "send_summary",
+            SummaryState::SendDenial => "send_denial",
             SummaryState::Close => "close",
             SummaryState::Finish => "finish",
             SummaryState::Error => "error",
@@ -279,8 +281,23 @@ impl LocationSummaryOperation {
         };
         match allowed {
             Ok(true) => self.resolve_version(),
-            _ => self.fail(LocationSummaryError::Denied),
+            _ => self.deny(),
         }
+    }
+
+    /// A refusal is answered rather than dropped: a caller must be able to tell
+    /// a node that will not answer from one that cannot.
+    fn deny(&mut self) -> Effects {
+        let Some(stream_id) = self.stream_id else {
+            return self.fail(LocationSummaryError::Denied);
+        };
+        let payload = match VersionReplicationMessage::LocationSummaryDenied.to_bytes() {
+            Ok(payload) => payload,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.output = Some(Err(LocationSummaryError::Denied));
+        self.state = SummaryState::SendDenial;
+        smallvec![Effect::Blob(BlobEffect::SendMessage { stream_id, payload })]
     }
 
     fn resolve_version(&mut self) -> Effects {
@@ -395,6 +412,13 @@ impl Operation for LocationSummaryOperation {
                     return self.unexpected(event);
                 };
                 self.output = Some(Ok(self.summary.clone()));
+                self.state = SummaryState::Close;
+                smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })]
+            }
+            SummaryState::SendDenial => {
+                let Event::Blob(BlobEvent::MessageSent { stream_id }) = event else {
+                    return self.unexpected(event);
+                };
                 self.state = SummaryState::Close;
                 smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })]
             }
@@ -523,6 +547,11 @@ impl Operation for RemoteLocationSummaryOperation {
                 match VersionReplicationMessage::from_bytes(&payload) {
                     Ok(VersionReplicationMessage::LocationSummaryResponse(summary)) => {
                         self.output = Some(Ok(summary));
+                        self.state = RemoteState::Close;
+                        smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })]
+                    }
+                    Ok(VersionReplicationMessage::LocationSummaryDenied) => {
+                        self.output = Some(Err(LocationSummaryError::Denied));
                         self.state = RemoteState::Close;
                         smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })]
                     }
@@ -852,6 +881,63 @@ mod tests {
             panic!("expected a realm read first, got {effects:?}")
         };
         assert_eq!(key_space, aruna_core::keyspaces::REALM_CONFIG_KEYSPACE);
+    }
+
+    #[test]
+    fn answers_denial() {
+        // A refused peer must say so, so the caller does not read it as offline.
+        let stream_id = Ulid::from_bytes([5u8; 16]);
+        let mut operation = LocationSummaryOperation::new_incoming(
+            node_id(4),
+            node_id(5),
+            stream_id,
+            request(Some(Ulid::from_bytes([3u8; 16]))),
+        );
+        operation.state = super::SummaryState::CheckPermission;
+
+        let effects = operation.step(Event::SubOperation(
+            aruna_core::events::SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
+        ));
+
+        let [Effect::Blob(aruna_core::effects::BlobEffect::SendMessage { payload, .. })] =
+            effects.as_slice()
+        else {
+            panic!("expected an explicit denial, got {effects:?}")
+        };
+        assert_eq!(
+            crate::replication::protocol::VersionReplicationMessage::from_bytes(payload).unwrap(),
+            crate::replication::protocol::VersionReplicationMessage::LocationSummaryDenied
+        );
+    }
+
+    #[test]
+    fn reports_remote_denial() {
+        // The asking side turns the denial back into a Denied error, never a
+        // transport failure.
+        let stream_id = Ulid::from_bytes([5u8; 16]);
+        let mut operation = super::RemoteLocationSummaryOperation::new(node_id(4), request(None));
+        operation.start();
+        operation.step(Event::Blob(
+            aruna_core::events::BlobEvent::ConnectionEstablished { stream_id },
+        ));
+        operation.step(Event::Blob(aruna_core::events::BlobEvent::MessageSent {
+            stream_id,
+        }));
+
+        operation.step(Event::Blob(
+            aruna_core::events::BlobEvent::MessageReceived {
+                stream_id,
+                payload:
+                    crate::replication::protocol::VersionReplicationMessage::LocationSummaryDenied
+                        .to_bytes()
+                        .unwrap(),
+            },
+        ));
+
+        assert_eq!(
+            operation.finalize(),
+            Err(super::LocationSummaryError::Denied)
+        );
     }
 
     fn job(target: ReplicateScopeTarget, target_node: NodeId) -> BlobReplicationJobRecord {
