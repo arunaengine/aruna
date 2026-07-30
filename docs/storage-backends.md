@@ -100,9 +100,11 @@ version can sit on different classes and even on different kinds of storage.
 
 Tenant-supplied endpoints (group backends, staging sources, autoindex fetches)
 are screened against a compiled-in deny table covering loopback, link-local,
-RFC1918, carrier-grade NAT, documentation, benchmarking, multicast and
-reserved ranges, in both IPv4 and IPv6, after unwrapping IPv4-mapped, NAT64
-and RFC 8215 translations. The table cannot be widened. `[egress].deny` only
+RFC1918, carrier-grade NAT, documentation, benchmarking, multicast, reserved,
+segment-routing and IPv6 transition ranges, in both IPv4 and IPv6, after
+unwrapping IPv4-mapped, NAT64 and RFC 8215 translations. It holds every IANA
+special-purpose prefix whose registry entry is not globally reachable. The
+table cannot be widened. `[egress].deny` only
 appends further CIDRs, and `serve_group_backends = false` makes group-backend
 routing targets fail loudly.
 

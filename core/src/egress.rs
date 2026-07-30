@@ -40,13 +40,19 @@ const DENIED_V4: &[Ipv4Net] = &[
     Ipv4Net::new_assert(Ipv4Addr::new(255, 255, 255, 255), 32),
 ];
 
-/// IPv6 ranges that are never a legitimate tenant destination. `::/96` covers
-/// the deprecated IPv4-compatible spellings that embed an arbitrary v4 address.
+/// IPv6 ranges that are never a legitimate tenant destination: every IANA
+/// special-purpose prefix that is not globally reachable, plus the tunnelling
+/// prefixes whose reachability depends on a translator. `::/96` covers the
+/// deprecated IPv4-compatible spellings that embed an arbitrary v4 address.
 const DENIED_V6: &[Ipv6Net] = &[
     Ipv6Net::new_assert(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), 96),
     Ipv6Net::new_assert(Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 0), 64),
+    Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 32),
+    Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0x0002, 0, 0, 0, 0, 0, 0), 48),
     Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0), 32),
     Ipv6Net::new_assert(Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16),
+    Ipv6Net::new_assert(Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20),
+    Ipv6Net::new_assert(Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0), 16),
     Ipv6Net::new_assert(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),
     Ipv6Net::new_assert(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
     Ipv6Net::new_assert(Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0), 10),
@@ -172,11 +178,15 @@ mod tests {
         "255.255.255.255/32",
     ];
 
-    const V6_ROWS: [&str; 8] = [
+    const V6_ROWS: [&str; 12] = [
         "::/96",
         "100::/64",
+        "2001::/32",
+        "2001:2::/48",
         "2001:db8::/32",
         "2002::/16",
+        "3fff::/20",
+        "5f00::/16",
         "fc00::/7",
         "fe80::/10",
         "fec0::/10",
