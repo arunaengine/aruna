@@ -10,15 +10,15 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
-    NODE_USAGE_DIRTY_GLOBAL_KEY, NODE_USAGE_DIRTY_PREFIX, NODE_USAGE_GLOBAL_PREFIX,
-    NODE_USAGE_GROUP_PREFIX, NODE_USAGE_SUMMARY_GLOBAL_KEY, NODE_USAGE_SUMMARY_GROUP_PREFIX,
-    NodeUsageSnapshot, RealmConfigDocument, RealmId, USAGE_GLOBAL_KEY, USAGE_GLOBAL_SHARD_COUNT,
-    UsageCounterError, UsageCounters, UsageDelta, VersionKey, node_usage_dirty_group_id,
-    node_usage_dirty_group_key, node_usage_global_key, node_usage_group_key,
-    node_usage_group_key_group_id, node_usage_group_prefix, node_usage_key_node_id,
-    node_usage_summary_group_key, usage_global_key_for_group, usage_global_shard_index,
-    usage_global_shard_key, usage_global_shard_keys, usage_group_key,
+    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
+    CurrentVersionPointer, NODE_USAGE_DIRTY_GLOBAL_KEY, NODE_USAGE_DIRTY_PREFIX,
+    NODE_USAGE_GLOBAL_PREFIX, NODE_USAGE_GROUP_PREFIX, NODE_USAGE_SUMMARY_GLOBAL_KEY,
+    NODE_USAGE_SUMMARY_GROUP_PREFIX, NodeUsageSnapshot, RealmConfigDocument, RealmId,
+    USAGE_GLOBAL_KEY, USAGE_GLOBAL_SHARD_COUNT, UsageCounterError, UsageCounters, UsageDelta,
+    VersionKey, node_usage_dirty_group_id, node_usage_dirty_group_key, node_usage_global_key,
+    node_usage_group_key, node_usage_group_key_group_id, node_usage_group_prefix,
+    node_usage_key_node_id, node_usage_summary_group_key, usage_global_key_for_group,
+    usage_global_shard_index, usage_global_shard_key, usage_global_shard_keys, usage_group_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -653,7 +653,9 @@ impl RebuildUsageStatsOperation {
                     };
                     self.global.add(&delta)?;
                     self.global_shards[0].add(&delta)?;
-                    self.blob_sizes.insert(key.to_vec(), location.blob_size);
+                    // Copies of one hash share a size, so the hash prefix keys the map.
+                    let hash = BlobLocationKey::from_bytes(key.as_ref())?.blake3_hash;
+                    self.blob_sizes.insert(hash.to_vec(), location.blob_size);
                 }
             }
             RebuildUsageStatsState::ScanHeads => {
@@ -2006,7 +2008,9 @@ mod tests {
             ctx.storage_handle
                 .send_storage_effect(StorageEffect::Write {
                     key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                    key: hash.to_vec().into(),
+                    key: BlobLocationKey::new(hash, loc.backend.clone())
+                        .to_bytes()
+                        .into(),
                     value: loc.to_bytes().unwrap().into(),
                     txn_id: Some(txn_id),
                 })
@@ -2051,13 +2055,13 @@ mod tests {
         let alpha_live_head = write_version(
             "alpha",
             "live.txt",
-            BlobVersion::materialized(hashes[0], now, user, None),
+            BlobVersion::materialized(hashes[0], BackendRef::node_default(), now, user, None),
         )
         .await;
         write_version(
             "alpha",
             "gone.txt",
-            BlobVersion::materialized(hashes[1], now, user, None),
+            BlobVersion::materialized(hashes[1], BackendRef::node_default(), now, user, None),
         )
         .await;
         let alpha_gone_head =
@@ -2065,13 +2069,13 @@ mod tests {
         write_version(
             "beta",
             "shared.bin",
-            BlobVersion::materialized(hashes[1], now, user, None),
+            BlobVersion::materialized(hashes[1], BackendRef::node_default(), now, user, None),
         )
         .await;
         let beta_head = write_version(
             "beta",
             "shared.bin",
-            BlobVersion::materialized(hashes[1], now, user, None),
+            BlobVersion::materialized(hashes[1], BackendRef::node_default(), now, user, None),
         )
         .await;
         let alpha_ref_head = write_version(

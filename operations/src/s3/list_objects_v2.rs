@@ -5,8 +5,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
-    SourceConnectorKind, SourceMetadata, VersionKey,
+    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
+    CurrentVersionPointer, SourceConnectorKind, SourceMetadata, VersionKey,
 };
 use aruna_core::types::{Effects, GroupId, Key, Value};
 use aruna_core::util::prefix_upper_bound;
@@ -528,10 +528,12 @@ impl ListObjectsV2Operation {
                                     version_created_at: None,
                                 }));
                         }
-                        BlobVersionState::Materialized { blob_hash, .. } => {
+                        BlobVersionState::Materialized {
+                            blob_hash, backend, ..
+                        } => {
                             self.location_reads.push((
                                 BLOB_LOCATIONS_KEYSPACE.to_string(),
-                                blob_hash.to_vec().into(),
+                                BlobLocationKey::new(blob_hash, backend).to_bytes().into(),
                             ));
                             self.resolved.push(ResolvedEntry::AwaitingLocation {
                                 head,
@@ -721,7 +723,13 @@ mod test {
             (
                 "alpha",
                 live_version_id,
-                BlobVersion::materialized(live_hash, created_at, created_by, None),
+                BlobVersion::materialized(
+                    live_hash,
+                    BackendRef::node_default(),
+                    created_at,
+                    created_by,
+                    None,
+                ),
             ),
             (
                 "beta",
@@ -772,7 +780,9 @@ mod test {
         let event = storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                key: live_hash.to_vec().into(),
+                key: BlobLocationKey::new(live_hash, location.backend.clone())
+                    .to_bytes()
+                    .into(),
                 value: location.to_bytes().unwrap().into(),
                 txn_id: None,
             })
@@ -955,10 +965,16 @@ mod test {
                     .to_bytes()
                     .unwrap()
                     .into(),
-                value: BlobVersion::materialized(hash, created_at, created_by, None)
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
+                value: BlobVersion::materialized(
+                    hash,
+                    BackendRef::node_default(),
+                    created_at,
+                    created_by,
+                    None,
+                )
+                .to_bytes()
+                .unwrap()
+                .into(),
                 txn_id: None,
             })
             .await;
@@ -1210,7 +1226,13 @@ mod test {
         for (index, key) in keys.iter().enumerate() {
             let version_id = Ulid::generate();
             let hash = [index as u8 + 1; 32];
-            let version = BlobVersion::materialized(hash, created_at, created_by, None);
+            let version = BlobVersion::materialized(
+                hash,
+                BackendRef::node_default(),
+                created_at,
+                created_by,
+                None,
+            );
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
                     key_space: BLOB_HEAD_KEYSPACE.to_string(),
@@ -1236,7 +1258,9 @@ mod test {
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
                     key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                    key: hash.to_vec().into(),
+                    key: BlobLocationKey::new(hash, BackendRef::node_default())
+                        .to_bytes()
+                        .into(),
                     value: BackendLocation {
                         backend: BackendRef::node_default(),
                         storage_class: None,
@@ -1671,11 +1695,16 @@ mod test {
         };
         let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
         let created_at = UNIX_EPOCH + Duration::from_secs(5);
-        let version: aruna_core::types::Value =
-            BlobVersion::materialized([1u8; 32], created_at, created_by, None)
-                .to_bytes()
-                .unwrap()
-                .into();
+        let version: aruna_core::types::Value = BlobVersion::materialized(
+            [1u8; 32],
+            BackendRef::node_default(),
+            created_at,
+            created_by,
+            None,
+        )
+        .to_bytes()
+        .unwrap()
+        .into();
         let version_values = reads
             .iter()
             .map(|(_, key)| (key.clone(), Some(version.clone())))

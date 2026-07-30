@@ -4,8 +4,8 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
 };
 use aruna_core::structs::{
-    BackendLocation, BlobHeadKey, BlobVersion, CurrentVersionPointer, HashPathIndexKey, RealmId,
-    VersionKey,
+    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, CurrentVersionPointer,
+    HashPathIndexKey, RealmId, VersionKey,
 };
 use aruna_core::types::{Effects, GroupId, NodeId, TxnId};
 use byteview::ByteView;
@@ -55,22 +55,25 @@ impl HeadAliasContext {
     }
 }
 
-pub fn read_blob_location_effect(blake3_hash: &[u8], txn_id: Option<TxnId>) -> Effect {
+pub fn blob_location_read(key: &BlobLocationKey, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-        key: ByteView::from(blake3_hash.to_vec()),
+        key: ByteView::from(key.to_bytes()),
         txn_id,
     })
 }
 
+/// Keyed by the location's own backend, so a rewrite of identical content only
+/// ever replaces the copy on the backend the write resolved to.
 pub fn write_blob_location_effect(
     blake3_hash: [u8; 32],
     location: BackendLocation,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
+    let key = BlobLocationKey::new(blake3_hash, location.backend.clone());
     Ok(Effect::Storage(StorageEffect::Write {
         key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-        key: ByteView::from(blake3_hash.to_vec()),
+        key: ByteView::from(key.to_bytes()),
         value: location.to_bytes()?.into(),
         txn_id,
     }))

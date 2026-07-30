@@ -7,7 +7,7 @@ use aruna_core::events::{DhtEntry, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{RealmId, RoCrateLimits};
+use aruna_core::structs::{BlobLocationKey, RealmId, RoCrateLimits};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, Key, NodeId};
 use smallvec::smallvec;
@@ -51,6 +51,7 @@ pub struct RefreshBlobHoldersOperation {
     state: RefreshState,
     pending: VecDeque<DhtKeyId>,
     next_start: Option<Key>,
+    last_published: Option<DhtKeyId>,
     refreshed: usize,
     output: Option<Result<usize, RefreshBlobHoldersError>>,
 }
@@ -64,6 +65,7 @@ impl RefreshBlobHoldersOperation {
             state: RefreshState::Init,
             pending: VecDeque::new(),
             next_start: None,
+            last_published: None,
             refreshed: 0,
             output: None,
         }
@@ -138,12 +140,17 @@ impl Operation for RefreshBlobHoldersOperation {
                     values,
                     next_start_after,
                 }) => {
-                    self.pending
-                        .extend(values.into_iter().filter_map(|(key, _)| {
-                            <[u8; 32]>::try_from(key.as_ref())
-                                .ok()
-                                .map(DhtKeyId::from_bytes)
-                        }));
+                    // Copies of one hash sort together, so one publish per hash
+                    // is enough even though each backend has its own entry.
+                    for (key, _) in values {
+                        let Ok(location) = BlobLocationKey::from_bytes(key.as_ref()) else {
+                            continue;
+                        };
+                        let dht_key = DhtKeyId::from_bytes(location.blake3_hash);
+                        if self.last_published.replace(dht_key) != Some(dht_key) {
+                            self.pending.push_back(dht_key);
+                        }
+                    }
                     self.next_start = next_start_after;
                     self.next_effect()
                 }

@@ -1,18 +1,19 @@
 use std::collections::BTreeSet;
 
+use crate::blob::blob_keyspace_helper::blob_location_read;
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_REPLICATION_JOB_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    S3_BUCKET_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_REPLICATION_JOB_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    GROUP_STORAGE_BACKEND_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
-    GroupStorageBackend, Permission, RealmConfigDocument, VersionKey, blob_object_permission_path,
+    BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
+    CurrentVersionPointer, GroupStorageBackend, Permission, RealmConfigDocument, VersionKey,
+    blob_object_permission_path,
 };
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
@@ -192,13 +193,9 @@ impl LocationSummaryOperation {
         })]
     }
 
-    fn read_location(&mut self, blob_hash: [u8; 32]) -> Effects {
+    fn read_location(&mut self, key: BlobLocationKey) -> Effects {
         self.state = SummaryState::ReadLocation;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-            key: blob_hash.to_vec().into(),
-            txn_id: None,
-        })]
+        smallvec![blob_location_read(&key, None)]
     }
 
     fn read_backend(&mut self, backend_id: Ulid) -> Effects {
@@ -336,8 +333,8 @@ impl LocationSummaryOperation {
             Ok(version) => version,
             Err(error) => return self.fail(error.into()),
         };
-        match version.blob_hash().copied() {
-            Some(blob_hash) => self.read_location(blob_hash),
+        match version.location_key() {
+            Some(key) => self.read_location(key),
             None => self.answer(),
         }
     }
@@ -801,6 +798,7 @@ mod tests {
     fn materialized() -> BlobVersion {
         BlobVersion::materialized(
             [7u8; 32],
+            BackendRef::node_default(),
             SystemTime::UNIX_EPOCH,
             UserId::nil(realm_id()),
             None,

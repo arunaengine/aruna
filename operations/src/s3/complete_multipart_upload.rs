@@ -1,5 +1,5 @@
 use crate::blob::blob_keyspace_helper::{
-    HeadAliasContext, add_hash_path_index_effect, write_blob_head_effect,
+    HeadAliasContext, add_hash_path_index_effect, blob_location_read, write_blob_head_effect,
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::blob::cleanup::schedule_blob_cleanup_effect;
@@ -13,17 +13,17 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
     S3_MULTIPART_UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobVersion, CurrentVersionPointer,
-    MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
-    MultipartUpload, MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus, RealmId,
-    ResolvedBackend, RoCrateLimits, UsageDelta, VersionKey,
+    AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
+    CurrentVersionPointer, MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
+    MultipartObjectSummary, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
+    MultipartUploadStatus, RealmId, ResolvedBackend, RoCrateLimits, UsageDelta, VersionKey,
 };
 use aruna_core::types::{Effects, NodeId, TxnId, UserId};
 use smallvec::smallvec;
@@ -540,12 +540,13 @@ impl CompleteMultipartUploadOperation {
                 "blake3",
             ));
         };
+        // Only the copy on the upload's pinned backend may be deduplicated.
+        let key = match BlobLocationKey::from_blake3(blake3_hash, location.backend.clone()) {
+            Ok(key) => key,
+            Err(error) => return self.schedule_error(error.into()),
+        };
         self.state = CompleteMultipartUploadState::CheckHashLookup;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-            key: blake3_hash.to_vec().into(),
-            txn_id: self.txn_id,
-        })]
+        smallvec![blob_location_read(&key, self.txn_id)]
     }
 
     fn handle_hash_lookup_checked(&mut self, event: Event) -> Effects {
@@ -764,6 +765,7 @@ impl CompleteMultipartUploadOperation {
                         .schedule_error(CompleteMultipartUploadError::ConversionError(err.into()));
                 }
             },
+            location.backend.clone(),
             created_at,
             self.input.created_by,
             None,

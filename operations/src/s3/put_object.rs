@@ -1,5 +1,5 @@
 use crate::blob::blob_keyspace_helper::{
-    HeadAliasContext, add_hash_path_index_effect, write_blob_head_effect,
+    HeadAliasContext, add_hash_path_index_effect, blob_location_read, write_blob_head_effect,
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
@@ -12,16 +12,14 @@ use crate::usage_stats::{
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
-use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
-};
+use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
-    RealmId, RoCrateLimits, RoutingError, RoutingSnapshot, UsageDelta, VersionKey,
-    VersionSourceBinding, resolve_backend,
+    AuthContext, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
+    CurrentVersionPointer, RealmId, RoCrateLimits, RoutingError, RoutingSnapshot, UsageDelta,
+    VersionKey, VersionSourceBinding, resolve_backend,
 };
 use aruna_core::types::{Effects, GroupId, NodeId, UserId};
 use bytes::Bytes;
@@ -224,15 +222,11 @@ impl PutObjectOperation {
             Ok(version) => version,
             Err(error) => return self.emit_error(error.into()),
         };
-        let Some(hash) = version.blob_hash() else {
+        let Some(location_key) = version.location_key() else {
             return self.emit_error(PutObjectError::InvalidPreassignedVersion);
         };
         self.state = PutObjectState::ReadPreassignedLocation;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-            key: hash.to_vec().into(),
-            txn_id: None,
-        })]
+        smallvec![blob_location_read(&location_key, None)]
     }
 
     fn handle_preassigned_location(&mut self, event: Event) -> Effects {
@@ -389,21 +383,22 @@ impl PutObjectOperation {
         self.start_fence()
     }
 
+    /// Looks up only the copy on the backend this write resolved to, so
+    /// identical content on another backend never overrides the placement.
     fn start_hash_lookup(&mut self) -> Effects {
         self.state = PutObjectState::CheckHashLookup;
-        if let Some(written_location) = self.get_written_location() {
-            if let Some(blake3_hash) = written_location.get_blake3() {
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                    key: blake3_hash.to_vec().into(),
-                    txn_id: self.txn_id,
-                })]
-            } else {
-                self.emit_error(PutObjectError::MissingHash("blake3".to_string()))
-            }
-        } else {
-            self.emit_error(PutObjectError::MissingOutput)
-        }
+        let Some(written_location) = self.get_written_location() else {
+            return self.emit_error(PutObjectError::MissingOutput);
+        };
+        let Some(blake3_hash) = written_location.get_blake3() else {
+            return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
+        };
+        let key = match BlobLocationKey::from_blake3(blake3_hash, written_location.backend.clone())
+        {
+            Ok(key) => key,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        smallvec![blob_location_read(&key, self.txn_id)]
     }
 
     fn handle_hash_lookup_checked(&mut self, event: Event) -> Effects {
@@ -614,6 +609,7 @@ impl PutObjectOperation {
                         return self.emit_error(PutObjectError::ConversionError(err.into()));
                     }
                 },
+                output.backend.clone(),
                 version_created_at,
                 output.created_by,
                 self.config.version_source.clone(),
@@ -1204,8 +1200,9 @@ mod test {
     use aruna_core::structs::RoutingSnapshot;
     use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
     use aruna_core::structs::{
-        Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,
-        CurrentVersionPointer, HashPathIndexKey, RealmId, UsageDelta, VersionKey,
+        Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey,
+        BlobVersion, BucketInfo, CurrentVersionPointer, HashPathIndexKey, RealmId, UsageDelta,
+        VersionKey,
     };
     use aruna_net::dht::storage::decode_entries;
     use aruna_net::{NetConfig, NetHandle};
@@ -1626,7 +1623,13 @@ mod test {
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
                 key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                key: result.location.get_blake3().unwrap().to_vec().into(),
+                key: BlobLocationKey::from_blake3(
+                    result.location.get_blake3().unwrap(),
+                    result.location.backend.clone(),
+                )
+                .unwrap()
+                .to_bytes()
+                .into(),
                 txn_id: None,
             })
             .await
@@ -1892,7 +1895,9 @@ mod test {
         assert_eq!(count_files(Path::new(&blob_root)), 1);
         let blob_hash: [u8; 32] = first.location.get_blake3().unwrap().try_into().unwrap();
 
-        let blob_location_value = read_value(&context, BLOB_LOCATIONS_KEYSPACE, blob_hash.to_vec())
+        let location_key =
+            BlobLocationKey::new(blob_hash, first.location.backend.clone()).to_bytes();
+        let blob_location_value = read_value(&context, BLOB_LOCATIONS_KEYSPACE, location_key)
             .await
             .expect("missing blob location entry");
         assert_eq!(

@@ -106,6 +106,18 @@ impl BackendRef {
             Self::Group(id) => format!("g:{id}").into_bytes(),
         }
     }
+
+    pub fn from_key_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|error| ConversionError::FromStrError(error.to_string()))?;
+        match text.split_at_checked(2) {
+            Some(("n:", name)) => Ok(Self::Node(name.to_string())),
+            Some(("g:", id)) => Ok(Self::Group(id.parse()?)),
+            _ => Err(ConversionError::FromStrError(format!(
+                "unknown backend key `{text}`"
+            ))),
+        }
+    }
 }
 
 impl Display for BackendRef {
@@ -283,6 +295,44 @@ impl BackendLocation {
 
     pub fn get_blake3(&self) -> Option<&[u8]> {
         self.hashes.get(HASH_BLAKE3).map(|h| h.as_slice())
+    }
+}
+
+/// Names one physical copy: the content hash followed by the backend holding
+/// it. Deduplication therefore stays inside the backend a write routed to, and
+/// every backend keeps at most one copy of a hash.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobLocationKey {
+    pub blake3_hash: [u8; 32],
+    pub backend: BackendRef,
+}
+
+impl BlobLocationKey {
+    pub fn new(blake3_hash: [u8; 32], backend: BackendRef) -> Self {
+        Self {
+            blake3_hash,
+            backend,
+        }
+    }
+
+    pub fn from_blake3(hash: &[u8], backend: BackendRef) -> Result<Self, ConversionError> {
+        Ok(Self::new(hash.try_into()?, backend))
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut key = self.blake3_hash.to_vec();
+        key.extend_from_slice(&self.backend.key_bytes());
+        key
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        let (hash, backend) = bytes.split_at_checked(32).ok_or_else(|| {
+            ConversionError::InvalidLength("blob location key is too short".to_string())
+        })?;
+        Ok(Self::new(
+            hash.try_into()?,
+            BackendRef::from_key_bytes(backend)?,
+        ))
     }
 }
 
@@ -661,6 +711,7 @@ pub struct BlobVersion {
 impl BlobVersion {
     pub fn materialized(
         blob_hash: [u8; 32],
+        backend: BackendRef,
         created_at: SystemTime,
         created_by: UserId,
         source: Option<VersionSourceBinding>,
@@ -668,7 +719,11 @@ impl BlobVersion {
         Self {
             created_at,
             created_by,
-            state: BlobVersionState::Materialized { blob_hash, source },
+            state: BlobVersionState::Materialized {
+                blob_hash,
+                backend,
+                source,
+            },
             metadata: HashMap::new(),
         }
     }
@@ -718,6 +773,14 @@ impl BlobVersion {
         self.state.blob_hash()
     }
 
+    pub fn blob_backend(&self) -> Option<&BackendRef> {
+        self.state.blob_backend()
+    }
+
+    pub fn location_key(&self) -> Option<BlobLocationKey> {
+        self.state.location_key()
+    }
+
     pub fn source_binding(&self) -> Option<&VersionSourceBinding> {
         self.state.source_binding()
     }
@@ -735,6 +798,9 @@ impl BlobVersion {
 pub enum BlobVersionState {
     Materialized {
         blob_hash: [u8; 32],
+        /// Backend the write routed to. Stamped here so a read never has to
+        /// re-derive routing or guess which physical copy the object owns.
+        backend: BackendRef,
         source: Option<VersionSourceBinding>,
     },
     Reference {
@@ -749,6 +815,22 @@ impl BlobVersionState {
     pub fn blob_hash(&self) -> Option<&[u8; 32]> {
         match self {
             Self::Materialized { blob_hash, .. } => Some(blob_hash),
+            Self::Reference { .. } | Self::Deleted => None,
+        }
+    }
+
+    pub fn blob_backend(&self) -> Option<&BackendRef> {
+        match self {
+            Self::Materialized { backend, .. } => Some(backend),
+            Self::Reference { .. } | Self::Deleted => None,
+        }
+    }
+
+    pub fn location_key(&self) -> Option<BlobLocationKey> {
+        match self {
+            Self::Materialized {
+                blob_hash, backend, ..
+            } => Some(BlobLocationKey::new(*blob_hash, backend.clone())),
             Self::Reference { .. } | Self::Deleted => None,
         }
     }
@@ -1009,11 +1091,17 @@ mod tests {
         };
 
         let versions = vec![
-            BlobVersion::materialized([1u8; 32], created_at, created_by, Some(binding.clone()))
-                .with_metadata(HashMap::from([(
-                    "mtime".to_string(),
-                    "1753272000.123456789".to_string(),
-                )])),
+            BlobVersion::materialized(
+                [1u8; 32],
+                BackendRef::node_default(),
+                created_at,
+                created_by,
+                Some(binding.clone()),
+            )
+            .with_metadata(HashMap::from([(
+                "mtime".to_string(),
+                "1753272000.123456789".to_string(),
+            )])),
             BlobVersion::reference(
                 binding.clone(),
                 reference_metadata,
@@ -1029,7 +1117,13 @@ mod tests {
             assert_eq!(version, restored);
         }
 
-        let materialized = BlobVersion::materialized([1u8; 32], created_at, created_by, None);
+        let materialized = BlobVersion::materialized(
+            [1u8; 32],
+            BackendRef::node_default(),
+            created_at,
+            created_by,
+            None,
+        );
         assert_eq!(materialized.blob_hash(), Some(&[1u8; 32]));
         assert!(materialized.is_materialized());
         assert!(!materialized.is_deleted());

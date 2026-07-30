@@ -823,7 +823,7 @@ mod tests {
         AUTH_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
     use aruna_core::structs::{
-        Actor, AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo,
+        Actor, AuthContext, BackendLocation, BackendRef, BlobLocationKey, BlobVersion, BucketInfo,
         GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument, RealmId,
         SourceMetadata, VersionKey, VersionedObjectArn,
     };
@@ -983,15 +983,21 @@ mod tests {
             VersionKey::new(bucket, key, version)
                 .to_bytes()
                 .expect("version key serializes"),
-            BlobVersion::materialized(hash, SystemTime::UNIX_EPOCH, owner, None)
-                .to_bytes()
-                .expect("version serializes"),
+            BlobVersion::materialized(
+                hash,
+                BackendRef::node_default(),
+                SystemTime::UNIX_EPOCH,
+                owner,
+                None,
+            )
+            .to_bytes()
+            .expect("version serializes"),
         )
         .await;
         write_fixture(
             state,
             BLOB_LOCATIONS_KEYSPACE,
-            hash.to_vec(),
+            BlobLocationKey::new(hash, location.backend.clone()).to_bytes(),
             location.to_bytes().expect("location serializes"),
         )
         .await;

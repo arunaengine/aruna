@@ -1305,10 +1305,10 @@ mod tests {
         BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
     use aruna_core::structs::{
-        Actor, BackendLocation, BackendRef, BlobHeadKey, BlobVersion, CurrentVersionPointer, Group,
-        GroupAuthorizationDocument, NodeCapabilities, PathRestriction, PortableSourceDescriptor,
-        RealmAuthorizationDocument, RealmConfigDocument, SourceConnectorKind, SourceMetadata,
-        StagingStrategy, VersionKey, VersionSourceBinding,
+        Actor, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
+        CurrentVersionPointer, Group, GroupAuthorizationDocument, NodeCapabilities,
+        PathRestriction, PortableSourceDescriptor, RealmAuthorizationDocument, RealmConfigDocument,
+        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::replication::queue::{
@@ -1719,7 +1719,9 @@ mod tests {
         write_doc(
             &test.state.get_ctx(),
             BLOB_LOCATIONS_KEYSPACE,
-            materialized_hash.to_vec().into(),
+            BlobLocationKey::new(materialized_hash, location.backend.clone())
+                .to_bytes()
+                .into(),
             location.to_bytes().unwrap().into(),
         )
         .await;
@@ -1728,7 +1730,13 @@ mod tests {
                 &test.state.get_ctx(),
                 &test.bucket,
                 key,
-                BlobVersion::materialized(materialized_hash, UNIX_EPOCH, created_by, None),
+                BlobVersion::materialized(
+                    materialized_hash,
+                    BackendRef::node_default(),
+                    UNIX_EPOCH,
+                    created_by,
+                    None,
+                ),
             )
             .await;
         }

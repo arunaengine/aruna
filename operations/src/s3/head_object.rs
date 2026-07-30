@@ -1,3 +1,4 @@
+use crate::blob::blob_keyspace_helper::blob_location_read;
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
 };
@@ -7,14 +8,13 @@ use aruna_core::errors::{
 };
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
-    MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectSummary, SourceConnectorKind,
-    SourceMetadata, VersionKey, VersionSourceBinding,
+    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
+    CurrentVersionPointer, MultipartChecksumType, MultipartObjectMetadataKey,
+    MultipartObjectSummary, SourceConnectorKind, SourceMetadata, VersionKey, VersionSourceBinding,
 };
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -260,11 +260,13 @@ impl HeadObjectOperation {
         self.metadata = version.metadata.clone();
 
         match version.state {
-            BlobVersionState::Materialized { blob_hash, .. } => {
+            BlobVersionState::Materialized {
+                blob_hash, backend, ..
+            } => {
                 self.source_metadata = None;
                 self.last_refresh = None;
                 self.version_created_at = Some(version.created_at);
-                self.read_blob_location(blob_hash)
+                self.read_blob_location(BlobLocationKey::new(blob_hash, backend))
             }
             BlobVersionState::Deleted => self.emit_error(if explicit_version_request {
                 HeadObjectError::DeleteMarker
@@ -298,13 +300,9 @@ impl HeadObjectOperation {
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
-    fn read_blob_location(&mut self, blob_hash: [u8; 32]) -> Effects {
+    fn read_blob_location(&mut self, key: BlobLocationKey) -> Effects {
         self.state = HeadObjectState::GetBlobLocation;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-            key: blob_hash.to_vec().into(),
-            txn_id: self.txn_id,
-        })]
+        smallvec![blob_location_read(&key, self.txn_id)]
     }
 
     fn handle_blob_location_read(&mut self, event: Event) -> Effects {
@@ -632,6 +630,7 @@ mod tests {
                     .into(),
                 value: BlobVersion::materialized(
                     location.get_blake3().unwrap().try_into().unwrap(),
+                    BackendRef::node_default(),
                     location.created_at,
                     location.created_by,
                     None,
@@ -645,7 +644,13 @@ mod tests {
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                key: location.get_blake3().unwrap().to_vec().into(),
+                key: BlobLocationKey::from_blake3(
+                    location.get_blake3().unwrap(),
+                    location.backend.clone(),
+                )
+                .unwrap()
+                .to_bytes()
+                .into(),
                 value: location.to_bytes().unwrap().into(),
                 txn_id: Some(txn_id),
             })
@@ -711,6 +716,7 @@ mod tests {
         let version_id = Ulid::generate();
         let metadata = BlobVersion::materialized(
             location.get_blake3().unwrap().try_into().unwrap(),
+            BackendRef::node_default(),
             SystemTime::now(),
             Default::default(),
             None,
@@ -737,7 +743,13 @@ mod tests {
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                key: location.get_blake3().unwrap().to_vec().into(),
+                key: BlobLocationKey::from_blake3(
+                    location.get_blake3().unwrap(),
+                    location.backend.clone(),
+                )
+                .unwrap()
+                .to_bytes()
+                .into(),
                 value: location.to_bytes().unwrap().into(),
                 txn_id: Some(txn_id),
             })

@@ -2307,6 +2307,7 @@ mod tests {
         };
         let version = BlobVersion::materialized(
             [9_u8; 32],
+            BackendRef::node_default(),
             std::time::SystemTime::UNIX_EPOCH,
             created_by,
             None,
@@ -2338,9 +2339,11 @@ mod tests {
             other => panic!("expected current version pointer, got {other:?}"),
         }
 
+        let mut location_key = [9_u8; 32].to_vec();
+        location_key.extend_from_slice(&location.backend.key_bytes());
         let decoded_location = decode_entry(
             BLOB_LOCATIONS_KEYSPACE,
-            &[9_u8; 32],
+            &location_key,
             &location.to_bytes().unwrap(),
         );
         match decoded_location.value {

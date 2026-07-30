@@ -1,6 +1,6 @@
 use crate::blob::blob_keyspace_helper::{
-    HeadAliasContext, build_head_transition_effects, delete_blob_version_effect,
-    delete_hash_path_index_effect, write_blob_version_effect,
+    HeadAliasContext, blob_location_read, build_head_transition_effects,
+    delete_blob_version_effect, delete_hash_path_index_effect, write_blob_version_effect,
 };
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::usage_stats::{
@@ -10,8 +10,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
@@ -274,18 +273,14 @@ impl DeleteObjectOperation {
             Ok(version) => version,
             Err(err) => return self.emit_error(err.into()),
         };
+        let location_key = version.location_key();
         let summary = VersionSummary::from_blob_version(version_id, &version);
-        let materialized_hash = summary.materialized_hash;
         self.target_size = summary.logical_size;
         self.target_version = Some(summary);
 
-        if let Some(hash) = materialized_hash {
+        if let Some(key) = location_key {
             self.state = DeleteObjectState::ReadTargetLocation;
-            return smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                key: hash.to_vec().into(),
-                txn_id: self.txn_id,
-            })];
+            return smallvec![blob_location_read(&key, self.txn_id)];
         }
 
         self.read_all_versions()

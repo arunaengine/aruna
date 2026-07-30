@@ -4,8 +4,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
-    SourceMetadata, VersionKey,
+    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
+    CurrentVersionPointer, SourceMetadata, VersionKey,
 };
 use aruna_core::types::{Effects, Key, Value};
 use aruna_core::util::prefix_upper_bound;
@@ -492,10 +492,12 @@ impl ListObjectVersionsOperation {
                         created_at: version.created_at,
                     }));
                 }
-                BlobVersionState::Materialized { blob_hash, .. } => {
+                BlobVersionState::Materialized {
+                    blob_hash, backend, ..
+                } => {
                     location_reads.push((
                         BLOB_LOCATIONS_KEYSPACE.to_string(),
-                        blob_hash.to_vec().into(),
+                        BlobLocationKey::new(blob_hash, backend).to_bytes().into(),
                     ));
                     pending.push(PendingItem::AwaitingLocation {
                         key: key.clone(),
@@ -796,6 +798,7 @@ mod test {
             version_id,
             BlobVersion::materialized(
                 hash,
+                BackendRef::node_default(),
                 UNIX_EPOCH + Duration::from_secs(5),
                 created_by(),
                 None,
@@ -805,7 +808,9 @@ mod test {
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                key: hash.to_vec().into(),
+                key: BlobLocationKey::new(hash, BackendRef::node_default())
+                    .to_bytes()
+                    .into(),
                 value: location(hash).to_bytes().unwrap().into(),
                 txn_id: None,
             })

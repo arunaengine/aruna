@@ -3351,9 +3351,9 @@ mod tests {
         REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
     use aruna_core::structs::{
-        Actor, BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BlobVersionState,
-        CurrentVersionPointer, GroupAuthorizationDocument, NotificationClass, NotificationKind,
-        NotificationRecord, PortableSourceDescriptor, RealmAuthorizationDocument,
+        Actor, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
+        BlobVersionState, CurrentVersionPointer, GroupAuthorizationDocument, NotificationClass,
+        NotificationKind, NotificationRecord, PortableSourceDescriptor, RealmAuthorizationDocument,
         RealmConfigDocument, RealmNodeKind, SourceConnectorKind, SourceMetadata, StagingStrategy,
         VersionKey, VersionSourceBinding, WatchEventMask, WatchInterestEntry, WatchInterestTable,
     };
@@ -4168,7 +4168,13 @@ mod tests {
         created_at: SystemTime,
         blob_size: u64,
     ) {
-        let version = BlobVersion::materialized(hash, created_at, created_by, None);
+        let version = BlobVersion::materialized(
+            hash,
+            BackendRef::node_default(),
+            created_at,
+            created_by,
+            None,
+        );
         let _ = storage
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
@@ -4200,7 +4206,9 @@ mod tests {
         let _ = storage
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                key: hash.to_vec().into(),
+                key: BlobLocationKey::new(hash, location.backend.clone())
+                    .to_bytes()
+                    .into(),
                 value: location.to_bytes().unwrap().into(),
                 txn_id: None,
             })

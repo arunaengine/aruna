@@ -2199,7 +2199,7 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
     use aruna_core::structs::{
-        Actor, ArunaArn, BlobVersion, BucketInfo, BucketReplicationTarget,
+        Actor, ArunaArn, BackendRef, BlobVersion, BucketInfo, BucketReplicationTarget,
         GroupAuthorizationDocument, RealmAuthorizationDocument, RealmId, ReferenceHandling,
         SyncStatusSnapshot, VersionKey, sync_relationship_key,
     };
@@ -2487,7 +2487,13 @@ mod tests {
         key: &str,
         version_id: Ulid,
     ) {
-        let version = BlobVersion::materialized([7u8; 32], SystemTime::UNIX_EPOCH, user(), None);
+        let version = BlobVersion::materialized(
+            [7u8; 32],
+            BackendRef::node_default(),
+            SystemTime::UNIX_EPOCH,
+            user(),
+            None,
+        );
         match storage
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_VERSIONS_KEYSPACE.to_string(),

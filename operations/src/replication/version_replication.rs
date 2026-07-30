@@ -1,3 +1,4 @@
+use crate::blob::blob_keyspace_helper::blob_location_read;
 use crate::connectors::resolver::ARUNA_NATIVE_RELATIONSHIP_ID;
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
@@ -13,17 +14,18 @@ use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, St
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
     S3_MULTIPART_OBJECT_METADATA_KEYSPACE, SYNC_REFERENCE_STATE_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    ArunaArn, AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
-    CurrentVersionPointer, GroupRoutingInputs, MultipartObjectMetadataKey, MultipartObjectPart,
-    MultipartObjectSummary, PortableSourceDescriptor, ReferenceHandling, ReplicationItemKind,
-    ReplicationNegotiationResult, ReplicationSuboperationResult, ResolvedSourceAccess,
-    RoutingError, SourceConnectorKind, SourceMetadata, StagingStrategy, SyncMode, SyncRelationship,
-    VersionKey, VersionSourceBinding, sync_state_key,
+    ArunaArn, AuthContext, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion,
+    BlobVersionState, BucketInfo, CurrentVersionPointer, GroupRoutingInputs,
+    MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
+    PortableSourceDescriptor, ReferenceHandling, ReplicationItemKind, ReplicationNegotiationResult,
+    ReplicationSuboperationResult, ResolvedSourceAccess, RoutingError, SourceConnectorKind,
+    SourceMetadata, StagingStrategy, SyncMode, SyncRelationship, VersionKey, VersionSourceBinding,
+    sync_state_key,
 };
 use aruna_core::structs::{NodeRouting, StorageRoutingRule, resolve_backend};
 use aruna_core::types::{Effects, GroupId, Key, NodeId};
@@ -900,13 +902,9 @@ impl ReplicateObjectVersionOperation {
         })]
     }
 
-    fn read_blob_location(&mut self, blob_hash: [u8; 32]) -> Effects {
+    fn read_blob_location(&mut self, key: BlobLocationKey) -> Effects {
         self.state = ReplicateObjectVersionState::ReadBlobLocation;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-            key: blob_hash.to_vec().into(),
-            txn_id: None,
-        })]
+        smallvec![blob_location_read(&key, None)]
     }
 
     fn read_multipart_summary(&mut self) -> Effects {
@@ -1664,7 +1662,11 @@ impl Operation for ReplicateObjectVersionOperation {
                 } = version;
 
                 match state {
-                    BlobVersionState::Materialized { blob_hash, source } => {
+                    BlobVersionState::Materialized {
+                        blob_hash,
+                        backend,
+                        source,
+                    } => {
                         self.pending_materialized_version =
                             Some(PendingMaterializedReplicationVersion {
                                 created_at,
@@ -1673,7 +1675,7 @@ impl Operation for ReplicateObjectVersionOperation {
                                 source,
                                 metadata,
                             });
-                        self.read_blob_location(blob_hash)
+                        self.read_blob_location(BlobLocationKey::new(blob_hash, backend))
                     }
                     BlobVersionState::Deleted => {
                         self.pending_materialized_version = None;
@@ -2206,6 +2208,7 @@ mod tests {
     ) -> BlobVersion {
         BlobVersion::materialized(
             location.get_blake3().unwrap().try_into().unwrap(),
+            BackendRef::node_default(),
             location.created_at,
             location.created_by,
             source,
