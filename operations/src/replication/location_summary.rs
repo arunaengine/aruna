@@ -601,12 +601,14 @@ enum QueuedState {
     Error,
 }
 
-/// Nodes with a queued replication job, plus whether the scan hit its page cap
-/// before the keyspace ended. A truncated answer may be missing queued copies.
+/// Nodes with a queued replication job, plus what the scan could not see: a
+/// page cap reached before the keyspace ended, and records that would not
+/// decode. Either one means a queued copy may be missing from `nodes`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QueuedReplicas {
     pub nodes: BTreeSet<NodeId>,
     pub truncated: bool,
+    pub skipped: usize,
 }
 
 /// Collects nodes with a queued replication job for one version. They are the
@@ -696,6 +698,7 @@ impl Operation for QueuedReplicaNodesOperation {
                 };
                 for (_, value) in values {
                     let Ok(record) = BlobReplicationJobRecord::from_bytes(value.as_ref()) else {
+                        self.found.skipped = self.found.skipped.saturating_add(1);
                         continue;
                     };
                     if self.covers(&record.input) {
@@ -992,6 +995,27 @@ mod tests {
         assert_eq!(queued.nodes.len(), 1);
         assert!(queued.nodes.contains(&wanted));
         assert!(!queued.truncated);
+    }
+
+    #[test]
+    fn counts_skipped_records() {
+        // A record that will not decode may name a node; the scan is then not
+        // an exhaustive answer and must say so.
+        let mut operation = QueuedReplicaNodesOperation::new(
+            "raw".to_string(),
+            "run1.tar".to_string(),
+            Ulid::from_bytes([3u8; 16]),
+        );
+        operation.start();
+
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![(b"a".to_vec().into(), vec![0xffu8; 8].into())],
+            next_start_after: None,
+        }));
+
+        let queued = operation.finalize().unwrap();
+        assert_eq!(queued.skipped, 1);
+        assert!(queued.nodes.is_empty());
     }
 
     #[test]

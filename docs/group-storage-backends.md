@@ -100,7 +100,8 @@ current version.
     { "node_id": "9f01...", "local": false, "state": "pending",
       "storage": null, "storage_class": null,
       "group_backend_id": null, "group_backend_name": null }
-  ]
+  ],
+  "complete": true, "limits": []
 }
 ```
 
@@ -121,6 +122,20 @@ question asked; READ on the destination bucket is what gets it answered. A
 caller without it sees the node listed as `denied` and learns nothing else
 about it, not even whether a copy exists there. Ask a destination-bucket
 reader, or have the destination bucket's admin grant you READ.
+
+`complete` is the honesty flag. It is true only when every node that could
+hold a copy was enumerated and asked. When it is false, `limits` names each
+reason, and a node absent from `copies` may still hold a copy:
+
+- `queued-scan-truncated`: the queued-replication scan hit its page cap.
+- `queued-scan-failed`: that scan failed, so no queued copy is known at all.
+- `queued-record-unreadable`: some queued job records would not decode.
+- `candidate-cap-reached`: more nodes than one request asks were candidates.
+
+The whole request is bounded: at most 64 nodes are asked, no peer is waited on
+for more than 5 seconds, and the fan-out as a whole is abandoned after 30
+seconds, with any peer not answered by then reported as `unreachable`. The
+local entry is computed first and never waits on a remote node.
 
 Node-managed copies report their storage class, not the operator's backend
 name. Group-backend copies report the backend's id and name, because that copy

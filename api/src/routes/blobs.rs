@@ -7,7 +7,7 @@ use aruna_core::structs::{
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::replication::location_summary::{
-    LocationSummaryError, LocationSummaryOperation, QueuedReplicaNodesOperation,
+    LocationSummaryError, LocationSummaryOperation, QueuedReplicaNodesOperation, QueuedReplicas,
     RemoteLocationSummaryOperation,
 };
 use aruna_operations::replication::protocol::{
@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout_at};
 use tracing::warn;
 use utoipa::{OpenApi, ToSchema};
 
@@ -49,6 +49,11 @@ pub fn router() -> Router<Arc<ServerState>> {
 /// small; the deadline keeps an offline target from holding the answer.
 const LOCATION_FANOUT_LIMIT: usize = 8;
 const LOCATION_SUMMARY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Ceilings on the whole request. The queued scan alone can name far more
+/// nodes than a caller will wait for, so the request bounds its own work
+/// rather than trusting the candidate list to stay small.
+const LOCATION_CANDIDATE_LIMIT: usize = 64;
+const LOCATION_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReplicateBlobRequest {
@@ -231,15 +236,31 @@ pub struct BlobCopyResponse {
     pub group_backend_name: Option<String>,
 }
 
+/// Why an answer could not cover every node that might hold a copy.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocationScanLimit {
+    /// The queued-replication scan hit its page cap before the keyspace ended.
+    QueuedScanTruncated,
+    /// The queued-replication scan itself failed, so no queued copy is known.
+    QueuedScanFailed,
+    /// Queued job records could not be decoded and were skipped.
+    QueuedRecordUnreadable,
+    /// More candidate nodes than one request asks; the rest were not asked.
+    CandidateCapReached,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BlobLocationsResponse {
     pub bucket: String,
     pub key: String,
     pub version_id: String,
     pub copies: Vec<BlobCopyResponse>,
-    /// The queued-replication scan hit its page cap, so a queued copy may be
-    /// missing from `copies` rather than genuinely absent.
-    pub queued_truncated: bool,
+    /// Every node that might hold a copy was enumerated and asked. When false,
+    /// a copy may be missing from `copies` rather than genuinely absent.
+    pub complete: bool,
+    /// What stopped the search from covering everything; empty when `complete`.
+    pub limits: Vec<LocationScanLimit>,
 }
 
 fn pending_copy(node_id: NodeId, state: BlobCopyState) -> BlobCopyResponse {
@@ -364,23 +385,37 @@ pub async fn blob_locations(
     };
 
     let mut copies = vec![copy_response(local_node, true, local)];
+    let mut limits = Vec::new();
     let mut candidates = BTreeMap::new();
+    let mut capped = false;
     for target in bucket_info
         .replication
         .iter()
         .flat_map(|config| config.targets.iter())
         .filter(|target| target.node_id != local_node)
     {
-        candidates.insert(target.node_id, target.bucket.clone());
+        capped |= !add_candidate(&mut candidates, target.node_id, &target.bucket);
     }
-    let queued = drive(
+    let queued = match drive(
         QueuedReplicaNodesOperation::new(query.bucket.clone(), query.path.clone(), resolved),
         ctx.as_ref(),
     )
     .await
-    .unwrap_or_default();
+    {
+        Ok(queued) => queued,
+        Err(error) => {
+            warn!(
+                bucket = %query.bucket,
+                key = %query.path,
+                error = %error,
+                "Queued replication scan failed; queued copies are unknown"
+            );
+            limits.push(LocationScanLimit::QueuedScanFailed);
+            QueuedReplicas::default()
+        }
+    };
     for node_id in queued.nodes.iter().filter(|node| **node != local_node) {
-        candidates.entry(*node_id).or_insert(query.bucket.clone());
+        capped |= !add_candidate(&mut candidates, *node_id, &query.bucket);
     }
     if queued.truncated {
         warn!(
@@ -388,8 +423,29 @@ pub async fn blob_locations(
             key = %query.path,
             "Queued replication scan hit its page cap; queued copies may be missing"
         );
+        limits.push(LocationScanLimit::QueuedScanTruncated);
+    }
+    if queued.skipped > 0 {
+        warn!(
+            bucket = %query.bucket,
+            key = %query.path,
+            skipped = queued.skipped,
+            "Queued replication records could not be decoded"
+        );
+        limits.push(LocationScanLimit::QueuedRecordUnreadable);
+    }
+    if capped {
+        warn!(
+            bucket = %query.bucket,
+            key = %query.path,
+            "More candidate nodes than the per-request cap; some were not asked"
+        );
+        limits.push(LocationScanLimit::CandidateCapReached);
     }
 
+    // One deadline for the whole fan-out, so a wall of stalled peers costs the
+    // caller the deadline rather than the deadline times the candidate count.
+    let deadline = Instant::now() + LOCATION_REQUEST_DEADLINE;
     let answers = stream::iter(candidates.into_iter().map(|(node_id, bucket)| {
         let request = LocationSummaryRequest {
             bucket,
@@ -398,8 +454,8 @@ pub async fn blob_locations(
         };
         let ctx = ctx.clone();
         async move {
-            let answer = timeout(
-                LOCATION_SUMMARY_TIMEOUT,
+            let answer = timeout_at(
+                deadline.min(Instant::now() + LOCATION_SUMMARY_TIMEOUT),
                 drive(
                     RemoteLocationSummaryOperation::new(node_id, request),
                     ctx.as_ref(),
@@ -436,8 +492,22 @@ pub async fn blob_locations(
         key: query.path,
         version_id: resolved.to_string(),
         copies,
-        queued_truncated: queued.truncated,
+        complete: limits.is_empty(),
+        limits,
     }))
+}
+
+/// Adds a candidate node unless the request is already at its cap. `false`
+/// means the node was dropped, which the answer has to admit.
+fn add_candidate(candidates: &mut BTreeMap<NodeId, String>, node: NodeId, bucket: &str) -> bool {
+    if candidates.contains_key(&node) {
+        return true;
+    }
+    if candidates.len() >= LOCATION_CANDIDATE_LIMIT {
+        return false;
+    }
+    candidates.insert(node, bucket.to_string());
+    true
 }
 
 #[cfg(test)]
@@ -510,6 +580,23 @@ mod tests {
     }
 
     #[test]
+    fn caps_candidates() {
+        // Past the cap a node is dropped, and the caller has to be told.
+        let mut candidates = std::collections::BTreeMap::new();
+        for seed in 0..super::LOCATION_CANDIDATE_LIMIT {
+            let node = iroh::SecretKey::from_bytes(&[seed as u8 + 1; 32]).public();
+            assert!(super::add_candidate(&mut candidates, node, "raw"));
+        }
+
+        let extra = iroh::SecretKey::from_bytes(&[0u8; 32]).public();
+        assert!(!super::add_candidate(&mut candidates, extra, "raw"));
+        assert_eq!(candidates.len(), super::LOCATION_CANDIDATE_LIMIT);
+
+        let known = *candidates.keys().next().unwrap();
+        assert!(super::add_candidate(&mut candidates, known, "raw"));
+    }
+
+    #[test]
     fn openapi_lists_locations() {
         let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
 
@@ -517,6 +604,11 @@ mod tests {
         assert!(
             openapi["components"]["schemas"]["BlobCopyResponse"]["properties"]
                 .get("state")
+                .is_some()
+        );
+        assert!(
+            openapi["components"]["schemas"]["BlobLocationsResponse"]["properties"]
+                .get("complete")
                 .is_some()
         );
     }
