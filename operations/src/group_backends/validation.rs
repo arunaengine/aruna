@@ -1,4 +1,4 @@
-use aruna_core::structs::{GroupBackendKind, ensure_confined_relative_path};
+use aruna_core::structs::{GroupBackendKind, GroupStorageBackend, ensure_confined_relative_path};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use thiserror::Error;
@@ -44,6 +44,8 @@ pub enum GroupBackendError {
     UnsafeRoot(String),
     #[error("`force_path_style` must be `true` or `false`")]
     InvalidBool,
+    #[error("`{0}` is fixed after create; register a new backend instead")]
+    Immutable(String),
 }
 
 /// The normalized, storable configs: keys lowercased so the record matches what
@@ -52,6 +54,36 @@ pub enum GroupBackendError {
 pub struct NormalizedConfig {
     pub public: HashMap<String, String>,
     pub secret: HashMap<String, String>,
+}
+
+/// Keys that name the physical store. Stored locations record neither the kind
+/// nor the endpoint, so changing one of these would silently redirect every
+/// object already stamped with the backend.
+const fn identity_keys(kind: GroupBackendKind) -> &'static [&'static str] {
+    match kind {
+        GroupBackendKind::S3 | GroupBackendKind::Gcs => &["endpoint", "bucket"],
+        GroupBackendKind::Azblob => &["endpoint", "container", "account_name"],
+        GroupBackendKind::Azdls => &["endpoint", "filesystem", "account_name"],
+        GroupBackendKind::B2 => &["bucket", "bucket_id"],
+    }
+}
+
+/// Replacement rotates credentials and the name only; the store it points at
+/// must stay the one the existing objects were written to.
+pub fn check_identity(
+    existing: &GroupStorageBackend,
+    kind: GroupBackendKind,
+    public: &HashMap<String, String>,
+) -> Result<(), GroupBackendError> {
+    if existing.kind != kind {
+        return Err(GroupBackendError::Immutable("type".to_string()));
+    }
+    for key in identity_keys(kind) {
+        if existing.public_config.get(*key) != public.get(*key) {
+            return Err(GroupBackendError::Immutable((*key).to_string()));
+        }
+    }
+    Ok(())
 }
 
 pub const fn rules_for_kind(kind: GroupBackendKind) -> GroupBackendRules {

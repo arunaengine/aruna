@@ -1,5 +1,5 @@
 use super::create::{CreateGroupBackendError, CreateGroupBackendInput};
-use super::validation::validate_backend_input;
+use super::validation::{check_identity, validate_backend_input};
 use super::{backend_key, parse_read};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -23,8 +23,9 @@ enum ReplaceState {
     Error,
 }
 
-/// Replaces a tenant backend in place. The id survives, so credentials rotate
-/// without stranding the objects already stamped with this backend.
+/// Rotates a tenant backend's credentials and name in place. The id and the
+/// store it names both survive, so the objects already stamped with this
+/// backend keep resolving.
 #[derive(Debug, PartialEq)]
 pub struct ReplaceGroupBackendOperation {
     input: CreateGroupBackendInput,
@@ -69,6 +70,9 @@ impl ReplaceGroupBackendOperation {
             Ok(normalized) => normalized,
             Err(error) => return self.fail(error.into()),
         };
+        if let Err(error) = check_identity(&existing, self.input.kind, &normalized.public) {
+            return self.fail(error.into());
+        }
 
         let now = SystemTime::now();
         let record = GroupStorageBackend {
@@ -197,6 +201,7 @@ impl Operation for ReplaceGroupBackendOperation {
 mod tests {
     use super::ReplaceGroupBackendOperation;
     use crate::group_backends::create::{CreateGroupBackendError, CreateGroupBackendInput};
+    use crate::group_backends::validation::GroupBackendError;
     use aruna_core::effects::{BlobEffect, Effect};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::operation::Operation;
@@ -228,11 +233,29 @@ mod tests {
             group_id,
             name: "old".to_string(),
             kind: GroupBackendKind::S3,
-            public_config: HashMap::new(),
+            public_config: HashMap::from([
+                ("endpoint".to_string(), "https://s3.example.com".to_string()),
+                ("bucket".to_string(), "data".to_string()),
+            ]),
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::default(),
         }
+    }
+
+    fn refuse(input: CreateGroupBackendInput) -> CreateGroupBackendError {
+        let group_id = input.group_id;
+        let backend_id = Ulid::from_bytes([9u8; 16]);
+        let mut operation = ReplaceGroupBackendOperation::new(backend_id, input);
+        operation.start();
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(existing(group_id, backend_id).to_bytes().unwrap().into()),
+        }));
+
+        assert!(effects.is_empty(), "expected no probe, got {effects:?}");
+        operation.finalize().unwrap_err()
     }
 
     #[test]
@@ -261,6 +284,29 @@ mod tests {
             entries: Vec::new(),
         }));
         assert_eq!(operation.finalize().unwrap().name, "rotated");
+    }
+
+    #[test]
+    fn refuses_moved_store() {
+        // Stored locations carry neither kind nor endpoint, so both are frozen.
+        let group_id = Ulid::from_bytes([1u8; 16]);
+        let mut moved = input(group_id);
+        moved
+            .public_config
+            .insert("bucket".to_string(), "elsewhere".to_string());
+        assert_eq!(
+            refuse(moved),
+            CreateGroupBackendError::Invalid(GroupBackendError::Immutable("bucket".to_string()))
+        );
+
+        let mut retyped = input(group_id);
+        retyped.kind = GroupBackendKind::Gcs;
+        retyped.public_config = HashMap::from([("bucket".to_string(), "data".to_string())]);
+        retyped.secret_config = HashMap::from([("credential".to_string(), "token".to_string())]);
+        assert_eq!(
+            refuse(retyped),
+            CreateGroupBackendError::Invalid(GroupBackendError::Immutable("type".to_string()))
+        );
     }
 
     #[test]

@@ -69,6 +69,14 @@ across every supported provider.
 Bytes on a group backend still count against the group's quota in this
 release.
 
+## Rotating credentials
+
+`PUT /groups/{group_id}/storage-backends/{backend_id}` replaces the stored
+credentials and the display name. The backend type and the keys that name the
+store, such as `endpoint` and `bucket`, are fixed after create and a request
+that changes one is refused with 400: stored objects record neither, so the
+change would silently redirect them. Register a second backend to move data.
+
 ## Deleting a backend
 
 `DELETE /groups/{group_id}/storage-backends/{backend_id}` removes the record

@@ -229,8 +229,12 @@ pub async fn get_group_backend(
     ),
     request_body = CreateGroupBackendRequest,
     responses(
-        (status = 200, description = "Backend replaced", body = GroupBackendResponse),
-        (status = 400, description = "Invalid or unreachable backend", body = ErrorResponse),
+        (status = 200, description = "Credentials rotated", body = GroupBackendResponse),
+        (
+            status = 400,
+            description = "Invalid, unreachable, or store-changing backend",
+            body = ErrorResponse
+        ),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Backend not found", body = ErrorResponse)
