@@ -7,6 +7,7 @@ use super::{
     },
 };
 use crate::messages::{MessageType, ReplicationMessage};
+use crate::s3::make_bucket;
 use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{BlobEffect, StagingSourceEffect, StorageEffect};
@@ -17,9 +18,9 @@ use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB, HASH_PATHS
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::{
-    Backend, BackendConfig, BackendLocation, BackendRef, BlobTimeoutConfig, HiddenBlobKey,
-    MultipartUploadPartKey, RealmId, ResolvedBackend, ResolvedSourceAccess, SourceConnectorKind,
-    Status,
+    Backend, BackendConfig, BackendLocation, BackendRef, BlobTimeoutConfig, GroupBackendKind,
+    HiddenBlobKey, MultipartUploadPartKey, RealmId, ResolvedBackend, ResolvedSourceAccess,
+    SourceConnectorKind, Status,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::storage;
@@ -1686,4 +1687,258 @@ async fn reservation_forces_rollover() {
             1
         );
     }
+}
+
+/// Coverage against a real S3 endpoint. Every test returns early when the
+/// endpoint variables are unset, so the default lane stays filesystem-only.
+struct S3Env {
+    endpoint: String,
+    access_key: String,
+    secret_key: String,
+    region: String,
+}
+
+fn s3_env() -> Option<S3Env> {
+    Some(S3Env {
+        endpoint: std::env::var("ARUNA_TEST_S3_ENDPOINT").ok()?,
+        access_key: std::env::var("ARUNA_TEST_S3_ACCESS_KEY").ok()?,
+        secret_key: std::env::var("ARUNA_TEST_S3_SECRET_KEY").ok()?,
+        region: std::env::var("ARUNA_TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
+    })
+}
+
+fn s3_config(env: &S3Env, bucket: Option<&str>) -> HashMap<String, String> {
+    let mut config = HashMap::from([
+        ("endpoint".to_string(), env.endpoint.clone()),
+        ("region".to_string(), env.region.clone()),
+        ("access_key_id".to_string(), env.access_key.clone()),
+        ("secret_access_key".to_string(), env.secret_key.clone()),
+        ("force_path_style".to_string(), "true".to_string()),
+    ]);
+    if let Some(bucket) = bucket {
+        config.insert("bucket".to_string(), bucket.to_string());
+    }
+    config
+}
+
+fn unique_name(prefix: &str) -> String {
+    format!("{prefix}{}", Ulid::generate().to_string().to_lowercase())
+}
+
+/// A filesystem default plus an S3 `cold` backend, so one handler covers mixed
+/// routing without a second fixture.
+async fn setup_s3_mixed(env: &S3Env) -> TestContext {
+    let temp_dir = tempdir().unwrap();
+    let temp_root = temp_dir.path().to_str().unwrap().to_string();
+    let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
+    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+        .await
+        .unwrap();
+    let mut backends = std::collections::BTreeMap::new();
+    backends.insert(
+        "default".to_string(),
+        std::sync::Arc::new(NodeBackend::new(
+            filesystem_backend(&format!("{temp_root}/hot"), "hot-", "hot-parts"),
+            None,
+        )),
+    );
+    backends.insert(
+        "cold".to_string(),
+        std::sync::Arc::new(NodeBackend::new(
+            BackendConfig {
+                backend_type: Backend::S3,
+                root: String::new(),
+                service_config: s3_config(env, None),
+                bucket_prefix: Some(unique_name("aruna-cold-")),
+                max_bucket_size: None,
+                multipart_bucket: Some(unique_name("aruna-parts-")),
+                timeouts: Default::default(),
+            },
+            Some("cold".to_string()),
+        )),
+    );
+    let registry = BackendRegistry::new(backends, "default".to_string()).unwrap();
+    let blob_handle = BlobHandler::with_registry(
+        registry,
+        storage_handle.clone(),
+        net_handle,
+        EgressPolicy::loopback(),
+    )
+    .await
+    .unwrap();
+
+    TestContext {
+        _temp_dir: temp_dir,
+        blob_handle,
+        storage_handle,
+    }
+}
+
+#[tokio::test]
+async fn s3_roundtrip_and_range() {
+    let Some(env) = s3_env() else { return };
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+
+    let BlobEvent::WriteFinished { location } = handler
+        .write_blob(
+            "bucket",
+            "object.bin",
+            cold_backend(),
+            test_user_id(),
+            stream_from_bytes(b"0123456789"),
+        )
+        .await
+    else {
+        panic!("s3 write failed")
+    };
+
+    assert_eq!(location.backend, BackendRef::Node("cold".to_string()));
+    assert_eq!(read_back(&handler, location.clone()).await, b"0123456789");
+
+    let BlobEvent::ReadFinished { blob, .. } =
+        handler.read_blob_range(location.clone(), 2..5).await
+    else {
+        panic!("s3 range read failed")
+    };
+    let chunks: Vec<bytes::Bytes> = blob.try_collect().await.unwrap();
+    assert_eq!(chunks.concat(), b"234");
+
+    assert!(matches!(
+        handler.delete_blob(location.clone()).await,
+        BlobEvent::DeleteFinished
+    ));
+    // S3 readers open lazily, so absence surfaces either now or while draining.
+    let gone = match handler.read_blob(location).await {
+        BlobEvent::Error(_) => true,
+        BlobEvent::ReadFinished { blob, .. } => {
+            blob.try_collect::<Vec<bytes::Bytes>>().await.is_err()
+        }
+        other => panic!("unexpected read event {other:?}"),
+    };
+    assert!(gone, "deleted object must not be readable");
+}
+
+#[tokio::test]
+async fn s3_multipart_compose() {
+    let Some(env) = s3_env() else { return };
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let upload_id = Ulid::generate();
+
+    let mut parts = Vec::new();
+    for (number, payload) in [(1u16, b"first-".to_vec()), (2, b"second".to_vec())] {
+        let BlobEvent::WriteFinished { location } = handler
+            .write_blob_part(
+                MultipartUploadPartKey::new(upload_id, number),
+                cold_backend(),
+                test_user_id(),
+                false,
+                false,
+                stream_from_bytes(&payload),
+            )
+            .await
+        else {
+            panic!("s3 part write failed")
+        };
+        assert!(location.backend_path.starts_with("_parts/"));
+        parts.push(location);
+    }
+
+    let BlobEvent::WriteFinished { location } = handler
+        .compose_blob(
+            "bucket",
+            "composed.bin",
+            cold_backend(),
+            test_user_id(),
+            parts,
+        )
+        .await
+    else {
+        panic!("s3 compose failed")
+    };
+
+    assert_eq!(read_back(&handler, location).await, b"first-second");
+}
+
+#[tokio::test]
+async fn s3_serves_group_backend() {
+    // The tenant endpoint path: MinIO stands in for a group-owned store.
+    let Some(env) = s3_env() else { return };
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let bucket = unique_name("tenant-");
+    make_bucket(&bucket, &s3_config(&env, None)).await.unwrap();
+
+    let backend_id = Ulid::generate();
+    context.blob_handle.handler.registry.insert_group(
+        backend_id,
+        NodeBackend::new(
+            BackendConfig {
+                backend_type: Backend::Group(GroupBackendKind::S3),
+                root: String::new(),
+                service_config: s3_config(&env, Some(&bucket)),
+                bucket_prefix: None,
+                max_bucket_size: None,
+                multipart_bucket: Some(bucket.clone()),
+                timeouts: Default::default(),
+            },
+            None,
+        ),
+    );
+
+    let resolved = ResolvedBackend::new(BackendRef::Group(backend_id), None);
+    let BlobEvent::WriteFinished { location } = handler
+        .write_blob(
+            "bucket",
+            "tenant.bin",
+            resolved,
+            test_user_id(),
+            stream_from_bytes(b"tenant bytes"),
+        )
+        .await
+    else {
+        panic!("group backend write failed")
+    };
+
+    assert_eq!(location.backend, BackendRef::Group(backend_id));
+    assert_eq!(location.storage_bucket, bucket);
+    assert_eq!(read_back(&handler, location).await, b"tenant bytes");
+}
+
+#[tokio::test]
+async fn s3_and_fs_route_apart() {
+    let Some(env) = s3_env() else { return };
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+
+    let BlobEvent::WriteFinished { location: hot } = handler
+        .write_blob(
+            "bucket",
+            "hot.bin",
+            ResolvedBackend::node_default(),
+            test_user_id(),
+            stream_from_bytes(b"hot"),
+        )
+        .await
+    else {
+        panic!("filesystem write failed")
+    };
+    let BlobEvent::WriteFinished { location: cold } = handler
+        .write_blob(
+            "bucket",
+            "cold.bin",
+            cold_backend(),
+            test_user_id(),
+            stream_from_bytes(b"cold"),
+        )
+        .await
+    else {
+        panic!("s3 write failed")
+    };
+
+    assert_eq!(hot.backend, BackendRef::node_default());
+    assert_eq!(cold.backend, BackendRef::Node("cold".to_string()));
+    assert_eq!(read_back(&handler, hot).await, b"hot");
+    assert_eq!(read_back(&handler, cold).await, b"cold");
 }
