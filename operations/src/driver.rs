@@ -4,13 +4,10 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, NetEvent, SubOperationEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{
-    GROUP_STORAGE_ROUTING_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
-};
+use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::{Operation, SubOperation};
 use aruna_core::structs::{
-    BucketInfo, GroupStorageRouting, NodeRouting, RoutingSnapshot, RoutingTarget,
-    StorageRoutingRule,
+    BucketInfo, GroupRoutingInputs, NodeRouting, RoutingSnapshot, StorageRoutingRule,
 };
 use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
@@ -22,6 +19,7 @@ use std::future::Future;
 use std::pin::Pin;
 use tracing::{Instrument, debug, debug_span, error, trace, warn};
 
+use crate::group_routing::GroupRoutingInputsOperation;
 use crate::metadata::MetadataHandle;
 use crate::task_persistence::persist_task_effect;
 use aruna_core::events::NetError;
@@ -39,15 +37,15 @@ pub fn node_routing(context: &DriverContext) -> NodeRouting {
         .unwrap_or_default()
 }
 
-/// The group's default write target. A read failure leaves the group default
-/// unset, so the write still lands on the node default instead of failing.
-async fn group_default(context: &DriverContext, group_id: GroupId) -> Option<RoutingTarget> {
-    let event = read_record(context, GROUP_STORAGE_ROUTING_KEYSPACE, group_id.to_bytes()).await?;
-    match GroupStorageRouting::from_bytes(event.as_ref()) {
-        Ok(record) => record.default_target,
+/// The group's default target plus the ids of the backends it registered. A
+/// read failure leaves both unset, so the write still lands on the node default
+/// instead of failing. Only the named group's ids are ever loaded.
+async fn group_inputs(context: &DriverContext, group_id: GroupId) -> GroupRoutingInputs {
+    match drive(GroupRoutingInputsOperation::new(group_id), context).await {
+        Ok(inputs) => inputs,
         Err(error) => {
-            warn!(error = %error, group_id = %group_id, "Failed to decode group storage routing");
-            None
+            warn!(error = %error, group_id = %group_id, "Failed to load group routing inputs");
+            GroupRoutingInputs::default()
         }
     }
 }
@@ -97,7 +95,7 @@ pub async fn routing_snapshot(
 ) -> RoutingSnapshot {
     node_routing(context)
         .snapshot(group_id)
-        .with_group_default(group_default(context, group_id).await)
+        .with_group_inputs(group_inputs(context, group_id).await)
         .with_bucket_rules(bucket_rules(context, bucket).await)
 }
 
@@ -106,7 +104,7 @@ pub async fn routing_snapshot(
 pub async fn bucket_snapshot(context: &DriverContext, bucket: &BucketInfo) -> RoutingSnapshot {
     node_routing(context)
         .snapshot(bucket.group_id)
-        .with_group_default(group_default(context, bucket.group_id).await)
+        .with_group_inputs(group_inputs(context, bucket.group_id).await)
         .with_bucket_rules(bucket.storage_routing.clone())
 }
 
@@ -890,5 +888,130 @@ mod test {
             Event::SubOperation(SubOperationEvent::DepthLimitExceeded { max_depth })
                 if max_depth == super::MAX_SUBOP_DEPTH
         ));
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::{DriverContext, bucket_snapshot, routing_snapshot};
+    use crate::staging::test_utils::setup_driver_context;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{GROUP_STORAGE_BACKEND_KEYSPACE, GROUP_STORAGE_ROUTING_KEYSPACE};
+    use aruna_core::structs::{
+        BackendRef, BucketInfo, GroupBackendKind, GroupStorageBackend, GroupStorageRouting,
+        ResolvedBackend, RoutingTarget, resolve_backend,
+    };
+    use std::collections::HashMap;
+    use std::time::SystemTime;
+    use ulid::Ulid;
+
+    async fn write(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key: key.into(),
+                value: value.into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    async fn register(context: &DriverContext, group_id: Ulid) -> Ulid {
+        let record = GroupStorageBackend {
+            backend_id: Ulid::generate(),
+            group_id,
+            name: "tenant".to_string(),
+            kind: GroupBackendKind::S3,
+            public_config: HashMap::new(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+        };
+        write(
+            context,
+            GROUP_STORAGE_BACKEND_KEYSPACE,
+            record.backend_id.to_bytes().to_vec(),
+            record.to_bytes().unwrap(),
+        )
+        .await;
+        record.backend_id
+    }
+
+    async fn set_default(context: &DriverContext, group_id: Ulid, backend_id: Ulid) {
+        let record = GroupStorageRouting {
+            group_id,
+            default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
+            updated_at: SystemTime::UNIX_EPOCH,
+            updated_by: Default::default(),
+        };
+        write(
+            context,
+            GROUP_STORAGE_ROUTING_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            record.to_bytes().unwrap(),
+        )
+        .await;
+    }
+
+    fn bucket(group_id: Ulid) -> BucketInfo {
+        BucketInfo {
+            group_id,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            replication: None,
+            storage_routing: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn routes_group_backend() {
+        // The catalog is built the way production builds it, so a group default
+        // naming a registered backend has to resolve rather than fail.
+        let test = setup_driver_context().await;
+        let group_id = Ulid::generate();
+        let backend_id = register(&test.driver_context, group_id).await;
+        set_default(&test.driver_context, group_id, backend_id).await;
+
+        let snapshot = routing_snapshot(&test.driver_context, group_id, "b").await;
+
+        assert_eq!(
+            resolve_backend(&snapshot, "b", "k").unwrap(),
+            ResolvedBackend::new(BackendRef::Group(backend_id), None)
+        );
+    }
+
+    #[tokio::test]
+    async fn scopes_catalog_to_group() {
+        // Another group's backend must never enter this group's catalog.
+        let test = setup_driver_context().await;
+        let group_id = Ulid::generate();
+        let foreign = register(&test.driver_context, Ulid::generate()).await;
+        set_default(&test.driver_context, group_id, foreign).await;
+
+        let snapshot = routing_snapshot(&test.driver_context, group_id, "b").await;
+
+        assert!(resolve_backend(&snapshot, "b", "k").is_err());
+    }
+
+    #[tokio::test]
+    async fn bucket_snapshot_loads_group() {
+        let test = setup_driver_context().await;
+        let group_id = Ulid::generate();
+        let backend_id = register(&test.driver_context, group_id).await;
+        set_default(&test.driver_context, group_id, backend_id).await;
+
+        let snapshot = bucket_snapshot(&test.driver_context, &bucket(group_id)).await;
+
+        assert_eq!(
+            resolve_backend(&snapshot, "b", "k").unwrap(),
+            ResolvedBackend::new(BackendRef::Group(backend_id), None)
+        );
     }
 }

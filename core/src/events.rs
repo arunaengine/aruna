@@ -2,8 +2,8 @@ use crate::errors::{BlobError, SourceConnectorResolutionError, StagingSourceErro
 use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::{
-    BackendLocation, HiddenBlobEntry, RealmId, ReplicationSuboperationResult, ResolvedSourceAccess,
-    ResolvedSourceConnector, SourceEntry, SourceMetadata,
+    BackendLocation, GroupRoutingInputs, HiddenBlobEntry, RealmId, ReplicationSuboperationResult,
+    ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry, SourceMetadata,
 };
 use crate::{
     document::DocumentSyncNetEvent,
@@ -59,6 +59,9 @@ pub enum SubOperationEvent {
     },
     BucketCreated {
         result: Result<(), String>,
+    },
+    GroupRoutingLoaded {
+        result: Result<GroupRoutingInputs, String>,
     },
     NotificationsEmitted,
 }

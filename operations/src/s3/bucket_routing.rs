@@ -1,16 +1,18 @@
+use crate::group_routing::load_group_inputs;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{BucketInfo, RoutingError, StorageRoutingRule, validate_tenant_rules};
-use aruna_core::types::{Effects, Key};
+use aruna_core::types::{Effects, GroupId, Key};
 use smallvec::smallvec;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PutBucketRoutingState {
     Init,
+    LoadInputs,
     StartTransaction,
     ReadBucket,
     WriteBucket,
@@ -29,6 +31,10 @@ pub enum PutBucketRoutingError {
     InvalidRules(#[from] RoutingError),
     #[error("The specified bucket does not exist.")]
     NoSuchBucket,
+    #[error("could not load the group's storage backends: {0}")]
+    InputsUnavailable(String),
+    #[error("The bucket changed owner while the rules were written")]
+    GroupMismatch,
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]
@@ -42,6 +48,7 @@ pub enum PutBucketRoutingError {
 #[derive(Debug, PartialEq)]
 pub struct PutBucketRoutingOperation {
     bucket: String,
+    group_id: GroupId,
     rules: Vec<StorageRoutingRule>,
     state: PutBucketRoutingState,
     txn_id: Option<ulid::Ulid>,
@@ -49,9 +56,10 @@ pub struct PutBucketRoutingOperation {
 }
 
 impl PutBucketRoutingOperation {
-    pub fn new(bucket: String, rules: Vec<StorageRoutingRule>) -> Self {
+    pub fn new(bucket: String, group_id: GroupId, rules: Vec<StorageRoutingRule>) -> Self {
         Self {
             bucket,
+            group_id,
             rules,
             state: PutBucketRoutingState::Init,
             txn_id: None,
@@ -72,6 +80,7 @@ impl PutBucketRoutingOperation {
     fn state_name(&self) -> &'static str {
         match self.state {
             PutBucketRoutingState::Init => "Init",
+            PutBucketRoutingState::LoadInputs => "LoadInputs",
             PutBucketRoutingState::StartTransaction => "StartTransaction",
             PutBucketRoutingState::ReadBucket => "ReadBucket",
             PutBucketRoutingState::WriteBucket => "WriteBucket",
@@ -87,18 +96,38 @@ impl Operation for PutBucketRoutingOperation {
     type Error = PutBucketRoutingError;
 
     fn start(&mut self) -> Effects {
-        if let Err(error) = validate_tenant_rules(&self.rules) {
-            return self.fail(error.into());
-        }
-        self.state = PutBucketRoutingState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
+        // A `Group` target is checked against the ids the bucket's own group
+        // registered, so a rule can never name another tenant's backend.
+        self.state = PutBucketRoutingState::LoadInputs;
+        smallvec![load_group_inputs(self.group_id)]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             PutBucketRoutingState::Init => self.start(),
+            PutBucketRoutingState::LoadInputs => {
+                let Event::SubOperation(SubOperationEvent::GroupRoutingLoaded { result }) = event
+                else {
+                    return self.fail(PutBucketRoutingError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::SubOperation(SubOperationEvent::GroupRoutingLoaded)",
+                        received: event,
+                    });
+                };
+                let owned = match result {
+                    Ok(inputs) => inputs.backend_ids,
+                    Err(error) => {
+                        return self.fail(PutBucketRoutingError::InputsUnavailable(error));
+                    }
+                };
+                if let Err(error) = validate_tenant_rules(&self.rules, &owned) {
+                    return self.fail(error.into());
+                }
+                self.state = PutBucketRoutingState::StartTransaction;
+                smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                    read: false,
+                })]
+            }
             PutBucketRoutingState::StartTransaction => {
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
                     return self.fail(PutBucketRoutingError::InvalidStateEvent {
@@ -130,6 +159,11 @@ impl Operation for PutBucketRoutingOperation {
                     Ok(info) => info,
                     Err(err) => return self.fail(err.into()),
                 };
+                // The owned backend ids were loaded for the authorized group, so
+                // the record has to still belong to it.
+                if info.group_id != self.group_id {
+                    return self.fail(PutBucketRoutingError::GroupMismatch);
+                }
                 info.storage_routing = self.rules.clone();
                 let value = match info.to_bytes() {
                     Ok(value) => value,
@@ -324,12 +358,13 @@ mod tests {
         PutBucketRoutingOperation,
     };
     use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        BackendRef, BucketInfo, RoutingError, RoutingTarget, StorageRoutingRule,
+        BackendRef, BucketInfo, GroupRoutingInputs, RoutingError, RoutingTarget, StorageRoutingRule,
     };
-    use aruna_core::types::TxnId;
+    use aruna_core::types::{Effects, TxnId};
+    use std::collections::BTreeSet;
     use std::time::SystemTime;
     use ulid::Ulid;
 
@@ -341,9 +376,24 @@ mod tests {
         }
     }
 
+    fn group() -> Ulid {
+        Ulid::from_bytes([1u8; 16])
+    }
+
+    /// Replays the loader sub-operation with the ids the group owns.
+    fn loaded(operation: &mut PutBucketRoutingOperation, owned: BTreeSet<Ulid>) -> Effects {
+        operation.start();
+        operation.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
+            result: Ok(GroupRoutingInputs {
+                default_target: None,
+                backend_ids: owned,
+            }),
+        }))
+    }
+
     fn bucket() -> BucketInfo {
         BucketInfo {
-            group_id: Ulid::from_bytes([1u8; 16]),
+            group_id: group(),
             created_at: SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::default(),
             cors_configuration: None,
@@ -355,8 +405,8 @@ mod tests {
     #[test]
     fn writes_bucket_rules() {
         let rules = vec![rule(RoutingTarget::Class("cold".to_string()))];
-        let mut operation = PutBucketRoutingOperation::new("b".to_string(), rules.clone());
-        operation.start();
+        let mut operation = PutBucketRoutingOperation::new("b".to_string(), group(), rules.clone());
+        loaded(&mut operation, BTreeSet::new());
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
         }));
@@ -379,9 +429,9 @@ mod tests {
         let rules = vec![rule(RoutingTarget::Backend(BackendRef::Node(
             "cold".to_string(),
         )))];
-        let mut operation = PutBucketRoutingOperation::new("b".to_string(), rules);
+        let mut operation = PutBucketRoutingOperation::new("b".to_string(), group(), rules);
 
-        let effects = operation.start();
+        let effects = loaded(&mut operation, BTreeSet::new());
 
         assert!(effects.is_empty());
         assert!(operation.is_complete());
@@ -394,9 +444,67 @@ mod tests {
     }
 
     #[test]
+    fn rejects_foreign_backend() {
+        // A rule naming a backend this group does not own must not be stored.
+        let foreign = Ulid::from_bytes([9u8; 16]);
+        let rules = vec![rule(RoutingTarget::Backend(BackendRef::Group(foreign)))];
+        let mut operation = PutBucketRoutingOperation::new("b".to_string(), group(), rules);
+
+        let effects = loaded(
+            &mut operation,
+            BTreeSet::from([Ulid::from_bytes([4u8; 16])]),
+        );
+
+        assert!(effects.is_empty(), "expected no write, got {effects:?}");
+        assert_eq!(
+            operation.finalize(),
+            Err(PutBucketRoutingError::InvalidRules(
+                RoutingError::ForeignBackend(foreign)
+            ))
+        );
+    }
+
+    #[test]
+    fn accepts_owned_backend() {
+        let owned = Ulid::from_bytes([4u8; 16]);
+        let rules = vec![rule(RoutingTarget::Backend(BackendRef::Group(owned)))];
+        let mut operation = PutBucketRoutingOperation::new("b".to_string(), group(), rules);
+
+        let effects = loaded(&mut operation, BTreeSet::from([owned]));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
+    }
+
+    #[test]
+    fn rejects_foreign_bucket() {
+        // The loaded ids belong to the authorized group, so a record that moved
+        // to another group must not take its rules.
+        let mut operation = PutBucketRoutingOperation::new("b".to_string(), group(), Vec::new());
+        loaded(&mut operation, BTreeSet::new());
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+        let mut moved = bucket();
+        moved.group_id = Ulid::from_bytes([2u8; 16]);
+
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"b".to_vec().into(),
+            value: Some(moved.to_bytes().unwrap().into()),
+        }));
+
+        assert_eq!(
+            operation.finalize(),
+            Err(PutBucketRoutingError::GroupMismatch)
+        );
+    }
+
+    #[test]
     fn missing_bucket_aborts() {
-        let mut operation = PutBucketRoutingOperation::new("b".to_string(), Vec::new());
-        operation.start();
+        let mut operation = PutBucketRoutingOperation::new("b".to_string(), group(), Vec::new());
+        loaded(&mut operation, BTreeSet::new());
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
         }));
@@ -418,8 +526,8 @@ mod tests {
 
     #[test]
     fn rejects_unexpected_event() {
-        let mut operation = PutBucketRoutingOperation::new("b".to_string(), Vec::new());
-        operation.start();
+        let mut operation = PutBucketRoutingOperation::new("b".to_string(), group(), Vec::new());
+        loaded(&mut operation, BTreeSet::new());
 
         operation.step(Event::Storage(StorageEvent::WriteResult {
             key: b"b".to_vec().into(),

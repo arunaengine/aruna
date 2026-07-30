@@ -24,6 +24,8 @@ pub enum RoutingError {
     InvalidClass(String),
     #[error("routing rules may not name an operator backend")]
     OperatorBackendTarget,
+    #[error("storage backend {0} is not registered for this group")]
+    ForeignBackend(Ulid),
 }
 
 /// A storage class identifier is `[a-z0-9-]` of 1..=32 characters.
@@ -78,6 +80,15 @@ impl GroupStorageRouting {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
     }
+}
+
+/// One group's routing inputs: its default target and the ids of the backends
+/// it registered. Loaded together so a `Group` target always has a catalog
+/// entry to resolve against, and only ever for the group that owns them.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GroupRoutingInputs {
+    pub default_target: Option<RoutingTarget>,
+    pub backend_ids: BTreeSet<Ulid>,
 }
 
 /// Operator-authored all-groups rule from the node's backends file. An unset
@@ -161,6 +172,13 @@ impl BackendCatalog {
 
     pub fn with_group(mut self, backend_id: Ulid) -> Self {
         self.group_backends.insert(backend_id);
+        self
+    }
+
+    /// Only the ids the snapshot's own group registered are ever folded in, so
+    /// a rule can never bind another tenant's endpoint and credentials.
+    pub fn with_group_backends(mut self, ids: impl IntoIterator<Item = Ulid>) -> Self {
+        self.group_backends.extend(ids);
         self
     }
 
@@ -309,6 +327,14 @@ impl RoutingSnapshot {
         self.bucket_rules = rules;
         self
     }
+
+    /// Applies the owning group's default and its registered backend ids in one
+    /// step: a `Group` target only resolves once its id is in the catalog.
+    pub fn with_group_inputs(mut self, inputs: GroupRoutingInputs) -> Self {
+        self.group_default = inputs.default_target;
+        self.catalog = self.catalog.with_group_backends(inputs.backend_ids);
+        self
+    }
 }
 
 /// One rule that could decide a write, with the provenance class lookup needs.
@@ -413,21 +439,32 @@ pub fn validate_rule_set(rules: &[StorageRoutingRule]) -> Result<(), RoutingErro
     Ok(())
 }
 
-/// Tenants may name their own group backend or a storage class, never an
-/// operator backend: node topology must not be bound into replicated records.
-pub fn validate_tenant_target(target: &RoutingTarget) -> Result<(), RoutingError> {
+/// Tenants may name a backend their own group registered or a storage class,
+/// never an operator backend: node topology must not be bound into replicated
+/// records, and a foreign id would route the group's bytes to another tenant's
+/// endpoint and credentials.
+pub fn validate_tenant_target(
+    target: &RoutingTarget,
+    owned: &BTreeSet<Ulid>,
+) -> Result<(), RoutingError> {
     match target {
         RoutingTarget::Backend(BackendRef::Node(_)) => Err(RoutingError::OperatorBackendTarget),
-        RoutingTarget::Backend(BackendRef::Group(_)) => Ok(()),
+        RoutingTarget::Backend(BackendRef::Group(id)) => owned
+            .contains(id)
+            .then_some(())
+            .ok_or(RoutingError::ForeignBackend(*id)),
         RoutingTarget::Class(class) => validate_storage_class(class),
     }
 }
 
-pub fn validate_tenant_rules(rules: &[StorageRoutingRule]) -> Result<(), RoutingError> {
+pub fn validate_tenant_rules(
+    rules: &[StorageRoutingRule],
+    owned: &BTreeSet<Ulid>,
+) -> Result<(), RoutingError> {
     validate_rule_set(rules)?;
     rules
         .iter()
-        .try_for_each(|rule| validate_tenant_target(&rule.target))
+        .try_for_each(|rule| validate_tenant_target(&rule.target, owned))
 }
 
 /// Advisory only. A rule may name a class or backend this node does not have,
@@ -463,6 +500,7 @@ mod tests {
         validate_storage_class, validate_tenant_rules, validate_tenant_target,
     };
     use crate::structs::{BackendRef, ResolvedBackend};
+    use std::collections::BTreeSet;
     use ulid::Ulid;
 
     fn catalog() -> BackendCatalog {
@@ -830,18 +868,38 @@ mod tests {
     #[test]
     fn rejects_operator_target() {
         // Tenant records must never bind an operator backend name.
+        let owned = BTreeSet::from([Ulid::from_bytes([5u8; 16])]);
         assert_eq!(
-            validate_tenant_rules(&[rule("a/", false, "cold")]),
+            validate_tenant_rules(&[rule("a/", false, "cold")], &owned),
             Err(RoutingError::OperatorBackendTarget)
         );
-        validate_tenant_rules(&[class_rule("a/", "cold")]).unwrap();
-        validate_tenant_target(&RoutingTarget::Backend(BackendRef::Group(
-            Ulid::from_bytes([5u8; 16]),
-        )))
+        validate_tenant_rules(&[class_rule("a/", "cold")], &owned).unwrap();
+        validate_tenant_target(
+            &RoutingTarget::Backend(BackendRef::Group(Ulid::from_bytes([5u8; 16]))),
+            &owned,
+        )
         .unwrap();
         assert_eq!(
-            validate_tenant_rules(&[class_rule("a/", "COLD")]),
+            validate_tenant_rules(&[class_rule("a/", "COLD")], &owned),
             Err(RoutingError::InvalidClass("COLD".to_string()))
+        );
+    }
+
+    #[test]
+    fn rejects_foreign_backend() {
+        // A rule naming another group's backend would route bytes to its
+        // endpoint and credentials, so the id has to be one this group owns.
+        let foreign = Ulid::from_bytes([7u8; 16]);
+        let owned = BTreeSet::from([Ulid::from_bytes([5u8; 16])]);
+        let target = RoutingTarget::Backend(BackendRef::Group(foreign));
+
+        assert_eq!(
+            validate_tenant_target(&target, &owned),
+            Err(RoutingError::ForeignBackend(foreign))
+        );
+        assert_eq!(
+            validate_tenant_target(&target, &BTreeSet::new()),
+            Err(RoutingError::ForeignBackend(foreign))
         );
     }
 

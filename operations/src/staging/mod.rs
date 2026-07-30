@@ -70,6 +70,9 @@ pub(crate) fn describe_event(event: &Event) -> String {
             SubOperationEvent::BucketCreated { .. } => {
                 "Event::SubOperation(SubOperationEvent::BucketCreated)".to_string()
             }
+            SubOperationEvent::GroupRoutingLoaded { .. } => {
+                "Event::SubOperation(SubOperationEvent::GroupRoutingLoaded)".to_string()
+            }
             SubOperationEvent::NotificationsEmitted => {
                 "Event::SubOperation(SubOperationEvent::NotificationsEmitted)".to_string()
             }

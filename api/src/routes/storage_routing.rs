@@ -8,7 +8,8 @@ use aruna_core::structs::{
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{drive, node_routing};
 use aruna_operations::group_routing::{
-    GetGroupRoutingOperation, PutGroupRoutingError, PutGroupRoutingOperation,
+    GetGroupRoutingOperation, GroupRoutingInputsOperation, PutGroupRoutingError,
+    PutGroupRoutingOperation,
 };
 use aruna_operations::s3::bucket_routing::{
     GetBucketRoutingError, GetBucketRoutingOperation, PutBucketRoutingError,
@@ -153,25 +154,40 @@ impl From<StorageRoutingRule> for StorageRoutingRuleRequest {
 
 fn map_group_error(error: PutGroupRoutingError) -> ServerError {
     match error {
-        PutGroupRoutingError::InvalidTarget(_) => ServerError::BadRequest,
+        PutGroupRoutingError::InvalidTarget(reason) => {
+            ServerError::BadRequestReason(reason.to_string())
+        }
         other => ServerError::InternalError(other.to_string()),
     }
 }
 
 fn map_put_error(error: PutBucketRoutingError) -> ServerError {
     match error {
-        PutBucketRoutingError::NoSuchBucket => ServerError::NotFound,
-        PutBucketRoutingError::InvalidRules(_) => ServerError::BadRequest,
+        PutBucketRoutingError::NoSuchBucket | PutBucketRoutingError::GroupMismatch => {
+            ServerError::NotFound
+        }
+        PutBucketRoutingError::InvalidRules(reason) => {
+            ServerError::BadRequestReason(reason.to_string())
+        }
         other => ServerError::InternalError(other.to_string()),
     }
 }
 
-/// Advisory notes from this node's own class table.
-fn warnings_for<'a>(
+/// Advisory notes from this node's own class table, read against the backends
+/// the group itself registered.
+async fn warnings_for<'a>(
     state: &ServerState,
+    group_id: Ulid,
     targets: impl IntoIterator<Item = &'a RoutingTarget>,
 ) -> Vec<String> {
-    target_warnings(&node_routing(&state.get_ctx()).catalog, targets)
+    let context = state.get_ctx();
+    let inputs = drive(GroupRoutingInputsOperation::new(group_id), &context)
+        .await
+        .unwrap_or_default();
+    let catalog = node_routing(&context)
+        .catalog
+        .with_group_backends(inputs.backend_ids);
+    target_warnings(&catalog, targets)
 }
 
 async fn group_of_bucket(state: &ServerState, bucket: &str) -> ServerResult<Ulid> {
@@ -255,7 +271,7 @@ pub async fn get_bucket_routing(
     .map_err(|error| ServerError::InternalError(error.to_string()))?
     .unwrap_or_default();
 
-    let warnings = warnings_for(&state, rules.iter().map(|rule| &rule.target));
+    let warnings = warnings_for(&state, group_id, rules.iter().map(|rule| &rule.target)).await;
     Ok(Json(BucketRoutingResponse {
         bucket,
         rules: rules.into_iter().map(Into::into).collect(),
@@ -295,7 +311,7 @@ pub async fn put_bucket_routing(
         .collect::<Result<Vec<_>, _>>()?;
 
     let stored = drive(
-        PutBucketRoutingOperation::new(bucket.clone(), rules),
+        PutBucketRoutingOperation::new(bucket.clone(), group_id, rules),
         &state.get_ctx(),
     )
     .await
@@ -304,7 +320,7 @@ pub async fn put_bucket_routing(
     .map_err(map_put_error)?
     .unwrap_or_default();
 
-    let warnings = warnings_for(&state, stored.iter().map(|rule| &rule.target));
+    let warnings = warnings_for(&state, group_id, stored.iter().map(|rule| &rule.target)).await;
     Ok(Json(BucketRoutingResponse {
         bucket,
         rules: stored.into_iter().map(Into::into).collect(),
@@ -341,7 +357,7 @@ pub async fn get_group_routing(
         .flatten();
 
     let target = record.and_then(|record| record.default_target);
-    let warnings = warnings_for(&state, target.iter());
+    let warnings = warnings_for(&state, group_id, target.iter()).await;
     Ok(Json(GroupRoutingResponse {
         group_id: group_id.to_string(),
         default_target: target.map(Into::into),
@@ -388,7 +404,7 @@ pub async fn put_group_routing(
     .map_err(map_group_error)?;
 
     let target = record.and_then(|record| record.default_target);
-    let warnings = warnings_for(&state, target.iter());
+    let warnings = warnings_for(&state, group_id, target.iter()).await;
     Ok(Json(GroupRoutingResponse {
         group_id: group_id.to_string(),
         default_target: target.map(Into::into),
@@ -565,7 +581,36 @@ pub(crate) mod tests {
         )
         .await;
 
-        assert!(matches!(result, Err(ServerError::BadRequest)));
+        assert!(matches!(result, Err(ServerError::BadRequestReason(_))));
+    }
+
+    #[tokio::test]
+    async fn rejects_foreign_backend() {
+        // Nothing registered this id for the group, so the rule must not store.
+        let test = setup_state().await;
+        let foreign = Ulid::generate();
+
+        let result = put_bucket_routing(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Path(test.bucket.clone()),
+            Json(BucketRoutingRequest {
+                rules: vec![StorageRoutingRuleRequest {
+                    key_prefix: String::new(),
+                    exact: false,
+                    target: RoutingTargetRequest {
+                        backend_id: Some(foreign.to_string()),
+                        class: None,
+                    },
+                }],
+            }),
+        )
+        .await;
+
+        let Err(ServerError::BadRequestReason(reason)) = result else {
+            panic!("expected a 400 naming the backend, got {result:?}")
+        };
+        assert!(reason.contains(&foreign.to_string()), "{reason}");
     }
 
     #[test]
