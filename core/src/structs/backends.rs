@@ -1,7 +1,7 @@
 use crate::errors::ConversionError;
 use crate::structs::{
     Backend, BackendConfig, BackendRef, BlobTimeoutConfig, NodeRoutingRule, RoutingTarget,
-    validate_storage_class,
+    validate_node_rules, validate_storage_class,
 };
 use ipnet::IpNet;
 use serde::Deserialize;
@@ -206,6 +206,8 @@ impl BackendsFile {
             .iter()
             .map(|entry| entry.to_rule(&self.backend, &classes))
             .collect::<Result<Vec<_>, _>>()?;
+        validate_node_rules(&rules)
+            .map_err(|error| ConversionError::FromStrError(error.to_string()))?;
 
         let extra_deny = self
             .egress
@@ -475,6 +477,39 @@ target = { class = "glacier" }
         assert!(
             file.resolve(&secrets, BlobTimeoutConfig::default())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_tied_rules() {
+        // Both rules match the same write with the same specificity, so file
+        // order would silently decide where the bytes land.
+        let file = BackendsFile::parse(
+            r#"
+[backend.a]
+type = "filesystem"
+default = true
+
+[[routing]]
+bucket = "raw"
+target = { backend = "a" }
+
+[[routing]]
+group = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+target = { backend = "a" }
+"#,
+        )
+        .unwrap();
+
+        let error = file
+            .resolve(&secrets, BlobTimeoutConfig::default())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("bucket=raw"), "{error}");
+        assert!(
+            error.contains("group=01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            "{error}"
         );
     }
 

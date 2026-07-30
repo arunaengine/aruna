@@ -82,6 +82,11 @@ bucket, group, node, then the default backend. Operator rules live in the
 (`PUT /groups/{group_id}/storage-routing`). The response carries advisory
 warnings, for example when no node currently advertises the requested class.
 
+Ties are rejected when rules are written, never broken at write time. Two
+operator rules that are equally specific and can both match one write make the
+backends file invalid and the node refuses to start, naming both scopes. Two
+tenant rules sharing `exact` and `key_prefix` are rejected by the API.
+
 Routing input is the resource path only. `x-amz-storage-class` on a request is
 ignored beyond its pre-existing behaviour.
 

@@ -26,6 +26,10 @@ pub enum RoutingError {
     OperatorBackendTarget,
     #[error("storage backend {0} is not registered for this group")]
     ForeignBackend(Ulid),
+    #[error(
+        "routing rules `{first}` and `{second}` are equally specific and both match the same writes"
+    )]
+    AmbiguousRules { first: String, second: String },
 }
 
 /// A storage class identifier is `[a-z0-9-]` of 1..=32 characters.
@@ -116,6 +120,42 @@ impl NodeRoutingRule {
             + usize::from(self.bucket.is_some())
             + usize::from(self.key_prefix.is_some());
         (fields, self.key_prefix.as_ref().map_or(0, String::len))
+    }
+
+    /// Whether some write matches both rules. An unset field matches every
+    /// value, and two key prefixes overlap only when one contains the other.
+    fn overlaps(&self, other: &Self) -> bool {
+        let scope = |left: &Option<String>, right: &Option<String>| match (left, right) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        };
+        let groups = match (self.group, other.group) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        };
+        let prefixes = match (&self.key_prefix, &other.key_prefix) {
+            (Some(left), Some(right)) => left.starts_with(right) || right.starts_with(left),
+            _ => true,
+        };
+        groups && scope(&self.bucket, &other.bucket) && prefixes
+    }
+
+    /// The rule's scope, for an operator who has to find it in the file.
+    fn scope_label(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(group) = self.group {
+            parts.push(format!("group={group}"));
+        }
+        if let Some(bucket) = &self.bucket {
+            parts.push(format!("bucket={bucket}"));
+        }
+        if let Some(prefix) = &self.key_prefix {
+            parts.push(format!("key_prefix={prefix}"));
+        }
+        if parts.is_empty() {
+            return "all writes".to_string();
+        }
+        parts.join(", ")
     }
 }
 
@@ -439,6 +479,23 @@ pub fn validate_rule_set(rules: &[StorageRoutingRule]) -> Result<(), RoutingErro
     Ok(())
 }
 
+/// Rejects two operator rules that are equally specific and can both match one
+/// write, the node-scoped counterpart of `validate_rule_set`. Node rules carry a
+/// group and bucket scope too, so overlap decides the tie, not equality.
+pub fn validate_node_rules(rules: &[NodeRoutingRule]) -> Result<(), RoutingError> {
+    for (index, rule) in rules.iter().enumerate() {
+        for other in &rules[index + 1..] {
+            if rule.specificity() == other.specificity() && rule.overlaps(other) {
+                return Err(RoutingError::AmbiguousRules {
+                    first: rule.scope_label(),
+                    second: other.scope_label(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Tenants may name a backend their own group registered or a storage class,
 /// never an operator backend: node topology must not be bound into replicated
 /// records, and a foreign id would route the group's bytes to another tenant's
@@ -621,6 +678,47 @@ mod tests {
             }]);
 
         assert_eq!(resolve_backend(&snapshot, "b", "k").unwrap(), node("cold"));
+    }
+
+    fn node_rule(
+        group: Option<Ulid>,
+        bucket: Option<&str>,
+        prefix: Option<&str>,
+    ) -> NodeRoutingRule {
+        NodeRoutingRule {
+            group,
+            bucket: bucket.map(str::to_string),
+            key_prefix: prefix.map(str::to_string),
+            target: RoutingTarget::Backend(BackendRef::Node("cold".to_string())),
+        }
+    }
+
+    #[test]
+    fn rejects_tied_rules() {
+        // A group-only and a bucket-only rule both score (1, 0) and both match
+        // one write, so file order would decide it.
+        let rules = vec![
+            node_rule(Some(Ulid::from_bytes([1u8; 16])), None, None),
+            node_rule(None, Some("raw"), None),
+        ];
+
+        assert!(matches!(
+            super::validate_node_rules(&rules),
+            Err(RoutingError::AmbiguousRules { .. })
+        ));
+    }
+
+    #[test]
+    fn allows_disjoint_rules() {
+        // Equal scores are fine when no single write can match both.
+        let rules = vec![
+            node_rule(Some(Ulid::from_bytes([1u8; 16])), None, None),
+            node_rule(Some(Ulid::from_bytes([2u8; 16])), None, None),
+            node_rule(None, None, Some("a/")),
+            node_rule(None, None, Some("b/")),
+        ];
+
+        assert!(super::validate_node_rules(&rules).is_ok());
     }
 
     #[test]
