@@ -1,0 +1,117 @@
+# Group storage backends
+
+A group admin can register object stores the group owns and route the group's
+writes to them. Data written to such a backend lives on infrastructure Aruna
+does not operate: its durability, cost and availability are the group's
+responsibility.
+
+## Registering a backend
+
+`POST /groups/{group_id}/storage-backends` with ADMIN on the group:
+
+```json
+{
+  "name": "lab-minio",
+  "kind": "s3",
+  "public_config": { "endpoint": "https://minio.lab.example.org", "bucket": "aruna" },
+  "secret_config": { "access_key_id": "...", "secret_access_key": "..." }
+}
+```
+
+Five kinds are supported, each with its own required configuration:
+
+| kind | required public | required secret |
+| ---- | --------------- | --------------- |
+| `s3` | `endpoint`, `bucket` | `access_key_id`, `secret_access_key` |
+| `gcs` | `bucket` | `credential` |
+| `azblob` | `endpoint`, `container` | `account_key` or `sas_token` |
+| `azdls` | `endpoint`, `filesystem` | `account_key` or `sas_token` |
+| `b2` | `bucket`, `bucket_id` | `application_key_id`, `application_key` |
+
+Credentials must be static and long-lived. Session tokens are rejected: Aruna
+has no rotation story for them yet, and a write that outlives the token would
+fail mid-stream. Secrets are stored separately from the record, never
+returned by the API, and never logged.
+
+Creation probes the endpoint: the node checks the store and writes and deletes
+a sentinel key. A backend that fails the probe is not registered. Health is
+not probed continuously afterwards.
+
+The endpoint is screened against the egress guard's deny table before any
+connection is made, at creation and on every later use. Private, loopback and
+link-local addresses are refused. An operator may narrow this further, or
+refuse group backends entirely, in which case a rule naming one fails loudly.
+
+## Routing writes to it
+
+A group backend receives data only when a routing rule names it, by backend
+id:
+
+```
+PUT /buckets/{bucket}/storage-routing
+{ "rules": [ { "key_prefix": "archive/", "exact": false,
+               "target": { "backend_id": "01J..." } } ] }
+```
+
+or as the group default via `PUT /groups/{group_id}/storage-routing`. Rules
+apply to new writes only; existing objects stay where they were written.
+
+Aruna uses the container you configured and never creates another one.
+In-flight multipart parts live under a reserved `_parts/` prefix inside it,
+and hidden internal blobs are never placed on a group backend. Multipart
+compose is performed by Aruna, downloading and re-uploading parts, so it works
+across every supported provider.
+
+Bytes on a group backend still count against the group's quota in this
+release.
+
+## Deleting a backend
+
+`DELETE /groups/{group_id}/storage-backends/{backend_id}` removes the record
+and its credentials together. Deletion is refused with 409 while any stored
+object still names the backend, since removing it would make those objects
+unreadable. Delete or move the objects first, then remove the backend.
+
+## Where your data actually is
+
+Replication does not copy your routing decision. Each node that holds a
+replica resolves its own rules, so copies generally land on Aruna-managed
+storage even when the origin write went to your own endpoint. This is by
+design: it is what keeps the data available when your endpoint is not.
+
+`GET /blobs/locations?bucket={bucket}&path={key}&version_id={ulid}` reports one
+version's copies. It needs READ on the object; `version_id` defaults to the
+current version.
+
+```json
+{
+  "bucket": "raw", "key": "archive/run1.tar", "version_id": "01J...",
+  "copies": [
+    { "node_id": "ae58...", "local": true,  "state": "present",
+      "storage": "node-managed", "storage_class": "cold",
+      "group_backend_id": null, "group_backend_name": null },
+    { "node_id": "b7c2...", "local": false, "state": "present",
+      "storage": "group-backend", "storage_class": null,
+      "group_backend_id": "01H...", "group_backend_name": "lab-minio" },
+    { "node_id": "9f01...", "local": false, "state": "pending",
+      "storage": null, "storage_class": null,
+      "group_backend_id": null, "group_backend_name": null }
+  ]
+}
+```
+
+- `present` means that node confirmed it holds the version.
+- `pending` means a copy is expected there and has not arrived yet, either
+  because the node is a configured replication target or because a
+  replication job for the version is queued for it.
+- `unreachable` means the node did not answer within the deadline. The
+  endpoint never waits on an offline node beyond that deadline, and the local
+  entry is always returned.
+
+Node-managed copies report their storage class, not the operator's backend
+name. Group-backend copies report the backend's id and name, because that copy
+sits on your infrastructure and its durability is yours to judge.
+
+A copy that lands on a class you did not ask for is not an error: a class your
+node does not offer falls through to that node's default storage. If placement
+must be exact, name a backend rather than a class, and check this endpoint.
