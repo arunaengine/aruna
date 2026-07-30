@@ -280,7 +280,8 @@ pub async fn replace_group_backend(
         (status = 204, description = "Backend removed"),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Backend not found", body = ErrorResponse)
+        (status = 404, description = "Backend not found", body = ErrorResponse),
+        (status = 409, description = "Backend still holds object data", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -299,6 +300,9 @@ pub async fn delete_group_backend(
     .await
     .map_err(|error| match error {
         DeleteGroupBackendError::NotFound => ServerError::NotFound,
+        DeleteGroupBackendError::StillReferenced => ServerError::Conflict(
+            "storage backend still holds object data and cannot be removed".to_string(),
+        ),
         other => ServerError::InternalError(other.to_string()),
     })?;
 
