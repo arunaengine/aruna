@@ -1,7 +1,9 @@
 use crate::egress::EgressGuard;
 use aruna_core::errors::{BlobError, StagingSourceError};
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::{Backend, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata};
+use aruna_core::structs::{
+    Backend, GroupBackendKind, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata,
+};
 use bytes::Bytes;
 use futures::TryStreamExt;
 use opendal::layers::{HttpClientLayer, LoggingLayer, RetryLayer};
@@ -21,9 +23,12 @@ pub(crate) async fn abort_partial_writer(
     }
 }
 
+/// Tenant backends always build through the guarded client; operator backends
+/// are node-local topology and keep the direct one.
 pub(crate) fn init_operator(
     backend_type: Backend,
     config: HashMap<String, String>,
+    guard: &EgressGuard,
 ) -> Result<Operator, BlobError> {
     match backend_type {
         Backend::S3 => build_service::<services::S3>(s3_operator_config(config), None)
@@ -31,7 +36,35 @@ pub(crate) fn init_operator(
         Backend::FileSystem => {
             build_service::<services::Fs>(config, None).map_err(blob_operator_creation_error)
         }
+        Backend::Group(kind) => {
+            build_group_service(kind, config, guard).map_err(blob_operator_creation_error)
+        }
     }
+}
+
+/// Every tenant build pins the provider's ambient-credential switches where the
+/// service exposes them; the others rely on the mandatory static credential.
+pub(crate) fn build_group_service(
+    kind: GroupBackendKind,
+    config: HashMap<String, String>,
+    guard: &EgressGuard,
+) -> Result<Operator, String> {
+    let layer = Some(guard.layer());
+    match kind {
+        GroupBackendKind::S3 => build_service::<services::S3>(s3_operator_config(config), layer),
+        GroupBackendKind::Gcs => build_service::<services::Gcs>(gcs_operator_config(config), layer),
+        GroupBackendKind::Azblob => build_service::<services::Azblob>(config, layer),
+        GroupBackendKind::Azdls => build_service::<services::Azdls>(config, layer),
+        GroupBackendKind::B2 => build_service::<services::B2>(config, layer),
+    }
+}
+
+// gcs is the only tenant kind with explicit kill-switches; both are forced so
+// neither the node's gcloud config nor its VM metadata identity can be used.
+fn gcs_operator_config(mut config: HashMap<String, String>) -> HashMap<String, String> {
+    config.insert("disable_config_load".to_string(), "true".to_string());
+    config.insert("disable_vm_metadata".to_string(), "true".to_string());
+    config
 }
 
 pub(crate) async fn check_staging_source(
@@ -424,6 +457,119 @@ mod tests {
 
         restore_env(previous);
         assert_eq!(metadata.hits(), 0);
+    }
+
+    const AZURE_ENV_KEYS: [&str; 8] = [
+        "AZURE_STORAGE_ACCOUNT_NAME",
+        "AZURE_STORAGE_ACCOUNT_KEY",
+        "AZURE_STORAGE_SAS_TOKEN",
+        "AZURE_TENANT_ID",
+        "AZURE_CLIENT_ID",
+        "AZURE_CLIENT_SECRET",
+        "AZURE_CLIENT_CERTIFICATE_PATH",
+        "AZURE_AUTHORITY_HOST",
+    ];
+
+    fn group_config(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn gcs_skips_metadata() {
+        // Counterfactual: the same build without the two forced kill-switches
+        // walks the VM metadata service, which the hardened build never does.
+        let _guard = env_lock().lock().await;
+        let metadata = CountingListener::bind().await;
+        let data = CountingListener::bind().await;
+        let host = metadata.endpoint.trim_start_matches("http://").to_string();
+        // APPDATA short-circuits the well-known-file lookup onto an empty dir,
+        // so no gcloud credential on the machine can pre-empt the chain.
+        let empty = tempdir().unwrap();
+        let previous = swap_env(&[
+            ("GCE_METADATA_HOST", Some(host)),
+            ("GOOGLE_APPLICATION_CREDENTIALS", None),
+            ("APPDATA", Some(empty.path().to_string_lossy().into_owned())),
+        ]);
+        let config = group_config(&[("bucket", "data"), ("endpoint", &data.endpoint)]);
+
+        let unhardened =
+            build_service::<services::Gcs>(config.clone(), Some(test_guard().layer())).unwrap();
+        let _ = unhardened.stat("probe").await;
+        let ambient = metadata.hits();
+
+        let hardened = build_group_service(GroupBackendKind::Gcs, config, &test_guard()).unwrap();
+        let _ = hardened.stat("probe").await;
+
+        restore_env(previous);
+        assert!(
+            ambient > 0,
+            "counterfactual never reached the metadata host"
+        );
+        assert_eq!(metadata.hits(), ambient);
+    }
+
+    #[tokio::test]
+    async fn azblob_skips_ambient() {
+        // Azure has no kill-switch: the static key is what keeps the ambient
+        // chain unreachable, because it is pushed ahead of every provider.
+        let _guard = env_lock().lock().await;
+        let authority = CountingListener::bind().await;
+        let data = CountingListener::bind().await;
+        let mut entries: Vec<(&str, Option<String>)> =
+            AZURE_ENV_KEYS.iter().map(|key| (*key, None)).collect();
+        entries.push(("AZURE_TENANT_ID", Some("tenant".to_string())));
+        entries.push(("AZURE_CLIENT_ID", Some("client".to_string())));
+        entries.push(("AZURE_CLIENT_SECRET", Some("secret".to_string())));
+        entries.push(("AZURE_AUTHORITY_HOST", Some(authority.endpoint.clone())));
+        let previous = swap_env(&entries);
+        let base = [
+            ("container", "data"),
+            ("endpoint", data.endpoint.as_str()),
+            ("account_name", "acct"),
+        ];
+
+        let ambient_only =
+            build_group_service(GroupBackendKind::Azblob, group_config(&base), &test_guard())
+                .unwrap();
+        let _ = ambient_only.stat("probe").await;
+        let ambient = authority.hits();
+
+        let mut with_key = group_config(&base);
+        with_key.insert("account_key".to_string(), "a2V5c2VjcmV0".to_string());
+        let hardened =
+            build_group_service(GroupBackendKind::Azblob, with_key, &test_guard()).unwrap();
+        let _ = hardened.stat("probe").await;
+
+        restore_env(previous);
+        assert!(
+            ambient > 0,
+            "counterfactual never reached the authority host"
+        );
+        assert_eq!(authority.hits(), ambient);
+    }
+
+    #[tokio::test]
+    async fn azdls_fetches_nothing() {
+        // azdls cannot be pointed at a local authority host, so the proof is
+        // that a signed request opens exactly one connection and no other.
+        let _guard = env_lock().lock().await;
+        let data = CountingListener::bind().await;
+        let previous = swap_env(&AZURE_ENV_KEYS.map(|key| (key, None)));
+        let config = group_config(&[
+            ("filesystem", "data"),
+            ("endpoint", data.endpoint.as_str()),
+            ("account_name", "acct"),
+            ("account_key", "a2V5c2VjcmV0"),
+        ]);
+
+        let operator = build_group_service(GroupBackendKind::Azdls, config, &test_guard()).unwrap();
+        let _ = operator.stat("probe").await;
+
+        restore_env(previous);
+        assert_eq!(data.hits(), 1);
     }
 
     #[tokio::test]

@@ -1,3 +1,4 @@
+use crate::egress::EgressGuard;
 use crate::error::BlobLibError;
 use crate::opendal::init_operator;
 use aruna_core::errors::BlobError;
@@ -6,9 +7,10 @@ use aruna_core::structs::{
     NodeBackendsConfig, NodeRouting, NodeRoutingRule, ResolvedBackend, Status,
 };
 use opendal::Operator;
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, RwLock as SyncRwLock};
 use tokio::sync::RwLock;
+use ulid::Ulid;
 
 /// One operator-registered backend plus its own health state.
 #[derive(Clone, Debug)]
@@ -46,7 +48,10 @@ impl NodeBackend {
 /// stored `BackendRef` always resolves to the same operator or to a loud error.
 #[derive(Clone, Debug)]
 pub struct BackendRegistry {
-    node: Arc<BTreeMap<String, NodeBackend>>,
+    node: Arc<BTreeMap<String, Arc<NodeBackend>>>,
+    /// Tenant backends, loaded from storage on first use. Unlike node backends
+    /// these are created and deleted while the process runs.
+    group: Arc<SyncRwLock<HashMap<Ulid, Arc<NodeBackend>>>>,
     default_name: String,
     rules: Arc<[NodeRoutingRule]>,
     serve_group_backends: bool,
@@ -58,10 +63,11 @@ impl BackendRegistry {
         let mut node = BTreeMap::new();
         node.insert(
             BackendRef::DEFAULT_NODE_NAME.to_string(),
-            NodeBackend::new(config, None),
+            Arc::new(NodeBackend::new(config, None)),
         );
         Self {
             node: Arc::new(node),
+            group: Arc::default(),
             default_name: BackendRef::DEFAULT_NODE_NAME.to_string(),
             rules: Arc::from([]),
             serve_group_backends: true,
@@ -73,7 +79,7 @@ impl BackendRegistry {
         let node = config
             .backends
             .iter()
-            .map(|entry| (entry.name.clone(), NodeBackend::from_entry(entry)))
+            .map(|entry| (entry.name.clone(), Arc::new(NodeBackend::from_entry(entry))))
             .collect();
         let registry = Self::new(node, config.default_name.clone())?;
         Ok(Self {
@@ -84,7 +90,7 @@ impl BackendRegistry {
     }
 
     pub fn new(
-        node: BTreeMap<String, NodeBackend>,
+        node: BTreeMap<String, Arc<NodeBackend>>,
         default_name: String,
     ) -> Result<Self, BlobLibError> {
         if !node.contains_key(&default_name) {
@@ -94,10 +100,25 @@ impl BackendRegistry {
         }
         Ok(Self {
             node: Arc::new(node),
+            group: Arc::default(),
             default_name,
             rules: Arc::from([]),
             serve_group_backends: true,
         })
+    }
+
+    /// Caches a tenant backend synthesized from its stored record, so the sync
+    /// lookup path works for `BackendRef::Group` exactly as for node backends.
+    pub fn insert_group(&self, backend_id: Ulid, backend: NodeBackend) {
+        if let Ok(mut group) = self.group.write() {
+            group.insert(backend_id, Arc::new(backend));
+        }
+    }
+
+    pub fn forget_group(&self, backend_id: &Ulid) {
+        if let Ok(mut group) = self.group.write() {
+            group.remove(backend_id);
+        }
     }
 
     pub fn default_name(&self) -> &str {
@@ -130,20 +151,24 @@ impl BackendRegistry {
         self.default_config().timeouts
     }
 
-    pub fn entries(&self) -> impl Iterator<Item = (&String, &NodeBackend)> {
+    pub fn entries(&self) -> impl Iterator<Item = (&String, &Arc<NodeBackend>)> {
         self.node.iter()
     }
 
-    pub fn backend(&self, backend: &BackendRef) -> Result<&NodeBackend, BlobError> {
+    pub fn backend(&self, backend: &BackendRef) -> Result<Arc<NodeBackend>, BlobError> {
         match backend {
-            BackendRef::Node(name) => self.node.get(name),
-            BackendRef::Group(_) => None,
+            BackendRef::Node(name) => self.node.get(name).cloned(),
+            BackendRef::Group(backend_id) => self
+                .group
+                .read()
+                .ok()
+                .and_then(|group| group.get(backend_id).cloned()),
         }
         .ok_or_else(|| BlobError::UnknownBackend(backend.to_string()))
     }
 
-    pub fn config_for(&self, backend: &BackendRef) -> Result<&BackendConfig, BlobError> {
-        Ok(&self.backend(backend)?.config)
+    pub fn config_for(&self, backend: &BackendRef) -> Result<BackendConfig, BlobError> {
+        Ok(self.backend(backend)?.config.clone())
     }
 
     /// Builds the operator a stored record resolves to. Replaces rebuilding it
@@ -153,6 +178,7 @@ impl BackendRegistry {
         backend: &BackendRef,
         root: &str,
         bucket: &str,
+        guard: &EgressGuard,
     ) -> Result<Operator, BlobError> {
         let entry = self.backend(backend)?;
         let mut config = entry.config.service_config.clone();
@@ -160,16 +186,17 @@ impl BackendRegistry {
         if entry.config.backend_type == Backend::S3 {
             config.insert("bucket".to_string(), bucket.to_string());
         }
-        init_operator(entry.config.backend_type.clone(), config)
+        init_operator(entry.config.backend_type.clone(), config, guard)
     }
 
     pub fn bucket_operator(
         &self,
         backend: &BackendRef,
         bucket: &str,
+        guard: &EgressGuard,
     ) -> Result<Operator, BlobError> {
         let root = self.config_for(backend)?.root.clone();
-        self.operator_for(backend, &root, bucket)
+        self.operator_for(backend, &root, bucket, guard)
     }
 
     /// Credential-free view handed to operations so they can turn a routing

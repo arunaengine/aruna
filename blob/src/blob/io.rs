@@ -1,5 +1,6 @@
 use super::BlobHandler;
 use super::backend::{build_backend_path, build_hidden_path, build_multipart_part_path};
+use super::group::GROUP_WRITE_CHUNK;
 use crate::hash::Hasher;
 use crate::opendal::abort_partial_writer;
 use aruna_core::errors::BlobError;
@@ -7,8 +8,8 @@ use aruna_core::events::BlobEvent;
 use aruna_core::stream::BackendStream;
 use aruna_core::stream::StreamError;
 use aruna_core::structs::{
-    BackendLocation, HIDDEN_BLOB_PREFIX, HiddenBlobEntry, HiddenBlobKey, MultipartUploadPartKey,
-    ResolvedBackend,
+    BackendLocation, BackendRef, HIDDEN_BLOB_PREFIX, HiddenBlobEntry, HiddenBlobKey,
+    MultipartUploadPartKey, ResolvedBackend,
 };
 use aruna_core::types::UserId;
 use bytes::Bytes;
@@ -19,6 +20,19 @@ use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ulid::Ulid;
+
+/// Tenant writers open with an explicit chunk so a small-chunk stream cannot
+/// exhaust a provider's per-object block ceiling.
+async fn open_writer(
+    operator: &Operator,
+    path: &str,
+    backend: &BackendRef,
+) -> Result<opendal::Writer, opendal::Error> {
+    match backend {
+        BackendRef::Group(_) => operator.writer_with(path).chunk(GROUP_WRITE_CHUNK).await,
+        BackendRef::Node(_) => operator.writer(path).await,
+    }
+}
 
 impl BlobHandler {
     pub(super) async fn write_stream_to_location(
@@ -41,7 +55,7 @@ impl BlobHandler {
             Ok(storage_path) => storage_path,
             Err(e) => return BlobEvent::Error(e),
         };
-        let Ok(mut writer) = operator.writer(&storage_path).await else {
+        let Ok(mut writer) = open_writer(&operator, &storage_path, &location.backend).await else {
             return BlobEvent::Error(BlobError::OperatorCreationFailed(
                 "Failed to create writer from operator".to_string(),
             ));
@@ -125,13 +139,14 @@ impl BlobHandler {
             blob_size: 0,
             hashes: HashMap::new(),
         };
-        let operator = match self
-            .registry
-            .bucket_operator(&resolved.backend, &backend_bucket)
-        {
-            Ok(operator) => operator,
-            Err(err) => return BlobEvent::Error(err),
-        };
+        let operator =
+            match self
+                .registry
+                .bucket_operator(&resolved.backend, &backend_bucket, &self.egress)
+            {
+                Ok(operator) => operator,
+                Err(err) => return BlobEvent::Error(err),
+            };
         let location = match self
             .write_stream_limit(location, operator, blob, max_bytes)
             .await
@@ -219,17 +234,18 @@ impl BlobHandler {
             hashes: HashMap::new(),
         };
 
-        let operator = match self
-            .registry
-            .bucket_operator(&resolved.backend, &backend_bucket)
-        {
-            Ok(op) => op,
-            Err(err) => {
-                self.release_bucket(&resolved.backend, &backend_bucket)
-                    .await;
-                return BlobEvent::Error(err);
-            }
-        };
+        let operator =
+            match self
+                .registry
+                .bucket_operator(&resolved.backend, &backend_bucket, &self.egress)
+            {
+                Ok(op) => op,
+                Err(err) => {
+                    self.release_bucket(&resolved.backend, &backend_bucket)
+                        .await;
+                    return BlobEvent::Error(err);
+                }
+            };
         match self
             .write_stream_to_location(location, operator, blob)
             .await
@@ -277,13 +293,14 @@ impl BlobHandler {
             blob_size: 0,
             hashes: HashMap::new(),
         };
-        let operator = match self
-            .registry
-            .bucket_operator(&resolved.backend, &multipart_bucket)
-        {
-            Ok(op) => op,
-            Err(err) => return BlobEvent::Error(err),
-        };
+        let operator =
+            match self
+                .registry
+                .bucket_operator(&resolved.backend, &multipart_bucket, &self.egress)
+            {
+                Ok(op) => op,
+                Err(err) => return BlobEvent::Error(err),
+            };
         Box::pin(self.write_stream_to_location(location, operator, blob)).await
     }
 
@@ -329,17 +346,18 @@ impl BlobHandler {
             blob_size: 0,
             hashes: HashMap::new(),
         };
-        let operator = match self
-            .registry
-            .bucket_operator(&resolved.backend, &backend_bucket)
-        {
-            Ok(op) => op,
-            Err(err) => {
-                self.release_bucket(&resolved.backend, &backend_bucket)
-                    .await;
-                return BlobEvent::Error(err);
-            }
-        };
+        let operator =
+            match self
+                .registry
+                .bucket_operator(&resolved.backend, &backend_bucket, &self.egress)
+            {
+                Ok(op) => op,
+                Err(err) => {
+                    self.release_bucket(&resolved.backend, &backend_bucket)
+                        .await;
+                    return BlobEvent::Error(err);
+                }
+            };
         match self
             .compose_parts_to_location(location, operator, parts)
             .await
@@ -363,7 +381,7 @@ impl BlobHandler {
             Ok(storage_path) => storage_path,
             Err(e) => return BlobEvent::Error(e),
         };
-        let Ok(mut writer) = operator.writer(&storage_path).await else {
+        let Ok(mut writer) = open_writer(&operator, &storage_path, &location.backend).await else {
             return BlobEvent::Error(BlobError::OperatorCreationFailed(
                 "Failed to create writer from operator".to_string(),
             ));
@@ -575,7 +593,10 @@ impl BlobHandler {
         let prefix = hidden_prefix(namespace);
         let mut entries = Vec::new();
         for bucket in buckets {
-            let operator = match self.registry.bucket_operator(&backend, &bucket) {
+            let operator = match self
+                .registry
+                .bucket_operator(&backend, &bucket, &self.egress)
+            {
                 Ok(operator) => operator,
                 Err(error) => return BlobEvent::Error(error),
             };

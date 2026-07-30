@@ -77,6 +77,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::Delete { .. } => (EffectClass::Local, "delete"),
         BlobEffect::DeleteHidden { .. } => (EffectClass::Local, "delete_hidden"),
         BlobEffect::ListHidden { .. } => (EffectClass::Local, "list_hidden"),
+        BlobEffect::CheckGroupBackend { .. } => (EffectClass::Control, "check_group_backend"),
     }
 }
 
@@ -326,6 +327,7 @@ impl BlobHandler {
     // Effects run concurrently on their caller's task; per-operation ordering
     // is preserved by the driver awaiting each effect before the next.
     pub(super) async fn execute_effect(&self, effect: BlobEffect) -> BlobEvent {
+        self.load_group_backends(&effect).await;
         match effect {
             BlobEffect::Write {
                 bucket,
@@ -381,6 +383,9 @@ impl BlobHandler {
             BlobEffect::DeleteHidden { key } => Box::pin(self.delete_hidden_blob(key)).await,
             BlobEffect::ListHidden { namespace } => {
                 Box::pin(self.list_hidden_blobs(namespace)).await
+            }
+            BlobEffect::CheckGroupBackend { record, secret } => {
+                Box::pin(self.check_group_backend(record, secret)).await
             }
             BlobEffect::OpenConnection { node_id } => Box::pin(self.open_connection(node_id)).await,
             BlobEffect::SendMessage { stream_id, payload } => {
@@ -615,7 +620,7 @@ impl BlobHandler {
             }
         }
 
-        match init_operator(backend_type, config) {
+        match init_operator(backend_type, config, &self.egress) {
             Ok(operator) => {
                 let probe_timeout = self.handler_probe_timeout();
                 match timeout(probe_timeout, operator.check()).await {

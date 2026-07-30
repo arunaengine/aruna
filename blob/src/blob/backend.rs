@@ -226,7 +226,8 @@ impl BlobHandler {
         self.registry
             .config_for(backend)
             .ok()
-            .and_then(|config| config.multipart_bucket.as_deref())
+            .and_then(|config| config.multipart_bucket)
+            .as_deref()
             != Some(bucket)
     }
 
@@ -426,13 +427,17 @@ impl BlobHandler {
         &self,
         location: &BackendLocation,
     ) -> Result<Operator, BlobError> {
-        self.registry
-            .operator_for(&location.backend, &location.root, &location.storage_bucket)
+        self.registry.operator_for(
+            &location.backend,
+            &location.root,
+            &location.storage_bucket,
+            &self.egress,
+        )
     }
 
     pub(super) fn operator_from_hidden(&self, key: &HiddenBlobKey) -> Result<Operator, BlobError> {
         self.registry
-            .operator_for(&key.backend, &key.root, &key.storage_bucket)
+            .operator_for(&key.backend, &key.root, &key.storage_bucket, &self.egress)
     }
 
     pub(super) async fn hidden_buckets(

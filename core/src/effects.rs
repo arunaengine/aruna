@@ -7,7 +7,8 @@ use crate::metadata::MetadataEffect;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::{
-    BackendLocation, HiddenBlobKey, RealmId, ResolvedBackend, ResolvedSourceAccess,
+    BackendLocation, GroupStorageBackend, GroupStorageBackendSecret, HiddenBlobKey, RealmId,
+    ResolvedBackend, ResolvedSourceAccess,
 };
 use crate::task::TaskEffect;
 use crate::types::UserId;
@@ -121,6 +122,12 @@ pub enum BlobEffect {
         stream_id: Ulid,
         size: u64,
         expected_blake3: [u8; 32],
+    },
+    /// Create-time reachability proof for a tenant backend: build the guarded
+    /// operator and round-trip a sentinel object.
+    CheckGroupBackend {
+        record: GroupStorageBackend,
+        secret: GroupStorageBackendSecret,
     },
 }
 

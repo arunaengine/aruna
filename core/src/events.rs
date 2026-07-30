@@ -105,6 +105,7 @@ pub enum BlobEvent {
     ReadServed {
         stream_id: Ulid,
     },
+    GroupBackendChecked,
     Error(BlobError),
 }
 

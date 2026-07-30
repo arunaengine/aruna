@@ -12,6 +12,7 @@ use ulid::Ulid;
 
 mod backend;
 mod control_plane;
+mod group;
 mod io;
 mod registry;
 mod replication;

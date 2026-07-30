@@ -283,17 +283,17 @@ async fn setup_two_backends() -> TestContext {
     let mut backends = std::collections::BTreeMap::new();
     backends.insert(
         "default".to_string(),
-        NodeBackend::new(
+        std::sync::Arc::new(NodeBackend::new(
             filesystem_backend(&format!("{temp_root}/hot"), "hot-", "hot-parts"),
             None,
-        ),
+        )),
     );
     backends.insert(
         "cold".to_string(),
-        NodeBackend::new(
+        std::sync::Arc::new(NodeBackend::new(
             filesystem_backend(&format!("{temp_root}/cold"), "cold-", "cold-parts"),
             Some("cold".to_string()),
-        ),
+        )),
     );
     let registry = BackendRegistry::new(backends, "default".to_string()).unwrap();
     let blob_handle = BlobHandler::with_registry(
@@ -1367,6 +1367,7 @@ async fn failed_write_cleans() {
             "root".to_string(),
             root.path().to_str().unwrap().to_string(),
         )]),
+        &crate::egress::EgressGuard::new(aruna_core::egress::EgressPolicy::loopback()).unwrap(),
     )
     .unwrap();
     let blob = BackendStream::new(futures::stream::iter([

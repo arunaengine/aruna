@@ -397,7 +397,7 @@ pub async fn put_group_routing(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::openapi::ApiDoc;
     use aruna_core::UserId;
@@ -412,13 +412,13 @@ mod tests {
     use aruna_storage::storage;
     use tempfile::TempDir;
 
-    struct TestState {
+    pub(crate) struct TestState {
         _storage_dir: TempDir,
-        auth: AuthContext,
-        other_auth: AuthContext,
-        group_id: Ulid,
-        bucket: String,
-        state: Arc<ServerState>,
+        pub(crate) auth: AuthContext,
+        pub(crate) other_auth: AuthContext,
+        pub(crate) group_id: Ulid,
+        pub(crate) bucket: String,
+        pub(crate) state: Arc<ServerState>,
     }
 
     fn class_rule(class: &str) -> StorageRoutingRuleRequest {
@@ -581,7 +581,7 @@ mod tests {
         );
     }
 
-    async fn setup_state() -> TestState {
+    pub(crate) async fn setup_state() -> TestState {
         let storage_dir = tempfile::tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();

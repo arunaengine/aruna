@@ -1,8 +1,8 @@
 use crate::errors::{BlobError, ConversionError};
 use crate::structs::checksum::HASH_BLAKE3;
 use crate::structs::{
-    BucketReplicationConfig, PathRestriction, RealmId, SourceMetadata, StorageRoutingRule,
-    VersionSourceBinding,
+    BucketReplicationConfig, GroupBackendKind, PathRestriction, RealmId, SourceMetadata,
+    StorageRoutingRule, VersionSourceBinding,
 };
 use crate::types::{GroupId, NodeId, UserId};
 use byteview::ByteView;
@@ -51,6 +51,9 @@ pub enum Backend {
     #[default]
     S3,
     FileSystem,
+    /// A tenant-registered backend. Never nameable in the backends file: it is
+    /// synthesized from a `GroupStorageBackend` record.
+    Group(GroupBackendKind),
 }
 
 impl FromStr for Backend {
@@ -73,6 +76,7 @@ impl Display for Backend {
         match self {
             Backend::S3 => write!(f, "s3"),
             Backend::FileSystem => write!(f, "filesystem"),
+            Backend::Group(kind) => write!(f, "group:{kind}"),
         }
     }
 }

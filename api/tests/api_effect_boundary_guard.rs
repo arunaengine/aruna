@@ -187,7 +187,14 @@ fn pattern_applies(pattern: &str, relative_path: &str) -> bool {
 }
 
 fn is_module_declaration(line: &str) -> bool {
-    (line.starts_with("mod test") || line.starts_with("mod tests")) && line.contains('{')
+    // A `#[cfg(test)]` module stays a test module when a fixture is shared with
+    // a sibling module and the declaration carries a visibility.
+    let line = line
+        .trim_start_matches("pub(crate)")
+        .trim_start_matches("pub(super)")
+        .trim_start_matches("pub")
+        .trim_start();
+    line.starts_with("mod test") && line.contains('{')
 }
 
 fn format_matches(matches: &[&GuardMatch]) -> String {
