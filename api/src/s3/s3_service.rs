@@ -7,7 +7,7 @@ use crate::s3::checksum::{
     verify_trailer_stream,
 };
 use crate::s3::cors::{bucket_cors_to_get_output, dto_to_bucket_cors};
-use crate::s3::error::IntoS3Error;
+use crate::s3::error::{IntoS3Error, routing_inputs_error};
 use crate::s3::s3_server::DeleteObjectsBody;
 use crate::s3::util::{
     checked_size, checksum_response_hashes, convert_input, declared_trailer_algorithm,
@@ -1578,7 +1578,8 @@ impl S3 for ArunaS3Service {
         let routing = match bucket_info.as_ref() {
             Some(info) => bucket_snapshot(&self.state, info).await,
             None => routing_snapshot(&self.state, group_id, &replication_bucket).await,
-        };
+        }
+        .map_err(routing_inputs_error)?;
         let input = convert_input(req.input)?;
         let operation = PutObjectOperation::new(PutObjectConfig {
             user_id: user_access.user_identity,
@@ -1827,7 +1828,8 @@ impl S3 for ArunaS3Service {
         let routing = match bucket_info.as_ref() {
             Some(info) => bucket_snapshot(&self.state, info).await,
             None => routing_snapshot(&self.state, group_id, &req.input.bucket).await,
-        };
+        }
+        .map_err(routing_inputs_error)?;
         let operation = CreateMultipartUploadOperation::new(CMPI {
             bucket: req.input.bucket.clone(),
             key: req.input.key.clone(),

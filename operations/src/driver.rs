@@ -17,9 +17,11 @@ use std::any::{type_name, type_name_of_val};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
+use thiserror::Error;
 use tracing::{Instrument, debug, debug_span, error, trace, warn};
 
-use crate::group_routing::GroupRoutingInputsOperation;
+use crate::group_backends::{RecordReadError, parse_read};
+use crate::group_routing::{GroupRoutingInputsError, GroupRoutingInputsOperation};
 use crate::metadata::MetadataHandle;
 use crate::task_persistence::persist_task_effect;
 use aruna_core::events::NetError;
@@ -37,75 +39,84 @@ pub fn node_routing(context: &DriverContext) -> NodeRouting {
         .unwrap_or_default()
 }
 
-/// The group's default target plus the ids of the backends it registered. A
-/// read failure leaves both unset, so the write still lands on the node default
-/// instead of failing. Only the named group's ids are ever loaded.
-async fn group_inputs(context: &DriverContext, group_id: GroupId) -> GroupRoutingInputs {
-    match drive(GroupRoutingInputsOperation::new(group_id), context).await {
-        Ok(inputs) => inputs,
-        Err(error) => {
-            warn!(error = %error, group_id = %group_id, "Failed to load group routing inputs");
-            GroupRoutingInputs::default()
+/// Why a write could not learn where it belongs. Absent records are not an
+/// error; only an unreadable or undecodable one is.
+#[derive(Debug, Error, PartialEq)]
+pub enum RoutingInputsError {
+    #[error("group routing inputs unavailable: {0}")]
+    GroupInputs(#[from] GroupRoutingInputsError),
+    #[error("bucket routing rules unavailable: {0}")]
+    BucketRules(#[from] RecordReadError),
+}
+
+impl RoutingInputsError {
+    /// The underlying storage failure, so retrying callers can tell a transient
+    /// read failure from a record that will never decode.
+    pub fn storage(&self) -> Option<&aruna_core::errors::StorageError> {
+        let read = match self {
+            Self::GroupInputs(GroupRoutingInputsError::Read(read)) => read,
+            Self::BucketRules(read) => read,
+            Self::GroupInputs(GroupRoutingInputsError::Incomplete) => return None,
+        };
+        match read {
+            RecordReadError::Storage(error) => Some(error),
+            RecordReadError::Conversion(_) | RecordReadError::Unexpected => None,
         }
     }
 }
 
-/// Bucket rules for callers that do not already hold the bucket record.
-async fn bucket_rules(context: &DriverContext, bucket: &str) -> Vec<StorageRoutingRule> {
-    let Some(value) = read_record(context, S3_BUCKET_KEYSPACE, bucket.as_bytes().to_vec()).await
-    else {
-        return Vec::new();
-    };
-    match BucketInfo::from_bytes(value.as_ref()) {
-        Ok(info) => info.storage_routing,
-        Err(error) => {
-            warn!(error = %error, bucket = %bucket, "Failed to decode bucket record for routing");
-            Vec::new()
-        }
-    }
-}
-
-async fn read_record(
+/// The group's default target plus the ids of the backends it registered. Only
+/// the named group's ids are ever loaded.
+async fn group_inputs(
     context: &DriverContext,
-    key_space: &str,
-    key: impl Into<Vec<u8>>,
-) -> Option<aruna_core::types::Value> {
+    group_id: GroupId,
+) -> Result<GroupRoutingInputs, RoutingInputsError> {
+    Ok(drive(GroupRoutingInputsOperation::new(group_id), context).await?)
+}
+
+/// Bucket rules for callers that do not already hold the bucket record. A
+/// bucket without a record simply has no rules.
+async fn bucket_rules(
+    context: &DriverContext,
+    bucket: &str,
+) -> Result<Vec<StorageRoutingRule>, RoutingInputsError> {
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key: key.into().into(),
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: bucket.as_bytes().to_vec().into(),
             txn_id: None,
         })
         .await;
-    match event {
-        Event::Storage(aruna_core::events::StorageEvent::ReadResult { value, .. }) => value,
-        other => {
-            warn!(key_space = key_space, event = ?other, "Routing input read failed");
-            None
-        }
-    }
+    Ok(parse_read(event, BucketInfo::from_bytes)?
+        .map(|info| info.storage_routing)
+        .unwrap_or_default())
 }
 
 /// Routing inputs for one bucket write, assembled before the operation starts.
+/// Failing here fails the write: a partial snapshot would route it to the node
+/// default and D3/D4 record that choice for good.
 pub async fn routing_snapshot(
     context: &DriverContext,
     group_id: GroupId,
     bucket: &str,
-) -> RoutingSnapshot {
-    node_routing(context)
+) -> Result<RoutingSnapshot, RoutingInputsError> {
+    Ok(node_routing(context)
         .snapshot(group_id)
-        .with_group_inputs(group_inputs(context, group_id).await)
-        .with_bucket_rules(bucket_rules(context, bucket).await)
+        .with_group_inputs(group_inputs(context, group_id).await?)
+        .with_bucket_rules(bucket_rules(context, bucket).await?))
 }
 
 /// The same inputs when the caller already holds the bucket record, as the S3
 /// surface does from its auth middleware.
-pub async fn bucket_snapshot(context: &DriverContext, bucket: &BucketInfo) -> RoutingSnapshot {
-    node_routing(context)
+pub async fn bucket_snapshot(
+    context: &DriverContext,
+    bucket: &BucketInfo,
+) -> Result<RoutingSnapshot, RoutingInputsError> {
+    Ok(node_routing(context)
         .snapshot(bucket.group_id)
-        .with_group_inputs(group_inputs(context, bucket.group_id).await)
-        .with_bucket_rules(bucket.storage_routing.clone())
+        .with_group_inputs(group_inputs(context, bucket.group_id).await?)
+        .with_bucket_rules(bucket.storage_routing.clone()))
 }
 
 #[derive(Clone)]
@@ -519,17 +530,55 @@ mod test {
         )
         .await;
 
-        let snapshot = routing_snapshot(&context, group_id, "routed").await;
+        let snapshot = routing_snapshot(&context, group_id, "routed")
+            .await
+            .unwrap();
         assert_eq!(snapshot.bucket_rules, vec![rule.clone()]);
         assert_eq!(snapshot.group_default, record.default_target);
 
-        let known = bucket_snapshot(&context, &info).await;
+        let known = bucket_snapshot(&context, &info).await.unwrap();
         assert_eq!(known.bucket_rules, vec![rule]);
         assert_eq!(known.group_default, record.default_target);
 
-        let absent = routing_snapshot(&context, ulid::Ulid::generate(), "missing").await;
+        // An unwritten group and bucket are normal empty state, never an error.
+        let absent = routing_snapshot(&context, ulid::Ulid::generate(), "missing")
+            .await
+            .unwrap();
         assert!(absent.bucket_rules.is_empty());
         assert_eq!(absent.group_default, None);
+    }
+
+    #[tokio::test]
+    async fn snapshot_fails_corrupt() {
+        // A bucket record that will not decode must fail the write instead of
+        // routing it to the node default.
+        use crate::driver::routing_snapshot;
+        use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+
+        let dir = tempdir().unwrap();
+        let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        write_value(
+            &context,
+            S3_BUCKET_KEYSPACE,
+            b"corrupt".to_vec(),
+            vec![0xff; 8],
+        )
+        .await;
+
+        let result = routing_snapshot(&context, ulid::Ulid::generate(), "corrupt").await;
+
+        assert!(matches!(
+            result,
+            Err(crate::driver::RoutingInputsError::BucketRules(_))
+        ));
     }
 
     async fn write_value(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
@@ -979,7 +1028,9 @@ mod routing_tests {
         let backend_id = register(&test.driver_context, group_id).await;
         set_default(&test.driver_context, group_id, backend_id).await;
 
-        let snapshot = routing_snapshot(&test.driver_context, group_id, "b").await;
+        let snapshot = routing_snapshot(&test.driver_context, group_id, "b")
+            .await
+            .unwrap();
 
         assert_eq!(
             resolve_backend(&snapshot, "b", "k").unwrap(),
@@ -995,7 +1046,9 @@ mod routing_tests {
         let foreign = register(&test.driver_context, Ulid::generate()).await;
         set_default(&test.driver_context, group_id, foreign).await;
 
-        let snapshot = routing_snapshot(&test.driver_context, group_id, "b").await;
+        let snapshot = routing_snapshot(&test.driver_context, group_id, "b")
+            .await
+            .unwrap();
 
         assert!(resolve_backend(&snapshot, "b", "k").is_err());
     }
@@ -1007,7 +1060,9 @@ mod routing_tests {
         let backend_id = register(&test.driver_context, group_id).await;
         set_default(&test.driver_context, group_id, backend_id).await;
 
-        let snapshot = bucket_snapshot(&test.driver_context, &bucket(group_id)).await;
+        let snapshot = bucket_snapshot(&test.driver_context, &bucket(group_id))
+            .await
+            .unwrap();
 
         assert_eq!(
             resolve_backend(&snapshot, "b", "k").unwrap(),

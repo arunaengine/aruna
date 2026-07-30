@@ -843,7 +843,12 @@ async fn write_next(
     .map_err(|error| ImportFailure::Retryable(error.to_string()))?
     .quota
     .effective_group_ceiling(&bucket_info.group_id);
-    let routing = bucket_snapshot(&ctx.driver, &bucket_info).await;
+    let routing = bucket_snapshot(&ctx.driver, &bucket_info)
+        .await
+        .map_err(|error| match error.storage() {
+            Some(_) => ImportFailure::Retryable(error.to_string()),
+            None => ImportFailure::Permanent(error.to_string()),
+        })?;
     let result = drive(
         PutObjectOperation::new(PutObjectConfig {
             user_id: spec.auth_context.user_id,

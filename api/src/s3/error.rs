@@ -1,5 +1,6 @@
 use crate::s3::checksum::checksum_mismatch_error;
 use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
+use aruna_operations::driver::RoutingInputsError;
 use aruna_operations::s3::abort_multipart_upload::AbortMultipartUploadError;
 use aruna_operations::s3::bucket_cors::{
     DeleteBucketCorsError, GetBucketCorsError, PutBucketCorsError,
@@ -43,6 +44,13 @@ fn quota_exceeded_error(limit: u64, usage: u64) -> S3Error {
     );
     error.set_status_code(http::StatusCode::FORBIDDEN);
     error
+}
+
+/// A write whose routing inputs could not be read is refused: landing it on the
+/// node default would permanently record the wrong backend.
+pub(crate) fn routing_inputs_error(error: RoutingInputsError) -> S3Error {
+    warn!(error = %error, "Refusing write with unreadable routing inputs");
+    s3_error!(InternalError, "Storage routing inputs are unavailable")
 }
 
 fn no_such_upload_error() -> S3Error {
@@ -316,6 +324,7 @@ impl IntoS3Error for CopyObjectError {
         match self {
             CopyObjectError::Get(err) => err.into_s3_error(),
             CopyObjectError::Put(err) => err.into_s3_error(),
+            CopyObjectError::Routing(err) => routing_inputs_error(err),
             CopyObjectError::PreconditionFailed => s3_error!(
                 PreconditionFailed,
                 "At least one of the preconditions you specified did not hold."

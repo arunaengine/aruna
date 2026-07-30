@@ -2,6 +2,7 @@ use crate::connectors::resolver::ARUNA_NATIVE_RELATIONSHIP_ID;
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
 };
+use crate::group_backends::{RecordReadError, parse_read};
 use crate::group_routing::load_group_inputs;
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{
@@ -727,6 +728,8 @@ pub enum ReplicateObjectVersionError {
     RoutingFailed(#[from] RoutingError),
     #[error("could not load the group's routing inputs: {0}")]
     RoutingInputsFailed(String),
+    #[error("could not read the bucket's routing rules: {0}")]
+    BucketRulesFailed(#[from] RecordReadError),
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -1197,22 +1200,27 @@ impl ReplicateObjectVersionOperation {
         self.read_bucket_rules()
     }
 
-    /// An unreadable bucket record leaves the rules empty: the write still
-    /// lands on the group or node default instead of failing.
+    /// A bucket without a record simply has no rules; an unreadable or
+    /// undecodable one fails the write instead of rerouting it, matching the
+    /// snapshot the local write surface assembles.
     fn handle_bucket_rules(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        if !matches!(
+            event,
+            Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
+        ) {
             return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
                 received: event,
             });
-        };
-        self.bucket_rules = value
-            .as_ref()
-            .and_then(|value| BucketInfo::from_bytes(value.as_ref()).ok())
-            .map(|info| info.storage_routing)
-            .unwrap_or_default();
-        self.read_reference_source()
+        }
+        match parse_read(event, BucketInfo::from_bytes) {
+            Ok(record) => {
+                self.bucket_rules = record.map(|info| info.storage_routing).unwrap_or_default();
+                self.read_reference_source()
+            }
+            Err(error) => self.fail(error.into()),
+        }
     }
 
     fn read_reference_source(&mut self) -> Effects {
@@ -2818,6 +2826,43 @@ mod tests {
             op.finalize(),
             Ok(Ok(ReplicationSuboperationResult::Skipped))
         );
+    }
+
+    #[test]
+    fn fails_unreadable_rules() {
+        // A storage failure reading the bucket record must fail the write, not
+        // reroute it to the node default.
+        let mut op = ReplicateObjectVersionOperation::new(version_request_with_mode(
+            Ulid::generate(),
+            ReplicationMode::OnDemand,
+        ));
+        op.start();
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![1u8].into(),
+            value: Some(reference_blob_version().to_bytes().unwrap().into()),
+        }));
+        op.step(Event::SubOperation(
+            SubOperationEvent::VersionSourceAccessResolved {
+                result: Ok(ResolvedSourceAccess::OpenDal {
+                    kind: SourceConnectorKind::Http,
+                    config: HashMap::new(),
+                    path: "ref/file.txt".to_string(),
+                    version: None,
+                }),
+            },
+        ));
+        op.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
+            result: Ok(GroupRoutingInputs::default()),
+        }));
+
+        op.step(Event::Storage(StorageEvent::Error {
+            error: aruna_core::errors::StorageError::ReadError,
+        }));
+
+        assert!(matches!(
+            op.finalize(),
+            Err(ReplicateObjectVersionError::BucketRulesFailed(_))
+        ));
     }
 
     #[test]

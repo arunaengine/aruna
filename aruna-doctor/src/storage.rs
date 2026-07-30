@@ -739,7 +739,9 @@ mod tests {
             .unwrap();
 
             let data = b"tiny snapshot object";
-            let routing = routing_snapshot(context.as_ref(), group.0.group_id, &bucket_name).await;
+            let routing = routing_snapshot(context.as_ref(), group.0.group_id, &bucket_name)
+                .await
+                .unwrap();
             let upload = drive(
                 PutObjectOperation::new(PutObjectConfig {
                     user_id: realm_admin,

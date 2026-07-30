@@ -1193,6 +1193,7 @@ fn map_snapshot_error(error: MaterializeSnapshotError) -> ServerError {
         MaterializeSnapshotError::Conversion(error) => {
             ServerError::InternalError(error.to_string())
         }
+        MaterializeSnapshotError::Routing(error) => ServerError::InternalError(error.to_string()),
     }
 }
 

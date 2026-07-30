@@ -1,4 +1,4 @@
-use crate::driver::{DriverContext, drive, routing_snapshot};
+use crate::driver::{DriverContext, RoutingInputsError, drive, routing_snapshot};
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::descriptor::build_version_source_binding;
 use crate::staging::read_source::{
@@ -52,6 +52,8 @@ pub enum MaterializeSnapshotError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
+    #[error(transparent)]
+    Routing(#[from] RoutingInputsError),
 }
 
 pub async fn materialize_snapshot(
@@ -101,7 +103,7 @@ pub async fn materialize_snapshot(
             version_id,
         });
     }
-    let routing = routing_snapshot(context, input.group_id, &input.bucket).await;
+    let routing = routing_snapshot(context, input.group_id, &input.bucket).await?;
     let put_result = drive(
         PutObjectOperation::new(PutObjectConfig {
             user_id: input.user_id,

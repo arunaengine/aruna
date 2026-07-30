@@ -1,4 +1,4 @@
-use crate::driver::{DriverContext, drive, routing_snapshot};
+use crate::driver::{DriverContext, RoutingInputsError, drive, routing_snapshot};
 use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use aruna_core::UserId;
@@ -50,6 +50,8 @@ pub enum CopyObjectError {
     Get(#[from] GetObjectError),
     #[error(transparent)]
     Put(#[from] PutObjectError),
+    #[error(transparent)]
+    Routing(#[from] RoutingInputsError),
     #[error("At least one of the preconditions you specified did not hold.")]
     PreconditionFailed,
 }
@@ -178,7 +180,7 @@ pub async fn copy_object(
     };
     let metadata = input.metadata.unwrap_or(source.metadata);
 
-    let routing = routing_snapshot(context, input.group_id, &input.dest_bucket).await;
+    let routing = routing_snapshot(context, input.group_id, &input.dest_bucket).await?;
     let put_result = drive(
         PutObjectOperation::new(PutObjectConfig {
             user_id: input.user_id,
