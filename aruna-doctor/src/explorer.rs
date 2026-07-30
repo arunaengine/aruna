@@ -9,19 +9,20 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BUCKET_STATS_DB, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE,
     CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE,
-    HASH_PATHS_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
-    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
-    S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
-    SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
-    USER_ACCESS_KEYSPACE,
+    GROUP_STORAGE_BACKEND_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE,
+    METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+    S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
+    S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
+    SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
-    BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument,
-    HashPathIndexKey, MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
-    MultipartUpload, MultipartUploadPart, MultipartUploadPartKey, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId, UserAccess, VersionKey,
+    BackendLocation, BackendRef, BackendsFile, BlobHeadKey, BlobVersion, BucketInfo,
+    CurrentVersionPointer, Group, GroupAuthorizationDocument, HashPathIndexKey,
+    MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
+    MultipartUploadPart, MultipartUploadPartKey, RealmAuthorizationDocument, RealmConfigDocument,
+    RealmId, UserAccess, VersionKey,
 };
 use aruna_net::dht::storage::StoredEntry;
 use chrono::{DateTime, Utc};
@@ -32,7 +33,7 @@ use craqle::{
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 use ulid::Ulid;
 
@@ -54,6 +55,21 @@ pub enum ExplorerError {
     KeyspaceNotFound(String),
     #[error("decode failed: {0}")]
     Decode(String),
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct LocationScanOutput {
+    database_path: String,
+    backends_path: Option<String>,
+    scanned: usize,
+    unresolved: Vec<UnresolvedLocation>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq, Ord, PartialOrd)]
+struct UnresolvedLocation {
+    backend: String,
+    storage_bucket: String,
+    backend_path: String,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -859,6 +875,24 @@ pub async fn print_node_state(database_path: String) -> Result<(), CliError> {
     explore_entries(database_path, NODE_STATE_KEYSPACE.to_string()).await
 }
 
+/// Reports locations whose recorded backend no longer resolves: node refs
+/// against the operator's backends file, group refs against the stored tenant
+/// records. Storage-side only, so the doctor needs no blob backend.
+pub async fn scan_locations(
+    database_path: String,
+    backends_path: Option<String>,
+) -> Result<(), CliError> {
+    let output = tokio::task::spawn_blocking({
+        let database_path = database_path.clone();
+        move || location_scan(&database_path, backends_path.as_deref())
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
 pub async fn print_topics_list(database_path: String) -> Result<(), CliError> {
     let output = tokio::task::spawn_blocking({
         let database_path = database_path.clone();
@@ -988,6 +1022,85 @@ fn list_entries(database_path: &str, keyspace_name: &str) -> Result<EntriesOutpu
         database_path: database_path.to_string(),
         keyspace: keyspace_name.to_string(),
         entries,
+    })
+}
+
+fn known_node_backends(backends_path: Option<&str>) -> Result<BTreeSet<String>, ExplorerError> {
+    let Some(path) = backends_path else {
+        return Ok(BTreeSet::from([BackendRef::DEFAULT_NODE_NAME.to_string()]));
+    };
+    let text = std::fs::read_to_string(path)?;
+    let file =
+        BackendsFile::parse(&text).map_err(|error| ExplorerError::Decode(error.to_string()))?;
+    Ok(file.backend.into_keys().collect())
+}
+
+fn known_group_backends(
+    db: &OptimisticTxDatabase,
+    keyspaces: &[String],
+) -> Result<BTreeSet<Ulid>, ExplorerError> {
+    let mut known = BTreeSet::new();
+    if !keyspaces
+        .iter()
+        .any(|name| name == GROUP_STORAGE_BACKEND_KEYSPACE)
+    {
+        return Ok(known);
+    }
+    let keyspace = db.keyspace(
+        GROUP_STORAGE_BACKEND_KEYSPACE,
+        KeyspaceCreateOptions::default,
+    )?;
+    for entry in db.read_tx().iter(&keyspace) {
+        let (key, _) = entry.into_inner()?;
+        if let Ok(bytes) = <[u8; 16]>::try_from(key.as_ref()) {
+            known.insert(Ulid::from_bytes(bytes));
+        }
+    }
+    Ok(known)
+}
+
+fn location_scan(
+    database_path: &str,
+    backends_path: Option<&str>,
+) -> Result<LocationScanOutput, ExplorerError> {
+    let nodes = known_node_backends(backends_path)?;
+    let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
+    let keyspaces = db
+        .list_keyspace_names()
+        .iter()
+        .map(|name| name.as_ref().to_string())
+        .collect::<Vec<_>>();
+    let groups = known_group_backends(&db, &keyspaces)?;
+
+    let mut scanned = 0;
+    let mut unresolved = Vec::new();
+    if keyspaces.iter().any(|name| name == BLOB_LOCATIONS_KEYSPACE) {
+        let keyspace = db.keyspace(BLOB_LOCATIONS_KEYSPACE, KeyspaceCreateOptions::default)?;
+        for entry in db.read_tx().iter(&keyspace) {
+            let (_, value) = entry.into_inner()?;
+            let location = BackendLocation::from_bytes(value.as_ref())
+                .map_err(|error| ExplorerError::Decode(error.to_string()))?;
+            scanned += 1;
+            let resolves = match &location.backend {
+                BackendRef::Node(name) => nodes.contains(name),
+                BackendRef::Group(id) => groups.contains(id),
+            };
+            if !resolves {
+                unresolved.push(UnresolvedLocation {
+                    backend: location.backend.to_string(),
+                    storage_bucket: location.storage_bucket,
+                    backend_path: location.backend_path,
+                });
+            }
+        }
+    }
+    unresolved.sort();
+
+    Ok(LocationScanOutput {
+        database_path: database_path.to_string(),
+        backends_path: backends_path.map(ToString::to_string),
+        scanned,
+        unresolved,
     })
 }
 
@@ -1358,7 +1471,7 @@ mod tests {
         CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_BATCH_PREFIX, CRAQLE_LOG_KEYSPACE,
         CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, CraqleStoredBatch, CraqleStoredGraphMeta,
         CraqleStoredQuadOp, DecodedField, DecodedValue, decode_entry, list_entries, list_keyspaces,
-        raw_field,
+        location_scan, raw_field,
     };
     use aruna::config::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
@@ -1368,9 +1481,9 @@ mod tests {
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, API_STATE_KEYSPACE,
         AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
         BUCKET_STATS_DB, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE,
-        HASH_PATHS_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
-        METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE,
-        ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+        GROUP_STORAGE_BACKEND_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE,
+        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+        NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
         S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
         S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
         SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
@@ -1395,6 +1508,98 @@ mod tests {
     use std::time::SystemTime;
     use tempfile::tempdir;
     use ulid::Ulid;
+
+    fn scan_location(backend: BackendRef) -> BackendLocation {
+        BackendLocation {
+            backend,
+            storage_class: None,
+            root: "/tmp".to_string(),
+            storage_bucket: "blob-bucket".to_string(),
+            backend_path: "path/blob.bin".to_string(),
+            ulid: Ulid::from_bytes([5_u8; 16]),
+            compressed: false,
+            encrypted: false,
+            created_by: aruna_core::UserId::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 11,
+            hashes: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn scan_reports_unknown_backend() {
+        // A removed backend must be discoverable without a blob backend.
+        let temp = tempdir().unwrap();
+        let backends_path = temp.path().join("backends.toml");
+        std::fs::write(
+            &backends_path,
+            "[backend.hot]\ntype = \"filesystem\"\nroot = \"/data/hot\"\ndefault = true\n",
+        )
+        .unwrap();
+        let group_id = Ulid::generate();
+        {
+            let db = OptimisticTxDatabase::builder(temp.path().join("db"))
+                .open()
+                .unwrap();
+            let locations = db
+                .keyspace(BLOB_LOCATIONS_KEYSPACE, KeyspaceCreateOptions::default)
+                .unwrap();
+            let group_backends = db
+                .keyspace(
+                    GROUP_STORAGE_BACKEND_KEYSPACE,
+                    KeyspaceCreateOptions::default,
+                )
+                .unwrap();
+            let mut txn = db.write_tx().unwrap();
+            txn.insert(
+                locations.clone(),
+                vec![1_u8; 32],
+                scan_location(BackendRef::Node("hot".to_string()))
+                    .to_bytes()
+                    .unwrap(),
+            );
+            txn.insert(
+                locations.clone(),
+                vec![2_u8; 32],
+                scan_location(BackendRef::Node("gone".to_string()))
+                    .to_bytes()
+                    .unwrap(),
+            );
+            txn.insert(
+                locations.clone(),
+                vec![3_u8; 32],
+                scan_location(BackendRef::Group(group_id))
+                    .to_bytes()
+                    .unwrap(),
+            );
+            txn.insert(
+                locations,
+                vec![4_u8; 32],
+                scan_location(BackendRef::Group(Ulid::generate()))
+                    .to_bytes()
+                    .unwrap(),
+            );
+            txn.insert(group_backends, group_id.to_bytes().to_vec(), vec![0_u8]);
+            let _ = txn.commit().unwrap();
+        }
+
+        let output = location_scan(
+            temp.path().join("db").to_str().unwrap(),
+            backends_path.to_str(),
+        )
+        .unwrap();
+
+        assert_eq!(output.scanned, 4);
+        let named = output
+            .unresolved
+            .into_iter()
+            .map(|entry| entry.backend)
+            .collect::<Vec<_>>();
+        assert_eq!(named.len(), 2);
+        assert!(named.contains(&"node:gone".to_string()));
+    }
 
     #[test]
     fn lists_sorted_keyspaces() {

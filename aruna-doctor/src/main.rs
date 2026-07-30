@@ -1,7 +1,7 @@
 use crate::error::CliError;
 use crate::explorer::{
     explore_entries, explore_keyspaces, print_node_state, print_topic_placements,
-    print_topic_status, print_topics_list,
+    print_topic_status, print_topics_list, scan_locations,
 };
 use crate::info::print_info;
 use crate::iroh_check::print_iroh_check;
@@ -95,6 +95,14 @@ pub enum ExploreCommands {
         database_path: String,
         keyspace: String,
     },
+    /// Lists stored locations whose backend no longer resolves.
+    Locations {
+        database_path: String,
+        /// Backends file to resolve node backends against. Without it only the
+        /// implicit `default` backend counts as registered.
+        #[arg(long)]
+        backends_path: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -184,6 +192,10 @@ pub async fn main() -> Result<(), CliError> {
                 database_path,
                 keyspace,
             } => explore_entries(database_path, keyspace).await?,
+            ExploreCommands::Locations {
+                database_path,
+                backends_path,
+            } => scan_locations(database_path, backends_path).await?,
         },
         Commands::Topics { command } => match command {
             TopicsCommands::List { database_path } => print_topics_list(database_path).await?,

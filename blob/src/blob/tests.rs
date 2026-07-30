@@ -319,6 +319,73 @@ fn cold_backend() -> ResolvedBackend {
     )
 }
 
+/// Backend-agnostic assertion path: reads through the handler instead of the
+/// filesystem, so a mixed-backend test never pins one backend's layout.
+async fn read_back(handler: &BlobHandler, location: BackendLocation) -> Vec<u8> {
+    let BlobEvent::ReadFinished { blob, .. } = handler.read_blob(location).await else {
+        panic!("read failed")
+    };
+    let chunks: Vec<bytes::Bytes> = blob.try_collect().await.unwrap();
+    chunks.concat()
+}
+
+#[tokio::test]
+async fn part_copy_crosses_backends() {
+    // UploadPartCopy shape: source on the default backend, part pinned to cold.
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+
+    let BlobEvent::WriteFinished { location: source } = handler
+        .write_blob(
+            "bucket",
+            "source.bin",
+            ResolvedBackend::node_default(),
+            test_user_id(),
+            stream_from_bytes(b"copied bytes"),
+        )
+        .await
+    else {
+        panic!("source write failed")
+    };
+
+    let BlobEvent::ReadFinished { blob, .. } = handler.read_blob(source.clone()).await else {
+        panic!("source read failed")
+    };
+    let BlobEvent::WriteFinished { location: part } = handler
+        .write_blob_part(
+            MultipartUploadPartKey::new(Ulid::generate(), 1),
+            cold_backend(),
+            test_user_id(),
+            false,
+            false,
+            blob,
+        )
+        .await
+    else {
+        panic!("part write failed")
+    };
+
+    assert_eq!(part.backend, BackendRef::Node("cold".to_string()));
+    assert!(part.backend_path.starts_with("_parts/"));
+
+    let BlobEvent::WriteFinished { location: composed } = handler
+        .compose_blob(
+            "bucket",
+            "target.bin",
+            cold_backend(),
+            test_user_id(),
+            vec![part],
+        )
+        .await
+    else {
+        panic!("compose failed")
+    };
+
+    assert_eq!(composed.backend, BackendRef::Node("cold".to_string()));
+    assert_eq!(read_back(&handler, composed).await, b"copied bytes");
+    assert_eq!(read_back(&handler, source).await, b"copied bytes");
+}
+
 #[test]
 fn registry_reads_config() {
     // The parsed backends file is the only source of names, classes and rules.
