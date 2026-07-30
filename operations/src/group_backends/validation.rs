@@ -75,9 +75,10 @@ pub const fn rules_for_kind(kind: GroupBackendKind) -> GroupBackendRules {
             one_of_secret: &[],
         },
         // Azure exposes no switch to disable ambient discovery, so a static
-        // credential is the only thing keeping that chain unreachable.
+        // credential is the only thing keeping that chain unreachable. Opendal
+        // pushes the shared-key provider only when `account_name` is set too.
         GroupBackendKind::Azblob => GroupBackendRules {
-            required_public: &["endpoint", "container"],
+            required_public: &["endpoint", "container", "account_name"],
             allowed_public: &["endpoint", "container", "root", "account_name"],
             allowed_secret: &["account_key", "sas_token"],
             required_secret: &[],
@@ -86,7 +87,7 @@ pub const fn rules_for_kind(kind: GroupBackendKind) -> GroupBackendRules {
         // `authority_host` is absent: it redirects the OAuth token request to a
         // tenant-chosen host.
         GroupBackendKind::Azdls => GroupBackendRules {
-            required_public: &["endpoint", "filesystem"],
+            required_public: &["endpoint", "filesystem", "account_name"],
             allowed_public: &["endpoint", "filesystem", "root", "account_name"],
             allowed_secret: &["account_key", "sas_token"],
             required_secret: &[],
@@ -314,6 +315,31 @@ mod tests {
     }
 
     #[test]
+    fn requires_account_name() {
+        // Opendal derives the name only for `*.core.windows.net`-style hosts, so
+        // without it a tenant endpoint gets the node's ambient token instead.
+        for kind in [GroupBackendKind::Azblob, GroupBackendKind::Azdls] {
+            let mut public = kind_public(kind);
+            public.remove("account_name");
+            public.insert(
+                "endpoint".to_string(),
+                "https://collector.attacker.example".to_string(),
+            );
+
+            let error =
+                validate_backend_input("tenant", kind, &public, &kind_secret(kind)).unwrap_err();
+
+            assert_eq!(
+                error,
+                GroupBackendError::MissingPublicKey {
+                    kind,
+                    key: "account_name".to_string(),
+                }
+            );
+        }
+    }
+
+    #[test]
     fn rejects_bad_endpoint() {
         let mut public = s3_public();
         public.insert("endpoint".to_string(), "http://s3.example.com".to_string());
@@ -350,10 +376,12 @@ mod tests {
             GroupBackendKind::Azblob => config(&[
                 ("endpoint", "https://acct.blob.core.windows.net"),
                 ("container", "data"),
+                ("account_name", "acct"),
             ]),
             GroupBackendKind::Azdls => config(&[
                 ("endpoint", "https://acct.dfs.core.windows.net"),
                 ("filesystem", "data"),
+                ("account_name", "acct"),
             ]),
             GroupBackendKind::B2 => config(&[("bucket", "data"), ("bucket_id", "abc")]),
         }

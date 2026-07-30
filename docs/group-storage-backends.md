@@ -24,9 +24,13 @@ Five kinds are supported, each with its own required configuration:
 | ---- | --------------- | --------------- |
 | `s3` | `endpoint`, `bucket` | `access_key_id`, `secret_access_key` |
 | `gcs` | `bucket` | `credential` |
-| `azblob` | `endpoint`, `container` | `account_key` or `sas_token` |
-| `azdls` | `endpoint`, `filesystem` | `account_key` or `sas_token` |
+| `azblob` | `endpoint`, `container`, `account_name` | `account_key` or `sas_token` |
+| `azdls` | `endpoint`, `filesystem`, `account_name` | `account_key` or `sas_token` |
 | `b2` | `bucket`, `bucket_id` | `application_key_id`, `application_key` |
+
+`account_name` is mandatory on both Azure kinds: without it opendal never pushes
+the static shared-key provider and signs the request with the node's ambient
+Azure identity instead.
 
 Credentials must be static and long-lived. Session tokens are rejected: Aruna
 has no rotation story for them yet, and a write that outlives the token would
