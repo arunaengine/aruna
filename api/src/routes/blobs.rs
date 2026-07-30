@@ -233,6 +233,9 @@ pub struct BlobLocationsResponse {
     pub key: String,
     pub version_id: String,
     pub copies: Vec<BlobCopyResponse>,
+    /// The queued-replication scan hit its page cap, so a queued copy may be
+    /// missing from `copies` rather than genuinely absent.
+    pub queued_truncated: bool,
 }
 
 fn pending_copy(node_id: NodeId, state: BlobCopyState) -> BlobCopyResponse {
@@ -372,8 +375,15 @@ pub async fn blob_locations(
     )
     .await
     .unwrap_or_default();
-    for node_id in queued.into_iter().filter(|node| *node != local_node) {
-        candidates.entry(node_id).or_insert(query.bucket.clone());
+    for node_id in queued.nodes.iter().filter(|node| **node != local_node) {
+        candidates.entry(*node_id).or_insert(query.bucket.clone());
+    }
+    if queued.truncated {
+        warn!(
+            bucket = %query.bucket,
+            key = %query.path,
+            "Queued replication scan hit its page cap; queued copies may be missing"
+        );
     }
 
     let answers = stream::iter(candidates.into_iter().map(|(node_id, bucket)| {
@@ -419,6 +429,7 @@ pub async fn blob_locations(
         key: query.path,
         version_id: resolved.to_string(),
         copies,
+        queued_truncated: queued.truncated,
     }))
 }
 

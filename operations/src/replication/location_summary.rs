@@ -572,6 +572,14 @@ enum QueuedState {
     Error,
 }
 
+/// Nodes with a queued replication job, plus whether the scan hit its page cap
+/// before the keyspace ended. A truncated answer may be missing queued copies.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QueuedReplicas {
+    pub nodes: BTreeSet<NodeId>,
+    pub truncated: bool,
+}
+
 /// Collects nodes with a queued replication job for one version. They are the
 /// copies a caller must see as `pending`: no location record for them exists
 /// anywhere yet, so nothing else would report them.
@@ -581,9 +589,9 @@ pub struct QueuedReplicaNodesOperation {
     key: String,
     version_id: Ulid,
     pages: usize,
-    nodes: BTreeSet<NodeId>,
+    found: QueuedReplicas,
     state: QueuedState,
-    output: Option<Result<BTreeSet<NodeId>, LocationSummaryError>>,
+    output: Option<Result<QueuedReplicas, LocationSummaryError>>,
 }
 
 impl QueuedReplicaNodesOperation {
@@ -593,7 +601,7 @@ impl QueuedReplicaNodesOperation {
             key,
             version_id,
             pages: 0,
-            nodes: BTreeSet::new(),
+            found: QueuedReplicas::default(),
             state: QueuedState::Init,
             output: None,
         }
@@ -625,15 +633,16 @@ impl QueuedReplicaNodesOperation {
         }
     }
 
-    fn finish(&mut self) -> Effects {
+    fn finish(&mut self, truncated: bool) -> Effects {
         self.state = QueuedState::Finish;
-        self.output = Some(Ok(std::mem::take(&mut self.nodes)));
+        self.found.truncated = truncated;
+        self.output = Some(Ok(std::mem::take(&mut self.found)));
         smallvec![]
     }
 }
 
 impl Operation for QueuedReplicaNodesOperation {
-    type Output = BTreeSet<NodeId>;
+    type Output = QueuedReplicas;
     type Error = LocationSummaryError;
 
     fn start(&mut self) -> Effects {
@@ -661,12 +670,13 @@ impl Operation for QueuedReplicaNodesOperation {
                         continue;
                     };
                     if self.covers(&record.input) {
-                        self.nodes.insert(record.input.target_node_id);
+                        self.found.nodes.insert(record.input.target_node_id);
                     }
                 }
                 match next_start_after {
                     Some(start) if self.pages < QUEUED_JOB_MAX_PAGES => self.scan(Some(start)),
-                    _ => self.finish(),
+                    Some(_) => self.finish(true),
+                    None => self.finish(false),
                 }
             }
             QueuedState::Finish | QueuedState::Error => smallvec![],
@@ -891,8 +901,39 @@ mod tests {
             next_start_after: None,
         }));
 
-        let nodes = operation.finalize().unwrap();
-        assert_eq!(nodes.len(), 1);
-        assert!(nodes.contains(&wanted));
+        let queued = operation.finalize().unwrap();
+        assert_eq!(queued.nodes.len(), 1);
+        assert!(queued.nodes.contains(&wanted));
+        assert!(!queued.truncated);
+    }
+
+    #[test]
+    fn signals_truncated_scan() {
+        // A capped scan must not look like an exhausted one: a queued copy past
+        // the cap is otherwise indistinguishable from absent.
+        let wanted = node_id(6);
+        let mut operation = QueuedReplicaNodesOperation::new(
+            "raw".to_string(),
+            "run1.tar".to_string(),
+            Ulid::from_bytes([3u8; 16]),
+        );
+        operation.start();
+
+        for _ in 0..super::QUEUED_JOB_MAX_PAGES {
+            operation.step(Event::Storage(StorageEvent::IterResult {
+                values: vec![(
+                    b"a".to_vec().into(),
+                    job(ReplicateScopeTarget::Bucket, wanted)
+                        .to_bytes()
+                        .unwrap()
+                        .into(),
+                )],
+                next_start_after: Some(b"a".to_vec().into()),
+            }));
+        }
+
+        let queued = operation.finalize().unwrap();
+        assert!(queued.truncated);
+        assert!(queued.nodes.contains(&wanted));
     }
 }
