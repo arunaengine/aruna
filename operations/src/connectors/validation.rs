@@ -57,7 +57,11 @@ pub fn validate_connector_input(
         return Err(ValidationError::EmptyName);
     }
 
-    if kind == SourceConnectorKind::ArunaNative {
+    // ftp is refused because opendal cannot constrain its passive data address.
+    if matches!(
+        kind,
+        SourceConnectorKind::Ftp | SourceConnectorKind::ArunaNative
+    ) {
         return Err(ValidationError::UnsupportedConnectorKind { kind });
     }
 
@@ -241,8 +245,9 @@ mod tests {
     }
 
     #[test]
-    fn accepts_valid_ftp_config() {
-        validate_connector_input(
+    fn rejects_ftp_kind() {
+        // An otherwise well-formed ftp connector must still fail registration.
+        let err = validate_connector_input(
             "ftp",
             SourceConnectorKind::Ftp,
             &HashMap::from([
@@ -257,7 +262,14 @@ mod tests {
                 ("password".to_string(), "secret".to_string()),
             ]),
         )
-        .unwrap();
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ValidationError::UnsupportedConnectorKind {
+                kind: SourceConnectorKind::Ftp,
+            }
+        );
     }
 
     #[test]

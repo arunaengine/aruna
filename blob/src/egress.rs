@@ -155,9 +155,9 @@ impl EgressGuard {
         Ok(self.plain.get(url))
     }
 
-    /// Preflight screen for protocols no HTTP client can cover, such as FTP.
-    /// Every resolved address must pass; a rebind after this point is the
-    /// documented residual.
+    /// Preflight screen for endpoints resolved outside the guarded client.
+    /// Every resolved address must pass; a rebind after this point is not
+    /// covered, so this is never sufficient on its own.
     pub async fn screen(&self, endpoint: &str) -> Result<(), EgressError> {
         let url =
             Url::parse(endpoint).map_err(|_| EgressError::MissingHost(endpoint.to_string()))?;

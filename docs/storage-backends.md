@@ -158,12 +158,12 @@ network firewall.
 - **A globally routed address that reaches internal infrastructure is
   invisible.** NAT that maps a public address onto an internal service defeats
   any host-side IP check. Only the operator's firewall can express that.
-- **FTP staging sources keep a preflight-only window.** opendal's FTP service
-  does not speak HTTP, so the guarded client cannot cover it. FTP sources are
-  screened at creation and again immediately before each operator build; the
-  window between that resolution and the library's own connect cannot be
-  closed from here. FTP remains read-only staging and is never a write
-  backend.
+- **FTP staging sources are refused.** opendal's FTP service does not speak
+  HTTP, so the guarded client cannot cover it, and it exposes no way to
+  constrain the passive data address: the server picks the host and port the
+  node connects to. Registering an `ftp` connector fails with `400`, and any
+  stored `ftp` record fails at use. The kind stays readable so existing
+  records can still be listed and deleted.
 - **Backblaze B2 has no counterfactual zero-connect test.** Every other
   provider kind is pinned by a test asserting zero connections to its
   credential endpoint. B2's endpoint is hardcoded upstream, so no such test

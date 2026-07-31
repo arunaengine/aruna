@@ -113,7 +113,6 @@ opendal = { version = "0.57.0", features = [
     "services-azdls",
     "services-b2",
     "services-fs",
-    "services-ftp",
     "services-gcs",
     "services-s3",
     "services-http",

@@ -100,7 +100,9 @@ pub enum ApiSourceConnectorKind {
     Http,
     S3,
     Webdav,
+    /// Rejected on registration and refused at use; readable on stored records only.
     Ftp,
+    /// Rejected on registration and refused at use; readable on stored records only.
     ArunaNative,
 }
 

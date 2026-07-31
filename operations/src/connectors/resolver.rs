@@ -534,17 +534,17 @@ mod tests {
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
                 group_id,
                 created_by: Default::default(),
-                name: "ftp-source".to_string(),
-                kind: SourceConnectorKind::Ftp,
+                name: "dav-source".to_string(),
+                kind: SourceConnectorKind::Webdav,
                 public_config: HashMap::from([
                     (
                         "endpoint".to_string(),
-                        "ftp://ftp.example.org:21".to_string(),
+                        "https://dav.example.org".to_string(),
                     ),
                     ("root".to_string(), "/datasets".to_string()),
                 ]),
                 secret_config: HashMap::from([
-                    ("user".to_string(), "alice".to_string()),
+                    ("username".to_string(), "alice".to_string()),
                     ("password".to_string(), "secret".to_string()),
                 ]),
             }),
@@ -571,10 +571,10 @@ mod tests {
             path,
             version,
         } = resolved.access;
-        assert_eq!(kind, SourceConnectorKind::Ftp);
+        assert_eq!(kind, SourceConnectorKind::Webdav);
         assert_eq!(path, "run-1/data.txt");
         assert_eq!(version, None);
-        assert_eq!(config.get("user").map(String::as_str), Some("alice"));
+        assert_eq!(config.get("username").map(String::as_str), Some("alice"));
         assert_eq!(config.get("root").map(String::as_str), Some("/datasets"));
     }
 
@@ -711,17 +711,17 @@ mod tests {
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
                 group_id,
                 created_by: Default::default(),
-                name: "ftp-source".to_string(),
-                kind: SourceConnectorKind::Ftp,
+                name: "dav-source".to_string(),
+                kind: SourceConnectorKind::Webdav,
                 public_config: HashMap::from([
                     (
                         "endpoint".to_string(),
-                        "ftp://ftp.example.org:21".to_string(),
+                        "https://dav.example.org".to_string(),
                     ),
                     ("root".to_string(), "/datasets".to_string()),
                 ]),
                 secret_config: HashMap::from([
-                    ("user".to_string(), "alice".to_string()),
+                    ("username".to_string(), "alice".to_string()),
                     ("password".to_string(), "secret".to_string()),
                 ]),
             }),
@@ -771,15 +771,15 @@ mod tests {
             path,
             version,
         } = access;
-        assert_eq!(kind, SourceConnectorKind::Ftp);
+        assert_eq!(kind, SourceConnectorKind::Webdav);
         assert_eq!(path, "run-1/data.txt");
         assert_eq!(version, None);
         assert_eq!(
             config.get("endpoint").map(String::as_str),
-            Some("ftp://ftp.example.org:21")
+            Some("https://dav.example.org")
         );
         assert_eq!(config.get("root").map(String::as_str), Some("/datasets"));
-        assert_eq!(config.get("user").map(String::as_str), Some("alice"));
+        assert_eq!(config.get("username").map(String::as_str), Some("alice"));
     }
 
     #[test]

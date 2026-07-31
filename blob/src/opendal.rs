@@ -244,19 +244,9 @@ async fn build_source_operator<'access>(
                     build_service::<services::Webdav>(config.clone(), Some(guard.layer()))
                         .map_err(staging_operator_creation_error)?
                 }
-                // opendal's ftp service never touches an http client, so a
-                // preflight screen is the only control available here.
-                SourceConnectorKind::Ftp => {
-                    let endpoint = config.get("endpoint").ok_or_else(|| {
-                        StagingSourceError::OperatorCreationFailed(
-                            "ftp connector endpoint is missing".to_string(),
-                        )
-                    })?;
-                    guard.screen(endpoint).await?;
-                    build_service::<services::Ftp>(config.clone(), None)
-                        .map_err(staging_operator_creation_error)?
-                }
-                SourceConnectorKind::ArunaNative => {
+                // opendal's ftp service exposes no way to constrain the passive
+                // data address, so the data socket cannot be screened.
+                SourceConnectorKind::Ftp | SourceConnectorKind::ArunaNative => {
                     return Err(StagingSourceError::UnsupportedKind(kind.to_string()));
                 }
             };
@@ -611,8 +601,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ftp_screens_endpoint() {
-        // ftp never reaches an http client, so the preflight screen is the control.
+    async fn refuses_ftp_kind() {
+        // A stored ftp record must never reach a socket: the passive data
+        // address is server-chosen and cannot be screened.
         let listener = CountingListener::bind().await;
         let endpoint = listener.endpoint.replace("http://", "ftp://");
         let access = ResolvedSourceAccess::OpenDal {
@@ -621,11 +612,12 @@ mod tests {
             path: "file.txt".to_string(),
             version: None,
         };
-        let guard = EgressGuard::new(EgressPolicy::strict()).unwrap();
 
-        let error = build_source_operator(&guard, &access).await.unwrap_err();
+        let error = build_source_operator(&test_guard(), &access)
+            .await
+            .unwrap_err();
 
-        assert!(matches!(error, StagingSourceError::EgressDenied(_)));
+        assert!(matches!(error, StagingSourceError::UnsupportedKind(kind) if kind == "ftp"));
         assert_eq!(listener.hits(), 0);
     }
 
@@ -641,25 +633,6 @@ mod tests {
         let (.., path, version) = build_source_operator(&test_guard(), &access).await.unwrap();
         assert_eq!(path, "file.txt");
         assert_eq!(version, Some("v42"));
-    }
-
-    #[tokio::test]
-    async fn ftp_build_helper_accepts_expected_keys() {
-        let access = ResolvedSourceAccess::OpenDal {
-            kind: SourceConnectorKind::Ftp,
-            config: HashMap::from([
-                ("endpoint".to_string(), "ftp://127.0.0.1:21".to_string()),
-                ("root".to_string(), "/datasets".to_string()),
-                ("user".to_string(), "alice".to_string()),
-                ("password".to_string(), "secret".to_string()),
-            ]),
-            path: "run-1/data.txt".to_string(),
-            version: None,
-        };
-
-        let (.., path, version) = build_source_operator(&test_guard(), &access).await.unwrap();
-        assert_eq!(path, "run-1/data.txt");
-        assert_eq!(version, None);
     }
 
     #[tokio::test]
