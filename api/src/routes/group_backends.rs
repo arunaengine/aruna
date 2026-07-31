@@ -2,7 +2,10 @@ use crate::auth::{parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage_routing::ensure_group_admin;
 use crate::server_state::ServerState;
-use aruna_core::structs::{AuthContext, CleanupStrategy, GroupBackendKind, GroupStorageBackend};
+use aruna_core::structs::{
+    AuthContext, BackendRef, CleanupStrategy, GroupBackendKind, GroupStorageBackend,
+};
+use aruna_operations::blob::reclaim::backend_status;
 use aruna_operations::driver::drive;
 use aruna_operations::group_backends::create::{
     CreateGroupBackendError, CreateGroupBackendInput, CreateGroupBackendOperation,
@@ -36,7 +39,8 @@ use utoipa::{OpenApi, ToSchema};
         get_group_backend,
         replace_group_backend,
         delete_group_backend,
-        enable_group_backend
+        enable_group_backend,
+        group_backend_reclaim_status
     )
 )]
 pub struct GroupBackendsApiDoc;
@@ -56,6 +60,10 @@ pub fn router() -> Router<Arc<ServerState>> {
         .route(
             "/groups/{group_id}/storage-backends/{backend_id}/enable",
             post(enable_group_backend),
+        )
+        .route(
+            "/groups/{group_id}/storage-backends/{backend_id}/reclaim-status",
+            get(group_backend_reclaim_status),
         )
 }
 
@@ -130,6 +138,18 @@ pub struct GroupBackendResponse {
     /// Writes are refused while this is set; reads keep working.
     pub disabled: bool,
     pub cleanup: CleanupPolicy,
+}
+
+/// Reclaim queue depth for one backend, computed from the queues on each call.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ReclaimStatusResponse {
+    pub pending_candidates: usize,
+    /// Physical deletes still queued for this backend. A count that never falls
+    /// means reclaim is blocked.
+    pub failing_cleanups: usize,
+    pub oldest_enqueued_at: Option<String>,
+    /// A scan hit its cap, so the counts are lower bounds.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -386,6 +406,50 @@ pub async fn enable_group_backend(
     Ok(Json(record.into()))
 }
 
+#[utoipa::path(
+    get,
+    path = "/groups/{group_id}/storage-backends/{backend_id}/reclaim-status",
+    tag = "storage-backends",
+    params(
+        ("group_id" = String, Path, description = "Group id"),
+        ("backend_id" = String, Path, description = "Backend id")
+    ),
+    responses(
+        (status = 200, description = "Reclaim queue depth", body = ReclaimStatusResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Backend not found", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn group_backend_reclaim_status(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((group_id, backend_id)): Path<(String, String)>,
+) -> ServerResult<Json<ReclaimStatusResponse>> {
+    let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
+    let backend_id = Ulid::from_str(&backend_id).map_err(|_| ServerError::BadRequest)?;
+    let context = state.get_ctx();
+
+    drive(GetGroupBackendOperation::new(backend_id), &context)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?
+        .filter(|record| record.group_id == group_id)
+        .ok_or(ServerError::NotFound)?;
+    let status = backend_status(&context, &BackendRef::Group(backend_id))
+        .await
+        .map_err(ServerError::InternalError)?;
+
+    Ok(Json(ReclaimStatusResponse {
+        pending_candidates: status.pending_candidates,
+        failing_cleanups: status.failing_cleanups,
+        oldest_enqueued_at: status
+            .oldest_enqueued_at
+            .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339()),
+        truncated: status.truncated,
+    }))
+}
+
 async fn set_disabled(
     state: &Arc<ServerState>,
     auth: Option<AuthContext>,
@@ -411,7 +475,8 @@ async fn set_disabled(
 mod tests {
     use super::{
         CleanupPolicy, CleanupStrategy, CreateGroupBackendRequest, create_group_backend,
-        delete_group_backend, enable_group_backend, list_group_backends,
+        delete_group_backend, enable_group_backend, group_backend_reclaim_status,
+        list_group_backends,
     };
     use crate::error::ServerError;
     use crate::routes::storage_routing::tests::setup_state;
@@ -451,17 +516,31 @@ mod tests {
         .await;
 
         assert!(matches!(enabled, Err(ServerError::Forbidden)));
+
+        let status = group_backend_reclaim_status(
+            State(test.state.clone()),
+            Extension(Some(test.other_auth.clone())),
+            Path((test.group_id.to_string(), Ulid::generate().to_string())),
+        )
+        .await;
+
+        assert!(matches!(status, Err(ServerError::Forbidden)));
     }
 
     #[tokio::test]
     async fn openapi_lists_enable() {
         let openapi = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
 
-        assert!(
-            openapi["paths"]
-                .get("/groups/{group_id}/storage-backends/{backend_id}/enable")
-                .is_some()
-        );
+        for path in ["enable", "reclaim-status"] {
+            assert!(
+                openapi["paths"]
+                    .get(format!(
+                        "/groups/{{group_id}}/storage-backends/{{backend_id}}/{path}"
+                    ))
+                    .is_some(),
+                "{path}"
+            );
+        }
         for field in ["disabled", "cleanup"] {
             assert!(
                 openapi["components"]["schemas"]["GroupBackendResponse"]["properties"]
@@ -504,6 +583,21 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn reclaim_status_needs_backend() {
+        // The record must exist and belong to the group before any queue scan.
+        let test = setup_state().await;
+
+        let result = group_backend_reclaim_status(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Path((test.group_id.to_string(), Ulid::generate().to_string())),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServerError::NotFound)));
     }
 
     #[tokio::test]

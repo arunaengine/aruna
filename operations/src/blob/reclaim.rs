@@ -109,6 +109,7 @@ async fn sweep_at(context: &DriverContext, now: SystemTime) -> Result<ReclaimOut
                 outcome.dropped = outcome.dropped.saturating_add(1);
                 continue;
             };
+            let backend = candidate.0.backend.clone();
             let strategy = match &candidate.0.backend {
                 BackendRef::Node(name) => catalog.cleanup_of(name).unwrap_or_default(),
                 BackendRef::Group(id) => group_strategy(context, &mut records, *id)
@@ -137,7 +138,7 @@ async fn sweep_at(context: &DriverContext, now: SystemTime) -> Result<ReclaimOut
                 Ok(ReclaimVerdict::Pinned) => outcome.pinned = outcome.pinned.saturating_add(1),
                 Ok(ReclaimVerdict::Dropped) => outcome.dropped = outcome.dropped.saturating_add(1),
                 Err(error) => {
-                    warn!(error = %error, "Blob reclaim candidate failed");
+                    warn!(backend = %backend, error = %error, "Blob reclaim candidate failed");
                     outcome.failed = outcome.failed.saturating_add(1);
                 }
             }
@@ -224,6 +225,69 @@ async fn delete_candidates(context: &DriverContext, keys: Vec<Key>) -> Result<()
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected candidate delete event: {other:?}")),
     }
+}
+
+/// Queue depth for one backend, computed from the queues themselves so it can
+/// never drift. `truncated` reports that a scan hit its cap.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReclaimStatus {
+    pub pending_candidates: usize,
+    pub failing_cleanups: usize,
+    pub oldest_enqueued_at: Option<SystemTime>,
+    pub truncated: bool,
+}
+
+const STATUS_SCAN_LIMIT: usize = 10_000;
+
+/// Counts one backend's queued candidates and the physical deletes still owed
+/// to it. The candidate side is a bounded prefix scan; the cleanup queue has no
+/// backend order, so that side is a capped filtered scan.
+pub async fn backend_status(
+    context: &DriverContext,
+    backend: &BackendRef,
+) -> Result<ReclaimStatus, String> {
+    let mut status = ReclaimStatus::default();
+    let (candidates, next) = iter_prefix_page(
+        &context.storage_handle,
+        BLOB_RECLAIM_KEYSPACE,
+        Some(ReclaimCandidateKey::prefix(backend).into()),
+        None,
+        STATUS_SCAN_LIMIT,
+        None,
+    )
+    .await?;
+    status.pending_candidates = candidates.len();
+    status.truncated = next.is_some();
+    for (_, value) in candidates {
+        if let Ok(candidate) = ReclaimCandidate::from_bytes(value.as_ref()) {
+            status.oldest_enqueued_at = Some(match status.oldest_enqueued_at {
+                Some(oldest) => oldest.min(candidate.enqueued_at),
+                None => candidate.enqueued_at,
+            });
+        }
+    }
+
+    let (cleanups, next) = iter_prefix_page(
+        &context.storage_handle,
+        BLOB_CLEANUP_KEYSPACE,
+        None,
+        None,
+        STATUS_SCAN_LIMIT,
+        None,
+    )
+    .await?;
+    status.truncated = status.truncated || next.is_some();
+    status.failing_cleanups = cleanups
+        .iter()
+        .filter(
+            |(_, value)| match BlobCleanupWork::from_bytes(value.as_ref()) {
+                Ok(BlobCleanupWork::DeleteBlob { location }) => &location.backend == backend,
+                _ => false,
+            },
+        )
+        .count();
+
+    Ok(status)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1016,6 +1080,34 @@ mod tests {
         }
         .to_bytes()
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn status_counts_one_backend() {
+        // Another backend's queue rows must not show up in this one's depth.
+        let dir = tempdir().unwrap();
+        let context = context(dir.path().to_str().unwrap());
+        seed(&context, 10).await;
+        write(
+            &context,
+            BLOB_RECLAIM_KEYSPACE,
+            ReclaimCandidateKey::new(BackendRef::Node("cold".to_string()), [9u8; 32]).to_bytes(),
+            ReclaimCandidate {
+                enqueued_at: SystemTime::UNIX_EPOCH,
+            }
+            .to_bytes()
+            .unwrap(),
+        )
+        .await;
+
+        let status = backend_status(&context, &BackendRef::node_default())
+            .await
+            .unwrap();
+
+        assert_eq!(status.pending_candidates, 1);
+        assert_eq!(status.failing_cleanups, 0);
+        assert_eq!(status.oldest_enqueued_at, Some(SystemTime::UNIX_EPOCH));
+        assert!(!status.truncated);
     }
 
     #[test]
