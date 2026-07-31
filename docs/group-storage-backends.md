@@ -119,12 +119,18 @@ on. `disabled` on the backend record tells you which state it is in.
 Credentials can be changed while a backend is disabled, so a leaked key can be
 replaced without accepting writes again.
 
-The record and its credentials remain on the node while any stored copy or
-queued cleanup still names the backend. Once nothing does, the node deletes the
-record and the credentials by itself, on the same schedule as the reclaim sweep.
-A backend set to `retain` keeps its stored copies, and so its record, forever;
-set `cleanup` to `reclaim` before disabling if you want the node to let go of
-both.
+The record and its credentials remain on the node while any stored copy, queued
+cleanup or open multipart upload still names the backend. Once nothing does, the
+node deletes the record and the credentials by itself, on the same schedule as
+the reclaim sweep. A backend set to `retain` keeps its stored copies, and so its
+record, forever; set `cleanup` to `reclaim` before disabling if you want the node
+to let go of both.
+
+An open multipart upload holds the backend for as long as it exists, and nothing
+expires abandoned uploads: an upload nobody completes or aborts blocks removal
+indefinitely. `ListMultipartUploads` and `AbortMultipartUpload` are how you clear
+one. The reclaim-status response does not count open uploads, because that would
+mean scanning every upload on the node per request.
 
 ## Where your data actually is
 

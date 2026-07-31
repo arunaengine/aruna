@@ -5,9 +5,12 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, GROUP_STORAGE_BACKEND_INDEX_KEYSPACE,
     GROUP_STORAGE_BACKEND_KEYSPACE, GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
+    S3_MULTIPART_UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{BackendRef, BlobCleanupWork, BlobLocationKey, GroupStorageBackend};
+use aruna_core::structs::{
+    BackendRef, BlobCleanupWork, BlobLocationKey, GroupStorageBackend, MultipartUpload,
+};
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use std::collections::BTreeSet;
@@ -79,9 +82,9 @@ async fn disabled_backends(context: &DriverContext) -> Result<Vec<GroupStorageBa
     }
 }
 
-/// Every backend still named by a stored copy or by a queued physical delete.
-/// The sweep frees both in one transaction, so a backend absent from both truly
-/// holds nothing.
+/// Every backend still named by a stored copy, a queued physical delete or an
+/// open multipart upload. Uploaded parts have no location row, so only the
+/// upload record names the backend their abort needs credentials for.
 async fn backends_holding_data(context: &DriverContext) -> Result<BTreeSet<BackendRef>, String> {
     let mut holding = BTreeSet::new();
     let mut start_after = None;
@@ -122,6 +125,28 @@ async fn backends_holding_data(context: &DriverContext) -> Result<BTreeSet<Backe
                 BlobCleanupWork::from_bytes(value.as_ref())
             {
                 holding.insert(location.backend);
+            }
+        }
+        match next {
+            Some(next) => start_after = Some(next),
+            None => break,
+        }
+    }
+
+    let mut start_after = None;
+    loop {
+        let (values, next) = iter_prefix_page(
+            &context.storage_handle,
+            S3_MULTIPART_UPLOAD_KEYSPACE,
+            None,
+            start_after,
+            SCAN_PAGE_SIZE,
+            None,
+        )
+        .await?;
+        for (_, value) in values {
+            if let Ok(upload) = MultipartUpload::from_bytes(value.as_ref()) {
+                holding.insert(upload.backend);
             }
         }
         match next {
@@ -345,6 +370,7 @@ mod tests {
     use super::*;
     use aruna_core::structs::{
         BackendLocation, CleanupStrategy, GroupBackendKind, GroupStorageBackendSecret,
+        MultipartUploadStatus,
     };
     use aruna_core::types::Key;
     use std::collections::HashMap;
@@ -524,6 +550,36 @@ mod tests {
             BLOB_CLEANUP_KEYSPACE,
             Ulid::from_bytes([7u8; 16]).to_bytes().to_vec().into(),
             queued.to_bytes().unwrap(),
+        )
+        .await;
+
+        assert_eq!(remove_drained_backends(&ctx).await.unwrap(), 0);
+
+        // An open upload's parts have no location row, yet its abort still needs
+        // the credentials to delete them.
+        let upload_id = Ulid::from_bytes([8u8; 16]);
+        let dir = tempdir().unwrap();
+        let ctx = context(dir.path().to_str().unwrap());
+        seed(&ctx, backend_id, true).await;
+        write(
+            &ctx,
+            S3_MULTIPART_UPLOAD_KEYSPACE,
+            upload_id.to_bytes().to_vec().into(),
+            MultipartUpload {
+                upload_id,
+                backend: BackendRef::Group(backend_id),
+                storage_class: None,
+                bucket: "bucket".to_string(),
+                key: "object".to_string(),
+                group_id: Ulid::from_bytes([1u8; 16]),
+                created_by: Default::default(),
+                created_at: SystemTime::UNIX_EPOCH,
+                status: MultipartUploadStatus::Open,
+                checksum_hint: None,
+                metadata: HashMap::new(),
+            }
+            .to_bytes()
+            .unwrap(),
         )
         .await;
 
