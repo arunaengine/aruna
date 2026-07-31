@@ -399,12 +399,14 @@ fn registry_reads_config() {
 [backend.hot]
 type = "filesystem"
 root = "/data/hot"
+multipart_bucket = "hot-parts"
 default = true
 
 [backend.cold]
 type = "filesystem"
 class = "cold"
 root = "/data/cold"
+multipart_bucket = "cold-parts"
 
 [[routing]]
 key_prefix = "archive/"

@@ -192,6 +192,18 @@ impl BackendsFile {
                     "backend `{name}` sets quota_bytes = 0, which allows no user data"
                 )));
             }
+            // Without it every UploadPart fails long after regular writes work,
+            // and no default can be synthesized that is certain not to name a
+            // container the operator already uses for something else.
+            if entry
+                .multipart_bucket
+                .as_deref()
+                .is_none_or(|bucket| bucket.trim().is_empty())
+            {
+                return Err(ConversionError::FromStrError(format!(
+                    "backend `{name}` must set multipart_bucket; multipart uploads have nowhere to store parts"
+                )));
+            }
             backends.push(NodeBackendEntry {
                 name: name.clone(),
                 config: entry.to_config(credentials(name), timeouts)?,
@@ -271,7 +283,10 @@ impl BackendEntry {
             service_config,
             bucket_prefix: self.bucket_prefix.clone(),
             max_bucket_size: self.max_bucket_size,
-            multipart_bucket: self.multipart_bucket.clone(),
+            multipart_bucket: self
+                .multipart_bucket
+                .as_deref()
+                .map(|bucket| bucket.trim().to_string()),
             timeouts,
         })
     }
@@ -326,6 +341,7 @@ mod tests {
 [backend.default]
 type = "filesystem"
 root = "/data/blob"
+multipart_bucket = "uploaded-parts"
 default = true
 
 [backend.cold]
@@ -488,6 +504,7 @@ target = { class = "glacier" }
             r#"
 [backend.a]
 type = "filesystem"
+multipart_bucket = "parts"
 default = true
 
 [[routing]]
@@ -520,6 +537,7 @@ target = { backend = "a" }
 [backend.a]
 type = "s3"
 endpoint = "https://s3.example.org"
+multipart_bucket = "parts"
 default = true
 "#,
         )
@@ -547,6 +565,26 @@ quota_bytes = 0
             file.resolve(&secrets, BlobTimeoutConfig::default())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_missing_multipart() {
+        // Regular writes would work and every UploadPart would fail.
+        let file = BackendsFile::parse(
+            r#"
+[backend.a]
+type = "filesystem"
+default = true
+"#,
+        )
+        .unwrap();
+
+        let error = file
+            .resolve(&secrets, BlobTimeoutConfig::default())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("multipart_bucket"), "{error}");
     }
 
     #[test]

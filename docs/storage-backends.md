@@ -14,6 +14,7 @@ single filesystem backend rooted at `BLOB_ROOT` and named `default`.
 [backend.hot]
 type = "filesystem"
 root = "/srv/aruna/hot"
+multipart_bucket = "aruna-hot-parts"
 class = "hot"
 default = true
 
@@ -30,6 +31,7 @@ quota_bytes = 20000000000000 # advisory only, never enforced
 [backend.archive]
 type = "s3"
 endpoint = "https://archive.internal"
+multipart_bucket = "aruna-archive-parts"
 class = "archive"
 allow_tenants = false
 
@@ -45,8 +47,16 @@ deny = ["203.0.113.0/24"]
 
 Only `s3` and `filesystem` are valid `type` values for node backends. Exactly
 one backend must carry `default = true`; it receives every write no rule
-claims. Backend names are operator-facing identifiers: they appear in `/info`
-and in the doctor's view, never in tenant-facing object records.
+claims. Every backend must set `multipart_bucket`: it names the container that
+holds in-flight multipart parts, and a node whose file omits it refuses to
+start rather than accept regular writes and fail every `UploadPart`. Backend
+names are operator-facing identifiers: they appear in `/info` and in the
+doctor's view, never in tenant-facing object records.
+
+Backend names must also stay distinct after non-alphanumeric characters are
+folded to `_` and the result is upper-cased, because that token selects the
+`BLOB_BACKEND_<NAME>_ACCESS_KEY_ID` and `..._SECRET_ACCESS_KEY` variables.
+`cold-s3` and `cold_s3` collide and the node refuses to start.
 
 ## The class table
 

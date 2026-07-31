@@ -1543,7 +1543,7 @@ mod tests {
         let backends_path = temp.path().join("backends.toml");
         std::fs::write(
             &backends_path,
-            "[backend.hot]\ntype = \"filesystem\"\nroot = \"/data/hot\"\ndefault = true\n",
+            "[backend.hot]\ntype = \"filesystem\"\nroot = \"/data/hot\"\nmultipart_bucket = \"parts\"\ndefault = true\n",
         )
         .unwrap();
         let group_id = Ulid::generate();
