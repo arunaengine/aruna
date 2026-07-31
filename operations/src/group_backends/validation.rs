@@ -56,20 +56,20 @@ pub struct NormalizedConfig {
     pub secret: HashMap<String, String>,
 }
 
-/// Keys that name the physical store. Stored locations record neither the kind
-/// nor the endpoint, so changing one of these would silently redirect every
-/// object already stamped with the backend.
+/// Keys that name the physical store. Stored locations record the path below
+/// `root` only, and neither the kind nor the endpoint, so changing one of these
+/// would silently redirect every object already stamped with the backend.
 const fn identity_keys(kind: GroupBackendKind) -> &'static [&'static str] {
     match kind {
-        GroupBackendKind::S3 | GroupBackendKind::Gcs => &["endpoint", "bucket"],
-        GroupBackendKind::Azblob => &["endpoint", "container", "account_name"],
-        GroupBackendKind::Azdls => &["endpoint", "filesystem", "account_name"],
-        GroupBackendKind::B2 => &["bucket", "bucket_id"],
+        GroupBackendKind::S3 | GroupBackendKind::Gcs => &["endpoint", "bucket", "root"],
+        GroupBackendKind::Azblob => &["endpoint", "container", "account_name", "root"],
+        GroupBackendKind::Azdls => &["endpoint", "filesystem", "account_name", "root"],
+        GroupBackendKind::B2 => &["bucket", "bucket_id", "root"],
     }
 }
 
-/// Replacement rotates credentials and the name only; the store it points at
-/// must stay the one the existing objects were written to.
+/// An update changes credentials and the name only; the store it points at must
+/// stay the one the existing objects were written to.
 pub fn check_identity(
     existing: &GroupStorageBackend,
     kind: GroupBackendKind,

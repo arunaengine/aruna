@@ -288,7 +288,8 @@ mod tests {
 
     #[test]
     fn refuses_moved_store() {
-        // Stored locations carry neither kind nor endpoint, so both are frozen.
+        // Stored locations carry neither kind nor endpoint, and record only the
+        // path below `root`, so all three are frozen.
         let group_id = Ulid::from_bytes([1u8; 16]);
         let mut moved = input(group_id);
         moved
@@ -297,6 +298,15 @@ mod tests {
         assert_eq!(
             refuse(moved),
             CreateGroupBackendError::Invalid(GroupBackendError::Immutable("bucket".to_string()))
+        );
+
+        let mut rerooted = input(group_id);
+        rerooted
+            .public_config
+            .insert("root".to_string(), "moved".to_string());
+        assert_eq!(
+            refuse(rerooted),
+            CreateGroupBackendError::Invalid(GroupBackendError::Immutable("root".to_string()))
         );
 
         let mut retyped = input(group_id);
