@@ -7,9 +7,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::group_backends::create::{
     CreateGroupBackendError, CreateGroupBackendInput, CreateGroupBackendOperation,
 };
-use aruna_operations::group_backends::delete::{
-    DeleteGroupBackendError, DeleteGroupBackendOperation,
-};
+use aruna_operations::group_backends::disable::{SetDisabledError, SetDisabledOperation};
 use aruna_operations::group_backends::query::{
     GetGroupBackendOperation, ListGroupBackendsOperation,
 };
@@ -36,7 +34,8 @@ use utoipa::{OpenApi, ToSchema};
         list_group_backends,
         get_group_backend,
         replace_group_backend,
-        delete_group_backend
+        delete_group_backend,
+        enable_group_backend
     )
 )]
 pub struct GroupBackendsApiDoc;
@@ -52,6 +51,10 @@ pub fn router() -> Router<Arc<ServerState>> {
             get(get_group_backend)
                 .put(replace_group_backend)
                 .delete(delete_group_backend),
+        )
+        .route(
+            "/groups/{group_id}/storage-backends/{backend_id}/enable",
+            post(enable_group_backend),
         )
 }
 
@@ -74,6 +77,8 @@ pub struct GroupBackendResponse {
     pub name: String,
     pub kind: String,
     pub public_config: HashMap<String, String>,
+    /// Writes are refused while this is set; reads keep working.
+    pub disabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -89,6 +94,7 @@ impl From<GroupStorageBackend> for GroupBackendResponse {
             name: value.name,
             kind: value.kind.to_string(),
             public_config: value.public_config,
+            disabled: value.disabled,
         }
     }
 }
@@ -281,15 +287,10 @@ pub async fn replace_group_backend(
         ("backend_id" = String, Path, description = "Backend id")
     ),
     responses(
-        (status = 204, description = "Backend removed"),
+        (status = 204, description = "Backend disabled"),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Backend not found", body = ErrorResponse),
-        (
-            status = 409,
-            description = "Backend still holds object data or changed while disabled",
-            body = ErrorResponse
-        )
+        (status = 404, description = "Backend not found", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -298,32 +299,63 @@ pub async fn delete_group_backend(
     Extension(auth): Extension<Option<AuthContext>>,
     Path((group_id, backend_id)): Path<(String, String)>,
 ) -> ServerResult<StatusCode> {
-    let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
-    let backend_id = Ulid::from_str(&backend_id).map_err(|_| ServerError::BadRequest)?;
+    set_disabled(&state, auth, &group_id, &backend_id, true).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post,
+    path = "/groups/{group_id}/storage-backends/{backend_id}/enable",
+    tag = "storage-backends",
+    params(
+        ("group_id" = String, Path, description = "Group id"),
+        ("backend_id" = String, Path, description = "Backend id")
+    ),
+    responses(
+        (status = 200, description = "Backend enabled", body = GroupBackendResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Backend not found", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn enable_group_backend(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((group_id, backend_id)): Path<(String, String)>,
+) -> ServerResult<Json<GroupBackendResponse>> {
+    let record = set_disabled(&state, auth, &group_id, &backend_id, false).await?;
+
+    Ok(Json(record.into()))
+}
+
+async fn set_disabled(
+    state: &Arc<ServerState>,
+    auth: Option<AuthContext>,
+    group_id: &str,
+    backend_id: &str,
+    disabled: bool,
+) -> ServerResult<GroupStorageBackend> {
+    let (group_id, _) = admin_of_group(state, auth, group_id).await?;
+    let backend_id = Ulid::from_str(backend_id).map_err(|_| ServerError::BadRequest)?;
 
     drive(
-        DeleteGroupBackendOperation::new(group_id, backend_id),
+        SetDisabledOperation::new(group_id, backend_id, disabled),
         &state.get_ctx(),
     )
     .await
     .map_err(|error| match error {
-        DeleteGroupBackendError::NotFound => ServerError::NotFound,
-        DeleteGroupBackendError::StillReferenced => ServerError::Conflict(
-            "storage backend still holds object data and cannot be removed".to_string(),
-        ),
-        DeleteGroupBackendError::Changed => {
-            ServerError::Conflict("storage backend changed while it was disabled".to_string())
-        }
+        SetDisabledError::NotFound => ServerError::NotFound,
         other => ServerError::InternalError(other.to_string()),
-    })?;
-
-    Ok(StatusCode::NO_CONTENT)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CreateGroupBackendRequest, create_group_backend, delete_group_backend, list_group_backends,
+        CreateGroupBackendRequest, create_group_backend, delete_group_backend,
+        enable_group_backend, list_group_backends,
     };
     use crate::error::ServerError;
     use crate::routes::storage_routing::tests::setup_state;
@@ -346,14 +378,39 @@ mod tests {
 
         assert!(matches!(result, Err(ServerError::Forbidden)));
 
-        let removed = delete_group_backend(
+        let disabled = delete_group_backend(
             State(test.state.clone()),
             Extension(Some(test.other_auth.clone())),
             Path((test.group_id.to_string(), Ulid::generate().to_string())),
         )
         .await;
 
-        assert!(matches!(removed, Err(ServerError::Forbidden)));
+        assert!(matches!(disabled, Err(ServerError::Forbidden)));
+
+        let enabled = enable_group_backend(
+            State(test.state.clone()),
+            Extension(Some(test.other_auth.clone())),
+            Path((test.group_id.to_string(), Ulid::generate().to_string())),
+        )
+        .await;
+
+        assert!(matches!(enabled, Err(ServerError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn openapi_lists_enable() {
+        let openapi = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
+
+        assert!(
+            openapi["paths"]
+                .get("/groups/{group_id}/storage-backends/{backend_id}/enable")
+                .is_some()
+        );
+        assert!(
+            openapi["components"]["schemas"]["GroupBackendResponse"]["properties"]
+                .get("disabled")
+                .is_some()
+        );
     }
 
     #[tokio::test]

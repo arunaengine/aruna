@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn refuses_disabled_backend() {
-        // The pinned backend must not outlive a deletion that already disabled it.
+        // The pinned backend must not outlive the tenant disabling it.
         let backend_id = Ulid::from_bytes([5u8; 16]);
         let snapshot = snapshot().with_group_inputs(GroupRoutingInputs {
             default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),

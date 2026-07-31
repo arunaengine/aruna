@@ -1109,8 +1109,8 @@ mod routing_test {
 
     #[test]
     fn refuses_disabled_backend() {
-        // Deletion disables the record before it scans, so this write must not
-        // commit a location the deletion would then strand.
+        // A disabled backend refuses writes, so this write must not commit a
+        // location on it.
         let backend_id = Ulid::from_bytes([5u8; 16]);
         let snapshot = snapshot()
             .with_group_inputs(GroupRoutingInputs {

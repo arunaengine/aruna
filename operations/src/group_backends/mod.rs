@@ -1,5 +1,5 @@
 pub mod create;
-pub mod delete;
+pub mod disable;
 pub mod query;
 pub mod replace;
 pub mod validation;
@@ -61,8 +61,8 @@ pub enum BackendFenceError {
 }
 
 /// Joins a tenant backend's record to the transaction that commits a reference
-/// to it. Deletion disables the record before it scans, so a writer that already
-/// resolved the backend either reads the flag or loses its commit.
+/// to it, so a writer that already resolved a backend the tenant has since
+/// disabled either reads the flag or loses its commit.
 pub fn fence_backend(backend: &BackendRef, txn_id: Option<TxnId>) -> Option<Effect> {
     let BackendRef::Group(backend_id) = backend else {
         return None;
