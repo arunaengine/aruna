@@ -4,6 +4,7 @@ use aruna_core::NodeId;
 use aruna_core::structs::{
     AuthContext, Permission, blob_bucket_permission_path, blob_object_permission_path,
 };
+use aruna_operations::blob_holders::{GetBlobHoldersError, GetBlobHoldersOperation};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::replication::location_summary::{
@@ -24,7 +25,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -248,6 +249,9 @@ pub enum LocationScanLimit {
     QueuedRecordUnreadable,
     /// More candidate nodes than one request asks; the rest were not asked.
     CandidateCapReached,
+    /// The holder index could not be queried, so copies outside the current
+    /// configuration and queue are unknown.
+    HolderLookupFailed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -380,13 +384,15 @@ pub async fn blob_locations(
     )
     .await
     .map_err(|err| ServerError::InternalError(err.to_string()))?;
-    let Some(resolved) = local.version_id else {
+    let Some(resolved) = local.summary.version_id else {
         return Err(ServerError::NotFound);
     };
+    let blake3 = local.blake3;
 
-    let mut copies = vec![copy_response(local_node, true, local)];
+    let mut copies = vec![copy_response(local_node, true, local.summary)];
     let mut limits = Vec::new();
     let mut candidates = BTreeMap::new();
+    let mut expected: BTreeSet<NodeId> = BTreeSet::new();
     let mut capped = false;
     for target in bucket_info
         .replication
@@ -394,6 +400,7 @@ pub async fn blob_locations(
         .flat_map(|config| config.targets.iter())
         .filter(|target| target.node_id != local_node)
     {
+        expected.insert(target.node_id);
         capped |= !add_candidate(&mut candidates, target.node_id, &target.bucket);
     }
     let queued = match drive(
@@ -415,7 +422,27 @@ pub async fn blob_locations(
         }
     };
     for node_id in queued.nodes.iter().filter(|node| **node != local_node) {
+        expected.insert(*node_id);
         capped |= !add_candidate(&mut candidates, *node_id, &query.bucket);
+    }
+    // Config and queue only name copies that are planned. A destination dropped
+    // from the config, or one whose queue record is already consumed, still
+    // stores the bytes and is only found through the holder index.
+    match holder_nodes(&ctx, blake3, state.get_realm_id(), local_node).await {
+        Ok(holders) => {
+            for node_id in holders {
+                capped |= !add_candidate(&mut candidates, node_id, &query.bucket);
+            }
+        }
+        Err(error) => {
+            warn!(
+                bucket = %query.bucket,
+                key = %query.path,
+                error = %error,
+                "Blob holder lookup failed; copies outside the configuration are unknown"
+            );
+            limits.push(LocationScanLimit::HolderLookupFailed);
+        }
     }
     if queued.truncated {
         warn!(
@@ -468,14 +495,7 @@ pub async fn blob_locations(
     .await;
 
     for (node_id, answer) in answers {
-        copies.push(match answer {
-            Ok(summary) => copy_response(node_id, false, summary),
-            Err(LocationSummaryError::Denied) => pending_copy(node_id, BlobCopyState::Denied),
-            Err(error) => {
-                warn!(node = %node_id, error = %error, "Location summary peer gave no answer");
-                pending_copy(node_id, BlobCopyState::Unreachable)
-            }
-        });
+        copies.extend(peer_copy(node_id, expected.contains(&node_id), answer));
     }
     copies.sort_by(|left, right| (!left.local, &left.node_id).cmp(&(!right.local, &right.node_id)));
 
@@ -487,6 +507,44 @@ pub async fn blob_locations(
         complete: limits.is_empty(),
         limits,
     }))
+}
+
+/// The copy to report for one peer's answer. `None` drops a holder-index
+/// candidate that does not hold this version: it merely stores the same bytes
+/// under another object, and nothing expects a copy of this one there.
+fn peer_copy(
+    node_id: NodeId,
+    expected: bool,
+    answer: Result<LocationSummary, LocationSummaryError>,
+) -> Option<BlobCopyResponse> {
+    match answer {
+        Ok(summary) if !summary.held && !expected => None,
+        Ok(summary) => Some(copy_response(node_id, false, summary)),
+        Err(LocationSummaryError::Denied) => Some(pending_copy(node_id, BlobCopyState::Denied)),
+        Err(error) => {
+            warn!(node = %node_id, error = %error, "Location summary peer gave no answer");
+            Some(pending_copy(node_id, BlobCopyState::Unreachable))
+        }
+    }
+}
+
+/// Nodes the durable holder index says store these bytes. A version with no
+/// materialized content has no hash and therefore no holders.
+async fn holder_nodes(
+    ctx: &Arc<aruna_operations::driver::DriverContext>,
+    blake3: Option<[u8; 32]>,
+    realm_id: aruna_core::structs::RealmId,
+    local_node: NodeId,
+) -> Result<Vec<NodeId>, GetBlobHoldersError> {
+    let Some(blake3) = blake3 else {
+        return Ok(Vec::new());
+    };
+    drive_until(
+        GetBlobHoldersOperation::new(blake3, realm_id, local_node),
+        ctx.as_ref(),
+        Instant::now() + LOCATION_SUMMARY_TIMEOUT,
+    )
+    .await
 }
 
 /// Adds a candidate node unless the request is already at its cap. `false`
@@ -506,6 +564,7 @@ fn add_candidate(candidates: &mut BTreeMap<NodeId, String>, node: NodeId, bucket
 mod tests {
     use super::{BlobCopyState, BlobCopyStorage, copy_response, pending_copy};
     use crate::openapi::ApiDoc;
+    use aruna_operations::replication::location_summary::LocationSummaryError;
     use aruna_operations::replication::protocol::{LocationCopyStorage, LocationSummary};
     use ulid::Ulid;
 
@@ -586,6 +645,29 @@ mod tests {
 
         let known = *candidates.keys().next().unwrap();
         assert!(super::add_candidate(&mut candidates, known, "raw"));
+    }
+
+    #[test]
+    fn drops_unheld_holder() {
+        // A node holding the same bytes under another object is not a copy of
+        // this version, but a configured or queued target that has not received
+        // it yet still is.
+        let absent = LocationSummary::absent();
+        assert!(super::peer_copy(node_id(), false, Ok(absent.clone())).is_none());
+        assert_eq!(
+            super::peer_copy(node_id(), true, Ok(absent.clone())).map(|copy| copy.state),
+            Some(BlobCopyState::Pending)
+        );
+        assert_eq!(
+            super::peer_copy(node_id(), false, Err(LocationSummaryError::Denied))
+                .map(|copy| copy.state),
+            Some(BlobCopyState::Denied)
+        );
+        assert_eq!(
+            super::peer_copy(node_id(), false, Err(LocationSummaryError::Aborted))
+                .map(|copy| copy.state),
+            Some(BlobCopyState::Unreachable)
+        );
     }
 
     #[test]

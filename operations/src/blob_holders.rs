@@ -203,6 +203,8 @@ enum GetState {
 pub enum GetBlobHoldersError {
     #[error(transparent)]
     Dht(#[from] DhtError),
+    #[error("blob holder lookup did not complete")]
+    Aborted,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -292,11 +294,14 @@ impl Operation for GetBlobHoldersOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .expect("blob holder get operation must set output")
+        self.output.unwrap_or(Err(GetBlobHoldersError::Aborted))
     }
 
+    /// A deadline must not look like an empty holder set: the caller reports the
+    /// gap instead of claiming it enumerated every copy.
     fn abort(&mut self) -> Effects {
+        self.state = GetState::Error;
+        self.output.get_or_insert(Err(GetBlobHoldersError::Aborted));
         smallvec![]
     }
 }

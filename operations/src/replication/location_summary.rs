@@ -63,6 +63,15 @@ pub enum LocationSummaryError {
     Aborted,
 }
 
+/// A local answer, plus the content hash that never goes on the wire. The hash
+/// is what lets the caller ask the durable holder index which other nodes store
+/// these bytes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LocalSummary {
+    pub summary: LocationSummary,
+    pub blake3: Option<[u8; 32]>,
+}
+
 /// Answers "which copy does THIS node hold" for one version. One state machine
 /// serves the local read and, with a reply stream, an inbound peer request; the
 /// peer path additionally proves realm membership and READ access.
@@ -74,8 +83,9 @@ pub struct LocationSummaryOperation {
     stream_id: Option<Ulid>,
     state: SummaryState,
     version_id: Option<Ulid>,
+    blake3: Option<[u8; 32]>,
     summary: LocationSummary,
-    output: Option<Result<LocationSummary, LocationSummaryError>>,
+    output: Option<Result<LocalSummary, LocationSummaryError>>,
 }
 
 impl LocationSummaryOperation {
@@ -107,6 +117,7 @@ impl LocationSummaryOperation {
             stream_id,
             state: SummaryState::Init,
             version_id,
+            blake3: None,
             summary: LocationSummary::absent(),
             output: None,
         }
@@ -145,6 +156,13 @@ impl LocationSummaryOperation {
             state,
             event: format!("{event:?}"),
         })
+    }
+
+    fn local_answer(&self) -> LocalSummary {
+        LocalSummary {
+            summary: self.summary.clone(),
+            blake3: self.blake3,
+        }
     }
 
     fn read_realm(&mut self) -> Effects {
@@ -214,7 +232,7 @@ impl LocationSummaryOperation {
         let summary = self.summary.clone();
         let Some(stream_id) = self.stream_id else {
             self.state = SummaryState::Finish;
-            self.output = Some(Ok(summary));
+            self.output = Some(Ok(self.local_answer()));
             return smallvec![];
         };
         let payload = match VersionReplicationMessage::LocationSummaryResponse(summary).to_bytes() {
@@ -336,7 +354,10 @@ impl LocationSummaryOperation {
             Err(error) => return self.fail(error.into()),
         };
         match version.location_key() {
-            Some(key) => self.read_location(key),
+            Some(key) => {
+                self.blake3 = Some(key.blake3_hash);
+                self.read_location(key)
+            }
             None => self.answer(),
         }
     }
@@ -386,7 +407,7 @@ impl LocationSummaryOperation {
 }
 
 impl Operation for LocationSummaryOperation {
-    type Output = LocationSummary;
+    type Output = LocalSummary;
     type Error = LocationSummaryError;
 
     fn start(&mut self) -> Effects {
@@ -410,7 +431,7 @@ impl Operation for LocationSummaryOperation {
                 let Event::Blob(BlobEvent::MessageSent { stream_id }) = event else {
                     return self.unexpected(event);
                 };
-                self.output = Some(Ok(self.summary.clone()));
+                self.output = Some(Ok(self.local_answer()));
                 self.state = SummaryState::Close;
                 smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })]
             }
@@ -821,7 +842,9 @@ mod tests {
                 .unwrap(),
         )));
 
-        let summary = operation.finalize().unwrap();
+        let local = operation.finalize().unwrap();
+        assert_eq!(local.blake3, Some([7u8; 32]));
+        let summary = local.summary;
         assert!(summary.held);
         assert_eq!(summary.version_id, Some(version_id));
         assert_eq!(
@@ -847,7 +870,7 @@ mod tests {
         )));
         operation.step(read_result(None));
 
-        let summary = operation.finalize().unwrap();
+        let summary = operation.finalize().unwrap().summary;
         assert_eq!(
             summary.storage,
             Some(LocationCopyStorage::GroupBackend {
@@ -865,9 +888,10 @@ mod tests {
         operation.start();
         operation.step(read_result(None));
 
-        let summary = operation.finalize().unwrap();
-        assert!(!summary.held);
-        assert_eq!(summary.version_id, None);
+        let local = operation.finalize().unwrap();
+        assert!(local.blake3.is_none());
+        assert!(!local.summary.held);
+        assert_eq!(local.summary.version_id, None);
     }
 
     #[test]

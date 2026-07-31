@@ -117,10 +117,20 @@ current version.
 }
 ```
 
+Candidates come from three places: the bucket's configured replication
+targets, the queued replication jobs for the version, and the durable holder
+index the DHT keeps per content hash. The holder index is what finds a copy on
+a node that is no longer a configured target, or whose queue record was already
+consumed by a completed replication. Every candidate is then asked directly, so
+the reported state is always the answering node's own.
+
 - `present` means that node confirmed it holds the version.
 - `pending` means a copy is expected there and has not arrived yet, either
   because the node is a configured replication target or because a
-  replication job for the version is queued for it.
+  replication job for the version is queued for it. A node found only through
+  the holder index and answering that it does not hold the version is left out
+  entirely: it stores the same bytes under some other object, and no copy of
+  this one is on its way there.
 - `unreachable` means the node did not answer within the deadline. The
   endpoint never waits on an offline node beyond that deadline, and the local
   entry is always returned.
@@ -143,6 +153,12 @@ reason, and a node absent from `copies` may still hold a copy:
 - `queued-scan-failed`: that scan failed, so no queued copy is known at all.
 - `queued-record-unreadable`: some queued job records would not decode.
 - `candidate-cap-reached`: more nodes than one request asks were candidates.
+- `holder-lookup-failed`: the holder index could not be queried, so copies
+  outside the current configuration and queue are unknown.
+
+The holder index is refreshed on a TTL, so a copy made moments ago may not be
+published yet. `complete` does not promise otherwise: it promises that every
+node the three sources named was asked.
 
 The whole request is bounded: at most 64 nodes are asked, no peer is waited on
 for more than 5 seconds, and the fan-out as a whole is abandoned after 30
