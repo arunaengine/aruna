@@ -115,7 +115,6 @@ pub struct EgressGuard {
     policy: EgressPolicy,
     opendal: reqwest::Client,
     plain: reqwest::Client,
-    lookup: Lookup,
 }
 
 impl fmt::Debug for EgressGuard {
@@ -135,14 +134,8 @@ impl EgressGuard {
     fn build(policy: EgressPolicy, lookup: Lookup) -> Result<Self, BlobLibError> {
         Ok(Self {
             opendal: guarded_client(policy.clone(), lookup.clone(), None, READ_TIMEOUT)?,
-            plain: guarded_client(
-                policy.clone(),
-                lookup.clone(),
-                Some(REDIRECT_HOPS),
-                READ_TIMEOUT,
-            )?,
+            plain: guarded_client(policy.clone(), lookup, Some(REDIRECT_HOPS), READ_TIMEOUT)?,
             policy,
-            lookup,
         })
     }
 
@@ -162,35 +155,6 @@ impl EgressGuard {
             .ok_or_else(|| EgressError::MissingHost(url.to_string()))?;
         screen_host(&self.policy, host)?;
         Ok(self.plain.get(url))
-    }
-
-    /// Preflight screen for endpoints resolved outside the guarded client.
-    /// Every resolved address must pass; a rebind after this point is not
-    /// covered, so this is never sufficient on its own.
-    pub async fn screen(&self, endpoint: &str) -> Result<(), EgressError> {
-        let url =
-            Url::parse(endpoint).map_err(|_| EgressError::MissingHost(endpoint.to_string()))?;
-        let host = url
-            .host_str()
-            .ok_or_else(|| EgressError::MissingHost(endpoint.to_string()))?;
-        let literal = host.trim_start_matches('[').trim_end_matches(']');
-        if let Ok(address) = literal.parse::<IpAddr>() {
-            return self.policy.check(address);
-        }
-        let resolved =
-            (self.lookup)(host.to_string())
-                .await
-                .map_err(|error| EgressError::ResolveFailed {
-                    host: host.to_string(),
-                    reason: error.to_string(),
-                })?;
-        if resolved.is_empty() {
-            return Err(EgressError::NoAllowedAddress(host.to_string()));
-        }
-        for address in resolved {
-            self.policy.check(address.ip())?;
-        }
-        Ok(())
     }
 }
 
@@ -518,17 +482,5 @@ mod tests {
 
         assert!(error.is_timeout(), "expected a timeout, got {error:?}");
         task.abort();
-    }
-
-    #[tokio::test]
-    async fn screen_rejects_denied() {
-        let guard = EgressGuard::build(
-            EgressPolicy::strict(),
-            fixed_lookup("10.0.0.5:21".parse().unwrap()),
-        )
-        .unwrap();
-
-        guard.screen("ftp://files.test:21").await.unwrap_err();
-        guard.screen("ftp://169.254.169.254:21").await.unwrap_err();
     }
 }
