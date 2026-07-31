@@ -140,7 +140,8 @@ fn class_labels(catalog: &BackendCatalog) -> BTreeMap<String, String> {
 }
 
 /// Derived from the node's own registry, so a class disappears from the labels
-/// as soon as the operator stops offering it.
+/// as soon as the operator stops offering it. Advertisement only: the class
+/// labels stay in `NodeInfo` and never enter the placement selector input.
 fn node_labels(
     ctx: &DriverContext,
     config: &RealmConfigDocument,

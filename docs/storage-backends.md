@@ -84,10 +84,22 @@ class, so an operator who needs hard placement must name a backend rather than
 a class.
 
 Every class a node registers is published as a derived node label
-`aruna-engine.org/storage-class/<class> = "true"`, including classes with
-`allow_tenants = false`. The label advertises capability only. Placement
-affinity rules can match it to steer objects toward nodes that offer a class;
-the labels are read-only and derived, and configuring one by hand is rejected.
+`aruna-engine.org/storage-class/<class> = "true"` on that node's `NodeInfo`
+document, including classes with `allow_tenants = false`. These labels are
+**capability advertisement only and no part of Aruna consumes them today.**
+Placement selection reads its selector labels from the realm placement map, and
+that map is a separate, operator-written input that the derived labels are
+never copied into; a placement affinity rule matching
+`aruna-engine.org/storage-class/*` therefore matches nothing. Setting one by
+hand is rejected on every write surface (`ARUNA_NODE_LABELS`, the realm
+placement API, the admin document, and node onboarding), precisely so a
+placement rule can never be steered by an untrue capability claim.
+
+An operator who wants placement to respect a class today must express it with
+an ordinary placement label they own, for example `tier=cold` in
+`ARUNA_NODE_LABELS` on the nodes that offer the class, and match that label in
+the affinity rule. Keeping the two in step is manual: nothing checks that a
+node labelled `tier=cold` actually registers a `cold` backend.
 
 ## Routing rules
 

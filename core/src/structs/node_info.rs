@@ -9,7 +9,9 @@ pub const KIND_LABEL_KEY: &str = "aruna-engine.org/kind";
 
 /// Derived read-only label prefix advertising a storage class this node's
 /// operator registered. Class tables are per node, so the label claims
-/// capability and never a shared meaning across nodes.
+/// capability and never a shared meaning across nodes. It reaches `NodeInfo`
+/// only: placement selection reads the realm placement map, which these labels
+/// are deliberately not copied into.
 pub const STORAGE_CLASS_LABEL_PREFIX: &str = "aruna-engine.org/storage-class/";
 
 /// Names the first derived label a write surface tried to set. Every such label
