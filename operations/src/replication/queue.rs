@@ -34,7 +34,7 @@ use super::version_replication::{
     ReplicateScopeError, ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
 };
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::{DriverContext, drive, node_routing};
+use crate::driver::{DriverContext, drive, quota_marked_routing};
 use crate::notifications::watch::emit::emit_resource_watch_event;
 use crate::queue_backoff::queue_retry_after_ms;
 use crate::s3::get_bucket_info::GetBucketInfoOperation;
@@ -1472,8 +1472,10 @@ async fn process_blob_replication_job(
     context: &DriverContext,
     job: &BlobReplicationJobRecord,
 ) -> Result<BlobReplicationJobOutcome, String> {
-    let mut operation =
-        ReplicateScopeOperation::new(job.input.clone()).with_routing(node_routing(context));
+    let routing = quota_marked_routing(context)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut operation = ReplicateScopeOperation::new(job.input.clone()).with_routing(routing);
     let mut watch_group_id = None;
     let mut relationship = if let Some(relationship_id) = job.relationship_id {
         let relationship = read_relationships(&context.storage_handle, &job.input.bucket)

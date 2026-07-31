@@ -623,9 +623,11 @@ impl IncomingVersionReplicationOperation {
             return self.fail(IncomingVersionReplicationError::MissingBlobInfo);
         };
         let hash = blob.hash;
+        // Still before the negotiation reply, so a node that cannot place the
+        // blob owes the sender a reason rather than a dropped stream.
         let resolved = match self.resolve_destination() {
             Ok(resolved) => resolved,
-            Err(error) => return self.fail(error),
+            Err(error) => return self.reject_negotiation(error),
         };
         self.state = IncomingVersionReplicationState::ReadExistingBlob;
         smallvec![blob_location_read(
@@ -2170,9 +2172,9 @@ mod tests {
     use aruna_core::structs::{
         AuthContext, BackendLocation, BackendRef, BlobLocationKey, BlobVersion, BlobVersionState,
         BucketInfo, CurrentVersionPointer, GroupRoutingInputs, HashPathIndexKey,
-        MultipartObjectMetadataKey, QuotaConfig, RealmConfigDocument, RealmId, ReplicationItemKind,
-        ReplicationNegotiationResult, RoutingTarget, SourceConnectorKind, SourceMetadata,
-        StagingStrategy, StorageRoutingRule, VersionSourceBinding,
+        MultipartObjectMetadataKey, NodeRouting, QuotaConfig, RealmConfigDocument, RealmId,
+        ReplicationItemKind, ReplicationNegotiationResult, RoutingTarget, SourceConnectorKind,
+        SourceMetadata, StagingStrategy, StorageRoutingRule, VersionSourceBinding,
     };
     use std::collections::{BTreeSet, HashMap};
     use std::time::SystemTime;
@@ -2838,6 +2840,41 @@ mod tests {
                 ReplicationNegotiationResult::Rejected(reason),
             ) => assert_eq!(reason, "quota"),
             other => panic!("expected quota rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn full_backend_rejects() {
+        // Replication now routes through the quota-marked catalog, so a full
+        // destination backend owes the sender a reason before any transfer.
+        let manifest = make_manifest(ReplicationItemKind::Materialized);
+        let group_id = test_group_id();
+        let mut routing = NodeRouting::default();
+        routing.catalog = routing.catalog.mark_full(BackendRef::DEFAULT_NODE_NAME);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            manifest,
+        )
+        .with_routing(routing);
+
+        let _effects = advance_to_version_lookup(&mut op, group_id);
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        match message_from_effect(&effects[0]) {
+            VersionReplicationMessage::VersionNegotiationResponse(
+                ReplicationNegotiationResult::Rejected(reason),
+            ) => assert!(reason.contains("quota"), "unexpected reason: {reason}"),
+            other => panic!("expected a rejected negotiation, got {other:?}"),
         }
     }
 

@@ -6,7 +6,7 @@ use crate::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, schedule_outbox_drain_effect, write_outbox_effect,
 };
-use crate::driver::{DriverContext, drive, node_routing};
+use crate::driver::{DriverContext, drive, quota_marked_routing};
 use crate::metadata::MetadataHandle;
 use crate::metadata::projector::{
     METADATA_PROJECTION_RETRY_AFTER, project_metadata_create_events,
@@ -339,13 +339,23 @@ impl InboundEventHandler for OperationsInboundHandler {
                                             "Received inbound version replication manifest"
                                         );
                                         let watch_manifest = manifest.clone();
+                                        let routing =
+                                            match quota_marked_routing(self.context.as_ref()).await
+                                            {
+                                                Ok(routing) => routing,
+                                                Err(error) => {
+                                                    error!(peer = %node_id, error = %error, "Refusing inbound replication with unreadable routing inputs");
+                                                    close_failed_bao(&blob_handle, stream_id).await;
+                                                    return;
+                                                }
+                                            };
                                         let op = IncomingVersionReplicationOperation::new(
                                             stream_id,
                                             net_handle.node_id(),
                                             *net_handle.realm_id(),
                                             manifest,
                                         )
-                                        .with_routing(node_routing(self.context.as_ref()))
+                                        .with_routing(routing)
                                         .with_rocrate_limits(self.rocrate_limits.clone());
                                         match drive(op, self.context.as_ref()).await {
                                             Ok(Ok(result)) => {

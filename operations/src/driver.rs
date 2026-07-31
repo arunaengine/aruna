@@ -7,8 +7,8 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::operation::{Operation, SubOperation};
 use aruna_core::structs::{
-    BackendRef, BucketInfo, GroupRoutingInputs, NodeRouting, RoutingSnapshot, StorageRoutingRule,
-    UsageCounters, usage_backend_keys,
+    BackendCatalog, BackendRef, BucketInfo, GroupRoutingInputs, NodeRouting, RoutingSnapshot,
+    StorageRoutingRule, UsageCounters, usage_backend_keys,
 };
 use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
@@ -125,18 +125,41 @@ pub async fn bucket_snapshot(
     mark_full_backends(context, snapshot).await
 }
 
-/// Freezes each capped backend's fullness for one request, exactly like the
-/// group quota ceiling. Concurrent writes can overshoot by their own bytes; an
-/// unreadable counter fails the caller rather than routing past the cap.
+/// Node routing whose capped backends already carry their fullness, for the
+/// background writers that assemble their own snapshot later. Replication
+/// consults the same catalog as an API write, so a fail-closed counter read
+/// refuses it too; a refused replication is rescheduled with backoff.
+pub async fn quota_marked_routing(
+    context: &DriverContext,
+) -> Result<NodeRouting, RoutingInputsError> {
+    let routing = node_routing(context);
+    let catalog = mark_full_catalog(context, routing.catalog.clone()).await?;
+    Ok(NodeRouting { catalog, ..routing })
+}
+
 async fn mark_full_backends(
     context: &DriverContext,
     snapshot: RoutingSnapshot,
 ) -> Result<RoutingSnapshot, RoutingInputsError> {
-    let quotas = snapshot.catalog.quotas();
+    let catalog = mark_full_catalog(context, snapshot.catalog.clone()).await?;
+    Ok(RoutingSnapshot {
+        catalog,
+        ..snapshot
+    })
+}
+
+/// Freezes each capped backend's fullness for one request, exactly like the
+/// group quota ceiling. Concurrent writes can overshoot by their own bytes; an
+/// unreadable counter fails the caller rather than routing past the cap.
+async fn mark_full_catalog(
+    context: &DriverContext,
+    catalog: BackendCatalog,
+) -> Result<BackendCatalog, RoutingInputsError> {
+    let quotas = catalog.quotas();
     if quotas.is_empty() {
-        return Ok(snapshot);
+        return Ok(catalog);
     }
-    let mut catalog = snapshot.catalog.clone();
+    let mut catalog = catalog;
     for (name, quota) in quotas {
         let used = backend_used_bytes(context, &BackendRef::Node(name.clone()))
             .await
@@ -146,10 +169,7 @@ async fn mark_full_backends(
             catalog = catalog.mark_full(&name);
         }
     }
-    Ok(RoutingSnapshot {
-        catalog,
-        ..snapshot
-    })
+    Ok(catalog)
 }
 
 /// Sums one backend's stored-byte shards. A missing row reads as zero, so a node

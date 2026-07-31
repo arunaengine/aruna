@@ -85,6 +85,13 @@ exactly as the group quota behaves. A counter this node cannot read refuses the
 write instead of routing past the cap, and `/info` omits `used_bytes` for that
 backend. Hidden blobs and job spool never count.
 
+Inbound replication routes through the same catalog, so a full backend refuses
+it too: the sending node gets the quota as its rejection reason and reschedules
+the transfer with backoff instead of overshooting the cap. A node whose
+**default** backend is full therefore refuses inbound replication for every
+bucket with no class rule, and a counter it cannot read refuses it the same
+way until the read succeeds.
+
 ## Cleanup strategy
 
 `cleanup` decides what happens to bytes on a backend once no version references
