@@ -25,8 +25,11 @@ pub enum TaskKey {
     DrainSyncMirrorRepair,
     SweepHiddenBlobs,
     DrainBlobCleanupQueue,
-    DrainBlobReclaimQueue,
     RefreshBlobHolders,
+    // Unit variants encode as their index and that index is the storage key, so
+    // a new variant only ever goes at the end: inserting one would make every
+    // persisted timer behind it decode as a different task.
+    DrainBlobReclaimQueue,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
