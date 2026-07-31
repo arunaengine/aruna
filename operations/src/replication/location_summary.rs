@@ -443,6 +443,12 @@ impl Operation for LocationSummaryOperation {
                 smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })]
             }
             SummaryState::Close => {
+                let Event::Blob(BlobEvent::ConnectionClosed { stream_id }) = event else {
+                    return self.unexpected(event);
+                };
+                if Some(stream_id) != self.stream_id {
+                    return self.unexpected(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
+                }
                 self.state = SummaryState::Finish;
                 smallvec![]
             }
@@ -583,6 +589,12 @@ impl Operation for RemoteLocationSummaryOperation {
                 }
             }
             RemoteState::Close => {
+                let Event::Blob(BlobEvent::ConnectionClosed { stream_id }) = event else {
+                    return self.unexpected(event);
+                };
+                if Some(stream_id) != self.stream_id {
+                    return self.unexpected(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
+                }
                 self.state = RemoteState::Finish;
                 smallvec![]
             }
@@ -967,6 +979,44 @@ mod tests {
             operation.finalize(),
             Err(super::LocationSummaryError::Denied)
         );
+    }
+
+    #[test]
+    fn close_rejects_stray() {
+        // Only the matching close ends the answer; anything else is an error.
+        let stream_id = Ulid::from_bytes([5u8; 16]);
+        let mut operation = LocationSummaryOperation::new_incoming(
+            node_id(4),
+            node_id(5),
+            stream_id,
+            request(None),
+        );
+        operation.state = super::SummaryState::Close;
+
+        operation.step(Event::Blob(
+            aruna_core::events::BlobEvent::ConnectionClosed {
+                stream_id: Ulid::from_bytes([6u8; 16]),
+            },
+        ));
+
+        assert_eq!(operation.state, super::SummaryState::Error);
+    }
+
+    #[test]
+    fn remote_close_rejects() {
+        let stream_id = Ulid::from_bytes([5u8; 16]);
+        let mut operation = super::RemoteLocationSummaryOperation::new(node_id(4), request(None));
+        operation.start();
+        operation.step(Event::Blob(
+            aruna_core::events::BlobEvent::ConnectionEstablished { stream_id },
+        ));
+        operation.state = super::RemoteState::Close;
+
+        operation.step(Event::Blob(aruna_core::events::BlobEvent::MessageSent {
+            stream_id,
+        }));
+
+        assert_eq!(operation.state, super::RemoteState::Error);
     }
 
     #[test]
