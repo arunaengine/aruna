@@ -155,17 +155,18 @@ pub fn usage_group_key(group_id: GroupId) -> Vec<u8> {
     key
 }
 
-/// Maintained usage aggregates. `stored_*` fields track physical,
+/// Maintained usage aggregates. The `stored_*` fields track physical
 /// content-addressed blobs and are only meaningful on the global and
-/// per-backend rows; `logical_bytes` sums materialized version sizes and is the
-/// per-group quota basis; `referenced_bytes` reports external references.
+/// per-backend rows.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UsageCounters {
     pub buckets: u64,
     pub objects: u64,
     pub stored_blobs: u64,
     pub stored_bytes: u64,
+    /// Materialized version sizes, and the per-group quota basis.
     pub logical_bytes: u64,
+    /// Bytes reachable only through an external reference.
     pub referenced_bytes: u64,
 }
 

@@ -342,10 +342,9 @@ pub enum ReclaimBlobError {
     },
 }
 
-/// Deletes one unreferenced copy. Everything that decides the outcome happens
-/// inside a single transaction: the tenant record fence, the location read, and
-/// the full alias scan, so a concurrent write either loses its commit or pins
-/// the hash before this one commits.
+/// Deletes one unreferenced copy. Everything that decides it happens inside one
+/// transaction: the tenant fence, the location read and the full alias scan, so
+/// a concurrent write either loses its commit or pins the hash first.
 #[derive(Debug, PartialEq)]
 pub struct ReclaimBlobOperation {
     key: ReclaimCandidateKey,
