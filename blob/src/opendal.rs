@@ -347,26 +347,36 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    fn swap_env(entries: &[(&str, Option<String>)]) -> Vec<(String, Option<String>)> {
-        entries
-            .iter()
-            .map(|(key, value)| {
-                let previous = std::env::var(key).ok();
+    /// Restores every swapped variable on drop, so a test that panics first
+    /// still hands the process environment back unchanged.
+    struct EnvGuard {
+        previous: Vec<(String, Option<String>)>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.previous.drain(..) {
                 match value {
                     Some(value) => unsafe { std::env::set_var(key, value) },
                     None => unsafe { std::env::remove_var(key) },
                 }
-                ((*key).to_string(), previous)
-            })
-            .collect()
+            }
+        }
     }
 
-    fn restore_env(previous: Vec<(String, Option<String>)>) {
-        for (key, value) in previous {
-            match value {
-                Some(value) => unsafe { std::env::set_var(key, value) },
-                None => unsafe { std::env::remove_var(key) },
-            }
+    fn swap_env(entries: &[(&str, Option<String>)]) -> EnvGuard {
+        EnvGuard {
+            previous: entries
+                .iter()
+                .map(|(key, value)| {
+                    let previous = std::env::var(key).ok();
+                    match value {
+                        Some(value) => unsafe { std::env::set_var(key, value) },
+                        None => unsafe { std::env::remove_var(key) },
+                    }
+                    ((*key).to_string(), previous)
+                })
+                .collect(),
         }
     }
 
@@ -430,7 +440,7 @@ mod tests {
             "AWS_EC2_METADATA_SERVICE_ENDPOINT",
             Some(metadata.endpoint.clone()),
         ));
-        let previous = swap_env(&entries);
+        let _env = swap_env(&entries);
 
         let access = ResolvedSourceAccess::OpenDal {
             kind: SourceConnectorKind::S3,
@@ -445,7 +455,6 @@ mod tests {
         let (operator, path, ..) = build_source_operator(&test_guard(), &access).await.unwrap();
         let _ = operator.stat(path).await;
 
-        restore_env(previous);
         assert_eq!(metadata.hits(), 0);
     }
 
@@ -478,7 +487,7 @@ mod tests {
         // APPDATA short-circuits the well-known-file lookup onto an empty dir,
         // so no gcloud credential on the machine can pre-empt the chain.
         let empty = tempdir().unwrap();
-        let previous = swap_env(&[
+        let _env = swap_env(&[
             ("GCE_METADATA_HOST", Some(host)),
             ("GOOGLE_APPLICATION_CREDENTIALS", None),
             ("APPDATA", Some(empty.path().to_string_lossy().into_owned())),
@@ -493,7 +502,6 @@ mod tests {
         let hardened = build_group_service(GroupBackendKind::Gcs, config, &test_guard()).unwrap();
         let _ = hardened.stat("probe").await;
 
-        restore_env(previous);
         assert!(
             ambient > 0,
             "counterfactual never reached the metadata host"
@@ -514,7 +522,7 @@ mod tests {
         entries.push(("AZURE_CLIENT_ID", Some("client".to_string())));
         entries.push(("AZURE_CLIENT_SECRET", Some("secret".to_string())));
         entries.push(("AZURE_AUTHORITY_HOST", Some(authority.endpoint.clone())));
-        let previous = swap_env(&entries);
+        let _env = swap_env(&entries);
         let base = [
             ("container", "data"),
             ("endpoint", data.endpoint.as_str()),
@@ -533,7 +541,6 @@ mod tests {
             build_group_service(GroupBackendKind::Azblob, with_key, &test_guard()).unwrap();
         let _ = hardened.stat("probe").await;
 
-        restore_env(previous);
         assert!(
             ambient > 0,
             "counterfactual never reached the authority host"
@@ -547,7 +554,7 @@ mod tests {
         // that a signed request opens exactly one connection and no other.
         let _guard = env_lock().lock().await;
         let data = CountingListener::bind().await;
-        let previous = swap_env(&AZURE_ENV_KEYS.map(|key| (key, None)));
+        let _env = swap_env(&AZURE_ENV_KEYS.map(|key| (key, None)));
         let config = group_config(&[
             ("filesystem", "data"),
             ("endpoint", data.endpoint.as_str()),
@@ -558,7 +565,6 @@ mod tests {
         let operator = build_group_service(GroupBackendKind::Azdls, config, &test_guard()).unwrap();
         let _ = operator.stat("probe").await;
 
-        restore_env(previous);
         assert_eq!(data.hits(), 1);
     }
 

@@ -258,6 +258,8 @@ pub enum LocationScanLimit {
     /// A node the holder index names holds the bytes but knows no copy under
     /// the bucket and key it was asked about, so its copy list may be short.
     HolderPathUnknown,
+    /// A node gave no answer, so whether it holds a copy stays unknown.
+    HolderUnreachable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -477,11 +479,18 @@ pub async fn blob_locations(
     .await;
 
     let mut path_unknown = false;
+    let mut unreachable = false;
     for (node_id, answer) in answers {
         match peer_copy(node_id, expected.contains(&node_id), answer) {
-            Some(copy) => copies.push(copy),
+            Some(copy) => {
+                unreachable |= copy.state == BlobCopyState::Unreachable;
+                copies.push(copy);
+            }
             None => path_unknown = true,
         }
+    }
+    if unreachable {
+        limits.push(LocationScanLimit::HolderUnreachable);
     }
     if path_unknown {
         warn!(

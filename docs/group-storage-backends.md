@@ -215,7 +215,10 @@ reason, and a node absent from `copies` may still hold a copy:
   outside the current configuration and queue are unknown.
 - `holder-path-unknown`: a node the holder index named knows no copy under the
   bucket and key it was asked about, so its copy may be recorded under a path
-  this node cannot name.
+  this node cannot name. A sync relationship that maps the prefix produces
+  exactly this: the copy is there, under a bucket or prefix of its own.
+- `holder-unreachable`: a node gave no answer at all, so whether it holds a
+  copy is unknown. Its entry is still listed, with state `unreachable`.
 
 The holder index is refreshed on a TTL, so a copy made moments ago may not be
 published yet. `complete` does not promise otherwise: it promises that every
