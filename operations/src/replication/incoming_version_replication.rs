@@ -62,6 +62,7 @@ enum IncomingVersionReplicationState {
     ReadReplacedMetadata,
     DeleteReplacedMetadata,
     FenceBackend,
+    VerifyExistingBlob,
     WriteBlobLocation,
     ReadObjectLookup,
     ReadCurrentVersion,
@@ -134,6 +135,8 @@ pub enum IncomingVersionReplicationError {
     BlobSizeMismatch,
     #[error("Replicated blob storage flags do not match manifest")]
     BlobStorageFlagsMismatch,
+    #[error("Existing blob copy changed before the version committed")]
+    ExistingBlobChanged,
     #[error("Replaced multipart metadata exceeds the supported part limit")]
     MultipartMetadataOverflow,
     #[error("Unexpected event in state {state}: expected {expected}, got {received:?}")]
@@ -260,6 +263,7 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::ReadReplacedMetadata => "ReadReplacedMetadata",
             IncomingVersionReplicationState::DeleteReplacedMetadata => "DeleteReplacedMetadata",
             IncomingVersionReplicationState::FenceBackend => "FenceBackend",
+            IncomingVersionReplicationState::VerifyExistingBlob => "VerifyExistingBlob",
             IncomingVersionReplicationState::WriteBlobLocation => "WriteBlobLocation",
             IncomingVersionReplicationState::ReadObjectLookup => "ReadObjectLookup",
             IncomingVersionReplicationState::ReadCurrentVersion => "ReadCurrentVersion",
@@ -812,7 +816,31 @@ impl IncomingVersionReplicationOperation {
             self.state = IncomingVersionReplicationState::FenceBackend;
             return smallvec![effect];
         }
-        self.write_blob_location()
+        self.verify_existing_blob()
+    }
+
+    /// A negotiation that adopted an existing copy read it outside the
+    /// transaction. Re-reading it inside makes the commit fail rather than
+    /// leave the version naming bytes another writer has since removed.
+    fn verify_existing_blob(&mut self) -> Effects {
+        if self.received_blob_location.is_some() {
+            return self.write_blob_location();
+        }
+        let Some(location) = self.existing_blob_location.clone() else {
+            return self.write_blob_location();
+        };
+        let Some(blake3_hash) = location.get_blake3() else {
+            return self.write_blob_location();
+        };
+        let hash: [u8; 32] = match blake3_hash.try_into() {
+            Ok(hash) => hash,
+            Err(err) => return self.fail(ConversionError::from(err).into()),
+        };
+        self.state = IncomingVersionReplicationState::VerifyExistingBlob;
+        smallvec![blob_location_read(
+            &BlobLocationKey::new(hash, location.backend),
+            self.txn_id
+        )]
     }
 
     fn write_blob_location(&mut self) -> Effects {
@@ -1789,9 +1817,29 @@ impl Operation for IncomingVersionReplicationOperation {
                 self.write_hash_lookup_or_continue()
             }
             IncomingVersionReplicationState::FenceBackend => match check_fence(event) {
-                Ok(()) => self.write_blob_location(),
+                Ok(()) => self.verify_existing_blob(),
                 Err(error) => self.fail(error.into()),
             },
+            IncomingVersionReplicationState::VerifyExistingBlob => {
+                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::ReadResult)",
+                        received: event,
+                    });
+                };
+                let stored = match value
+                    .map(|value| BackendLocation::from_bytes(value.as_ref()))
+                    .transpose()
+                {
+                    Ok(stored) => stored,
+                    Err(error) => return self.fail(error.into()),
+                };
+                if stored != self.existing_blob_location {
+                    return self.fail(IncomingVersionReplicationError::ExistingBlobChanged);
+                }
+                self.write_blob_location()
+            }
             IncomingVersionReplicationState::WriteBlobLocation => {
                 let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
                     return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
@@ -3346,6 +3394,43 @@ mod tests {
             panic!("expected one location read, got {effects:?}")
         };
         key.to_vec()
+    }
+
+    #[test]
+    fn refuses_vanished_copy() {
+        // The adopted copy is re-read in the transaction, so a sweep that
+        // removed it in between must fail the apply instead of committing.
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            make_manifest(ReplicationItemKind::Materialized),
+        );
+        let txn_id = Ulid::generate();
+        op.txn_id = Some(txn_id);
+        op.destination_group_id = Some(test_group_id());
+        op.existing_blob_location = Some(make_location());
+
+        let effects = op.write_blob_location_or_continue();
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::VerifyExistingBlob
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, txn_id: read_txn, .. })]
+                if key_space == BLOB_LOCATIONS_KEYSPACE && *read_txn == Some(txn_id)
+        ));
+
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+
+        assert_eq!(
+            op.output,
+            Some(Err(IncomingVersionReplicationError::ExistingBlobChanged))
+        );
     }
 
     #[test]
