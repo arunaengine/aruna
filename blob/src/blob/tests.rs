@@ -1106,6 +1106,76 @@ async fn hidden_spool_limits() {
 }
 
 #[tokio::test]
+async fn sweeps_demoted_backend() {
+    // A changed default must not hide the old backend's crash leftovers.
+    let temp_dir = tempdir().unwrap();
+    let temp_root = temp_dir.path().to_str().unwrap().to_string();
+    let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
+    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+        .await
+        .unwrap();
+    let backends = std::collections::BTreeMap::from([
+        (
+            "hot".to_string(),
+            std::sync::Arc::new(NodeBackend::new(
+                filesystem_backend(&format!("{temp_root}/hot"), "hot-", "hot-parts"),
+                None,
+            )),
+        ),
+        (
+            "cold".to_string(),
+            std::sync::Arc::new(NodeBackend::new(
+                filesystem_backend(&format!("{temp_root}/cold"), "cold-", "cold-parts"),
+                None,
+            )),
+        ),
+    ]);
+
+    let namespace = Ulid::from_bytes([9u8; 16]);
+    let before = BlobHandler::with_registry(
+        BackendRegistry::new(backends.clone(), "hot".to_string()).unwrap(),
+        storage_handle.clone(),
+        net_handle.clone(),
+        EgressPolicy::loopback(),
+    )
+    .await
+    .unwrap();
+    let Event::Blob(BlobEvent::HiddenSpooled { location, .. }) = before
+        .send_blob_effect(BlobEffect::SpoolHidden {
+            namespace,
+            name: "leftover".to_string(),
+            created_by: test_user_id(),
+            max_bytes: None,
+            blob: stream_from_bytes(b"leftover"),
+        })
+        .await
+    else {
+        panic!("hidden spool failed")
+    };
+    assert_eq!(location.backend, BackendRef::Node("hot".to_string()));
+
+    let after = BlobHandler::with_registry(
+        BackendRegistry::new(backends, "cold".to_string()).unwrap(),
+        storage_handle,
+        net_handle,
+        EgressPolicy::loopback(),
+    )
+    .await
+    .unwrap();
+    let Event::Blob(BlobEvent::HiddenListed { entries }) = after
+        .send_blob_effect(BlobEffect::ListHidden {
+            namespace: Some(namespace),
+        })
+        .await
+    else {
+        panic!("hidden list failed")
+    };
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].key, HiddenBlobKey::try_from(&location).unwrap());
+}
+
+#[tokio::test]
 async fn range_passes_writes() {
     // Import readers fetch hidden ranges while a write consumes their payload.
     let context = setup_blob_handle(5).await;

@@ -580,70 +580,79 @@ impl BlobHandler {
         BlobEvent::HiddenDeleted
     }
 
+    /// Sweeps every registered node backend: a demoted default keeps serving its
+    /// stamped objects, so its crash leftovers must stay reachable too.
     pub async fn list_hidden_blobs(&self, namespace: Option<Ulid>) -> BlobEvent {
-        let backend = self.registry.default_ref();
-        let root = match self.registry.config_for(&backend) {
-            Ok(config) => config.root.clone(),
-            Err(error) => return BlobEvent::Error(error),
-        };
-        let buckets = match self.hidden_buckets(&backend).await {
-            Ok(buckets) => buckets,
-            Err(error) => return BlobEvent::Error(error),
-        };
         let prefix = hidden_prefix(namespace);
+        let backends: Vec<BackendRef> = self
+            .registry
+            .entries()
+            .map(|(name, _)| BackendRef::Node(name.clone()))
+            .collect();
         let mut entries = Vec::new();
-        for bucket in buckets {
-            let operator = match self
+        for backend in backends {
+            if let Err(error) = self.collect_hidden(&backend, &prefix, &mut entries).await {
+                return BlobEvent::Error(error);
+            }
+        }
+        entries.sort_by(|left, right| {
+            (
+                &left.key.backend,
+                &left.key.storage_bucket,
+                &left.key.backend_path,
+            )
+                .cmp(&(
+                    &right.key.backend,
+                    &right.key.storage_bucket,
+                    &right.key.backend_path,
+                ))
+        });
+        BlobEvent::HiddenListed { entries }
+    }
+
+    async fn collect_hidden(
+        &self,
+        backend: &BackendRef,
+        prefix: &str,
+        entries: &mut Vec<HiddenBlobEntry>,
+    ) -> Result<(), BlobError> {
+        let root = self.registry.config_for(backend)?.root.clone();
+        for bucket in self.hidden_buckets(backend).await? {
+            let operator = self
                 .registry
-                .bucket_operator(&backend, &bucket, &self.egress)
-            {
-                Ok(operator) => operator,
-                Err(error) => return BlobEvent::Error(error),
-            };
-            let storage_prefix = PathBuf::from(&bucket).join(&prefix);
+                .bucket_operator(backend, &bucket, &self.egress)?;
+            let storage_prefix = PathBuf::from(&bucket).join(prefix);
             let Some(storage_prefix) = storage_prefix.to_str() else {
-                return BlobEvent::Error(BlobError::ListError(
+                return Err(BlobError::ListError(
                     "hidden blob prefix is not valid utf-8".to_string(),
                 ));
             };
-            let mut lister = match operator.lister_with(storage_prefix).recursive(true).await {
-                Ok(lister) => lister,
-                Err(error) => return BlobEvent::Error(BlobError::ListError(error.to_string())),
-            };
+            let mut lister = operator
+                .lister_with(storage_prefix)
+                .recursive(true)
+                .await
+                .map_err(|error| BlobError::ListError(error.to_string()))?;
             loop {
                 let entry = match lister.try_next().await {
                     Ok(Some(entry)) => entry,
                     Ok(None) => break,
-                    Err(error) => {
-                        return BlobEvent::Error(BlobError::ListError(error.to_string()));
-                    }
+                    Err(error) => return Err(BlobError::ListError(error.to_string())),
                 };
                 if entry.metadata().mode() != EntryMode::FILE {
                     continue;
                 }
                 let listed_path = PathBuf::from(entry.path());
-                let backend_path = match listed_path.strip_prefix(&bucket) {
-                    Ok(path) => match path.to_str() {
-                        Some(path) => path.to_string(),
-                        None => {
-                            return BlobEvent::Error(BlobError::ListError(
-                                "hidden blob path is not valid utf-8".to_string(),
-                            ));
-                        }
-                    },
-                    Err(error) => {
-                        return BlobEvent::Error(BlobError::ListError(error.to_string()));
-                    }
-                };
-                let key = match HiddenBlobKey::new(
-                    backend.clone(),
-                    root.clone(),
-                    bucket.clone(),
-                    backend_path,
-                ) {
-                    Ok(key) => key,
-                    Err(error) => return BlobEvent::Error(BlobError::ConversionError(error)),
-                };
+                let backend_path = listed_path
+                    .strip_prefix(&bucket)
+                    .map_err(|error| BlobError::ListError(error.to_string()))?
+                    .to_str()
+                    .ok_or_else(|| {
+                        BlobError::ListError("hidden blob path is not valid utf-8".to_string())
+                    })?
+                    .to_string();
+                let key =
+                    HiddenBlobKey::new(backend.clone(), root.clone(), bucket.clone(), backend_path)
+                        .map_err(BlobError::ConversionError)?;
                 let modified_at = entry
                     .metadata()
                     .last_modified()
@@ -652,11 +661,7 @@ impl BlobHandler {
                 entries.push(HiddenBlobEntry { key, modified_at });
             }
         }
-        entries.sort_by(|left, right| {
-            (&left.key.storage_bucket, &left.key.backend_path)
-                .cmp(&(&right.key.storage_bucket, &right.key.backend_path))
-        });
-        BlobEvent::HiddenListed { entries }
+        Ok(())
     }
 
     pub async fn delete_blob(&self, location: BackendLocation) -> BlobEvent {
