@@ -229,7 +229,7 @@ pub async fn get_group_backend(
     ),
     request_body = CreateGroupBackendRequest,
     responses(
-        (status = 200, description = "Credentials rotated", body = GroupBackendResponse),
+        (status = 200, description = "Backend updated", body = GroupBackendResponse),
         (
             status = 400,
             description = "Invalid, unreachable, or store-changing backend",

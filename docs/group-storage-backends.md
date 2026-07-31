@@ -33,7 +33,7 @@ the static shared-key provider and signs the request with the node's ambient
 Azure identity instead.
 
 Credentials must be static and long-lived. Session tokens are rejected: Aruna
-has no rotation story for them yet, and a write that outlives the token would
+cannot renew them, and a write that outlives the token would
 fail mid-stream. Secrets are stored separately from the record, never
 returned by the API, and never logged.
 
@@ -69,13 +69,18 @@ across every supported provider.
 Bytes on a group backend still count against the group's quota in this
 release.
 
-## Rotating credentials
+## Changing credentials
 
 `PUT /groups/{group_id}/storage-backends/{backend_id}` replaces the stored
 credentials and the display name. The backend type and the keys that name the
-store, such as `endpoint` and `bucket`, are fixed after create and a request
-that changes one is refused with 400: stored objects record neither, so the
-change would silently redirect them. Register a second backend to move data.
+store, `endpoint`, `bucket` (or `container`, `filesystem`), `account_name` and
+`root`, are fixed after create and a request that changes one is refused with
+400: stored objects record only the path below `root` and neither the kind nor
+the endpoint, so the change would silently redirect them. Register a second
+backend to move data.
+
+A disabled backend still accepts this request, so a leaked key can be replaced
+without enabling writes again.
 
 ## Deleting a backend
 
