@@ -228,11 +228,10 @@ impl Config {
     }
 }
 
-/// Per-backend S3 credentials. The backends file never holds secrets; this is
-/// the one lookup a node-local vault will replace later.
-fn backend_credentials(name: &str) -> Option<(String, String)> {
-    let upper: String = name
-        .chars()
+/// Environment token a backend name maps to. The mapping is lossy, so callers
+/// must reject two names that share a token before reading any credential.
+fn credential_token(name: &str) -> String {
+    name.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() {
                 c.to_ascii_uppercase()
@@ -240,10 +239,33 @@ fn backend_credentials(name: &str) -> Option<(String, String)> {
                 '_'
             }
         })
-        .collect();
+        .collect()
+}
+
+/// Per-backend S3 credentials. The backends file never holds secrets; this is
+/// the one lookup a node-local vault will replace later.
+fn backend_credentials(name: &str) -> Option<(String, String)> {
+    let upper = credential_token(name);
     let key = dotenvy::var(format!("BLOB_BACKEND_{upper}_ACCESS_KEY_ID")).ok()?;
     let secret = dotenvy::var(format!("BLOB_BACKEND_{upper}_SECRET_ACCESS_KEY")).ok()?;
     Some((key, secret))
+}
+
+/// Refuses a file where two backends would read the same credential variables,
+/// which would let one backend authenticate with another's account.
+fn reject_token_clashes(names: impl Iterator<Item = String>) -> Result<(), SetupError> {
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    for name in names {
+        let token = credential_token(&name);
+        if let Some(other) = seen.insert(token.clone(), name.clone()) {
+            return Err(invalid_config_value(
+                "BLOB_BACKENDS_PATH",
+                format!("{other}, {name}"),
+                format!("both backends resolve to BLOB_BACKEND_{token}_* credentials"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Reads the operator's backends file, or synthesises the implicit single
@@ -256,7 +278,9 @@ fn load_backends_config(
         return Ok(NodeBackendsConfig::single(implicit));
     };
     let text = std::fs::read_to_string(&path)?;
-    Ok(BackendsFile::parse(&text)?.resolve(&backend_credentials, timeouts)?)
+    let file = BackendsFile::parse(&text)?;
+    reject_token_clashes(file.backend.keys().cloned())?;
+    Ok(file.resolve(&backend_credentials, timeouts)?)
 }
 
 pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
@@ -1758,6 +1782,24 @@ mod tests {
         ));
 
         restore_env(previous);
+    }
+
+    #[test]
+    fn rejects_token_clashes() {
+        // The env token is lossy, so two spellings must not share credentials.
+        let names = ["cold-s3", "cold_s3"].map(str::to_string);
+        let error =
+            super::reject_token_clashes(names.into_iter()).expect_err("clash should be rejected");
+        assert!(matches!(
+            error,
+            super::SetupError::InvalidConfigValue {
+                key: "BLOB_BACKENDS_PATH",
+                ..
+            }
+        ));
+
+        let distinct = ["cold", "hot"].map(str::to_string);
+        super::reject_token_clashes(distinct.into_iter()).unwrap();
     }
 
     #[tokio::test]
