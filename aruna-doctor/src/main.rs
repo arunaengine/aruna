@@ -6,6 +6,7 @@ use crate::explorer::{
 use crate::info::print_info;
 use crate::iroh_check::print_iroh_check;
 use crate::portal::update_portal;
+use crate::reclaim::{print_status as reclaim_status, seed_backend};
 use crate::storage::{import, snapshot};
 use crate::tokens::{create_local_bootstrap_token, create_oidc_token, view_token};
 use clap::{Parser, Subcommand};
@@ -16,6 +17,7 @@ mod explorer;
 mod info;
 mod iroh_check;
 mod portal;
+mod reclaim;
 mod storage;
 #[cfg(test)]
 mod test_support;
@@ -84,6 +86,24 @@ pub enum Commands {
         #[arg(long)]
         token: Option<String>,
     },
+    Reclaim {
+        #[command(subcommand)]
+        command: ReclaimCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ReclaimCommands {
+    /// Queue every stored copy on one backend, for garbage that predates a
+    /// switch to reclaim. Run with the node stopped.
+    Seed {
+        database_path: String,
+        /// Backend key: `n:<name>` for a node backend, `g:<ulid>` for a tenant one.
+        #[arg(long)]
+        backend: String,
+    },
+    /// Queue depth and stuck physical deletes per backend.
+    Status { database_path: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -237,6 +257,13 @@ pub async fn main() -> Result<(), CliError> {
             }
         },
         Commands::Info { token } => print_info(token).await?,
+        Commands::Reclaim { command } => match command {
+            ReclaimCommands::Seed {
+                database_path,
+                backend,
+            } => seed_backend(database_path, backend).await?,
+            ReclaimCommands::Status { database_path } => reclaim_status(database_path).await?,
+        },
     };
 
     Ok(())
