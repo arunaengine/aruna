@@ -252,6 +252,9 @@ pub enum LocationScanLimit {
     /// The holder index could not be queried, so copies outside the current
     /// configuration and queue are unknown.
     HolderLookupFailed,
+    /// A node the holder index names holds the bytes but knows no copy under
+    /// the bucket and key it was asked about, so its copy list may be short.
+    HolderPathUnknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -465,8 +468,20 @@ pub async fn blob_locations(
     .collect::<Vec<_>>()
     .await;
 
+    let mut path_unknown = false;
     for (node_id, answer) in answers {
-        copies.extend(peer_copy(node_id, expected.contains(&node_id), answer));
+        match peer_copy(node_id, expected.contains(&node_id), answer) {
+            Some(copy) => copies.push(copy),
+            None => path_unknown = true,
+        }
+    }
+    if path_unknown {
+        warn!(
+            bucket = %query.bucket,
+            key = %query.path,
+            "A holder answered under no path it knows; copies may be missing"
+        );
+        limits.push(LocationScanLimit::HolderPathUnknown);
     }
     copies.sort_by(|left, right| (!left.local, &left.node_id).cmp(&(!right.local, &right.node_id)));
 
@@ -481,8 +496,8 @@ pub async fn blob_locations(
 }
 
 /// The copy to report for one peer's answer. `None` drops a holder-index
-/// candidate that does not hold this version: it merely stores the same bytes
-/// under another object, and nothing expects a copy of this one there.
+/// candidate that does not hold this version under the path it was asked
+/// about, which the answer admits as `HolderPathUnknown`.
 fn peer_copy(
     node_id: NodeId,
     expected: bool,
@@ -646,6 +661,12 @@ mod tests {
         let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
 
         assert!(openapi["paths"].get("/blobs/locations").is_some());
+        assert!(
+            openapi["components"]["schemas"]["LocationScanLimit"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("holder-path-unknown"))
+        );
         assert!(
             openapi["components"]["schemas"]["BlobCopyResponse"]["properties"]
                 .get("state")
