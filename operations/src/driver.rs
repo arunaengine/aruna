@@ -377,9 +377,9 @@ fn drive_suboperation<'a>(
 }
 
 /// Drives an operation under one wall-clock deadline. On expiry the operation's
-/// own `abort()` runs and its cleanup effects are dispatched unbounded, so a
-/// stream or transaction it opened is still released. Racing `drive` against a
-/// timeout instead drops the future and strands whatever it holds.
+/// own `abort` runs and its cleanup effects are dispatched unbounded, so a
+/// stream or transaction it opened is released; racing a timeout against
+/// `drive` instead drops the future and strands whatever it holds.
 #[tracing::instrument(
     name = "operation",
     level = "debug",
