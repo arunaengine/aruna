@@ -1013,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn location_key_separates_backends() {
+    fn key_separates_backends() {
         // One hash on two backends must produce two distinct, decodable keys.
         let node = BlobLocationKey::new([7u8; 32], BackendRef::node_default());
         let group = BlobLocationKey::new([7u8; 32], BackendRef::Group(Ulid::from_bytes([4u8; 16])));
@@ -1029,7 +1029,8 @@ mod tests {
     }
 
     #[test]
-    fn location_key_rejects_garbage() {
+    fn key_rejects_garbage() {
+        // A short or unknown-backend location key must never decode.
         assert!(BlobLocationKey::from_bytes(&[1u8; 20]).is_err());
         let mut unknown = [2u8; 32].to_vec();
         unknown.extend_from_slice(b"x:name");

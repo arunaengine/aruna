@@ -2109,7 +2109,8 @@ mod test {
     }
 
     #[tokio::test]
-    async fn dedup_stays_inside_backend() {
+    async fn dedup_per_backend() {
+        // Identical bytes routed to two backends must keep one copy on each.
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let (context, hot_root, cold_root) = setup_two_backends(temp_root).await;
@@ -2158,7 +2159,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn dedup_repeats_inside_backend() {
+    async fn dedup_repeats_backend() {
         // A rewrite onto the same backend must still adopt the stored copy.
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
@@ -2176,7 +2177,8 @@ mod test {
     }
 
     #[tokio::test]
-    async fn delete_keeps_other_backend_copy() {
+    async fn delete_keeps_copy() {
+        // Deleting one object must leave the twin copy on the other backend.
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let (context, _hot_root, cold_root) = setup_two_backends(temp_root).await;
