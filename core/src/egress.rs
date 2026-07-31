@@ -139,9 +139,17 @@ impl EgressPolicy {
         self
     }
 
+    fn extra_denied(&self, address: IpAddr) -> bool {
+        self.extra_deny.iter().any(|net| net.contains(&address))
+    }
+
     pub fn check(&self, address: IpAddr) -> Result<(), EgressError> {
         let normalized = normalize(address);
-        if self.extra_deny.iter().any(|net| net.contains(&normalized)) {
+        // A deny may be written in either spelling of a translated address.
+        if self.extra_denied(address) {
+            return Err(EgressError::BlockedAddress(address));
+        }
+        if self.extra_denied(normalized) {
             return Err(EgressError::BlockedAddress(normalized));
         }
         if self.loopback && (address.is_loopback() || normalized.is_loopback()) {
@@ -325,5 +333,34 @@ mod tests {
         widened
             .check(IpAddr::from_str("127.0.0.1").unwrap())
             .unwrap_err();
+    }
+
+    #[test]
+    fn denies_v6_spellings() {
+        // A deny written as NAT64 or IPv4-mapped must match the v6 original.
+        let policy = EgressPolicy::strict().with_deny(vec![
+            IpNet::from_str("64:ff9b::/96").unwrap(),
+            IpNet::from_str("::ffff:0:0/96").unwrap(),
+        ]);
+        for row in ["64:ff9b::1.1.1.1", "::ffff:1.1.1.1"] {
+            let address = IpAddr::from_str(row).unwrap();
+            assert_eq!(
+                policy.check(address),
+                Err(EgressError::BlockedAddress(address)),
+                "{row}"
+            );
+        }
+        policy.check(IpAddr::from_str("1.1.1.1").unwrap()).unwrap();
+
+        // A v4 deny still matches the embedded address of a v6 spelling.
+        let embedded =
+            EgressPolicy::strict().with_deny(vec![IpNet::from_str("1.1.1.0/24").unwrap()]);
+        let mapped = IpAddr::from_str("64:ff9b::1.1.1.1").unwrap();
+        assert_eq!(
+            embedded.check(mapped),
+            Err(EgressError::BlockedAddress(
+                IpAddr::from_str("1.1.1.1").unwrap()
+            ))
+        );
     }
 }
