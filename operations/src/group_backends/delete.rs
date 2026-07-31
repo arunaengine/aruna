@@ -1,11 +1,11 @@
-use super::{RecordReadError, backend_key, parse_pairs, parse_read};
+use super::{RecordReadError, backend_key, index_key, parse_pairs, parse_read, record_writes};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
-    GROUP_STORAGE_BACKEND_SECRET_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
-    S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, GROUP_STORAGE_BACKEND_INDEX_KEYSPACE,
+    GROUP_STORAGE_BACKEND_KEYSPACE, GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
+    S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
@@ -144,10 +144,8 @@ impl DeleteGroupBackendOperation {
     }
 
     fn write_record(&self, record: &GroupStorageBackend) -> Result<Effect, ConversionError> {
-        Ok(Effect::Storage(StorageEffect::Write {
-            key_space: GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
-            key: backend_key(self.backend_id),
-            value: record.to_bytes()?.into(),
+        Ok(Effect::Storage(StorageEffect::BatchWrite {
+            writes: record_writes(record)?,
             txn_id: None,
         }))
     }
@@ -174,11 +172,11 @@ impl DeleteGroupBackendOperation {
 
     fn handle_retired(&mut self, event: Event) -> Effects {
         match event {
-            Event::Storage(StorageEvent::WriteResult { .. }) => self.scan(Scan::Uploads, None),
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.scan(Scan::Uploads, None),
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
             received => self.fail(DeleteGroupBackendError::InvalidStateEvent {
                 state: "Retire",
-                expected: "Event::Storage(StorageEvent::WriteResult)",
+                expected: "Event::Storage(StorageEvent::BatchWriteResult)",
                 received,
             }),
         }
@@ -284,6 +282,10 @@ impl DeleteGroupBackendOperation {
                 (
                     GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
                     backend_key(self.backend_id),
+                ),
+                (
+                    GROUP_STORAGE_BACKEND_INDEX_KEYSPACE.to_string(),
+                    index_key(self.group_id, self.backend_id),
                 ),
                 (
                     GROUP_STORAGE_BACKEND_SECRET_KEYSPACE.to_string(),
@@ -399,8 +401,9 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
-        S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+        BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, GROUP_STORAGE_BACKEND_INDEX_KEYSPACE,
+        GROUP_STORAGE_BACKEND_KEYSPACE, GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
+        S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
@@ -493,8 +496,8 @@ mod tests {
             key: b"x".to_vec().into(),
             value: Some(record(group_id).to_bytes().unwrap().into()),
         }));
-        operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: b"x".to_vec().into(),
+        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
         }));
         operation
     }
@@ -543,17 +546,27 @@ mod tests {
             value: Some(record(group_id).to_bytes().unwrap().into()),
         }));
 
-        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected a retirement write, got {effects:?}")
         };
-        assert!(
+        assert_eq!(
+            writes
+                .iter()
+                .map(|(key_space, ..)| key_space.as_str())
+                .collect::<Vec<_>>(),
+            [
+                GROUP_STORAGE_BACKEND_KEYSPACE,
+                GROUP_STORAGE_BACKEND_INDEX_KEYSPACE
+            ]
+        );
+        assert!(writes.iter().all(|(.., value)| {
             GroupStorageBackend::from_bytes(value.as_ref())
                 .unwrap()
                 .retiring
-        );
+        }));
 
-        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: b"x".to_vec().into(),
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
         }));
         let [Effect::Storage(StorageEffect::Iter { txn_id: None, .. })] = effects.as_slice() else {
             panic!("expected an untransacted scan, got {effects:?}")
@@ -591,11 +604,11 @@ mod tests {
             }
             let effects = operation.step(found);
 
-            let [Effect::Storage(StorageEffect::Write { .. })] = effects.as_slice() else {
+            let [Effect::Storage(StorageEffect::BatchWrite { .. })] = effects.as_slice() else {
                 panic!("expected a restore write for {key_space}, got {effects:?}")
             };
-            operation.step(Event::Storage(StorageEvent::WriteResult {
-                key: b"x".to_vec().into(),
+            operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+                entries: Vec::new(),
             }));
             assert!(operation.is_complete());
             assert_eq!(
@@ -640,7 +653,17 @@ mod tests {
         else {
             panic!("expected one batch delete, got {effects:?}")
         };
-        assert_eq!(deletes.len(), 2);
+        assert_eq!(
+            deletes
+                .iter()
+                .map(|(key_space, _)| key_space.as_str())
+                .collect::<Vec<_>>(),
+            [
+                GROUP_STORAGE_BACKEND_KEYSPACE,
+                GROUP_STORAGE_BACKEND_INDEX_KEYSPACE,
+                GROUP_STORAGE_BACKEND_SECRET_KEYSPACE
+            ]
+        );
         assert_eq!(*txn_id, Some(TxnId::from(7)));
 
         operation.step(Event::Storage(StorageEvent::BatchDeleteResult {

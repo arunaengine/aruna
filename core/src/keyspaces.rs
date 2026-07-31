@@ -69,6 +69,11 @@ pub const GROUP_STORAGE_ROUTING_KEYSPACE: &str = "group_storage_routing";
 pub const GROUP_STORAGE_BACKEND_KEYSPACE: &str = "group_storage_backend";
 pub const GROUP_STORAGE_BACKEND_SECRET_KEYSPACE: &str = "group_storage_backend_secret";
 
+/// The same records keyed by `group id || backend id`, so routing a write reads
+/// one group's backends instead of every tenant's. Written in the same batch or
+/// transaction as the id-keyed record it mirrors.
+pub const GROUP_STORAGE_BACKEND_INDEX_KEYSPACE: &str = "group_storage_backend_index";
+
 pub const SOURCE_CONNECTOR_INDEX_KEYSPACE: &str = "source_connector_index";
 pub const SOURCE_CONNECTOR_SECRET_KEYSPACE: &str = "source_connector_secret";
 

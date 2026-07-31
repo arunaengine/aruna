@@ -7,9 +7,10 @@ pub mod validation;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::GROUP_STORAGE_BACKEND_KEYSPACE;
+use aruna_core::keyspaces::{GROUP_STORAGE_BACKEND_INDEX_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE};
 use aruna_core::structs::{BackendRef, GroupStorageBackend};
-use aruna_core::types::{Key, TxnId};
+use aruna_core::types::{GroupId, Key, TxnId};
+use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -17,6 +18,38 @@ use ulid::Ulid;
 /// stored `BackendRef::Group` without knowing the owning group.
 pub fn backend_key(backend_id: Ulid) -> Key {
     backend_id.to_bytes().to_vec().into()
+}
+
+/// Index key of the same record. The group prefix is what lets routing scan one
+/// group instead of the whole keyspace.
+pub fn index_key(group_id: GroupId, backend_id: Ulid) -> Key {
+    let mut key = group_id.to_bytes().to_vec();
+    key.extend_from_slice(&backend_id.to_bytes());
+    key.into()
+}
+
+pub fn index_prefix(group_id: GroupId) -> Key {
+    group_id.to_bytes().to_vec().into()
+}
+
+/// Both copies of one record. Callers must apply them in a single batch or
+/// transaction so the index can never disagree with the id-keyed record.
+pub fn record_writes(
+    record: &GroupStorageBackend,
+) -> Result<Vec<(String, Key, ByteView)>, ConversionError> {
+    let value: ByteView = record.to_bytes()?.into();
+    Ok(vec![
+        (
+            GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+            backend_key(record.backend_id),
+            value.clone(),
+        ),
+        (
+            GROUP_STORAGE_BACKEND_INDEX_KEYSPACE.to_string(),
+            index_key(record.group_id, record.backend_id),
+            value,
+        ),
+    ])
 }
 
 #[derive(Debug, Error, PartialEq)]

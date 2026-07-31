@@ -1085,7 +1085,7 @@ mod routing_tests {
     use crate::staging::test_utils::setup_driver_context;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{GROUP_STORAGE_BACKEND_KEYSPACE, GROUP_STORAGE_ROUTING_KEYSPACE};
+    use aruna_core::keyspaces::GROUP_STORAGE_ROUTING_KEYSPACE;
     use aruna_core::structs::{
         BackendRef, BucketInfo, GroupBackendKind, GroupStorageBackend, GroupStorageRouting,
         ResolvedBackend, RoutingTarget, resolve_backend,
@@ -1122,13 +1122,9 @@ mod routing_tests {
             created_by: Default::default(),
             retiring: false,
         };
-        write(
-            context,
-            GROUP_STORAGE_BACKEND_KEYSPACE,
-            record.backend_id.to_bytes().to_vec(),
-            record.to_bytes().unwrap(),
-        )
-        .await;
+        for (key_space, key, value) in crate::group_backends::record_writes(&record).unwrap() {
+            write(context, &key_space, key.to_vec(), value.to_vec()).await;
+        }
         record.backend_id
     }
 

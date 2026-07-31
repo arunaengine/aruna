@@ -1,6 +1,6 @@
 use super::create::{CreateGroupBackendError, CreateGroupBackendInput};
 use super::validation::{check_identity, validate_backend_input};
-use super::{backend_key, parse_read};
+use super::{backend_key, parse_read, record_writes};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -124,29 +124,23 @@ impl ReplaceGroupBackendOperation {
         let (Some(record), Some(secret)) = (self.record.as_ref(), self.secret.as_ref()) else {
             return self.fail(CreateGroupBackendError::Failed);
         };
-        let record_bytes = match record.to_bytes() {
-            Ok(bytes) => bytes,
+        let mut writes = match record_writes(record) {
+            Ok(writes) => writes,
             Err(error) => return self.fail(error.into()),
         };
         let secret_bytes = match secret.to_bytes() {
             Ok(bytes) => bytes,
             Err(error) => return self.fail(error.into()),
         };
+        writes.push((
+            GROUP_STORAGE_BACKEND_SECRET_KEYSPACE.to_string(),
+            backend_key(self.backend_id),
+            secret_bytes.into(),
+        ));
 
         self.state = ReplaceState::WriteRecords;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: vec![
-                (
-                    GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
-                    backend_key(self.backend_id),
-                    record_bytes.into(),
-                ),
-                (
-                    GROUP_STORAGE_BACKEND_SECRET_KEYSPACE.to_string(),
-                    backend_key(self.backend_id),
-                    secret_bytes.into(),
-                ),
-            ],
+            writes,
             txn_id: None,
         })]
     }

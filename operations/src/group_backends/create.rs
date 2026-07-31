@@ -1,11 +1,9 @@
 use super::validation::{GroupBackendError, validate_backend_input};
-use super::{RecordReadError, backend_key};
+use super::{RecordReadError, backend_key, record_writes};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{
-    GROUP_STORAGE_BACKEND_KEYSPACE, GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
-};
+use aruna_core::keyspaces::GROUP_STORAGE_BACKEND_SECRET_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{GroupBackendKind, GroupStorageBackend, GroupStorageBackendSecret};
 use aruna_core::types::{Effects, GroupId, UserId};
@@ -144,29 +142,23 @@ impl CreateGroupBackendOperation {
         let (Some(record), Some(secret)) = (self.record.as_ref(), self.secret.as_ref()) else {
             return self.fail(CreateGroupBackendError::Failed);
         };
-        let record_bytes = match record.to_bytes() {
-            Ok(bytes) => bytes,
+        let mut writes = match record_writes(record) {
+            Ok(writes) => writes,
             Err(error) => return self.fail(error.into()),
         };
         let secret_bytes = match secret.to_bytes() {
             Ok(bytes) => bytes,
             Err(error) => return self.fail(error.into()),
         };
+        writes.push((
+            GROUP_STORAGE_BACKEND_SECRET_KEYSPACE.to_string(),
+            backend_key(record.backend_id),
+            secret_bytes.into(),
+        ));
 
         self.state = CreateState::WriteRecords;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: vec![
-                (
-                    GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
-                    backend_key(record.backend_id),
-                    record_bytes.into(),
-                ),
-                (
-                    GROUP_STORAGE_BACKEND_SECRET_KEYSPACE.to_string(),
-                    backend_key(record.backend_id),
-                    secret_bytes.into(),
-                ),
-            ],
+            writes,
             txn_id: None,
         })]
     }
@@ -228,7 +220,8 @@ mod tests {
     use aruna_core::errors::BlobError;
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::keyspaces::{
-        GROUP_STORAGE_BACKEND_KEYSPACE, GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
+        GROUP_STORAGE_BACKEND_INDEX_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
+        GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{GroupBackendKind, GroupStorageBackend};
@@ -268,10 +261,18 @@ mod tests {
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected one batch write, got {effects:?}")
         };
-        assert_eq!(writes.len(), 2);
-        assert_eq!(writes[0].0, GROUP_STORAGE_BACKEND_KEYSPACE);
-        assert_eq!(writes[1].0, GROUP_STORAGE_BACKEND_SECRET_KEYSPACE);
-        assert_eq!(writes[0].1, writes[1].1);
+        assert_eq!(
+            writes
+                .iter()
+                .map(|(key_space, ..)| key_space.as_str())
+                .collect::<Vec<_>>(),
+            [
+                GROUP_STORAGE_BACKEND_KEYSPACE,
+                GROUP_STORAGE_BACKEND_INDEX_KEYSPACE,
+                GROUP_STORAGE_BACKEND_SECRET_KEYSPACE
+            ]
+        );
+        assert_eq!(writes[0].1, writes[2].1);
         let stored = GroupStorageBackend::from_bytes(writes[0].2.as_ref()).unwrap();
         assert!(!stored.public_config.contains_key("access_key_id"));
     }

@@ -1,8 +1,8 @@
-use crate::group_backends::{RecordReadError, parse_iter, parse_read};
+use crate::group_backends::{RecordReadError, index_prefix, parse_iter, parse_read};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{GROUP_STORAGE_BACKEND_KEYSPACE, GROUP_STORAGE_ROUTING_KEYSPACE};
+use aruna_core::keyspaces::{GROUP_STORAGE_BACKEND_INDEX_KEYSPACE, GROUP_STORAGE_ROUTING_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     GroupRoutingInputs, GroupStorageBackend, GroupStorageRouting, RoutingError, RoutingTarget,
@@ -39,8 +39,8 @@ pub enum GroupRoutingInputsError {
 }
 
 /// Loads one group's routing inputs: its default write target and the ids of
-/// the backends it registered. Records are keyed by backend id alone, so the
-/// scan filters on the record's own group and never yields a foreign id.
+/// the backends it registered. The scan is prefixed by group, so a write never
+/// pays for another tenant's backends.
 #[derive(Debug, PartialEq)]
 pub struct GroupRoutingInputsOperation {
     group_id: GroupId,
@@ -62,8 +62,8 @@ impl GroupRoutingInputsOperation {
     fn scan_backends(&mut self, start_after: Option<Key>) -> Effects {
         self.state = LoadInputsState::ScanBackends;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
-            prefix: None,
+            key_space: GROUP_STORAGE_BACKEND_INDEX_KEYSPACE.to_string(),
+            prefix: Some(index_prefix(self.group_id)),
             start: start_after.map(IterStart::After),
             limit: BACKEND_PAGE_SIZE,
             txn_id: None,
@@ -412,9 +412,12 @@ mod tests {
         GetGroupRoutingOperation, GroupRoutingInputsOperation, PutGroupRoutingError,
         PutGroupRoutingOperation, routing_key,
     };
+    use crate::group_backends::{index_key, index_prefix};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-    use aruna_core::keyspaces::{GROUP_STORAGE_BACKEND_KEYSPACE, GROUP_STORAGE_ROUTING_KEYSPACE};
+    use aruna_core::keyspaces::{
+        GROUP_STORAGE_BACKEND_INDEX_KEYSPACE, GROUP_STORAGE_ROUTING_KEYSPACE,
+    };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
         BackendRef, GroupBackendKind, GroupRoutingInputs, GroupStorageBackend, GroupStorageRouting,
@@ -562,8 +565,9 @@ mod tests {
 
     #[test]
     fn loads_own_backends() {
-        // Records are keyed by id, so a foreign record on the same page drops.
+        // The scan is prefixed by group, and a retiring backend cannot be routed to.
         let mine = Ulid::from_bytes([4u8; 16]);
+        let retiring = Ulid::from_bytes([5u8; 16]);
         let mut operation = GroupRoutingInputsOperation::new(group());
         operation.start();
 
@@ -577,23 +581,30 @@ mod tests {
             ),
         }));
 
-        let [Effect::Storage(StorageEffect::Iter { key_space, .. })] = effects.as_slice() else {
-            panic!("expected a backend scan, got {effects:?}")
+        let [
+            Effect::Storage(StorageEffect::Iter {
+                key_space,
+                prefix: Some(prefix),
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected a prefixed backend scan, got {effects:?}")
         };
-        assert_eq!(key_space, GROUP_STORAGE_BACKEND_KEYSPACE);
+        assert_eq!(key_space, GROUP_STORAGE_BACKEND_INDEX_KEYSPACE);
+        assert_eq!(prefix, &index_prefix(group()));
 
+        let mut leaving = backend(retiring, group());
+        leaving.retiring = true;
         operation.step(Event::Storage(StorageEvent::IterResult {
             values: vec![
                 (
-                    b"a".to_vec().into(),
+                    index_key(group(), mine),
                     backend(mine, group()).to_bytes().unwrap().into(),
                 ),
                 (
-                    b"b".to_vec().into(),
-                    backend(Ulid::from_bytes([9u8; 16]), Ulid::from_bytes([8u8; 16]))
-                        .to_bytes()
-                        .unwrap()
-                        .into(),
+                    index_key(group(), retiring),
+                    leaving.to_bytes().unwrap().into(),
                 ),
             ],
             next_start_after: None,
