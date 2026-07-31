@@ -1,3 +1,4 @@
+use crate::endpoint;
 use aruna_core::structs::{GroupBackendKind, GroupStorageBackend, ensure_confined_relative_path};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -40,6 +41,10 @@ pub enum GroupBackendError {
     },
     #[error("endpoint `{0}` must be an https url")]
     InsecureEndpoint(String),
+    #[error("endpoint `{0}` must be spelled as the http client parses it")]
+    AmbiguousEndpoint(String),
+    #[error("bucket `{0}` must not contain `/`, `\\`, `?`, `#` or `@`")]
+    UnsafeBucket(String),
     #[error("root `{0}` must be a relative path without parent components")]
     UnsafeRoot(String),
     #[error("`force_path_style` must be `true` or `false`")]
@@ -181,10 +186,18 @@ pub fn validate_backend_input(
         });
     }
 
-    if let Some(endpoint) = public.get("endpoint")
-        && !endpoint.starts_with("https://")
+    if let Some(endpoint) = public.get("endpoint") {
+        if !endpoint.starts_with("https://") {
+            return Err(GroupBackendError::InsecureEndpoint(endpoint.clone()));
+        }
+        if !endpoint::is_canonical(endpoint) {
+            return Err(GroupBackendError::AmbiguousEndpoint(endpoint.clone()));
+        }
+    }
+    if let Some(bucket) = public.get("bucket")
+        && endpoint::breaks_authority(bucket)
     {
-        return Err(GroupBackendError::InsecureEndpoint(endpoint.clone()));
+        return Err(GroupBackendError::UnsafeBucket(bucket.clone()));
     }
     if let Some(root) = public.get("root")
         && ensure_confined_relative_path(Path::new(root.trim_start_matches('/'))).is_err()
@@ -380,6 +393,44 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, GroupBackendError::InsecureEndpoint(_)));
+    }
+
+    #[test]
+    fn rejects_respelled_endpoint() {
+        // The http client reads each of these as a link-local or loopback host.
+        for host in [
+            "2852039166",
+            "0xa9fea9fe",
+            "169.254.169.254.",
+            "127.1",
+            "2851995650",
+            "0251.0376.0251.0376",
+        ] {
+            let endpoint = format!("https://{host}");
+            let mut public = s3_public();
+            public.insert("endpoint".to_string(), endpoint.clone());
+
+            let error =
+                validate_backend_input("tenant", GroupBackendKind::S3, &public, &s3_secret())
+                    .unwrap_err();
+
+            assert_eq!(error, GroupBackendError::AmbiguousEndpoint(endpoint));
+        }
+    }
+
+    #[test]
+    fn rejects_spliced_bucket() {
+        // A bucket is spliced into the authority under virtual-host style.
+        let mut public = s3_public();
+        public.insert("bucket".to_string(), "2852039166/".to_string());
+
+        let error = validate_backend_input("tenant", GroupBackendKind::S3, &public, &s3_secret())
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            GroupBackendError::UnsafeBucket("2852039166/".to_string())
+        );
     }
 
     #[test]

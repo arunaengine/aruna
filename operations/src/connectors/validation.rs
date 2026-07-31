@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::endpoint;
 use aruna_core::structs::SourceConnectorKind;
 use thiserror::Error;
 
@@ -37,6 +38,10 @@ pub enum ValidationError {
     EmptySecretValue { key: String },
     #[error("public config key `{key}` must be `true` or `false`")]
     InvalidBoolValue { key: String },
+    #[error("endpoint `{0}` must be spelled as the http client parses it")]
+    AmbiguousEndpoint(String),
+    #[error("bucket `{0}` must not contain `/`, `\\`, `?`, `#` or `@`")]
+    UnsafeBucket(String),
     #[error("credentials must not be set when `skip_signature` is enabled")]
     CredentialsWithSkipSignature,
     #[error("signed s3 connectors require `{ACCESS_KEY_ID}` and `{SECRET_ACCESS_KEY}`")]
@@ -106,6 +111,17 @@ pub fn validate_connector_input(
                 key: (*key).to_string(),
             });
         }
+    }
+
+    if let Some(endpoint) = public_config.get("endpoint")
+        && !endpoint::is_canonical(endpoint)
+    {
+        return Err(ValidationError::AmbiguousEndpoint(endpoint.clone()));
+    }
+    if let Some(bucket) = public_config.get("bucket")
+        && endpoint::breaks_authority(bucket)
+    {
+        return Err(ValidationError::UnsafeBucket(bucket.clone()));
     }
 
     let mut anonymous = false;
@@ -385,6 +401,53 @@ mod tests {
             ValidationError::InvalidBoolValue {
                 key: S3_SKIP_SIGNATURE.to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn rejects_respelled_endpoint() {
+        // The http client reads each of these as a link-local or loopback host.
+        for host in [
+            "2852039166",
+            "0xa9fea9fe",
+            "169.254.169.254.",
+            "127.1",
+            "2851995650",
+            "0251.0376.0251.0376",
+        ] {
+            let endpoint = format!("https://{host}");
+            let err = validate_connector_input(
+                "http",
+                SourceConnectorKind::Http,
+                &HashMap::from([("endpoint".to_string(), endpoint.clone())]),
+                &HashMap::new(),
+            )
+            .unwrap_err();
+
+            assert_eq!(err, ValidationError::AmbiguousEndpoint(endpoint));
+        }
+    }
+
+    #[test]
+    fn rejects_spliced_bucket() {
+        // A bucket is spliced into the authority under virtual-host style.
+        let err = validate_connector_input(
+            "signed-s3",
+            SourceConnectorKind::S3,
+            &HashMap::from([
+                ("bucket".to_string(), "2852039166/".to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+            ]),
+            &HashMap::from([
+                ("access_key_id".to_string(), "AKIA".to_string()),
+                ("secret_access_key".to_string(), "secret".to_string()),
+            ]),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ValidationError::UnsafeBucket("2852039166/".to_string())
         );
     }
 

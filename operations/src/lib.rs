@@ -28,6 +28,7 @@ pub mod delete_onboarding_secret;
 pub mod document_repository;
 pub mod document_sync_outbox;
 pub mod driver;
+pub(crate) mod endpoint;
 pub mod ensure_canonical_user_token_subject;
 pub mod ensure_realm_config;
 pub mod get_group;
