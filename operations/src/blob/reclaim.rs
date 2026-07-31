@@ -62,11 +62,13 @@ pub async fn restore_reclaim_sweep(storage: &StorageHandle, task_handle: &TaskHa
 
 /// What one candidate resolved to. `Dropped` covers every reason the queue row
 /// is stale: retain, a vanished backend, or a location that is already gone.
+/// `NotDue` keeps the row: the grace grew after the sweep read it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReclaimVerdict {
     Freed { bytes: u64 },
     Pinned,
     Dropped,
+    NotDue,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -130,13 +132,15 @@ async fn sweep_at(context: &DriverContext, now: SystemTime) -> Result<ReclaimOut
                 outcome.not_due = outcome.not_due.saturating_add(1);
                 continue;
             }
-            match drive(ReclaimBlobOperation::new(candidate.0), context).await {
+            let operation = ReclaimBlobOperation::new(candidate.0, candidate.1.enqueued_at, now);
+            match drive(operation, context).await {
                 Ok(ReclaimVerdict::Freed { bytes }) => {
                     outcome.freed = outcome.freed.saturating_add(1);
                     outcome.freed_bytes = outcome.freed_bytes.saturating_add(bytes);
                 }
                 Ok(ReclaimVerdict::Pinned) => outcome.pinned = outcome.pinned.saturating_add(1),
                 Ok(ReclaimVerdict::Dropped) => outcome.dropped = outcome.dropped.saturating_add(1),
+                Ok(ReclaimVerdict::NotDue) => outcome.not_due = outcome.not_due.saturating_add(1),
                 Err(error) => {
                     warn!(backend = %backend, error = %error, "Blob reclaim candidate failed");
                     outcome.failed = outcome.failed.saturating_add(1);
@@ -334,6 +338,8 @@ pub enum ReclaimBlobError {
 #[derive(Debug, PartialEq)]
 pub struct ReclaimBlobOperation {
     key: ReclaimCandidateKey,
+    enqueued_at: SystemTime,
+    sweep_time: SystemTime,
     state: ReclaimState,
     txn_id: Option<TxnId>,
     location: Option<BackendLocation>,
@@ -343,9 +349,11 @@ pub struct ReclaimBlobOperation {
 }
 
 impl ReclaimBlobOperation {
-    pub fn new(key: ReclaimCandidateKey) -> Self {
+    pub fn new(key: ReclaimCandidateKey, enqueued_at: SystemTime, sweep_time: SystemTime) -> Self {
         Self {
             key,
+            enqueued_at,
+            sweep_time,
             state: ReclaimState::Init,
             txn_id: None,
             location: None,
@@ -417,12 +425,35 @@ impl ReclaimBlobOperation {
     }
 
     /// Re-checks the tenant's strategy under the transaction, so a flip to
-    /// retain conflicts with this sweep instead of racing it.
+    /// retain conflicts with this sweep instead of racing it. A grace the tenant
+    /// lengthened since the sweep read it makes the candidate not due again.
     fn handle_fence(&mut self, event: Event) -> Effects {
-        match parse_read(event, GroupStorageBackend::from_bytes) {
-            Ok(Some(record)) if record.cleanup.grace().is_some() => self.read_location(),
-            Ok(_) => self.drop_candidate(ReclaimVerdict::Dropped),
-            Err(error) => self.fail(error.into()),
+        let record = match parse_read(event, GroupStorageBackend::from_bytes) {
+            Ok(Some(record)) => record,
+            Ok(None) => return self.drop_candidate(ReclaimVerdict::Dropped),
+            Err(error) => return self.fail(error.into()),
+        };
+        let Some(after) = record.cleanup.grace() else {
+            return self.drop_candidate(ReclaimVerdict::Dropped);
+        };
+        match self.enqueued_at.checked_add(after) {
+            Some(due) if due <= self.sweep_time => self.read_location(),
+            _ => self.finish_not_due(),
+        }
+    }
+
+    /// Leaves the queue row in place: the candidate is simply not due yet.
+    fn finish_not_due(&mut self) -> Effects {
+        self.output = Some(Ok(ReclaimVerdict::NotDue));
+        match self.txn_id.take() {
+            Some(txn_id) => {
+                self.state = ReclaimState::AbortTransaction;
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            }
+            None => {
+                self.state = ReclaimState::Finish;
+                smallvec![]
+            }
         }
     }
 
@@ -653,7 +684,10 @@ impl ReclaimBlobOperation {
         match event {
             Event::Storage(StorageEvent::TransactionAborted { .. })
             | Event::Storage(StorageEvent::Error { .. }) => {
-                self.state = ReclaimState::Error;
+                self.state = match self.output {
+                    Some(Ok(_)) => ReclaimState::Finish,
+                    _ => ReclaimState::Error,
+                };
                 smallvec![]
             }
             received => self.unexpected(
@@ -726,6 +760,11 @@ mod tests {
     use tempfile::tempdir;
 
     const HASH: [u8; 32] = [4u8; 32];
+
+    /// Long past its grace, so only the case under test decides the verdict.
+    fn reclaim_op(key: ReclaimCandidateKey) -> ReclaimBlobOperation {
+        ReclaimBlobOperation::new(key, SystemTime::UNIX_EPOCH, SystemTime::now())
+    }
 
     fn context(root: &str) -> DriverContext {
         DriverContext {
@@ -891,9 +930,7 @@ mod tests {
         let context = context(dir.path().to_str().unwrap());
         seed(&context, 10).await;
 
-        let verdict = drive(ReclaimBlobOperation::new(candidate_key()), &context)
-            .await
-            .unwrap();
+        let verdict = drive(reclaim_op(candidate_key()), &context).await.unwrap();
 
         assert_eq!(verdict, ReclaimVerdict::Freed { bytes: 10 });
         assert!(
@@ -942,9 +979,7 @@ mod tests {
         seed(&context, 10).await;
         add_alias(&context, Ulid::from_bytes([6u8; 16]), true).await;
 
-        let verdict = drive(ReclaimBlobOperation::new(candidate_key()), &context)
-            .await
-            .unwrap();
+        let verdict = drive(reclaim_op(candidate_key()), &context).await.unwrap();
 
         assert_eq!(verdict, ReclaimVerdict::Pinned);
         assert!(
@@ -971,9 +1006,7 @@ mod tests {
         seed(&context, 10).await;
         add_alias(&context, Ulid::from_bytes([7u8; 16]), false).await;
 
-        let verdict = drive(ReclaimBlobOperation::new(candidate_key()), &context)
-            .await
-            .unwrap();
+        let verdict = drive(reclaim_op(candidate_key()), &context).await.unwrap();
 
         assert_eq!(verdict, ReclaimVerdict::Freed { bytes: 10 });
     }
@@ -994,9 +1027,7 @@ mod tests {
         )
         .await;
 
-        let verdict = drive(ReclaimBlobOperation::new(candidate_key()), &context)
-            .await
-            .unwrap();
+        let verdict = drive(reclaim_op(candidate_key()), &context).await.unwrap();
 
         assert_eq!(verdict, ReclaimVerdict::Dropped);
         assert!(
@@ -1043,7 +1074,7 @@ mod tests {
     fn fence_drops_retain() {
         // A tenant flip to retain is read inside the transaction and stands down.
         let backend_id = Ulid::from_bytes([8u8; 16]);
-        let mut operation = ReclaimBlobOperation::new(ReclaimCandidateKey::new(
+        let mut operation = reclaim_op(ReclaimCandidateKey::new(
             BackendRef::Group(backend_id),
             HASH,
         ));
@@ -1063,6 +1094,46 @@ mod tests {
         };
         assert_eq!(deletes.len(), 1);
         assert_eq!(deletes[0].0, BLOB_RECLAIM_KEYSPACE);
+    }
+
+    #[test]
+    fn fence_keeps_not_due() {
+        // A grace the tenant lengthened after the sweep read it must leave the
+        // queue row alone rather than delete the copy under the old value.
+        let backend_id = Ulid::from_bytes([8u8; 16]);
+        let enqueued_at = SystemTime::UNIX_EPOCH;
+        let sweep_time = enqueued_at + Duration::from_secs(60);
+        let mut operation = ReclaimBlobOperation::new(
+            ReclaimCandidateKey::new(BackendRef::Group(backend_id), HASH),
+            enqueued_at,
+            sweep_time,
+        );
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([9u8; 16]),
+        }));
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(
+                group_record(
+                    backend_id,
+                    CleanupStrategy::Reclaim {
+                        after: Duration::from_secs(3_600),
+                    },
+                )
+                .into(),
+            ),
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        operation.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: Ulid::from_bytes([9u8; 16]),
+        }));
+        assert_eq!(operation.finalize(), Ok(ReclaimVerdict::NotDue));
     }
 
     fn group_record(backend_id: Ulid, cleanup: CleanupStrategy) -> Vec<u8> {
@@ -1113,7 +1184,7 @@ mod tests {
     #[test]
     fn rejects_stray_event() {
         // A write acknowledgement is not a transaction start.
-        let mut operation = ReclaimBlobOperation::new(candidate_key());
+        let mut operation = reclaim_op(candidate_key());
         operation.start();
 
         operation.step(Event::Storage(StorageEvent::BatchWriteResult {
