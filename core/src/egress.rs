@@ -40,14 +40,14 @@ const DENIED_V4: &[Ipv4Net] = &[
 ];
 
 /// IPv6 ranges that are never a legitimate tenant destination: every IANA
-/// special-purpose prefix that is not globally reachable, plus the tunnelling
-/// prefixes whose reachability depends on a translator. `::/96` covers the
-/// deprecated IPv4-compatible spellings that embed an arbitrary v4 address.
+/// special-purpose prefix that is not globally reachable, minus [`ALLOWED_V6`].
+/// `::/96` covers the deprecated spellings that embed an arbitrary v4 address.
 const DENIED_V6: &[Ipv6Net] = &[
     Ipv6Net::new_assert(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), 96),
+    Ipv6Net::new_assert(Ipv6Addr::new(0x0064, 0xff9b, 0x0001, 0, 0, 0, 0, 0), 48),
     Ipv6Net::new_assert(Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 0), 64),
-    Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 32),
-    Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0x0002, 0, 0, 0, 0, 0, 0), 48),
+    Ipv6Net::new_assert(Ipv6Addr::new(0x0100, 0, 0, 0x0001, 0, 0, 0, 0), 64),
+    Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23),
     Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0), 32),
     Ipv6Net::new_assert(Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16),
     Ipv6Net::new_assert(Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20),
@@ -58,10 +58,20 @@ const DENIED_V6: &[Ipv6Net] = &[
     Ipv6Net::new_assert(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
 ];
 
+/// The globally reachable assignments inside `2001::/23`, which is otherwise
+/// denied whole. Checked before the deny table.
+const ALLOWED_V6: &[Ipv6Net] = &[
+    Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0x0001, 0, 0, 0, 0, 0, 0x0001), 128),
+    Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0x0001, 0, 0, 0, 0, 0, 0x0002), 128),
+    Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0x0001, 0, 0, 0, 0, 0, 0x0003), 128),
+    Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0x0003, 0, 0, 0, 0, 0, 0), 32),
+    Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0x0004, 0x0112, 0, 0, 0, 0, 0), 48),
+    Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0x0020, 0, 0, 0, 0, 0, 0), 28),
+    Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0x0030, 0, 0, 0, 0, 0, 0), 28),
+];
+
 const NAT64_WELL_KNOWN: Ipv6Net =
     Ipv6Net::new_assert(Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0, 0), 96);
-const NAT64_LOCAL_USE: Ipv6Net =
-    Ipv6Net::new_assert(Ipv6Addr::new(0x0064, 0xff9b, 0x0001, 0, 0, 0, 0, 0), 48);
 
 /// Unwraps an IPv4 address carried inside an IPv6 address so a v6 spelling of a
 /// blocked v4 destination cannot skip the v4 rows.
@@ -85,17 +95,16 @@ fn embedded_v4(address: Ipv6Addr) -> Option<Ipv4Addr> {
             octets[12], octets[13], octets[14], octets[15],
         ));
     }
-    // RFC 6052 /48 embedding straddles the reserved octet at bits 64..71.
-    if NAT64_LOCAL_USE.contains(&address) {
-        return Some(Ipv4Addr::new(octets[6], octets[7], octets[9], octets[10]));
-    }
     None
 }
 
 fn denied(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => DENIED_V4.iter().any(|net| net.contains(&address)),
-        IpAddr::V6(address) => DENIED_V6.iter().any(|net| net.contains(&address)),
+        IpAddr::V6(address) => {
+            !ALLOWED_V6.iter().any(|net| net.contains(&address))
+                && DENIED_V6.iter().any(|net| net.contains(&address))
+        }
     }
 }
 
@@ -185,11 +194,12 @@ mod tests {
         "255.255.255.255/32",
     ];
 
-    const V6_ROWS: [&str; 12] = [
+    const V6_ROWS: [&str; 13] = [
         "::/96",
+        "64:ff9b:1::/48",
         "100::/64",
-        "2001::/32",
-        "2001:2::/48",
+        "100:0:0:1::/64",
+        "2001::/23",
         "2001:db8::/32",
         "2002::/16",
         "3fff::/20",
@@ -200,14 +210,39 @@ mod tests {
         "ff00::/8",
     ];
 
+    const ALLOWED_ROWS: [&str; 7] = [
+        "2001:1::1/128",
+        "2001:1::2/128",
+        "2001:1::3/128",
+        "2001:3::/32",
+        "2001:4:112::/48",
+        "2001:20::/28",
+        "2001:30::/28",
+    ];
+
     #[test]
     fn table_matches_spec() {
         // The table is the security contract; pin its exact rows.
         let v4: Vec<String> = DENIED_V4.iter().map(ToString::to_string).collect();
         let v6: Vec<String> = DENIED_V6.iter().map(ToString::to_string).collect();
+        let allowed: Vec<String> = ALLOWED_V6.iter().map(ToString::to_string).collect();
 
         assert_eq!(v4, V4_ROWS);
         assert_eq!(v6, V6_ROWS);
+        assert_eq!(allowed, ALLOWED_ROWS);
+    }
+
+    #[test]
+    fn allows_v6_exceptions() {
+        // `2001::/23` is denied whole, so its reachable assignments need a pass.
+        let policy = EgressPolicy::strict();
+        for row in ALLOWED_ROWS {
+            let net = Ipv6Net::from_str(row).unwrap();
+            policy.check(IpAddr::V6(net.network())).unwrap();
+        }
+        for row in ["2001::1", "2001:2::1", "2001:1::4", "2001:5::1"] {
+            policy.check(IpAddr::from_str(row).unwrap()).unwrap_err();
+        }
     }
 
     #[test]
@@ -275,18 +310,24 @@ mod tests {
 
     #[test]
     fn unwraps_nat64_prefixes() {
-        // Well-known /96 and RFC 8215 /48 embeddings of 169.254.169.254.
+        // The well-known /96 unwraps; the RFC 8215 /48 is denied whole instead,
+        // because its embedding offset is a local choice the node cannot know.
         let policy = EgressPolicy::strict();
         let well_known = IpAddr::from_str("64:ff9b::169.254.169.254").unwrap();
         let local_use = IpAddr::V6(Ipv6Addr::new(
             0x0064, 0xff9b, 0x0001, 0xa9fe, 0x00a9, 0xfe00, 0, 0,
         ));
-        let blocked = Err(EgressError::BlockedAddress(
-            IpAddr::from_str("169.254.169.254").unwrap(),
-        ));
 
-        assert_eq!(policy.check(well_known), blocked);
-        assert_eq!(policy.check(local_use), blocked);
+        assert_eq!(
+            policy.check(well_known),
+            Err(EgressError::BlockedAddress(
+                IpAddr::from_str("169.254.169.254").unwrap(),
+            ))
+        );
+        assert_eq!(
+            policy.check(local_use),
+            Err(EgressError::BlockedAddress(local_use))
+        );
         policy
             .check(IpAddr::from_str("64:ff9b::1.1.1.1").unwrap())
             .unwrap();
@@ -294,7 +335,7 @@ mod tests {
             .check(IpAddr::V6(Ipv6Addr::new(
                 0x0064, 0xff9b, 0x0001, 0x0101, 0x0001, 0x0100, 0, 0,
             )))
-            .unwrap();
+            .unwrap_err();
     }
 
     #[test]

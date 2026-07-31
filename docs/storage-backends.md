@@ -130,8 +130,10 @@ Tenant-supplied endpoints (group backends, staging sources, autoindex fetches)
 are screened against a compiled-in deny table covering loopback, link-local,
 RFC1918, carrier-grade NAT, documentation, benchmarking, multicast, reserved,
 segment-routing and IPv6 transition ranges, in both IPv4 and IPv6, after
-unwrapping IPv4-mapped, NAT64 and RFC 8215 translations. It holds every IANA
-special-purpose prefix whose registry entry is not globally reachable. The
+unwrapping IPv4-mapped and well-known NAT64 translations. It holds every IANA
+special-purpose prefix whose registry entry is not globally reachable,
+including the RFC 8215 local-use NAT64 prefix, which is denied whole because
+its embedding offset is a local choice the node cannot know. The
 table cannot be widened. `[egress].deny` only
 appends further CIDRs, and `serve_group_backends = false` makes group-backend
 routing targets fail loudly.
