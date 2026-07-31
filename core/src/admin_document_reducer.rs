@@ -11,10 +11,10 @@ use crate::admin_documents::{
     AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use crate::structs::{
-    Actor, BindingScope, DocumentClass, KIND_LABEL_KEY, MAX_PLACEMENT_SHARD_COUNT,
-    MetadataRegistryRecord, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig,
-    PlacementOverride, PlacementStrategy, QuotaConfig, RealmConfigDocument, RealmDiscoveryConfig,
-    RealmId, RealmNodeKind, StrategyBinding,
+    Actor, BindingScope, DocumentClass, MAX_PLACEMENT_SHARD_COUNT, MetadataRegistryRecord,
+    MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, PlacementOverride,
+    PlacementStrategy, QuotaConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
+    RealmNodeKind, StrategyBinding, reserved_label,
 };
 use crate::types::{RoleId, UserId};
 use crate::user_update_validation::{
@@ -36,8 +36,8 @@ pub enum AdminDocumentReducerError {
     UnsupportedTarget,
     #[error(transparent)]
     InvalidUserAttribute(#[from] UserAttributeValidationError),
-    #[error("placement labels must not set the reserved kind label")]
-    ReservedPlacementLabel,
+    #[error("placement labels must not set the derived label `{0}`")]
+    ReservedPlacementLabel(String),
     #[error("placement strategy replica count must not be zero")]
     ZeroPlacementReplicaCount,
     #[error(
@@ -446,8 +446,10 @@ impl AdminDocumentReducerState {
                 AdminDocumentTarget::RealmConfig { .. },
                 AdminDocumentOperation::RealmConfigNodePlacementSet { entry },
             ) => {
-                if entry.labels.contains_key(KIND_LABEL_KEY) {
-                    return Err(AdminDocumentReducerError::ReservedPlacementLabel);
+                if let Some(label) = reserved_label(&entry.labels) {
+                    return Err(AdminDocumentReducerError::ReservedPlacementLabel(
+                        label.to_string(),
+                    ));
                 }
                 self.apply_realm_config_placement_field(
                     event,
@@ -1684,7 +1686,7 @@ mod tests {
         KIND_LABEL_KEY, LabelMatch, MAX_PLACEMENT_SHARD_COUNT, MetadataReplicationConfig,
         NodePlacementEntry, OidcProviderConfig, Permission, PlacementOverride, PlacementStrategy,
         QuotaConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind,
-        StrategyBinding, UserGroupCapOverride,
+        STORAGE_CLASS_LABEL_PREFIX, StrategyBinding, UserGroupCapOverride,
     };
     use crate::types::{GroupId, RoleId};
     use crate::user_update_validation::UserAttributeValidationError;
@@ -4181,19 +4183,23 @@ mod tests {
     }
 
     #[test]
-    fn realm_config_node_placement_rejects_reserved_kind_label() {
-        let mut state = realm_config_state();
-        let before = state.clone();
-        let mut entry = placement_entry(node(11), 100);
-        entry
-            .labels
-            .insert(KIND_LABEL_KEY.to_string(), "Server".to_string());
+    fn placement_rejects_derived_labels() {
+        // Both the kind label and any storage class are stamped by the node.
+        for key in [
+            KIND_LABEL_KEY.to_string(),
+            format!("{STORAGE_CLASS_LABEL_PREFIX}cold"),
+        ] {
+            let mut state = realm_config_state();
+            let before = state.clone();
+            let mut entry = placement_entry(node(11), 100);
+            entry.labels.insert(key.clone(), "Server".to_string());
 
-        assert_eq!(
-            state.apply(&set_placement_entry(1, 1, entry)),
-            Err(AdminDocumentReducerError::ReservedPlacementLabel)
-        );
-        assert_eq!(state, before);
+            assert_eq!(
+                state.apply(&set_placement_entry(1, 1, entry)),
+                Err(AdminDocumentReducerError::ReservedPlacementLabel(key))
+            );
+            assert_eq!(state, before);
+        }
     }
 
     #[test]
