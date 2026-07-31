@@ -203,10 +203,13 @@ impl CompleteMultipartUploadOperation {
         self
     }
 
+    /// The terminal state is complete, so the driver never calls `abort` for us;
+    /// releasing the transaction here is what keeps it from outliving the
+    /// operation. `abort` takes the id, so it cannot run twice.
     fn emit_error(&mut self, error: CompleteMultipartUploadError) -> Effects {
         self.state = CompleteMultipartUploadState::Error;
         self.output = Some(Err(error));
-        smallvec![]
+        self.abort()
     }
 
     fn schedule_error(&mut self, error: CompleteMultipartUploadError) -> Effects {

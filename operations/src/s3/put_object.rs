@@ -767,9 +767,11 @@ impl PutObjectOperation {
         }
     }
 
+    /// Takes the location: once its delete is queued the rollback in `abort`
+    /// must not queue a second one.
     fn cleanup_orphan_blob(&mut self) -> Effects {
         self.state = PutObjectState::CleanupFailedWrite;
-        self.get_written_location().cloned().map_or_else(
+        self.written_location.take().map_or_else(
             || self.emit_pending_error(),
             |location| smallvec![Effect::Blob(BlobEffect::Delete { location })],
         )
@@ -799,6 +801,9 @@ impl PutObjectOperation {
         match event {
             Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                 self.txn_id = None;
+                // The committed records own the blob now, so the rollback must
+                // not still hold it.
+                self.written_location = None;
                 self.register_blob_in_dht_or_continue()
             }
             Event::Storage(StorageEvent::Error {
@@ -874,7 +879,7 @@ impl PutObjectOperation {
         self.pending_error = Some(error);
         self.state = PutObjectState::CleanupFailedWrite;
 
-        self.get_written_location().cloned().map_or_else(
+        self.written_location.take().map_or_else(
             || self.emit_pending_error(),
             |location| smallvec![Effect::Blob(BlobEffect::Delete { location })],
         )
@@ -896,10 +901,13 @@ impl PutObjectOperation {
         self.emit_error(error)
     }
 
+    /// The terminal state is complete, so the driver never calls `abort` for us;
+    /// rolling back here is what keeps an open transaction from outliving the
+    /// operation. `abort` takes what it releases, so it cannot run twice.
     fn emit_error(&mut self, error: PutObjectError) -> Effects {
         self.state = PutObjectState::Error;
         self.output = Some(Err(error));
-        smallvec![]
+        self.abort()
     }
 
     fn get_output(&self) -> Option<&BackendLocation> {
@@ -980,16 +988,12 @@ impl Operation for PutObjectOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        // Rollback blob io and transaction
-        let mut actions = smallvec![];
+        let mut actions: Effects = smallvec![];
         if let Some(location) = self.written_location.take() {
-            actions.insert(0, Effect::Blob(BlobEffect::Delete { location }))
+            actions.push(Effect::Blob(BlobEffect::Delete { location }));
         }
         if let Some(txn_id) = self.txn_id.take() {
-            actions.insert(
-                1,
-                Effect::Storage(StorageEffect::AbortTransaction { txn_id }),
-            )
+            actions.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
         }
         actions
     }
@@ -1367,13 +1371,54 @@ mod test {
             value: Some(recreated.to_bytes().unwrap().into()),
         }));
 
-        assert!(effects.is_empty());
+        // The terminal state is complete, so this is the only chance to release
+        // the transaction the guard read joined.
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::Blob(BlobEffect::Delete { .. }),
+                    Effect::Storage(StorageEffect::AbortTransaction { .. }),
+                ]
+            ),
+            "expected a rollback, got {effects:?}"
+        );
         assert!(op.is_complete());
+        assert!(op.step(Event::Blob(BlobEvent::DeleteFinished)).is_empty());
         assert_eq!(
             op.finalize(),
             Err(PutObjectError::StorageError(
                 StorageError::TransactionConflict
             ))
+        );
+    }
+
+    #[test]
+    fn error_closes_transaction() {
+        // Error is a complete state, so nothing else can release the transaction.
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let mut op = PutObjectOperation::new(put_config(
+            realm_id,
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+        ));
+        let txn_id = Ulid::generate();
+        op.state = PutObjectState::CheckHashLookup;
+        op.txn_id = Some(txn_id);
+
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"unexpected".to_vec().into(),
+        }));
+
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+        );
+        assert!(op.txn_id.is_none());
+        // Replaying the terminal state must not abort the same transaction twice.
+        assert!(
+            op.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }))
+                .is_empty()
         );
     }
 

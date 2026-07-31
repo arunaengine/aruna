@@ -107,10 +107,13 @@ impl UploadPartOperation {
         }
     }
 
+    /// The terminal state is complete, so the driver never calls `abort` for us;
+    /// rolling back here is what keeps an open transaction from outliving the
+    /// operation. `abort` takes what it releases, so it cannot run twice.
     fn emit_error(&mut self, error: UploadPartError) -> Effects {
         self.state = UploadPartState::Error;
         self.output = Some(Err(error));
-        smallvec![]
+        self.abort()
     }
 
     fn handle_init(&mut self) -> Effects {
@@ -206,10 +209,12 @@ impl UploadPartOperation {
         })]
     }
 
+    /// Takes the location: once its delete is queued the rollback in `abort`
+    /// must not queue a second one.
     fn cleanup_failed_write(&mut self, error: UploadPartError) -> Effects {
         self.pending_error = Some(error);
         self.state = UploadPartState::CleanupFailedWrite;
-        if let Some(location) = self.written_location.clone() {
+        if let Some(location) = self.written_location.take() {
             smallvec![Effect::Blob(BlobEffect::Delete { location })]
         } else {
             self.emit_pending_error()
@@ -334,16 +339,18 @@ impl UploadPartOperation {
             return self.emit_error(UploadPartError::InvalidOperationState);
         };
         self.txn_id = None;
+        // The committed part record owns the blob now, so the rollback must not
+        // still hold it.
+        let Some(location) = self.written_location.take() else {
+            return self.emit_error(UploadPartError::UploadPartFailed);
+        };
+        self.output = Some(Ok(UploadPartResult { location }));
 
-        if let Some(location) = self.replaced_location.take() {
+        if let Some(replaced) = self.replaced_location.take() {
             self.state = UploadPartState::CleanupReplacedPart;
-            smallvec![Effect::Blob(BlobEffect::Delete { location })]
+            smallvec![Effect::Blob(BlobEffect::Delete { location: replaced })]
         } else {
             self.state = UploadPartState::Finish;
-            let Some(location) = self.written_location.clone() else {
-                return self.emit_error(UploadPartError::UploadPartFailed);
-            };
-            self.output = Some(Ok(UploadPartResult { location }));
             smallvec![]
         }
     }
@@ -352,10 +359,6 @@ impl UploadPartOperation {
         match event {
             Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
                 self.state = UploadPartState::Finish;
-                let Some(location) = self.written_location.clone() else {
-                    return self.emit_error(UploadPartError::UploadPartFailed);
-                };
-                self.output = Some(Ok(UploadPartResult { location }));
                 smallvec![]
             }
             _ => self.emit_error(UploadPartError::InvalidOperationState),
