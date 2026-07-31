@@ -108,7 +108,10 @@ It does not delete anything: the record and its credentials stay, so objects
 already stored there keep being readable and cleanups that were already queued
 still reach the store. What stops is writing. Routing no longer chooses the
 backend, a rule that names it fails, and any write that had already resolved it
-loses its commit. Repeating the request is harmless and answers `204` again.
+loses its commit. A multipart upload pinned the backend when it was created, so
+both `UploadPart` and `CompleteMultipartUpload` re-read the record inside their
+own transaction and refuse; the part or the composed object is deleted again.
+Repeating the request is harmless and answers `204` again.
 
 `POST /groups/{group_id}/storage-backends/{backend_id}/enable` turns writes back
 on. `disabled` on the backend record tells you which state it is in.

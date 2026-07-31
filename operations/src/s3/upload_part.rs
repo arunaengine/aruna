@@ -1,3 +1,4 @@
+use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -23,6 +24,7 @@ pub enum UploadPartState {
     WritePart,
     CleanupFailedWrite,
     StartTransaction,
+    FenceBackend,
     ReReadUpload,
     ReadExistingPart,
     WritePartRecord,
@@ -38,6 +40,8 @@ pub enum UploadPartError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    BackendFenceError(#[from] BackendFenceError),
     #[error("Invalid operation state")]
     InvalidOperationState,
     #[error("No transaction found")]
@@ -243,11 +247,34 @@ impl UploadPartOperation {
         };
 
         self.txn_id = Some(txn_id);
+        // The pin was taken at creation, so the part write must still prove the
+        // tenant backend is enabled before its record joins the transaction.
+        match self
+            .written_location
+            .as_ref()
+            .and_then(|location| fence_backend(&location.backend, self.txn_id))
+        {
+            Some(effect) => {
+                self.state = UploadPartState::FenceBackend;
+                smallvec![effect]
+            }
+            None => self.reread_upload(),
+        }
+    }
+
+    fn handle_backend_fenced(&mut self, event: Event) -> Effects {
+        match check_fence(event) {
+            Ok(()) => self.reread_upload(),
+            Err(error) => self.cleanup_failed_write(error.into()),
+        }
+    }
+
+    fn reread_upload(&mut self) -> Effects {
         self.state = UploadPartState::ReReadUpload;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
             key: self.input.upload_id.to_bytes().to_vec().into(),
-            txn_id: Some(txn_id),
+            txn_id: self.txn_id,
         })]
     }
 
@@ -381,6 +408,7 @@ impl Operation for UploadPartOperation {
             UploadPartState::WritePart => self.handle_write_finished(event),
             UploadPartState::CleanupFailedWrite => self.handle_failed_write_cleanup(event),
             UploadPartState::StartTransaction => self.handle_transaction_started(event),
+            UploadPartState::FenceBackend => self.handle_backend_fenced(event),
             UploadPartState::ReReadUpload => self.handle_upload_reread(event),
             UploadPartState::ReadExistingPart => self.handle_existing_part_read(event),
             UploadPartState::WritePartRecord => self.handle_part_record_written(event),
@@ -532,6 +560,114 @@ mod test {
             op.finalize(),
             Err(UploadPartError::BlobWriteFailed(_))
         ));
+    }
+
+    #[test]
+    fn refuses_disabled_backend() {
+        // The pin predates the disable, so only the finalize fence can catch it.
+        let backend_id = Ulid::from_bytes([5u8; 16]);
+        let mut op = upload_part_op(backend_id);
+        op.state = UploadPartState::StartTransaction;
+        op.written_location = Some(part_location(backend_id));
+
+        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([3u8; 16]),
+        }));
+        assert_eq!(op.state, UploadPartState::FenceBackend);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(disabled_record(backend_id).into()),
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Delete { .. })]
+        ));
+        op.step(Event::Blob(BlobEvent::DeleteFinished));
+        assert!(matches!(
+            op.finalize(),
+            Err(UploadPartError::BackendFenceError(
+                BackendFenceError::Unavailable
+            ))
+        ));
+    }
+
+    #[test]
+    fn fence_rejects_stray_event() {
+        let backend_id = Ulid::from_bytes([5u8; 16]);
+        let mut op = upload_part_op(backend_id);
+        op.state = UploadPartState::FenceBackend;
+        op.written_location = Some(part_location(backend_id));
+
+        op.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        op.step(Event::Blob(BlobEvent::DeleteFinished));
+
+        assert!(matches!(
+            op.finalize(),
+            Err(UploadPartError::BackendFenceError(BackendFenceError::Read(
+                _
+            )))
+        ));
+    }
+
+    fn upload_part_op(backend_id: Ulid) -> UploadPartOperation {
+        let mut op = UploadPartOperation::new(UploadPartInput {
+            bucket: "mybucket".to_string(),
+            key: "object.txt".to_string(),
+            upload_id: Ulid::generate(),
+            part_number: 1,
+            content_length: None,
+            body: None,
+            created_by: test_user_id(),
+            compressed: false,
+            encrypted: false,
+            expected_checksums: Vec::new(),
+        });
+        op.written_location = Some(part_location(backend_id));
+        op
+    }
+
+    fn part_location(backend_id: Ulid) -> BackendLocation {
+        BackendLocation {
+            backend: aruna_core::structs::BackendRef::Group(backend_id),
+            storage_class: None,
+            root: "root".to_string(),
+            storage_bucket: "storage".to_string(),
+            backend_path: "mybucket/object.txt".to_string(),
+            ulid: Ulid::from_bytes([6u8; 16]),
+            compressed: false,
+            encrypted: false,
+            created_by: test_user_id(),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 4,
+            hashes: std::collections::HashMap::new(),
+        }
+    }
+
+    fn disabled_record(backend_id: Ulid) -> Vec<u8> {
+        aruna_core::structs::GroupStorageBackend {
+            backend_id,
+            group_id: Ulid::from_bytes([7u8; 16]),
+            name: "tenant".to_string(),
+            kind: aruna_core::structs::GroupBackendKind::S3,
+            public_config: std::collections::HashMap::new(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            disabled: true,
+            cleanup: aruna_core::structs::CleanupStrategy::Retain,
+        }
+        .to_bytes()
+        .unwrap()
     }
 
     #[tokio::test]

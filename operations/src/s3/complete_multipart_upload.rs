@@ -3,6 +3,7 @@ use crate::blob::blob_keyspace_helper::{
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::blob::cleanup::schedule_blob_cleanup_effect;
+use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::usage_stats::{
     QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
@@ -42,6 +43,7 @@ pub enum CompleteMultipartUploadState {
     ReadUploadParts,
     ComposeBlob,
     StartFinalizeTransaction,
+    FenceBackend,
     CheckHashLookup,
     WriteBlobLocation,
     ReadObjectLookup,
@@ -72,6 +74,8 @@ pub enum CompleteMultipartUploadError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    BackendFenceError(#[from] BackendFenceError),
     #[error("Invalid operation state")]
     InvalidOperationState,
     #[error("stored part does not live on the upload's pinned backend")]
@@ -534,6 +538,29 @@ impl CompleteMultipartUploadOperation {
         };
         self.txn_id = Some(txn_id);
 
+        let Some(location) = self.composed_location.clone() else {
+            return self
+                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        };
+        // The compose already ran on the pinned backend, so the finalize must
+        // prove it is still enabled or roll the composed object back.
+        match fence_backend(&location.backend, self.txn_id) {
+            Some(effect) => {
+                self.state = CompleteMultipartUploadState::FenceBackend;
+                smallvec![effect]
+            }
+            None => self.check_hash_lookup(),
+        }
+    }
+
+    fn handle_backend_fenced(&mut self, event: Event) -> Effects {
+        match check_fence(event) {
+            Ok(()) => self.check_hash_lookup(),
+            Err(error) => self.schedule_error(error.into()),
+        }
+    }
+
+    fn check_hash_lookup(&mut self) -> Effects {
         let Some(location) = self.composed_location.clone() else {
             return self
                 .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
@@ -1224,6 +1251,7 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::StartFinalizeTransaction => {
                 self.handle_finalize_transaction_started(event)
             }
+            CompleteMultipartUploadState::FenceBackend => self.handle_backend_fenced(event),
             CompleteMultipartUploadState::CheckHashLookup => self.handle_hash_lookup_checked(event),
             CompleteMultipartUploadState::WriteBlobLocation => {
                 self.handle_blob_location_written(event)
@@ -1487,6 +1515,85 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn refuses_disabled_backend() {
+        // Compose already ran on the pinned backend, so the finalize fence has
+        // to abort the transaction and roll the composed object back.
+        let backend_id = Ulid::from_bytes([5u8; 16]);
+        let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+        op.upload_record = Some(open_upload_record(&op.input));
+        op.composed_location = Some(composed_location(backend_id));
+        op.state = CompleteMultipartUploadState::StartFinalizeTransaction;
+        let txn_id = TxnId::generate();
+
+        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert_eq!(op.state, CompleteMultipartUploadState::FenceBackend);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(disabled_record(backend_id).into()),
+        }));
+
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })]
+                    if *aborted == txn_id
+            ),
+            "expected the finalize transaction to abort, got {effects:?}"
+        );
+        assert_eq!(
+            op.pending_error,
+            Some(BackendFenceError::Unavailable.into())
+        );
+    }
+
+    #[test]
+    fn fence_rejects_stray_event() {
+        let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+        op.composed_location = Some(composed_location(Ulid::from_bytes([5u8; 16])));
+        op.state = CompleteMultipartUploadState::FenceBackend;
+
+        op.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+
+        assert!(matches!(
+            op.pending_error,
+            Some(CompleteMultipartUploadError::BackendFenceError(
+                BackendFenceError::Read(_)
+            ))
+        ));
+    }
+
+    fn composed_location(backend_id: Ulid) -> BackendLocation {
+        let mut location = part_record(1, 10).location;
+        location.backend = BackendRef::Group(backend_id);
+        location.partial = false;
+        location
+    }
+
+    fn disabled_record(backend_id: Ulid) -> Vec<u8> {
+        aruna_core::structs::GroupStorageBackend {
+            backend_id,
+            group_id: Ulid::from_bytes([7u8; 16]),
+            name: "tenant".to_string(),
+            kind: aruna_core::structs::GroupBackendKind::S3,
+            public_config: HashMap::new(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            disabled: true,
+            cleanup: aruna_core::structs::CleanupStrategy::Retain,
+        }
+        .to_bytes()
+        .unwrap()
     }
 
     #[test]
