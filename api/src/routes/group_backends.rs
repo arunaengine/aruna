@@ -287,7 +287,7 @@ pub async fn replace_group_backend(
         (status = 404, description = "Backend not found", body = ErrorResponse),
         (
             status = 409,
-            description = "Backend still holds object data or changed while retiring",
+            description = "Backend still holds object data or changed while disabled",
             body = ErrorResponse
         )
     ),
@@ -312,7 +312,7 @@ pub async fn delete_group_backend(
             "storage backend still holds object data and cannot be removed".to_string(),
         ),
         DeleteGroupBackendError::Changed => {
-            ServerError::Conflict("storage backend changed while it was retiring".to_string())
+            ServerError::Conflict("storage backend changed while it was disabled".to_string())
         }
         other => ServerError::InternalError(other.to_string()),
     })?;

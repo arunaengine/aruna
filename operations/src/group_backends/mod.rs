@@ -61,8 +61,8 @@ pub enum BackendFenceError {
 }
 
 /// Joins a tenant backend's record to the transaction that commits a reference
-/// to it. Deletion retires the record before it scans, so a writer that already
-/// resolved the backend either reads the retirement or loses its commit.
+/// to it. Deletion disables the record before it scans, so a writer that already
+/// resolved the backend either reads the flag or loses its commit.
 pub fn fence_backend(backend: &BackendRef, txn_id: Option<TxnId>) -> Option<Effect> {
     let BackendRef::Group(backend_id) = backend else {
         return None;
@@ -76,7 +76,7 @@ pub fn fence_backend(backend: &BackendRef, txn_id: Option<TxnId>) -> Option<Effe
 
 pub fn check_fence(event: Event) -> Result<(), BackendFenceError> {
     match parse_read(event, GroupStorageBackend::from_bytes)? {
-        Some(record) if !record.retiring => Ok(()),
+        Some(record) if !record.disabled => Ok(()),
         _ => Err(BackendFenceError::Unavailable),
     }
 }

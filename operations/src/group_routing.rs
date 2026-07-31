@@ -109,7 +109,7 @@ impl Operation for GroupRoutingInputsOperation {
                             records
                                 .into_iter()
                                 .filter(|record| {
-                                    record.group_id == self.group_id && !record.retiring
+                                    record.group_id == self.group_id && !record.disabled
                                 })
                                 .map(|record| record.backend_id),
                         );
@@ -453,7 +453,7 @@ mod tests {
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::default(),
-            retiring: false,
+            disabled: false,
         }
     }
 
@@ -565,9 +565,9 @@ mod tests {
 
     #[test]
     fn loads_own_backends() {
-        // The scan is prefixed by group, and a retiring backend cannot be routed to.
+        // The scan is prefixed by group, and a disabled backend cannot be routed to.
         let mine = Ulid::from_bytes([4u8; 16]);
-        let retiring = Ulid::from_bytes([5u8; 16]);
+        let disabled = Ulid::from_bytes([5u8; 16]);
         let mut operation = GroupRoutingInputsOperation::new(group());
         operation.start();
 
@@ -594,8 +594,8 @@ mod tests {
         assert_eq!(key_space, GROUP_STORAGE_BACKEND_INDEX_KEYSPACE);
         assert_eq!(prefix, &index_prefix(group()));
 
-        let mut leaving = backend(retiring, group());
-        leaving.retiring = true;
+        let mut leaving = backend(disabled, group());
+        leaving.disabled = true;
         operation.step(Event::Storage(StorageEvent::IterResult {
             values: vec![
                 (
@@ -603,7 +603,7 @@ mod tests {
                     backend(mine, group()).to_bytes().unwrap().into(),
                 ),
                 (
-                    index_key(group(), retiring),
+                    index_key(group(), disabled),
                     leaving.to_bytes().unwrap().into(),
                 ),
             ],

@@ -55,10 +55,10 @@ impl ReplaceGroupBackendOperation {
     }
 
     fn handle_existing(&mut self, event: Event) -> Effects {
-        // A retiring backend is already gone as far as writers are concerned;
+        // A disabled backend is already gone as far as writers are concerned;
         // reviving it here would strand whatever the deletion then removes.
         let existing = match parse_read(event, GroupStorageBackend::from_bytes) {
-            Ok(Some(record)) if record.group_id == self.input.group_id && !record.retiring => {
+            Ok(Some(record)) if record.group_id == self.input.group_id && !record.disabled => {
                 record
             }
             Ok(_) => return self.fail(CreateGroupBackendError::NotFound),
@@ -88,7 +88,7 @@ impl ReplaceGroupBackendOperation {
             created_at: existing.created_at,
             updated_at: now,
             created_by: existing.created_by,
-            retiring: false,
+            disabled: false,
         };
         let secret = GroupStorageBackendSecret {
             backend_id: self.backend_id,
@@ -239,7 +239,7 @@ mod tests {
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::default(),
-            retiring: false,
+            disabled: false,
         }
     }
 

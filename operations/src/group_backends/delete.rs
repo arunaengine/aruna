@@ -72,7 +72,7 @@ fn names_backend(
 enum DeleteState {
     Init,
     ReadRecord,
-    Retire,
+    Disable,
     Scan(Scan),
     Restore,
     StartTransaction,
@@ -96,7 +96,7 @@ pub enum DeleteGroupBackendError {
     NotFound,
     #[error("storage backend still holds stored object data")]
     StillReferenced,
-    #[error("storage backend was changed while it was retiring")]
+    #[error("storage backend was changed while it was disabled")]
     Changed,
     #[error("DeleteGroupBackend failed")]
     Failed,
@@ -108,7 +108,7 @@ pub enum DeleteGroupBackendError {
     },
 }
 
-/// Removes a tenant backend and its credentials together. The record is retired
+/// Removes a tenant backend and its credentials together. The record is disabled
 /// first, so writers that already resolved it lose their commit, and deletion is
 /// then refused while any stored reference survives.
 #[derive(Debug, PartialEq)]
@@ -157,25 +157,25 @@ impl DeleteGroupBackendOperation {
             Err(error) => return self.fail(error.into()),
         };
 
-        let retiring = GroupStorageBackend {
-            retiring: true,
+        let disabled = GroupStorageBackend {
+            disabled: true,
             ..record.clone()
         };
-        let effect = match self.write_record(&retiring) {
+        let effect = match self.write_record(&disabled) {
             Ok(effect) => effect,
             Err(error) => return self.fail(error.into()),
         };
         self.record = Some(record);
-        self.state = DeleteState::Retire;
+        self.state = DeleteState::Disable;
         smallvec![effect]
     }
 
-    fn handle_retired(&mut self, event: Event) -> Effects {
+    fn handle_disabled(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.scan(Scan::Uploads, None),
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
             received => self.fail(DeleteGroupBackendError::InvalidStateEvent {
-                state: "Retire",
+                state: "Disable",
                 expected: "Event::Storage(StorageEvent::BatchWriteResult)",
                 received,
             }),
@@ -231,7 +231,7 @@ impl DeleteGroupBackendOperation {
 
     fn handle_restored(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::Error { error }) = event {
-            tracing::error!(backend_id = %self.backend_id, %error, "group backend stayed retired");
+            tracing::error!(backend_id = %self.backend_id, %error, "group backend stayed disabled");
         }
         self.state = DeleteState::Error;
         smallvec![]
@@ -265,10 +265,10 @@ impl DeleteGroupBackendOperation {
     }
 
     /// Reading the record inside the deleting transaction closes the window in
-    /// which a replacement clears the retirement after the scans passed.
+    /// which a replacement clears the flag after the scans passed.
     fn handle_record_verified(&mut self, event: Event) -> Effects {
         match parse_read(event, GroupStorageBackend::from_bytes) {
-            Ok(Some(record)) if record.retiring && record.group_id == self.group_id => {}
+            Ok(Some(record)) if record.disabled && record.group_id == self.group_id => {}
             Ok(_) => return self.fail(DeleteGroupBackendError::Changed),
             Err(error) => return self.fail(error.into()),
         }
@@ -366,7 +366,7 @@ impl Operation for DeleteGroupBackendOperation {
         match self.state {
             DeleteState::Init => self.start(),
             DeleteState::ReadRecord => self.handle_record_read(event),
-            DeleteState::Retire => self.handle_retired(event),
+            DeleteState::Disable => self.handle_disabled(event),
             DeleteState::Scan(scan) => self.handle_scanned(scan, event),
             DeleteState::Restore => self.handle_restored(event),
             DeleteState::StartTransaction => self.handle_txn_started(event),
@@ -429,7 +429,7 @@ mod tests {
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::default(),
-            retiring: false,
+            disabled: false,
         }
     }
 
@@ -535,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn retires_before_scanning() {
+    fn disables_before_scanning() {
         // A writer that already resolved the backend must lose its commit.
         let group_id = Ulid::from_bytes([1u8; 16]);
         let mut operation = DeleteGroupBackendOperation::new(group_id, backend_id());
@@ -547,7 +547,7 @@ mod tests {
         }));
 
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected a retirement write, got {effects:?}")
+            panic!("expected a disabling write, got {effects:?}")
         };
         assert_eq!(
             writes
@@ -562,7 +562,7 @@ mod tests {
         assert!(writes.iter().all(|(.., value)| {
             GroupStorageBackend::from_bytes(value.as_ref())
                 .unwrap()
-                .retiring
+                .disabled
         }));
 
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
@@ -642,11 +642,11 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::from(7),
         }));
-        let mut retired = record(group_id);
-        retired.retiring = true;
+        let mut disabled_record = record(group_id);
+        disabled_record.disabled = true;
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: b"x".to_vec().into(),
-            value: Some(retired.to_bytes().unwrap().into()),
+            value: Some(disabled_record.to_bytes().unwrap().into()),
         }));
 
         let [Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id })] = effects.as_slice()
@@ -676,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_cleared_retirement() {
+    fn refuses_cleared_flag() {
         // A replacement between the scans and the delete must abort the delete.
         let group_id = Ulid::from_bytes([1u8; 16]);
         let mut operation = scanning(group_id);

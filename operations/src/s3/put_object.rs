@@ -1108,8 +1108,8 @@ mod routing_test {
     }
 
     #[test]
-    fn refuses_retiring_backend() {
-        // Deletion retires the record before it scans, so this write must not
+    fn refuses_disabled_backend() {
+        // Deletion disables the record before it scans, so this write must not
         // commit a location the deletion would then strand.
         let backend_id = Ulid::from_bytes([5u8; 16]);
         let snapshot = snapshot()
@@ -1129,7 +1129,7 @@ mod routing_test {
 
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: b"x".to_vec().into(),
-            value: Some(retiring(backend_id).to_bytes().unwrap().into()),
+            value: Some(disabled(backend_id).to_bytes().unwrap().into()),
         }));
 
         assert!(
@@ -1169,7 +1169,7 @@ mod routing_test {
         }
     }
 
-    fn retiring(backend_id: Ulid) -> GroupStorageBackend {
+    fn disabled(backend_id: Ulid) -> GroupStorageBackend {
         GroupStorageBackend {
             backend_id,
             group_id: Ulid::from_bytes([7u8; 16]),
@@ -1179,7 +1179,7 @@ mod routing_test {
             created_at: std::time::SystemTime::UNIX_EPOCH,
             updated_at: std::time::SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::default(),
-            retiring: true,
+            disabled: true,
         }
     }
 }

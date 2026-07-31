@@ -1119,7 +1119,7 @@ mod routing_tests {
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
             created_by: Default::default(),
-            retiring: false,
+            disabled: false,
         };
         for (key_space, key, value) in crate::group_backends::record_writes(&record).unwrap() {
             write(context, &key_space, key.to_vec(), value.to_vec()).await;

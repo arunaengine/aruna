@@ -343,8 +343,8 @@ mod tests {
     }
 
     #[test]
-    fn refuses_retiring_backend() {
-        // The pinned backend must not outlive a deletion that already retired it.
+    fn refuses_disabled_backend() {
+        // The pinned backend must not outlive a deletion that already disabled it.
         let backend_id = Ulid::from_bytes([5u8; 16]);
         let snapshot = snapshot().with_group_inputs(GroupRoutingInputs {
             default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
@@ -358,7 +358,7 @@ mod tests {
 
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: b"x".to_vec().into(),
-            value: Some(retiring(backend_id).to_bytes().unwrap().into()),
+            value: Some(disabled(backend_id).to_bytes().unwrap().into()),
         }));
 
         assert!(
@@ -376,7 +376,7 @@ mod tests {
         ));
     }
 
-    fn retiring(backend_id: Ulid) -> GroupStorageBackend {
+    fn disabled(backend_id: Ulid) -> GroupStorageBackend {
         GroupStorageBackend {
             backend_id,
             group_id: Ulid::from_bytes([7u8; 16]),
@@ -386,7 +386,7 @@ mod tests {
             created_at: std::time::SystemTime::UNIX_EPOCH,
             updated_at: std::time::SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::default(),
-            retiring: true,
+            disabled: true,
         }
     }
 

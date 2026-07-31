@@ -80,13 +80,13 @@ change would silently redirect them. Register a second backend to move data.
 ## Deleting a backend
 
 `DELETE /groups/{group_id}/storage-backends/{backend_id}` removes the record
-and its credentials together. The backend is first marked as retiring, which
+and its credentials together. The backend is first marked as disabled, which
 stops routing from choosing it and makes any write that already resolved it
 fail; the request then checks for stored objects, open multipart uploads,
 uploaded parts and pending cleanups. Deletion is refused with 409 while any of
-them still names the backend, and the retirement is undone. Delete or move the
+them still names the backend, and the record is enabled again. Delete or move the
 objects first, then remove the backend. If the node fails midway the backend can
-stay retired; repeating the request either removes it or clears the retirement.
+stay disabled; repeating the request either removes it or enables it again.
 
 ## Where your data actually is
 
