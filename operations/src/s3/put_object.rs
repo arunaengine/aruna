@@ -6,7 +6,7 @@ use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::replication::util::dht_registration_effect;
 use crate::usage_stats::{
-    QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError,
+    QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_usage_snapshot_publish_effect,
 };
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -675,15 +675,13 @@ impl PutObjectOperation {
                     logical_bytes: size,
                     ..Default::default()
                 };
-                let global_delta = UsageDelta {
-                    stored_blobs: if self.new_blob { 1 } else { 0 },
-                    stored_bytes: if self.new_blob { size } else { 0 },
-                    ..group_delta
+                let Some(stored) = StoredDelta::for_location(&location, self.new_blob) else {
+                    return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
                 };
-                self.usage_update = Some(UsageCounterUpdate::with_global(
+                self.usage_update = Some(UsageCounterUpdate::with_stored(
                     self.config.group_id,
                     group_delta,
-                    global_delta,
+                    stored,
                 ));
 
                 // Enforce the hard group quota before the counters commit. Only a
@@ -1520,9 +1518,8 @@ mod test {
         op.state = PutObjectState::UpdateUsage;
         op.txn_id = Some(txn_id);
         op.written_location = Some(location.clone());
-        op.usage_update = Some(UsageCounterUpdate::with_global(
+        op.usage_update = Some(UsageCounterUpdate::for_group(
             group_id,
-            UsageDelta::default(),
             UsageDelta::default(),
         ));
 

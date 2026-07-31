@@ -13,7 +13,7 @@ use crate::replication::queue::{
 use crate::replication::util::dht_registration_effect;
 use crate::s3::create_bucket::CreateBucketOperation;
 use crate::usage_stats::{
-    QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError,
+    QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_usage_snapshot_publish_effect,
 };
 use aruna_core::document::DocumentSyncTarget;
@@ -1128,18 +1128,13 @@ impl IncomingVersionReplicationOperation {
         let Some(blob) = self.manifest.blob.as_ref() else {
             return self.fail(IncomingVersionReplicationError::MissingBlobInfo);
         };
-        let size = i128::from(blob.size);
-        let new_blob = self.received_blob_location.is_some();
-        let global_delta = UsageDelta {
-            stored_blobs: i128::from(new_blob),
-            stored_bytes: if new_blob { size } else { 0 },
-            ..group_delta
-        };
-        self.usage_update = Some(UsageCounterUpdate::with_global(
-            group_id,
-            group_delta,
-            global_delta,
-        ));
+        self.usage_update = Some(match self.received_blob_location.as_ref() {
+            None => UsageCounterUpdate::for_group(group_id, group_delta),
+            Some(location) => match StoredDelta::for_location(location, true) {
+                Some(stored) => UsageCounterUpdate::with_stored(group_id, group_delta, stored),
+                None => return self.fail(IncomingVersionReplicationError::MissingBlobInfo),
+            },
+        });
         let Some(txn_id) = self.txn_id else {
             return self.fail(IncomingVersionReplicationError::StorageError(
                 StorageError::TransactionNotFound,

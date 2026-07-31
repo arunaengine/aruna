@@ -5,7 +5,7 @@ use crate::blob::blob_keyspace_helper::{
 use crate::blob::cleanup::schedule_blob_cleanup_effect;
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::usage_stats::{
-    QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError,
+    QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_usage_snapshot_publish_effect,
 };
 use aruna_blob::hash::Hasher;
@@ -989,15 +989,18 @@ impl CompleteMultipartUploadOperation {
             logical_bytes: size,
             ..Default::default()
         };
-        let global_delta = UsageDelta {
-            stored_blobs: if self.new_blob { 1 } else { 0 },
-            stored_bytes: if self.new_blob { size } else { 0 },
-            ..group_delta
+        let stored = self
+            .final_location
+            .as_ref()
+            .and_then(|location| StoredDelta::for_location(location, self.new_blob));
+        let Some(stored) = stored else {
+            return self
+                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         };
-        self.usage_update = Some(UsageCounterUpdate::with_global(
+        self.usage_update = Some(UsageCounterUpdate::with_stored(
             group_id,
             group_delta,
-            global_delta,
+            stored,
         ));
 
         // Enforce the hard group quota before the counters commit. Only a positive
