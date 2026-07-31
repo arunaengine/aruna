@@ -132,6 +132,14 @@ indefinitely. `ListMultipartUploads` and `AbortMultipartUpload` are how you clea
 one. The reclaim-status response does not count open uploads, because that would
 mean scanning every upload on the node per request.
 
+A write that is streaming has no record of any kind yet, so the node also holds
+the backend for as long as any transfer against it is running. Disabling stops
+new writes from choosing the backend, so that set only drains. It is tracked in
+memory: a node restart forgets it, but a killed transfer's bytes are orphaned in
+your bucket either way, because writes are not sealed on shutdown. A rollback
+delete the backend refuses is queued instead, and the node drops that queued
+delete once the backend record is gone, since nothing can reach the bytes then.
+
 ## Where your data actually is
 
 Replication does not copy your routing decision. Each node that holds a

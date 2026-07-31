@@ -2118,3 +2118,30 @@ async fn routes_backends_apart() {
     assert_eq!(read_back(&handler, hot).await, b"hot");
     assert_eq!(read_back(&handler, cold).await, b"cold");
 }
+
+#[tokio::test]
+async fn effect_holds_backend() {
+    // A tenant backend an effect names must not look removable while it runs.
+    let ctx = setup_blob_handle(1).await;
+    let handler = &ctx.blob_handle.handler;
+    let backend_id = Ulid::from_bytes([4u8; 16]);
+    let mut location = make_test_location();
+    location.backend = BackendRef::Group(backend_id);
+    let effect = BlobEffect::Delete { location };
+
+    let hold = handler.hold_group_backends(&effect);
+    assert!(hold.is_some());
+    assert!(handler.active_group_backends().contains(&backend_id));
+
+    drop(hold);
+    assert!(handler.active_group_backends().is_empty());
+
+    // A node backend never enters the set, so removal never waits on one.
+    assert!(
+        handler
+            .hold_group_backends(&BlobEffect::Delete {
+                location: make_test_location()
+            })
+            .is_none()
+    );
+}

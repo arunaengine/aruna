@@ -5,8 +5,8 @@ use aruna_net::streams::BiStream;
 use aruna_storage::storage::StorageHandle;
 use bao_tree::BlockSize;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, Semaphore};
 use ulid::Ulid;
 
@@ -52,6 +52,9 @@ pub struct BlobHandler {
     read_slots: Arc<Semaphore>,
     spool_slots: Arc<Semaphore>,
     inflight: Arc<AtomicUsize>,
+    /// Effects currently executing against a tenant backend. Erasing its
+    /// credentials while one runs would leave that work unable to roll back.
+    group_effects: Arc<StdMutex<HashMap<Ulid, usize>>>,
 }
 
 #[derive(Clone, Debug)]

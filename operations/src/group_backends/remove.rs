@@ -36,7 +36,9 @@ pub async fn remove_drained_backends(context: &DriverContext) -> Result<usize, S
     let mut removed = 0usize;
     for record in disabled {
         let backend = BackendRef::Group(record.backend_id);
-        if holding.contains(&backend) {
+        // Read per backend rather than once: a write that resolved the backend
+        // just before it was disabled must still finish with its credentials.
+        if holding.contains(&backend) || active_backends(context).contains(&record.backend_id) {
             continue;
         }
         match drive(
@@ -53,6 +55,14 @@ pub async fn remove_drained_backends(context: &DriverContext) -> Result<usize, S
         }
     }
     Ok(removed)
+}
+
+fn active_backends(context: &DriverContext) -> BTreeSet<Ulid> {
+    context
+        .blob_handle
+        .as_ref()
+        .map(aruna_blob::blob::BlobHandle::active_group_backends)
+        .unwrap_or_default()
 }
 
 async fn disabled_backends(context: &DriverContext) -> Result<Vec<GroupStorageBackend>, String> {

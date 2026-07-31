@@ -4,13 +4,14 @@ use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffec
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::DhtKeyId;
-use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
-use aruna_core::structs::BlobCleanupWork;
+use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE};
+use aruna_core::structs::{BackendRef, BlobCleanupWork, GroupStorageBackend};
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::driver::DriverContext;
+use crate::group_backends::{backend_key, parse_read};
 use crate::jobs::store::iter_prefix_page;
 
 pub const BLOB_CLEANUP_AFTER: Duration = Duration::from_secs(300);
@@ -57,6 +58,15 @@ pub async fn process_cleanup_batch(context: &DriverContext) -> Result<BlobCleanu
                     done.push((BLOB_CLEANUP_KEYSPACE.to_string(), key));
                     outcome.dropped = outcome.dropped.saturating_add(1);
                 }
+                // A tenant backend that is gone can never resolve credentials,
+                // so retrying this row forever would wedge the drain.
+                Ok(BlobCleanupWork::DeleteBlob { location })
+                    if is_removed_backend(context, &location.backend).await =>
+                {
+                    error!(backend = %location.backend, "Dropping blob cleanup for a removed backend");
+                    done.push((BLOB_CLEANUP_KEYSPACE.to_string(), key));
+                    outcome.dropped = outcome.dropped.saturating_add(1);
+                }
                 Ok(work) => {
                     if run_cleanup_work(context, work).await {
                         done.push((BLOB_CLEANUP_KEYSPACE.to_string(), key));
@@ -75,6 +85,23 @@ pub async fn process_cleanup_batch(context: &DriverContext) -> Result<BlobCleanu
         };
         start_after = Some(next);
     }
+}
+
+/// Only a tenant backend whose record is provably absent counts as removed; an
+/// unreadable record leaves the row queued.
+async fn is_removed_backend(context: &DriverContext, backend: &BackendRef) -> bool {
+    let BackendRef::Group(backend_id) = backend else {
+        return false;
+    };
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+            key: backend_key(*backend_id),
+            txn_id: None,
+        })
+        .await;
+    matches!(parse_read(event, GroupStorageBackend::from_bytes), Ok(None))
 }
 
 async fn delete_cleanup_rows(
@@ -195,6 +222,14 @@ mod tests {
         .unwrap()
     }
 
+    fn group_delete_work() -> Vec<u8> {
+        let mut work = BlobCleanupWork::from_bytes(&delete_work()).unwrap();
+        if let BlobCleanupWork::DeleteBlob { location } = &mut work {
+            location.backend = BackendRef::Group(Ulid::generate());
+        }
+        work.to_bytes().unwrap()
+    }
+
     async fn write_rows(storage: &StorageHandle, rows: Vec<Vec<u8>>) {
         let writes = rows
             .into_iter()
@@ -241,6 +276,20 @@ mod tests {
         // The delete row fails because this context has no blob handle.
         assert_eq!(outcome.failed, 1);
         assert_eq!(remaining_rows(&storage).await, 1);
+    }
+
+    #[tokio::test]
+    async fn drops_removed_backend() {
+        // A tenant backend whose record is gone can never resolve credentials,
+        // so its delete must be dropped instead of retried forever.
+        let (_dir, storage, context) = setup_context();
+        write_rows(&storage, vec![group_delete_work()]).await;
+
+        let outcome = process_cleanup_batch(&context).await.unwrap();
+
+        assert_eq!(outcome.dropped, 1);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(remaining_rows(&storage).await, 0);
     }
 
     #[tokio::test]

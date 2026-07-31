@@ -11,8 +11,9 @@ use aruna_core::structs::{
     GroupStorageBackendSecret,
 };
 use aruna_core::types::Key;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
 use ulid::Ulid;
 
 /// Uniform tenant write chunk. azblob and azdls declare no minimum, so without
@@ -112,7 +113,57 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
     ids
 }
 
+/// Keeps every tenant backend an executing effect names off the removable list
+/// until the effect returns.
+pub(super) struct GroupEffectGuard {
+    counts: Arc<Mutex<HashMap<Ulid, usize>>>,
+    ids: Vec<Ulid>,
+}
+
+impl Drop for GroupEffectGuard {
+    fn drop(&mut self) {
+        let Ok(mut counts) = self.counts.lock() else {
+            return;
+        };
+        for backend_id in &self.ids {
+            if let Entry::Occupied(mut entry) = counts.entry(*backend_id) {
+                match entry.get().checked_sub(1) {
+                    Some(0) | None => {
+                        entry.remove();
+                    }
+                    Some(left) => *entry.get_mut() = left,
+                }
+            }
+        }
+    }
+}
+
 impl BlobHandler {
+    /// Taken before the credentials are read, so a removal either sees the
+    /// backend as busy or wins the race before any bytes exist.
+    pub(super) fn hold_group_backends(&self, effect: &BlobEffect) -> Option<GroupEffectGuard> {
+        let ids = group_ids(effect);
+        if ids.is_empty() {
+            return None;
+        }
+        let mut counts = self.group_effects.lock().ok()?;
+        for backend_id in &ids {
+            *counts.entry(*backend_id).or_insert(0) += 1;
+        }
+        drop(counts);
+        Some(GroupEffectGuard {
+            counts: self.group_effects.clone(),
+            ids,
+        })
+    }
+
+    pub(super) fn active_group_backends(&self) -> BTreeSet<Ulid> {
+        self.group_effects
+            .lock()
+            .map(|counts| counts.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
     /// Loads every tenant backend the effect names into a handler of its own.
     /// The snapshot never enters shared state, so a concurrent replacement or
     /// deletion cannot swap the backend an executing effect resolves.

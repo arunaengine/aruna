@@ -222,6 +222,13 @@ impl BlobHandle {
         self.handler.registry.routing()
     }
 
+    /// Tenant backends with an effect running against them right now. Their
+    /// credentials must outlive that effect or its rollback cannot reach the
+    /// bytes it wrote.
+    pub fn active_group_backends(&self) -> std::collections::BTreeSet<Ulid> {
+        self.handler.active_group_backends()
+    }
+
     /// Per-backend health for `/info`.
     pub async fn backend_states(&self) -> Vec<BackendState> {
         let mut states = Vec::new();
@@ -310,6 +317,7 @@ impl BlobHandler {
             read_slots: Arc::new(Semaphore::new(READ_SLOTS)),
             spool_slots: Arc::new(Semaphore::new(SPOOL_SLOTS)),
             inflight: Arc::new(AtomicUsize::new(0)),
+            group_effects: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         blob_handler.ensure_multipart_bucket().await?;
         blob_handler.probe_all_backends().await;
@@ -324,6 +332,7 @@ impl BlobHandler {
     // Effects run concurrently on their caller's task; per-operation ordering
     // is preserved by the driver awaiting each effect before the next.
     pub(super) async fn execute_effect(&self, effect: BlobEffect) -> BlobEvent {
+        let _hold = self.hold_group_backends(&effect);
         let handler = match self.with_group_backends(&effect).await {
             Ok(handler) => handler,
             Err(error) => return BlobEvent::Error(error),

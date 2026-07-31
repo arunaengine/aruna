@@ -2,12 +2,14 @@ use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE};
+use aruna_core::keyspaces::{
+    BLOB_CLEANUP_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
-    BackendLocation, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
+    BackendLocation, BlobCleanupWork, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
     MultipartUploadStatus, ResolvedBackend,
 };
 use aruna_core::types::{Effects, TxnId, UserId};
@@ -15,6 +17,7 @@ use bytes::Bytes;
 use smallvec::smallvec;
 use std::time::SystemTime;
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -23,6 +26,7 @@ pub enum UploadPartState {
     ReadUpload,
     WritePart,
     CleanupFailedWrite,
+    QueueRollbackDelete,
     StartTransaction,
     FenceBackend,
     ReReadUpload,
@@ -94,6 +98,7 @@ pub struct UploadPartOperation {
     txn_id: Option<TxnId>,
     written_location: Option<BackendLocation>,
     replaced_location: Option<BackendLocation>,
+    rollback_location: Option<BackendLocation>,
     pending_error: Option<UploadPartError>,
     output: Option<Result<UploadPartResult, UploadPartError>>,
 }
@@ -106,6 +111,7 @@ impl UploadPartOperation {
             txn_id: None,
             written_location: None,
             replaced_location: None,
+            rollback_location: None,
             pending_error: None,
             output: None,
         }
@@ -214,11 +220,13 @@ impl UploadPartOperation {
     }
 
     /// Takes the location: once its delete is queued the rollback in `abort`
-    /// must not queue a second one.
+    /// must not queue a second one. A copy stays behind so a delete that fails
+    /// can still be handed to the durable cleanup queue.
     fn cleanup_failed_write(&mut self, error: UploadPartError) -> Effects {
         self.pending_error = Some(error);
         self.state = UploadPartState::CleanupFailedWrite;
         if let Some(location) = self.written_location.take() {
+            self.rollback_location = Some(location.clone());
             smallvec![Effect::Blob(BlobEffect::Delete { location })]
         } else {
             self.emit_pending_error()
@@ -227,7 +235,42 @@ impl UploadPartOperation {
 
     fn handle_failed_write_cleanup(&mut self, event: Event) -> Effects {
         match event {
-            Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
+            Event::Blob(BlobEvent::DeleteFinished) => {
+                self.rollback_location = None;
+                self.emit_pending_error()
+            }
+            // The part bytes are still on the backend, and this operation is
+            // over; only a queued delete can still reach them.
+            Event::Blob(BlobEvent::Error(_)) => self.queue_rollback_delete(),
+            _ => self.emit_error(UploadPartError::InvalidOperationState),
+        }
+    }
+
+    fn queue_rollback_delete(&mut self) -> Effects {
+        let Some(location) = self.rollback_location.take() else {
+            return self.emit_pending_error();
+        };
+        let work = match (BlobCleanupWork::DeleteBlob { location }).to_bytes() {
+            Ok(work) => work,
+            Err(error) => {
+                warn!(error = %error, "Orphaned part could not be encoded for cleanup");
+                return self.emit_pending_error();
+            }
+        };
+        self.state = UploadPartState::QueueRollbackDelete;
+        smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            key: Ulid::generate().to_bytes().to_vec().into(),
+            value: work.into(),
+            txn_id: None,
+        })]
+    }
+
+    fn handle_rollback_queued(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::WriteResult { .. }) => self.emit_pending_error(),
+            Event::Storage(StorageEvent::Error { error }) => {
+                warn!(error = %error, "Rollback delete could not be queued");
                 self.emit_pending_error()
             }
             _ => self.emit_error(UploadPartError::InvalidOperationState),
@@ -407,6 +450,7 @@ impl Operation for UploadPartOperation {
             UploadPartState::ReadUpload => self.handle_upload_read(event),
             UploadPartState::WritePart => self.handle_write_finished(event),
             UploadPartState::CleanupFailedWrite => self.handle_failed_write_cleanup(event),
+            UploadPartState::QueueRollbackDelete => self.handle_rollback_queued(event),
             UploadPartState::StartTransaction => self.handle_transaction_started(event),
             UploadPartState::FenceBackend => self.handle_backend_fenced(event),
             UploadPartState::ReReadUpload => self.handle_upload_reread(event),

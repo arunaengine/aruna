@@ -12,14 +12,16 @@ use crate::usage_stats::{
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
-use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::keyspaces::{
+    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
-    CurrentVersionPointer, RealmId, RoCrateLimits, RoutingError, RoutingSnapshot, UsageDelta,
-    VersionKey, VersionSourceBinding, resolve_backend,
+    AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
+    BucketInfo, CurrentVersionPointer, RealmId, RoCrateLimits, RoutingError, RoutingSnapshot,
+    UsageDelta, VersionKey, VersionSourceBinding, resolve_backend,
 };
 use aruna_core::types::{Effects, GroupId, NodeId, UserId};
 use bytes::Bytes;
@@ -27,6 +29,7 @@ use smallvec::smallvec;
 use std::collections::HashMap;
 use std::time::{Duration, UNIX_EPOCH};
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -36,6 +39,7 @@ pub enum PutObjectState {
     ReadPreassignedLocation,
     WriteBlob,
     CleanupFailedWrite,
+    QueueRollbackDelete,
     StartTransaction,
     CheckBucket,
     FenceBackend,
@@ -144,6 +148,7 @@ pub struct PutObjectOperation {
     version_id: Option<Ulid>,
     written_location: Option<BackendLocation>,
     cleanup_location: Option<BackendLocation>,
+    rollback_location: Option<BackendLocation>,
     existing_pointer: Option<CurrentVersionPointer>,
     new_blob: bool,
     was_live: bool,
@@ -166,6 +171,7 @@ impl PutObjectOperation {
             version_id,
             written_location: None,
             cleanup_location: None,
+            rollback_location: None,
             existing_pointer: None,
             new_blob: false,
             was_live: false,
@@ -354,11 +360,7 @@ impl PutObjectOperation {
     fn handle_backend_fenced(&mut self, event: Event) -> Effects {
         match check_fence(event) {
             Ok(()) => self.start_hash_lookup(),
-            Err(error) => {
-                self.output = Some(Err(error.into()));
-                self.state = PutObjectState::Error;
-                self.abort()
-            }
+            Err(error) => self.cleanup_failed_write(error.into()),
         }
     }
 
@@ -765,14 +767,22 @@ impl PutObjectOperation {
         }
     }
 
-    /// Takes the location: once its delete is queued the rollback in `abort`
-    /// must not queue a second one.
     fn cleanup_orphan_blob(&mut self) -> Effects {
+        self.rollback_written_blob()
+    }
+
+    /// Takes the location: once its delete is queued the rollback in `abort`
+    /// must not queue a second one. A copy stays behind so a delete that fails
+    /// can still be handed to the durable cleanup queue.
+    fn rollback_written_blob(&mut self) -> Effects {
         self.state = PutObjectState::CleanupFailedWrite;
-        self.written_location.take().map_or_else(
-            || self.emit_pending_error(),
-            |location| smallvec![Effect::Blob(BlobEffect::Delete { location })],
-        )
+        match self.written_location.take() {
+            Some(location) => {
+                self.rollback_location = Some(location.clone());
+                smallvec![Effect::Blob(BlobEffect::Delete { location })]
+            }
+            None => self.emit_pending_error(),
+        }
     }
 
     fn handle_usage_update(&mut self, event: Event) -> Effects {
@@ -875,17 +885,47 @@ impl PutObjectOperation {
 
     fn cleanup_failed_write(&mut self, error: PutObjectError) -> Effects {
         self.pending_error = Some(error);
-        self.state = PutObjectState::CleanupFailedWrite;
-
-        self.written_location.take().map_or_else(
-            || self.emit_pending_error(),
-            |location| smallvec![Effect::Blob(BlobEffect::Delete { location })],
-        )
+        self.rollback_written_blob()
     }
 
     fn handle_failed_write_cleanup(&mut self, event: Event) -> Effects {
         match event {
-            Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
+            Event::Blob(BlobEvent::DeleteFinished) => {
+                self.rollback_location = None;
+                self.emit_pending_error()
+            }
+            // The bytes are still on the backend, and this operation is over;
+            // only a queued delete can still reach them.
+            Event::Blob(BlobEvent::Error(_)) => self.queue_rollback_delete(),
+            _ => self.emit_error(PutObjectError::InvalidOperationState),
+        }
+    }
+
+    fn queue_rollback_delete(&mut self) -> Effects {
+        let Some(location) = self.rollback_location.take() else {
+            return self.emit_pending_error();
+        };
+        let work = match (BlobCleanupWork::DeleteBlob { location }).to_bytes() {
+            Ok(work) => work,
+            Err(error) => {
+                warn!(error = %error, "Orphaned blob could not be encoded for cleanup");
+                return self.emit_pending_error();
+            }
+        };
+        self.state = PutObjectState::QueueRollbackDelete;
+        smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            key: Ulid::generate().to_bytes().to_vec().into(),
+            value: work.into(),
+            txn_id: None,
+        })]
+    }
+
+    fn handle_rollback_queued(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::WriteResult { .. }) => self.emit_pending_error(),
+            Event::Storage(StorageEvent::Error { error }) => {
+                warn!(error = %error, "Rollback delete could not be queued");
                 self.emit_pending_error()
             }
             _ => self.emit_error(PutObjectError::InvalidOperationState),
@@ -936,6 +976,7 @@ impl Operation for PutObjectOperation {
             PutObjectState::ReadPreassignedLocation => self.handle_preassigned_location(event),
             PutObjectState::WriteBlob => self.handle_write_finished(event),
             PutObjectState::CleanupFailedWrite => self.handle_failed_write_cleanup(event),
+            PutObjectState::QueueRollbackDelete => self.handle_rollback_queued(event),
             PutObjectState::StartTransaction => self.handle_transaction_started(event),
             PutObjectState::CheckBucket => self.handle_bucket_checked(event),
             PutObjectState::FenceBackend => self.handle_backend_fenced(event),
@@ -1133,18 +1174,73 @@ mod routing_test {
         assert!(
             matches!(
                 effects.as_slice(),
-                [
-                    Effect::Blob(BlobEffect::Delete { .. }),
-                    Effect::Storage(StorageEffect::AbortTransaction { .. })
-                ]
+                [Effect::Blob(BlobEffect::Delete { .. })]
             ),
-            "expected cleanup and abort, got {effects:?}"
+            "expected the written blob to be rolled back, got {effects:?}"
+        );
+
+        let effects = operation.step(Event::Blob(BlobEvent::DeleteFinished));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+            ),
+            "expected the transaction to abort, got {effects:?}"
         );
         assert!(matches!(
             operation.finalize(),
             Err(PutObjectError::BackendFenceError(
                 BackendFenceError::Unavailable
             ))
+        ));
+    }
+
+    #[test]
+    fn queues_failed_rollback() {
+        // A rollback delete the backend refuses must become a durable cleanup
+        // row, otherwise the written bytes are orphaned with nothing naming them.
+        let backend_id = Ulid::from_bytes([5u8; 16]);
+        let snapshot = snapshot()
+            .with_group_inputs(GroupRoutingInputs {
+                default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
+                backend_ids: BTreeSet::from([backend_id]),
+            })
+            .with_bucket_rules(Vec::new());
+        let mut operation = PutObjectOperation::new(config(snapshot));
+        operation.start();
+        operation.step(Event::Blob(BlobEvent::WriteFinished {
+            location: written(backend_id),
+        }));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::from(3),
+        }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(disabled(backend_id).to_bytes().unwrap().into()),
+        }));
+
+        let effects = operation.step(Event::Blob(BlobEvent::Error(
+            aruna_core::errors::BlobError::UnknownBackend("gone".to_string()),
+        )));
+
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space, txn_id, ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected one cleanup row write, got {effects:?}")
+        };
+        assert_eq!(key_space, aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE);
+        // Outside the transaction: that transaction is about to be aborted.
+        assert_eq!(*txn_id, None);
+
+        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"k".to_vec().into(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
         ));
     }
 
