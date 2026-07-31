@@ -1,7 +1,6 @@
-//! Connect-time enforcement of the egress policy.
-//!
-//! A URL check alone is defeated by redirects and DNS rebinding, so tenant
-//! traffic runs through clients that can only ever reach vetted addresses.
+//! Connect-time enforcement of the egress policy: a URL check alone is
+//! defeated by redirects and DNS rebinding, so tenant traffic runs through
+//! clients that can only ever reach vetted addresses.
 
 use crate::error::BlobLibError;
 use aruna_core::egress::{EgressError, EgressPolicy};

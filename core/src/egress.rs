@@ -1,7 +1,6 @@
-//! Compiled-in egress policy for tenant-supplied endpoints.
-//!
-//! The deny table is a constant: no realm config, node config, or API input can
-//! remove an entry from it. Every consumer of a tenant endpoint screens here.
+//! Compiled-in egress policy for tenant-supplied endpoints. The deny table is
+//! a constant: no realm config, node config, or API input can remove an entry,
+//! and every consumer of a tenant endpoint screens here.
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
