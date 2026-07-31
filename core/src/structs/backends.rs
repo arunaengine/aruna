@@ -249,6 +249,13 @@ impl BackendEntry {
     ) -> Result<BackendConfig, ConversionError> {
         let backend_type = Backend::from_str(&self.kind)?;
         let mut service_config = HashMap::new();
+        // An empty root makes opendal serve the whole filesystem from `/`.
+        let root = self.root.as_deref().map(str::trim).unwrap_or_default();
+        if backend_type == Backend::FileSystem && root.is_empty() {
+            return Err(ConversionError::FromStrError(
+                "filesystem backend requires a non-empty root".to_string(),
+            ));
+        }
         if backend_type == Backend::S3 {
             let endpoint = self.endpoint.as_ref().ok_or_else(|| {
                 ConversionError::FromStrError("s3 backend requires an endpoint".to_string())
@@ -279,7 +286,7 @@ impl BackendEntry {
 
         Ok(BackendConfig {
             backend_type,
-            root: self.root.clone().unwrap_or_default(),
+            root: root.to_string(),
             service_config,
             bucket_prefix: self.bucket_prefix.clone(),
             max_bucket_size: self.max_bucket_size,
@@ -504,6 +511,7 @@ target = { class = "glacier" }
             r#"
 [backend.a]
 type = "filesystem"
+root = "/data/blob"
 multipart_bucket = "parts"
 default = true
 
@@ -585,6 +593,30 @@ default = true
             .to_string();
 
         assert!(error.contains("multipart_bucket"), "{error}");
+    }
+
+    #[test]
+    fn rejects_blank_root() {
+        // Without a root the node would serve blobs from the filesystem root.
+        for root in ["", "root = \"   \""] {
+            let file = BackendsFile::parse(&format!(
+                r#"
+[backend.a]
+type = "filesystem"
+{root}
+multipart_bucket = "parts"
+default = true
+"#
+            ))
+            .unwrap();
+
+            let error = file
+                .resolve(&secrets, BlobTimeoutConfig::default())
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains("root"), "{error}");
+        }
     }
 
     #[test]
