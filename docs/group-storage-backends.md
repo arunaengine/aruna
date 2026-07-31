@@ -14,7 +14,8 @@ responsibility.
   "name": "lab-minio",
   "kind": "s3",
   "public_config": { "endpoint": "https://minio.lab.example.org", "bucket": "aruna" },
-  "secret_config": { "access_key_id": "...", "secret_access_key": "..." }
+  "secret_config": { "access_key_id": "...", "secret_access_key": "..." },
+  "cleanup": { "mode": "retain" }
 }
 ```
 
@@ -45,6 +46,24 @@ The endpoint is screened against the egress guard's deny table before any
 connection is made, at creation and on every later use. Private, loopback and
 link-local addresses are refused. An operator may narrow this further, or
 refuse group backends entirely, in which case a rule naming one fails loudly.
+
+## Cleanup strategy
+
+`cleanup` decides what the node does with bytes on your backend once no version
+references them. It defaults to `{ "mode": "retain" }`, which keeps them: this
+is your storage and nothing deletes from it unless you ask. Send
+`{ "mode": "reclaim", "after_secs": 86400 }` to have the node delete
+unreferenced copies once the grace has passed. `after_secs` may be omitted and
+then defaults to 24 hours.
+
+Reclaim is a request, not a guarantee. If your bucket is versioned or
+object-locked, the delete only writes a marker and frees nothing, which is your
+bucket's configuration and visible to you.
+
+`GET /groups/{group_id}/storage-backends/{backend_id}/reclaim-status` reports
+how many copies are queued, how many physical deletes are still owed, and how
+old the oldest queued entry is. A failing count that never falls means reclaim
+is blocked.
 
 ## Routing writes to it
 

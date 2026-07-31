@@ -26,7 +26,9 @@ bucket_prefix = "aruna-cold-"
 multipart_bucket = "aruna-cold-parts"
 class = "cold"
 allow_tenants = true
-quota_bytes = 20000000000000 # advisory only, never enforced
+quota_bytes = 20000000000000
+cleanup = "reclaim"
+reclaim_after_secs = 86400
 
 [backend.archive]
 type = "s3"
@@ -34,6 +36,7 @@ endpoint = "https://archive.internal"
 multipart_bucket = "aruna-archive-parts"
 class = "archive"
 allow_tenants = false
+cleanup = "retain"
 
 [[routing]]
 bucket = "raw"
@@ -69,13 +72,39 @@ that in mind.
 default; a tenant rule naming that class misses and falls through instead of
 binding.
 
-`quota_bytes` is **advisory and never enforced**. It records the total
-user-data bytes an operator intends for that backend across all groups, and it
-is validated, stored and reported back by `/info` and by the doctor. Nothing
-reads it at write time: no upload is rejected, throttled or rerouted when a
-backend passes it, and no alert fires. Treat it as a note to other operators
-until per-backend allowances are enforced. The only live storage limits are the
-realm and group quotas.
+`quota_bytes` caps the total user-data bytes on that backend across all groups.
+`/info` reports it next to `used_bytes`, the figure it is measured against.
+Enforcement happens where a write picks its backend, and the outcome follows
+what the rule asked for: a rule that **names** a full backend fails with
+`QuotaExceeded`, because writing elsewhere would hide the exhaustion; a rule
+that names a **class** treats a full backend like a class this node does not
+offer and falls through to the next rung; and a full **node default** fails,
+since nothing is left to fall through to. Fullness is read once per request, so
+writes already in flight can carry the backend past its cap by their own bytes,
+exactly as the group quota behaves. Hidden blobs and job spool never count.
+
+## Cleanup strategy
+
+`cleanup` decides what happens to bytes on a backend once no version references
+them any more. `reclaim` deletes them once `reclaim_after_secs` has passed since
+the last reference went away; `retain` keeps them forever.
+
+Node backends default to `reclaim` with a 24 hour grace: the operator pays for
+the space, so the node frees it. **An archive, WORM or object-locked tier must
+set `cleanup = "retain"` explicitly.** Tenant backends default to `retain` and
+only their owner can change that, because tenant storage holds tenant data.
+
+Reclaim is a request, not a guarantee. On a versioned or object-locked bucket a
+delete "succeeds" by writing a marker, so nothing is freed, nothing fails, and
+no signal exists. Do not point `reclaim` at such a bucket.
+
+The sweep deletes a copy only when no materialized version still names that
+exact copy on that exact backend, recounted inside the transaction that frees
+it. Physical deletion is queued, retried, and reported per backend by
+`aruna-doctor reclaim status`; a failing count that never falls is what "reclaim
+is blocked" looks like. `aruna-doctor reclaim seed --backend n:<name>` queues
+everything already stored on one backend, which is how garbage that predates a
+switch to `reclaim` gets picked up. Run it with the node stopped.
 
 A class a node does not offer is a preference, not a demand: resolution falls
 through to the next rule and finally to the node default, and each
