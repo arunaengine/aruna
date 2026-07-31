@@ -189,7 +189,7 @@ impl BackendsFile {
             }
             if entry.quota_bytes == Some(0) {
                 return Err(ConversionError::FromStrError(format!(
-                    "backend `{name}` sets quota_bytes = 0, which allows no user data"
+                    "backend `{name}` sets quota_bytes = 0; omit the field for an unlimited backend"
                 )));
             }
             // Without it every UploadPart fails long after regular writes work,
