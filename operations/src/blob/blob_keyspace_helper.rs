@@ -1,4 +1,4 @@
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
@@ -7,7 +7,7 @@ use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, CurrentVersionPointer,
     HashPathIndexKey, RealmId, VersionKey,
 };
-use aruna_core::types::{Effects, GroupId, NodeId, TxnId};
+use aruna_core::types::{Effects, GroupId, Key, NodeId, TxnId};
 use byteview::ByteView;
 use smallvec::smallvec;
 use ulid::Ulid;
@@ -184,12 +184,13 @@ pub fn delete_hash_path_index_effect(
 
 pub fn iter_hash_path_index_effect(
     blake3_hash: &[u8],
+    start_after: Option<Key>,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
     Ok(Effect::Storage(StorageEffect::Iter {
         key_space: HASH_PATHS_INDEX_KEYSPACE.to_string(),
         prefix: Some(HashPathIndexKey::hash_prefix(blake3_hash)?.into()),
-        start: None,
+        start: start_after.map(IterStart::After),
         limit: usize::MAX,
         txn_id,
     }))
@@ -260,7 +261,7 @@ mod tests {
 
     #[test]
     fn iter_hash_path_index_effect_uses_hash_prefix() {
-        let effect = iter_hash_path_index_effect(&[7u8; 32], None).unwrap();
+        let effect = iter_hash_path_index_effect(&[7u8; 32], None, None).unwrap();
 
         let Effect::Storage(StorageEffect::Iter { prefix, .. }) = effect else {
             panic!("expected storage iter effect");

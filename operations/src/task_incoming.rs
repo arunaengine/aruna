@@ -28,6 +28,9 @@ use crate::blob::cleanup::{BLOB_CLEANUP_AFTER, BLOB_CLEANUP_RETRY, process_clean
 use crate::blob::hidden::{
     HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, process_hidden_sweep, restore_hidden_sweep,
 };
+use crate::blob::reclaim::{
+    RECLAIM_SWEEP_AFTER, RECLAIM_SWEEP_RETRY, process_reclaim_batch, restore_reclaim_sweep,
+};
 use crate::blob_holders::RefreshBlobHoldersOperation;
 use crate::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::document_sync_outbox::{
@@ -1770,6 +1773,19 @@ impl OperationsTaskHandler {
             .await;
     }
 
+    async fn drain_blob_reclaim(&self) {
+        let after = match process_reclaim_batch(&self.context).await {
+            Ok(outcome) if outcome.failed > 0 => RECLAIM_SWEEP_RETRY,
+            Ok(_) => RECLAIM_SWEEP_AFTER,
+            Err(error) => {
+                warn!(task_id = ?TaskKey::DrainBlobReclaimQueue, error = %error, "Failed to drain blob reclaim");
+                RECLAIM_SWEEP_RETRY
+            }
+        };
+        self.reschedule_timer(TaskKey::DrainBlobReclaimQueue, after)
+            .await;
+    }
+
     async fn sweep_hidden_blobs(&self) {
         let after = match process_hidden_sweep(&self.context).await {
             Ok(_) => HIDDEN_SWEEP_AFTER,
@@ -1925,6 +1941,7 @@ async fn initialize_task_handler(
     restore_mirror_timer(&context.storage_handle, &task_handle).await;
     if context.blob_handle.is_some() {
         restore_hidden_sweep(&context.storage_handle, &task_handle).await;
+        restore_reclaim_sweep(&context.storage_handle, &task_handle).await;
         handler
             .reschedule_timer(TaskKey::DrainBlobCleanupQueue, Duration::ZERO)
             .await;
@@ -2029,6 +2046,9 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::DrainBlobCleanupQueue => {
                 self.drain_blob_cleanup().await;
+            }
+            TaskKey::DrainBlobReclaimQueue => {
+                self.drain_blob_reclaim().await;
             }
             TaskKey::RefreshBlobHolders => {
                 self.refresh_blob_holders().await;

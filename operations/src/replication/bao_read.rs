@@ -387,7 +387,7 @@ impl IncomingBaoReadOperation {
             return self.send_refusal(BaoReadRefusal::InvalidTarget);
         };
         self.state = IncomingBaoReadState::ReadHashAliases;
-        match iter_hash_path_index_effect(&hash, None) {
+        match iter_hash_path_index_effect(&hash, None, None) {
             Ok(effect) => smallvec![effect],
             Err(error) => self.fail(error.into()),
         }

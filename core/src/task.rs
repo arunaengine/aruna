@@ -25,6 +25,7 @@ pub enum TaskKey {
     DrainSyncMirrorRepair,
     SweepHiddenBlobs,
     DrainBlobCleanupQueue,
+    DrainBlobReclaimQueue,
     RefreshBlobHolders,
 }
 
