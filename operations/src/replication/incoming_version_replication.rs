@@ -504,9 +504,9 @@ impl IncomingVersionReplicationOperation {
         ))]
     }
 
-    /// The receiver's own group default and registered backend ids, loaded on
-    /// the one path that routes a blob. Without them a group default is ignored
-    /// and a `Group` target cannot resolve.
+    /// The receiver's own group default and registered backend ids, loaded once
+    /// the destination group is known so that the existing-copy probe and the
+    /// transfer resolve the destination from identical inputs.
     fn load_destination_routing(&mut self) -> Effects {
         self.state = IncomingVersionReplicationState::LoadDestinationRouting;
         smallvec![load_group_inputs(
@@ -1325,7 +1325,7 @@ impl Operation for IncomingVersionReplicationOperation {
 
                 self.destination_group_id = Some(bucket_info.group_id);
                 self.destination_rules = bucket_info.storage_routing;
-                self.check_write_permission(bucket_info.group_id)
+                self.load_destination_routing()
             }
             IncomingVersionReplicationState::LoadDestinationRouting => {
                 let Event::SubOperation(SubOperationEvent::GroupRoutingLoaded { result }) = event
@@ -1343,7 +1343,9 @@ impl Operation for IncomingVersionReplicationOperation {
                             .fail(IncomingVersionReplicationError::RoutingInputsFailed(error));
                     }
                 }
-                self.receive_blob()
+                self.check_write_permission(
+                    self.destination_group_id.unwrap_or(self.manifest.group_id),
+                )
             }
             IncomingVersionReplicationState::CreateDestinationBucket => {
                 let Event::SubOperation(SubOperationEvent::BucketCreated { result }) = event else {
@@ -1683,7 +1685,7 @@ impl Operation for IncomingVersionReplicationOperation {
                             decision = ?self.negotiation_result,
                             "Negotiation sent; awaiting blob transfer"
                         );
-                        self.load_destination_routing()
+                        self.receive_blob()
                     }
                     None => self.fail(IncomingVersionReplicationError::ReplicationError(
                         ReplicationError::ReplicationFailed,
@@ -2123,12 +2125,13 @@ mod tests {
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BackendRef, BlobVersion, BlobVersionState, BucketInfo,
-        CurrentVersionPointer, HashPathIndexKey, MultipartObjectMetadataKey, QuotaConfig,
-        RealmConfigDocument, RealmId, ReplicationItemKind, ReplicationNegotiationResult,
-        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionSourceBinding,
+        AuthContext, BackendLocation, BackendRef, BlobLocationKey, BlobVersion, BlobVersionState,
+        BucketInfo, CurrentVersionPointer, GroupRoutingInputs, HashPathIndexKey,
+        MultipartObjectMetadataKey, QuotaConfig, RealmConfigDocument, RealmId, ReplicationItemKind,
+        ReplicationNegotiationResult, RoutingTarget, SourceConnectorKind, SourceMetadata,
+        StagingStrategy, StorageRoutingRule, VersionSourceBinding,
     };
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::time::SystemTime;
     use ulid::Ulid;
 
@@ -2271,6 +2274,20 @@ mod tests {
         }
     }
 
+    /// Answers the routing load that follows every destination bucket read.
+    fn load_routing(
+        op: &mut IncomingVersionReplicationOperation,
+        inputs: GroupRoutingInputs,
+    ) -> aruna_core::types::Effects {
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::LoadDestinationRouting
+        );
+        op.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
+            result: Ok(inputs),
+        }))
+    }
+
     fn advance_to_version_lookup(
         op: &mut IncomingVersionReplicationOperation,
         group_id: Ulid,
@@ -2285,10 +2302,11 @@ mod tests {
             Effect::Storage(StorageEffect::Read { .. })
         ));
 
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+        op.step(Event::Storage(StorageEvent::ReadResult {
             key: b"bucket".to_vec().into(),
             value: Some(make_bucket_info(group_id).to_bytes().unwrap().into()),
         }));
+        let effects = load_routing(op, GroupRoutingInputs::default());
         assert_eq!(op.state, IncomingVersionReplicationState::CheckPermissions);
         assert!(matches!(effects[0], Effect::SubOperation(_)));
 
@@ -3288,6 +3306,114 @@ mod tests {
         ));
     }
 
+    /// Drives an incoming materialized version to the existing-copy probe under
+    /// the given bucket rules and group inputs.
+    fn probe_backend(
+        rules: Vec<StorageRoutingRule>,
+        inputs: GroupRoutingInputs,
+    ) -> (
+        IncomingVersionReplicationOperation,
+        aruna_core::types::Effects,
+    ) {
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            make_manifest(ReplicationItemKind::Materialized),
+        );
+        let mut bucket_info = make_bucket_info(test_group_id());
+        bucket_info.storage_routing = rules;
+
+        op.start();
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: Some(bucket_info.to_bytes().unwrap().into()),
+        }));
+        load_routing(&mut op, inputs);
+        op.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+        ));
+        let effects = advance_blob_lookup(&mut op);
+        (op, effects)
+    }
+
+    fn group_backend_key(backend_id: Ulid) -> Vec<u8> {
+        BlobLocationKey::new([1u8; 32], BackendRef::Group(backend_id)).to_bytes()
+    }
+
+    fn probed_key(effects: &aruna_core::types::Effects) -> Vec<u8> {
+        let [Effect::Storage(StorageEffect::Read { key, .. })] = effects.as_slice() else {
+            panic!("expected one location read, got {effects:?}")
+        };
+        key.to_vec()
+    }
+
+    #[test]
+    fn probes_rule_backend() {
+        // The probe must ask about the backend the bucket rule names.
+        let backend_id = Ulid::from_bytes([4u8; 16]);
+        let (op, effects) = probe_backend(
+            vec![StorageRoutingRule {
+                key_prefix: String::new(),
+                exact: false,
+                target: RoutingTarget::Backend(BackendRef::Group(backend_id)),
+            }],
+            GroupRoutingInputs {
+                default_target: None,
+                backend_ids: BTreeSet::from([backend_id]),
+            },
+        );
+
+        assert_eq!(
+            op.resolve_destination().unwrap().backend,
+            BackendRef::Group(backend_id)
+        );
+        assert_eq!(probed_key(&effects), group_backend_key(backend_id));
+    }
+
+    #[test]
+    fn probes_group_default() {
+        let backend_id = Ulid::from_bytes([5u8; 16]);
+        let (_op, effects) = probe_backend(
+            Vec::new(),
+            GroupRoutingInputs {
+                default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
+                backend_ids: BTreeSet::from([backend_id]),
+            },
+        );
+
+        assert_eq!(probed_key(&effects), group_backend_key(backend_id));
+    }
+
+    #[test]
+    fn keeps_loaded_inputs() {
+        // The version-only path resolves from the same inputs the probe used.
+        let backend_id = Ulid::from_bytes([6u8; 16]);
+        let (mut op, _effects) = probe_backend(
+            Vec::new(),
+            GroupRoutingInputs {
+                default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
+                backend_ids: BTreeSet::from([backend_id]),
+            },
+        );
+        let mut location = make_location();
+        location.backend = BackendRef::Group(backend_id);
+
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: group_backend_key(backend_id).into(),
+            value: Some(location.to_bytes().unwrap().into()),
+        }));
+
+        assert_eq!(
+            op.negotiation_result,
+            Some(ReplicationNegotiationResult::NeedVersionOnly)
+        );
+        assert_eq!(
+            op.resolve_destination().unwrap().backend,
+            BackendRef::Group(backend_id)
+        );
+    }
+
     #[test]
     fn received_blob_manifest_mismatch_is_rejected_and_cleaned_up() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
@@ -3383,7 +3509,7 @@ mod tests {
         );
 
         op.start();
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+        op.step(Event::Storage(StorageEvent::ReadResult {
             key: b"bucket".to_vec().into(),
             value: Some(
                 make_bucket_info(Ulid::generate())
@@ -3392,6 +3518,7 @@ mod tests {
                     .into(),
             ),
         }));
+        let effects = load_routing(&mut op, GroupRoutingInputs::default());
         assert_eq!(op.state, IncomingVersionReplicationState::CheckPermissions);
         assert!(matches!(effects[0], Effect::SubOperation(_)));
 
@@ -3434,6 +3561,7 @@ mod tests {
                     .into(),
             ),
         }));
+        load_routing(&mut op, GroupRoutingInputs::default());
 
         let effects = op.step(Event::SubOperation(
             SubOperationEvent::AuthorizationResult {
