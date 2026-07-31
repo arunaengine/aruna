@@ -160,10 +160,11 @@ The holder index is refreshed on a TTL, so a copy made moments ago may not be
 published yet. `complete` does not promise otherwise: it promises that every
 node the three sources named was asked.
 
-The whole request is bounded: at most 64 nodes are asked, no peer is waited on
-for more than 5 seconds, and the fan-out as a whole is abandoned after 30
-seconds, with any peer not answered by then reported as `unreachable`. The
-local entry is computed first and never waits on a remote node.
+The whole request is bounded: the holder-index lookup is given 5 seconds, at
+most 64 nodes are asked, no peer is waited on for more than 5 seconds, and the
+fan-out as a whole is abandoned after 30 seconds, with any peer not answered by
+then reported as `unreachable`. Every deadline closes the stream or query it
+gave up on. The local entry is computed first and never waits on a remote node.
 
 Node-managed copies report their storage class, not the operator's backend
 name. Group-backend copies report the backend's id and name, because that copy

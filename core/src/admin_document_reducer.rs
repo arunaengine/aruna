@@ -4183,7 +4183,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_rejects_derived_labels() {
+    fn rejects_derived_labels() {
         // Both the kind label and any storage class are stamped by the node.
         for key in [
             KIND_LABEL_KEY.to_string(),

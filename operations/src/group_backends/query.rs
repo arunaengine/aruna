@@ -215,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn list_scopes_by_group() {
+    fn scopes_by_group() {
         // The index prefix is what keeps another tenant's records out.
         let group_id = Ulid::from_bytes([1u8; 16]);
         let mine = record(group_id);
