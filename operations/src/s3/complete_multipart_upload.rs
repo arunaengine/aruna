@@ -1555,7 +1555,7 @@ mod tests {
     }
 
     #[test]
-    fn fence_rejects_stray_event() {
+    fn fence_rejects_stray() {
         let mut op = CompleteMultipartUploadOperation::new(finalize_input());
         op.composed_location = Some(composed_location(Ulid::from_bytes([5u8; 16])));
         op.state = CompleteMultipartUploadState::FenceBackend;

@@ -1138,7 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn fence_keeps_not_due() {
+    fn fence_keeps_row() {
         // A grace the tenant lengthened after the sweep read it must leave the
         // queue row alone rather than delete the copy under the old value.
         let backend_id = Ulid::from_bytes([8u8; 16]);

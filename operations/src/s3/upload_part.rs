@@ -642,7 +642,7 @@ mod test {
     }
 
     #[test]
-    fn fence_rejects_stray_event() {
+    fn fence_rejects_stray() {
         let backend_id = Ulid::from_bytes([5u8; 16]);
         let mut op = upload_part_op(backend_id);
         op.state = UploadPartState::FenceBackend;

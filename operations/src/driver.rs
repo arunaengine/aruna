@@ -126,9 +126,8 @@ pub async fn bucket_snapshot(
 }
 
 /// Node routing whose capped backends already carry their fullness, for the
-/// background writers that assemble their own snapshot later. Replication
-/// consults the same catalog as an API write, so a fail-closed counter read
-/// refuses it too; a refused replication is rescheduled with backoff.
+/// background writers that build their own snapshot later. Replication reads
+/// the same catalog, so an unreadable counter refuses it too and it retries.
 pub async fn quota_marked_routing(
     context: &DriverContext,
 ) -> Result<NodeRouting, RoutingInputsError> {
