@@ -16,6 +16,8 @@ pub const STORAGE_CLASS_MAX_LEN: usize = 32;
 pub enum RoutingError {
     #[error("backend {0} is not registered on this node")]
     UnknownBackend(BackendRef),
+    #[error("backend {0} has reached its quota")]
+    BackendFull(BackendRef),
     #[error("group-defined storage backends are disabled on this node")]
     GroupEgressDisabled,
     #[error("duplicate routing rule for prefix `{0}`")]
@@ -165,6 +167,8 @@ struct CatalogEntry {
     class: Option<String>,
     allow_tenants: bool,
     cleanup: CleanupStrategy,
+    quota_bytes: Option<u64>,
+    full: bool,
 }
 
 /// The node's registered backends and the group's own backend ids, without any
@@ -194,6 +198,8 @@ impl BackendCatalog {
                 class,
                 allow_tenants: true,
                 cleanup: CleanupStrategy::node_default(),
+                quota_bytes: None,
+                full: false,
             },
         );
         self
@@ -207,10 +213,35 @@ impl BackendCatalog {
         self
     }
 
+    pub fn with_quota(mut self, name: &str, quota_bytes: Option<u64>) -> Self {
+        if let Some(entry) = self.backends.get_mut(name) {
+            entry.quota_bytes = quota_bytes;
+        }
+        self
+    }
+
     /// The strategy a node backend's unreferenced bytes follow. An unknown name
     /// answers `None`, which the sweep treats as retain.
     pub fn cleanup_of(&self, name: &str) -> Option<CleanupStrategy> {
         self.backends.get(name).map(|entry| entry.cleanup)
+    }
+
+    /// Backends the operator capped, for the caller that reads their usage.
+    pub fn quotas(&self) -> Vec<(String, u64)> {
+        self.backends
+            .iter()
+            .filter_map(|(name, entry)| entry.quota_bytes.map(|quota| (name.clone(), quota)))
+            .collect()
+    }
+
+    /// Marks a capped backend as having reached its quota. A named target then
+    /// fails loudly and a class preference skips it like a class this node does
+    /// not offer.
+    pub fn mark_full(mut self, name: &str) -> Self {
+        if let Some(entry) = self.backends.get_mut(name) {
+            entry.full = true;
+        }
+        self
     }
 
     /// A backend whose class is reserved for operator rules and the node
@@ -222,6 +253,8 @@ impl BackendCatalog {
                 class,
                 allow_tenants: false,
                 cleanup: CleanupStrategy::node_default(),
+                quota_bytes: None,
+                full: false,
             },
         );
         self
@@ -280,6 +313,11 @@ impl BackendCatalog {
             .backends
             .get(name)
             .ok_or_else(|| RoutingError::UnknownBackend(BackendRef::Node(name.to_string())))?;
+        if entry.full {
+            return Err(RoutingError::BackendFull(BackendRef::Node(
+                name.to_string(),
+            )));
+        }
         Ok(ResolvedBackend::new(
             BackendRef::Node(name.to_string()),
             entry.class.clone(),
@@ -310,6 +348,7 @@ impl BackendCatalog {
                 .iter()
                 .find(|(_, entry)| {
                     entry.class.as_deref() == Some(class.as_str())
+                        && !entry.full
                         && (entry.allow_tenants || source == RuleSource::Operator)
                 })
                 .map(|(name, entry)| {
@@ -874,6 +913,55 @@ mod tests {
                 Some("archive".to_string())
             )
         );
+    }
+
+    #[test]
+    fn rejects_full_backend() {
+        // A rule that names a full backend fails rather than writing elsewhere.
+        let catalog = catalog().with_quota("cold", Some(10)).mark_full("cold");
+        let snapshot = RoutingSnapshot::new(Ulid::from_bytes([1u8; 16]), catalog)
+            .with_bucket_rules(vec![rule("", false, "cold")]);
+
+        assert_eq!(
+            resolve_backend(&snapshot, "b", "k"),
+            Err(RoutingError::BackendFull(BackendRef::Node(
+                "cold".to_string()
+            )))
+        );
+    }
+
+    #[test]
+    fn class_skips_full() {
+        // A class preference treats a full backend as a class this node lacks.
+        let catalog = catalog().mark_full("cold");
+        let snapshot = RoutingSnapshot::new(Ulid::from_bytes([1u8; 16]), catalog)
+            .with_bucket_rules(vec![class_rule("", "cold")]);
+
+        assert_eq!(
+            resolve_backend(&snapshot, "b", "k").unwrap(),
+            node("default")
+        );
+    }
+
+    #[test]
+    fn default_full_fails() {
+        // The terminal landing has nowhere to fall through to.
+        let catalog = catalog().mark_full("default");
+        let snapshot = RoutingSnapshot::new(Ulid::from_bytes([1u8; 16]), catalog);
+
+        assert_eq!(
+            resolve_backend(&snapshot, "b", "k"),
+            Err(RoutingError::BackendFull(BackendRef::Node(
+                "default".to_string()
+            )))
+        );
+    }
+
+    #[test]
+    fn quotas_list_capped_backends() {
+        let catalog = catalog().with_quota("cold", Some(10));
+
+        assert_eq!(catalog.quotas(), vec![("cold".to_string(), 10)]);
     }
 
     #[test]

@@ -8,11 +8,11 @@ use aruna_core::errors::StorageError;
 use aruna_core::structs::{
     Actor, AuthContext, GroupQuotaOverride, Permission, QuotaConfig, UserGroupCapOverride,
 };
+use aruna_core::structs::{BackendRef, USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
 use aruna_core::structs::{RealmConfigDocument, RealmNodeKind};
-use aruna_core::structs::{USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{backend_used_bytes, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::get_realm_nodes::{GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT};
 use aruna_operations::metadata::stats::count_realm_documents;
@@ -233,9 +233,11 @@ pub struct BackendStatus {
     pub class: Option<String>,
     /// Whether tenant routing rules may target this backend's class.
     pub allow_tenants: bool,
-    /// Advisory operator allowance for user data on this backend. Never
-    /// enforced: no write is rejected for exceeding it.
+    /// Operator allowance for user data on this backend. A write routed here is
+    /// refused once `used_bytes` reaches it.
     pub quota_bytes: Option<u64>,
+    /// Stored user-data bytes on this backend, from the maintained counters.
+    pub used_bytes: u64,
     pub default: bool,
     pub status: ServiceStatus,
 }
@@ -1383,6 +1385,31 @@ async fn interface_services_status(state: &ServerState) -> InterfaceServicesStat
     }
 }
 
+/// Adds the usage each backend's quota is measured against. Read once per
+/// request from the maintained counters, not from the store itself.
+async fn backend_statuses(
+    state: &ServerState,
+    backends: Vec<aruna_core::structs::BackendState>,
+) -> Vec<BackendStatus> {
+    let context = state.get_ctx();
+    let mut statuses = Vec::with_capacity(backends.len());
+    for backend in backends {
+        let used_bytes =
+            backend_used_bytes(&context, &BackendRef::Node(backend.name.clone())).await;
+        statuses.push(BackendStatus {
+            name: backend.name,
+            backend: backend.backend_type.to_string(),
+            class: backend.class,
+            allow_tenants: backend.allow_tenants,
+            quota_bytes: backend.quota_bytes,
+            used_bytes,
+            default: backend.default,
+            status: ServiceStatus::from(backend.status),
+        });
+    }
+    statuses
+}
+
 #[utoipa::path(
     get,
     path = "/info",
@@ -1488,19 +1515,7 @@ pub async fn get_info(
                     io: info.timeouts.control_plane_io_timeout.as_secs(),
                     transfer_idle: info.timeouts.transfer_idle_timeout.as_secs(),
                 }),
-                backends: info
-                    .backends
-                    .into_iter()
-                    .map(|backend| BackendStatus {
-                        name: backend.name,
-                        backend: backend.backend_type.to_string(),
-                        class: backend.class,
-                        allow_tenants: backend.allow_tenants,
-                        quota_bytes: backend.quota_bytes,
-                        default: backend.default,
-                        status: ServiceStatus::from(backend.status),
-                    })
-                    .collect(),
+                backends: backend_statuses(&state, info.backends).await,
             },
             None => BlobServiceStatus {
                 status: ServiceStatus::NotConfigured,

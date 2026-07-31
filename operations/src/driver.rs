@@ -2,12 +2,13 @@ use aruna_blob::blob::BlobHandle;
 use aruna_compute::ExecutorRegistry;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::BlobError;
-use aruna_core::events::{BlobEvent, Event, NetEvent, SubOperationEvent};
+use aruna_core::events::{BlobEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::operation::{Operation, SubOperation};
 use aruna_core::structs::{
-    BucketInfo, GroupRoutingInputs, NodeRouting, RoutingSnapshot, StorageRoutingRule,
+    BackendRef, BucketInfo, GroupRoutingInputs, NodeRouting, RoutingSnapshot, StorageRoutingRule,
+    UsageCounters, usage_backend_keys,
 };
 use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
@@ -101,10 +102,11 @@ pub async fn routing_snapshot(
     group_id: GroupId,
     bucket: &str,
 ) -> Result<RoutingSnapshot, RoutingInputsError> {
-    Ok(node_routing(context)
+    let snapshot = node_routing(context)
         .snapshot(group_id)
         .with_group_inputs(group_inputs(context, group_id).await?)
-        .with_bucket_rules(bucket_rules(context, bucket).await?))
+        .with_bucket_rules(bucket_rules(context, bucket).await?);
+    Ok(mark_full_backends(context, snapshot).await)
 }
 
 /// The same inputs when the caller already holds the bucket record, as the S3
@@ -113,10 +115,59 @@ pub async fn bucket_snapshot(
     context: &DriverContext,
     bucket: &BucketInfo,
 ) -> Result<RoutingSnapshot, RoutingInputsError> {
-    Ok(node_routing(context)
+    let snapshot = node_routing(context)
         .snapshot(bucket.group_id)
         .with_group_inputs(group_inputs(context, bucket.group_id).await?)
-        .with_bucket_rules(bucket.storage_routing.clone()))
+        .with_bucket_rules(bucket.storage_routing.clone());
+    Ok(mark_full_backends(context, snapshot).await)
+}
+
+/// Freezes each capped backend's fullness for one request, exactly like the
+/// group quota ceiling. Concurrent writes can overshoot by their own bytes; an
+/// unreadable counter leaves the backend usable rather than blocking writes.
+async fn mark_full_backends(context: &DriverContext, snapshot: RoutingSnapshot) -> RoutingSnapshot {
+    let quotas = snapshot.catalog.quotas();
+    if quotas.is_empty() {
+        return snapshot;
+    }
+    let mut catalog = snapshot.catalog.clone();
+    for (name, quota) in quotas {
+        if backend_used_bytes(context, &BackendRef::Node(name.clone())).await >= quota {
+            warn!(backend = %name, quota_bytes = quota, "Storage backend reached its quota");
+            catalog = catalog.mark_full(&name);
+        }
+    }
+    RoutingSnapshot {
+        catalog,
+        ..snapshot
+    }
+}
+
+/// Sums one backend's stored-byte shards. Missing rows read as zero, so a node
+/// whose counters were never built simply reports no usage.
+pub async fn backend_used_bytes(context: &DriverContext, backend: &BackendRef) -> u64 {
+    let reads = usage_backend_keys(backend)
+        .into_iter()
+        .map(|key| (USAGE_STATS_KEYSPACE.to_string(), key.into()))
+        .collect::<Vec<_>>();
+    let Event::Storage(StorageEvent::BatchReadResult { values }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::BatchRead {
+            reads,
+            txn_id: None,
+        })
+        .await
+    else {
+        warn!(backend = %backend, "Backend usage unavailable");
+        return 0;
+    };
+    values
+        .into_iter()
+        .filter_map(|(_, value)| value)
+        .filter_map(|value| UsageCounters::from_bytes(value.as_ref()).ok())
+        .fold(0u64, |total, counters| {
+            total.saturating_add(counters.stored_bytes)
+        })
 }
 
 #[derive(Clone)]
@@ -596,6 +647,51 @@ mod test {
             .unwrap();
         assert!(absent.bucket_rules.is_empty());
         assert_eq!(absent.group_default, None);
+    }
+
+    #[tokio::test]
+    async fn sums_backend_shards() {
+        // Fullness is measured over every shard of one backend, and only that one.
+        use crate::driver::backend_used_bytes;
+        use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
+        use aruna_core::structs::{BackendRef, UsageCounters, usage_backend_key};
+
+        let dir = tempdir().unwrap();
+        let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let counters = |bytes| UsageCounters {
+            stored_bytes: bytes,
+            ..Default::default()
+        };
+        for (backend, shard, bytes) in [
+            (BackendRef::node_default(), 0, 10u64),
+            (BackendRef::node_default(), 5, 7),
+            (BackendRef::Node("cold".to_string()), 0, 100),
+        ] {
+            write_value(
+                &context,
+                USAGE_STATS_KEYSPACE,
+                usage_backend_key(&backend, shard),
+                counters(bytes).to_bytes().unwrap(),
+            )
+            .await;
+        }
+
+        assert_eq!(
+            backend_used_bytes(&context, &BackendRef::node_default()).await,
+            17
+        );
+        assert_eq!(
+            backend_used_bytes(&context, &BackendRef::Node("gone".to_string())).await,
+            0
+        );
     }
 
     #[tokio::test]

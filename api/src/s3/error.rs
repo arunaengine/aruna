@@ -1,5 +1,6 @@
 use crate::s3::checksum::checksum_mismatch_error;
 use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
+use aruna_core::structs::RoutingError;
 use aruna_operations::driver::RoutingInputsError;
 use aruna_operations::s3::abort_multipart_upload::AbortMultipartUploadError;
 use aruna_operations::s3::bucket_cors::{
@@ -41,6 +42,17 @@ fn quota_exceeded_error(limit: u64, usage: u64) -> S3Error {
     let mut error = S3Error::with_message(
         S3ErrorCode::Custom("QuotaExceeded".into()),
         format!("Group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes"),
+    );
+    error.set_status_code(http::StatusCode::FORBIDDEN);
+    error
+}
+
+/// A named backend that has reached its operator quota. Refusing loudly beats
+/// hiding exhaustion by writing somewhere the rule did not name.
+fn backend_full_error(backend: &str) -> S3Error {
+    let mut error = S3Error::with_message(
+        S3ErrorCode::Custom("QuotaExceeded".into()),
+        format!("Storage backend {backend} has reached its quota"),
     );
     error.set_status_code(http::StatusCode::FORBIDDEN);
     error
@@ -180,6 +192,9 @@ impl IntoS3Error for PutObjectError {
                 missing_expected_checksum_s3_error(algorithm, "PutObject")
             }
             PutObjectError::QuotaExceeded { limit, usage } => quota_exceeded_error(limit, usage),
+            PutObjectError::RoutingFailed(RoutingError::BackendFull(backend)) => {
+                backend_full_error(&backend.to_string())
+            }
             PutObjectError::IncompleteBody => incomplete_body_error(),
             PutObjectError::WriteFailed(message) => write_failed_error(&message, "PutObject"),
             err => internal_error(err),
@@ -189,7 +204,12 @@ impl IntoS3Error for PutObjectError {
 
 impl IntoS3Error for CreateMultipartUploadError {
     fn into_s3_error(self) -> S3Error {
-        internal_error(self)
+        match self {
+            CreateMultipartUploadError::RoutingFailed(RoutingError::BackendFull(backend)) => {
+                backend_full_error(&backend.to_string())
+            }
+            err => internal_error(err),
+        }
     }
 }
 

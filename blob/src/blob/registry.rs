@@ -204,7 +204,9 @@ impl BackendRegistry {
                 } else {
                     catalog.with_reserved(name.clone(), backend.class.clone())
                 };
-                catalog.with_cleanup(name, backend.cleanup)
+                catalog
+                    .with_cleanup(name, backend.cleanup)
+                    .with_quota(name, backend.quota_bytes)
             },
         );
         if self.serve_group_backends {
