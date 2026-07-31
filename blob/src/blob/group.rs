@@ -194,8 +194,12 @@ impl BlobHandler {
         if let Err(error) = operator.write(&probe, b"aruna".to_vec()).await {
             return BlobEvent::Error(BlobError::WriteError(error.to_string()));
         }
+        // Credentials that cannot delete break object deletion, multipart abort
+        // and cleanup later, and leak the probe object now.
         if let Err(error) = operator.delete(&probe).await {
-            tracing::warn!(error = %error, "failed to remove group backend probe object");
+            return BlobEvent::Error(BlobError::DeleteError(format!(
+                "group backend probe object could not be removed: {error}"
+            )));
         }
         BlobEvent::GroupBackendChecked
     }
