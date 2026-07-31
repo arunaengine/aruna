@@ -378,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_keys_stay_distinct() {
+    fn keys_stay_distinct() {
         // A name ending in a shard-shaped suffix must not alias another backend.
         let plain = BackendRef::Node("cold".to_string());
         let tricky = BackendRef::Node("cold/07".to_string());
@@ -393,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_shard_is_stable() {
+    fn shard_is_stable() {
         let hash = [7u8; 32];
         assert_eq!(
             usage_hash_key(&hash),

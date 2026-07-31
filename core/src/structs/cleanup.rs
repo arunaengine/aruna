@@ -97,7 +97,7 @@ mod tests {
     use std::time::SystemTime;
 
     #[test]
-    fn candidate_key_round_trips() {
+    fn key_round_trips() {
         // A name that prefixes another must not fall inside its scan range.
         let key = ReclaimCandidateKey::new(BackendRef::Node("cold".to_string()), [4u8; 32]);
         let bytes = key.to_bytes();

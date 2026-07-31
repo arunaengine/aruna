@@ -40,7 +40,7 @@ use utoipa::{OpenApi, ToSchema};
         replace_group_backend,
         delete_group_backend,
         enable_group_backend,
-        group_backend_reclaim_status
+        backend_reclaim_status
     )
 )]
 pub struct GroupBackendsApiDoc;
@@ -63,7 +63,7 @@ pub fn router() -> Router<Arc<ServerState>> {
         )
         .route(
             "/groups/{group_id}/storage-backends/{backend_id}/reclaim-status",
-            get(group_backend_reclaim_status),
+            get(backend_reclaim_status),
         )
 }
 
@@ -424,7 +424,7 @@ pub async fn enable_group_backend(
     ),
     security(("bearer_auth" = []))
 )]
-pub async fn group_backend_reclaim_status(
+pub async fn backend_reclaim_status(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path((group_id, backend_id)): Path<(String, String)>,
@@ -476,9 +476,8 @@ async fn set_disabled(
 #[cfg(test)]
 mod tests {
     use super::{
-        CleanupPolicy, CleanupStrategy, CreateGroupBackendRequest, create_group_backend,
-        delete_group_backend, enable_group_backend, group_backend_reclaim_status,
-        list_group_backends,
+        CleanupPolicy, CleanupStrategy, CreateGroupBackendRequest, backend_reclaim_status,
+        create_group_backend, delete_group_backend, enable_group_backend, list_group_backends,
     };
     use crate::error::ServerError;
     use crate::routes::storage_routing::tests::setup_state;
@@ -519,7 +518,7 @@ mod tests {
 
         assert!(matches!(enabled, Err(ServerError::Forbidden)));
 
-        let status = group_backend_reclaim_status(
+        let status = backend_reclaim_status(
             State(test.state.clone()),
             Extension(Some(test.other_auth.clone())),
             Path((test.group_id.to_string(), Ulid::generate().to_string())),
@@ -553,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_policy_round_trips() {
+    fn policy_round_trips() {
         // Omitted means retain, and a reclaim without a grace takes the default.
         assert_eq!(
             CleanupPolicy::resolve(None).unwrap(),
@@ -588,11 +587,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reclaim_status_needs_backend() {
+    async fn status_needs_backend() {
         // The record must exist and belong to the group before any queue scan.
         let test = setup_state().await;
 
-        let result = group_backend_reclaim_status(
+        let result = backend_reclaim_status(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
             Path((test.group_id.to_string(), Ulid::generate().to_string())),

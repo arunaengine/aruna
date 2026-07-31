@@ -1010,7 +1010,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn other_backend_never_pins() {
+    async fn other_never_pins() {
         // Deduplication is per backend, so a copy elsewhere holds nothing here.
         let dir = tempdir().unwrap();
         let context = context(dir.path().to_str().unwrap());
@@ -1067,7 +1067,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sweep_frees_when_due() {
+    async fn sweep_frees_due() {
         let dir = tempdir().unwrap();
         let context = context(dir.path().to_str().unwrap());
         seed(&context, 10).await;
@@ -1196,7 +1196,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_counts_one_backend() {
+    async fn status_counts_backend() {
         // Another backend's queue rows must not show up in this one's depth.
         let dir = tempdir().unwrap();
         let context = context(dir.path().to_str().unwrap());

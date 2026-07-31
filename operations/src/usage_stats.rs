@@ -1873,7 +1873,7 @@ mod tests {
     }
 
     #[test]
-    fn credit_picks_hash_shard() {
+    fn credit_picks_shard() {
         // Stored bytes belong to the hash's shard and the holding backend's row,
         // never to the writing group's shard.
         let group_id = Ulid::from_bytes([1u8; 16]);
@@ -1907,7 +1907,7 @@ mod tests {
     }
 
     #[test]
-    fn credit_merges_equal_shard() {
+    fn credit_merges_shard() {
         // One key must carry both halves when the hash shard is the group shard.
         let group_id = Ulid::from_bytes([1u8; 16]);
         let blake3 = hash_on_shard(usage_global_shard_index(group_id));
@@ -1935,7 +1935,7 @@ mod tests {
     }
 
     #[test]
-    fn adopted_copy_credits_nothing() {
+    fn adopted_credits_nothing() {
         let update = UsageCounterUpdate::for_stored(StoredDelta::new(
             [3u8; 32],
             BackendRef::node_default(),

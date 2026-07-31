@@ -958,7 +958,7 @@ mod tests {
     }
 
     #[test]
-    fn quotas_list_capped_backends() {
+    fn quotas_list_capped() {
         let catalog = catalog().with_quota("cold", Some(10));
 
         assert_eq!(catalog.quotas(), vec![("cold".to_string(), 10)]);
