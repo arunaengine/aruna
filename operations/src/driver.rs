@@ -48,6 +48,9 @@ pub enum RoutingInputsError {
     GroupInputs(#[from] GroupRoutingInputsError),
     #[error("bucket routing rules unavailable: {0}")]
     BucketRules(#[from] RecordReadError),
+    /// Not `#[from]`: `BucketRules` already owns the conversion from a read.
+    #[error("backend usage counters unavailable: {0}")]
+    BackendUsage(#[source] RecordReadError),
 }
 
 impl RoutingInputsError {
@@ -56,7 +59,7 @@ impl RoutingInputsError {
     pub fn storage(&self) -> Option<&aruna_core::errors::StorageError> {
         let read = match self {
             Self::GroupInputs(GroupRoutingInputsError::Read(read)) => read,
-            Self::BucketRules(read) => read,
+            Self::BucketRules(read) | Self::BackendUsage(read) => read,
             Self::GroupInputs(GroupRoutingInputsError::Incomplete) => return None,
         };
         match read {
@@ -106,7 +109,7 @@ pub async fn routing_snapshot(
         .snapshot(group_id)
         .with_group_inputs(group_inputs(context, group_id).await?)
         .with_bucket_rules(bucket_rules(context, bucket).await?);
-    Ok(mark_full_backends(context, snapshot).await)
+    mark_full_backends(context, snapshot).await
 }
 
 /// The same inputs when the caller already holds the bucket record, as the S3
@@ -119,55 +122,65 @@ pub async fn bucket_snapshot(
         .snapshot(bucket.group_id)
         .with_group_inputs(group_inputs(context, bucket.group_id).await?)
         .with_bucket_rules(bucket.storage_routing.clone());
-    Ok(mark_full_backends(context, snapshot).await)
+    mark_full_backends(context, snapshot).await
 }
 
 /// Freezes each capped backend's fullness for one request, exactly like the
 /// group quota ceiling. Concurrent writes can overshoot by their own bytes; an
-/// unreadable counter leaves the backend usable rather than blocking writes.
-async fn mark_full_backends(context: &DriverContext, snapshot: RoutingSnapshot) -> RoutingSnapshot {
+/// unreadable counter fails the caller rather than routing past the cap.
+async fn mark_full_backends(
+    context: &DriverContext,
+    snapshot: RoutingSnapshot,
+) -> Result<RoutingSnapshot, RoutingInputsError> {
     let quotas = snapshot.catalog.quotas();
     if quotas.is_empty() {
-        return snapshot;
+        return Ok(snapshot);
     }
     let mut catalog = snapshot.catalog.clone();
     for (name, quota) in quotas {
-        if backend_used_bytes(context, &BackendRef::Node(name.clone())).await >= quota {
+        let used = backend_used_bytes(context, &BackendRef::Node(name.clone()))
+            .await
+            .map_err(RoutingInputsError::BackendUsage)?;
+        if used >= quota {
             warn!(backend = %name, quota_bytes = quota, "Storage backend reached its quota");
             catalog = catalog.mark_full(&name);
         }
     }
-    RoutingSnapshot {
+    Ok(RoutingSnapshot {
         catalog,
         ..snapshot
-    }
+    })
 }
 
-/// Sums one backend's stored-byte shards. Missing rows read as zero, so a node
-/// whose counters were never built simply reports no usage.
-pub async fn backend_used_bytes(context: &DriverContext, backend: &BackendRef) -> u64 {
+/// Sums one backend's stored-byte shards. A missing row reads as zero, so a node
+/// whose counters were never built reports no usage; an unreadable or
+/// undecodable shard is an error, never a zero.
+pub async fn backend_used_bytes(
+    context: &DriverContext,
+    backend: &BackendRef,
+) -> Result<u64, RecordReadError> {
     let reads = usage_backend_keys(backend)
         .into_iter()
         .map(|key| (USAGE_STATS_KEYSPACE.to_string(), key.into()))
         .collect::<Vec<_>>();
-    let Event::Storage(StorageEvent::BatchReadResult { values }) = context
+    let values = match context
         .storage_handle
         .send_storage_effect(StorageEffect::BatchRead {
             reads,
             txn_id: None,
         })
         .await
-    else {
-        warn!(backend = %backend, "Backend usage unavailable");
-        return 0;
+    {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        _ => return Err(RecordReadError::Unexpected),
     };
-    values
-        .into_iter()
-        .filter_map(|(_, value)| value)
-        .filter_map(|value| UsageCounters::from_bytes(value.as_ref()).ok())
-        .fold(0u64, |total, counters| {
-            total.saturating_add(counters.stored_bytes)
-        })
+    let mut total = 0u64;
+    for (_, value) in values {
+        let Some(value) = value else { continue };
+        total = total.saturating_add(UsageCounters::from_bytes(value.as_ref())?.stored_bytes);
+    }
+    Ok(total)
 }
 
 #[derive(Clone)]
@@ -685,12 +698,30 @@ mod test {
         }
 
         assert_eq!(
-            backend_used_bytes(&context, &BackendRef::node_default()).await,
+            backend_used_bytes(&context, &BackendRef::node_default())
+                .await
+                .unwrap(),
             17
         );
         assert_eq!(
-            backend_used_bytes(&context, &BackendRef::Node("gone".to_string())).await,
+            backend_used_bytes(&context, &BackendRef::Node("gone".to_string()))
+                .await
+                .unwrap(),
             0
+        );
+
+        // One undecodable shard must fail the read, not read as zero usage.
+        write_value(
+            &context,
+            USAGE_STATS_KEYSPACE,
+            usage_backend_key(&BackendRef::node_default(), 1),
+            vec![0xff; 8],
+        )
+        .await;
+        assert!(
+            backend_used_bytes(&context, &BackendRef::node_default())
+                .await
+                .is_err()
         );
     }
 

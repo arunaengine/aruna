@@ -237,7 +237,8 @@ pub struct BackendStatus {
     /// refused once `used_bytes` reaches it.
     pub quota_bytes: Option<u64>,
     /// Stored user-data bytes on this backend, from the maintained counters.
-    pub used_bytes: u64,
+    /// Absent when those counters could not be read.
+    pub used_bytes: Option<u64>,
     pub default: bool,
     pub status: ServiceStatus,
 }
@@ -1394,8 +1395,12 @@ async fn backend_statuses(
     let context = state.get_ctx();
     let mut statuses = Vec::with_capacity(backends.len());
     for backend in backends {
-        let used_bytes =
-            backend_used_bytes(&context, &BackendRef::Node(backend.name.clone())).await;
+        let used_bytes = backend_used_bytes(&context, &BackendRef::Node(backend.name.clone()))
+            .await
+            .inspect_err(
+                |error| warn!(backend = %backend.name, error = %error, "Backend usage unavailable"),
+            )
+            .ok();
         statuses.push(BackendStatus {
             name: backend.name,
             backend: backend.backend_type.to_string(),

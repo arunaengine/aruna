@@ -81,7 +81,9 @@ that names a **class** treats a full backend like a class this node does not
 offer and falls through to the next rung; and a full **node default** fails,
 since nothing is left to fall through to. Fullness is read once per request, so
 writes already in flight can carry the backend past its cap by their own bytes,
-exactly as the group quota behaves. Hidden blobs and job spool never count.
+exactly as the group quota behaves. A counter this node cannot read refuses the
+write instead of routing past the cap, and `/info` omits `used_bytes` for that
+backend. Hidden blobs and job spool never count.
 
 ## Cleanup strategy
 
