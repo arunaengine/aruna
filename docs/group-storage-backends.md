@@ -62,8 +62,10 @@ bucket's configuration and visible to you.
 
 `GET /groups/{group_id}/storage-backends/{backend_id}/reclaim-status` reports
 how many copies are queued, how many physical deletes are still owed, and how
-old the oldest queued entry is. A failing count that never falls means reclaim
-is blocked.
+old the oldest queued entry is. `queued_cleanups` is normally non-zero: the
+drain runs on its own timer, so every sweep leaves work behind for a few
+minutes. Reclaim is blocked when `oldest_enqueued_at` stops moving forward.
+`truncated` says a scan hit its cap and the counts are lower bounds.
 
 ## Routing writes to it
 

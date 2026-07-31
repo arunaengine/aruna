@@ -241,12 +241,18 @@ async fn delete_candidates(context: &DriverContext, keys: Vec<Key>) -> Result<()
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReclaimStatus {
     pub pending_candidates: usize,
-    pub failing_cleanups: usize,
+    /// Physical deletes still owed to this backend. The drain runs on its own
+    /// timer, so a non-zero count is normal; `oldest_enqueued_at` is what says
+    /// whether the queue is moving.
+    pub queued_cleanups: usize,
     pub oldest_enqueued_at: Option<SystemTime>,
     pub truncated: bool,
 }
 
 const STATUS_SCAN_LIMIT: usize = 10_000;
+/// The cleanup queue has no backend order, so this scan decodes every row it
+/// reads. It runs per request, so it is capped far lower than the prefix scan.
+const CLEANUP_SCAN_LIMIT: usize = 1_000;
 
 /// Counts one backend's queued candidates and the physical deletes still owed
 /// to it. The candidate side is a bounded prefix scan; the cleanup queue has no
@@ -281,12 +287,12 @@ pub async fn backend_status(
         BLOB_CLEANUP_KEYSPACE,
         None,
         None,
-        STATUS_SCAN_LIMIT,
+        CLEANUP_SCAN_LIMIT,
         None,
     )
     .await?;
     status.truncated = status.truncated || next.is_some();
-    status.failing_cleanups = cleanups
+    status.queued_cleanups = cleanups
         .iter()
         .filter(
             |(_, value)| match BlobCleanupWork::from_bytes(value.as_ref()) {
@@ -1212,7 +1218,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(status.pending_candidates, 1);
-        assert_eq!(status.failing_cleanups, 0);
+        assert_eq!(status.queued_cleanups, 0);
         assert_eq!(status.oldest_enqueued_at, Some(SystemTime::UNIX_EPOCH));
         assert!(!status.truncated);
     }

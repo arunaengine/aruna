@@ -25,7 +25,7 @@ pub struct SeedOutput {
 #[derive(Debug, Default, Serialize)]
 pub struct BackendReclaim {
     pub candidates: usize,
-    pub failing_cleanups: usize,
+    pub queued_cleanups: usize,
     pub oldest_enqueued_at: Option<DateTime<Utc>>,
 }
 
@@ -140,7 +140,7 @@ fn status_output(database_path: &str) -> Result<ReclaimStatusOutput, ExplorerErr
             backends
                 .entry(location.backend.to_string())
                 .or_default()
-                .failing_cleanups += 1;
+                .queued_cleanups += 1;
         }
     }
 
@@ -217,7 +217,7 @@ mod tests {
         let status = status_output(path.to_str().unwrap()).unwrap();
         let row = status.backends.get("node:default").unwrap();
         assert_eq!(row.candidates, 1);
-        assert_eq!(row.failing_cleanups, 0);
+        assert_eq!(row.queued_cleanups, 0);
         assert!(row.oldest_enqueued_at.is_some());
 
         let db = OptimisticTxDatabase::builder(Path::new(&path))

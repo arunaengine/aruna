@@ -144,9 +144,11 @@ pub struct GroupBackendResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct ReclaimStatusResponse {
     pub pending_candidates: usize,
-    /// Physical deletes still queued for this backend. A count that never falls
-    /// means reclaim is blocked.
-    pub failing_cleanups: usize,
+    /// Physical deletes still owed to this backend. The drain runs on its own
+    /// timer, so a non-zero count is normal; reclaim is blocked when
+    /// `oldest_enqueued_at` stops moving forward.
+    pub queued_cleanups: usize,
+    /// When the oldest queued candidate was enqueued.
     pub oldest_enqueued_at: Option<String>,
     /// A scan hit its cap, so the counts are lower bounds.
     pub truncated: bool,
@@ -442,7 +444,7 @@ pub async fn group_backend_reclaim_status(
 
     Ok(Json(ReclaimStatusResponse {
         pending_candidates: status.pending_candidates,
-        failing_cleanups: status.failing_cleanups,
+        queued_cleanups: status.queued_cleanups,
         oldest_enqueued_at: status
             .oldest_enqueued_at
             .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339()),
