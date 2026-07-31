@@ -97,10 +97,12 @@ on. `disabled` on the backend record tells you which state it is in.
 Credentials can be changed while a backend is disabled, so a leaked key can be
 replaced without accepting writes again.
 
-The record and its credentials remain on the node while any stored object,
-open multipart upload, uploaded part or queued cleanup still names the backend.
-Until the cleanup sweep that removes drained backends ships, a disabled backend
-simply stays.
+The record and its credentials remain on the node while any stored copy or
+queued cleanup still names the backend. Once nothing does, the node deletes the
+record and the credentials by itself, on the same schedule as the reclaim sweep.
+A backend set to `retain` keeps its stored copies, and so its record, forever;
+set `cleanup` to `reclaim` before disabling if you want the node to let go of
+both.
 
 ## Where your data actually is
 

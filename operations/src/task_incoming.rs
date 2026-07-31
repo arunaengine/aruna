@@ -38,6 +38,7 @@ use crate::document_sync_outbox::{
     restore_document_sync_outbox_timers,
 };
 use crate::driver::{DriverContext, drive};
+use crate::group_backends::remove::remove_drained_backends;
 use crate::jobs::drain::{JobClassBudget, process_job_queue_batch, restore_job_queue_timer};
 use crate::jobs::prune::{process_job_prune_batch, restore_job_prune_timer};
 use crate::jobs::runtime::JobsRuntime;
@@ -1782,6 +1783,9 @@ impl OperationsTaskHandler {
                 RECLAIM_SWEEP_RETRY
             }
         };
+        if let Err(error) = remove_drained_backends(&self.context).await {
+            warn!(error = %error, "Failed to remove drained storage backends");
+        }
         self.reschedule_timer(TaskKey::DrainBlobReclaimQueue, after)
             .await;
     }

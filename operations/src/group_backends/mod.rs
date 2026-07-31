@@ -1,6 +1,7 @@
 pub mod create;
 pub mod disable;
 pub mod query;
+pub mod remove;
 pub mod replace;
 pub mod validation;
 
