@@ -190,6 +190,9 @@ pub struct LocationSummary {
     pub version_id: Option<Ulid>,
     pub held: bool,
     pub storage: Option<LocationCopyStorage>,
+    /// Whether the resolved version carries stored bytes at all. A delete
+    /// marker or a reference-only version never will, anywhere.
+    pub materialized: bool,
 }
 
 impl LocationSummary {
@@ -198,6 +201,7 @@ impl LocationSummary {
             version_id: None,
             held: false,
             storage: None,
+            materialized: false,
         }
     }
 }

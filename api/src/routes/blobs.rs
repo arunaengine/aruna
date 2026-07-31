@@ -209,7 +209,7 @@ pub struct BlobLocationsQuery {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum BlobCopyState {
     Present,
     Pending,
@@ -217,6 +217,9 @@ pub enum BlobCopyState {
     /// The node holds this bucket under access rules the caller does not pass,
     /// so it refused to say whether a copy is there.
     Denied,
+    /// The version exists but carries no bytes anywhere: a delete marker, or a
+    /// version that only references content held elsewhere.
+    NotStored,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -287,6 +290,7 @@ fn copy_response(node_id: NodeId, local: bool, summary: LocationSummary) -> Blob
         local,
         ..pending_copy(node_id, BlobCopyState::Pending)
     };
+    let unstored = summary.version_id.is_some() && !summary.materialized;
     match summary.storage.filter(|_| summary.held) {
         Some(LocationCopyStorage::NodeManaged { storage_class }) => BlobCopyResponse {
             state: BlobCopyState::Present,
@@ -299,6 +303,10 @@ fn copy_response(node_id: NodeId, local: bool, summary: LocationSummary) -> Blob
             storage: Some(BlobCopyStorage::GroupBackend),
             group_backend_id: Some(backend_id.to_string()),
             group_backend_name: name,
+            ..base
+        },
+        None if unstored => BlobCopyResponse {
+            state: BlobCopyState::NotStored,
             ..base
         },
         None => base,
@@ -570,6 +578,7 @@ mod tests {
                 storage: Some(LocationCopyStorage::NodeManaged {
                     storage_class: Some("cold".to_string()),
                 }),
+                materialized: true,
             },
         );
 
@@ -592,6 +601,7 @@ mod tests {
                     backend_id,
                     name: Some("lab-minio".to_string()),
                 }),
+                materialized: true,
             },
         );
 
@@ -605,7 +615,30 @@ mod tests {
     }
 
     #[test]
+    fn reports_unstored_version() {
+        // A delete marker resolves a version that holds bytes nowhere.
+        let copy = copy_response(
+            node_id(),
+            false,
+            LocationSummary {
+                version_id: Some(Ulid::from_bytes([1u8; 16])),
+                held: false,
+                storage: None,
+                materialized: false,
+            },
+        );
+
+        assert_eq!(copy.state, BlobCopyState::NotStored);
+        assert!(copy.storage.is_none());
+        assert_eq!(
+            serde_json::to_value(BlobCopyState::NotStored).unwrap(),
+            serde_json::json!("not-stored")
+        );
+    }
+
+    #[test]
     fn absent_copy_pends() {
+        // No version at the peer is a copy still to come, not a missing one.
         let copy = copy_response(node_id(), false, LocationSummary::absent());
 
         assert_eq!(copy.state, BlobCopyState::Pending);
@@ -666,6 +699,12 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .contains(&serde_json::json!("holder-path-unknown"))
+        );
+        assert!(
+            openapi["components"]["schemas"]["BlobCopyState"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("not-stored"))
         );
         assert!(
             openapi["components"]["schemas"]["BlobCopyResponse"]["properties"]

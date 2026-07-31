@@ -339,6 +339,7 @@ impl LocationSummaryOperation {
         match version.location_key() {
             Some(key) => {
                 self.blake3 = Some(key.blake3_hash);
+                self.summary.materialized = true;
                 self.read_location(key)
             }
             None => self.answer(),

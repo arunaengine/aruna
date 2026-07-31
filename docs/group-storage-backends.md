@@ -144,12 +144,16 @@ the reported state is always the answering node's own.
   replication job for the version is queued for it. A node found only through
   the holder index and answering that it does not hold the version is left out
   entirely: it stores the same bytes under some other object, and no copy of
-  this one is on its way there.
+  this one is on its way there. That answer sets `holder-path-unknown` below,
+  because the node may hold this version under a path this node cannot name.
 - `unreachable` means the node did not answer within the deadline. The
   endpoint never waits on an offline node beyond that deadline, and the local
   entry is always returned.
 - `denied` means the node refused to answer because you may not read the
   bucket it would hold that copy under.
+- `not-stored` means the version exists there but holds no bytes anywhere: it
+  is a delete marker, or a version that only references content held
+  elsewhere. Unlike `pending`, no copy is coming.
 
 `denied` is not a bug. A replication target may write into a different bucket,
 sometimes owned by a different group, and each node authorizes you against the
@@ -169,6 +173,9 @@ reason, and a node absent from `copies` may still hold a copy:
 - `candidate-cap-reached`: more nodes than one request asks were candidates.
 - `holder-lookup-failed`: the holder index could not be queried, so copies
   outside the current configuration and queue are unknown.
+- `holder-path-unknown`: a node the holder index named knows no copy under the
+  bucket and key it was asked about, so its copy may be recorded under a path
+  this node cannot name.
 
 The holder index is refreshed on a TTL, so a copy made moments ago may not be
 published yet. `complete` does not promise otherwise: it promises that every
