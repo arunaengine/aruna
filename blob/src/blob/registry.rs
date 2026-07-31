@@ -3,8 +3,8 @@ use crate::error::BlobLibError;
 use crate::opendal::init_operator;
 use aruna_core::errors::BlobError;
 use aruna_core::structs::{
-    Backend, BackendCatalog, BackendConfig, BackendRef, BlobTimeoutConfig, NodeBackendEntry,
-    NodeBackendsConfig, NodeRouting, NodeRoutingRule, ResolvedBackend, Status,
+    Backend, BackendCatalog, BackendConfig, BackendRef, BlobTimeoutConfig, CleanupStrategy,
+    NodeBackendEntry, NodeBackendsConfig, NodeRouting, NodeRoutingRule, ResolvedBackend, Status,
 };
 use opendal::Operator;
 use std::collections::{BTreeMap, HashMap};
@@ -19,6 +19,7 @@ pub struct NodeBackend {
     pub class: Option<String>,
     pub allow_tenants: bool,
     pub quota_bytes: Option<u64>,
+    pub cleanup: CleanupStrategy,
     pub status: Arc<RwLock<Status>>,
 }
 
@@ -29,6 +30,7 @@ impl NodeBackend {
             class,
             allow_tenants: true,
             quota_bytes: None,
+            cleanup: CleanupStrategy::node_default(),
             status: Arc::new(RwLock::new(Status::Unavailable)),
         }
     }
@@ -39,6 +41,7 @@ impl NodeBackend {
         Self {
             allow_tenants: entry.allow_tenants,
             quota_bytes: entry.quota_bytes,
+            cleanup: entry.cleanup,
             ..Self::new(entry.config.clone(), entry.class.clone())
         }
     }
@@ -196,11 +199,12 @@ impl BackendRegistry {
         let catalog = self.node.iter().fold(
             BackendCatalog::new(self.default_name.clone()),
             |catalog, (name, backend)| {
-                if backend.allow_tenants {
+                let catalog = if backend.allow_tenants {
                     catalog.with_backend(name.clone(), backend.class.clone())
                 } else {
                     catalog.with_reserved(name.clone(), backend.class.clone())
-                }
+                };
+                catalog.with_cleanup(name, backend.cleanup)
             },
         );
         if self.serve_group_backends {

@@ -1,5 +1,5 @@
 use crate::errors::ConversionError;
-use crate::structs::{BackendRef, ResolvedBackend};
+use crate::structs::{BackendRef, CleanupStrategy, ResolvedBackend};
 use crate::types::{GroupId, UserId};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -164,6 +164,7 @@ impl NodeRoutingRule {
 struct CatalogEntry {
     class: Option<String>,
     allow_tenants: bool,
+    cleanup: CleanupStrategy,
 }
 
 /// The node's registered backends and the group's own backend ids, without any
@@ -192,9 +193,24 @@ impl BackendCatalog {
             CatalogEntry {
                 class,
                 allow_tenants: true,
+                cleanup: CleanupStrategy::node_default(),
             },
         );
         self
+    }
+
+    /// Records what the operator's file says about an already-added backend.
+    pub fn with_cleanup(mut self, name: &str, cleanup: CleanupStrategy) -> Self {
+        if let Some(entry) = self.backends.get_mut(name) {
+            entry.cleanup = cleanup;
+        }
+        self
+    }
+
+    /// The strategy a node backend's unreferenced bytes follow. An unknown name
+    /// answers `None`, which the sweep treats as retain.
+    pub fn cleanup_of(&self, name: &str) -> Option<CleanupStrategy> {
+        self.backends.get(name).map(|entry| entry.cleanup)
     }
 
     /// A backend whose class is reserved for operator rules and the node
@@ -205,6 +221,7 @@ impl BackendCatalog {
             CatalogEntry {
                 class,
                 allow_tenants: false,
+                cleanup: CleanupStrategy::node_default(),
             },
         );
         self

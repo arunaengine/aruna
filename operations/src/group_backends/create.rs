@@ -5,7 +5,9 @@ use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::GROUP_STORAGE_BACKEND_SECRET_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{GroupBackendKind, GroupStorageBackend, GroupStorageBackendSecret};
+use aruna_core::structs::{
+    CleanupStrategy, GroupBackendKind, GroupStorageBackend, GroupStorageBackendSecret,
+};
 use aruna_core::types::{Effects, GroupId, UserId};
 use smallvec::smallvec;
 use std::collections::HashMap;
@@ -21,6 +23,7 @@ pub struct CreateGroupBackendInput {
     pub kind: GroupBackendKind,
     pub public_config: HashMap<String, String>,
     pub secret_config: HashMap<String, String>,
+    pub cleanup: CleanupStrategy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -107,6 +110,7 @@ impl CreateGroupBackendOperation {
             updated_at: now,
             created_by: self.input.created_by,
             disabled: false,
+            cleanup: self.input.cleanup,
         };
         let secret = GroupStorageBackendSecret {
             backend_id,
@@ -224,7 +228,7 @@ mod tests {
         GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
     };
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{GroupBackendKind, GroupStorageBackend};
+    use aruna_core::structs::{CleanupStrategy, GroupBackendKind, GroupStorageBackend};
     use std::collections::HashMap;
     use ulid::Ulid;
 
@@ -242,6 +246,7 @@ mod tests {
                 ("access_key_id".to_string(), "id".to_string()),
                 ("secret_access_key".to_string(), "key".to_string()),
             ]),
+            cleanup: CleanupStrategy::Retain,
         }
     }
 

@@ -97,6 +97,7 @@ impl ReplaceGroupBackendOperation {
             updated_at: now,
             created_by: existing.created_by,
             disabled: existing.disabled,
+            cleanup: self.input.cleanup,
         };
         let secret = GroupStorageBackendSecret {
             backend_id: self.backend_id,
@@ -299,7 +300,7 @@ mod tests {
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{GroupBackendKind, GroupStorageBackend};
+    use aruna_core::structs::{CleanupStrategy, GroupBackendKind, GroupStorageBackend};
     use aruna_core::types::{Effects, TxnId};
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime};
@@ -319,6 +320,7 @@ mod tests {
                 ("access_key_id".to_string(), "new-id".to_string()),
                 ("secret_access_key".to_string(), "new-key".to_string()),
             ]),
+            cleanup: CleanupStrategy::Retain,
         }
     }
 
@@ -336,6 +338,7 @@ mod tests {
             updated_at: SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::default(),
             disabled: false,
+            cleanup: CleanupStrategy::Retain,
         }
     }
 

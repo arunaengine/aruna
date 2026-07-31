@@ -1,6 +1,7 @@
 mod backends;
 mod blob;
 pub mod checksum;
+mod cleanup;
 mod group;
 mod group_backend;
 mod info;
@@ -24,6 +25,7 @@ mod usage;
 
 pub use backends::*;
 pub use blob::*;
+pub use cleanup::*;
 pub use group::*;
 pub use group_backend::*;
 pub use info::*;

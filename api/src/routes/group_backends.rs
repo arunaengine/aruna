@@ -2,7 +2,7 @@ use crate::auth::{parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage_routing::ensure_group_admin;
 use crate::server_state::ServerState;
-use aruna_core::structs::{AuthContext, GroupBackendKind, GroupStorageBackend};
+use aruna_core::structs::{AuthContext, CleanupStrategy, GroupBackendKind, GroupStorageBackend};
 use aruna_operations::driver::drive;
 use aruna_operations::group_backends::create::{
     CreateGroupBackendError, CreateGroupBackendInput, CreateGroupBackendOperation,
@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 
@@ -68,6 +69,55 @@ pub struct CreateGroupBackendRequest {
     /// Credentials. Stored separately and never returned.
     #[serde(default)]
     pub secret_config: HashMap<String, String>,
+    /// Omitted means `retain`: tenant storage is never reclaimed by default.
+    #[serde(default)]
+    pub cleanup: Option<CleanupPolicy>,
+}
+
+/// Wire form of the cleanup strategy. Durations cross the API as seconds so no
+/// client has to parse a duration syntax.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct CleanupPolicy {
+    /// `retain` or `reclaim`.
+    pub mode: String,
+    /// Grace before an unreferenced copy is deleted. Reclaim only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_secs: Option<u64>,
+}
+
+impl CleanupPolicy {
+    fn resolve(policy: Option<Self>) -> ServerResult<CleanupStrategy> {
+        let Some(policy) = policy else {
+            return Ok(CleanupStrategy::Retain);
+        };
+        match (policy.mode.as_str(), policy.after_secs) {
+            ("retain", None) => Ok(CleanupStrategy::Retain),
+            ("reclaim", None) => Ok(CleanupStrategy::Reclaim {
+                after: CleanupStrategy::DEFAULT_RECLAIM_AFTER,
+            }),
+            ("reclaim", Some(after)) if after > 0 => Ok(CleanupStrategy::Reclaim {
+                after: Duration::from_secs(after),
+            }),
+            _ => Err(ServerError::BadRequestMessage(
+                "cleanup must be `retain`, or `reclaim` with a positive after_secs".to_string(),
+            )),
+        }
+    }
+}
+
+impl From<CleanupStrategy> for CleanupPolicy {
+    fn from(value: CleanupStrategy) -> Self {
+        match value {
+            CleanupStrategy::Retain => Self {
+                mode: "retain".to_string(),
+                after_secs: None,
+            },
+            CleanupStrategy::Reclaim { after } => Self {
+                mode: "reclaim".to_string(),
+                after_secs: Some(after.as_secs()),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -79,6 +129,7 @@ pub struct GroupBackendResponse {
     pub public_config: HashMap<String, String>,
     /// Writes are refused while this is set; reads keep working.
     pub disabled: bool,
+    pub cleanup: CleanupPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -95,6 +146,7 @@ impl From<GroupStorageBackend> for GroupBackendResponse {
             kind: value.kind.to_string(),
             public_config: value.public_config,
             disabled: value.disabled,
+            cleanup: value.cleanup.into(),
         }
     }
 }
@@ -146,6 +198,7 @@ pub async fn create_group_backend(
     let (group_id, auth) = admin_of_group(&state, auth, &group_id).await?;
     let kind = GroupBackendKind::from_str(&request.kind)
         .map_err(|error| ServerError::BadRequestMessage(error.to_string()))?;
+    let cleanup = CleanupPolicy::resolve(request.cleanup)?;
 
     let record = drive(
         CreateGroupBackendOperation::new(CreateGroupBackendInput {
@@ -155,6 +208,7 @@ pub async fn create_group_backend(
             kind,
             public_config: request.public_config,
             secret_config: request.secret_config,
+            cleanup,
         }),
         &state.get_ctx(),
     )
@@ -257,6 +311,7 @@ pub async fn replace_group_backend(
     let backend_id = Ulid::from_str(&backend_id).map_err(|_| ServerError::BadRequest)?;
     let kind = GroupBackendKind::from_str(&request.kind)
         .map_err(|error| ServerError::BadRequestMessage(error.to_string()))?;
+    let cleanup = CleanupPolicy::resolve(request.cleanup)?;
 
     let record = drive(
         ReplaceGroupBackendOperation::new(
@@ -268,6 +323,7 @@ pub async fn replace_group_backend(
                 kind,
                 public_config: request.public_config,
                 secret_config: request.secret_config,
+                cleanup,
             },
         ),
         &state.get_ctx(),
@@ -354,8 +410,8 @@ async fn set_disabled(
 #[cfg(test)]
 mod tests {
     use super::{
-        CreateGroupBackendRequest, create_group_backend, delete_group_backend,
-        enable_group_backend, list_group_backends,
+        CleanupPolicy, CleanupStrategy, CreateGroupBackendRequest, create_group_backend,
+        delete_group_backend, enable_group_backend, list_group_backends,
     };
     use crate::error::ServerError;
     use crate::routes::storage_routing::tests::setup_state;
@@ -406,11 +462,48 @@ mod tests {
                 .get("/groups/{group_id}/storage-backends/{backend_id}/enable")
                 .is_some()
         );
-        assert!(
-            openapi["components"]["schemas"]["GroupBackendResponse"]["properties"]
-                .get("disabled")
-                .is_some()
+        for field in ["disabled", "cleanup"] {
+            assert!(
+                openapi["components"]["schemas"]["GroupBackendResponse"]["properties"]
+                    .get(field)
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_policy_round_trips() {
+        // Omitted means retain, and a reclaim without a grace takes the default.
+        assert_eq!(
+            CleanupPolicy::resolve(None).unwrap(),
+            CleanupStrategy::Retain
         );
+        assert_eq!(
+            CleanupPolicy::resolve(Some(CleanupPolicy {
+                mode: "reclaim".to_string(),
+                after_secs: None,
+            }))
+            .unwrap(),
+            CleanupStrategy::Reclaim {
+                after: CleanupStrategy::DEFAULT_RECLAIM_AFTER
+            }
+        );
+        assert_eq!(
+            CleanupPolicy::from(CleanupStrategy::Reclaim {
+                after: std::time::Duration::from_secs(60)
+            })
+            .after_secs,
+            Some(60)
+        );
+        for bad in [("reclaim", Some(0)), ("retain", Some(60)), ("purge", None)] {
+            assert!(
+                CleanupPolicy::resolve(Some(CleanupPolicy {
+                    mode: bad.0.to_string(),
+                    after_secs: bad.1,
+                }))
+                .is_err()
+            );
+        }
     }
 
     #[tokio::test]
@@ -427,6 +520,7 @@ mod tests {
                 kind: "webdav".to_string(),
                 public_config: HashMap::new(),
                 secret_config: HashMap::new(),
+                cleanup: None,
             }),
         )
         .await;

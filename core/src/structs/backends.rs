@@ -1,12 +1,13 @@
 use crate::errors::ConversionError;
 use crate::structs::{
-    Backend, BackendConfig, BackendRef, BlobTimeoutConfig, NodeRoutingRule, RoutingTarget,
-    validate_node_rules, validate_storage_class,
+    Backend, BackendConfig, BackendRef, BlobTimeoutConfig, CleanupStrategy, NodeRoutingRule,
+    RoutingTarget, validate_node_rules, validate_storage_class,
 };
 use ipnet::IpNet;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
+use std::time::Duration;
 use ulid::Ulid;
 
 /// TOML schema of the node's backends file. Shared by the node and the doctor
@@ -32,10 +33,16 @@ pub struct BackendEntry {
     /// Whether tenant-authored rules may target this entry's class.
     #[serde(default = "tenants_allowed")]
     pub allow_tenants: bool,
-    /// Advisory operator allowance for user data on this backend. Recorded and
-    /// reported, never enforced: no write is rejected for exceeding it.
+    /// Operator allowance for user data on this backend. A write routed here
+    /// is refused once the backend's stored bytes reach it.
     #[serde(default)]
     pub quota_bytes: Option<u64>,
+    /// `reclaim` (the default) deletes unreferenced bytes after the grace,
+    /// `retain` keeps them. Archive and WORM tiers must set `retain`.
+    #[serde(default)]
+    pub cleanup: Option<String>,
+    #[serde(default)]
+    pub reclaim_after_secs: Option<u64>,
     #[serde(default)]
     pub default: bool,
     #[serde(default)]
@@ -108,6 +115,7 @@ pub struct NodeBackendEntry {
     pub class: Option<String>,
     pub allow_tenants: bool,
     pub quota_bytes: Option<u64>,
+    pub cleanup: CleanupStrategy,
 }
 
 /// The whole storage configuration of one node.
@@ -130,6 +138,7 @@ impl NodeBackendsConfig {
                 class: None,
                 allow_tenants: true,
                 quota_bytes: None,
+                cleanup: CleanupStrategy::node_default(),
             }],
             default_name: BackendRef::DEFAULT_NODE_NAME.to_string(),
             rules: Vec::new(),
@@ -210,6 +219,7 @@ impl BackendsFile {
                 class: entry.class.clone(),
                 allow_tenants: entry.allow_tenants,
                 quota_bytes: entry.quota_bytes,
+                cleanup: entry.cleanup_strategy(name)?,
             });
         }
 
@@ -242,6 +252,32 @@ impl BackendsFile {
 }
 
 impl BackendEntry {
+    /// Node backends reclaim by default; a grace of zero is refused because it
+    /// would race in-flight reads and re-uploads.
+    fn cleanup_strategy(&self, name: &str) -> Result<CleanupStrategy, ConversionError> {
+        let invalid = |message: String| ConversionError::FromStrError(message);
+        match (
+            self.cleanup.as_deref().map(str::trim).unwrap_or("reclaim"),
+            self.reclaim_after_secs,
+        ) {
+            ("retain", None) => Ok(CleanupStrategy::Retain),
+            ("retain", Some(_)) => Err(invalid(format!(
+                "backend `{name}` sets reclaim_after_secs with cleanup = \"retain\""
+            ))),
+            ("reclaim", Some(0)) => Err(invalid(format!(
+                "backend `{name}` sets reclaim_after_secs = 0; a grace period is required"
+            ))),
+            ("reclaim", after) => Ok(CleanupStrategy::Reclaim {
+                after: after
+                    .map(Duration::from_secs)
+                    .unwrap_or(CleanupStrategy::DEFAULT_RECLAIM_AFTER),
+            }),
+            (other, _) => Err(invalid(format!(
+                "backend `{name}` sets unknown cleanup `{other}`; use \"retain\" or \"reclaim\""
+            ))),
+        }
+    }
+
     pub fn to_config(
         &self,
         credentials: Option<(String, String)>,
@@ -342,7 +378,7 @@ impl RoutingEntry {
 #[cfg(test)]
 mod tests {
     use super::BackendsFile;
-    use crate::structs::{BackendRef, BlobTimeoutConfig, RoutingTarget};
+    use crate::structs::{BackendRef, BlobTimeoutConfig, CleanupStrategy, RoutingTarget};
 
     const FILE: &str = r#"
 [backend.default]
@@ -616,6 +652,82 @@ default = true
                 .to_string();
 
             assert!(error.contains("root"), "{error}");
+        }
+    }
+
+    #[test]
+    fn resolves_cleanup_modes() {
+        // Node backends reclaim unless the operator says otherwise.
+        let file = BackendsFile::parse(
+            r#"
+[backend.a]
+type = "filesystem"
+root = "/data"
+multipart_bucket = "parts"
+default = true
+
+[backend.tape]
+type = "filesystem"
+root = "/tape"
+multipart_bucket = "tape-parts"
+cleanup = "retain"
+
+[backend.warm]
+type = "filesystem"
+root = "/warm"
+multipart_bucket = "warm-parts"
+cleanup = "reclaim"
+reclaim_after_secs = 60
+"#,
+        )
+        .unwrap();
+
+        let config = file
+            .resolve(&secrets, BlobTimeoutConfig::default())
+            .unwrap();
+        let strategy = |name: &str| {
+            config
+                .backends
+                .iter()
+                .find(|entry| entry.name == name)
+                .map(|entry| entry.cleanup)
+                .unwrap()
+        };
+
+        assert_eq!(strategy("a"), CleanupStrategy::node_default());
+        assert_eq!(strategy("tape"), CleanupStrategy::Retain);
+        assert_eq!(
+            strategy("warm"),
+            CleanupStrategy::Reclaim {
+                after: std::time::Duration::from_secs(60)
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_bad_cleanup() {
+        for entry in [
+            "cleanup = \"purge\"",
+            "cleanup = \"retain\"\nreclaim_after_secs = 60",
+            "reclaim_after_secs = 0",
+        ] {
+            let file = BackendsFile::parse(&format!(
+                r#"
+[backend.a]
+type = "filesystem"
+root = "/data"
+multipart_bucket = "parts"
+default = true
+{entry}
+"#
+            ))
+            .unwrap();
+
+            assert!(
+                file.resolve(&secrets, BlobTimeoutConfig::default())
+                    .is_err(),
+                "{entry}"
+            );
         }
     }
 

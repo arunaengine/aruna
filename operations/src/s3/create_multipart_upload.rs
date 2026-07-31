@@ -387,6 +387,7 @@ mod tests {
             updated_at: std::time::SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::default(),
             disabled: true,
+            cleanup: aruna_core::structs::CleanupStrategy::Retain,
         }
     }
 

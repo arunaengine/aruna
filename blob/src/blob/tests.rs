@@ -1952,6 +1952,7 @@ async fn write_group_backend(context: &TestContext, backend_id: Ulid, paired: bo
         updated_at: SystemTime::UNIX_EPOCH,
         created_by: UserId::default(),
         disabled: false,
+        cleanup: aruna_core::structs::CleanupStrategy::Retain,
     };
     let mut writes = vec![(
         GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),

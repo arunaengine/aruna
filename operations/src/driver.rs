@@ -1120,6 +1120,7 @@ mod routing_tests {
             updated_at: SystemTime::UNIX_EPOCH,
             created_by: Default::default(),
             disabled: false,
+            cleanup: aruna_core::structs::CleanupStrategy::Retain,
         };
         for (key_space, key, value) in crate::group_backends::record_writes(&record).unwrap() {
             write(context, &key_space, key.to_vec(), value.to_vec()).await;

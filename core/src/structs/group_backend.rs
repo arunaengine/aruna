@@ -1,4 +1,5 @@
 use crate::errors::ConversionError;
+use crate::structs::CleanupStrategy;
 use crate::types::{GroupId, UserId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -71,6 +72,9 @@ pub struct GroupStorageBackend {
     /// backend and every write that reads this record in its own transaction
     /// refuses or conflicts.
     pub disabled: bool,
+    /// Tenant storage holds tenant data, so this defaults to `Retain`; the
+    /// tenant opts into reclaim and no operator setting overrides it.
+    pub cleanup: CleanupStrategy,
 }
 
 impl GroupStorageBackend {
@@ -115,6 +119,7 @@ impl GroupStorageBackendSecret {
 mod tests {
     use super::{GroupBackendKind, GroupStorageBackend, GroupStorageBackendSecret};
     use crate::UserId;
+    use crate::structs::CleanupStrategy;
     use crate::structs::RealmId;
     use std::collections::HashMap;
     use std::str::FromStr;
@@ -135,6 +140,7 @@ mod tests {
             updated_at: SystemTime::UNIX_EPOCH,
             created_by: UserId::local(Ulid::from_bytes([3u8; 16]), RealmId([4u8; 32])),
             disabled: false,
+            cleanup: CleanupStrategy::Retain,
         };
         let secret = GroupStorageBackendSecret {
             backend_id,

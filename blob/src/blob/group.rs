@@ -231,6 +231,7 @@ mod tests {
             updated_at: SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::default(),
             disabled: false,
+            cleanup: aruna_core::structs::CleanupStrategy::Retain,
         }
     }
 
