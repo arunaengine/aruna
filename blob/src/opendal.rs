@@ -600,6 +600,126 @@ mod tests {
         assert_eq!(listener.hits(), 0);
     }
 
+    /// Hosts `std` refuses to read as addresses and the parser opendal re-runs
+    /// turns into denied ones. `127.1` reaches the fixture listener, so a screen
+    /// that missed it would be observable as an accept.
+    const RESPELLINGS: [&str; 6] = [
+        "2852039166",
+        "0xa9fea9fe",
+        "169.254.169.254.",
+        "127.1",
+        "2851995650",
+        "0251.0376.0251.0376",
+    ];
+
+    fn assert_denied(error: opendal::Error, label: &str) {
+        assert_eq!(
+            error.kind(),
+            opendal::ErrorKind::PermissionDenied,
+            "{label}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_respelled_hosts() {
+        // Both tenant surfaces, every spelling, no socket opened.
+        let listener = CountingListener::bind().await;
+        let guard = EgressGuard::new(EgressPolicy::strict()).unwrap();
+        let port = listener.endpoint.rsplit(':').next().unwrap().to_string();
+
+        for host in RESPELLINGS {
+            let endpoint = format!("http://{host}:{port}");
+            for kind in [
+                SourceConnectorKind::Http,
+                SourceConnectorKind::S3,
+                SourceConnectorKind::Webdav,
+            ] {
+                let mut config = HashMap::from([("endpoint".to_string(), endpoint.clone())]);
+                if kind == SourceConnectorKind::S3 {
+                    config.insert("bucket".to_string(), "reads".to_string());
+                    config.insert("region".to_string(), "eu-central-1".to_string());
+                    config.insert("access_key_id".to_string(), "AKIA".to_string());
+                    config.insert("secret_access_key".to_string(), "secret".to_string());
+                }
+                let access = ResolvedSourceAccess::OpenDal {
+                    kind,
+                    config,
+                    path: "file.txt".to_string(),
+                    version: None,
+                };
+
+                let (operator, path, ..) = build_source_operator(&guard, &access).await.unwrap();
+                assert_denied(
+                    operator.stat(path).await.unwrap_err(),
+                    &format!("{kind} {host}"),
+                );
+            }
+
+            let s3 = build_group_service(
+                GroupBackendKind::S3,
+                group_config(&[
+                    ("bucket", "data"),
+                    ("endpoint", &endpoint),
+                    ("region", "eu-central-1"),
+                    ("access_key_id", "AKIA"),
+                    ("secret_access_key", "secret"),
+                ]),
+                &guard,
+            )
+            .unwrap();
+            assert_denied(s3.stat("probe").await.unwrap_err(), &format!("s3 {host}"));
+
+            let azblob = build_group_service(
+                GroupBackendKind::Azblob,
+                group_config(&[
+                    ("container", "data"),
+                    ("endpoint", &endpoint),
+                    ("account_name", "acct"),
+                    ("account_key", "a2V5c2VjcmV0"),
+                ]),
+                &guard,
+            )
+            .unwrap();
+            assert_denied(
+                azblob.stat("probe").await.unwrap_err(),
+                &format!("azblob {host}"),
+            );
+        }
+
+        assert_eq!(listener.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn refuses_spliced_bucket() {
+        // Virtual-host style splices the bucket into the authority after the
+        // endpoint was parsed, so only the outgoing uri carries the real host.
+        let listener = CountingListener::bind().await;
+        let guard = EgressGuard::new(EgressPolicy::strict()).unwrap();
+        let port = listener.endpoint.rsplit(':').next().unwrap().to_string();
+
+        // Opendal refuses a dotted bucket here, so both spellings are decimal:
+        // the second normalizes onto the fixture listener and would accept.
+        for bucket in ["2852039166/", &format!("2130706433:{port}/")] {
+            let operator = build_group_service(
+                GroupBackendKind::S3,
+                group_config(&[
+                    ("bucket", bucket),
+                    ("endpoint", &listener.endpoint),
+                    ("region", "eu-central-1"),
+                    ("access_key_id", "AKIA"),
+                    ("secret_access_key", "secret"),
+                    ("force_path_style", "false"),
+                ]),
+                &guard,
+            )
+            .unwrap();
+
+            assert_denied(operator.stat("probe").await.unwrap_err(), bucket);
+        }
+
+        assert_eq!(listener.hits(), 0);
+    }
+
     #[tokio::test]
     async fn refuses_ftp_kind() {
         // A stored ftp record must never reach a socket: the passive data
