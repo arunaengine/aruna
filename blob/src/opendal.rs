@@ -272,12 +272,13 @@ where
     })
 }
 
-// reqsign resolves credentials lazily on the first request and on every retry,
-// so ambient AWS config and EC2 metadata lookups must be disabled in the config
-// itself. `force_path_style` is our key; opendal speaks `enable_virtual_host_style`.
+// reqsign resolves lazily on every request, so the switches live in the config.
+// These two are all opendal exposes; sso, web identity, process and ecs stay in
+// the chain, closed only by the static credential both surfaces require.
 fn s3_operator_config(mut config: HashMap<String, String>) -> HashMap<String, String> {
     config.insert("disable_config_load".to_string(), "true".to_string());
     config.insert("disable_ec2_metadata".to_string(), "true".to_string());
+    // `force_path_style` is our key; opendal speaks `enable_virtual_host_style`.
     let path_style = config
         .remove("force_path_style")
         .map(|value| value.trim().parse::<bool>().unwrap_or(true))
