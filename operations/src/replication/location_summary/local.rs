@@ -39,13 +39,14 @@ enum SummaryState {
     Error,
 }
 
-/// A local answer, plus the content hash that never goes on the wire. The hash
-/// is what lets the caller ask the durable holder index which other nodes store
-/// these bytes.
+/// A local answer, plus the content hash that never goes on the wire and the
+/// bucket record the answer was authorized against. The hash is what lets the
+/// caller ask the durable holder index which other nodes store these bytes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LocalSummary {
     pub summary: LocationSummary,
     pub blake3: Option<[u8; 32]>,
+    pub bucket: Option<BucketInfo>,
 }
 
 /// Answers "which copy does THIS node hold" for one version. One state machine
@@ -57,6 +58,7 @@ pub struct LocationSummaryOperation {
     peer: Option<NodeId>,
     local_node: Option<NodeId>,
     stream_id: Option<Ulid>,
+    bucket: Option<BucketInfo>,
     state: SummaryState,
     version_id: Option<Ulid>,
     blake3: Option<[u8; 32]>,
@@ -65,9 +67,10 @@ pub struct LocationSummaryOperation {
 }
 
 impl LocationSummaryOperation {
-    /// Local read: the caller has already authorized the request.
-    pub fn new_local(request: LocationSummaryRequest) -> Self {
-        Self::build(request, None, None, None)
+    /// Local read. The operation reads the bucket and checks READ itself, so
+    /// the answer and its authorization come from the same bucket record.
+    pub fn new_local(local_node: NodeId, request: LocationSummaryRequest) -> Self {
+        Self::build(request, None, Some(local_node), None)
     }
 
     pub fn new_incoming(
@@ -91,6 +94,7 @@ impl LocationSummaryOperation {
             peer,
             local_node,
             stream_id,
+            bucket: None,
             state: SummaryState::Init,
             version_id,
             blake3: None,
@@ -138,6 +142,7 @@ impl LocationSummaryOperation {
         LocalSummary {
             summary: self.summary.clone(),
             blake3: self.blake3,
+            bucket: self.bucket.clone(),
         }
     }
 
@@ -250,9 +255,11 @@ impl LocationSummaryOperation {
         let Some(local_node) = self.local_node else {
             return self.fail(LocationSummaryError::PeerDenied);
         };
+        let group_id = bucket.group_id;
+        self.bucket = Some(bucket);
         let path = blob_object_permission_path(
             self.request.realm_id,
-            bucket.group_id,
+            group_id,
             local_node,
             &self.request.bucket,
             &self.request.key,
@@ -389,7 +396,7 @@ impl Operation for LocationSummaryOperation {
     fn start(&mut self) -> Effects {
         match self.peer {
             Some(_) => self.read_realm(),
-            None => self.resolve_version(),
+            None => self.read_bucket(),
         }
     }
 
@@ -454,13 +461,13 @@ impl Operation for LocationSummaryOperation {
 
 #[cfg(test)]
 mod tests {
-    use super::LocationSummaryOperation;
+    use super::{LocationSummaryError, LocationSummaryOperation};
     use crate::replication::location_summary::fixtures::{node_id, realm_id, request};
     use crate::replication::protocol::LocationCopyStorage;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{BackendLocation, BackendRef, BlobVersion};
+    use aruna_core::structs::{BackendLocation, BackendRef, BlobVersion, BucketInfo};
     use aruna_core::types::UserId;
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -485,6 +492,28 @@ mod tests {
         }
     }
 
+    fn bucket_info() -> BucketInfo {
+        BucketInfo {
+            group_id: Ulid::from_bytes([8u8; 16]),
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: UserId::nil(realm_id()),
+            cors_configuration: None,
+            replication: None,
+            storage_routing: Vec::new(),
+        }
+    }
+
+    /// Answers the bucket read and the READ check every local answer starts with.
+    fn authorized(version_id: Option<Ulid>) -> LocationSummaryOperation {
+        let mut operation = LocationSummaryOperation::new_local(node_id(5), request(version_id));
+        operation.start();
+        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
+        operation.step(Event::SubOperation(
+            aruna_core::events::SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+        ));
+        operation
+    }
+
     fn read_result(value: Option<Vec<u8>>) -> Event {
         Event::Storage(StorageEvent::ReadResult {
             key: b"k".to_vec().into(),
@@ -505,8 +534,7 @@ mod tests {
     #[test]
     fn reports_copy_class() {
         let version_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = LocationSummaryOperation::new_local(request(Some(version_id)));
-        operation.start();
+        let mut operation = authorized(Some(version_id));
         operation.step(read_result(Some(materialized().to_bytes().unwrap())));
         operation.step(read_result(Some(
             location(BackendRef::node_default(), Some("cold".to_string()))
@@ -531,9 +559,7 @@ mod tests {
     fn names_group_backend() {
         // Tenant-owned storage is the durability signal, so id and name ship.
         let backend_id = Ulid::from_bytes([9u8; 16]);
-        let mut operation =
-            LocationSummaryOperation::new_local(request(Some(Ulid::from_bytes([3u8; 16]))));
-        operation.start();
+        let mut operation = authorized(Some(Ulid::from_bytes([3u8; 16])));
         operation.step(read_result(Some(materialized().to_bytes().unwrap())));
         operation.step(read_result(Some(
             location(BackendRef::Group(backend_id), None)
@@ -555,15 +581,39 @@ mod tests {
     #[test]
     fn unknown_version_empty() {
         // An unknown version is no copy anywhere, not a copy in an unknown state.
-        let mut operation =
-            LocationSummaryOperation::new_local(request(Some(Ulid::from_bytes([3u8; 16]))));
-        operation.start();
+        let mut operation = authorized(Some(Ulid::from_bytes([3u8; 16])));
         operation.step(read_result(None));
 
         let local = operation.finalize().unwrap();
         assert!(local.blake3.is_none());
         assert!(!local.summary.held);
         assert_eq!(local.summary.version_id, None);
+    }
+
+    #[test]
+    fn carries_bucket_record() {
+        // The caller must fan out from the record the answer was authorized on.
+        let mut operation = authorized(Some(Ulid::from_bytes([3u8; 16])));
+        operation.step(read_result(None));
+
+        assert_eq!(operation.finalize().unwrap().bucket, Some(bucket_info()));
+    }
+
+    #[test]
+    fn local_refuses_denied() {
+        // Without a stream there is no one to answer, so the read just fails.
+        let mut operation = LocationSummaryOperation::new_local(
+            node_id(5),
+            request(Some(Ulid::from_bytes([3u8; 16]))),
+        );
+        operation.start();
+        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
+
+        operation.step(Event::SubOperation(
+            aruna_core::events::SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
+        ));
+
+        assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
     }
 
     #[test]

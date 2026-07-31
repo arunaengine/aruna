@@ -330,41 +330,7 @@ pub async fn blob_locations(
         return Err(ServerError::Forbidden);
     }
     let ctx = state.get_ctx();
-    let bucket_info = match drive(
-        GetBucketInfoOperation::new(query.bucket.clone()),
-        ctx.as_ref(),
-    )
-    .await
-    {
-        Ok(Some(Ok(bucket_info))) => bucket_info,
-        Ok(Some(Err(GetBucketInfoError::NotFound))) | Err(GetBucketInfoError::NotFound) => {
-            return Err(ServerError::NotFound);
-        }
-        Ok(Some(Err(err))) | Err(err) => return Err(ServerError::InternalError(err.to_string())),
-        Ok(None) => return Err(ServerError::NotFound),
-    };
-
     let local_node = state.get_node_id();
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth.clone(),
-            path: blob_object_permission_path(
-                state.get_realm_id(),
-                bucket_info.group_id,
-                local_node,
-                &query.bucket,
-                &query.path,
-            ),
-            required_permission: Permission::READ,
-        }),
-        ctx.as_ref(),
-    )
-    .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
-    if !allowed {
-        return Err(ServerError::Forbidden);
-    }
-
     let version_id = query
         .version_id
         .as_deref()
@@ -379,15 +345,20 @@ pub async fn blob_locations(
         auth_context: auth,
     };
     let local = drive(
-        LocationSummaryOperation::new_local(request.clone()),
+        LocationSummaryOperation::new_local(local_node, request.clone()),
         ctx.as_ref(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|error| match error {
+        LocationSummaryError::Denied => ServerError::Forbidden,
+        LocationSummaryError::BucketNotFound => ServerError::NotFound,
+        other => ServerError::InternalError(other.to_string()),
+    })?;
     let Some(resolved) = local.summary.version_id else {
         return Err(ServerError::NotFound);
     };
     let blake3 = local.blake3;
+    let bucket_info = local.bucket;
 
     let mut copies = vec![copy_response(local_node, true, local.summary)];
     let mut limits = Vec::new();
@@ -395,8 +366,8 @@ pub async fn blob_locations(
     let mut expected: BTreeSet<NodeId> = BTreeSet::new();
     let mut capped = false;
     for target in bucket_info
-        .replication
         .iter()
+        .flat_map(|bucket| bucket.replication.iter())
         .flat_map(|config| config.targets.iter())
         .filter(|target| target.node_id != local_node)
     {
