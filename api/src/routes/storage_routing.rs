@@ -50,12 +50,15 @@ pub fn router() -> Router<Arc<ServerState>> {
         )
 }
 
-/// A rule target names either a group storage backend or a storage class.
-/// Operator backend names are rejected: tenants never bind node topology.
+/// A rule target names either a group storage backend or a storage class, and
+/// exactly one of the two fields must be set. Operator backend names are
+/// rejected: tenants never bind node topology.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct RoutingTargetRequest {
+    /// Set this or `class`, never both and never neither.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_id: Option<String>,
+    /// Set this or `backend_id`, never both and never neither.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<String>,
 }
@@ -335,6 +338,7 @@ pub async fn put_bucket_routing(
     params(("group_id" = String, Path, description = "Group id")),
     responses(
         (status = 200, description = "Group routing default", body = GroupRoutingResponse),
+        (status = 400, description = "Invalid group id", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse)
     ),

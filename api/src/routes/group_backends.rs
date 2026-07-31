@@ -247,6 +247,7 @@ pub async fn create_group_backend(
     params(("group_id" = String, Path, description = "Group id")),
     responses(
         (status = 200, description = "Registered backends", body = ListGroupBackendsResponse),
+        (status = 400, description = "Invalid group id", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse)
     ),
@@ -278,6 +279,7 @@ pub async fn list_group_backends(
     ),
     responses(
         (status = 200, description = "Registered backend", body = GroupBackendResponse),
+        (status = 400, description = "Invalid group or backend id", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Backend not found", body = ErrorResponse)
@@ -366,6 +368,7 @@ pub async fn replace_group_backend(
     ),
     responses(
         (status = 204, description = "Backend disabled"),
+        (status = 400, description = "Invalid group or backend id", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Backend not found", body = ErrorResponse)
@@ -392,6 +395,7 @@ pub async fn delete_group_backend(
     ),
     responses(
         (status = 200, description = "Backend enabled", body = GroupBackendResponse),
+        (status = 400, description = "Invalid group or backend id", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Backend not found", body = ErrorResponse)
@@ -418,6 +422,7 @@ pub async fn enable_group_backend(
     ),
     responses(
         (status = 200, description = "Reclaim queue depth", body = ReclaimStatusResponse),
+        (status = 400, description = "Invalid group or backend id", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Backend not found", body = ErrorResponse)
