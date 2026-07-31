@@ -34,13 +34,9 @@ use crate::usage_stats::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
 pub const RECLAIM_SWEEP_AFTER: Duration = Duration::from_secs(15 * 60);
 pub const RECLAIM_SWEEP_RETRY: Duration = Duration::from_secs(60);
 const RECLAIM_PAGE_SIZE: usize = 128;
-
-pub fn schedule_blob_reclaim_effect() -> Effect {
-    Effect::Task(TaskEffect::ShortenTimer {
-        key: TaskKey::DrainBlobReclaimQueue,
-        after: Duration::ZERO,
-    })
-}
+/// Candidates one tick may drive. A longer queue is picked up at
+/// `RECLAIM_SWEEP_RETRY` rather than held against the task loop.
+const RECLAIM_TICK_LIMIT: usize = 1024;
 
 pub async fn restore_reclaim_sweep(storage: &StorageHandle, task_handle: &TaskHandle) {
     let effect = TaskEffect::ShortenTimer {
@@ -79,6 +75,8 @@ pub struct ReclaimOutcome {
     pub dropped: usize,
     pub not_due: usize,
     pub failed: usize,
+    /// The tick stopped at its work cap with candidates still queued.
+    pub capped: bool,
 }
 
 /// Pages the whole queue so a candidate that keeps conflicting cannot starve
@@ -92,6 +90,7 @@ async fn sweep_at(context: &DriverContext, now: SystemTime) -> Result<ReclaimOut
     let mut records: HashMap<Ulid, Option<GroupStorageBackend>> = HashMap::new();
     let mut outcome = ReclaimOutcome::default();
     let mut start_after = None;
+    let mut driven = 0usize;
 
     loop {
         let (values, next) = iter_prefix_page(
@@ -146,13 +145,18 @@ async fn sweep_at(context: &DriverContext, now: SystemTime) -> Result<ReclaimOut
                     outcome.failed = outcome.failed.saturating_add(1);
                 }
             }
+            driven = driven.saturating_add(1);
+            if driven >= RECLAIM_TICK_LIMIT {
+                outcome.capped = true;
+                break;
+            }
         }
 
         delete_candidates(context, stale).await?;
 
         match next {
-            Some(next) => start_after = Some(next),
-            None => break,
+            Some(next) if !outcome.capped => start_after = Some(next),
+            _ => break,
         }
     }
 
@@ -163,6 +167,7 @@ async fn sweep_at(context: &DriverContext, now: SystemTime) -> Result<ReclaimOut
         dropped = outcome.dropped,
         not_due = outcome.not_due,
         failed = outcome.failed,
+        capped = outcome.capped,
         "Blob reclaim sweep finished"
     );
     Ok(outcome)
@@ -1068,6 +1073,37 @@ mod tests {
 
         assert_eq!(outcome.freed, 1);
         assert_eq!(outcome.freed_bytes, 10);
+    }
+
+    #[tokio::test]
+    async fn sweep_caps_tick() {
+        // A long queue must hand the task loop back instead of draining in one
+        // tick; the rows left over are picked up by the retry sweep.
+        let dir = tempdir().unwrap();
+        let context = context(dir.path().to_str().unwrap());
+        for index in 0..=RECLAIM_TICK_LIMIT {
+            let mut blake3 = [0u8; 32];
+            blake3[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            write(
+                &context,
+                BLOB_RECLAIM_KEYSPACE,
+                ReclaimCandidateKey::new(BackendRef::node_default(), blake3).to_bytes(),
+                ReclaimCandidate {
+                    enqueued_at: SystemTime::UNIX_EPOCH,
+                }
+                .to_bytes()
+                .unwrap(),
+            )
+            .await;
+        }
+        let due = SystemTime::UNIX_EPOCH
+            + CleanupStrategy::DEFAULT_RECLAIM_AFTER
+            + Duration::from_secs(1);
+
+        let outcome = sweep_at(&context, due).await.unwrap();
+
+        assert!(outcome.capped);
+        assert_eq!(outcome.dropped, RECLAIM_TICK_LIMIT);
     }
 
     #[test]

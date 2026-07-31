@@ -2,7 +2,6 @@ use crate::blob::blob_keyspace_helper::{
     HeadAliasContext, blob_location_read, build_head_transition_effects,
     delete_blob_version_effect, delete_hash_path_index_effect, write_blob_version_effect,
 };
-use crate::blob::reclaim::schedule_blob_reclaim_effect;
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::usage_stats::{
     UsageCounterUpdate, UsageUpdateError, schedule_usage_snapshot_publish_effect,
@@ -784,12 +783,8 @@ impl DeleteObjectOperation {
                     version_id,
                     delete_marker,
                 }));
-                if self.target_location.is_some() {
-                    return smallvec![
-                        schedule_usage_snapshot_publish_effect(),
-                        schedule_blob_reclaim_effect(),
-                    ];
-                }
+                // No reclaim nudge: the shortest grace is hours, so an
+                // immediate sweep could never find this candidate due.
                 return smallvec![schedule_usage_snapshot_publish_effect()];
             }
             return self.emit_error(DeleteObjectError::InvalidOperationState);

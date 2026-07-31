@@ -1775,15 +1775,17 @@ impl OperationsTaskHandler {
     }
 
     async fn drain_blob_reclaim(&self) {
-        let after = match process_reclaim_batch(&self.context).await {
-            Ok(outcome) if outcome.failed > 0 => RECLAIM_SWEEP_RETRY,
-            Ok(_) => RECLAIM_SWEEP_AFTER,
+        let (after, drained) = match process_reclaim_batch(&self.context).await {
+            Ok(outcome) if outcome.capped || outcome.failed > 0 => (RECLAIM_SWEEP_RETRY, false),
+            Ok(_) => (RECLAIM_SWEEP_AFTER, true),
             Err(error) => {
                 warn!(task_id = ?TaskKey::DrainBlobReclaimQueue, error = %error, "Failed to drain blob reclaim");
-                RECLAIM_SWEEP_RETRY
+                (RECLAIM_SWEEP_RETRY, false)
             }
         };
-        if let Err(error) = remove_drained_backends(&self.context).await {
+        // Removal walks whole keyspaces too, so it only rides a sweep that
+        // finished its queue, never the fast retries behind a backlog.
+        if drained && let Err(error) = remove_drained_backends(&self.context).await {
             warn!(error = %error, "Failed to remove drained storage backends");
         }
         self.reschedule_timer(TaskKey::DrainBlobReclaimQueue, after)
