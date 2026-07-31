@@ -21,21 +21,23 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE,
-    S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+    S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     BucketInfo, CurrentVersionPointer, GroupRoutingInputs, MultipartObjectMetadataKey, NodeRouting,
-    Permission, RealmConfigDocument, RealmId, ReplicationItemKind, ReplicationNegotiationResult,
-    ResolvedBackend, RoCrateLimits, RoutingError, StorageRoutingRule, UsageDelta, VersionKey,
-    blob_bucket_permission_path, blob_object_permission_path, resolve_backend,
+    Permission, RealmConfigDocument, RealmId, ReclaimCandidate, ReclaimCandidateKey,
+    ReplicationItemKind, ReplicationNegotiationResult, ResolvedBackend, RoCrateLimits,
+    RoutingError, StorageRoutingRule, UsageDelta, VersionKey, blob_bucket_permission_path,
+    blob_object_permission_path, resolve_backend,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, NodeId};
 use smallvec::smallvec;
 use std::collections::VecDeque;
+use std::time::SystemTime;
 use thiserror::Error;
 use tracing::{debug, warn};
 use ulid::Ulid;
@@ -61,6 +63,7 @@ enum IncomingVersionReplicationState {
     VerifyReplaced,
     ReadReplacedMetadata,
     DeleteReplacedMetadata,
+    WriteReclaimCandidate,
     FenceBackend,
     VerifyExistingBlob,
     WriteBlobLocation,
@@ -262,6 +265,7 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::VerifyReplaced => "VerifyReplaced",
             IncomingVersionReplicationState::ReadReplacedMetadata => "ReadReplacedMetadata",
             IncomingVersionReplicationState::DeleteReplacedMetadata => "DeleteReplacedMetadata",
+            IncomingVersionReplicationState::WriteReclaimCandidate => "WriteReclaimCandidate",
             IncomingVersionReplicationState::FenceBackend => "FenceBackend",
             IncomingVersionReplicationState::VerifyExistingBlob => "VerifyExistingBlob",
             IncomingVersionReplicationState::WriteBlobLocation => "WriteBlobLocation",
@@ -754,6 +758,36 @@ impl IncomingVersionReplicationOperation {
         self.state = IncomingVersionReplicationState::DeleteReplacedMetadata;
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
             deletes,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    /// The copy the replaced version named, once the replacement stops naming
+    /// it. Nothing else drops that reference, so without this the bytes stay
+    /// charged to the backend forever.
+    fn replaced_reclaim_key(&self) -> Option<ReclaimCandidateKey> {
+        let replaced = self.replaced_version.as_ref()?.location_key()?;
+        let replacement = self.effective_materialized_location().ok().and_then(|it| {
+            let hash: [u8; 32] = it.get_blake3()?.try_into().ok()?;
+            Some(BlobLocationKey::new(hash, it.backend))
+        });
+        (replacement.as_ref() != Some(&replaced))
+            .then(|| ReclaimCandidateKey::new(replaced.backend, replaced.blake3_hash))
+    }
+
+    fn write_replaced_candidate(&mut self, key: ReclaimCandidateKey) -> Effects {
+        let candidate = ReclaimCandidate {
+            enqueued_at: SystemTime::now(),
+        };
+        let value = match candidate.to_bytes() {
+            Ok(value) => value,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.state = IncomingVersionReplicationState::WriteReclaimCandidate;
+        smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: BLOB_RECLAIM_KEYSPACE.to_string(),
+            key: key.to_bytes().into(),
+            value: value.into(),
             txn_id: self.txn_id,
         })]
     }
@@ -1810,6 +1844,22 @@ impl Operation for IncomingVersionReplicationOperation {
                         received: event,
                     });
                 };
+                match self.replaced_reclaim_key() {
+                    Some(key) => self.write_replaced_candidate(key),
+                    None => {
+                        self.replaced_version = None;
+                        self.write_hash_lookup_or_continue()
+                    }
+                }
+            }
+            IncomingVersionReplicationState::WriteReclaimCandidate => {
+                let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::WriteResult)",
+                        received: event,
+                    });
+                };
                 self.replaced_version = None;
                 self.write_hash_lookup_or_continue()
             }
@@ -2165,16 +2215,17 @@ mod tests {
     use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-        BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE,
-        S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+        BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+        S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
         AuthContext, BackendLocation, BackendRef, BlobLocationKey, BlobVersion, BlobVersionState,
         BucketInfo, CurrentVersionPointer, GroupRoutingInputs, HashPathIndexKey,
         MultipartObjectMetadataKey, NodeRouting, QuotaConfig, RealmConfigDocument, RealmId,
-        ReplicationItemKind, ReplicationNegotiationResult, RoutingTarget, SourceConnectorKind,
-        SourceMetadata, StagingStrategy, StorageRoutingRule, VersionSourceBinding,
+        ReclaimCandidateKey, ReplicationItemKind, ReplicationNegotiationResult, RoutingTarget,
+        SourceConnectorKind, SourceMetadata, StagingStrategy, StorageRoutingRule,
+        VersionSourceBinding,
     };
     use std::collections::{BTreeSet, HashMap};
     use std::time::SystemTime;
@@ -2619,12 +2670,62 @@ mod tests {
         let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
             entries: deletes,
         }));
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::WriteReclaimCandidate
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Write { key_space, .. })]
+                if key_space == BLOB_RECLAIM_KEYSPACE
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: vec![0u8; 4].into(),
+        }));
         assert_eq!(op.state, IncomingVersionReplicationState::ReadObjectLookup);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Read { key_space, .. })]
                 if key_space == BLOB_HEAD_KEYSPACE
         ));
+    }
+
+    #[test]
+    fn replacement_queues_reclaim() {
+        // The copy a replaced materialized version named is unreferenced once
+        // the replacement names a different one, and only this enqueue frees it.
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            make_manifest(ReplicationItemKind::Materialized),
+        );
+        op.txn_id = Some(Ulid::generate());
+        op.replaced_version = Some(BlobVersion::materialized(
+            [9u8; 32],
+            BackendRef::node_default(),
+            SystemTime::now(),
+            test_user_id(),
+            None,
+        ));
+
+        assert_eq!(
+            op.replaced_reclaim_key(),
+            Some(ReclaimCandidateKey::new(
+                BackendRef::node_default(),
+                [9u8; 32]
+            ))
+        );
+
+        // The replacement adopting the very same copy must not queue it.
+        let mut adopted = make_location();
+        adopted.backend = BackendRef::node_default();
+        adopted
+            .hashes
+            .insert("blake3".to_string(), [9u8; 32].to_vec());
+        op.received_blob_location = Some(adopted);
+        assert_eq!(op.replaced_reclaim_key(), None);
     }
 
     #[test]
