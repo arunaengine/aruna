@@ -10,12 +10,14 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState,
-    CurrentVersionPointer, MultipartObjectMetadataKey, RealmId, UsageDelta, VersionKey,
+    AuthContext, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
+    CurrentVersionPointer, MultipartObjectMetadataKey, RealmId, ReclaimCandidate,
+    ReclaimCandidateKey, UsageDelta, VersionKey,
 };
 use aruna_core::types::{Effects, GroupId, Key, NodeId, UserId};
 use smallvec::smallvec;
@@ -39,6 +41,7 @@ pub enum DeleteObjectState {
     DeleteMultipartSummary,
     ReadMultipartParts,
     DeleteMultipartPart,
+    WriteReclaimCandidate,
     WriteBlobVersion,
     WriteLiveReplicationObligation,
     UpdateUsage,
@@ -138,6 +141,7 @@ pub struct DeleteObjectOperation {
     multipart_part_keys: Vec<Key>,
     multipart_delete_index: usize,
     target_size: Option<u64>,
+    target_location: Option<BlobLocationKey>,
     live_before_marker: bool,
     usage_update: Option<UsageCounterUpdate>,
     output: Option<Result<DeleteObjectResult, DeleteObjectError>>,
@@ -162,6 +166,7 @@ impl DeleteObjectOperation {
             multipart_part_keys: Vec::new(),
             multipart_delete_index: 0,
             target_size: None,
+            target_location: None,
             live_before_marker: false,
             usage_update: None,
             output: None,
@@ -277,6 +282,7 @@ impl DeleteObjectOperation {
         let summary = VersionSummary::from_blob_version(version_id, &version);
         self.target_size = summary.logical_size;
         self.target_version = Some(summary);
+        self.target_location = location_key.clone();
 
         if let Some(key) = location_key {
             self.state = DeleteObjectState::ReadTargetLocation;
@@ -564,6 +570,38 @@ impl DeleteObjectOperation {
         self.delete_next_multipart_part()
     }
 
+    /// Queues the copy the deleted version named. Blind and idempotent: two
+    /// aliases of one hash just refresh the row, and the sweep owns the recount.
+    fn write_reclaim_candidate(&mut self) -> Effects {
+        let Some(location) = self.target_location.clone() else {
+            return self.start_usage_update();
+        };
+        let candidate = ReclaimCandidate {
+            enqueued_at: SystemTime::now(),
+        };
+        let value = match candidate.to_bytes() {
+            Ok(value) => value,
+            Err(err) => return self.emit_error(err.into()),
+        };
+        self.state = DeleteObjectState::WriteReclaimCandidate;
+        smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: BLOB_RECLAIM_KEYSPACE.to_string(),
+            key: ReclaimCandidateKey::new(location.backend, location.blake3_hash)
+                .to_bytes()
+                .into(),
+            value: value.into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn handle_candidate_written(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+
+        self.start_usage_update()
+    }
+
     fn usage_delta(&self) -> UsageDelta {
         if let Some(target) = self.target_version.as_ref() {
             let pointed_at_target = self
@@ -634,7 +672,7 @@ impl DeleteObjectOperation {
             .get(self.multipart_delete_index)
             .cloned()
         else {
-            return self.start_usage_update();
+            return self.write_reclaim_candidate();
         };
 
         self.state = DeleteObjectState::DeleteMultipartPart;
@@ -789,6 +827,7 @@ impl Operation for DeleteObjectOperation {
             }
             DeleteObjectState::ReadMultipartParts => self.handle_multipart_parts_read(event),
             DeleteObjectState::DeleteMultipartPart => self.handle_multipart_part_deleted(event),
+            DeleteObjectState::WriteReclaimCandidate => self.handle_candidate_written(event),
             DeleteObjectState::WriteBlobVersion => self.handle_blob_version_written(event),
             DeleteObjectState::WriteLiveReplicationObligation => {
                 self.handle_live_replication_obligation_written(event)
@@ -909,6 +948,62 @@ mod test {
 
         assert_eq!(summary.logical_size, Some(1_000_000));
         assert!(summary.referenced);
+    }
+
+    fn candidate_op(location: Option<BlobLocationKey>) -> DeleteObjectOperation {
+        let mut op = DeleteObjectOperation::new(DeleteObjectInput {
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            version_id: Some(Ulid::from_bytes([2u8; 16])),
+            group_id: Ulid::from_bytes([1u8; 16]),
+            realm_id: RealmId::from_bytes([1u8; 32]),
+            node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
+            deleted_by: test_user_id(),
+        });
+        op.txn_id = Some(Ulid::from_bytes([7u8; 16]));
+        op.target_location = location;
+        op
+    }
+
+    #[test]
+    fn queues_deleted_copy() {
+        // The candidate rides the delete transaction, keyed backend first.
+        let key = BlobLocationKey::new([4u8; 32], aruna_core::structs::BackendRef::node_default());
+        let mut op = candidate_op(Some(key.clone()));
+
+        let effects = op.write_reclaim_candidate();
+
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space,
+                key: written,
+                txn_id,
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected candidate write, got {effects:?}")
+        };
+        assert_eq!(key_space, BLOB_RECLAIM_KEYSPACE);
+        assert_eq!(*txn_id, op.txn_id);
+        assert_eq!(
+            written.as_ref(),
+            ReclaimCandidateKey::new(key.backend, key.blake3_hash)
+                .to_bytes()
+                .as_slice()
+        );
+    }
+
+    #[test]
+    fn marker_queues_nothing() {
+        let mut op = candidate_op(None);
+
+        let effects = op.write_reclaim_candidate();
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+        ));
     }
 
     async fn read_value(
