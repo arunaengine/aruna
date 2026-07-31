@@ -59,6 +59,8 @@ pub enum LocationSummaryError {
     BucketNotFound,
     #[error("unexpected event in state {state}: {event}")]
     Unexpected { state: &'static str, event: String },
+    #[error("peer did not answer before the request deadline")]
+    Aborted,
 }
 
 /// Answers "which copy does THIS node hold" for one version. One state machine
@@ -580,6 +582,8 @@ impl Operation for RemoteLocationSummaryOperation {
 
     fn abort(&mut self) -> Effects {
         self.state = RemoteState::Error;
+        self.output
+            .get_or_insert(Err(LocationSummaryError::Aborted));
         match self.stream_id.take() {
             Some(stream_id) => smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })],
             None => smallvec![],
@@ -938,6 +942,31 @@ mod tests {
         assert_eq!(
             operation.finalize(),
             Err(super::LocationSummaryError::Denied)
+        );
+    }
+
+    #[test]
+    fn abort_closes_stream() {
+        // A deadline must release the stream; only CloseConnection unregisters it.
+        let stream_id = Ulid::from_bytes([5u8; 16]);
+        let mut operation = super::RemoteLocationSummaryOperation::new(node_id(4), request(None));
+        operation.start();
+        operation.step(Event::Blob(
+            aruna_core::events::BlobEvent::ConnectionEstablished { stream_id },
+        ));
+
+        let effects = operation.abort();
+
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Blob(
+                aruna_core::effects::BlobEffect::CloseConnection { stream_id }
+            )]
+        );
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize(),
+            Err(super::LocationSummaryError::Aborted)
         );
     }
 

@@ -376,6 +376,57 @@ fn drive_suboperation<'a>(
     })
 }
 
+/// Drives an operation under one wall-clock deadline. On expiry the operation's
+/// own `abort()` runs and its cleanup effects are dispatched unbounded, so a
+/// stream or transaction it opened is still released. Racing `drive` against a
+/// timeout instead drops the future and strands whatever it holds.
+#[tracing::instrument(
+    name = "operation",
+    level = "debug",
+    skip(operation, context),
+    fields(operation = type_name::<O>())
+)]
+pub async fn drive_until<O: Operation>(
+    mut operation: O,
+    context: &DriverContext,
+    deadline: tokio::time::Instant,
+) -> Result<O::Output, O::Error> {
+    let mut queue: VecDeque<_> = operation.start().into_iter().collect();
+    let mut expired = false;
+
+    while !operation.is_complete() {
+        while let Some(effect) = queue.pop_front() {
+            let dispatch = Box::pin(dispatch_effect(effect, context, 0));
+            let event = if expired {
+                dispatch.await
+            } else {
+                match tokio::time::timeout_at(deadline, dispatch).await {
+                    Ok(event) => event,
+                    Err(_) => {
+                        expired = true;
+                        warn!(
+                            operation = %type_name::<O>(),
+                            "Operation deadline expired; running its abort path"
+                        );
+                        queue.clear();
+                        queue.extend(operation.abort());
+                        continue;
+                    }
+                }
+            };
+            queue.extend(operation.step(event));
+        }
+
+        if queue.is_empty() && !operation.is_complete() {
+            queue.extend(operation.abort());
+            if queue.is_empty() {
+                break;
+            }
+        }
+    }
+    operation.finalize()
+}
+
 #[tracing::instrument(
     name = "operation",
     level = "debug",
@@ -681,6 +732,94 @@ mod test {
         fn abort(&mut self) -> aruna_core::types::Effects {
             smallvec::smallvec![]
         }
+    }
+
+    /// Never finishes on its own, so only the deadline can end it. The step cap
+    /// keeps a failing test from spinning instead of hanging.
+    #[derive(Debug, PartialEq)]
+    struct StallingOperation {
+        aborted: bool,
+        steps: usize,
+    }
+
+    impl Operation for StallingOperation {
+        type Output = bool;
+        type Error = Infallible;
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: "default".to_string(),
+                key: ByteView::from(*b"stall"),
+                txn_id: None,
+            })]
+        }
+
+        fn step(&mut self, _: Event) -> aruna_core::types::Effects {
+            self.steps += 1;
+            if self.is_complete() {
+                return smallvec::smallvec![];
+            }
+            self.start()
+        }
+
+        fn is_complete(&self) -> bool {
+            self.aborted || self.steps > 1_000
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            Ok(self.aborted)
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            self.aborted = true;
+            smallvec::smallvec![Effect::Storage(StorageEffect::Write {
+                key_space: "default".to_string(),
+                key: ByteView::from(*b"cleanup"),
+                value: ByteView::from(*b"done"),
+                txn_id: None,
+            })]
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_runs_abort() {
+        // Racing a timeout against the whole drive would drop the abort path.
+        let directory = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+
+        let aborted = crate::driver::drive_until(
+            StallingOperation {
+                aborted: false,
+                steps: 0,
+            },
+            &context,
+            tokio::time::Instant::now(),
+        )
+        .await
+        .unwrap();
+
+        assert!(aborted, "the deadline must end the operation");
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: "default".to_string(),
+                key: ByteView::from(*b"cleanup"),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("unexpected storage event")
+        };
+        assert_eq!(value, Some(ByteView::from(*b"done")));
     }
 
     #[tokio::test]

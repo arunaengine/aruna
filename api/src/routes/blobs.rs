@@ -5,7 +5,7 @@ use aruna_core::structs::{
     AuthContext, Permission, blob_bucket_permission_path, blob_object_permission_path,
 };
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::replication::location_summary::{
     LocationSummaryError, LocationSummaryOperation, QueuedReplicaNodesOperation, QueuedReplicas,
     RemoteLocationSummaryOperation,
@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::Instant;
 use tracing::warn;
 use utoipa::{OpenApi, ToSchema};
 
@@ -454,12 +454,10 @@ pub async fn blob_locations(
         };
         let ctx = ctx.clone();
         async move {
-            let answer = timeout_at(
+            let answer = drive_until(
+                RemoteLocationSummaryOperation::new(node_id, request),
+                ctx.as_ref(),
                 deadline.min(Instant::now() + LOCATION_SUMMARY_TIMEOUT),
-                drive(
-                    RemoteLocationSummaryOperation::new(node_id, request),
-                    ctx.as_ref(),
-                ),
             )
             .await;
             (node_id, answer)
@@ -471,16 +469,10 @@ pub async fn blob_locations(
 
     for (node_id, answer) in answers {
         copies.push(match answer {
-            Ok(Ok(summary)) => copy_response(node_id, false, summary),
-            Ok(Err(LocationSummaryError::Denied)) => {
-                pending_copy(node_id, BlobCopyState::Denied)
-            }
-            Ok(Err(error)) => {
-                warn!(node = %node_id, error = %error, "Location summary peer answered with an error");
-                pending_copy(node_id, BlobCopyState::Unreachable)
-            }
-            Err(_) => {
-                warn!(node = %node_id, "Location summary deadline expired");
+            Ok(summary) => copy_response(node_id, false, summary),
+            Err(LocationSummaryError::Denied) => pending_copy(node_id, BlobCopyState::Denied),
+            Err(error) => {
+                warn!(node = %node_id, error = %error, "Location summary peer gave no answer");
                 pending_copy(node_id, BlobCopyState::Unreachable)
             }
         });
