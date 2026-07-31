@@ -82,16 +82,25 @@ backend to move data.
 A disabled backend still accepts this request, so a leaked key can be replaced
 without enabling writes again.
 
-## Deleting a backend
+## Disabling a backend
 
-`DELETE /groups/{group_id}/storage-backends/{backend_id}` removes the record
-and its credentials together. The backend is first marked as disabled, which
-stops routing from choosing it and makes any write that already resolved it
-fail; the request then checks for stored objects, open multipart uploads,
-uploaded parts and pending cleanups. Deletion is refused with 409 while any of
-them still names the backend, and the record is enabled again. Delete or move the
-objects first, then remove the backend. If the node fails midway the backend can
-stay disabled; repeating the request either removes it or enables it again.
+`DELETE /groups/{group_id}/storage-backends/{backend_id}` disables the backend.
+It does not delete anything: the record and its credentials stay, so objects
+already stored there keep being readable and cleanups that were already queued
+still reach the store. What stops is writing. Routing no longer chooses the
+backend, a rule that names it fails, and any write that had already resolved it
+loses its commit. Repeating the request is harmless and answers `204` again.
+
+`POST /groups/{group_id}/storage-backends/{backend_id}/enable` turns writes back
+on. `disabled` on the backend record tells you which state it is in.
+
+Credentials can be changed while a backend is disabled, so a leaked key can be
+replaced without accepting writes again.
+
+The record and its credentials remain on the node while any stored object,
+open multipart upload, uploaded part or queued cleanup still names the backend.
+Until the cleanup sweep that removes drained backends ships, a disabled backend
+simply stays.
 
 ## Where your data actually is
 
