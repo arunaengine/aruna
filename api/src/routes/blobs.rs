@@ -25,8 +25,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,10 +51,14 @@ pub fn router() -> Router<Arc<ServerState>> {
 const LOCATION_FANOUT_LIMIT: usize = 8;
 const LOCATION_SUMMARY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Ceilings on the whole request. The queued scan alone can name far more
-/// nodes than a caller will wait for, so the request bounds its own work
+/// destinations than a caller will wait for, so the request bounds its own work
 /// rather than trusting the candidate list to stay small.
 const LOCATION_CANDIDATE_LIMIT: usize = 64;
 const LOCATION_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+
+/// One place a copy can be: the node, and the bucket and key it stores it
+/// under. A sync relationship maps the key, so one node can be several.
+type Destination = (NodeId, String, String);
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReplicateBlobRequest {
@@ -230,10 +233,18 @@ pub enum BlobCopyStorage {
     GroupBackend,
 }
 
+/// One copy of a version at one destination. A node reached under several
+/// destination paths has one entry per path, so `node_id` may repeat and only
+/// the whole `(node_id, bucket, key)` triple identifies an entry.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BlobCopyResponse {
     pub node_id: String,
     pub local: bool,
+    /// Bucket this copy is stored under on that node, which a sync relationship
+    /// can map away from the requested one.
+    pub bucket: String,
+    /// Key this copy is stored under on that node.
+    pub key: String,
     pub state: BlobCopyState,
     pub storage: Option<BlobCopyStorage>,
     pub storage_class: Option<String>,
@@ -279,10 +290,13 @@ pub struct BlobLocationsResponse {
     pub limits: Vec<LocationScanLimit>,
 }
 
-fn pending_copy(node_id: NodeId, state: BlobCopyState) -> BlobCopyResponse {
+fn pending_copy(destination: &Destination, state: BlobCopyState) -> BlobCopyResponse {
+    let (node_id, bucket, key) = destination;
     BlobCopyResponse {
         node_id: node_id.to_string(),
         local: false,
+        bucket: bucket.clone(),
+        key: key.clone(),
         state,
         storage: None,
         storage_class: None,
@@ -291,10 +305,14 @@ fn pending_copy(node_id: NodeId, state: BlobCopyState) -> BlobCopyResponse {
     }
 }
 
-fn copy_response(node_id: NodeId, local: bool, summary: LocationSummary) -> BlobCopyResponse {
+fn copy_response(
+    destination: &Destination,
+    local: bool,
+    summary: LocationSummary,
+) -> BlobCopyResponse {
     let base = BlobCopyResponse {
         local,
-        ..pending_copy(node_id, BlobCopyState::Pending)
+        ..pending_copy(destination, BlobCopyState::Pending)
     };
     let unstored = summary.version_id.is_some() && !summary.materialized;
     match summary.storage.filter(|_| summary.held) {
@@ -378,10 +396,11 @@ pub async fn blob_locations(
     let bucket_info = local.bucket;
     let delete_marker = local.delete_marker;
 
-    let mut copies = vec![copy_response(local_node, true, local.summary)];
+    let here = (local_node, query.bucket.clone(), query.path.clone());
+    let mut copies = vec![copy_response(&here, true, local.summary)];
     let mut limits = Vec::new();
-    let mut candidates = BTreeSet::new();
-    let mut expected: BTreeSet<NodeId> = BTreeSet::new();
+    let mut candidates: BTreeSet<Destination> = BTreeSet::new();
+    let mut expected: BTreeSet<Destination> = BTreeSet::new();
     let mut capped = false;
     // First, because these are the only candidates that carry the path the copy
     // is actually stored under; the source path every other source has is a
@@ -399,9 +418,9 @@ pub async fn blob_locations(
     {
         Ok(targets) => {
             for target in targets {
-                expected.insert(target.node_id);
-                capped |=
-                    !add_candidate(&mut candidates, target.node_id, &target.bucket, &target.key);
+                let destination = (target.node_id, target.bucket, target.key);
+                expected.insert(destination.clone());
+                capped |= !add_candidate(&mut candidates, destination);
             }
         }
         Err(error) => {
@@ -415,8 +434,9 @@ pub async fn blob_locations(
         }
     }
     for (node_id, bucket) in configured_targets(bucket_info.as_ref(), local_node, delete_marker) {
-        expected.insert(node_id);
-        capped |= !add_candidate(&mut candidates, node_id, &bucket, &query.path);
+        let destination = (node_id, bucket, query.path.clone());
+        expected.insert(destination.clone());
+        capped |= !add_candidate(&mut candidates, destination);
     }
     let queued = match drive(
         QueuedReplicaNodesOperation::new(
@@ -445,8 +465,9 @@ pub async fn blob_locations(
     // about it. A relationship that rewrites the key already contributed the
     // stored path above, and the more informative answer wins.
     for node_id in queued.nodes.iter().filter(|node| **node != local_node) {
-        expected.insert(*node_id);
-        capped |= !add_candidate(&mut candidates, *node_id, &query.bucket, &query.path);
+        let destination = (*node_id, query.bucket.clone(), query.path.clone());
+        expected.insert(destination.clone());
+        capped |= !add_candidate(&mut candidates, destination);
     }
     // Config and queue only name copies that are planned. A destination dropped
     // from the config, or one whose queue record is already consumed, still
@@ -454,7 +475,8 @@ pub async fn blob_locations(
     match holder_nodes(&ctx, blake3, state.get_realm_id(), local_node).await {
         Ok(holders) => {
             for node_id in holders {
-                capped |= !add_candidate(&mut candidates, node_id, &query.bucket, &query.path);
+                let destination = (node_id, query.bucket.clone(), query.path.clone());
+                capped |= !add_candidate(&mut candidates, destination);
             }
         }
         Err(error) => {
@@ -496,7 +518,8 @@ pub async fn blob_locations(
     // One deadline for the whole fan-out, so a wall of stalled peers costs the
     // caller the deadline rather than the deadline times the candidate count.
     let deadline = Instant::now() + LOCATION_REQUEST_DEADLINE;
-    let answers = stream::iter(candidates.into_iter().map(|(node_id, bucket, key)| {
+    let answers = stream::iter(candidates.into_iter().map(|destination| {
+        let (node_id, bucket, key) = destination.clone();
         let request = LocationSummaryRequest {
             bucket,
             key,
@@ -511,40 +534,31 @@ pub async fn blob_locations(
                 deadline.min(Instant::now() + LOCATION_SUMMARY_TIMEOUT),
             )
             .await;
-            (node_id, answer)
+            (destination, answer)
         }
     }))
     .buffer_unordered(LOCATION_FANOUT_LIMIT)
     .collect::<Vec<_>>()
     .await;
 
+    // A node asked under several destination paths keeps one entry per path;
+    // only a node no path answered for is short of a copy it may hold.
     let mut asked: BTreeSet<NodeId> = BTreeSet::new();
-    let mut answered: BTreeMap<NodeId, BlobCopyResponse> = BTreeMap::new();
-    for (node_id, answer) in answers {
-        asked.insert(node_id);
-        let Some(copy) = peer_copy(node_id, expected.contains(&node_id), answer) else {
+    let mut answered: BTreeSet<NodeId> = BTreeSet::new();
+    let mut unreachable = false;
+    for (destination, answer) in answers {
+        asked.insert(destination.0);
+        let Some(copy) = peer_copy(&destination, expected.contains(&destination), answer) else {
             continue;
         };
-        match answered.entry(node_id) {
-            Entry::Vacant(slot) => {
-                slot.insert(copy);
-            }
-            Entry::Occupied(mut slot) => {
-                if copy_rank(copy.state) < copy_rank(slot.get().state) {
-                    slot.insert(copy);
-                }
-            }
-        }
+        answered.insert(destination.0);
+        unreachable |= copy.state == BlobCopyState::Unreachable;
+        copies.push(copy);
     }
-    let path_unknown = asked.iter().any(|node| !answered.contains_key(node));
-    let unreachable = answered
-        .values()
-        .any(|copy| copy.state == BlobCopyState::Unreachable);
-    copies.extend(answered.into_values());
     if unreachable {
         limits.push(LocationScanLimit::HolderUnreachable);
     }
-    if path_unknown {
+    if asked.iter().any(|node| !answered.contains(node)) {
         warn!(
             bucket = %query.bucket,
             key = %query.path,
@@ -552,7 +566,14 @@ pub async fn blob_locations(
         );
         limits.push(LocationScanLimit::HolderPathUnknown);
     }
-    copies.sort_by(|left, right| (!left.local, &left.node_id).cmp(&(!right.local, &right.node_id)));
+    copies.sort_by(|left, right| {
+        (!left.local, &left.node_id, &left.bucket, &left.key).cmp(&(
+            !right.local,
+            &right.node_id,
+            &right.bucket,
+            &right.key,
+        ))
+    });
 
     Ok(Json(BlobLocationsResponse {
         bucket: query.bucket,
@@ -568,17 +589,17 @@ pub async fn blob_locations(
 /// candidate that does not hold this version under the path it was asked
 /// about, which the answer admits as `HolderPathUnknown`.
 fn peer_copy(
-    node_id: NodeId,
+    destination: &Destination,
     expected: bool,
     answer: Result<LocationSummary, LocationSummaryError>,
 ) -> Option<BlobCopyResponse> {
     match answer {
         Ok(summary) if !summary.held && !expected => None,
-        Ok(summary) => Some(copy_response(node_id, false, summary)),
-        Err(LocationSummaryError::Denied) => Some(pending_copy(node_id, BlobCopyState::Denied)),
+        Ok(summary) => Some(copy_response(destination, false, summary)),
+        Err(LocationSummaryError::Denied) => Some(pending_copy(destination, BlobCopyState::Denied)),
         Err(error) => {
-            warn!(node = %node_id, error = %error, "Location summary peer gave no answer");
-            Some(pending_copy(node_id, BlobCopyState::Unreachable))
+            warn!(node = %destination.0, error = %error, "Location summary peer gave no answer");
+            Some(pending_copy(destination, BlobCopyState::Unreachable))
         }
     }
 }
@@ -620,36 +641,17 @@ fn configured_targets(
         .collect()
 }
 
-/// How much an answer says. A node asked under several destination paths keeps
-/// its most informative one: a path that holds the copy outranks one that only
-/// knows a copy is expected there.
-fn copy_rank(state: BlobCopyState) -> u8 {
-    match state {
-        BlobCopyState::Present => 0,
-        BlobCopyState::NotStored => 1,
-        BlobCopyState::Pending => 2,
-        BlobCopyState::Denied => 3,
-        BlobCopyState::Unreachable => 4,
-    }
-}
-
-/// Adds one destination unless the request is already at its cap. Candidates
-/// are whole paths, so two mappings onto one node are two questions. `false`
-/// means the destination was dropped, which the answer has to admit.
-fn add_candidate(
-    candidates: &mut BTreeSet<(NodeId, String, String)>,
-    node: NodeId,
-    bucket: &str,
-    key: &str,
-) -> bool {
-    let candidate = (node, bucket.to_string(), key.to_string());
-    if candidates.contains(&candidate) {
+/// Adds one destination unless the request is already at its cap, which counts
+/// destinations rather than nodes because each one is a separate question.
+/// `false` means the destination was dropped, which the answer has to admit.
+fn add_candidate(candidates: &mut BTreeSet<Destination>, destination: Destination) -> bool {
+    if candidates.contains(&destination) {
         return true;
     }
     if candidates.len() >= LOCATION_CANDIDATE_LIMIT {
         return false;
     }
-    candidates.insert(candidate);
+    candidates.insert(destination);
     true
 }
 
@@ -711,7 +713,7 @@ mod tests {
     fn hides_backend_name() {
         // Node-managed copies expose the class only; backend names stay operator-side.
         let copy = copy_response(
-            node_id(),
+            &(node_id(), "raw".to_string(), "a.tar".to_string()),
             true,
             LocationSummary {
                 version_id: Some(Ulid::from_bytes([1u8; 16])),
@@ -733,7 +735,7 @@ mod tests {
     fn names_group_backend() {
         let backend_id = Ulid::from_bytes([9u8; 16]);
         let copy = copy_response(
-            node_id(),
+            &(node_id(), "raw".to_string(), "a.tar".to_string()),
             false,
             LocationSummary {
                 version_id: Some(Ulid::from_bytes([1u8; 16])),
@@ -759,7 +761,7 @@ mod tests {
     fn reports_unstored_version() {
         // A delete marker resolves a version that holds bytes nowhere.
         let copy = copy_response(
-            node_id(),
+            &(node_id(), "raw".to_string(), "a.tar".to_string()),
             false,
             LocationSummary {
                 version_id: Some(Ulid::from_bytes([1u8; 16])),
@@ -780,12 +782,17 @@ mod tests {
     #[test]
     fn absent_copy_pends() {
         // No version at the peer is a copy still to come, not a missing one.
-        let copy = copy_response(node_id(), false, LocationSummary::absent());
+        let destination = (node_id(), "archive".to_string(), "images/a.jpg".to_string());
+        let copy = copy_response(&destination, false, LocationSummary::absent());
 
         assert_eq!(copy.state, BlobCopyState::Pending);
         assert!(copy.storage.is_none());
+        // The mapped destination travels with the answer, so two copies on one
+        // node stay apart.
+        assert_eq!(copy.bucket, "archive");
+        assert_eq!(copy.key, "images/a.jpg");
         assert_eq!(
-            pending_copy(node_id(), BlobCopyState::Unreachable).state,
+            pending_copy(&destination, BlobCopyState::Unreachable).state,
             BlobCopyState::Unreachable
         );
     }
@@ -796,20 +803,24 @@ mod tests {
         let mut candidates = std::collections::BTreeSet::new();
         for seed in 0..super::LOCATION_CANDIDATE_LIMIT {
             let node = iroh::SecretKey::from_bytes(&[seed as u8 + 1; 32]).public();
-            assert!(super::add_candidate(&mut candidates, node, "raw", "a.tar"));
+            assert!(super::add_candidate(
+                &mut candidates,
+                (node, "raw".to_string(), "a.tar".to_string())
+            ));
         }
 
         let extra = iroh::SecretKey::from_bytes(&[0u8; 32]).public();
         assert!(!super::add_candidate(
             &mut candidates,
-            extra,
-            "raw",
-            "a.tar"
+            (extra, "raw".to_string(), "a.tar".to_string())
         ));
         assert_eq!(candidates.len(), super::LOCATION_CANDIDATE_LIMIT);
 
         let known = candidates.iter().next().unwrap().0;
-        assert!(super::add_candidate(&mut candidates, known, "raw", "a.tar"));
+        assert!(super::add_candidate(
+            &mut candidates,
+            (known, "raw".to_string(), "a.tar".to_string())
+        ));
     }
 
     #[test]
@@ -820,30 +831,14 @@ mod tests {
         let node = node_id();
         assert!(super::add_candidate(
             &mut candidates,
-            node,
-            "archive",
-            "images/a.jpg"
+            (node, "archive".to_string(), "images/a.jpg".to_string())
         ));
         assert!(super::add_candidate(
             &mut candidates,
-            node,
-            "raw",
-            "photos/a.jpg"
+            (node, "raw".to_string(), "photos/a.jpg".to_string())
         ));
 
         assert_eq!(candidates.len(), 2);
-    }
-
-    #[test]
-    fn present_outranks_pending() {
-        // A node that holds the copy under its mapped path must not be reported
-        // as pending because another path it was asked about knows nothing.
-        assert!(
-            super::copy_rank(BlobCopyState::Present) < super::copy_rank(BlobCopyState::Pending)
-        );
-        assert!(
-            super::copy_rank(BlobCopyState::Pending) < super::copy_rank(BlobCopyState::Unreachable)
-        );
     }
 
     #[test]
@@ -852,18 +847,19 @@ mod tests {
         // this version, but a configured or queued target that has not received
         // it yet still is.
         let absent = LocationSummary::absent();
-        assert!(super::peer_copy(node_id(), false, Ok(absent.clone())).is_none());
+        let destination = (node_id(), "raw".to_string(), "a.tar".to_string());
+        assert!(super::peer_copy(&destination, false, Ok(absent.clone())).is_none());
         assert_eq!(
-            super::peer_copy(node_id(), true, Ok(absent.clone())).map(|copy| copy.state),
+            super::peer_copy(&destination, true, Ok(absent.clone())).map(|copy| copy.state),
             Some(BlobCopyState::Pending)
         );
         assert_eq!(
-            super::peer_copy(node_id(), false, Err(LocationSummaryError::Denied))
+            super::peer_copy(&destination, false, Err(LocationSummaryError::Denied))
                 .map(|copy| copy.state),
             Some(BlobCopyState::Denied)
         );
         assert_eq!(
-            super::peer_copy(node_id(), false, Err(LocationSummaryError::Aborted))
+            super::peer_copy(&destination, false, Err(LocationSummaryError::Aborted))
                 .map(|copy| copy.state),
             Some(BlobCopyState::Unreachable)
         );
@@ -888,7 +884,7 @@ mod tests {
         );
         assert!(
             openapi["components"]["schemas"]["BlobCopyResponse"]["properties"]
-                .get("state")
+                .get("key")
                 .is_some()
         );
         assert!(

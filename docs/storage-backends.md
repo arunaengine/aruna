@@ -163,11 +163,10 @@ its own rules for the copy it materializes. Tenant data therefore does not
 stay exclusively on the endpoint the tenant wrote to, and the copies of one
 version can sit on different classes and even on different kinds of storage.
 `GET /blobs/locations` asks every node that might hold a copy and reports where
-each one keeps it. A node reached through a sync relationship that maps the
-prefix is asked under the source path, so a copy it keeps under a different
-bucket or prefix is reported as an unknown path rather than a placement.
-`complete` is false whenever any part of the answer is missing, and `limits`
-names what was missing.
+each one keeps it. Each copy carries the destination bucket and key it is
+stored under, so a node reached under several mapped paths has one entry per
+path and its node id repeats. `complete` is false whenever any part of the
+answer is missing, and `limits` names what was missing.
 
 ## The egress guard
 

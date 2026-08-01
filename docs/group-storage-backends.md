@@ -164,14 +164,14 @@ current version.
 {
   "bucket": "raw", "key": "archive/run1.tar", "version_id": "01J...",
   "copies": [
-    { "node_id": "ae58...", "local": true,  "state": "present",
-      "storage": "node-managed", "storage_class": "cold",
+    { "node_id": "ae58...", "local": true,  "bucket": "raw", "key": "archive/run1.tar",
+      "state": "present", "storage": "node-managed", "storage_class": "cold",
       "group_backend_id": null, "group_backend_name": null },
-    { "node_id": "b7c2...", "local": false, "state": "present",
-      "storage": "group-backend", "storage_class": null,
+    { "node_id": "b7c2...", "local": false, "bucket": "archive", "key": "images/run1.tar",
+      "state": "present", "storage": "group-backend", "storage_class": null,
       "group_backend_id": "01H...", "group_backend_name": "lab-minio" },
-    { "node_id": "9f01...", "local": false, "state": "pending",
-      "storage": null, "storage_class": null,
+    { "node_id": "9f01...", "local": false, "bucket": "raw", "key": "archive/run1.tar",
+      "state": "pending", "storage": null, "storage_class": null,
       "group_backend_id": null, "group_backend_name": null }
   ],
   "complete": true, "limits": []
