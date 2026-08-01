@@ -5304,6 +5304,17 @@ mod tests {
         )
         .await;
 
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.seed_default_placement();
+        config.ensure_node(node_id, RealmNodeKind::Server);
+        write_doc(
+            &driver_ctx,
+            REALM_CONFIG_KEYSPACE,
+            (*realm_id.as_bytes()).into(),
+            config.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+
         let state = Arc::new(
             ServerState::new(
                 driver_ctx,
@@ -5377,6 +5388,7 @@ mod tests {
         });
         // Single-node realm config so the holder proxy serves mutations locally.
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.seed_default_placement();
         config.ensure_node(node_id, RealmNodeKind::Server);
         write_doc(
             &driver_ctx,
