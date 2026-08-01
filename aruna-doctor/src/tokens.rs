@@ -1165,10 +1165,13 @@ mod tests {
         let (provider, oidc_task) =
             spawn_oidc_provider(issuer, kid, &signing_key, oidc_token).await;
         let node = spawn_test_node(provider.clone(), false).await;
-        let onboarding_secret =
-            ensure_initial_local_onboarding_secret(node.context.as_ref(), node.base_url.clone())
-                .await?
-                .encode()?;
+        let onboarding_secret = ensure_initial_local_onboarding_secret(
+            node.context.as_ref(),
+            node.base_url.clone(),
+            &[7u8; 32],
+        )
+        .await?
+        .encode()?;
         let previous = set_oidc_env(&node.base_url, &provider);
 
         let token = create_local_bootstrap_token(

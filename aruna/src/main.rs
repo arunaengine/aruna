@@ -212,13 +212,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 match ensure_initial_local_onboarding_secret(
                     driver_ctx.as_ref(),
                     format!("http://{}", config.http_socket_addr),
+                    &config.node_state.net_secret_key,
                 )
                 .await
                 {
-                    Ok(secret) => warn!(
-                        onboarding_secret = %secret
-                            .encode()
-                            .expect("initial onboarding secret encoding should succeed"),
+                    Ok(_) => info!(
                         "Created initial local onboarding secret for first user registration"
                     ),
                     Err(error) => {
