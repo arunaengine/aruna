@@ -10,7 +10,11 @@ use ulid::Ulid;
 use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::invert_timestamp_ms;
-use crate::structs::{AuthContext, BackendLocation, StagingStrategy};
+use crate::structs::{
+    AuthContext, BackendLocation, DEFAULT_SHARD_COUNT, JOBCONTROL_HANDLE, StagingStrategy,
+    shard_for_subject,
+};
+use crate::structured_id::{BucketId, JobId as RoutableJobId, PlacementHandle, StructuredId};
 use crate::types::{GroupId, Key, UserId};
 
 /// Version prefix keeping the record wrappable in a version envelope later (#286).
@@ -1142,15 +1146,28 @@ pub fn run_crate_dedup_key(job_id: JobId) -> Vec<u8> {
     format!("internal/run-crate/{job_id}").into_bytes()
 }
 
+/// Deterministic routable child-job id: places the child in the reserved
+/// JobControl band by id, folding `domain` into both the routing bucket and the
+/// nonce so a parent's distinct child kinds never collide.
+fn child_job_id(job_id: JobId, domain: &[u8]) -> JobId {
+    let handle = PlacementHandle::new(JOBCONTROL_HANDLE).expect("job-control handle is reserved");
+    let mut subject = job_id.to_bytes().to_vec();
+    subject.extend_from_slice(domain);
+    let shard = shard_for_subject(&subject, DEFAULT_SHARD_COUNT) as u16;
+    let bucket = BucketId::new(shard).expect("shard within bucket space");
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(domain);
+    hasher.update(&job_id.to_bytes());
+    let nonce = u64::from_be_bytes(hasher.finalize().as_bytes()[..8].try_into().expect("8 bytes"))
+        & ((1u64 << 48) - 1);
+    let routable = RoutableJobId::from_parts(job_id.timestamp_ms(), handle, bucket, nonce)
+        .expect("structured child job id");
+    JobId(routable.as_ulid())
+}
+
 /// Stable child-job identity for the durable run-crate obligation.
 pub fn crate_job_id(job_id: JobId) -> JobId {
-    let parent = job_id.to_bytes();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"aruna/run-crate-job/v1");
-    hasher.update(&parent);
-    let mut child = parent;
-    child[6..].copy_from_slice(&hasher.finalize().as_bytes()[..10]);
-    JobId::from_bytes(child)
+    child_job_id(job_id, b"aruna/run-crate-job/v1")
 }
 
 pub fn cleanup_dedup_key(job_id: JobId) -> Vec<u8> {
@@ -1158,13 +1175,7 @@ pub fn cleanup_dedup_key(job_id: JobId) -> Vec<u8> {
 }
 
 pub fn cleanup_job_id(job_id: JobId) -> JobId {
-    let parent = job_id.to_bytes();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"aruna/terminal-cleanup-job/v1");
-    hasher.update(&parent);
-    let mut child = parent;
-    child[6..].copy_from_slice(&hasher.finalize().as_bytes()[..10]);
-    JobId::from_bytes(child)
+    child_job_id(job_id, b"aruna/terminal-cleanup-job/v1")
 }
 
 pub fn workspace_credential_id(job_id: JobId) -> String {
@@ -1546,6 +1557,18 @@ mod tests {
         assert_eq!(cleanup_job_id(job), cleanup_job_id(job));
         assert_ne!(cleanup_job_id(job), crate_job_id(job));
         assert_eq!(workspace_credential_id(job), format!("ws{job}"));
+    }
+
+    #[test]
+    fn routable_child_ids() {
+        // A parent's crate and cleanup children stay stable and distinct, and
+        // carry the reserved JobControl handle so they route by id.
+        let parent = JobId::from_bytes([3u8; 16]);
+        assert_eq!(crate_job_id(parent), crate_job_id(parent));
+        assert_eq!(cleanup_job_id(parent), cleanup_job_id(parent));
+        assert_ne!(crate_job_id(parent), cleanup_job_id(parent));
+        let routed = RoutableJobId::parse(&crate_job_id(parent).to_string()).unwrap();
+        assert_eq!(routed.placement_handle().get(), JOBCONTROL_HANDLE);
     }
 
     #[test]
