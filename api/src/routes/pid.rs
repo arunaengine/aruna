@@ -11,23 +11,32 @@
 
 use std::sync::Arc;
 
-use axum::Json;
-use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::{Extension, Json, Router};
 use ulid::Ulid;
 
-use aruna_core::structs::PersistentIdStatus;
+use aruna_core::structs::{
+    AuthContext, DEFAULT_JOB_RETENTION_MS, MetadataRegistryRecord, MintPersistentIdSpec,
+    Permission, PersistentIdStatus,
+};
+use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::get_metadata_document::load_metadata_record_by_document;
-use aruna_operations::persistent_id::read_mapping;
+use aruna_operations::jobs::service::submit_mint_pid;
+use aruna_operations::persistent_id::{read_mapping, withdraw_persistent_id};
 
+use crate::auth::{ensure_permission, require_unrestricted_realm_auth};
+use crate::error::{ServerError, ServerResult};
 use crate::server_state::ServerState;
 
 pub fn router() -> Router<Arc<ServerState>> {
-    Router::new().route("/pid/{document_id}", get(resolve_pid))
+    Router::new().route(
+        "/pid/{document_id}",
+        get(resolve_pid).post(mint_pid).delete(withdraw_pid),
+    )
 }
 
 fn rocrate_location(document_id: Ulid) -> String {
@@ -78,6 +87,78 @@ fn gone(pid: &str) -> Response {
         Json(serde_json::json!({ "pid": pid, "status": "withdrawn" })),
     )
         .into_response()
+}
+
+/// Register a w3id PID for a document. Idempotent by document id; requires WRITE
+/// on the document. Runs as a fenced job, so the response is 202 Accepted.
+async fn mint_pid(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(document_id): Path<String>,
+) -> ServerResult<(StatusCode, Json<serde_json::Value>)> {
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let document_id = Ulid::from_string(&document_id).map_err(|_| ServerError::BadRequest)?;
+    let ctx = state.get_ctx();
+    let record = load_metadata_record_by_document(&ctx, document_id)
+        .await
+        .map_err(|error| ServerError::InternalError(format!("{error:?}")))?
+        .ok_or(ServerError::NotFound)?;
+    ensure_permission(
+        &state,
+        &auth,
+        record.permission_path.clone(),
+        Permission::WRITE,
+    )
+    .await?;
+
+    let result = submit_mint_pid(
+        &ctx,
+        MintPersistentIdSpec {
+            document_id,
+            minted_by: auth.user_id,
+        },
+        state.get_node_id(),
+        DEFAULT_JOB_RETENTION_MS,
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "pid": MetadataRegistryRecord::graph_iri_for(document_id),
+            "job_id": result.job_id.to_string(),
+            "created": result.created,
+        })),
+    ))
+}
+
+/// Explicit admin withdrawal: flip a minted PID to a permanent 410 tombstone.
+/// Deletion and harvest-tombstoning withdraw automatically; this is the manual
+/// path. Idempotent.
+async fn withdraw_pid(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(document_id): Path<String>,
+) -> ServerResult<StatusCode> {
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let document_id = Ulid::from_string(&document_id).map_err(|_| ServerError::BadRequest)?;
+    let ctx = state.get_ctx();
+    let record = load_metadata_record_by_document(&ctx, document_id)
+        .await
+        .map_err(|error| ServerError::InternalError(format!("{error:?}")))?
+        .ok_or(ServerError::NotFound)?;
+    ensure_permission(
+        &state,
+        &auth,
+        record.permission_path.clone(),
+        Permission::WRITE,
+    )
+    .await?;
+    withdraw_persistent_id(&ctx, document_id, unix_timestamp_millis())
+        .await
+        .map_err(|error| ServerError::InternalError(format!("{error:?}")))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

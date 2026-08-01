@@ -5,8 +5,8 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     ArtifactRef, DEFAULT_SHARD_COUNT, ExecutionSpec, ExportRoCrateSpec, FIRST_GRANTABLE_HANDLE,
     ImportRoCrateSpec, JobId, JobOwnerError, JobPayload, JobRecord, JobResultPayload, JobState,
-    RealmId, RunCrateStatus, StagingJobCheckpoint, StagingJobSpec, WorkspaceMode,
-    shard_for_subject, user_dedup_key,
+    MintPersistentIdSpec, RealmId, RunCrateStatus, StagingJobCheckpoint, StagingJobSpec,
+    WorkspaceMode, shard_for_subject, user_dedup_key,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
@@ -203,6 +203,41 @@ pub async fn submit_staging_job(
             now_ms: unix_timestamp_millis(),
             retention_ms,
             workspace_mode: WorkspaceMode::default(),
+            workspace_bucket: None,
+        },
+        job_id,
+    )
+    .await
+}
+
+/// Register a w3id PID for a document as a fenced job. The dedup key is the
+/// document id alone, so a concurrent re-mint by another user joins the same
+/// job rather than conflicting.
+pub async fn submit_mint_pid(
+    context: &DriverContext,
+    spec: MintPersistentIdSpec,
+    owner_node_id: NodeId,
+    retention_ms: u64,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    let created_by = spec.minted_by;
+    let dedup_key = Some(spec.document_id.to_bytes().to_vec());
+    let job_id = mint_local_job(
+        context,
+        created_by.realm_id,
+        owner_node_id,
+        dedup_key.as_deref(),
+    )
+    .await?;
+    submit_local_job(
+        context,
+        SubmitJobSpec {
+            payload: JobPayload::MintPersistentId(spec),
+            created_by,
+            owner_node_id,
+            dedup_key,
+            now_ms: unix_timestamp_millis(),
+            retention_ms,
+            workspace_mode: WorkspaceMode::None,
             workspace_bucket: None,
         },
         job_id,
