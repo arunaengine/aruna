@@ -122,7 +122,16 @@ async fn harvest(ctx: &JobContext, spec: &HarvestJobSpec) -> Result<HarvestCount
             check_signals(ctx)?;
             let datestamp_ms = parse_datestamp_ms(&record.header.datestamp).unwrap_or(0);
             overall_max = overall_max.max(datestamp_ms);
-            apply_record(ctx, &source, &actor, realm_id, record, datestamp_ms, &mut counts).await?;
+            apply_record(
+                ctx,
+                &source,
+                &actor,
+                realm_id,
+                record,
+                datestamp_ms,
+                &mut counts,
+            )
+            .await?;
         }
         ctx.progress.advance(page.records.len() as u64);
 

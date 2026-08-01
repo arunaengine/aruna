@@ -144,8 +144,8 @@ fn on_open(
         }
         b"header" => {
             if let Some(record) = record.as_mut() {
-                record.header.deleted = attribute(element, b"status")?
-                    .is_some_and(|status| status == "deleted");
+                record.header.deleted =
+                    attribute(element, b"status")?.is_some_and(|status| status == "deleted");
             }
         }
         b"error" => {
@@ -168,7 +168,10 @@ fn commit_text(
     let Some(current) = stack.last() else {
         return;
     };
-    let parent = stack.len().checked_sub(2).map(|index| stack[index].as_slice());
+    let parent = stack
+        .len()
+        .checked_sub(2)
+        .map(|index| stack[index].as_slice());
     let value = value.trim();
 
     match current.as_slice() {
@@ -193,9 +196,10 @@ fn commit_text(
             record.header.sets.push(value.to_string());
         }
         (Some(b"dc"), element) if !value.is_empty() => {
-            record
-                .dc
-                .push((String::from_utf8_lossy(element).into_owned(), value.to_string()));
+            record.dc.push((
+                String::from_utf8_lossy(element).into_owned(),
+                value.to_string(),
+            ));
         }
         _ => {}
     }
@@ -205,10 +209,7 @@ fn local_name(element: &BytesStart<'_>) -> Vec<u8> {
     element.local_name().as_ref().to_vec()
 }
 
-fn attribute(
-    element: &BytesStart<'_>,
-    key: &[u8],
-) -> Result<Option<String>, OaiParseError> {
+fn attribute(element: &BytesStart<'_>, key: &[u8]) -> Result<Option<String>, OaiParseError> {
     for attribute in element.attributes() {
         let attribute = attribute.map_err(|error| OaiParseError::Xml(error.to_string()))?;
         if attribute.key.local_name().as_ref() == key {
@@ -274,11 +275,11 @@ mod tests {
         assert_eq!(first.header.identifier, "oai:example.org:1");
         assert!(!first.header.deleted);
         assert_eq!(first.header.sets, vec!["alpha".to_string()]);
-        assert_eq!(first.dc[0], ("title".to_string(), "First & only".to_string()));
         assert_eq!(
-            first.dc.iter().filter(|(k, _)| k == "creator").count(),
-            2
+            first.dc[0],
+            ("title".to_string(), "First & only".to_string())
         );
+        assert_eq!(first.dc.iter().filter(|(k, _)| k == "creator").count(), 2);
 
         let second = &page.records[1];
         assert!(second.header.deleted);
@@ -287,7 +288,10 @@ mod tests {
 
     #[test]
     fn empty_element_resumption_token_ends_list() {
-        let xml = LIST.replace("<resumptionToken cursor=\"0\">TOKEN-2</resumptionToken>", "<resumptionToken/>");
+        let xml = LIST.replace(
+            "<resumptionToken cursor=\"0\">TOKEN-2</resumptionToken>",
+            "<resumptionToken/>",
+        );
         let page = parse_list_page(&xml).unwrap();
         assert!(page.resumption_token.is_none());
     }

@@ -61,9 +61,13 @@ mod tests {
 
     #[test]
     fn fresh_request_carries_prefix_set_and_from() {
-        let url =
-            list_records_url("https://ex.org/oai", &selector(), Some("2026-01-01T00:00:00Z"), None)
-                .unwrap();
+        let url = list_records_url(
+            "https://ex.org/oai",
+            &selector(),
+            Some("2026-01-01T00:00:00Z"),
+            None,
+        )
+        .unwrap();
         let query = url.query().unwrap();
         assert!(query.contains("verb=ListRecords"));
         assert!(query.contains("metadataPrefix=oai_dc"));
@@ -73,7 +77,8 @@ mod tests {
 
     #[test]
     fn resumption_token_is_exclusive() {
-        let url = list_records_url("https://ex.org/oai", &selector(), Some("x"), Some("TOK")).unwrap();
+        let url =
+            list_records_url("https://ex.org/oai", &selector(), Some("x"), Some("TOK")).unwrap();
         let query = url.query().unwrap();
         assert!(query.contains("resumptionToken=TOK"));
         assert!(!query.contains("metadataPrefix"));
@@ -83,8 +88,13 @@ mod tests {
 
     #[test]
     fn default_prefix_when_unset() {
-        let url = list_records_url("https://ex.org/oai", &HarvestSelector::default(), None, None)
-            .unwrap();
+        let url = list_records_url(
+            "https://ex.org/oai",
+            &HarvestSelector::default(),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(url.query().unwrap().contains("metadataPrefix=oai_dc"));
     }
 
