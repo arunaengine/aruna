@@ -731,10 +731,7 @@ mod test {
         assert!(
             PermissionRules::from_roles(
                 vec![CollectedRole {
-                    role: role(
-                        HashMap::from([(pattern, Permission::READ)]),
-                        HashSet::new()
-                    ),
+                    role: role(HashMap::from([(pattern, Permission::READ)]), HashSet::new()),
                     direct: true,
                     public: false,
                 }],

@@ -4,8 +4,8 @@ use aruna_core::NodeId;
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, CreateOnboardingSecretRequest,
     CreateOnboardingSecretResponse, OnboardingMode, OnboardingPurpose, OnboardingSecret,
-    OnboardingSecretRecord,
-    OnboardingSecretState, bootstrap_issuer_proof_message, bootstrap_node_proof_message,
+    OnboardingSecretRecord, OnboardingSecretState, bootstrap_issuer_proof_message,
+    bootstrap_node_proof_message,
 };
 use aruna_core::structs::{AuthContext, NodeCapabilities, Permission};
 use aruna_operations::bootstrap_onboarding_finalize::{

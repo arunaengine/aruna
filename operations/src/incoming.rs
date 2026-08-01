@@ -78,7 +78,12 @@ impl OperationsInboundHandler {
     /// sync data; unknown or user-kind peers are rejected. Fails closed when
     /// the realm config cannot be read.
     async fn peer_is_sync_eligible(&self, realm_id: RealmId, peer: NodeId) -> bool {
-        match drive(GetRealmConfigOperation::new(realm_id), self.context.as_ref()).await {
+        match drive(
+            GetRealmConfigOperation::new(realm_id),
+            self.context.as_ref(),
+        )
+        .await
+        {
             Ok(config) => match config.sync_eligible_node_ids() {
                 Ok(ids) => ids.contains(&peer),
                 Err(error) => {

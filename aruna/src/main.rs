@@ -217,9 +217,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await
                 {
-                    Ok(_) => info!(
-                        "Created initial local onboarding secret for first user registration"
-                    ),
+                    Ok(_) => {
+                        info!("Created initial local onboarding secret for first user registration")
+                    }
                     Err(error) => {
                         return Err(format!(
                             "failed to create initial local onboarding secret: {error}"
