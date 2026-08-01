@@ -1,3 +1,5 @@
+use crate::blob::cleanup::PendingCleanup;
+use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -6,14 +8,15 @@ use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
-    BackendLocation, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
-    MultipartUploadStatus,
+    BackendLocation, BlobCleanupWork, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
+    MultipartUploadStatus, ResolvedBackend, WriteOwner,
 };
 use aruna_core::types::{Effects, TxnId, UserId};
 use bytes::Bytes;
 use smallvec::smallvec;
 use std::time::SystemTime;
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -22,7 +25,9 @@ pub enum UploadPartState {
     ReadUpload,
     WritePart,
     CleanupFailedWrite,
+    QueueCleanupRow,
     StartTransaction,
+    FenceBackend,
     ReReadUpload,
     ReadExistingPart,
     WritePartRecord,
@@ -38,6 +43,8 @@ pub enum UploadPartError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    BackendFenceError(#[from] BackendFenceError),
     #[error("Invalid operation state")]
     InvalidOperationState,
     #[error("No transaction found")]
@@ -90,6 +97,8 @@ pub struct UploadPartOperation {
     txn_id: Option<TxnId>,
     written_location: Option<BackendLocation>,
     replaced_location: Option<BackendLocation>,
+    rollback_location: Option<BackendLocation>,
+    pending_cleanup: PendingCleanup,
     pending_error: Option<UploadPartError>,
     output: Option<Result<UploadPartResult, UploadPartError>>,
 }
@@ -102,15 +111,20 @@ impl UploadPartOperation {
             txn_id: None,
             written_location: None,
             replaced_location: None,
+            rollback_location: None,
+            pending_cleanup: PendingCleanup::default(),
             pending_error: None,
             output: None,
         }
     }
 
+    /// The terminal state is complete, so the driver never calls `abort` for us;
+    /// rolling back here is what keeps an open transaction from outliving the
+    /// operation. `abort` takes what it releases, so it cannot run twice.
     fn emit_error(&mut self, error: UploadPartError) -> Effects {
         self.state = UploadPartState::Error;
         self.output = Some(Err(error));
-        smallvec![]
+        self.abort()
     }
 
     fn handle_init(&mut self) -> Effects {
@@ -155,6 +169,7 @@ impl UploadPartOperation {
         smallvec![Effect::Blob(BlobEffect::WritePart {
             upload_id: self.input.upload_id,
             part_number: self.input.part_number,
+            resolved: ResolvedBackend::new(record.backend, record.storage_class),
             created_by: self.input.created_by,
             compressed: self.input.compressed,
             encrypted: self.input.encrypted,
@@ -205,10 +220,14 @@ impl UploadPartOperation {
         })]
     }
 
+    /// Takes the location: once its delete is queued the rollback in `abort`
+    /// must not queue a second one. A copy stays behind so a delete that fails
+    /// can still be handed to the durable cleanup queue.
     fn cleanup_failed_write(&mut self, error: UploadPartError) -> Effects {
         self.pending_error = Some(error);
         self.state = UploadPartState::CleanupFailedWrite;
-        if let Some(location) = self.written_location.clone() {
+        if let Some(location) = self.written_location.take() {
+            self.rollback_location = Some(location.clone());
             smallvec![Effect::Blob(BlobEffect::Delete { location })]
         } else {
             self.emit_pending_error()
@@ -217,8 +236,46 @@ impl UploadPartOperation {
 
     fn handle_failed_write_cleanup(&mut self, event: Event) -> Effects {
         match event {
-            Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
+            Event::Blob(BlobEvent::DeleteFinished) => {
+                self.rollback_location = None;
                 self.emit_pending_error()
+            }
+            // The part bytes are still on the backend, and this operation is
+            // over; only a queued delete can still reach them.
+            Event::Blob(BlobEvent::Error(_)) => self.queue_rollback_delete(),
+            _ => self.emit_error(UploadPartError::InvalidOperationState),
+        }
+    }
+
+    fn queue_rollback_delete(&mut self) -> Effects {
+        let Some(location) = self.rollback_location.take() else {
+            return self.emit_pending_error();
+        };
+        self.queue_cleanup_work(BlobCleanupWork::DeleteBlob { location })
+    }
+
+    /// Hands one row to the durable cleanup queue outside any transaction. The
+    /// row keeps the location until storage accepts it, so a refused write can
+    /// still be retried rather than losing the only record of the bytes.
+    fn queue_cleanup_work(&mut self, work: BlobCleanupWork) -> Effects {
+        let Some(effect) = self.pending_cleanup.queue(work) else {
+            return self.emit_pending_error();
+        };
+        self.state = UploadPartState::QueueCleanupRow;
+        smallvec![effect]
+    }
+
+    fn handle_cleanup_queued(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {
+                self.pending_cleanup.accepted();
+                self.emit_pending_error()
+            }
+            Event::Storage(StorageEvent::Error { error }) => {
+                match self.pending_cleanup.retry(&error) {
+                    Some(effect) => smallvec![effect],
+                    None => self.emit_pending_error(),
+                }
             }
             _ => self.emit_error(UploadPartError::InvalidOperationState),
         }
@@ -237,11 +294,34 @@ impl UploadPartOperation {
         };
 
         self.txn_id = Some(txn_id);
+        // The pin was taken at creation, so the part write must still prove the
+        // tenant backend is enabled before its record joins the transaction.
+        match self
+            .written_location
+            .as_ref()
+            .and_then(|location| fence_backend(&location.backend, self.txn_id))
+        {
+            Some(effect) => {
+                self.state = UploadPartState::FenceBackend;
+                smallvec![effect]
+            }
+            None => self.reread_upload(),
+        }
+    }
+
+    fn handle_backend_fenced(&mut self, event: Event) -> Effects {
+        match check_fence(event) {
+            Ok(()) => self.reread_upload(),
+            Err(error) => self.cleanup_failed_write(error.into()),
+        }
+    }
+
+    fn reread_upload(&mut self) -> Effects {
         self.state = UploadPartState::ReReadUpload;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
             key: self.input.upload_id.to_bytes().to_vec().into(),
-            txn_id: Some(txn_id),
+            txn_id: self.txn_id,
         })]
     }
 
@@ -330,31 +410,60 @@ impl UploadPartOperation {
 
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
+            return self.handle_commit_failure(event);
+        };
+        self.txn_id = None;
+        // The committed part record owns the blob now, so the rollback must not
+        // still hold it.
+        let Some(location) = self.written_location.take() else {
+            return self.emit_error(UploadPartError::UploadPartFailed);
+        };
+        self.output = Some(Ok(UploadPartResult { location }));
+
+        if let Some(replaced) = self.replaced_location.take() {
+            self.state = UploadPartState::CleanupReplacedPart;
+            smallvec![Effect::Blob(BlobEffect::Delete { location: replaced })]
+        } else {
+            self.state = UploadPartState::Finish;
+            smallvec![]
+        }
+    }
+
+    /// A commit whose outcome is unknown may already own the part bytes, so only
+    /// a proven refusal rolls them back. The rest go to the reconciliation
+    /// queue: the committed part record is what decides their fate.
+    fn handle_commit_failure(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::Error { error }) = event else {
             return self.emit_error(UploadPartError::InvalidOperationState);
         };
         self.txn_id = None;
-
-        if let Some(location) = self.replaced_location.take() {
-            self.state = UploadPartState::CleanupReplacedPart;
-            smallvec![Effect::Blob(BlobEffect::Delete { location })]
-        } else {
-            self.state = UploadPartState::Finish;
-            let Some(location) = self.written_location.clone() else {
-                return self.emit_error(UploadPartError::UploadPartFailed);
-            };
-            self.output = Some(Ok(UploadPartResult { location }));
-            smallvec![]
+        if error.proves_no_commit() {
+            return self.cleanup_failed_write(UploadPartError::StorageError(error));
         }
+        let Some(location) = self.written_location.take() else {
+            return self.emit_error(error.into());
+        };
+        warn!(
+            event = "upload_part.commit_outcome_unknown",
+            backend = %location.backend,
+            blob_size = location.blob_size,
+            error = %error,
+            "Queuing the written part for reconciliation"
+        );
+        self.pending_error = Some(error.into());
+        self.queue_cleanup_work(BlobCleanupWork::ReconcileWrite {
+            location,
+            owner: WriteOwner::UploadPart {
+                upload_id: self.input.upload_id,
+                part_number: self.input.part_number,
+            },
+        })
     }
 
     fn handle_replaced_part_cleanup(&mut self, event: Event) -> Effects {
         match event {
             Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
                 self.state = UploadPartState::Finish;
-                let Some(location) = self.written_location.clone() else {
-                    return self.emit_error(UploadPartError::UploadPartFailed);
-                };
-                self.output = Some(Ok(UploadPartResult { location }));
                 smallvec![]
             }
             _ => self.emit_error(UploadPartError::InvalidOperationState),
@@ -376,7 +485,9 @@ impl Operation for UploadPartOperation {
             UploadPartState::ReadUpload => self.handle_upload_read(event),
             UploadPartState::WritePart => self.handle_write_finished(event),
             UploadPartState::CleanupFailedWrite => self.handle_failed_write_cleanup(event),
+            UploadPartState::QueueCleanupRow => self.handle_cleanup_queued(event),
             UploadPartState::StartTransaction => self.handle_transaction_started(event),
+            UploadPartState::FenceBackend => self.handle_backend_fenced(event),
             UploadPartState::ReReadUpload => self.handle_upload_reread(event),
             UploadPartState::ReadExistingPart => self.handle_existing_part_read(event),
             UploadPartState::WritePartRecord => self.handle_part_record_written(event),
@@ -418,12 +529,58 @@ impl Operation for UploadPartOperation {
 mod test {
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
     use aruna_core::structs::RealmId;
     use aruna_storage::storage;
     use tempfile::tempdir;
 
     fn test_user_id() -> UserId {
         UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]))
+    }
+
+    #[test]
+    fn part_follows_pin() {
+        // The pinned backend on the upload record reaches WritePart unchanged.
+        let upload_id = Ulid::generate();
+        let mut op = UploadPartOperation::new(UploadPartInput {
+            bucket: "mybucket".to_string(),
+            key: "object.txt".to_string(),
+            upload_id,
+            part_number: 2,
+            content_length: None,
+            body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+                &b"part"[..],
+            ))),
+            created_by: test_user_id(),
+            compressed: false,
+            encrypted: false,
+            expected_checksums: Vec::new(),
+        });
+        op.state = UploadPartState::ReadUpload;
+        let record = MultipartUpload {
+            upload_id,
+            backend: aruna_core::structs::BackendRef::Node("cold".to_string()),
+            storage_class: Some("cold".to_string()),
+            bucket: "mybucket".to_string(),
+            key: "object.txt".to_string(),
+            group_id: Ulid::generate(),
+            created_by: test_user_id(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            status: MultipartUploadStatus::Open,
+            checksum_hint: None,
+            metadata: std::collections::HashMap::new(),
+        };
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            value: Some(record.to_bytes().unwrap().into()),
+            key: upload_id.to_bytes().to_vec().into(),
+        }));
+
+        let [Effect::Blob(BlobEffect::WritePart { resolved, .. })] = effects.as_slice() else {
+            panic!("expected one part write, got {effects:?}")
+        };
+        assert_eq!(resolved.backend, record.backend);
+        assert_eq!(resolved.storage_class, record.storage_class);
     }
 
     #[test]
@@ -483,6 +640,209 @@ mod test {
             op.finalize(),
             Err(UploadPartError::BlobWriteFailed(_))
         ));
+    }
+
+    #[test]
+    fn refuses_disabled_backend() {
+        // The pin predates the disable, so only the finalize fence can catch it.
+        let backend_id = Ulid::from_bytes([5u8; 16]);
+        let mut op = upload_part_op(backend_id);
+        op.state = UploadPartState::StartTransaction;
+        op.written_location = Some(part_location(backend_id));
+
+        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([3u8; 16]),
+        }));
+        assert_eq!(op.state, UploadPartState::FenceBackend);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(disabled_record(backend_id).into()),
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Delete { .. })]
+        ));
+        op.step(Event::Blob(BlobEvent::DeleteFinished));
+        assert!(matches!(
+            op.finalize(),
+            Err(UploadPartError::BackendFenceError(
+                BackendFenceError::Unavailable
+            ))
+        ));
+    }
+
+    #[test]
+    fn fence_rejects_stray() {
+        let backend_id = Ulid::from_bytes([5u8; 16]);
+        let mut op = upload_part_op(backend_id);
+        op.state = UploadPartState::FenceBackend;
+        op.written_location = Some(part_location(backend_id));
+
+        op.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        op.step(Event::Blob(BlobEvent::DeleteFinished));
+
+        assert!(matches!(
+            op.finalize(),
+            Err(UploadPartError::BackendFenceError(BackendFenceError::Read(
+                _
+            )))
+        ));
+    }
+
+    #[test]
+    fn unknown_keeps_part() {
+        // Only a proven refusal rolls the part back; every other commit failure
+        // may already have committed the record that names these bytes, so the
+        // copy is handed to reconciliation instead of deleted or forgotten.
+        for error in [
+            StorageError::CommitFailed,
+            StorageError::PersistError("journal".to_string()),
+            StorageError::Timeout,
+        ] {
+            let mut op = upload_part_op(Ulid::from_bytes([5u8; 16]));
+            op.state = UploadPartState::CommitTransaction;
+            op.txn_id = Some(Ulid::from_bytes([3u8; 16]));
+            let upload_id = op.input.upload_id;
+            let location = op.written_location.clone().unwrap();
+
+            let effects = op.step(Event::Storage(StorageEvent::Error {
+                error: error.clone(),
+            }));
+
+            let [
+                Effect::Storage(StorageEffect::Write {
+                    key_space, value, ..
+                }),
+            ] = effects.as_slice()
+            else {
+                panic!("{error} must queue reconciliation, got {effects:?}")
+            };
+            assert_eq!(key_space, BLOB_CLEANUP_KEYSPACE);
+            assert_eq!(
+                BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
+                BlobCleanupWork::ReconcileWrite {
+                    location,
+                    owner: WriteOwner::UploadPart {
+                        upload_id,
+                        part_number: 1,
+                    },
+                }
+            );
+
+            op.step(Event::Storage(StorageEvent::WriteResult {
+                key: b"k".to_vec().into(),
+            }));
+            assert!(op.is_complete());
+            assert!(matches!(
+                op.finalize(),
+                Err(UploadPartError::StorageError(observed)) if observed == error
+            ));
+        }
+    }
+
+    #[test]
+    fn conflict_deletes_part() {
+        let mut op = upload_part_op(Ulid::from_bytes([5u8; 16]));
+        op.state = UploadPartState::CommitTransaction;
+        op.txn_id = Some(Ulid::from_bytes([3u8; 16]));
+
+        let effects = op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Delete { .. })]
+        ));
+        assert!(op.step(Event::Blob(BlobEvent::DeleteFinished)).is_empty());
+        assert!(matches!(
+            op.finalize(),
+            Err(UploadPartError::StorageError(
+                StorageError::TransactionConflict
+            ))
+        ));
+    }
+
+    #[test]
+    fn conflict_queues_delete() {
+        // A rollback delete the backend refuses has to survive as cleanup work.
+        let mut op = upload_part_op(Ulid::from_bytes([5u8; 16]));
+        op.state = UploadPartState::CommitTransaction;
+        op.txn_id = Some(Ulid::from_bytes([3u8; 16]));
+
+        op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+        let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::DeleteError(
+            "gone".to_string(),
+        ))));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Write { key_space, .. })]
+                if key_space == BLOB_CLEANUP_KEYSPACE
+        ));
+    }
+
+    fn upload_part_op(backend_id: Ulid) -> UploadPartOperation {
+        let mut op = UploadPartOperation::new(UploadPartInput {
+            bucket: "mybucket".to_string(),
+            key: "object.txt".to_string(),
+            upload_id: Ulid::generate(),
+            part_number: 1,
+            content_length: None,
+            body: None,
+            created_by: test_user_id(),
+            compressed: false,
+            encrypted: false,
+            expected_checksums: Vec::new(),
+        });
+        op.written_location = Some(part_location(backend_id));
+        op
+    }
+
+    fn part_location(backend_id: Ulid) -> BackendLocation {
+        BackendLocation {
+            backend: aruna_core::structs::BackendRef::Group(backend_id),
+            storage_class: None,
+            root: "root".to_string(),
+            storage_bucket: "storage".to_string(),
+            backend_path: "mybucket/object.txt".to_string(),
+            ulid: Ulid::from_bytes([6u8; 16]),
+            compressed: false,
+            encrypted: false,
+            created_by: test_user_id(),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 4,
+            hashes: std::collections::HashMap::new(),
+        }
+    }
+
+    fn disabled_record(backend_id: Ulid) -> Vec<u8> {
+        aruna_core::structs::GroupStorageBackend {
+            backend_id,
+            group_id: Ulid::from_bytes([7u8; 16]),
+            name: "tenant".to_string(),
+            kind: aruna_core::structs::GroupBackendKind::S3,
+            public_config: std::collections::HashMap::new(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            disabled: true,
+            cleanup: aruna_core::structs::CleanupStrategy::Retain,
+        }
+        .to_bytes()
+        .unwrap()
     }
 
     #[tokio::test]

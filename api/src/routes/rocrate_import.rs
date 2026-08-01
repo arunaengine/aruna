@@ -645,7 +645,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE};
     use aruna_core::structs::{
-        Actor, Backend, BackendConfig, BackendLocation, BucketInfo, Group,
+        Actor, Backend, BackendConfig, BackendLocation, BackendRef, BucketInfo, Group,
         GroupAuthorizationDocument, NodeCapabilities, PathRestriction, RealmAuthorizationDocument,
         RealmId, RoCrateLimits, RoCrateUploadRecord,
     };
@@ -757,6 +757,7 @@ mod tests {
             created_by: user,
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         };
         write_doc(
             state,
@@ -778,6 +779,8 @@ mod tests {
             upload_id,
             owner,
             location: BackendLocation {
+                backend: BackendRef::node_default(),
+                storage_class: None,
                 root: "/data".to_string(),
                 storage_bucket: "storage".to_string(),
                 backend_path: format!("_jobs/{upload_id}/input"),

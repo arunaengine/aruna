@@ -1193,6 +1193,7 @@ fn map_snapshot_error(error: MaterializeSnapshotError) -> ServerError {
         MaterializeSnapshotError::Conversion(error) => {
             ServerError::InternalError(error.to_string())
         }
+        MaterializeSnapshotError::Routing(error) => ServerError::InternalError(error.to_string()),
     }
 }
 
@@ -1304,10 +1305,10 @@ mod tests {
         BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
     use aruna_core::structs::{
-        Actor, BackendLocation, BlobHeadKey, BlobVersion, CurrentVersionPointer, Group,
-        GroupAuthorizationDocument, NodeCapabilities, PathRestriction, PortableSourceDescriptor,
-        RealmAuthorizationDocument, RealmConfigDocument, SourceConnectorKind, SourceMetadata,
-        StagingStrategy, VersionKey, VersionSourceBinding,
+        Actor, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
+        CurrentVersionPointer, Group, GroupAuthorizationDocument, NodeCapabilities,
+        PathRestriction, PortableSourceDescriptor, RealmAuthorizationDocument, RealmConfigDocument,
+        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::replication::queue::{
@@ -1700,6 +1701,8 @@ mod tests {
         let created_by = test.auth_with_bucket_read.user_id;
         let materialized_hash = [21u8; 32];
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: "materialized".to_string(),
@@ -1716,7 +1719,9 @@ mod tests {
         write_doc(
             &test.state.get_ctx(),
             BLOB_LOCATIONS_KEYSPACE,
-            materialized_hash.to_vec().into(),
+            BlobLocationKey::new(materialized_hash, location.backend.clone())
+                .to_bytes()
+                .into(),
             location.to_bytes().unwrap().into(),
         )
         .await;
@@ -1725,7 +1730,13 @@ mod tests {
                 &test.state.get_ctx(),
                 &test.bucket,
                 key,
-                BlobVersion::materialized(materialized_hash, UNIX_EPOCH, created_by, None),
+                BlobVersion::materialized(
+                    materialized_hash,
+                    BackendRef::node_default(),
+                    UNIX_EPOCH,
+                    created_by,
+                    None,
+                ),
             )
             .await;
         }
@@ -1938,6 +1949,7 @@ mod tests {
             created_by: user_with_source_read,
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         };
         write_doc(
             &driver_ctx,

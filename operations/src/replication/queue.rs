@@ -26,7 +26,7 @@ use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use ulid::Ulid;
 
 use super::protocol::{ReplicationMode, SyncOrigin};
@@ -34,7 +34,7 @@ use super::version_replication::{
     ReplicateScopeError, ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
 };
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, quota_marked_routing};
 use crate::notifications::watch::emit::emit_resource_watch_event;
 use crate::queue_backoff::queue_retry_after_ms;
 use crate::s3::get_bucket_info::GetBucketInfoOperation;
@@ -1472,7 +1472,17 @@ async fn process_blob_replication_job(
     context: &DriverContext,
     job: &BlobReplicationJobRecord,
 ) -> Result<BlobReplicationJobOutcome, String> {
-    let mut operation = ReplicateScopeOperation::new(job.input.clone());
+    let routing = match quota_marked_routing(context).await {
+        Ok(routing) => routing,
+        // Retrying a record that will never decode only pins the queue at its
+        // backoff ceiling; the drain repair re-enqueues once it is repaired.
+        Err(error) if error.storage().is_none() => {
+            error!(error = %error, "Dropping blob replication job with undecodable routing inputs");
+            return Ok(BlobReplicationJobOutcome::TerminalFailure);
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut operation = ReplicateScopeOperation::new(job.input.clone()).with_routing(routing);
     let mut watch_group_id = None;
     let mut relationship = if let Some(relationship_id) = job.relationship_id {
         let relationship = read_relationships(&context.storage_handle, &job.input.bucket)
@@ -2198,7 +2208,7 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
     use aruna_core::structs::{
-        Actor, ArunaArn, BlobVersion, BucketInfo, BucketReplicationTarget,
+        Actor, ArunaArn, BackendRef, BlobVersion, BucketInfo, BucketReplicationTarget,
         GroupAuthorizationDocument, RealmAuthorizationDocument, RealmId, ReferenceHandling,
         SyncStatusSnapshot, VersionKey, sync_relationship_key,
     };
@@ -2311,6 +2321,7 @@ mod tests {
             created_by: user(),
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         };
         match storage
             .send_storage_effect(StorageEffect::Write {
@@ -2384,6 +2395,7 @@ mod tests {
             created_by: user(),
             cors_configuration: None,
             replication: Some(config),
+            storage_routing: Vec::new(),
         };
         match storage
             .send_storage_effect(StorageEffect::Write {
@@ -2484,7 +2496,13 @@ mod tests {
         key: &str,
         version_id: Ulid,
     ) {
-        let version = BlobVersion::materialized([7u8; 32], SystemTime::UNIX_EPOCH, user(), None);
+        let version = BlobVersion::materialized(
+            [7u8; 32],
+            BackendRef::node_default(),
+            SystemTime::UNIX_EPOCH,
+            user(),
+            None,
+        );
         match storage
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_VERSIONS_KEYSPACE.to_string(),

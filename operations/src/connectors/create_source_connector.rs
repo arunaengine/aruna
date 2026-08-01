@@ -231,7 +231,10 @@ mod tests {
                     ("bucket".to_string(), "reads".to_string()),
                     ("endpoint".to_string(), "https://s3.example.org".to_string()),
                 ]),
-                secret_config: HashMap::from([("access_key_id".to_string(), "secret".to_string())]),
+                secret_config: HashMap::from([
+                    ("access_key_id".to_string(), "AKIA".to_string()),
+                    ("secret_access_key".to_string(), "secret".to_string()),
+                ]),
             }),
             &context,
         )

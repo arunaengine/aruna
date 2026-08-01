@@ -7,6 +7,7 @@ pub mod auth;
 pub mod compute;
 pub mod document;
 pub mod effects;
+pub mod egress;
 pub mod errors;
 pub mod events;
 pub mod handle;

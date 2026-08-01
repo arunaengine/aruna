@@ -1,27 +1,35 @@
-use super::backend::{build_backend_path, rebuild_backend_path};
+use super::backend::{build_backend_path, build_multipart_part_path, rebuild_backend_path};
 use super::{
-    BlobHandle, BlobHandler, ControlPlaneTimeoutKind,
+    BackendRegistry, BlobHandle, BlobHandler, ControlPlaneTimeoutKind, NodeBackend,
     control_plane::control_plane_timeout_event,
     control_plane::{
         parse_replication_init, validate_replication_init_ack, with_control_plane_timeout,
     },
 };
 use crate::messages::{MessageType, ReplicationMessage};
+use crate::s3::make_bucket;
 use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{BlobEffect, StagingSourceEffect, StorageEffect};
+use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
-use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB, HASH_PATHS_INDEX_KEYSPACE};
+use aruna_core::keyspaces::{
+    BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB, GROUP_STORAGE_BACKEND_KEYSPACE,
+    GROUP_STORAGE_BACKEND_SECRET_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+};
 use aruna_core::stream::BackendStream;
+use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::{
-    Backend, BackendConfig, BackendLocation, BlobTimeoutConfig, HiddenBlobKey, RealmId,
-    ResolvedSourceAccess, SourceConnectorKind,
+    Backend, BackendConfig, BackendLocation, BackendRef, BlobTimeoutConfig, GroupBackendKind,
+    GroupStorageBackend, GroupStorageBackendSecret, HiddenBlobKey, MultipartUploadPartKey, RealmId,
+    ResolvedBackend, ResolvedSourceAccess, SourceConnectorKind, Status,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::storage;
 use futures::TryStreamExt;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tempfile::tempdir;
 use ulid::Ulid;
@@ -192,11 +200,18 @@ fn stream_from_bytes(
     )))
 }
 
-async fn bucket_load(storage_handle: &storage::StorageHandle, bucket: &str) -> u64 {
+async fn bucket_load(
+    storage_handle: &storage::StorageHandle,
+    backend: &BackendRef,
+    bucket: &str,
+) -> u64 {
+    let mut key = backend.key_bytes();
+    key.push(0);
+    key.extend_from_slice(bucket.as_bytes());
     let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: BUCKET_STATS_DB.to_string(),
-            key: bucket.as_bytes().to_vec().into(),
+            key: key.into(),
             txn_id: None,
         })
         .await
@@ -231,6 +246,8 @@ fn test_user_id() -> UserId {
 
 fn make_test_location() -> BackendLocation {
     BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
         root: "/tmp".to_string(),
         storage_bucket: "bucket".to_string(),
         backend_path: format!("blob/{}", Ulid::generate()),
@@ -244,6 +261,326 @@ fn make_test_location() -> BackendLocation {
         blob_size: 32,
         hashes: HashMap::new(),
     }
+}
+
+fn filesystem_backend(root: &str, prefix: &str, parts: &str) -> BackendConfig {
+    std::fs::create_dir_all(root).unwrap();
+    BackendConfig {
+        backend_type: Backend::FileSystem,
+        root: root.to_string(),
+        service_config: HashMap::new(),
+        bucket_prefix: Some(prefix.to_string()),
+        max_bucket_size: Some(4),
+        multipart_bucket: Some(parts.to_string()),
+        timeouts: Default::default(),
+    }
+}
+
+// Two filesystem backends with distinct roots are the multi-backend fixture:
+// deterministic, hermetic, and enough to prove registry dispatch.
+async fn setup_two_backends() -> TestContext {
+    let temp_dir = tempdir().unwrap();
+    let temp_root = temp_dir.path().to_str().unwrap().to_string();
+    let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
+    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+        .await
+        .unwrap();
+    let mut backends = std::collections::BTreeMap::new();
+    backends.insert(
+        "default".to_string(),
+        std::sync::Arc::new(NodeBackend::new(
+            filesystem_backend(&format!("{temp_root}/hot"), "hot-", "hot-parts"),
+            None,
+        )),
+    );
+    backends.insert(
+        "cold".to_string(),
+        std::sync::Arc::new(NodeBackend::new(
+            filesystem_backend(&format!("{temp_root}/cold"), "cold-", "cold-parts"),
+            Some("cold".to_string()),
+        )),
+    );
+    let registry = BackendRegistry::new(backends, "default".to_string()).unwrap();
+    let blob_handle = BlobHandler::with_registry(
+        registry,
+        storage_handle.clone(),
+        net_handle,
+        EgressPolicy::loopback(),
+    )
+    .await
+    .unwrap();
+
+    TestContext {
+        _temp_dir: temp_dir,
+        blob_handle,
+        storage_handle,
+    }
+}
+
+fn cold_backend() -> ResolvedBackend {
+    ResolvedBackend::new(
+        BackendRef::Node("cold".to_string()),
+        Some("cold".to_string()),
+    )
+}
+
+/// Backend-agnostic assertion path: reads through the handler instead of the
+/// filesystem, so a mixed-backend test never pins one backend's layout.
+async fn read_back(handler: &BlobHandler, location: BackendLocation) -> Vec<u8> {
+    let BlobEvent::ReadFinished { blob, .. } = handler.read_blob(location).await else {
+        panic!("read failed")
+    };
+    let chunks: Vec<bytes::Bytes> = blob.try_collect().await.unwrap();
+    chunks.concat()
+}
+
+#[tokio::test]
+async fn copies_across_backends() {
+    // UploadPartCopy shape: source on the default backend, part pinned to cold.
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+
+    let BlobEvent::WriteFinished { location: source } = handler
+        .write_blob(
+            "bucket",
+            "source.bin",
+            ResolvedBackend::node_default(),
+            test_user_id(),
+            stream_from_bytes(b"copied bytes"),
+        )
+        .await
+    else {
+        panic!("source write failed")
+    };
+
+    let BlobEvent::ReadFinished { blob, .. } = handler.read_blob(source.clone()).await else {
+        panic!("source read failed")
+    };
+    let BlobEvent::WriteFinished { location: part } = handler
+        .write_blob_part(
+            MultipartUploadPartKey::new(Ulid::generate(), 1),
+            cold_backend(),
+            test_user_id(),
+            false,
+            false,
+            blob,
+        )
+        .await
+    else {
+        panic!("part write failed")
+    };
+
+    assert_eq!(part.backend, BackendRef::Node("cold".to_string()));
+    assert!(part.backend_path.starts_with("_parts/"));
+
+    let BlobEvent::WriteFinished { location: composed } = handler
+        .compose_blob(
+            "bucket",
+            "target.bin",
+            cold_backend(),
+            test_user_id(),
+            vec![part],
+        )
+        .await
+    else {
+        panic!("compose failed")
+    };
+
+    assert_eq!(composed.backend, BackendRef::Node("cold".to_string()));
+    assert_eq!(read_back(&handler, composed).await, b"copied bytes");
+    assert_eq!(read_back(&handler, source).await, b"copied bytes");
+}
+
+#[test]
+fn registry_reads_config() {
+    // The parsed backends file is the only source of names, classes and rules.
+    let file = aruna_core::structs::BackendsFile::parse(
+        r#"
+[backend.hot]
+type = "filesystem"
+root = "/data/hot"
+multipart_bucket = "hot-parts"
+default = true
+
+[backend.cold]
+type = "filesystem"
+class = "cold"
+root = "/data/cold"
+multipart_bucket = "cold-parts"
+
+[[routing]]
+key_prefix = "archive/"
+target = { class = "cold" }
+
+[egress]
+serve_group_backends = false
+"#,
+    )
+    .unwrap();
+    let config = file
+        .resolve(&|_| None, BlobTimeoutConfig::default())
+        .unwrap();
+
+    let registry = BackendRegistry::from_config(&config).unwrap();
+    let routing = registry.routing();
+
+    assert_eq!(registry.default_name(), "hot");
+    assert_eq!(registry.entries().count(), 2);
+    assert_eq!(routing.rules.len(), 1);
+    assert_eq!(routing.catalog.class_of("cold"), Some("cold"));
+    let snapshot = routing.snapshot(Ulid::from_bytes([1u8; 16]));
+    assert_eq!(
+        aruna_core::structs::resolve_backend(&snapshot, "bucket", "archive/one").unwrap(),
+        ResolvedBackend::new(
+            BackendRef::Node("cold".to_string()),
+            Some("cold".to_string())
+        )
+    );
+    assert_eq!(
+        aruna_core::structs::resolve_backend(&snapshot, "bucket", "other").unwrap(),
+        ResolvedBackend::new(BackendRef::Node("hot".to_string()), None)
+    );
+    assert_eq!(
+        aruna_core::structs::resolve_backend(
+            &snapshot.with_group_default(Some(aruna_core::structs::RoutingTarget::Backend(
+                BackendRef::Group(Ulid::from_bytes([2u8; 16]))
+            ))),
+            "bucket",
+            "other"
+        ),
+        Err(aruna_core::structs::RoutingError::GroupEgressDisabled)
+    );
+}
+
+#[tokio::test]
+async fn routes_write_backend() {
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+
+    let BlobEvent::WriteFinished { location } = handler
+        .write_blob(
+            "bucket",
+            "cold.bin",
+            cold_backend(),
+            test_user_id(),
+            stream_from_bytes(b"cold"),
+        )
+        .await
+    else {
+        panic!("cold write failed")
+    };
+
+    assert_eq!(location.backend, BackendRef::Node("cold".to_string()));
+    assert_eq!(location.storage_class.as_deref(), Some("cold"));
+    assert!(location.storage_bucket.starts_with("cold-"));
+    assert!(std::path::Path::new(&location.get_full_path().unwrap()).exists());
+    assert!(matches!(
+        handler.read_blob(location).await,
+        BlobEvent::ReadFinished { .. }
+    ));
+}
+
+#[tokio::test]
+async fn stats_keys_qualify() {
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+
+    let BlobEvent::WriteFinished { location: hot } = handler
+        .write_blob(
+            "bucket",
+            "hot.bin",
+            handler.registry.default_resolved(),
+            test_user_id(),
+            stream_from_bytes(b"hot"),
+        )
+        .await
+    else {
+        panic!("hot write failed")
+    };
+    let BlobEvent::WriteFinished { location: cold } = handler
+        .write_blob(
+            "bucket",
+            "cold.bin",
+            cold_backend(),
+            test_user_id(),
+            stream_from_bytes(b"cold"),
+        )
+        .await
+    else {
+        panic!("cold write failed")
+    };
+
+    assert_ne!(hot.storage_bucket, cold.storage_bucket);
+    assert_eq!(
+        bucket_load(&context.storage_handle, &hot.backend, &hot.storage_bucket).await,
+        1
+    );
+    assert_eq!(
+        bucket_load(&context.storage_handle, &cold.backend, &cold.storage_bucket).await,
+        1
+    );
+    // The other backend's qualifier must not see the same bucket name.
+    assert_eq!(
+        bucket_load(&context.storage_handle, &cold.backend, &hot.storage_bucket).await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn read_rejects_unknown() {
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+
+    let mut location = make_test_location();
+    location.backend = BackendRef::Node("removed".to_string());
+    location
+        .hashes
+        .insert(HASH_BLAKE3.to_string(), vec![0u8; 32]);
+
+    assert!(matches!(
+        handler.read_blob(location.clone()).await,
+        BlobEvent::Error(BlobError::UnknownBackend(_))
+    ));
+    assert!(matches!(
+        handler.delete_blob(location).await,
+        BlobEvent::Error(BlobError::UnknownBackend(_))
+    ));
+}
+
+#[tokio::test]
+async fn backends_track_health() {
+    let context = setup_two_backends().await;
+    let registry = context.blob_handle.handler.registry.clone();
+
+    assert_eq!(registry.entries().count(), 2);
+    for (_, backend) in registry.entries() {
+        assert_eq!(*backend.status.read().await, Status::Available);
+    }
+    assert_eq!(registry.catalog().class_of("cold"), Some("cold"));
+    assert!(registry.catalog().class_of("default").is_none());
+}
+
+#[tokio::test]
+async fn pins_part_area() {
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+
+    let BlobEvent::WriteFinished { location } = handler
+        .write_blob_part(
+            MultipartUploadPartKey::new(Ulid::generate(), 1),
+            cold_backend(),
+            test_user_id(),
+            false,
+            false,
+            stream_from_bytes(b"part"),
+        )
+        .await
+    else {
+        panic!("part write failed")
+    };
+
+    assert_eq!(location.backend, BackendRef::Node("cold".to_string()));
+    assert_eq!(location.storage_bucket, "cold-parts");
 }
 
 #[test]
@@ -415,6 +752,7 @@ async fn reuses_bucket_until_max_object_count_is_reached() {
     let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
             bucket: "bucket-a".to_string(),
             key: "one.bin".to_string(),
             created_by: test_user_id(),
@@ -428,6 +766,7 @@ async fn reuses_bucket_until_max_object_count_is_reached() {
     let Event::Blob(BlobEvent::WriteFinished { location: second }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
             bucket: "bucket-a".to_string(),
             key: "two.bin".to_string(),
             created_by: test_user_id(),
@@ -441,7 +780,12 @@ async fn reuses_bucket_until_max_object_count_is_reached() {
     assert_eq!(first.storage_bucket, second.storage_bucket);
     assert!(first.storage_bucket.starts_with("aruna-test-"));
     assert_eq!(
-        bucket_load(&context.storage_handle, &first.storage_bucket).await,
+        bucket_load(
+            &context.storage_handle,
+            &BackendRef::node_default(),
+            &first.storage_bucket
+        )
+        .await,
         2
     );
 }
@@ -476,6 +820,7 @@ async fn creates_new_bucket_after_reaching_max_object_count() {
     let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
             bucket: "bucket-a".to_string(),
             key: "one.bin".to_string(),
             created_by: test_user_id(),
@@ -489,6 +834,7 @@ async fn creates_new_bucket_after_reaching_max_object_count() {
     let Event::Blob(BlobEvent::WriteFinished { location: second }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
             bucket: "bucket-a".to_string(),
             key: "two.bin".to_string(),
             created_by: test_user_id(),
@@ -501,11 +847,21 @@ async fn creates_new_bucket_after_reaching_max_object_count() {
 
     assert_ne!(first.storage_bucket, second.storage_bucket);
     assert_eq!(
-        bucket_load(&context.storage_handle, &first.storage_bucket).await,
+        bucket_load(
+            &context.storage_handle,
+            &BackendRef::node_default(),
+            &first.storage_bucket
+        )
+        .await,
         1
     );
     assert_eq!(
-        bucket_load(&context.storage_handle, &second.storage_bucket).await,
+        bucket_load(
+            &context.storage_handle,
+            &BackendRef::node_default(),
+            &second.storage_bucket
+        )
+        .await,
         1
     );
 }
@@ -517,6 +873,7 @@ async fn deleting_last_object_keeps_bucket_stat_row_at_zero_for_reuse() {
     let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
             bucket: "bucket-a".to_string(),
             key: "one.bin".to_string(),
             created_by: test_user_id(),
@@ -538,13 +895,19 @@ async fn deleting_last_object_keeps_bucket_stat_row_at_zero_for_reuse() {
     };
 
     assert_eq!(
-        bucket_load(&context.storage_handle, &first.storage_bucket).await,
+        bucket_load(
+            &context.storage_handle,
+            &BackendRef::node_default(),
+            &first.storage_bucket
+        )
+        .await,
         0
     );
 
     let Event::Blob(BlobEvent::WriteFinished { location: second }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
             bucket: "bucket-a".to_string(),
             key: "two.bin".to_string(),
             created_by: test_user_id(),
@@ -557,7 +920,12 @@ async fn deleting_last_object_keeps_bucket_stat_row_at_zero_for_reuse() {
 
     assert_eq!(first.storage_bucket, second.storage_bucket);
     assert_eq!(
-        bucket_load(&context.storage_handle, &first.storage_bucket).await,
+        bucket_load(
+            &context.storage_handle,
+            &BackendRef::node_default(),
+            &first.storage_bucket
+        )
+        .await,
         1
     );
 }
@@ -569,6 +937,7 @@ async fn multipart_part_bucket_is_excluded_from_bucket_stats() {
     let Event::Blob(BlobEvent::WriteFinished { location }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::WritePart {
+            resolved: ResolvedBackend::node_default(),
             upload_id: Ulid::generate(),
             part_number: 1,
             created_by: test_user_id(),
@@ -583,7 +952,12 @@ async fn multipart_part_bucket_is_excluded_from_bucket_stats() {
 
     assert_eq!(location.storage_bucket, "uploaded-parts");
     assert_eq!(
-        bucket_load(&context.storage_handle, "uploaded-parts").await,
+        bucket_load(
+            &context.storage_handle,
+            &BackendRef::node_default(),
+            "uploaded-parts"
+        )
+        .await,
         0
     );
 }
@@ -734,6 +1108,76 @@ async fn hidden_spool_limits() {
 }
 
 #[tokio::test]
+async fn sweeps_demoted_backend() {
+    // A changed default must not hide the old backend's crash leftovers.
+    let temp_dir = tempdir().unwrap();
+    let temp_root = temp_dir.path().to_str().unwrap().to_string();
+    let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
+    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+        .await
+        .unwrap();
+    let backends = std::collections::BTreeMap::from([
+        (
+            "hot".to_string(),
+            std::sync::Arc::new(NodeBackend::new(
+                filesystem_backend(&format!("{temp_root}/hot"), "hot-", "hot-parts"),
+                None,
+            )),
+        ),
+        (
+            "cold".to_string(),
+            std::sync::Arc::new(NodeBackend::new(
+                filesystem_backend(&format!("{temp_root}/cold"), "cold-", "cold-parts"),
+                None,
+            )),
+        ),
+    ]);
+
+    let namespace = Ulid::from_bytes([9u8; 16]);
+    let before = BlobHandler::with_registry(
+        BackendRegistry::new(backends.clone(), "hot".to_string()).unwrap(),
+        storage_handle.clone(),
+        net_handle.clone(),
+        EgressPolicy::loopback(),
+    )
+    .await
+    .unwrap();
+    let Event::Blob(BlobEvent::HiddenSpooled { location, .. }) = before
+        .send_blob_effect(BlobEffect::SpoolHidden {
+            namespace,
+            name: "leftover".to_string(),
+            created_by: test_user_id(),
+            max_bytes: None,
+            blob: stream_from_bytes(b"leftover"),
+        })
+        .await
+    else {
+        panic!("hidden spool failed")
+    };
+    assert_eq!(location.backend, BackendRef::Node("hot".to_string()));
+
+    let after = BlobHandler::with_registry(
+        BackendRegistry::new(backends, "cold".to_string()).unwrap(),
+        storage_handle,
+        net_handle,
+        EgressPolicy::loopback(),
+    )
+    .await
+    .unwrap();
+    let Event::Blob(BlobEvent::HiddenListed { entries }) = after
+        .send_blob_effect(BlobEffect::ListHidden {
+            namespace: Some(namespace),
+        })
+        .await
+    else {
+        panic!("hidden list failed")
+    };
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].key, HiddenBlobKey::try_from(&location).unwrap());
+}
+
+#[tokio::test]
 async fn range_passes_writes() {
     // Import readers fetch hidden ranges while a write consumes their payload.
     let context = setup_blob_handle(5).await;
@@ -767,6 +1211,7 @@ async fn range_passes_writes() {
     let write_task = tokio::spawn(async move {
         write_handle
             .send_blob_effect(BlobEffect::Write {
+                resolved: ResolvedBackend::node_default(),
                 bucket: "target".to_string(),
                 key: "object".to_string(),
                 created_by: test_user_id(),
@@ -827,6 +1272,7 @@ async fn interlocked_writes_complete() {
             }));
             handle
                 .send_blob_effect(BlobEffect::Write {
+                    resolved: ResolvedBackend::node_default(),
                     bucket: "bucket".to_string(),
                     key: format!("object-{index}"),
                     created_by: test_user_id(),
@@ -854,6 +1300,7 @@ async fn tracks_concurrent_loads() {
     let Event::Blob(BlobEvent::WriteFinished { location }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
             bucket: "bucket".to_string(),
             key: "seed".to_string(),
             created_by: test_user_id(),
@@ -876,6 +1323,7 @@ async fn tracks_concurrent_loads() {
             }));
             handle
                 .send_blob_effect(BlobEffect::Write {
+                    resolved: ResolvedBackend::node_default(),
                     bucket: "bucket".to_string(),
                     key: format!("object-{index}"),
                     created_by: test_user_id(),
@@ -894,7 +1342,12 @@ async fn tracks_concurrent_loads() {
             Event::Blob(BlobEvent::WriteFinished { .. })
         ));
     }
-    let load = bucket_load(&context.storage_handle, &location.storage_bucket).await;
+    let load = bucket_load(
+        &context.storage_handle,
+        &BackendRef::node_default(),
+        &location.storage_bucket,
+    )
+    .await;
     assert_eq!(load, 1 + writers as u64);
 }
 
@@ -995,6 +1448,8 @@ async fn write_finalization_failure_emits_no_success_or_load() {
     let context = setup_blob_handle(1).await;
     let handler = context.blob_handle.handler.clone();
     let location = BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
         root: "/tmp".to_string(),
         storage_bucket: "finalization-bucket".to_string(),
         backend_path: format!("obj/{}", Ulid::generate()),
@@ -1019,7 +1474,12 @@ async fn write_finalization_failure_emits_no_success_or_load() {
         "close failure must surface as an error, got {event:?}"
     );
     assert_eq!(
-        bucket_load(&context.storage_handle, &location.storage_bucket).await,
+        bucket_load(
+            &context.storage_handle,
+            &BackendRef::node_default(),
+            &location.storage_bucket
+        )
+        .await,
         0
     );
     assert_eq!(aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -1030,6 +1490,8 @@ async fn failed_write_cleans() {
     let context = setup_blob_handle(1).await;
     let root = tempdir().unwrap();
     let location = BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
         root: root.path().to_str().unwrap().to_string(),
         storage_bucket: "bucket".to_string(),
         backend_path: "partial.bin".to_string(),
@@ -1049,6 +1511,7 @@ async fn failed_write_cleans() {
             "root".to_string(),
             root.path().to_str().unwrap().to_string(),
         )]),
+        &crate::egress::EgressGuard::new(aruna_core::egress::EgressPolicy::loopback()).unwrap(),
     )
     .unwrap();
     let blob = BackendStream::new(futures::stream::iter([
@@ -1080,6 +1543,7 @@ async fn compose_close_fails() {
     let Event::Blob(BlobEvent::WriteFinished { location: part }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
             bucket: "bucket-a".to_string(),
             key: "part.bin".to_string(),
             created_by: test_user_id(),
@@ -1091,6 +1555,8 @@ async fn compose_close_fails() {
     };
 
     let target = BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
         root: "/tmp".to_string(),
         storage_bucket: "compose-target".to_string(),
         backend_path: format!("obj/{}", Ulid::generate()),
@@ -1115,7 +1581,12 @@ async fn compose_close_fails() {
         "compose close failure must surface as an error, got {event:?}"
     );
     assert_eq!(
-        bucket_load(&context.storage_handle, &target.storage_bucket).await,
+        bucket_load(
+            &context.storage_handle,
+            &BackendRef::node_default(),
+            &target.storage_bucket
+        )
+        .await,
         0
     );
     assert_eq!(aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -1156,12 +1627,25 @@ fn build_backend_path_rejects_traversal_keys() {
 #[test]
 fn reserved_bucket_rejected() {
     let ulid = Ulid::generate();
-    for bucket in ["_jobs", "./_jobs"] {
+    for bucket in ["_jobs", "./_jobs", "_parts", "./_parts"] {
         assert!(matches!(
             build_backend_path(bucket, "object", ulid),
             Err(ConversionError::UnsafePath(_))
         ));
     }
+}
+
+#[test]
+fn isolates_tenant_parts() {
+    // In-flight parts must not share the container namespace with objects.
+    let upload_id = Ulid::generate();
+    let path = build_multipart_part_path(upload_id, 1, Ulid::generate());
+
+    assert!(path.starts_with(&format!("_parts/{upload_id}/")));
+    assert!(matches!(
+        build_backend_path("_parts", "object", Ulid::generate()),
+        Err(ConversionError::UnsafePath(_))
+    ));
 }
 
 #[test]
@@ -1199,6 +1683,7 @@ async fn read_holds_permit() {
     let Event::Blob(BlobEvent::WriteFinished { location }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
             bucket: "bucket".to_string(),
             key: "object".to_string(),
             created_by: test_user_id(),
@@ -1242,6 +1727,7 @@ async fn reservation_forces_rollover() {
             }));
             handle
                 .send_blob_effect(BlobEffect::Write {
+                    resolved: ResolvedBackend::node_default(),
                     bucket: "bucket".to_string(),
                     key: format!("object-{index}"),
                     created_by: test_user_id(),
@@ -1267,6 +1753,409 @@ async fn reservation_forces_rollover() {
     buckets.dedup();
     assert_eq!(buckets.len(), writers);
     for bucket in buckets {
-        assert_eq!(bucket_load(&context.storage_handle, &bucket).await, 1);
+        assert_eq!(
+            bucket_load(
+                &context.storage_handle,
+                &BackendRef::node_default(),
+                &bucket
+            )
+            .await,
+            1
+        );
     }
+}
+
+/// Coverage against a real S3 endpoint. Every test returns early when the
+/// endpoint variables are unset, so the default lane stays filesystem-only.
+struct S3Env {
+    endpoint: String,
+    access_key: String,
+    secret_key: String,
+    region: String,
+}
+
+fn s3_env() -> Option<S3Env> {
+    Some(S3Env {
+        endpoint: std::env::var("ARUNA_TEST_S3_ENDPOINT").ok()?,
+        access_key: std::env::var("ARUNA_TEST_S3_ACCESS_KEY").ok()?,
+        secret_key: std::env::var("ARUNA_TEST_S3_SECRET_KEY").ok()?,
+        region: std::env::var("ARUNA_TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
+    })
+}
+
+fn s3_config(env: &S3Env, bucket: Option<&str>) -> HashMap<String, String> {
+    let mut config = HashMap::from([
+        ("endpoint".to_string(), env.endpoint.clone()),
+        ("region".to_string(), env.region.clone()),
+        ("access_key_id".to_string(), env.access_key.clone()),
+        ("secret_access_key".to_string(), env.secret_key.clone()),
+        ("force_path_style".to_string(), "true".to_string()),
+    ]);
+    if let Some(bucket) = bucket {
+        config.insert("bucket".to_string(), bucket.to_string());
+    }
+    config
+}
+
+fn unique_name(prefix: &str) -> String {
+    format!("{prefix}{}", Ulid::generate().to_string().to_lowercase())
+}
+
+/// A filesystem default plus an S3 `cold` backend, so one handler covers mixed
+/// routing without a second fixture.
+async fn setup_s3_mixed(env: &S3Env) -> TestContext {
+    let temp_dir = tempdir().unwrap();
+    let temp_root = temp_dir.path().to_str().unwrap().to_string();
+    let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
+    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+        .await
+        .unwrap();
+    let mut backends = std::collections::BTreeMap::new();
+    backends.insert(
+        "default".to_string(),
+        std::sync::Arc::new(NodeBackend::new(
+            filesystem_backend(&format!("{temp_root}/hot"), "hot-", "hot-parts"),
+            None,
+        )),
+    );
+    backends.insert(
+        "cold".to_string(),
+        std::sync::Arc::new(NodeBackend::new(
+            BackendConfig {
+                backend_type: Backend::S3,
+                root: String::new(),
+                service_config: s3_config(env, None),
+                bucket_prefix: Some(unique_name("aruna-cold-")),
+                max_bucket_size: None,
+                multipart_bucket: Some(unique_name("aruna-parts-")),
+                timeouts: Default::default(),
+            },
+            Some("cold".to_string()),
+        )),
+    );
+    let registry = BackendRegistry::new(backends, "default".to_string()).unwrap();
+    let blob_handle = BlobHandler::with_registry(
+        registry,
+        storage_handle.clone(),
+        net_handle,
+        EgressPolicy::loopback(),
+    )
+    .await
+    .unwrap();
+
+    TestContext {
+        _temp_dir: temp_dir,
+        blob_handle,
+        storage_handle,
+    }
+}
+
+#[tokio::test]
+async fn s3_roundtrip_range() {
+    let Some(env) = s3_env() else { return };
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+
+    let BlobEvent::WriteFinished { location } = handler
+        .write_blob(
+            "bucket",
+            "object.bin",
+            cold_backend(),
+            test_user_id(),
+            stream_from_bytes(b"0123456789"),
+        )
+        .await
+    else {
+        panic!("s3 write failed")
+    };
+
+    assert_eq!(location.backend, BackendRef::Node("cold".to_string()));
+    assert_eq!(read_back(&handler, location.clone()).await, b"0123456789");
+
+    let BlobEvent::ReadFinished { blob, .. } =
+        handler.read_blob_range(location.clone(), 2..5).await
+    else {
+        panic!("s3 range read failed")
+    };
+    let chunks: Vec<bytes::Bytes> = blob.try_collect().await.unwrap();
+    assert_eq!(chunks.concat(), b"234");
+
+    assert!(matches!(
+        handler.delete_blob(location.clone()).await,
+        BlobEvent::DeleteFinished
+    ));
+    // S3 readers open lazily, so absence surfaces either now or while draining.
+    let gone = match handler.read_blob(location).await {
+        BlobEvent::Error(_) => true,
+        BlobEvent::ReadFinished { blob, .. } => {
+            blob.try_collect::<Vec<bytes::Bytes>>().await.is_err()
+        }
+        other => panic!("unexpected read event {other:?}"),
+    };
+    assert!(gone, "deleted object must not be readable");
+}
+
+#[tokio::test]
+async fn s3_multipart_compose() {
+    let Some(env) = s3_env() else { return };
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+    let upload_id = Ulid::generate();
+
+    let mut parts = Vec::new();
+    for (number, payload) in [(1u16, b"first-".to_vec()), (2, b"second".to_vec())] {
+        let BlobEvent::WriteFinished { location } = handler
+            .write_blob_part(
+                MultipartUploadPartKey::new(upload_id, number),
+                cold_backend(),
+                test_user_id(),
+                false,
+                false,
+                stream_from_bytes(&payload),
+            )
+            .await
+        else {
+            panic!("s3 part write failed")
+        };
+        assert!(location.backend_path.starts_with("_parts/"));
+        parts.push(location);
+    }
+
+    let BlobEvent::WriteFinished { location } = handler
+        .compose_blob(
+            "bucket",
+            "composed.bin",
+            cold_backend(),
+            test_user_id(),
+            parts,
+        )
+        .await
+    else {
+        panic!("s3 compose failed")
+    };
+
+    assert_eq!(read_back(&handler, location).await, b"first-second");
+}
+
+async fn write_group_backend(context: &TestContext, backend_id: Ulid, paired: bool) {
+    let key: aruna_core::types::Key = backend_id.to_bytes().to_vec().into();
+    let record = GroupStorageBackend {
+        backend_id,
+        group_id: Ulid::generate(),
+        name: "tenant".to_string(),
+        kind: GroupBackendKind::S3,
+        public_config: HashMap::from([
+            ("bucket".to_string(), "data".to_string()),
+            ("endpoint".to_string(), "https://s3.example.com".to_string()),
+        ]),
+        created_at: SystemTime::UNIX_EPOCH,
+        updated_at: SystemTime::UNIX_EPOCH,
+        created_by: UserId::default(),
+        disabled: false,
+        cleanup: aruna_core::structs::CleanupStrategy::Retain,
+    };
+    let mut writes = vec![(
+        GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+        key.clone(),
+        record.to_bytes().unwrap().into(),
+    )];
+    if paired {
+        let secret = GroupStorageBackendSecret {
+            backend_id,
+            secret_config: HashMap::from([("access_key_id".to_string(), "id".to_string())]),
+            updated_at: SystemTime::UNIX_EPOCH,
+        };
+        writes.push((
+            GROUP_STORAGE_BACKEND_SECRET_KEYSPACE.to_string(),
+            key,
+            secret.to_bytes().unwrap().into(),
+        ));
+    }
+    context
+        .storage_handle
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        })
+        .await;
+}
+
+fn group_effect(backend_id: Ulid) -> BlobEffect {
+    BlobEffect::HandleReplication {
+        replication_id: None,
+        stream_id: Ulid::generate(),
+        resolved: ResolvedBackend::new(BackendRef::Group(backend_id), None),
+        keep_alive: false,
+    }
+}
+
+#[tokio::test]
+async fn pins_effect_snapshot() {
+    // A shared entry could be replaced or dropped while this effect still runs.
+    let context = setup_blob_handle(4).await;
+    let backend_id = Ulid::generate();
+    write_group_backend(&context, backend_id, true).await;
+    let handler = context.blob_handle.handler.clone();
+
+    let scoped = handler
+        .with_group_backends(&group_effect(backend_id))
+        .await
+        .unwrap();
+
+    assert!(
+        scoped
+            .registry
+            .backend(&BackendRef::Group(backend_id))
+            .is_ok()
+    );
+    assert!(
+        handler
+            .registry
+            .backend(&BackendRef::Group(backend_id))
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn needs_paired_secret() {
+    // Half a backend must fail loudly instead of building an operator.
+    let context = setup_blob_handle(4).await;
+    let backend_id = Ulid::generate();
+    write_group_backend(&context, backend_id, false).await;
+
+    let loaded = context
+        .blob_handle
+        .handler
+        .with_group_backends(&group_effect(backend_id))
+        .await;
+
+    assert!(loaded.is_err(), "expected a load failure");
+}
+
+#[tokio::test]
+async fn serves_group_backend() {
+    // The tenant endpoint path: MinIO stands in for a group-owned store.
+    let Some(env) = s3_env() else { return };
+    let context = setup_s3_mixed(&env).await;
+    let bucket = unique_name("tenant-");
+    make_bucket(&bucket, &s3_config(&env, None)).await.unwrap();
+
+    let backend_id = Ulid::generate();
+    let entry = NodeBackend::new(
+        BackendConfig {
+            backend_type: Backend::Group(GroupBackendKind::S3),
+            root: String::new(),
+            service_config: s3_config(&env, Some(&bucket)),
+            bucket_prefix: None,
+            max_bucket_size: None,
+            multipart_bucket: Some(bucket.clone()),
+            timeouts: Default::default(),
+        },
+        None,
+    );
+    let handler = BlobHandler {
+        registry: context
+            .blob_handle
+            .handler
+            .registry
+            .with_groups(HashMap::from([(backend_id, Arc::new(entry))])),
+        ..context.blob_handle.handler.clone()
+    };
+
+    let resolved = ResolvedBackend::new(BackendRef::Group(backend_id), None);
+    let BlobEvent::WriteFinished { location } = handler
+        .write_blob(
+            "bucket",
+            "tenant.bin",
+            resolved,
+            test_user_id(),
+            stream_from_bytes(b"tenant bytes"),
+        )
+        .await
+    else {
+        panic!("group backend write failed")
+    };
+
+    assert_eq!(location.backend, BackendRef::Group(backend_id));
+    assert_eq!(location.storage_bucket, bucket);
+    assert_eq!(read_back(&handler, location).await, b"tenant bytes");
+}
+
+#[tokio::test]
+async fn routes_backends_apart() {
+    // A cold-class rule pins to S3 while the default stays on the filesystem.
+    let Some(env) = s3_env() else { return };
+    let context = setup_s3_mixed(&env).await;
+    let handler = context.blob_handle.handler.clone();
+
+    let BlobEvent::WriteFinished { location: hot } = handler
+        .write_blob(
+            "bucket",
+            "hot.bin",
+            ResolvedBackend::node_default(),
+            test_user_id(),
+            stream_from_bytes(b"hot"),
+        )
+        .await
+    else {
+        panic!("filesystem write failed")
+    };
+    let BlobEvent::WriteFinished { location: cold } = handler
+        .write_blob(
+            "bucket",
+            "cold.bin",
+            cold_backend(),
+            test_user_id(),
+            stream_from_bytes(b"cold"),
+        )
+        .await
+    else {
+        panic!("s3 write failed")
+    };
+
+    assert_eq!(hot.backend, BackendRef::node_default());
+    assert_eq!(cold.backend, BackendRef::Node("cold".to_string()));
+    assert_eq!(read_back(&handler, hot).await, b"hot");
+    assert_eq!(read_back(&handler, cold).await, b"cold");
+}
+
+#[tokio::test]
+async fn hold_excludes_claim() {
+    // A hold and removal's claim are mutually exclusive in both directions, so
+    // credentials outlive every operation that could still roll back onto them.
+    let ctx = setup_blob_handle(1).await;
+    let handler = &ctx.blob_handle.handler;
+    let backend_id = Ulid::from_bytes([4u8; 16]);
+    let mut location = make_test_location();
+    location.backend = BackendRef::Group(backend_id);
+    let effect = BlobEffect::Delete { location };
+
+    let generation = handler.idle_generation(backend_id).unwrap();
+    let hold = handler.hold_backends(&effect).unwrap();
+    assert!(hold.is_some());
+    assert!(handler.idle_generation(backend_id).is_none());
+    assert!(handler.claim_backend(backend_id, generation).is_none());
+
+    // A hold taken and released since the generation was read still refuses the
+    // claim: whatever removal scanned in between may already be stale.
+    drop(hold);
+    assert!(handler.claim_backend(backend_id, generation).is_none());
+
+    let generation = handler.idle_generation(backend_id).unwrap();
+    let claim = handler.claim_backend(backend_id, generation).unwrap();
+    assert!(handler.claim_backend(backend_id, generation).is_none());
+    assert!(handler.hold_backends(&effect).is_err());
+
+    drop(claim);
+    assert!(handler.hold_backends(&effect).unwrap().is_some());
+
+    // A node backend never enters the map, so removal never waits on one.
+    assert!(
+        handler
+            .hold_backends(&BlobEffect::Delete {
+                location: make_test_location()
+            })
+            .unwrap()
+            .is_none()
+    );
 }

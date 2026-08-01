@@ -1,7 +1,8 @@
 use crate::errors::{BlobError, ConversionError};
 use crate::structs::checksum::HASH_BLAKE3;
 use crate::structs::{
-    BucketReplicationConfig, PathRestriction, RealmId, SourceMetadata, VersionSourceBinding,
+    BucketReplicationConfig, GroupBackendKind, PathRestriction, RealmId, SourceMetadata,
+    StorageRoutingRule, VersionSourceBinding,
 };
 use crate::types::{GroupId, NodeId, UserId};
 use byteview::ByteView;
@@ -16,6 +17,9 @@ use ulid::Ulid;
 
 const ACCESS_KEY_MAX_LEN: usize = 128;
 pub const HIDDEN_BLOB_PREFIX: &str = "_jobs";
+/// Reserved container prefix holding in-flight multipart parts, so parts never
+/// share a namespace with tenant-written keys.
+pub const MULTIPART_PART_PREFIX: &str = "_parts";
 pub const OBJECT_CONTENT_TYPE_KEY: &str = "aruna.internal.content-type";
 
 pub fn ensure_confined_relative_path(path: &Path) -> Result<(), ConversionError> {
@@ -49,9 +53,10 @@ pub fn ensure_confined_relative_path(path: &Path) -> Result<(), ConversionError>
 pub enum Backend {
     #[default]
     S3,
-    HTTP,
-    Postgres,
     FileSystem,
+    /// A tenant-registered backend. Never nameable in the backends file: it is
+    /// synthesized from a `GroupStorageBackend` record.
+    Group(GroupBackendKind),
 }
 
 impl FromStr for Backend {
@@ -60,8 +65,6 @@ impl FromStr for Backend {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "s3" => Ok(Backend::S3),
-            "http" => Ok(Backend::HTTP),
-            "postgres" => Ok(Backend::Postgres),
             "filesystem" => Ok(Backend::FileSystem),
             _ => Err(ConversionError::FromStrError(format!(
                 "unknown backend {}",
@@ -75,10 +78,75 @@ impl Display for Backend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Backend::S3 => write!(f, "s3"),
-            Backend::HTTP => write!(f, "http"),
-            Backend::Postgres => write!(f, "postgres"),
             Backend::FileSystem => write!(f, "filesystem"),
+            Backend::Group(kind) => write!(f, "group:{kind}"),
         }
+    }
+}
+
+/// Names the storage backend a stored record lives on. Node backends are named
+/// by the operator's backends file; group backends by their record id.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub enum BackendRef {
+    Node(String),
+    Group(Ulid),
+}
+
+impl BackendRef {
+    pub const DEFAULT_NODE_NAME: &str = "default";
+
+    pub fn node_default() -> Self {
+        Self::Node(Self::DEFAULT_NODE_NAME.to_string())
+    }
+
+    /// Stable byte encoding used to qualify keyspace entries per backend.
+    pub fn key_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Node(name) => format!("n:{name}").into_bytes(),
+            Self::Group(id) => format!("g:{id}").into_bytes(),
+        }
+    }
+
+    pub fn from_key_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|error| ConversionError::FromStrError(error.to_string()))?;
+        match text.split_at_checked(2) {
+            Some(("n:", name)) => Ok(Self::Node(name.to_string())),
+            Some(("g:", id)) => Ok(Self::Group(id.parse()?)),
+            _ => Err(ConversionError::FromStrError(format!(
+                "unknown backend key `{text}`"
+            ))),
+        }
+    }
+}
+
+impl Display for BackendRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Node(name) => write!(f, "node:{name}"),
+            Self::Group(id) => write!(f, "group:{id}"),
+        }
+    }
+}
+
+/// Outcome of routing resolution: the chosen backend plus the storage class it
+/// carried at that moment. Both are stamped on the record, never re-derived.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedBackend {
+    pub backend: BackendRef,
+    pub storage_class: Option<String>,
+}
+
+impl ResolvedBackend {
+    pub fn new(backend: BackendRef, storage_class: Option<String>) -> Self {
+        Self {
+            backend,
+            storage_class,
+        }
+    }
+
+    pub fn node_default() -> Self {
+        Self::new(BackendRef::node_default(), None)
     }
 }
 
@@ -147,6 +215,20 @@ pub enum BlobCleanupWork {
         realm_id: RealmId,
         ttl_ms: u64,
     },
+    /// Bytes written for a transaction whose commit outcome was never learned.
+    /// They are deleted only once `owner` proves the commit never landed, so a
+    /// commit that did land keeps the copy it already owns.
+    ReconcileWrite {
+        location: BackendLocation,
+        owner: WriteOwner,
+    },
+}
+
+/// The record a write's commit would have made the owner of its bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum WriteOwner {
+    Blob { blake3: [u8; 32] },
+    UploadPart { upload_id: Ulid, part_number: u16 },
 }
 
 impl BlobCleanupWork {
@@ -157,10 +239,22 @@ impl BlobCleanupWork {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
     }
+
+    /// The physical object this row is about, for the variants that name one.
+    pub fn location(&self) -> Option<&BackendLocation> {
+        match self {
+            Self::DeleteBlob { location } | Self::ReconcileWrite { location, .. } => Some(location),
+            Self::RegisterDht { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BackendLocation {
+    pub backend: BackendRef,
+    /// Storage class resolved at write time. Stamped so no later recount ever
+    /// re-derives it from the node's current backends file.
+    pub storage_class: Option<String>,
     pub root: String,
     pub storage_bucket: String,
     pub backend_path: String,
@@ -224,10 +318,58 @@ impl BackendLocation {
     pub fn get_blake3(&self) -> Option<&[u8]> {
         self.hashes.get(HASH_BLAKE3).map(|h| h.as_slice())
     }
+
+    /// Whether both name the same physical object. The path carries a per-write
+    /// id, so this distinguishes two copies of identical content.
+    pub fn same_object(&self, other: &Self) -> bool {
+        self.backend == other.backend
+            && self.root == other.root
+            && self.storage_bucket == other.storage_bucket
+            && self.backend_path == other.backend_path
+    }
+}
+
+/// Names one physical copy: the content hash followed by the backend holding
+/// it. Deduplication therefore stays inside the backend a write routed to, and
+/// every backend keeps at most one copy of a hash.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobLocationKey {
+    pub blake3_hash: [u8; 32],
+    pub backend: BackendRef,
+}
+
+impl BlobLocationKey {
+    pub fn new(blake3_hash: [u8; 32], backend: BackendRef) -> Self {
+        Self {
+            blake3_hash,
+            backend,
+        }
+    }
+
+    pub fn from_blake3(hash: &[u8], backend: BackendRef) -> Result<Self, ConversionError> {
+        Ok(Self::new(hash.try_into()?, backend))
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut key = self.blake3_hash.to_vec();
+        key.extend_from_slice(&self.backend.key_bytes());
+        key
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        let (hash, backend) = bytes.split_at_checked(32).ok_or_else(|| {
+            ConversionError::InvalidLength("blob location key is too short".to_string())
+        })?;
+        Ok(Self::new(
+            hash.try_into()?,
+            BackendRef::from_key_bytes(backend)?,
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct HiddenBlobKey {
+    pub backend: BackendRef,
     pub root: String,
     pub storage_bucket: String,
     pub backend_path: String,
@@ -235,11 +377,13 @@ pub struct HiddenBlobKey {
 
 impl HiddenBlobKey {
     pub fn new(
+        backend: BackendRef,
         root: String,
         storage_bucket: String,
         backend_path: String,
     ) -> Result<Self, ConversionError> {
         let key = Self {
+            backend,
             root,
             storage_bucket,
             backend_path,
@@ -288,6 +432,7 @@ impl TryFrom<&BackendLocation> for HiddenBlobKey {
 
     fn try_from(location: &BackendLocation) -> Result<Self, Self::Error> {
         Self::new(
+            location.backend.clone(),
             location.root.clone(),
             location.storage_bucket.clone(),
             location.backend_path.clone(),
@@ -333,6 +478,9 @@ pub struct BucketInfo {
     pub created_by: UserId,
     pub cors_configuration: Option<BucketCorsConfiguration>,
     pub replication: Option<BucketReplicationConfig>,
+    /// Bucket, prefix and exact-key write routing rules, most specific first at
+    /// resolution time. Empty means the group default decides.
+    pub storage_routing: Vec<StorageRoutingRule>,
 }
 
 impl BucketInfo {
@@ -342,6 +490,13 @@ impl BucketInfo {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
+    }
+
+    /// What makes this the same bucket record: what a write authorized against
+    /// must not have changed. The mutable configuration is excluded on purpose,
+    /// so an admin edit cannot abort a long-running write.
+    pub fn identity(&self) -> (Ulid, SystemTime, UserId) {
+        (self.group_id, self.created_at, self.created_by)
     }
 }
 
@@ -587,6 +742,7 @@ pub struct BlobVersion {
 impl BlobVersion {
     pub fn materialized(
         blob_hash: [u8; 32],
+        backend: BackendRef,
         created_at: SystemTime,
         created_by: UserId,
         source: Option<VersionSourceBinding>,
@@ -594,7 +750,11 @@ impl BlobVersion {
         Self {
             created_at,
             created_by,
-            state: BlobVersionState::Materialized { blob_hash, source },
+            state: BlobVersionState::Materialized {
+                blob_hash,
+                backend,
+                source,
+            },
             metadata: HashMap::new(),
         }
     }
@@ -644,6 +804,14 @@ impl BlobVersion {
         self.state.blob_hash()
     }
 
+    pub fn blob_backend(&self) -> Option<&BackendRef> {
+        self.state.blob_backend()
+    }
+
+    pub fn location_key(&self) -> Option<BlobLocationKey> {
+        self.state.location_key()
+    }
+
     pub fn source_binding(&self) -> Option<&VersionSourceBinding> {
         self.state.source_binding()
     }
@@ -661,6 +829,9 @@ impl BlobVersion {
 pub enum BlobVersionState {
     Materialized {
         blob_hash: [u8; 32],
+        /// Backend the write routed to. Stamped here so a read never has to
+        /// re-derive routing or guess which physical copy the object owns.
+        backend: BackendRef,
         source: Option<VersionSourceBinding>,
     },
     Reference {
@@ -675,6 +846,22 @@ impl BlobVersionState {
     pub fn blob_hash(&self) -> Option<&[u8; 32]> {
         match self {
             Self::Materialized { blob_hash, .. } => Some(blob_hash),
+            Self::Reference { .. } | Self::Deleted => None,
+        }
+    }
+
+    pub fn blob_backend(&self) -> Option<&BackendRef> {
+        match self {
+            Self::Materialized { backend, .. } => Some(backend),
+            Self::Reference { .. } | Self::Deleted => None,
+        }
+    }
+
+    pub fn location_key(&self) -> Option<BlobLocationKey> {
+        match self {
+            Self::Materialized {
+                blob_hash, backend, ..
+            } => Some(BlobLocationKey::new(*blob_hash, backend.clone())),
             Self::Reference { .. } | Self::Deleted => None,
         }
     }
@@ -745,9 +932,9 @@ impl UserAccess {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlobHeadKey, BlobVersion, BucketCorsConfiguration, BucketCorsRule, CurrentVersionPointer,
-        HashPathIndexKey, HiddenBlobKey, blob_bucket_permission_path, blob_group_permission_path,
-        blob_object_permission_path,
+        Backend, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketCorsConfiguration,
+        BucketCorsRule, CurrentVersionPointer, HashPathIndexKey, HiddenBlobKey,
+        blob_bucket_permission_path, blob_group_permission_path, blob_object_permission_path,
     };
     use crate::NodeId;
     use crate::structs::{
@@ -759,6 +946,20 @@ mod tests {
     use std::str::FromStr;
     use std::time::SystemTime;
     use ulid::Ulid;
+
+    #[test]
+    fn parses_backend_names() {
+        // The backends file accepts these two spellings and nothing else.
+        assert_eq!(Backend::from_str("s3").unwrap(), Backend::S3);
+        assert_eq!(
+            Backend::from_str("filesystem").unwrap(),
+            Backend::FileSystem
+        );
+        assert_eq!(Backend::S3.to_string(), "s3");
+        assert_eq!(Backend::FileSystem.to_string(), "filesystem");
+        Backend::from_str("http").unwrap_err();
+        Backend::from_str("postgres").unwrap_err();
+    }
 
     // The S3 auth layer rejects revoked/expired credentials via these predicates.
     #[test]
@@ -843,6 +1044,31 @@ mod tests {
     }
 
     #[test]
+    fn key_separates_backends() {
+        // One hash on two backends must produce two distinct, decodable keys.
+        let node = BlobLocationKey::new([7u8; 32], BackendRef::node_default());
+        let group = BlobLocationKey::new([7u8; 32], BackendRef::Group(Ulid::from_bytes([4u8; 16])));
+
+        assert_ne!(node.to_bytes(), group.to_bytes());
+        assert_eq!(BlobLocationKey::from_bytes(&node.to_bytes()).unwrap(), node);
+        assert_eq!(
+            BlobLocationKey::from_bytes(&group.to_bytes()).unwrap(),
+            group
+        );
+        assert!(node.to_bytes().starts_with(&[7u8; 32]));
+        assert!(group.to_bytes().starts_with(&[7u8; 32]));
+    }
+
+    #[test]
+    fn key_rejects_garbage() {
+        // A short or unknown-backend location key must never decode.
+        assert!(BlobLocationKey::from_bytes(&[1u8; 20]).is_err());
+        let mut unknown = [2u8; 32].to_vec();
+        unknown.extend_from_slice(b"x:name");
+        assert!(BlobLocationKey::from_bytes(&unknown).is_err());
+    }
+
+    #[test]
     fn hash_path_index_key_roundtrip_preserves_fields_and_hash_prefix() {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let group_id = Ulid::from_bytes([3u8; 16]);
@@ -921,11 +1147,17 @@ mod tests {
         };
 
         let versions = vec![
-            BlobVersion::materialized([1u8; 32], created_at, created_by, Some(binding.clone()))
-                .with_metadata(HashMap::from([(
-                    "mtime".to_string(),
-                    "1753272000.123456789".to_string(),
-                )])),
+            BlobVersion::materialized(
+                [1u8; 32],
+                BackendRef::node_default(),
+                created_at,
+                created_by,
+                Some(binding.clone()),
+            )
+            .with_metadata(HashMap::from([(
+                "mtime".to_string(),
+                "1753272000.123456789".to_string(),
+            )])),
             BlobVersion::reference(
                 binding.clone(),
                 reference_metadata,
@@ -941,7 +1173,13 @@ mod tests {
             assert_eq!(version, restored);
         }
 
-        let materialized = BlobVersion::materialized([1u8; 32], created_at, created_by, None);
+        let materialized = BlobVersion::materialized(
+            [1u8; 32],
+            BackendRef::node_default(),
+            created_at,
+            created_by,
+            None,
+        );
         assert_eq!(materialized.blob_hash(), Some(&[1u8; 32]));
         assert!(materialized.is_materialized());
         assert!(!materialized.is_deleted());
@@ -984,6 +1222,8 @@ mod tests {
         use crate::structs::BackendLocation;
 
         let mut location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/data".to_string(),
             storage_bucket: "bucket".to_string(),
             backend_path: "object.bin".to_string(),
@@ -1012,9 +1252,36 @@ mod tests {
     }
 
     #[test]
+    fn location_keeps_stamp() {
+        use crate::structs::BackendLocation;
+
+        let location = BackendLocation {
+            backend: BackendRef::Group(Ulid::from_bytes([6u8; 16])),
+            storage_class: Some("cold".to_string()),
+            root: "/data".to_string(),
+            storage_bucket: "bucket".to_string(),
+            backend_path: "object.bin".to_string(),
+            ulid: Ulid::from_bytes([2u8; 16]),
+            compressed: false,
+            encrypted: false,
+            created_by: UserId::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 7,
+            hashes: HashMap::new(),
+        };
+
+        let restored = BackendLocation::from_bytes(&location.to_bytes().unwrap()).unwrap();
+
+        assert_eq!(location, restored);
+    }
+
+    #[test]
     fn hidden_key_validates() {
         let namespace = Ulid::from_bytes([4u8; 16]);
         let key = HiddenBlobKey::new(
+            BackendRef::node_default(),
             "/data".to_string(),
             "storage".to_string(),
             format!("_jobs/{namespace}/input_01"),
@@ -1037,8 +1304,13 @@ mod tests {
             "_jobs/01ARZ3NDEKTSV4RRFFQ69G5FAV/../escape",
         ] {
             assert!(
-                HiddenBlobKey::new("/data".to_string(), "storage".to_string(), path.to_string(),)
-                    .is_err()
+                HiddenBlobKey::new(
+                    BackendRef::node_default(),
+                    "/data".to_string(),
+                    "storage".to_string(),
+                    path.to_string(),
+                )
+                .is_err()
             );
         }
     }

@@ -1095,10 +1095,10 @@ mod tests {
     use super::*;
     use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::{
-        ArtifactRef, BackendLocation, ExportOmissionCounts, ExportRoCrateResult, ExportRoCrateSpec,
-        ImportMetadataTarget, ImportReportDetail, ImportRoCrateResult, ImportRoCrateSource,
-        ImportRoCrateSpec, ImportRoCrateTarget, JobProgress, JobResultPayload, NodeCapabilities,
-        PathRestriction, Permission, RealmId, ReasonCode, RoCrateLimits,
+        ArtifactRef, BackendLocation, BackendRef, ExportOmissionCounts, ExportRoCrateResult,
+        ExportRoCrateSpec, ImportMetadataTarget, ImportReportDetail, ImportRoCrateResult,
+        ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobProgress, JobResultPayload,
+        NodeCapabilities, PathRestriction, Permission, RealmId, ReasonCode, RoCrateLimits,
     };
     use aruna_core::types::{NodeId, UserId};
     use aruna_operations::driver::DriverContext;
@@ -1256,6 +1256,8 @@ mod tests {
         hashes.insert(HASH_BLAKE3.to_string(), blake3.to_vec());
         let artifact = ArtifactRef {
             location: BackendLocation {
+                backend: BackendRef::node_default(),
+                storage_class: None,
                 root: "/tmp".to_string(),
                 storage_bucket: "hidden".to_string(),
                 backend_path: format!("_jobs/{job_id}/artifact.zip"),

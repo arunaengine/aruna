@@ -516,7 +516,7 @@ fn upload_key(upload_id: Ulid) -> ByteView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{BackendLocation, RealmId, RoCrateMediaType};
+    use aruna_core::structs::{BackendLocation, BackendRef, RealmId, RoCrateMediaType};
     use aruna_storage::FjallStorage;
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -526,6 +526,8 @@ mod tests {
         let owner = UserId::nil(RealmId::from_bytes([1u8; 32]));
         let upload_id = Ulid::from_bytes([2u8; 16]);
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/data".to_string(),
             storage_bucket: "storage".to_string(),
             backend_path: format!("_jobs/{upload_id}/input"),
@@ -629,6 +631,8 @@ mod tests {
             upload_id,
             owner,
             location: BackendLocation {
+                backend: BackendRef::node_default(),
+                storage_class: None,
                 root: "/data".to_string(),
                 storage_bucket: "storage".to_string(),
                 backend_path: "_jobs/input".to_string(),
@@ -670,6 +674,8 @@ mod tests {
             upload_id,
             owner,
             location: BackendLocation {
+                backend: BackendRef::node_default(),
+                storage_class: None,
                 root: "/data".to_string(),
                 storage_bucket: "storage".to_string(),
                 backend_path: "_jobs/input".to_string(),

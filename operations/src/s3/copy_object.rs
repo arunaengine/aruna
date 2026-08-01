@@ -1,4 +1,4 @@
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, RoutingInputsError, drive, routing_snapshot};
 use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use aruna_core::UserId;
@@ -50,6 +50,8 @@ pub enum CopyObjectError {
     Get(#[from] GetObjectError),
     #[error(transparent)]
     Put(#[from] PutObjectError),
+    #[error(transparent)]
+    Routing(#[from] RoutingInputsError),
     #[error("At least one of the preconditions you specified did not hold.")]
     PreconditionFailed,
 }
@@ -178,6 +180,7 @@ pub async fn copy_object(
     };
     let metadata = input.metadata.unwrap_or(source.metadata);
 
+    let routing = routing_snapshot(context, input.group_id, &input.dest_bucket).await?;
     let put_result = drive(
         PutObjectOperation::new(PutObjectConfig {
             user_id: input.user_id,
@@ -196,6 +199,7 @@ pub async fn copy_object(
             version_source,
             preassigned_version_id: None,
             quota_ceiling: input.quota_ceiling,
+            routing,
         })
         .with_metadata(metadata),
         context,
@@ -224,6 +228,7 @@ mod test {
     use crate::s3::get_object::GetObjectOperation;
     use aruna_blob::blob::BlobHandler;
     use aruna_core::effects::StorageEffect;
+    use aruna_core::egress::EgressPolicy;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
     use aruna_core::stream::BackendStream;
@@ -249,7 +254,7 @@ mod test {
         let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
             .await
             .unwrap();
-        let blob_handle = BlobHandler::new(
+        let blob_handle = BlobHandler::with_egress(
             BackendConfig {
                 backend_type: Backend::FileSystem,
                 bucket_prefix: Some("aruna_".to_string()),
@@ -261,6 +266,7 @@ mod test {
             },
             storage_handle.clone(),
             net_handle.clone(),
+            EgressPolicy::loopback(),
         )
         .await
         .unwrap();
@@ -315,6 +321,7 @@ mod test {
             version_source: None,
             preassigned_version_id: None,
             quota_ceiling: None,
+            routing: aruna_core::structs::RoutingSnapshot::single(group_id),
         }
     }
 

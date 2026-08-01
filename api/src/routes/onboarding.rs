@@ -478,7 +478,7 @@ fn map_finalize_error(error: BootstrapOnboardingFinalizeError) -> ServerError {
         BootstrapOnboardingFinalizeError::EnsureRealmConfig(
             EnsureRealmConfigError::NodeKindMismatch { .. },
         ) => ServerError::BadRequest,
-        BootstrapOnboardingFinalizeError::ReservedNodeLabel
+        BootstrapOnboardingFinalizeError::ReservedNodeLabel(_)
         | BootstrapOnboardingFinalizeError::NodeLocationTooLong => ServerError::BadRequest,
         other => ServerError::InternalError(other.to_string()),
     }
@@ -719,7 +719,9 @@ mod tests {
     #[test]
     fn placement_validation_errors_map_to_bad_request() {
         assert!(matches!(
-            map_finalize_error(BootstrapOnboardingFinalizeError::ReservedNodeLabel),
+            map_finalize_error(BootstrapOnboardingFinalizeError::ReservedNodeLabel(
+                String::new()
+            )),
             ServerError::BadRequest
         ));
         assert!(matches!(

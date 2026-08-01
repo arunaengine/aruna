@@ -7,7 +7,7 @@ use crate::s3::checksum::{
     verify_trailer_stream,
 };
 use crate::s3::cors::{bucket_cors_to_get_output, dto_to_bucket_cors};
-use crate::s3::error::IntoS3Error;
+use crate::s3::error::{IntoS3Error, routing_inputs_error};
 use crate::s3::s3_server::DeleteObjectsBody;
 use crate::s3::util::{
     checked_size, checksum_response_hashes, convert_input, declared_trailer_algorithm,
@@ -28,7 +28,7 @@ use aruna_core::structs::{
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::driver::{DriverContext, bucket_snapshot, drive, routing_snapshot};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::metadata::MetadataAuthToken;
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
@@ -1081,6 +1081,7 @@ impl S3 for ArunaS3Service {
                 created_by: user_access.user_identity,
                 cors_configuration: None,
                 replication: None,
+                storage_routing: Vec::new(),
             },
         );
 
@@ -1574,6 +1575,11 @@ impl S3 for ArunaS3Service {
             req.input.metadata.clone().unwrap_or_default(),
             req.input.content_type.as_deref(),
         );
+        let routing = match bucket_info.as_ref() {
+            Some(info) => bucket_snapshot(&self.state, info).await,
+            None => routing_snapshot(&self.state, group_id, &replication_bucket).await,
+        }
+        .map_err(routing_inputs_error)?;
         let input = convert_input(req.input)?;
         let operation = PutObjectOperation::new(PutObjectConfig {
             user_id: user_access.user_identity,
@@ -1587,6 +1593,7 @@ impl S3 for ArunaS3Service {
             preassigned_version_id: None,
             exists: false,
             quota_ceiling,
+            routing,
         })
         .with_rocrate_limits(self.rocrate_limits.clone())
         .with_metadata(metadata);
@@ -1814,15 +1821,22 @@ impl S3 for ArunaS3Service {
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let checksum_hint = parse_multipart_checksum_hint(&req.input)?;
 
+        let group_id = bucket_info
+            .as_ref()
+            .map(|bucket_info| bucket_info.group_id)
+            .unwrap_or(user_access.group_id);
+        let routing = match bucket_info.as_ref() {
+            Some(info) => bucket_snapshot(&self.state, info).await,
+            None => routing_snapshot(&self.state, group_id, &req.input.bucket).await,
+        }
+        .map_err(routing_inputs_error)?;
         let operation = CreateMultipartUploadOperation::new(CMPI {
             bucket: req.input.bucket.clone(),
             key: req.input.key.clone(),
-            group_id: bucket_info
-                .as_ref()
-                .map(|bucket_info| bucket_info.group_id)
-                .unwrap_or(user_access.group_id),
+            group_id,
             created_by: user_access.user_identity,
             checksum_hint: checksum_hint.clone(),
+            routing,
         })
         .with_metadata(object_metadata(
             req.input.metadata.clone().unwrap_or_default(),
@@ -3337,11 +3351,11 @@ mod tests {
         REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
     use aruna_core::structs::{
-        Actor, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
-        GroupAuthorizationDocument, NotificationClass, NotificationKind, NotificationRecord,
-        PortableSourceDescriptor, RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
-        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
-        WatchEventMask, WatchInterestEntry, WatchInterestTable,
+        Actor, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
+        BlobVersionState, CurrentVersionPointer, GroupAuthorizationDocument, NotificationClass,
+        NotificationKind, NotificationRecord, PortableSourceDescriptor, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmNodeKind, SourceConnectorKind, SourceMetadata, StagingStrategy,
+        VersionKey, VersionSourceBinding, WatchEventMask, WatchInterestEntry, WatchInterestTable,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::{DriverContext, drive};
@@ -3958,6 +3972,8 @@ mod tests {
         hashes.insert(HASH_MD5.to_string(), vec![1u8; 16]);
 
         BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: "bucket/object".to_string(),
@@ -4152,7 +4168,13 @@ mod tests {
         created_at: SystemTime,
         blob_size: u64,
     ) {
-        let version = BlobVersion::materialized(hash, created_at, created_by, None);
+        let version = BlobVersion::materialized(
+            hash,
+            BackendRef::node_default(),
+            created_at,
+            created_by,
+            None,
+        );
         let _ = storage
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
@@ -4166,6 +4188,8 @@ mod tests {
             .await;
 
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: format!("path/{key}"),
@@ -4182,7 +4206,9 @@ mod tests {
         let _ = storage
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                key: hash.to_vec().into(),
+                key: BlobLocationKey::new(hash, location.backend.clone())
+                    .to_bytes()
+                    .into(),
                 value: location.to_bytes().unwrap().into(),
                 txn_id: None,
             })
@@ -4252,6 +4278,7 @@ mod tests {
             created_by,
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         }
     }
 

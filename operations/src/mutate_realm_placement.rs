@@ -1079,7 +1079,7 @@ mod tests {
         assert!(matches!(
             mutate(&context, &actor, RealmPlacementMutation::UpsertNode(entry)).await,
             Err(MutateRealmPlacementError::AdminDocumentReducerError(
-                AdminDocumentReducerError::ReservedPlacementLabel
+                AdminDocumentReducerError::ReservedPlacementLabel(_)
             ))
         ));
     }

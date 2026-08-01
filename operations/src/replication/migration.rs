@@ -506,6 +506,7 @@ mod tests {
             created_by: owner,
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         };
         let source_info = BucketInfo {
             replication: Some(BucketReplicationConfig {

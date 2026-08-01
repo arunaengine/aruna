@@ -38,6 +38,7 @@ pub const USER_SUBJECT_CLAIMS_KEYSPACE: &str = "user_subject_claims";
 // Blob + S3 keyspaces
 pub const BLOB_LOCATIONS_KEYSPACE: &str = "blob_locations";
 pub const BLOB_CLEANUP_KEYSPACE: &str = "blob_pending_cleanups";
+pub const BLOB_RECLAIM_KEYSPACE: &str = "blob_reclaim_candidates";
 pub const BLOB_HEAD_KEYSPACE: &str = "blob_heads";
 pub const BLOB_VERSIONS_KEYSPACE: &str = "blob_versions";
 pub const HASH_PATHS_INDEX_KEYSPACE: &str = "hash_paths_index";
@@ -61,6 +62,18 @@ pub const NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE: &str = "notification_inbox_pr
 pub const NOTIFICATION_OUTBOX_KEYSPACE: &str = "notification_outbox";
 pub const NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE: &str = "notification_watch_subscriptions";
 pub const NOTIFICATION_WATCH_INTEREST_KEYSPACE: &str = "notification_watch_interest";
+
+pub const GROUP_STORAGE_ROUTING_KEYSPACE: &str = "group_storage_routing";
+
+/// Keyed by backend id alone: the blob adapter resolves a stored
+/// `BackendRef::Group` without knowing which group owns it.
+pub const GROUP_STORAGE_BACKEND_KEYSPACE: &str = "group_storage_backend";
+pub const GROUP_STORAGE_BACKEND_SECRET_KEYSPACE: &str = "group_storage_backend_secret";
+
+/// The same records keyed by `group id || backend id`, so routing a write reads
+/// one group's backends instead of every tenant's. Written in the same batch or
+/// transaction as the id-keyed record it mirrors.
+pub const GROUP_STORAGE_BACKEND_INDEX_KEYSPACE: &str = "group_storage_backend_index";
 
 pub const SOURCE_CONNECTOR_INDEX_KEYSPACE: &str = "source_connector_index";
 pub const SOURCE_CONNECTOR_SECRET_KEYSPACE: &str = "source_connector_secret";

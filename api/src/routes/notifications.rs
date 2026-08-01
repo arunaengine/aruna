@@ -1239,6 +1239,7 @@ mod tests {
             created_by,
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         };
         write_fixture(
             state,

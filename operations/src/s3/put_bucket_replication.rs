@@ -520,6 +520,7 @@ mod tests {
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
         ArunaArn, BucketInfo, BucketReplicationConfig, BucketReplicationTarget, RealmId,
+        RoutingTarget, StorageRoutingRule,
     };
     use aruna_core::types::UserId;
     use aruna_storage::storage;
@@ -547,6 +548,11 @@ mod tests {
             created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([9u8; 32])),
             cors_configuration: None,
             replication: None,
+            storage_routing: vec![StorageRoutingRule {
+                key_prefix: String::new(),
+                exact: false,
+                target: RoutingTarget::Class("cold".to_string()),
+            }],
         };
         let event = storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -642,6 +648,35 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(missing.to_string(), "Replication config not found");
+    }
+
+    #[tokio::test]
+    async fn delete_keeps_routing() {
+        // Clearing replication must leave the bucket's routing rules intact.
+        let temp_dir = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
+        let context = make_context(storage_handle.clone());
+
+        let bucket = "routed-bucket".to_string();
+        write_bucket(&storage_handle, &bucket).await;
+        drive(
+            PutBucketReplicationOperation::new(bucket.clone(), vec![make_target(&bucket)]),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        drive(
+            DeleteBucketReplicationOperation::new(bucket.clone()),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        let info = read_bucket(&storage_handle, &bucket).await;
+        assert!(info.replication.is_none());
+        assert_eq!(info.storage_routing.len(), 1);
     }
 
     #[tokio::test]

@@ -16,16 +16,17 @@ pub async fn create_s3_client(
     force_path_style: bool,
 ) -> Result<Client, BlobError> {
     let creds = Credentials::new(access_key_id, secret_key, None, None, "Aruna_v3");
+    // An unpinned region makes the SDK resolve one through the EC2 metadata service.
+    let region = Region::new(region.unwrap_or_else(|| DEFAULT_REGION.to_string()));
     let client_config = aws_config::defaults(BehaviorVersion::latest())
+        .region(region.clone())
         .credentials_provider(creds)
         .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
         .response_checksum_validation(aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired)
         .load()
         .await;
     let s3_config = aws_sdk_s3::config::Builder::from(&client_config)
-        .region(Region::new(
-            region.unwrap_or_else(|| DEFAULT_REGION.to_string()),
-        ))
+        .region(region)
         .endpoint_url(endpoint)
         .force_path_style(force_path_style)
         .build();

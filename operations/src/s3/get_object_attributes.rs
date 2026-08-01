@@ -1,15 +1,17 @@
+use crate::blob::blob_keyspace_helper::blob_location_read;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
+#[cfg(test)]
+use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
-    MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
-    SourceMetadata, VersionKey,
+    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
+    CurrentVersionPointer, MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
+    MultipartObjectSummary, SourceMetadata, VersionKey,
 };
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -227,10 +229,12 @@ impl GetObjectAttributesOperation {
         self.resolved_version_id = Some(version_id);
 
         match version.state {
-            BlobVersionState::Materialized { blob_hash, .. } => {
+            BlobVersionState::Materialized {
+                blob_hash, backend, ..
+            } => {
                 self.source_metadata = None;
                 self.version_created_at = Some(version.created_at);
-                self.read_blob_location(blob_hash)
+                self.read_blob_location(BlobLocationKey::new(blob_hash, backend))
             }
             BlobVersionState::Deleted => self.emit_error(if explicit_version_request {
                 GetObjectAttributesError::DeleteMarker
@@ -248,13 +252,9 @@ impl GetObjectAttributesOperation {
         }
     }
 
-    fn read_blob_location(&mut self, blob_hash: [u8; 32]) -> Effects {
+    fn read_blob_location(&mut self, key: BlobLocationKey) -> Effects {
         self.state = GetObjectAttributesState::GetBlobLocation;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-            key: blob_hash.to_vec().into(),
-            txn_id: self.txn_id,
-        })]
+        smallvec![blob_location_read(&key, self.txn_id)]
     }
 
     fn handle_blob_location_read(&mut self, event: Event) -> Effects {
@@ -464,8 +464,8 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
-    use aruna_core::structs::RealmId;
     use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5, HASH_SHA256};
+    use aruna_core::structs::{BackendRef, RealmId};
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -488,6 +488,8 @@ mod tests {
         hashes.insert(HASH_MD5.to_string(), vec![1; 16]);
         hashes.insert(HASH_SHA256.to_string(), vec![2; 32]);
         BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "mybucket".to_string(),
             backend_path: "hello.txt".to_string(),
@@ -541,6 +543,7 @@ mod tests {
                 .unwrap(),
             BlobVersion::materialized(
                 location.get_blake3().unwrap().try_into().unwrap(),
+                BackendRef::node_default(),
                 location.created_at,
                 location.created_by,
                 None,
@@ -552,7 +555,9 @@ mod tests {
         write(
             storage_handle,
             BLOB_LOCATIONS_KEYSPACE,
-            location.get_blake3().unwrap().to_vec(),
+            BlobLocationKey::from_blake3(location.get_blake3().unwrap(), location.backend.clone())
+                .unwrap()
+                .to_bytes(),
             location.to_bytes().unwrap(),
         )
         .await;
@@ -694,6 +699,7 @@ mod tests {
                 .unwrap(),
             BlobVersion::materialized(
                 location.get_blake3().unwrap().try_into().unwrap(),
+                BackendRef::node_default(),
                 location.created_at,
                 location.created_by,
                 None,
@@ -705,7 +711,9 @@ mod tests {
         write(
             &storage_handle,
             BLOB_LOCATIONS_KEYSPACE,
-            location.get_blake3().unwrap().to_vec(),
+            BlobLocationKey::from_blake3(location.get_blake3().unwrap(), location.backend.clone())
+                .unwrap()
+                .to_bytes(),
             location.to_bytes().unwrap(),
         )
         .await;

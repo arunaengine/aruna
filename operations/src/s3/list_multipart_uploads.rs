@@ -353,7 +353,7 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::{BackendRef, RealmId};
     use aruna_storage::storage;
     use std::time::{Duration, SystemTime};
     use tempfile::tempdir;
@@ -380,6 +380,8 @@ mod test {
         created_at: SystemTime,
     ) -> MultipartUpload {
         MultipartUpload {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             upload_id,
             bucket: bucket.to_string(),
             key: key.to_string(),

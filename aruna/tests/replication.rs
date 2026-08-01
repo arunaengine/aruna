@@ -18,8 +18,8 @@ use aruna_core::keyspaces::{
     SYNC_RELATIONSHIP_OUT_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::structs::{
-    BlobVersion, BlobVersionState, SourceConnectorKind, StagingStrategy, SyncRelationship,
-    SyncState, UsageCounters, VersionKey, sync_relationship_key,
+    BackendRef, BlobLocationKey, BlobVersion, BlobVersionState, SourceConnectorKind,
+    StagingStrategy, SyncRelationship, SyncState, UsageCounters, VersionKey, sync_relationship_key,
 };
 use aruna_operations::driver::DriverContext;
 use aws_sdk_s3::Client as S3Client;
@@ -844,7 +844,7 @@ async fn reference_syncs_lazily() -> TestResult<()> {
             read_value(
                 harness.joiner.context.as_ref(),
                 BLOB_LOCATIONS_KEYSPACE,
-                source_hash.to_vec(),
+                BlobLocationKey::new(source_hash, BackendRef::node_default()).to_bytes(),
             )
             .await?
             .is_none()
@@ -857,7 +857,7 @@ async fn reference_syncs_lazily() -> TestResult<()> {
             read_value(
                 harness.joiner.context.as_ref(),
                 BLOB_LOCATIONS_KEYSPACE,
-                source_hash.to_vec(),
+                BlobLocationKey::new(source_hash, BackendRef::node_default()).to_bytes(),
             )
             .await?
             .is_none()

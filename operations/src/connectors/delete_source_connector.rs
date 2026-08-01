@@ -391,17 +391,17 @@ mod tests {
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
                 group_id: ulid::Ulid::generate(),
                 created_by: Default::default(),
-                name: "ftp-source".to_string(),
-                kind: SourceConnectorKind::Ftp,
+                name: "dav-source".to_string(),
+                kind: SourceConnectorKind::Webdav,
                 public_config: HashMap::from([
                     (
                         "endpoint".to_string(),
-                        "ftp://ftp.example.org:21".to_string(),
+                        "https://dav.example.org".to_string(),
                     ),
                     ("root".to_string(), "/datasets".to_string()),
                 ]),
                 secret_config: HashMap::from([
-                    ("user".to_string(), "alice".to_string()),
+                    ("username".to_string(), "alice".to_string()),
                     ("password".to_string(), "secret".to_string()),
                 ]),
             }),
@@ -618,7 +618,7 @@ mod tests {
         .await
         .unwrap();
         let ResolvedSourceAccess::OpenDal { config, .. } = access;
-        assert_eq!(config.get("user").map(String::as_str), Some("alice"));
+        assert_eq!(config.get("username").map(String::as_str), Some("alice"));
     }
 
     #[tokio::test]

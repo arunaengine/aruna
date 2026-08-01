@@ -1,0 +1,494 @@
+use super::create::{CreateGroupBackendError, CreateGroupBackendInput};
+use super::validation::{check_identity, validate_backend_input};
+use super::{backend_key, parse_read, record_writes};
+use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::keyspaces::{
+    GROUP_STORAGE_BACKEND_KEYSPACE, GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
+};
+use aruna_core::operation::Operation;
+use aruna_core::structs::{GroupStorageBackend, GroupStorageBackendSecret};
+use aruna_core::types::{Effects, TxnId};
+use smallvec::smallvec;
+use std::time::SystemTime;
+use ulid::Ulid;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReplaceState {
+    Init,
+    ReadRecord,
+    Probe,
+    StartTransaction,
+    VerifyRecord,
+    WriteRecords,
+    CommitTransaction,
+    AbortTransaction,
+    Finish,
+    Error,
+}
+
+/// Changes a tenant backend's credentials and name in place. The id and the
+/// store it names both survive, so the objects already stamped with this
+/// backend keep resolving, and a disabled backend stays disabled.
+#[derive(Debug, PartialEq)]
+pub struct ReplaceGroupBackendOperation {
+    input: CreateGroupBackendInput,
+    backend_id: Ulid,
+    record: Option<GroupStorageBackend>,
+    secret: Option<GroupStorageBackendSecret>,
+    txn_id: Option<TxnId>,
+    state: ReplaceState,
+    output: Option<Result<GroupStorageBackend, CreateGroupBackendError>>,
+}
+
+impl ReplaceGroupBackendOperation {
+    pub fn new(backend_id: Ulid, input: CreateGroupBackendInput) -> Self {
+        Self {
+            input,
+            backend_id,
+            record: None,
+            secret: None,
+            txn_id: None,
+            state: ReplaceState::Init,
+            output: None,
+        }
+    }
+
+    fn fail(&mut self, error: CreateGroupBackendError) -> Effects {
+        self.output = Some(Err(error));
+        if let Some(txn_id) = self.txn_id.take() {
+            self.state = ReplaceState::AbortTransaction;
+            return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
+        }
+        self.state = ReplaceState::Error;
+        smallvec![]
+    }
+
+    fn handle_existing(&mut self, event: Event) -> Effects {
+        // Allowed while disabled: a leaked credential must be replaceable
+        // without first enabling the backend for writes again.
+        let existing = match parse_read(event, GroupStorageBackend::from_bytes) {
+            Ok(Some(record)) if record.group_id == self.input.group_id => record,
+            Ok(_) => return self.fail(CreateGroupBackendError::NotFound),
+            Err(error) => return self.fail(CreateGroupBackendError::Read(error)),
+        };
+
+        let normalized = match validate_backend_input(
+            &self.input.name,
+            self.input.kind,
+            &self.input.public_config,
+            &self.input.secret_config,
+        ) {
+            Ok(normalized) => normalized,
+            Err(error) => return self.fail(error.into()),
+        };
+        if let Err(error) = check_identity(&existing, self.input.kind, &normalized.public) {
+            return self.fail(error.into());
+        }
+
+        let now = SystemTime::now();
+        let record = GroupStorageBackend {
+            backend_id: self.backend_id,
+            group_id: existing.group_id,
+            name: self.input.name.trim().to_string(),
+            kind: self.input.kind,
+            public_config: normalized.public,
+            created_at: existing.created_at,
+            updated_at: now,
+            created_by: existing.created_by,
+            disabled: existing.disabled,
+            cleanup: self.input.cleanup,
+        };
+        let secret = GroupStorageBackendSecret {
+            backend_id: self.backend_id,
+            secret_config: normalized.secret,
+            updated_at: now,
+        };
+
+        self.state = ReplaceState::Probe;
+        let effect = Effect::Blob(BlobEffect::CheckGroupBackend {
+            record: record.clone(),
+            secret: secret.clone(),
+        });
+        self.record = Some(record);
+        self.secret = Some(secret);
+        smallvec![effect]
+    }
+
+    fn handle_probe(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Blob(BlobEvent::GroupBackendChecked) => {}
+            Event::Blob(BlobEvent::Error(error)) => {
+                return self.fail(CreateGroupBackendError::Unreachable(error));
+            }
+            received => {
+                return self.fail(CreateGroupBackendError::InvalidStateEvent {
+                    state: "Probe",
+                    expected: "Event::Blob(BlobEvent::GroupBackendChecked)",
+                    received,
+                });
+            }
+        }
+
+        self.state = ReplaceState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    fn handle_txn_started(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
+                self.txn_id = Some(txn_id);
+                self.state = ReplaceState::VerifyRecord;
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+                    key: backend_key(self.backend_id),
+                    txn_id: self.txn_id,
+                })]
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+            received => self.fail(CreateGroupBackendError::InvalidStateEvent {
+                state: "StartTransaction",
+                expected: "Event::Storage(StorageEvent::TransactionStarted)",
+                received,
+            }),
+        }
+    }
+
+    /// Reading the record again inside the write transaction serializes the
+    /// update against a concurrent disable, which the probe is too slow to see.
+    fn handle_verified(&mut self, event: Event) -> Effects {
+        let disabled = match parse_read(event, GroupStorageBackend::from_bytes) {
+            Ok(Some(record)) if record.group_id == self.input.group_id => record.disabled,
+            Ok(_) => return self.fail(CreateGroupBackendError::NotFound),
+            Err(error) => return self.fail(CreateGroupBackendError::Read(error)),
+        };
+        if let Some(record) = self.record.as_mut() {
+            record.disabled = disabled;
+        }
+
+        let (Some(record), Some(secret)) = (self.record.as_ref(), self.secret.as_ref()) else {
+            return self.fail(CreateGroupBackendError::Failed);
+        };
+        let mut writes = match record_writes(record) {
+            Ok(writes) => writes,
+            Err(error) => return self.fail(error.into()),
+        };
+        let secret_bytes = match secret.to_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => return self.fail(error.into()),
+        };
+        writes.push((
+            GROUP_STORAGE_BACKEND_SECRET_KEYSPACE.to_string(),
+            backend_key(self.backend_id),
+            secret_bytes.into(),
+        ));
+
+        self.state = ReplaceState::WriteRecords;
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn handle_written(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+            Event::Storage(StorageEvent::Error { error }) => return self.fail(error.into()),
+            received => {
+                return self.fail(CreateGroupBackendError::InvalidStateEvent {
+                    state: "WriteRecords",
+                    expected: "Event::Storage(StorageEvent::BatchWriteResult)",
+                    received,
+                });
+            }
+        }
+
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(CreateGroupBackendError::Failed);
+        };
+        self.state = ReplaceState::CommitTransaction;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+
+    fn handle_committed(&mut self, event: Event) -> Effects {
+        self.txn_id = None;
+        match event {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                let Some(record) = self.record.clone() else {
+                    return self.fail(CreateGroupBackendError::Failed);
+                };
+                self.state = ReplaceState::Finish;
+                self.output = Some(Ok(record));
+                smallvec![]
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+            received => self.fail(CreateGroupBackendError::InvalidStateEvent {
+                state: "CommitTransaction",
+                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
+                received,
+            }),
+        }
+    }
+
+    fn handle_aborted(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::TransactionAborted { .. })
+            | Event::Storage(StorageEvent::Error { .. }) => {
+                self.state = ReplaceState::Error;
+                smallvec![]
+            }
+            received => self.fail(CreateGroupBackendError::InvalidStateEvent {
+                state: "AbortTransaction",
+                expected: "Event::Storage(StorageEvent::TransactionAborted)",
+                received,
+            }),
+        }
+    }
+}
+
+impl Operation for ReplaceGroupBackendOperation {
+    type Output = GroupStorageBackend;
+    type Error = CreateGroupBackendError;
+
+    fn start(&mut self) -> Effects {
+        self.state = ReplaceState::ReadRecord;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+            key: backend_key(self.backend_id),
+            txn_id: None,
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match self.state {
+            ReplaceState::Init => self.start(),
+            ReplaceState::ReadRecord => self.handle_existing(event),
+            ReplaceState::Probe => self.handle_probe(event),
+            ReplaceState::StartTransaction => self.handle_txn_started(event),
+            ReplaceState::VerifyRecord => self.handle_verified(event),
+            ReplaceState::WriteRecords => self.handle_written(event),
+            ReplaceState::CommitTransaction => self.handle_committed(event),
+            ReplaceState::AbortTransaction => self.handle_aborted(event),
+            ReplaceState::Finish | ReplaceState::Error => smallvec![],
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, ReplaceState::Finish | ReplaceState::Error)
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Err(CreateGroupBackendError::Failed))
+    }
+
+    fn abort(&mut self) -> Effects {
+        if let Some(txn_id) = self.txn_id.take() {
+            self.state = ReplaceState::AbortTransaction;
+            return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
+        }
+        smallvec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReplaceGroupBackendOperation;
+    use crate::group_backends::create::{CreateGroupBackendError, CreateGroupBackendInput};
+    use crate::group_backends::validation::GroupBackendError;
+    use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+    use aruna_core::events::{BlobEvent, Event, StorageEvent};
+    use aruna_core::operation::Operation;
+    use aruna_core::structs::{CleanupStrategy, GroupBackendKind, GroupStorageBackend};
+    use aruna_core::types::{Effects, TxnId};
+    use std::collections::HashMap;
+    use std::time::{Duration, SystemTime};
+    use ulid::Ulid;
+
+    fn input(group_id: Ulid) -> CreateGroupBackendInput {
+        CreateGroupBackendInput {
+            group_id,
+            created_by: aruna_core::UserId::default(),
+            name: "updated".to_string(),
+            kind: GroupBackendKind::S3,
+            public_config: HashMap::from([
+                ("endpoint".to_string(), "https://s3.example.com".to_string()),
+                ("bucket".to_string(), "data".to_string()),
+            ]),
+            secret_config: HashMap::from([
+                ("access_key_id".to_string(), "new-id".to_string()),
+                ("secret_access_key".to_string(), "new-key".to_string()),
+            ]),
+            cleanup: CleanupStrategy::Retain,
+        }
+    }
+
+    fn existing(group_id: Ulid, backend_id: Ulid) -> GroupStorageBackend {
+        GroupStorageBackend {
+            backend_id,
+            group_id,
+            name: "old".to_string(),
+            kind: GroupBackendKind::S3,
+            public_config: HashMap::from([
+                ("endpoint".to_string(), "https://s3.example.com".to_string()),
+                ("bucket".to_string(), "data".to_string()),
+            ]),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            created_by: aruna_core::UserId::default(),
+            disabled: false,
+            cleanup: CleanupStrategy::Retain,
+        }
+    }
+
+    fn refuse(input: CreateGroupBackendInput) -> CreateGroupBackendError {
+        let group_id = input.group_id;
+        let backend_id = Ulid::from_bytes([9u8; 16]);
+        let mut operation = ReplaceGroupBackendOperation::new(backend_id, input);
+        operation.start();
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(existing(group_id, backend_id).to_bytes().unwrap().into()),
+        }));
+
+        assert!(effects.is_empty(), "expected no probe, got {effects:?}");
+        operation.finalize().unwrap_err()
+    }
+
+    /// Answers the probe and the transaction reads with the stored record.
+    fn commit_update(
+        operation: &mut ReplaceGroupBackendOperation,
+        stored: GroupStorageBackend,
+    ) -> Effects {
+        operation.step(Event::Blob(BlobEvent::GroupBackendChecked));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::from(7),
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(stored.to_bytes().unwrap().into()),
+        }));
+        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: TxnId::from(7),
+        }));
+        effects
+    }
+
+    #[test]
+    fn keeps_backend_identity() {
+        // An update must not mint a new id: stamped objects reference this one.
+        let group_id = Ulid::from_bytes([1u8; 16]);
+        let backend_id = Ulid::from_bytes([9u8; 16]);
+        let mut operation = ReplaceGroupBackendOperation::new(backend_id, input(group_id));
+        operation.start();
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(existing(group_id, backend_id).to_bytes().unwrap().into()),
+        }));
+
+        let [Effect::Blob(BlobEffect::CheckGroupBackend { record, .. })] = effects.as_slice()
+        else {
+            panic!("expected one probe, got {effects:?}")
+        };
+        assert_eq!(record.backend_id, backend_id);
+        assert_eq!(record.created_at, SystemTime::UNIX_EPOCH);
+        assert!(record.updated_at > SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+
+        let effects = commit_update(&mut operation, existing(group_id, backend_id));
+
+        let [Effect::Storage(StorageEffect::BatchWrite { txn_id, .. })] = effects.as_slice() else {
+            panic!("expected one transacted write, got {effects:?}")
+        };
+        assert_eq!(*txn_id, Some(TxnId::from(7)));
+        assert_eq!(operation.finalize().unwrap().name, "updated");
+    }
+
+    #[test]
+    fn update_keeps_disabled() {
+        // A leaked credential must be replaceable without enabling writes again.
+        let group_id = Ulid::from_bytes([1u8; 16]);
+        let backend_id = Ulid::from_bytes([9u8; 16]);
+        let mut stored = existing(group_id, backend_id);
+        stored.disabled = true;
+        let mut operation = ReplaceGroupBackendOperation::new(backend_id, input(group_id));
+        operation.start();
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(stored.to_bytes().unwrap().into()),
+        }));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Blob(BlobEffect::CheckGroupBackend { .. })]
+            ),
+            "expected a probe, got {effects:?}"
+        );
+
+        commit_update(&mut operation, stored);
+
+        assert!(operation.finalize().unwrap().disabled);
+    }
+
+    #[test]
+    fn refuses_moved_store() {
+        // Stored locations carry neither kind nor endpoint, and record only the
+        // path below `root`, so all three are frozen.
+        let group_id = Ulid::from_bytes([1u8; 16]);
+        let mut moved = input(group_id);
+        moved
+            .public_config
+            .insert("bucket".to_string(), "elsewhere".to_string());
+        assert_eq!(
+            refuse(moved),
+            CreateGroupBackendError::Invalid(GroupBackendError::Immutable("bucket".to_string()))
+        );
+
+        let mut rerooted = input(group_id);
+        rerooted
+            .public_config
+            .insert("root".to_string(), "moved".to_string());
+        assert_eq!(
+            refuse(rerooted),
+            CreateGroupBackendError::Invalid(GroupBackendError::Immutable("root".to_string()))
+        );
+
+        let mut retyped = input(group_id);
+        retyped.kind = GroupBackendKind::Gcs;
+        retyped.public_config = HashMap::from([("bucket".to_string(), "data".to_string())]);
+        retyped.secret_config = HashMap::from([("credential".to_string(), "token".to_string())]);
+        assert_eq!(
+            refuse(retyped),
+            CreateGroupBackendError::Invalid(GroupBackendError::Immutable("type".to_string()))
+        );
+    }
+
+    #[test]
+    fn rejects_foreign_group() {
+        let backend_id = Ulid::from_bytes([9u8; 16]);
+        let mut operation =
+            ReplaceGroupBackendOperation::new(backend_id, input(Ulid::from_bytes([1u8; 16])));
+        operation.start();
+
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(
+                existing(Ulid::from_bytes([2u8; 16]), backend_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            ),
+        }));
+
+        assert!(matches!(
+            operation.finalize(),
+            Err(CreateGroupBackendError::NotFound)
+        ));
+    }
+}

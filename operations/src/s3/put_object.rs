@@ -1,25 +1,26 @@
 use crate::blob::blob_keyspace_helper::{
-    HeadAliasContext, add_hash_path_index_effect, write_blob_head_effect,
+    HeadAliasContext, add_hash_path_index_effect, blob_location_read, write_blob_head_effect,
     write_blob_location_effect, write_blob_version_effect,
 };
+use crate::blob::cleanup::PendingCleanup;
+use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::replication::util::dht_registration_effect;
 use crate::usage_stats::{
-    QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError,
+    QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_usage_snapshot_publish_effect,
 };
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
-use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
-};
+use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
-    RealmId, RoCrateLimits, UsageDelta, VersionKey, VersionSourceBinding,
+    AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
+    BucketInfo, CurrentVersionPointer, RealmId, RoCrateLimits, RoutingError, RoutingSnapshot,
+    UsageDelta, VersionKey, VersionSourceBinding, WriteOwner, resolve_backend,
 };
 use aruna_core::types::{Effects, GroupId, NodeId, UserId};
 use bytes::Bytes;
@@ -27,6 +28,7 @@ use smallvec::smallvec;
 use std::collections::HashMap;
 use std::time::{Duration, UNIX_EPOCH};
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -36,8 +38,10 @@ pub enum PutObjectState {
     ReadPreassignedLocation,
     WriteBlob,
     CleanupFailedWrite,
+    QueueCleanupRow,
     StartTransaction,
     CheckBucket,
+    FenceBackend,
     CheckHashLookup,
     CreateBlobLocation,
     ReadObjectLookup,
@@ -88,6 +92,10 @@ pub enum PutObjectError {
     UsageUpdateError(#[from] UsageUpdateError),
     #[error(transparent)]
     QuotaGateError(#[from] QuotaGateError),
+    #[error(transparent)]
+    RoutingFailed(#[from] RoutingError),
+    #[error(transparent)]
+    BackendFenceError(#[from] BackendFenceError),
     #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
     QuotaExceeded { limit: u64, usage: u64 },
     #[error("Something went wrong ...")]
@@ -120,6 +128,9 @@ pub struct PutObjectConfig {
     /// resolved from the realm quota config at the request surface. `None` =
     /// unlimited, so no gate is enforced.
     pub quota_ceiling: Option<u64>,
+    /// Routing inputs assembled by the caller, so resolution stays a pure
+    /// synchronous step inside the operation.
+    pub routing: RoutingSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -136,6 +147,8 @@ pub struct PutObjectOperation {
     version_id: Option<Ulid>,
     written_location: Option<BackendLocation>,
     cleanup_location: Option<BackendLocation>,
+    rollback_location: Option<BackendLocation>,
+    pending_cleanup: PendingCleanup,
     existing_pointer: Option<CurrentVersionPointer>,
     new_blob: bool,
     was_live: bool,
@@ -158,6 +171,8 @@ impl PutObjectOperation {
             version_id,
             written_location: None,
             cleanup_location: None,
+            rollback_location: None,
+            pending_cleanup: PendingCleanup::default(),
             existing_pointer: None,
             new_blob: false,
             was_live: false,
@@ -214,15 +229,11 @@ impl PutObjectOperation {
             Ok(version) => version,
             Err(error) => return self.emit_error(error.into()),
         };
-        let Some(hash) = version.blob_hash() else {
+        let Some(location_key) = version.location_key() else {
             return self.emit_error(PutObjectError::InvalidPreassignedVersion);
         };
         self.state = PutObjectState::ReadPreassignedLocation;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-            key: hash.to_vec().into(),
-            txn_id: None,
-        })]
+        smallvec![blob_location_read(&location_key, None)]
     }
 
     fn handle_preassigned_location(&mut self, event: Event) -> Effects {
@@ -247,11 +258,21 @@ impl PutObjectOperation {
     }
 
     fn handle_init(&mut self) -> Effects {
+        // Resolution runs before any bytes move; a failure is terminal.
+        let resolved = match resolve_backend(
+            &self.config.routing,
+            &self.config.request.bucket,
+            &self.config.request.key,
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => return self.emit_error(error.into()),
+        };
         self.state = PutObjectState::WriteBlob;
         if let Some(blob) = self.config.request.body.take() {
             smallvec![Effect::Blob(BlobEffect::Write {
                 bucket: self.config.request.bucket.clone(),
                 key: self.config.request.key.clone(),
+                resolved,
                 created_by: self.config.user_id,
                 blob
             })]
@@ -317,10 +338,30 @@ impl PutObjectOperation {
                     txn_id: self.txn_id,
                 })]
             } else {
-                self.start_hash_lookup()
+                self.start_fence()
             }
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
+        }
+    }
+
+    fn start_fence(&mut self) -> Effects {
+        let Some(location) = self.get_written_location() else {
+            return self.emit_error(PutObjectError::MissingOutput);
+        };
+        match fence_backend(&location.backend, self.txn_id) {
+            Some(effect) => {
+                self.state = PutObjectState::FenceBackend;
+                smallvec![effect]
+            }
+            None => self.start_hash_lookup(),
+        }
+    }
+
+    fn handle_backend_fenced(&mut self, event: Event) -> Effects {
+        match check_fence(event) {
+            Ok(()) => self.start_hash_lookup(),
+            Err(error) => self.cleanup_failed_write(error.into()),
         }
     }
 
@@ -336,29 +377,31 @@ impl PutObjectOperation {
             Ok(current) => current,
             Err(error) => return self.emit_error(error.into()),
         };
-        if current.as_ref() != self.expected_bucket.as_ref()
+        if current.as_ref().map(BucketInfo::identity)
+            != self.expected_bucket.as_ref().map(BucketInfo::identity)
             || current.is_none_or(|bucket| bucket.group_id != self.config.group_id)
         {
             return self.emit_error(StorageError::TransactionConflict.into());
         }
-        self.start_hash_lookup()
+        self.start_fence()
     }
 
+    /// Looks up only the copy on the backend this write resolved to, so
+    /// identical content on another backend never overrides the placement.
     fn start_hash_lookup(&mut self) -> Effects {
         self.state = PutObjectState::CheckHashLookup;
-        if let Some(written_location) = self.get_written_location() {
-            if let Some(blake3_hash) = written_location.get_blake3() {
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                    key: blake3_hash.to_vec().into(),
-                    txn_id: self.txn_id,
-                })]
-            } else {
-                self.emit_error(PutObjectError::MissingHash("blake3".to_string()))
-            }
-        } else {
-            self.emit_error(PutObjectError::MissingOutput)
-        }
+        let Some(written_location) = self.get_written_location() else {
+            return self.emit_error(PutObjectError::MissingOutput);
+        };
+        let Some(blake3_hash) = written_location.get_blake3() else {
+            return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
+        };
+        let key = match BlobLocationKey::from_blake3(blake3_hash, written_location.backend.clone())
+        {
+            Ok(key) => key,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        smallvec![blob_location_read(&key, self.txn_id)]
     }
 
     fn handle_hash_lookup_checked(&mut self, event: Event) -> Effects {
@@ -569,6 +612,7 @@ impl PutObjectOperation {
                         return self.emit_error(PutObjectError::ConversionError(err.into()));
                     }
                 },
+                output.backend.clone(),
                 version_created_at,
                 output.created_by,
                 self.config.version_source.clone(),
@@ -634,15 +678,13 @@ impl PutObjectOperation {
                     logical_bytes: size,
                     ..Default::default()
                 };
-                let global_delta = UsageDelta {
-                    stored_blobs: if self.new_blob { 1 } else { 0 },
-                    stored_bytes: if self.new_blob { size } else { 0 },
-                    ..group_delta
+                let Some(stored) = StoredDelta::for_location(&location, self.new_blob) else {
+                    return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
                 };
-                self.usage_update = Some(UsageCounterUpdate::with_global(
+                self.usage_update = Some(UsageCounterUpdate::with_stored(
                     self.config.group_id,
                     group_delta,
-                    global_delta,
+                    stored,
                 ));
 
                 // Enforce the hard group quota before the counters commit. Only a
@@ -727,11 +769,21 @@ impl PutObjectOperation {
     }
 
     fn cleanup_orphan_blob(&mut self) -> Effects {
+        self.rollback_written_blob()
+    }
+
+    /// Takes the location: once its delete is queued the rollback in `abort`
+    /// must not queue a second one. A copy stays behind so a delete that fails
+    /// can still be handed to the durable cleanup queue.
+    fn rollback_written_blob(&mut self) -> Effects {
         self.state = PutObjectState::CleanupFailedWrite;
-        self.get_written_location().cloned().map_or_else(
-            || self.emit_pending_error(),
-            |location| smallvec![Effect::Blob(BlobEffect::Delete { location })],
-        )
+        match self.written_location.take() {
+            Some(location) => {
+                self.rollback_location = Some(location.clone());
+                smallvec![Effect::Blob(BlobEffect::Delete { location })]
+            }
+            None => self.emit_pending_error(),
+        }
     }
 
     fn handle_usage_update(&mut self, event: Event) -> Effects {
@@ -758,22 +810,47 @@ impl PutObjectOperation {
         match event {
             Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                 self.txn_id = None;
+                // The committed records own the blob now, so the rollback must
+                // not still hold it.
+                self.written_location = None;
                 self.register_blob_in_dht_or_continue()
-            }
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::TransactionConflict,
-            }) => {
-                self.txn_id = None;
-                self.cleanup_failed_write(PutObjectError::StorageError(
-                    StorageError::TransactionConflict,
-                ))
             }
             Event::Storage(StorageEvent::Error { error }) => {
                 self.txn_id = None;
-                self.emit_error(error.into())
+                if error.proves_no_commit() {
+                    return self.cleanup_failed_write(PutObjectError::StorageError(error));
+                }
+                self.keep_written_blob(error)
             }
             _ => self.emit_error(PutObjectError::InvalidOperationState),
         }
+    }
+
+    /// A commit whose outcome is unknown may already own these bytes, so they go
+    /// to the reconciliation queue rather than being deleted or dropped: the
+    /// committed blob location row is what decides their fate.
+    fn keep_written_blob(&mut self, error: StorageError) -> Effects {
+        let Some(location) = self.written_location.take() else {
+            return self.emit_error(error.into());
+        };
+        warn!(
+            event = "put_object.commit_outcome_unknown",
+            backend = %location.backend,
+            blob_size = location.blob_size,
+            error = %error,
+            "Queuing the written blob for reconciliation"
+        );
+        self.pending_error = Some(error.into());
+        let Some(blake3) = location
+            .get_blake3()
+            .and_then(|hash| <[u8; 32]>::try_from(hash).ok())
+        else {
+            return self.emit_pending_error();
+        };
+        self.queue_cleanup_work(BlobCleanupWork::ReconcileWrite {
+            location,
+            owner: WriteOwner::Blob { blake3 },
+        })
     }
 
     fn register_blob_in_dht_or_continue(&mut self) -> Effects {
@@ -831,18 +908,51 @@ impl PutObjectOperation {
 
     fn cleanup_failed_write(&mut self, error: PutObjectError) -> Effects {
         self.pending_error = Some(error);
-        self.state = PutObjectState::CleanupFailedWrite;
-
-        self.get_written_location().cloned().map_or_else(
-            || self.emit_pending_error(),
-            |location| smallvec![Effect::Blob(BlobEffect::Delete { location })],
-        )
+        self.rollback_written_blob()
     }
 
     fn handle_failed_write_cleanup(&mut self, event: Event) -> Effects {
         match event {
-            Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
+            Event::Blob(BlobEvent::DeleteFinished) => {
+                self.rollback_location = None;
                 self.emit_pending_error()
+            }
+            // The bytes are still on the backend, and this operation is over;
+            // only a queued delete can still reach them.
+            Event::Blob(BlobEvent::Error(_)) => self.queue_rollback_delete(),
+            _ => self.emit_error(PutObjectError::InvalidOperationState),
+        }
+    }
+
+    fn queue_rollback_delete(&mut self) -> Effects {
+        let Some(location) = self.rollback_location.take() else {
+            return self.emit_pending_error();
+        };
+        self.queue_cleanup_work(BlobCleanupWork::DeleteBlob { location })
+    }
+
+    /// Hands one row to the durable cleanup queue outside any transaction. The
+    /// row keeps the location until storage accepts it, so a refused write can
+    /// still be retried rather than losing the only record of the bytes.
+    fn queue_cleanup_work(&mut self, work: BlobCleanupWork) -> Effects {
+        let Some(effect) = self.pending_cleanup.queue(work) else {
+            return self.emit_pending_error();
+        };
+        self.state = PutObjectState::QueueCleanupRow;
+        smallvec![effect]
+    }
+
+    fn handle_cleanup_queued(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {
+                self.pending_cleanup.accepted();
+                self.emit_pending_error()
+            }
+            Event::Storage(StorageEvent::Error { error }) => {
+                match self.pending_cleanup.retry(&error) {
+                    Some(effect) => smallvec![effect],
+                    None => self.emit_pending_error(),
+                }
             }
             _ => self.emit_error(PutObjectError::InvalidOperationState),
         }
@@ -855,10 +965,13 @@ impl PutObjectOperation {
         self.emit_error(error)
     }
 
+    /// The terminal state is complete, so the driver never calls `abort` for us;
+    /// rolling back here is what keeps an open transaction from outliving the
+    /// operation. `abort` takes what it releases, so it cannot run twice.
     fn emit_error(&mut self, error: PutObjectError) -> Effects {
         self.state = PutObjectState::Error;
         self.output = Some(Err(error));
-        smallvec![]
+        self.abort()
     }
 
     fn get_output(&self) -> Option<&BackendLocation> {
@@ -889,8 +1002,10 @@ impl Operation for PutObjectOperation {
             PutObjectState::ReadPreassignedLocation => self.handle_preassigned_location(event),
             PutObjectState::WriteBlob => self.handle_write_finished(event),
             PutObjectState::CleanupFailedWrite => self.handle_failed_write_cleanup(event),
+            PutObjectState::QueueCleanupRow => self.handle_cleanup_queued(event),
             PutObjectState::StartTransaction => self.handle_transaction_started(event),
             PutObjectState::CheckBucket => self.handle_bucket_checked(event),
+            PutObjectState::FenceBackend => self.handle_backend_fenced(event),
             PutObjectState::CheckHashLookup => self.handle_hash_lookup_checked(event),
             PutObjectState::CreateBlobLocation => self.handle_blob_location_created(event),
             PutObjectState::ReadObjectLookup => self.handle_object_lookup_read(event),
@@ -938,18 +1053,255 @@ impl Operation for PutObjectOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        // Rollback blob io and transaction
-        let mut actions = smallvec![];
+        let mut actions: Effects = smallvec![];
         if let Some(location) = self.written_location.take() {
-            actions.insert(0, Effect::Blob(BlobEffect::Delete { location }))
+            actions.push(Effect::Blob(BlobEffect::Delete { location }));
         }
         if let Some(txn_id) = self.txn_id.take() {
-            actions.insert(
-                1,
-                Effect::Storage(StorageEffect::AbortTransaction { txn_id }),
-            )
+            actions.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
         }
         actions
+    }
+}
+
+#[cfg(test)]
+mod routing_test {
+    use super::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+    use crate::group_backends::BackendFenceError;
+    use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+    use aruna_core::events::{BlobEvent, Event, StorageEvent};
+    use aruna_core::operation::Operation;
+    use aruna_core::stream::BackendStream;
+    use aruna_core::structs::RealmId;
+    use aruna_core::structs::{
+        BackendCatalog, BackendLocation, BackendRef, GroupBackendKind, GroupRoutingInputs,
+        GroupStorageBackend, RoutingError, RoutingSnapshot, RoutingTarget, StorageRoutingRule,
+    };
+    use aruna_core::types::TxnId;
+    use std::collections::{BTreeSet, HashMap};
+    use ulid::Ulid;
+
+    fn config(snapshot: RoutingSnapshot) -> PutObjectConfig {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        PutObjectConfig {
+            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            group_id: snapshot.group_id,
+            realm_id,
+            node_id: iroh::SecretKey::generate().public(),
+            request: PutObjectInput {
+                bucket: "bucket".to_string(),
+                key: "archive/one".to_string(),
+                content_length: Some(3),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+                    &b"abc"[..],
+                ))),
+            },
+            expected_checksums: Vec::new(),
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: snapshot,
+        }
+    }
+
+    fn snapshot() -> RoutingSnapshot {
+        RoutingSnapshot::new(
+            Ulid::generate(),
+            BackendCatalog::new("default")
+                .with_backend("default", None)
+                .with_backend("tape", Some("archive".to_string())),
+        )
+    }
+
+    #[test]
+    fn stamps_resolved_backend() {
+        let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
+            key_prefix: "archive/".to_string(),
+            exact: false,
+            target: RoutingTarget::Class("archive".to_string()),
+        }]);
+
+        let effects = PutObjectOperation::new(config(snapshot)).start();
+
+        let [Effect::Blob(BlobEffect::Write { resolved, .. })] = effects.as_slice() else {
+            panic!("expected one blob write, got {effects:?}")
+        };
+        assert_eq!(resolved.backend, BackendRef::Node("tape".to_string()));
+        assert_eq!(resolved.storage_class.as_deref(), Some("archive"));
+    }
+
+    #[test]
+    fn missing_class_stamps() {
+        // A class this node does not offer reroutes the write, never fails it.
+        let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
+            key_prefix: String::new(),
+            exact: false,
+            target: RoutingTarget::Class("glacier".to_string()),
+        }]);
+
+        let effects = PutObjectOperation::new(config(snapshot)).start();
+
+        let [Effect::Blob(BlobEffect::Write { resolved, .. })] = effects.as_slice() else {
+            panic!("expected one blob write, got {effects:?}")
+        };
+        assert_eq!(resolved.backend, BackendRef::Node("default".to_string()));
+        assert_eq!(resolved.storage_class, None);
+    }
+
+    #[test]
+    fn unknown_backend_aborts() {
+        // A named backend is binding: nothing may be written when it is gone.
+        let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
+            key_prefix: String::new(),
+            exact: false,
+            target: RoutingTarget::Backend(BackendRef::Node("ghost".to_string())),
+        }]);
+
+        let mut operation = PutObjectOperation::new(config(snapshot));
+        let effects = operation.start();
+
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutObjectError::RoutingFailed(RoutingError::UnknownBackend(
+                _
+            )))
+        ));
+    }
+
+    #[test]
+    fn refuses_disabled_backend() {
+        // A disabled backend refuses writes, so this write must not commit a
+        // location on it.
+        let backend_id = Ulid::from_bytes([5u8; 16]);
+        let snapshot = snapshot()
+            .with_group_inputs(GroupRoutingInputs {
+                default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
+                backend_ids: BTreeSet::from([backend_id]),
+            })
+            .with_bucket_rules(Vec::new());
+        let mut operation = PutObjectOperation::new(config(snapshot));
+        operation.start();
+        operation.step(Event::Blob(BlobEvent::WriteFinished {
+            location: written(backend_id),
+        }));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::from(3),
+        }));
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(disabled(backend_id).to_bytes().unwrap().into()),
+        }));
+
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Blob(BlobEffect::Delete { .. })]
+            ),
+            "expected the written blob to be rolled back, got {effects:?}"
+        );
+
+        let effects = operation.step(Event::Blob(BlobEvent::DeleteFinished));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+            ),
+            "expected the transaction to abort, got {effects:?}"
+        );
+        assert!(matches!(
+            operation.finalize(),
+            Err(PutObjectError::BackendFenceError(
+                BackendFenceError::Unavailable
+            ))
+        ));
+    }
+
+    #[test]
+    fn queues_failed_rollback() {
+        // A rollback delete the backend refuses must become a durable cleanup
+        // row, otherwise the written bytes are orphaned with nothing naming them.
+        let backend_id = Ulid::from_bytes([5u8; 16]);
+        let snapshot = snapshot()
+            .with_group_inputs(GroupRoutingInputs {
+                default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
+                backend_ids: BTreeSet::from([backend_id]),
+            })
+            .with_bucket_rules(Vec::new());
+        let mut operation = PutObjectOperation::new(config(snapshot));
+        operation.start();
+        operation.step(Event::Blob(BlobEvent::WriteFinished {
+            location: written(backend_id),
+        }));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::from(3),
+        }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(disabled(backend_id).to_bytes().unwrap().into()),
+        }));
+
+        let effects = operation.step(Event::Blob(BlobEvent::Error(
+            aruna_core::errors::BlobError::UnknownBackend("gone".to_string()),
+        )));
+
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space, txn_id, ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected one cleanup row write, got {effects:?}")
+        };
+        assert_eq!(key_space, aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE);
+        // Outside the transaction: that transaction is about to be aborted.
+        assert_eq!(*txn_id, None);
+
+        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"k".to_vec().into(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+    }
+
+    fn written(backend_id: Ulid) -> BackendLocation {
+        BackendLocation {
+            backend: BackendRef::Group(backend_id),
+            storage_class: None,
+            root: "root".to_string(),
+            storage_bucket: "bucket".to_string(),
+            backend_path: "bucket/object".to_string(),
+            ulid: Ulid::from_bytes([6u8; 16]),
+            compressed: false,
+            encrypted: false,
+            created_by: aruna_core::UserId::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 3,
+            hashes: HashMap::new(),
+        }
+    }
+
+    fn disabled(backend_id: Ulid) -> GroupStorageBackend {
+        GroupStorageBackend {
+            backend_id,
+            group_id: Ulid::from_bytes([7u8; 16]),
+            name: "tenant".to_string(),
+            kind: GroupBackendKind::S3,
+            public_config: HashMap::new(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            updated_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: aruna_core::UserId::default(),
+            disabled: true,
+            cleanup: aruna_core::structs::CleanupStrategy::Retain,
+        }
     }
 }
 
@@ -961,7 +1313,9 @@ mod test {
     };
     use crate::usage_stats::{QuotaGate, UsageCounterUpdate};
     use aruna_blob::blob::BlobHandler;
+    use aruna_blob::blob::{BackendRegistry, NodeBackend};
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+    use aruna_core::egress::EgressPolicy;
     use aruna_core::errors::{BlobError, StorageError};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::keyspaces::{
@@ -972,9 +1326,11 @@ mod test {
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
     use aruna_core::structs::{
-        Backend, BackendConfig, BackendLocation, BlobHeadKey, BlobVersion, BucketInfo,
-        CurrentVersionPointer, HashPathIndexKey, RealmId, UsageDelta, VersionKey,
+        Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey,
+        BlobVersion, BucketInfo, CurrentVersionPointer, HashPathIndexKey, RealmId, UsageDelta,
+        VersionKey,
     };
+    use aruna_core::structs::{BackendCatalog, NodeRoutingRule, RoutingSnapshot, RoutingTarget};
     use aruna_net::dht::storage::decode_entries;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -1014,6 +1370,8 @@ mod test {
 
     fn test_location(created_by: aruna_core::UserId) -> BackendLocation {
         BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "bucket".to_string(),
             backend_path: "path".to_string(),
@@ -1051,7 +1409,52 @@ mod test {
             version_source: None,
             preassigned_version_id: None,
             quota_ceiling: Some(1),
+            routing: RoutingSnapshot::single(group_id),
         }
+    }
+
+    #[test]
+    fn guard_allows_edit() {
+        // A routing or CORS edit is prospective policy, not a different bucket:
+        // it must not discard a write that already landed.
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = iroh::SecretKey::generate().public();
+        let config = put_config(realm_id, group_id, node_id);
+        let expected = BucketInfo {
+            group_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: config.user_id,
+            cors_configuration: None,
+            replication: None,
+            storage_routing: Vec::new(),
+        };
+        let edited = BucketInfo {
+            storage_routing: vec![aruna_core::structs::StorageRoutingRule {
+                key_prefix: String::new(),
+                exact: false,
+                target: aruna_core::structs::RoutingTarget::Class("cold".to_string()),
+            }],
+            ..expected.clone()
+        };
+        let mut op = PutObjectOperation::new(config).with_bucket_guard(expected);
+        op.state = PutObjectState::StartTransaction;
+        op.written_location = Some(test_location(op.config.user_id));
+        op.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::generate(),
+        }));
+
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"mybucket".to_vec().into(),
+            value: Some(edited.to_bytes().unwrap().into()),
+        }));
+
+        assert_ne!(
+            op.finalize(),
+            Err(PutObjectError::StorageError(
+                StorageError::TransactionConflict
+            ))
+        );
     }
 
     #[test]
@@ -1066,6 +1469,7 @@ mod test {
             created_by: config.user_id,
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         };
         let recreated = BucketInfo {
             created_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
@@ -1088,13 +1492,54 @@ mod test {
             value: Some(recreated.to_bytes().unwrap().into()),
         }));
 
-        assert!(effects.is_empty());
+        // The terminal state is complete, so this is the only chance to release
+        // the transaction the guard read joined.
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::Blob(BlobEffect::Delete { .. }),
+                    Effect::Storage(StorageEffect::AbortTransaction { .. }),
+                ]
+            ),
+            "expected a rollback, got {effects:?}"
+        );
         assert!(op.is_complete());
+        assert!(op.step(Event::Blob(BlobEvent::DeleteFinished)).is_empty());
         assert_eq!(
             op.finalize(),
             Err(PutObjectError::StorageError(
                 StorageError::TransactionConflict
             ))
+        );
+    }
+
+    #[test]
+    fn error_closes_transaction() {
+        // Error is a complete state, so nothing else can release the transaction.
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let mut op = PutObjectOperation::new(put_config(
+            realm_id,
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+        ));
+        let txn_id = Ulid::generate();
+        op.state = PutObjectState::CheckHashLookup;
+        op.txn_id = Some(txn_id);
+
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"unexpected".to_vec().into(),
+        }));
+
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+        );
+        assert!(op.txn_id.is_none());
+        // Replaying the terminal state must not abort the same transaction twice.
+        assert!(
+            op.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }))
+                .is_empty()
         );
     }
 
@@ -1196,9 +1641,8 @@ mod test {
         op.state = PutObjectState::UpdateUsage;
         op.txn_id = Some(txn_id);
         op.written_location = Some(location.clone());
-        op.usage_update = Some(UsageCounterUpdate::with_global(
+        op.usage_update = Some(UsageCounterUpdate::for_group(
             group_id,
-            UsageDelta::default(),
             UsageDelta::default(),
         ));
 
@@ -1264,6 +1708,60 @@ mod test {
         ));
     }
 
+    #[test]
+    fn unknown_keeps_blob() {
+        // Only a proven refusal rolls the blob back; every other commit failure
+        // may already have committed the version that names these bytes, so the
+        // copy is handed to reconciliation instead of deleted or forgotten.
+        for error in [
+            StorageError::CommitFailed,
+            StorageError::PersistError("journal".to_string()),
+            StorageError::Timeout,
+        ] {
+            let realm_id = RealmId::from_bytes([1u8; 32]);
+            let node_id = iroh::SecretKey::generate().public();
+            let mut op = PutObjectOperation::new(put_config(realm_id, Ulid::generate(), node_id));
+            op.state = PutObjectState::CommitTransaction;
+            op.txn_id = Some(Ulid::generate());
+            let mut location = test_location(op.config.user_id);
+            location.hashes.insert(
+                aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+                vec![7u8; 32],
+            );
+            op.written_location = Some(location.clone());
+
+            let effects = op.step(Event::Storage(StorageEvent::Error {
+                error: error.clone(),
+            }));
+
+            let [
+                Effect::Storage(StorageEffect::Write {
+                    key_space, value, ..
+                }),
+            ] = effects.as_slice()
+            else {
+                panic!("{error} must queue reconciliation, got {effects:?}")
+            };
+            assert_eq!(key_space, aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE);
+            assert_eq!(
+                super::BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
+                super::BlobCleanupWork::ReconcileWrite {
+                    location,
+                    owner: super::WriteOwner::Blob { blake3: [7u8; 32] },
+                }
+            );
+
+            op.step(Event::Storage(StorageEvent::WriteResult {
+                key: b"k".to_vec().into(),
+            }));
+            assert!(op.is_complete());
+            assert!(matches!(
+                op.finalize(),
+                Err(PutObjectError::StorageError(observed)) if observed == error
+            ));
+        }
+    }
+
     #[tokio::test]
     pub async fn test_put_object() {
         let temp_handle = tempdir().unwrap();
@@ -1314,6 +1812,7 @@ mod test {
             version_source: None,
             preassigned_version_id: Some(preassigned_version_id),
             quota_ceiling: None,
+            routing: RoutingSnapshot::single(group_id),
         };
         let put_operation = PutObjectOperation::new(put_config);
 
@@ -1345,7 +1844,13 @@ mod test {
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
                 key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                key: result.location.get_blake3().unwrap().to_vec().into(),
+                key: BlobLocationKey::from_blake3(
+                    result.location.get_blake3().unwrap(),
+                    result.location.backend.clone(),
+                )
+                .unwrap()
+                .to_bytes()
+                .into(),
                 txn_id: None,
             })
             .await
@@ -1472,6 +1977,7 @@ mod test {
                 version_source: None,
                 preassigned_version_id: Some(preassigned_version_id),
                 quota_ceiling: None,
+                routing: RoutingSnapshot::single(group_id),
             }),
             &context,
         )
@@ -1568,6 +2074,7 @@ mod test {
                 version_source: None,
                 preassigned_version_id: None,
                 quota_ceiling: None,
+                routing: RoutingSnapshot::single(group_id),
             }),
             &context,
         )
@@ -1596,6 +2103,7 @@ mod test {
                 version_source: None,
                 preassigned_version_id: None,
                 quota_ceiling: None,
+                routing: RoutingSnapshot::single(group_id),
             }),
             &context,
         )
@@ -1608,7 +2116,9 @@ mod test {
         assert_eq!(count_files(Path::new(&blob_root)), 1);
         let blob_hash: [u8; 32] = first.location.get_blake3().unwrap().try_into().unwrap();
 
-        let blob_location_value = read_value(&context, BLOB_LOCATIONS_KEYSPACE, blob_hash.to_vec())
+        let location_key =
+            BlobLocationKey::new(blob_hash, first.location.backend.clone()).to_bytes();
+        let blob_location_value = read_value(&context, BLOB_LOCATIONS_KEYSPACE, location_key)
             .await
             .expect("missing blob location entry");
         assert_eq!(
@@ -1669,6 +2179,227 @@ mod test {
         }
     }
 
+    /// Two filesystem node backends with distinct roots: enough to prove that a
+    /// routed write never adopts a copy sitting on the other backend.
+    async fn setup_two_backends(temp_root: &str) -> (DriverContext, String, String) {
+        let hot_root = format!("{temp_root}/hot");
+        let cold_root = format!("{temp_root}/cold");
+        std::fs::create_dir_all(&hot_root).unwrap();
+        std::fs::create_dir_all(&cold_root).unwrap();
+        let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+        let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+            .await
+            .unwrap();
+
+        let backend = |root: &str, prefix: &str, class: Option<String>| {
+            std::sync::Arc::new(NodeBackend::new(
+                BackendConfig {
+                    backend_type: Backend::FileSystem,
+                    bucket_prefix: Some(prefix.to_string()),
+                    max_bucket_size: Some(100_000),
+                    multipart_bucket: Some(format!("{prefix}parts")),
+                    root: root.to_string(),
+                    service_config: HashMap::new(),
+                    timeouts: Default::default(),
+                },
+                class,
+            ))
+        };
+        let mut backends = std::collections::BTreeMap::new();
+        backends.insert("default".to_string(), backend(&hot_root, "hot-", None));
+        backends.insert(
+            "cold".to_string(),
+            backend(&cold_root, "cold-", Some("cold".to_string())),
+        );
+        let registry = BackendRegistry::new(backends, "default".to_string()).unwrap();
+        let blob_handle = BlobHandler::with_registry(
+            registry,
+            storage_handle.clone(),
+            net_handle.clone(),
+            EgressPolicy::loopback(),
+        )
+        .await
+        .unwrap();
+
+        (
+            DriverContext {
+                storage_handle,
+                net_handle: Some(net_handle),
+                blob_handle: Some(blob_handle),
+                metadata_handle: None,
+                task_handle: None,
+                compute_handle: None,
+            },
+            hot_root,
+            cold_root,
+        )
+    }
+
+    fn archive_routing(group_id: Ulid) -> RoutingSnapshot {
+        let catalog = BackendCatalog::new("default")
+            .with_backend("default", None)
+            .with_backend("cold", Some("cold".to_string()));
+        RoutingSnapshot::new(group_id, catalog).with_node_rules(vec![NodeRoutingRule {
+            group: None,
+            bucket: None,
+            key_prefix: Some("archive/".to_string()),
+            target: RoutingTarget::Class("cold".to_string()),
+        }])
+    }
+
+    async fn put_routed(
+        context: &DriverContext,
+        group_id: Ulid,
+        realm_id: RealmId,
+        key: &str,
+        data: &'static [u8],
+    ) -> super::PutObjectResult {
+        drive(
+            PutObjectOperation::new(PutObjectConfig {
+                user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+                group_id,
+                realm_id,
+                node_id: context.net_handle.as_ref().unwrap().node_id(),
+                request: PutObjectInput {
+                    bucket: "mybucket".to_string(),
+                    key: key.to_string(),
+                    content_length: Some(data.len() as u64),
+                    body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(data))),
+                },
+                expected_checksums: vec![],
+                checksum_type: None,
+                exists: false,
+                version_source: None,
+                preassigned_version_id: None,
+                quota_ceiling: None,
+                routing: archive_routing(group_id),
+            }),
+            context,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn dedup_per_backend() {
+        // Identical bytes routed to two backends must keep one copy on each.
+        let temp_handle = tempdir().unwrap();
+        let temp_root = temp_handle.path().to_str().unwrap();
+        let (context, hot_root, cold_root) = setup_two_backends(temp_root).await;
+
+        let data = b"identical bytes";
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::generate();
+
+        let hot = put_routed(&context, group_id, realm_id, "hot.txt", data).await;
+        let cold = put_routed(&context, group_id, realm_id, "archive/cold.txt", data).await;
+
+        assert_eq!(hot.location.backend, BackendRef::node_default());
+        assert_eq!(cold.location.backend, BackendRef::Node("cold".to_string()));
+        assert_eq!(count_files(Path::new(&hot_root)), 1);
+        assert_eq!(count_files(Path::new(&cold_root)), 1);
+
+        let hash: [u8; 32] = hot.location.get_blake3().unwrap().try_into().unwrap();
+        assert_eq!(cold.location.get_blake3().unwrap(), hash);
+
+        for (key, result) in [("hot.txt", &hot), ("archive/cold.txt", &cold)] {
+            let version_value = read_value(
+                &context,
+                BLOB_VERSIONS_KEYSPACE,
+                VersionKey::new("mybucket", key, result.version_id)
+                    .to_bytes()
+                    .unwrap(),
+            )
+            .await
+            .expect("missing blob version entry");
+            let version = BlobVersion::from_bytes(version_value.as_ref()).unwrap();
+            assert_eq!(version.blob_backend(), Some(&result.location.backend));
+
+            let location_value = read_value(
+                &context,
+                BLOB_LOCATIONS_KEYSPACE,
+                version.location_key().unwrap().to_bytes(),
+            )
+            .await
+            .expect("missing blob location entry");
+            assert_eq!(
+                BackendLocation::from_bytes(location_value.as_ref()).unwrap(),
+                result.location
+            );
+            assert!(exists(result.location.get_full_path().unwrap()).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn dedup_repeats_backend() {
+        // A rewrite onto the same backend must still adopt the stored copy.
+        let temp_handle = tempdir().unwrap();
+        let temp_root = temp_handle.path().to_str().unwrap();
+        let (context, _hot_root, cold_root) = setup_two_backends(temp_root).await;
+
+        let data = b"identical bytes";
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::generate();
+
+        let first = put_routed(&context, group_id, realm_id, "archive/one.txt", data).await;
+        let second = put_routed(&context, group_id, realm_id, "archive/two.txt", data).await;
+
+        assert_eq!(first.location, second.location);
+        assert_eq!(count_files(Path::new(&cold_root)), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_keeps_copy() {
+        // Deleting one object must leave the twin copy on the other backend.
+        let temp_handle = tempdir().unwrap();
+        let temp_root = temp_handle.path().to_str().unwrap();
+        let (context, _hot_root, cold_root) = setup_two_backends(temp_root).await;
+
+        let data = b"identical bytes";
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::generate();
+
+        let hot = put_routed(&context, group_id, realm_id, "hot.txt", data).await;
+        let cold = put_routed(&context, group_id, realm_id, "archive/cold.txt", data).await;
+
+        let deleted = drive(
+            crate::s3::delete_object::DeleteObjectOperation::new(
+                crate::s3::delete_object::DeleteObjectInput {
+                    bucket: "mybucket".to_string(),
+                    key: "hot.txt".to_string(),
+                    version_id: Some(hot.version_id),
+                    group_id,
+                    realm_id,
+                    node_id: context.net_handle.as_ref().unwrap().node_id(),
+                    deleted_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
+                },
+            ),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(deleted.is_some_and(|result| result.is_ok()));
+
+        let location_value = read_value(
+            &context,
+            BLOB_LOCATIONS_KEYSPACE,
+            BlobLocationKey::new(
+                cold.location.get_blake3().unwrap().try_into().unwrap(),
+                cold.location.backend.clone(),
+            )
+            .to_bytes(),
+        )
+        .await
+        .expect("cold copy was removed with the hot object");
+        assert_eq!(
+            BackendLocation::from_bytes(location_value.as_ref()).unwrap(),
+            cold.location
+        );
+        assert_eq!(count_files(Path::new(&cold_root)), 1);
+    }
+
     #[test]
     fn put_object_current_pointer_generation_increments_from_existing_pointer() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
@@ -1689,10 +2420,13 @@ mod test {
             version_source: None,
             preassigned_version_id: None,
             quota_ceiling: None,
+            routing: RoutingSnapshot::single(Ulid::generate()),
         });
         let version_id = Ulid::generate();
         op.version_id = Some(version_id);
         op.output = Some(Ok(BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "bucket".to_string(),
             backend_path: "path".to_string(),
@@ -1790,6 +2524,7 @@ mod test {
                 version_source: None,
                 preassigned_version_id: None,
                 quota_ceiling: None,
+                routing: RoutingSnapshot::single(group_id),
             }),
             &context,
         )
@@ -1818,6 +2553,7 @@ mod test {
                 version_source: None,
                 preassigned_version_id: None,
                 quota_ceiling: None,
+                routing: RoutingSnapshot::single(group_id),
             }),
             &context,
         )
@@ -1979,6 +2715,7 @@ mod test {
                 version_source: None,
                 preassigned_version_id: None,
                 quota_ceiling: None,
+                routing: RoutingSnapshot::single(Ulid::generate()),
             }),
             &context,
         )

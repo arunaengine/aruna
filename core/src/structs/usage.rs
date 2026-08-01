@@ -1,11 +1,13 @@
 use crate::NodeId;
 use crate::errors::ConversionError;
+use crate::structs::BackendRef;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const USAGE_GLOBAL_KEY: &[u8] = b"global";
 pub const USAGE_GLOBAL_SHARD_COUNT: usize = 64;
+pub const USAGE_BACKEND_PREFIX: &str = "backend/";
 
 /// Keys in the node-usage keyspace. Per-node snapshots use fixed-length keys so
 /// their prefixes are unambiguous: `n/` + node id for a node's global total,
@@ -120,6 +122,32 @@ pub fn usage_global_shard_keys() -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Shard of the physical `stored_*` counters. Keyed by content hash so a
+/// reclaim debits exactly the shard its write credited, which makes underflow
+/// structurally impossible.
+pub fn shard_for_hash(blake3: &[u8; 32]) -> usize {
+    blake3.iter().fold(0u8, |shard, byte| shard ^ byte) as usize % USAGE_GLOBAL_SHARD_COUNT
+}
+
+pub fn usage_hash_key(blake3: &[u8; 32]) -> Vec<u8> {
+    usage_global_shard_key(shard_for_hash(blake3))
+}
+
+/// Stored bytes on one backend. The trailing fixed-width shard keeps two
+/// backend names from ever producing the same key.
+pub fn usage_backend_key(backend: &BackendRef, shard: usize) -> Vec<u8> {
+    let mut key = USAGE_BACKEND_PREFIX.as_bytes().to_vec();
+    key.extend_from_slice(&backend.key_bytes());
+    key.extend_from_slice(format!("/{shard:02}").as_bytes());
+    key
+}
+
+pub fn usage_backend_keys(backend: &BackendRef) -> Vec<Vec<u8>> {
+    (0..USAGE_GLOBAL_SHARD_COUNT)
+        .map(|shard| usage_backend_key(backend, shard))
+        .collect()
+}
+
 pub fn usage_group_key(group_id: GroupId) -> Vec<u8> {
     let mut key = Vec::with_capacity(6 + 16);
     key.extend_from_slice(b"group/");
@@ -127,17 +155,18 @@ pub fn usage_group_key(group_id: GroupId) -> Vec<u8> {
     key
 }
 
-/// Maintained usage aggregates. `stored_*` fields track physical,
-/// content-addressed blobs and are only meaningful on the global counter;
-/// `logical_bytes` sums materialized version sizes and is the per-group quota
-/// basis; `referenced_bytes` reports external reference footprint separately.
+/// Maintained usage aggregates. The `stored_*` fields track physical
+/// content-addressed blobs and are only meaningful on the global and
+/// per-backend rows.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UsageCounters {
     pub buckets: u64,
     pub objects: u64,
     pub stored_blobs: u64,
     pub stored_bytes: u64,
+    /// Materialized version sizes, and the per-group quota basis.
     pub logical_bytes: u64,
+    /// Bytes reachable only through an external reference.
     pub referenced_bytes: u64,
 }
 
@@ -206,6 +235,19 @@ pub struct UsageDelta {
 impl UsageDelta {
     pub fn is_zero(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// Folds two deltas aimed at one key, so a hash shard that happens to equal
+    /// a group shard still applies both halves instead of losing one.
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            buckets: self.buckets.saturating_add(other.buckets),
+            objects: self.objects.saturating_add(other.objects),
+            stored_blobs: self.stored_blobs.saturating_add(other.stored_blobs),
+            stored_bytes: self.stored_bytes.saturating_add(other.stored_bytes),
+            logical_bytes: self.logical_bytes.saturating_add(other.logical_bytes),
+            referenced_bytes: self.referenced_bytes.saturating_add(other.referenced_bytes),
+        }
     }
 }
 
@@ -334,6 +376,31 @@ mod tests {
         };
         let bytes = counters.to_bytes().unwrap();
         assert_eq!(UsageCounters::from_bytes(&bytes).unwrap(), counters);
+    }
+
+    #[test]
+    fn keys_stay_distinct() {
+        // A name ending in a shard-shaped suffix must not alias another backend.
+        let plain = BackendRef::Node("cold".to_string());
+        let tricky = BackendRef::Node("cold/07".to_string());
+
+        assert_eq!(usage_backend_keys(&plain).len(), USAGE_GLOBAL_SHARD_COUNT);
+        assert_ne!(usage_backend_key(&plain, 7), usage_backend_key(&tricky, 7));
+        assert!(
+            !usage_backend_keys(&plain)
+                .iter()
+                .any(|key| usage_backend_keys(&tricky).contains(key))
+        );
+    }
+
+    #[test]
+    fn shard_is_stable() {
+        let hash = [7u8; 32];
+        assert_eq!(
+            usage_hash_key(&hash),
+            usage_global_shard_key(shard_for_hash(&hash))
+        );
+        assert!(shard_for_hash(&hash) < USAGE_GLOBAL_SHARD_COUNT);
     }
 
     fn node(seed: u8) -> NodeId {

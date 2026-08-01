@@ -1,11 +1,12 @@
 use crate::blob::blob_keyspace_helper::{
-    HeadAliasContext, add_hash_path_index_effect, write_blob_head_effect,
+    HeadAliasContext, add_hash_path_index_effect, blob_location_read, write_blob_head_effect,
     write_blob_location_effect, write_blob_version_effect,
 };
-use crate::blob::cleanup::schedule_blob_cleanup_effect;
+use crate::blob::cleanup::{PendingCleanup, schedule_blob_cleanup_effect};
+use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::usage_stats::{
-    QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError,
+    QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_usage_snapshot_publish_effect,
 };
 use aruna_blob::hash::Hasher;
@@ -13,23 +14,25 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
     S3_MULTIPART_UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobVersion, CurrentVersionPointer,
-    MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
-    MultipartUpload, MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus, RealmId,
-    RoCrateLimits, UsageDelta, VersionKey,
+    AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
+    CurrentVersionPointer, MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
+    MultipartObjectSummary, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
+    MultipartUploadStatus, RealmId, ResolvedBackend, RoCrateLimits, UsageDelta, VersionKey,
+    WriteOwner,
 };
 use aruna_core::types::{Effects, NodeId, TxnId, UserId};
 use smallvec::smallvec;
 use std::collections::HashMap;
 use std::time::SystemTime;
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -42,6 +45,7 @@ pub enum CompleteMultipartUploadState {
     ReadUploadParts,
     ComposeBlob,
     StartFinalizeTransaction,
+    FenceBackend,
     CheckHashLookup,
     WriteBlobLocation,
     ReadObjectLookup,
@@ -62,6 +66,7 @@ pub enum CompleteMultipartUploadState {
     WriteUploadReset,
     CommitResetTransaction,
     CleanupFailedCompose,
+    QueueCleanupRow,
     Finish,
     Error,
 }
@@ -72,8 +77,12 @@ pub enum CompleteMultipartUploadError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    BackendFenceError(#[from] BackendFenceError),
     #[error("Invalid operation state")]
     InvalidOperationState,
+    #[error("stored part does not live on the upload's pinned backend")]
+    BackendMismatch,
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("The specified upload does not exist.")]
@@ -157,6 +166,11 @@ pub struct CompleteMultipartUploadOperation {
     upload_parts: Vec<MultipartUploadPart>,
     resolved_parts: Vec<MultipartUploadPart>,
     composed_location: Option<BackendLocation>,
+    /// The composed object after a commit whose outcome is unknown. Held apart
+    /// from `composed_location` so `abort` cannot delete bytes a commit owns.
+    reconcile_location: Option<BackendLocation>,
+    rollback_location: Option<BackendLocation>,
+    pending_cleanup: PendingCleanup,
     final_location: Option<BackendLocation>,
     composite_hashes: HashMap<String, Vec<u8>>,
     version_id: Option<Ulid>,
@@ -181,6 +195,9 @@ impl CompleteMultipartUploadOperation {
             upload_parts: Vec::new(),
             resolved_parts: Vec::new(),
             composed_location: None,
+            reconcile_location: None,
+            rollback_location: None,
+            pending_cleanup: PendingCleanup::default(),
             final_location: None,
             composite_hashes: HashMap::new(),
             version_id: None,
@@ -201,10 +218,13 @@ impl CompleteMultipartUploadOperation {
         self
     }
 
+    /// The terminal state is complete, so the driver never calls `abort` for us;
+    /// releasing the transaction here is what keeps it from outliving the
+    /// operation. `abort` takes the id, so it cannot run twice.
     fn emit_error(&mut self, error: CompleteMultipartUploadError) -> Effects {
         self.state = CompleteMultipartUploadState::Error;
         self.output = Some(Err(error));
-        smallvec![]
+        self.abort()
     }
 
     fn schedule_error(&mut self, error: CompleteMultipartUploadError) -> Effects {
@@ -226,16 +246,72 @@ impl CompleteMultipartUploadOperation {
             smallvec![Effect::Storage(StorageEffect::StartTransaction {
                 read: false,
             })]
-        } else if self.composed_location.is_some() {
-            self.state = CompleteMultipartUploadState::CleanupFailedCompose;
-            smallvec![Effect::Blob(BlobEffect::Delete {
-                location: self
-                    .composed_location
-                    .clone()
-                    .expect("composed_location checked above"),
-            })]
         } else {
-            self.emit_pending_error()
+            self.rollback_composed_blob()
+        }
+    }
+
+    /// Takes the location: once its delete is queued the rollback in `abort`
+    /// must not queue a second one. A copy stays behind so a delete that fails
+    /// can still be handed to the durable cleanup queue.
+    fn rollback_composed_blob(&mut self) -> Effects {
+        if let Some(location) = self.reconcile_location.take() {
+            return self.queue_reconcile_write(location);
+        }
+        self.state = CompleteMultipartUploadState::CleanupFailedCompose;
+        match self.composed_location.take() {
+            Some(location) => {
+                self.rollback_location = Some(location.clone());
+                smallvec![Effect::Blob(BlobEffect::Delete { location })]
+            }
+            None => self.emit_pending_error(),
+        }
+    }
+
+    fn queue_reconcile_write(&mut self, location: BackendLocation) -> Effects {
+        let Some(blake3) = location
+            .get_blake3()
+            .and_then(|hash| <[u8; 32]>::try_from(hash).ok())
+        else {
+            return self.emit_pending_error();
+        };
+        self.queue_cleanup_work(BlobCleanupWork::ReconcileWrite {
+            location,
+            owner: WriteOwner::Blob { blake3 },
+        })
+    }
+
+    fn queue_rollback_delete(&mut self) -> Effects {
+        let Some(location) = self.rollback_location.take() else {
+            return self.emit_pending_error();
+        };
+        self.queue_cleanup_work(BlobCleanupWork::DeleteBlob { location })
+    }
+
+    /// Hands one row to the durable cleanup queue outside any transaction. The
+    /// row keeps the location until storage accepts it, so a refused write can
+    /// still be retried rather than losing the only record of the bytes.
+    fn queue_cleanup_work(&mut self, work: BlobCleanupWork) -> Effects {
+        let Some(effect) = self.pending_cleanup.queue(work) else {
+            return self.emit_pending_error();
+        };
+        self.state = CompleteMultipartUploadState::QueueCleanupRow;
+        smallvec![effect]
+    }
+
+    fn handle_cleanup_queued(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {
+                self.pending_cleanup.accepted();
+                self.emit_pending_error()
+            }
+            Event::Storage(StorageEvent::Error { error }) => {
+                match self.pending_cleanup.retry(&error) {
+                    Some(effect) => smallvec![effect],
+                    None => self.emit_pending_error(),
+                }
+            }
+            _ => self.emit_error(CompleteMultipartUploadError::InvalidOperationState),
         }
     }
 
@@ -432,6 +508,12 @@ impl CompleteMultipartUploadOperation {
             let Some(record) = all_parts.get(&requested.part_number).cloned() else {
                 return Err(CompleteMultipartUploadError::InvalidPart);
             };
+            // Compose stays same-backend: a part elsewhere means a routing bug.
+            if let Some(upload) = self.upload_record.as_ref()
+                && record.location.backend != upload.backend
+            {
+                return Err(CompleteMultipartUploadError::BackendMismatch);
+            }
             validate_requested_part(requested, &record, required_checksum_algorithm)?;
             resolved.push(record);
         }
@@ -472,10 +554,15 @@ impl CompleteMultipartUploadOperation {
         self.upload_parts = upload_parts;
         self.resolved_parts = resolved.clone();
 
+        let Some(upload) = self.upload_record.as_ref() else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+        let pinned = ResolvedBackend::new(upload.backend.clone(), upload.storage_class.clone());
         self.state = CompleteMultipartUploadState::ComposeBlob;
         smallvec![Effect::Blob(BlobEffect::Compose {
             bucket: self.input.bucket.clone(),
             key: self.input.key.clone(),
+            resolved: pinned,
             created_by: self.input.created_by,
             parts: resolved.into_iter().map(|part| part.location).collect(),
         })]
@@ -522,17 +609,41 @@ impl CompleteMultipartUploadOperation {
             return self
                 .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         };
+        // The compose already ran on the pinned backend, so the finalize must
+        // prove it is still enabled or roll the composed object back.
+        match fence_backend(&location.backend, self.txn_id) {
+            Some(effect) => {
+                self.state = CompleteMultipartUploadState::FenceBackend;
+                smallvec![effect]
+            }
+            None => self.check_hash_lookup(),
+        }
+    }
+
+    fn handle_backend_fenced(&mut self, event: Event) -> Effects {
+        match check_fence(event) {
+            Ok(()) => self.check_hash_lookup(),
+            Err(error) => self.schedule_error(error.into()),
+        }
+    }
+
+    fn check_hash_lookup(&mut self) -> Effects {
+        let Some(location) = self.composed_location.clone() else {
+            return self
+                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        };
         let Some(blake3_hash) = location.get_blake3() else {
             return self.schedule_error(CompleteMultipartUploadError::MissingExpectedChecksum(
                 "blake3",
             ));
         };
+        // Only the copy on the upload's pinned backend may be deduplicated.
+        let key = match BlobLocationKey::from_blake3(blake3_hash, location.backend.clone()) {
+            Ok(key) => key,
+            Err(error) => return self.schedule_error(error.into()),
+        };
         self.state = CompleteMultipartUploadState::CheckHashLookup;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-            key: blake3_hash.to_vec().into(),
-            txn_id: self.txn_id,
-        })]
+        smallvec![blob_location_read(&key, self.txn_id)]
     }
 
     fn handle_hash_lookup_checked(&mut self, event: Event) -> Effects {
@@ -751,6 +862,7 @@ impl CompleteMultipartUploadOperation {
                         .schedule_error(CompleteMultipartUploadError::ConversionError(err.into()));
                 }
             },
+            location.backend.clone(),
             created_at,
             self.input.created_by,
             None,
@@ -971,15 +1083,18 @@ impl CompleteMultipartUploadOperation {
             logical_bytes: size,
             ..Default::default()
         };
-        let global_delta = UsageDelta {
-            stored_blobs: if self.new_blob { 1 } else { 0 },
-            stored_bytes: if self.new_blob { size } else { 0 },
-            ..group_delta
+        let stored = self
+            .final_location
+            .as_ref()
+            .and_then(|location| StoredDelta::for_location(location, self.new_blob));
+        let Some(stored) = stored else {
+            return self
+                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         };
-        self.usage_update = Some(UsageCounterUpdate::with_global(
+        self.usage_update = Some(UsageCounterUpdate::with_stored(
             group_id,
             group_delta,
-            global_delta,
+            stored,
         ));
 
         // Enforce the hard group quota before the counters commit. Only a positive
@@ -1064,9 +1179,32 @@ impl CompleteMultipartUploadOperation {
         }
     }
 
+    /// A commit whose outcome is unknown may already own the composed object, so
+    /// only a proven refusal rolls it back. The rest moves to the reconciliation
+    /// queue, out of reach of `abort`, and the committed blob location row
+    /// decides its fate.
+    fn handle_finalize_failure(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::Error { error }) = event else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+        if !error.proves_no_commit()
+            && let Some(location) = self.composed_location.take()
+        {
+            warn!(
+                event = "complete_multipart_upload.commit_outcome_unknown",
+                backend = %location.backend,
+                blob_size = location.blob_size,
+                error = %error,
+                "Queuing the composed object for reconciliation"
+            );
+            self.reconcile_location = Some(location);
+        }
+        self.schedule_error(error.into())
+    }
+
     fn handle_finalize_committed(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.handle_finalize_failure(event);
         };
         self.txn_id = None;
         self.composed_location = None;
@@ -1135,12 +1273,7 @@ impl CompleteMultipartUploadOperation {
             self.state = CompleteMultipartUploadState::CleanupFailedCompose;
             return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
         }
-        self.state = CompleteMultipartUploadState::CleanupFailedCompose;
-        if let Some(location) = self.composed_location.clone() {
-            smallvec![Effect::Blob(BlobEffect::Delete { location })]
-        } else {
-            self.emit_pending_error()
-        }
+        self.rollback_composed_blob()
     }
 
     fn handle_upload_reset_written(&mut self, event: Event) -> Effects {
@@ -1159,19 +1292,21 @@ impl CompleteMultipartUploadOperation {
             return self.emit_error(CompleteMultipartUploadError::InvalidOperationState);
         };
         self.txn_id = None;
-        self.state = CompleteMultipartUploadState::CleanupFailedCompose;
-        if let Some(location) = self.composed_location.clone() {
-            smallvec![Effect::Blob(BlobEffect::Delete { location })]
-        } else {
-            self.emit_pending_error()
-        }
+        self.rollback_composed_blob()
     }
 
     fn handle_failed_compose_cleanup(&mut self, event: Event) -> Effects {
         match event {
-            Event::Blob(BlobEvent::DeleteFinished)
-            | Event::Blob(BlobEvent::Error(_))
-            | Event::Storage(StorageEvent::TransactionAborted { .. }) => self.emit_pending_error(),
+            Event::Storage(StorageEvent::TransactionAborted { .. }) => {
+                self.rollback_composed_blob()
+            }
+            Event::Blob(BlobEvent::DeleteFinished) => {
+                self.rollback_location = None;
+                self.emit_pending_error()
+            }
+            // The composed object is still on the backend and this operation is
+            // over; only a queued delete can still reach it.
+            Event::Blob(BlobEvent::Error(_)) => self.queue_rollback_delete(),
             _ => self.emit_error(CompleteMultipartUploadError::InvalidOperationState),
         }
     }
@@ -1203,6 +1338,7 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::StartFinalizeTransaction => {
                 self.handle_finalize_transaction_started(event)
             }
+            CompleteMultipartUploadState::FenceBackend => self.handle_backend_fenced(event),
             CompleteMultipartUploadState::CheckHashLookup => self.handle_hash_lookup_checked(event),
             CompleteMultipartUploadState::WriteBlobLocation => {
                 self.handle_blob_location_written(event)
@@ -1251,6 +1387,7 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::CleanupFailedCompose => {
                 self.handle_failed_compose_cleanup(event)
             }
+            CompleteMultipartUploadState::QueueCleanupRow => self.handle_cleanup_queued(event),
             CompleteMultipartUploadState::Finish => smallvec![],
             CompleteMultipartUploadState::Error => self.abort(),
         }
@@ -1275,11 +1412,14 @@ impl Operation for CompleteMultipartUploadOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id
-            .take()
-            .map_or_else(smallvec::SmallVec::new, |txn_id| {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            })
+        let mut effects: Effects = smallvec![];
+        if let Some(location) = self.composed_location.take() {
+            effects.push(Effect::Blob(BlobEffect::Delete { location }));
+        }
+        if let Some(txn_id) = self.txn_id.take() {
+            effects.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
+        }
+        effects
     }
 }
 
@@ -1365,7 +1505,7 @@ fn composite_digest_for_algorithm(algorithm: ChecksumAlgorithm, bytes: &[u8]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::MultipartUploadChecksumHint;
+    use aruna_core::structs::{BackendRef, MultipartUploadChecksumHint};
     use aruna_core::task::{TaskEffect, TaskKey};
 
     fn finalize_input() -> CompleteMultipartUploadInput {
@@ -1389,6 +1529,8 @@ mod tests {
 
     fn open_upload_record(input: &CompleteMultipartUploadInput) -> MultipartUpload {
         MultipartUpload {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             upload_id: input.upload_id,
             bucket: input.bucket.clone(),
             key: input.key.clone(),
@@ -1405,6 +1547,8 @@ mod tests {
         MultipartUploadPart {
             part_number,
             location: BackendLocation {
+                backend: BackendRef::node_default(),
+                storage_class: None,
                 root: "/tmp".to_string(),
                 storage_bucket: "multipart".to_string(),
                 backend_path: format!("part-{part_number}"),
@@ -1420,6 +1564,30 @@ mod tests {
             },
             created_at: SystemTime::now(),
         }
+    }
+
+    #[test]
+    fn rejects_foreign_part() {
+        // A part stored elsewhere means routing was re-run; compose must fail.
+        let mut input = finalize_input();
+        input.completed_parts = vec![CompleteMultipartPart {
+            part_number: 1,
+            etag: None,
+            expected_checksums: Vec::new(),
+        }];
+        let mut operation = CompleteMultipartUploadOperation::new(input);
+        let record = open_upload_record(&operation.input);
+        let upload_id = record.upload_id;
+        operation.upload_record = Some(record);
+        let mut part = part_record(1, 10);
+        part.location.backend = BackendRef::Node("elsewhere".to_string());
+
+        let result = operation.extract_requested_parts(part_values(upload_id, vec![part]));
+
+        assert!(matches!(
+            result,
+            Err(CompleteMultipartUploadError::BackendMismatch)
+        ));
     }
 
     fn part_values(
@@ -1438,6 +1606,204 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn refuses_disabled_backend() {
+        // Compose already ran on the pinned backend, so the finalize fence has
+        // to abort the transaction and roll the composed object back.
+        let backend_id = Ulid::from_bytes([5u8; 16]);
+        let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+        op.upload_record = Some(open_upload_record(&op.input));
+        op.composed_location = Some(composed_location(backend_id));
+        op.state = CompleteMultipartUploadState::StartFinalizeTransaction;
+        let txn_id = TxnId::generate();
+
+        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert_eq!(op.state, CompleteMultipartUploadState::FenceBackend);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(disabled_record(backend_id).into()),
+        }));
+
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })]
+                    if *aborted == txn_id
+            ),
+            "expected the finalize transaction to abort, got {effects:?}"
+        );
+        assert_eq!(
+            op.pending_error,
+            Some(BackendFenceError::Unavailable.into())
+        );
+    }
+
+    #[test]
+    fn fence_rejects_stray() {
+        let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+        op.composed_location = Some(composed_location(Ulid::from_bytes([5u8; 16])));
+        op.state = CompleteMultipartUploadState::FenceBackend;
+
+        op.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+
+        assert!(matches!(
+            op.pending_error,
+            Some(CompleteMultipartUploadError::BackendFenceError(
+                BackendFenceError::Read(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn rollback_queues_cleanup() {
+        // A backend that refuses the rollback delete would otherwise leave a
+        // composed object no location or cleanup row can find.
+        let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+        op.composed_location = Some(composed_location(Ulid::from_bytes([5u8; 16])));
+        op.state = CompleteMultipartUploadState::FenceBackend;
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(disabled_record(Ulid::from_bytes([5u8; 16])).into()),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Delete { .. })]
+        ));
+
+        let effects = op.step(Event::Blob(BlobEvent::Error(
+            aruna_core::errors::BlobError::DeleteError("unreachable".to_string()),
+        )));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Write { key_space, .. })]
+                if key_space == BLOB_CLEANUP_KEYSPACE
+        ));
+        assert!(
+            op.step(Event::Storage(StorageEvent::WriteResult {
+                key: b"x".to_vec().into(),
+            }))
+            .is_empty()
+        );
+        assert!(op.is_complete());
+    }
+
+    #[test]
+    fn commit_keeps_composed() {
+        // A finalize commit that may have landed already owns the composed
+        // object, so nothing here may delete it; it goes to reconciliation with
+        // the blob location row that decides whether the commit landed.
+        let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+        let mut location = composed_location(Ulid::from_bytes([5u8; 16]));
+        location.hashes.insert(
+            aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+            vec![7u8; 32],
+        );
+        op.composed_location = Some(location.clone());
+        op.state = CompleteMultipartUploadState::CommitFinalizeTransaction;
+
+        let effects = op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::CommitFailed,
+        }));
+
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space, value, ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected reconciliation to be queued, got {effects:?}")
+        };
+        assert_eq!(key_space, BLOB_CLEANUP_KEYSPACE);
+        assert_eq!(
+            BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
+            BlobCleanupWork::ReconcileWrite {
+                location,
+                owner: WriteOwner::Blob { blake3: [7u8; 32] },
+            }
+        );
+        assert!(op.composed_location.is_none());
+
+        op.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"k".to_vec().into(),
+        }));
+        assert!(op.is_complete());
+        assert!(matches!(
+            op.finalize(),
+            Err(CompleteMultipartUploadError::StorageError(
+                StorageError::CommitFailed
+            ))
+        ));
+    }
+
+    #[test]
+    fn conflict_deletes_composed() {
+        // A refused finalize proves no version names the composed object.
+        let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+        op.composed_location = Some(composed_location(Ulid::from_bytes([5u8; 16])));
+        op.state = CompleteMultipartUploadState::CommitFinalizeTransaction;
+
+        let effects = op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Delete { .. })]
+        ));
+    }
+
+    #[test]
+    fn abort_deletes_composed() {
+        // The reset transaction never commits, so nothing else can reach the
+        // composed object once this operation ends.
+        let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+        op.composed_location = Some(composed_location(Ulid::from_bytes([5u8; 16])));
+        op.state = CompleteMultipartUploadState::CommitResetTransaction;
+
+        let effects = op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Delete { .. })]
+        ));
+        assert!(op.composed_location.is_none());
+    }
+
+    fn composed_location(backend_id: Ulid) -> BackendLocation {
+        let mut location = part_record(1, 10).location;
+        location.backend = BackendRef::Group(backend_id);
+        location.partial = false;
+        location
+    }
+
+    fn disabled_record(backend_id: Ulid) -> Vec<u8> {
+        aruna_core::structs::GroupStorageBackend {
+            backend_id,
+            group_id: Ulid::from_bytes([7u8; 16]),
+            name: "tenant".to_string(),
+            kind: aruna_core::structs::GroupBackendKind::S3,
+            public_config: HashMap::new(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            disabled: true,
+            cleanup: aruna_core::structs::CleanupStrategy::Retain,
+        }
+        .to_bytes()
+        .unwrap()
     }
 
     #[test]
@@ -1605,6 +1971,8 @@ mod tests {
         let requested = part_record(1, 10);
         let omitted = part_record(2, 20);
         op.final_location = Some(BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: "object".to_string(),
@@ -1647,6 +2015,8 @@ mod tests {
         let input = finalize_input();
         let mut op = CompleteMultipartUploadOperation::new(input);
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: "object".to_string(),

@@ -7,7 +7,7 @@ use aruna_core::events::{DhtEntry, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{RealmId, RoCrateLimits};
+use aruna_core::structs::{BlobLocationKey, RealmId, RoCrateLimits};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, Key, NodeId};
 use smallvec::smallvec;
@@ -51,6 +51,7 @@ pub struct RefreshBlobHoldersOperation {
     state: RefreshState,
     pending: VecDeque<DhtKeyId>,
     next_start: Option<Key>,
+    last_published: Option<DhtKeyId>,
     refreshed: usize,
     output: Option<Result<usize, RefreshBlobHoldersError>>,
 }
@@ -64,6 +65,7 @@ impl RefreshBlobHoldersOperation {
             state: RefreshState::Init,
             pending: VecDeque::new(),
             next_start: None,
+            last_published: None,
             refreshed: 0,
             output: None,
         }
@@ -138,12 +140,17 @@ impl Operation for RefreshBlobHoldersOperation {
                     values,
                     next_start_after,
                 }) => {
-                    self.pending
-                        .extend(values.into_iter().filter_map(|(key, _)| {
-                            <[u8; 32]>::try_from(key.as_ref())
-                                .ok()
-                                .map(DhtKeyId::from_bytes)
-                        }));
+                    // Copies of one hash sort together, so one publish per hash
+                    // is enough even though each backend has its own entry.
+                    for (key, _) in values {
+                        let Ok(location) = BlobLocationKey::from_bytes(key.as_ref()) else {
+                            continue;
+                        };
+                        let dht_key = DhtKeyId::from_bytes(location.blake3_hash);
+                        if self.last_published.replace(dht_key) != Some(dht_key) {
+                            self.pending.push_back(dht_key);
+                        }
+                    }
                     self.next_start = next_start_after;
                     self.next_effect()
                 }
@@ -196,6 +203,8 @@ enum GetState {
 pub enum GetBlobHoldersError {
     #[error(transparent)]
     Dht(#[from] DhtError),
+    #[error("blob holder lookup did not complete")]
+    Aborted,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -285,11 +294,14 @@ impl Operation for GetBlobHoldersOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .expect("blob holder get operation must set output")
+        self.output.unwrap_or(Err(GetBlobHoldersError::Aborted))
     }
 
+    /// A deadline must not look like an empty holder set: the caller reports the
+    /// gap instead of claiming it enumerated every copy.
     fn abort(&mut self) -> Effects {
+        self.state = GetState::Error;
+        self.output.get_or_insert(Err(GetBlobHoldersError::Aborted));
         smallvec![]
     }
 }
@@ -303,6 +315,17 @@ mod tests {
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    use aruna_core::structs::BackendRef;
+
+    fn location_key(seed: u8) -> Vec<u8> {
+        BlobLocationKey::new([seed; 32], BackendRef::node_default()).to_bytes()
+    }
+
+    /// A second copy of the same hash, so the scan must publish it only once.
+    fn cold_key(seed: u8) -> Vec<u8> {
+        BlobLocationKey::new([seed; 32], BackendRef::Node("cold".to_string())).to_bytes()
     }
 
     fn entry(node_id: NodeId, realm_id: RealmId) -> DhtEntry {
@@ -367,9 +390,12 @@ mod tests {
             })] if key_space == BLOB_LOCATIONS_KEYSPACE
         ));
 
-        let cursor: Key = vec![1; 32].into();
+        let cursor: Key = location_key(1).into();
         let publish = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(vec![1; 32].into(), Vec::<u8>::new().into())],
+            values: vec![
+                (location_key(1).into(), Vec::<u8>::new().into()),
+                (cold_key(1).into(), Vec::<u8>::new().into()),
+            ],
             next_start_after: Some(cursor.clone()),
         }));
         assert!(matches!(
@@ -394,7 +420,7 @@ mod tests {
         ));
 
         let publish = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(vec![2; 32].into(), Vec::<u8>::new().into())],
+            values: vec![(location_key(2).into(), Vec::<u8>::new().into())],
             next_start_after: None,
         }));
         assert_eq!(publish.len(), 1);

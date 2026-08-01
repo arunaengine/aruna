@@ -1,9 +1,13 @@
+use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_MULTIPART_UPLOAD_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{MultipartUpload, MultipartUploadChecksumHint, MultipartUploadStatus};
+use aruna_core::structs::{
+    MultipartUpload, MultipartUploadChecksumHint, MultipartUploadStatus, ResolvedBackend,
+    RoutingError, RoutingSnapshot, resolve_backend,
+};
 use aruna_core::types::{Effects, GroupId, TxnId, UserId};
 use smallvec::smallvec;
 use std::collections::HashMap;
@@ -15,6 +19,7 @@ use ulid::Ulid;
 pub enum CreateMultipartUploadState {
     Init,
     StartTransaction,
+    FenceBackend,
     WriteUpload,
     CommitTransaction,
     Finish,
@@ -35,6 +40,10 @@ pub enum CreateMultipartUploadError {
         expected: &'static str,
         received: Event,
     },
+    #[error(transparent)]
+    RoutingFailed(#[from] RoutingError),
+    #[error(transparent)]
+    BackendFenceError(#[from] BackendFenceError),
     #[error("CreateMultipartUpload failed")]
     CreateMultipartUploadFailed,
 }
@@ -46,6 +55,9 @@ pub struct CreateMultipartUploadInput {
     pub group_id: GroupId,
     pub created_by: UserId,
     pub checksum_hint: Option<MultipartUploadChecksumHint>,
+    /// Routing inputs; the resolved backend is pinned on the upload record so
+    /// every part and the composed object follow it.
+    pub routing: RoutingSnapshot,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,6 +70,7 @@ pub struct CreateMultipartUploadOperation {
     input: CreateMultipartUploadInput,
     state: CreateMultipartUploadState,
     txn_id: Option<TxnId>,
+    resolved: Option<ResolvedBackend>,
     record: Option<MultipartUpload>,
     metadata: HashMap<String, String>,
     output: Option<Result<CreateMultipartUploadResult, CreateMultipartUploadError>>,
@@ -69,6 +82,7 @@ impl CreateMultipartUploadOperation {
             input,
             state: CreateMultipartUploadState::Init,
             txn_id: None,
+            resolved: None,
             record: None,
             metadata: HashMap::new(),
             output: None,
@@ -87,6 +101,14 @@ impl CreateMultipartUploadOperation {
     }
 
     fn handle_init(&mut self) -> Effects {
+        // Routing is fallible, so it resolves before a transaction exists to
+        // abort.
+        let resolved =
+            match resolve_backend(&self.input.routing, &self.input.bucket, &self.input.key) {
+                Ok(resolved) => resolved,
+                Err(error) => return self.emit_error(error.into()),
+            };
+        self.resolved = Some(resolved);
         self.state = CreateMultipartUploadState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
@@ -102,7 +124,33 @@ impl CreateMultipartUploadOperation {
             });
         };
 
+        self.txn_id = Some(txn_id);
+        let Some(resolved) = self.resolved.as_ref() else {
+            return self.emit_error(CreateMultipartUploadError::CreateMultipartUploadFailed);
+        };
+        match fence_backend(&resolved.backend, self.txn_id) {
+            Some(effect) => {
+                self.state = CreateMultipartUploadState::FenceBackend;
+                smallvec![effect]
+            }
+            None => self.write_upload(),
+        }
+    }
+
+    fn handle_backend_fenced(&mut self, event: Event) -> Effects {
+        match check_fence(event) {
+            Ok(()) => self.write_upload(),
+            Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    fn write_upload(&mut self) -> Effects {
+        let Some((txn_id, resolved)) = self.txn_id.zip(self.resolved.take()) else {
+            return self.emit_error(CreateMultipartUploadError::CreateMultipartUploadFailed);
+        };
         let record = MultipartUpload {
+            backend: resolved.backend,
+            storage_class: resolved.storage_class,
             upload_id: Ulid::generate(),
             bucket: self.input.bucket.clone(),
             key: self.input.key.clone(),
@@ -118,7 +166,6 @@ impl CreateMultipartUploadOperation {
             Err(err) => return self.emit_error(err.into()),
         };
 
-        self.txn_id = Some(txn_id);
         self.record = Some(record.clone());
         self.state = CreateMultipartUploadState::WriteUpload;
         smallvec![Effect::Storage(StorageEffect::Write {
@@ -176,6 +223,7 @@ impl Operation for CreateMultipartUploadOperation {
         match self.state {
             CreateMultipartUploadState::Init => self.handle_init(),
             CreateMultipartUploadState::StartTransaction => self.handle_transaction_started(event),
+            CreateMultipartUploadState::FenceBackend => self.handle_backend_fenced(event),
             CreateMultipartUploadState::WriteUpload => self.handle_record_written(event),
             CreateMultipartUploadState::CommitTransaction => {
                 self.handle_transaction_committed(event)
@@ -209,5 +257,159 @@ impl Operation for CreateMultipartUploadOperation {
             .map_or_else(smallvec::SmallVec::new, |txn_id| {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CreateMultipartUploadError, CreateMultipartUploadInput, CreateMultipartUploadOperation,
+    };
+    use crate::group_backends::BackendFenceError;
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::operation::Operation;
+    use aruna_core::structs::{
+        BackendCatalog, BackendRef, GroupBackendKind, GroupRoutingInputs, GroupStorageBackend,
+        MultipartUpload, RoutingError, RoutingSnapshot, RoutingTarget, StorageRoutingRule,
+    };
+    use aruna_core::types::TxnId;
+    use std::collections::BTreeSet;
+    use ulid::Ulid;
+
+    fn input(snapshot: RoutingSnapshot) -> CreateMultipartUploadInput {
+        CreateMultipartUploadInput {
+            bucket: "bucket".to_string(),
+            key: "archive/one".to_string(),
+            group_id: snapshot.group_id,
+            created_by: aruna_core::UserId::default(),
+            checksum_hint: None,
+            routing: snapshot,
+        }
+    }
+
+    fn snapshot() -> RoutingSnapshot {
+        RoutingSnapshot::new(
+            Ulid::generate(),
+            BackendCatalog::new("default")
+                .with_backend("default", None)
+                .with_backend("tape", Some("archive".to_string())),
+        )
+    }
+
+    fn rule(class: &str) -> StorageRoutingRule {
+        StorageRoutingRule {
+            key_prefix: String::new(),
+            exact: false,
+            target: RoutingTarget::Class(class.to_string()),
+        }
+    }
+
+    #[test]
+    fn pins_record_backend() {
+        let snapshot = snapshot().with_bucket_rules(vec![rule("archive")]);
+        let mut operation = CreateMultipartUploadOperation::new(input(snapshot));
+        operation.start();
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected one record write, got {effects:?}")
+        };
+        let record = MultipartUpload::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(record.backend, BackendRef::Node("tape".to_string()));
+        assert_eq!(record.storage_class.as_deref(), Some("archive"));
+    }
+
+    #[test]
+    fn missing_class_pins() {
+        // The pin records where the parts actually land, not what was asked.
+        let snapshot = snapshot().with_bucket_rules(vec![rule("glacier")]);
+        let mut operation = CreateMultipartUploadOperation::new(input(snapshot));
+        operation.start();
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected one record write, got {effects:?}")
+        };
+        let record = MultipartUpload::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(record.backend, BackendRef::Node("default".to_string()));
+        assert_eq!(record.storage_class, None);
+    }
+
+    #[test]
+    fn refuses_disabled_backend() {
+        // The pinned backend must not outlive the tenant disabling it.
+        let backend_id = Ulid::from_bytes([5u8; 16]);
+        let snapshot = snapshot().with_group_inputs(GroupRoutingInputs {
+            default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
+            backend_ids: BTreeSet::from([backend_id]),
+        });
+        let mut operation = CreateMultipartUploadOperation::new(input(snapshot));
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::from(3),
+        }));
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(disabled(backend_id).to_bytes().unwrap().into()),
+        }));
+
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+            ),
+            "expected an abort, got {effects:?}"
+        );
+        assert!(matches!(
+            operation.finalize(),
+            Err(CreateMultipartUploadError::BackendFenceError(
+                BackendFenceError::Unavailable
+            ))
+        ));
+    }
+
+    fn disabled(backend_id: Ulid) -> GroupStorageBackend {
+        GroupStorageBackend {
+            backend_id,
+            group_id: Ulid::from_bytes([7u8; 16]),
+            name: "tenant".to_string(),
+            kind: GroupBackendKind::S3,
+            public_config: std::collections::HashMap::new(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            updated_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: aruna_core::UserId::default(),
+            disabled: true,
+            cleanup: aruna_core::structs::CleanupStrategy::Retain,
+        }
+    }
+
+    #[test]
+    fn unknown_backend_aborts() {
+        // A refused backend must fail before a transaction exists to leak.
+        let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
+            key_prefix: String::new(),
+            exact: false,
+            target: RoutingTarget::Backend(BackendRef::Node("ghost".to_string())),
+        }]);
+        let mut operation = CreateMultipartUploadOperation::new(input(snapshot));
+
+        let effects = operation.start();
+
+        assert!(effects.is_empty(), "expected no effects, got {effects:?}");
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(CreateMultipartUploadError::RoutingFailed(
+                RoutingError::UnknownBackend(_)
+            ))
+        ));
     }
 }

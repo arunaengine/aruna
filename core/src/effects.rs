@@ -6,7 +6,10 @@ use crate::id::{DhtKeyId, NodeId};
 use crate::metadata::MetadataEffect;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
-use crate::structs::{BackendLocation, HiddenBlobKey, RealmId, ResolvedSourceAccess};
+use crate::structs::{
+    BackendLocation, GroupStorageBackend, GroupStorageBackendSecret, HiddenBlobKey, RealmId,
+    ResolvedBackend, ResolvedSourceAccess,
+};
 use crate::task::TaskEffect;
 use crate::types::UserId;
 use crate::types::{Key, KeySpace, TxnId, Value};
@@ -34,12 +37,16 @@ pub enum BlobEffect {
     Write {
         bucket: String,
         key: String,
+        /// Backend chosen by the operation. The adapter executes, never routes.
+        resolved: ResolvedBackend,
         created_by: UserId,
         blob: BackendStream<Result<Bytes, StreamError>>,
     },
     WritePart {
         upload_id: Ulid,
         part_number: u16,
+        /// Pinned at CreateMultipartUpload and carried by every part.
+        resolved: ResolvedBackend,
         created_by: UserId,
         compressed: bool,
         encrypted: bool,
@@ -48,6 +55,7 @@ pub enum BlobEffect {
     Compose {
         bucket: String,
         key: String,
+        resolved: ResolvedBackend,
         created_by: UserId,
         parts: Vec<BackendLocation>,
     },
@@ -101,6 +109,8 @@ pub enum BlobEffect {
     HandleReplication {
         replication_id: Option<Ulid>,
         stream_id: Ulid,
+        /// Each node routes its own replica; the sender's backend is ignored.
+        resolved: ResolvedBackend,
         keep_alive: bool,
     },
     ServeRead {
@@ -112,6 +122,12 @@ pub enum BlobEffect {
         stream_id: Ulid,
         size: u64,
         expected_blake3: [u8; 32],
+    },
+    /// Create-time reachability proof for a tenant backend: build the guarded
+    /// operator and round-trip a sentinel object.
+    CheckGroupBackend {
+        record: GroupStorageBackend,
+        secret: GroupStorageBackendSecret,
     },
 }
 

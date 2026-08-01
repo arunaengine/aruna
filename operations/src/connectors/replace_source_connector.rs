@@ -503,17 +503,17 @@ mod tests {
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
                 group_id: ulid::Ulid::generate(),
                 created_by: Default::default(),
-                name: "ftp-source".to_string(),
-                kind: SourceConnectorKind::Ftp,
+                name: "dav-source".to_string(),
+                kind: SourceConnectorKind::Webdav,
                 public_config: HashMap::from([
                     (
                         "endpoint".to_string(),
-                        "ftp://ftp.example.org:21".to_string(),
+                        "https://dav.example.org".to_string(),
                     ),
                     ("root".to_string(), "/datasets".to_string()),
                 ]),
                 secret_config: HashMap::from([
-                    ("user".to_string(), "alice".to_string()),
+                    ("username".to_string(), "alice".to_string()),
                     ("password".to_string(), "secret".to_string()),
                 ]),
             }),
@@ -558,7 +558,7 @@ mod tests {
         SourceConnectorSecret::new(
             connector_id,
             HashMap::from([
-                ("user".to_string(), user.to_string()),
+                ("username".to_string(), user.to_string()),
                 ("password".to_string(), "secret".to_string()),
             ]),
             SystemTime::UNIX_EPOCH,
@@ -571,8 +571,11 @@ mod tests {
             connector_id,
             group_id,
             "new".to_string(),
-            SourceConnectorKind::Ftp,
-            HashMap::from([("endpoint".to_string(), "ftp://ftp.example.org".to_string())]),
+            SourceConnectorKind::Webdav,
+            HashMap::from([(
+                "endpoint".to_string(),
+                "https://dav.example.org".to_string(),
+            )]),
             SystemTime::UNIX_EPOCH,
             SystemTime::UNIX_EPOCH,
             Default::default(),
@@ -608,7 +611,7 @@ mod tests {
             group_id,
             connector_id,
             name: "new".to_string(),
-            kind: SourceConnectorKind::Ftp,
+            kind: SourceConnectorKind::Webdav,
             public_config: HashMap::new(),
             secret_config: HashMap::new(),
         });
@@ -667,7 +670,7 @@ mod tests {
             group_id: Ulid::from_bytes([1u8; 16]),
             connector_id,
             name: "new".to_string(),
-            kind: SourceConnectorKind::Ftp,
+            kind: SourceConnectorKind::Webdav,
             public_config: HashMap::new(),
             secret_config: HashMap::new(),
         });
@@ -769,10 +772,10 @@ mod tests {
                 group_id: connector.group_id,
                 connector_id: connector.connector_id,
                 name: "new".to_string(),
-                kind: SourceConnectorKind::Ftp,
+                kind: SourceConnectorKind::Webdav,
                 public_config: connector.public_config.clone(),
                 secret_config: HashMap::from([
-                    ("user".to_string(), "bob".to_string()),
+                    ("username".to_string(), "bob".to_string()),
                     ("password".to_string(), "secret".to_string()),
                 ]),
             }),
@@ -805,16 +808,16 @@ mod tests {
                 group_id: connector.group_id,
                 connector_id: connector.connector_id,
                 name: "new".to_string(),
-                kind: SourceConnectorKind::Ftp,
+                kind: SourceConnectorKind::Webdav,
                 public_config: HashMap::from([
                     (
                         "endpoint".to_string(),
-                        "ftp://ftp.example.org/v2".to_string(),
+                        "https://dav.example.org/v2".to_string(),
                     ),
                     ("root".to_string(), "/datasets-v2".to_string()),
                 ]),
                 secret_config: HashMap::from([
-                    ("user".to_string(), "alice".to_string()),
+                    ("username".to_string(), "alice".to_string()),
                     ("password".to_string(), "secret".to_string()),
                 ]),
             }),
@@ -834,9 +837,9 @@ mod tests {
         let ResolvedSourceAccess::OpenDal { config, .. } = access;
         assert_eq!(
             config.get("endpoint").map(String::as_str),
-            Some("ftp://ftp.example.org:21")
+            Some("https://dav.example.org")
         );
         assert_eq!(config.get("root").map(String::as_str), Some("/datasets"));
-        assert_eq!(config.get("user").map(String::as_str), Some("alice"));
+        assert_eq!(config.get("username").map(String::as_str), Some("alice"));
     }
 }

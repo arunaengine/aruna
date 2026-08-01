@@ -1236,9 +1236,19 @@ impl FjallStorage {
                 Ok(Err(_)) => StorageEvent::Error {
                     error: StorageError::TransactionConflict,
                 },
-                Err(_e) => StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                },
+                // fjall only reaches here after its journal write began, so the
+                // batch may still be replayed; a conflict never wrote anything.
+                Err(error) => {
+                    warn!(
+                        event = "storage.transaction.commit_failed",
+                        txn_id = %txn_id,
+                        error = %error,
+                        "Storage transaction commit failed with an unknown outcome"
+                    );
+                    StorageEvent::Error {
+                        error: StorageError::CommitFailed,
+                    }
+                }
             },
             None => StorageEvent::Error {
                 error: StorageError::TransactionNotFound,

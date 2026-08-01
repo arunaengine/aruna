@@ -4,8 +4,8 @@ use aruna_core::NodeId;
 use aruna_core::errors::StorageError;
 use aruna_core::onboarding::{OnboardingMode, OnboardingSecretError};
 use aruna_core::structs::{
-    Actor, DEFAULT_METADATA_REPLICATION_FACTOR, KIND_LABEL_KEY, NodePlacementEntry, RealmId,
-    RealmNodeKind, ResourceEvent, normalize_node_placement_input,
+    Actor, DEFAULT_METADATA_REPLICATION_FACTOR, NodePlacementEntry, RealmId, RealmNodeKind,
+    ResourceEvent, normalize_node_placement_input, reserved_label,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
@@ -55,7 +55,7 @@ pub struct BootstrapOnboardingFinalizeInput {
     pub node_location: Option<String>,
     /// Joiner's placement weight (`None` ⇒ default weight).
     pub node_weight: Option<u32>,
-    /// Joiner's placement labels. Payload-sourced, so the reserved kind label is
+    /// Joiner's placement labels. Payload-sourced, so derived labels are
     /// rejected here (bypasses the config-parse rejection).
     pub node_labels: std::collections::BTreeMap<String, String>,
 }
@@ -86,8 +86,8 @@ pub enum BootstrapOnboardingFinalizeError {
     NetHandleUnavailable,
     #[error("document sync peer admission failed: {0}")]
     PeerAdmission(String),
-    #[error("placement labels must not set the reserved kind label")]
-    ReservedNodeLabel,
+    #[error("placement labels must not set the derived label `{0}`")]
+    ReservedNodeLabel(String),
     #[error("placement location must be at most 64 characters")]
     NodeLocationTooLong,
     #[error("ticketed user {0} has no placement")]
@@ -268,8 +268,10 @@ async fn ensure_realm_node_once(
 fn build_joiner_placement_entry(
     input: &BootstrapOnboardingFinalizeInput,
 ) -> Result<NodePlacementEntry, BootstrapOnboardingFinalizeError> {
-    if input.node_labels.contains_key(KIND_LABEL_KEY) {
-        return Err(BootstrapOnboardingFinalizeError::ReservedNodeLabel);
+    if let Some(label) = reserved_label(&input.node_labels) {
+        return Err(BootstrapOnboardingFinalizeError::ReservedNodeLabel(
+            label.to_string(),
+        ));
     }
     let (location, weight) =
         normalize_node_placement_input(input.node_location.as_deref(), input.node_weight)
@@ -1102,7 +1104,9 @@ mod tests {
         let result = bootstrap_onboarding_finalize(input, fixture.context.clone()).await;
         assert_eq!(
             result,
-            Err(BootstrapOnboardingFinalizeError::ReservedNodeLabel)
+            Err(BootstrapOnboardingFinalizeError::ReservedNodeLabel(
+                KIND_LABEL_KEY.to_string()
+            ))
         );
         assert_eq!(
             read_secret_state(&fixture.storage_handle, fixture.enrollment_id).await,

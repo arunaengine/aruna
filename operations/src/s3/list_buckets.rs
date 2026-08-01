@@ -236,6 +236,7 @@ mod test {
                     created_by: Default::default(),
                     cors_configuration: None,
                     replication: None,
+                    storage_routing: Vec::new(),
                 },
             ),
             (
@@ -246,6 +247,7 @@ mod test {
                     created_by: Default::default(),
                     cors_configuration: None,
                     replication: None,
+                    storage_routing: Vec::new(),
                 },
             ),
             (
@@ -256,6 +258,7 @@ mod test {
                     created_by: Default::default(),
                     cors_configuration: None,
                     replication: None,
+                    storage_routing: Vec::new(),
                 },
             ),
         ] {
@@ -307,6 +310,7 @@ mod test {
             created_by: Default::default(),
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         };
         let entry = |name: &str, group_id| {
             (

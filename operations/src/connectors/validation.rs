@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::endpoint;
 use aruna_core::structs::SourceConnectorKind;
 use thiserror::Error;
 
@@ -37,11 +38,19 @@ pub enum ValidationError {
     EmptySecretValue { key: String },
     #[error("public config key `{key}` must be `true` or `false`")]
     InvalidBoolValue { key: String },
+    #[error("endpoint `{0}` must be spelled as the http client parses it")]
+    AmbiguousEndpoint(String),
+    #[error("bucket `{0}` must not contain `/`, `\\`, `?`, `#` or `@`")]
+    UnsafeBucket(String),
     #[error("credentials must not be set when `skip_signature` is enabled")]
     CredentialsWithSkipSignature,
+    #[error("signed s3 connectors require `{ACCESS_KEY_ID}` and `{SECRET_ACCESS_KEY}`")]
+    MissingCredentials,
 }
 
 pub const S3_SKIP_SIGNATURE: &str = "skip_signature";
+const ACCESS_KEY_ID: &str = "access_key_id";
+const SECRET_ACCESS_KEY: &str = "secret_access_key";
 
 pub fn validate_connector_input(
     name: &str,
@@ -53,7 +62,11 @@ pub fn validate_connector_input(
         return Err(ValidationError::EmptyName);
     }
 
-    if kind == SourceConnectorKind::ArunaNative {
+    // ftp is refused because opendal cannot constrain its passive data address.
+    if matches!(
+        kind,
+        SourceConnectorKind::Ftp | SourceConnectorKind::ArunaNative
+    ) {
         return Err(ValidationError::UnsupportedConnectorKind { kind });
     }
 
@@ -100,15 +113,38 @@ pub fn validate_connector_input(
         }
     }
 
+    if let Some(endpoint) = public_config.get("endpoint")
+        && !endpoint::is_canonical(endpoint)
+    {
+        return Err(ValidationError::AmbiguousEndpoint(endpoint.clone()));
+    }
+    if let Some(bucket) = public_config.get("bucket")
+        && endpoint::breaks_authority(bucket)
+    {
+        return Err(ValidationError::UnsafeBucket(bucket.clone()));
+    }
+
+    let mut anonymous = false;
     if let Some(value) = public_config.get(S3_SKIP_SIGNATURE) {
         if value != "true" && value != "false" {
             return Err(ValidationError::InvalidBoolValue {
                 key: S3_SKIP_SIGNATURE.to_string(),
             });
         }
-        if value == "true" && !secret_config.is_empty() {
+        anonymous = value == "true";
+        if anonymous && !secret_config.is_empty() {
             return Err(ValidationError::CredentialsWithSkipSignature);
         }
+    }
+
+    // Without static keys a signed connector makes reqsign walk the node's own
+    // ambient credential chain against a tenant-chosen endpoint.
+    if kind == SourceConnectorKind::S3
+        && !anonymous
+        && !(secret_config.contains_key(ACCESS_KEY_ID)
+            && secret_config.contains_key(SECRET_ACCESS_KEY))
+    {
+        return Err(ValidationError::MissingCredentials);
     }
 
     Ok(())
@@ -225,8 +261,9 @@ mod tests {
     }
 
     #[test]
-    fn accepts_valid_ftp_config() {
-        validate_connector_input(
+    fn rejects_ftp_kind() {
+        // An otherwise well-formed ftp connector must still fail registration.
+        let err = validate_connector_input(
             "ftp",
             SourceConnectorKind::Ftp,
             &HashMap::from([
@@ -241,7 +278,14 @@ mod tests {
                 ("password".to_string(), "secret".to_string()),
             ]),
         )
-        .unwrap();
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ValidationError::UnsupportedConnectorKind {
+                kind: SourceConnectorKind::Ftp,
+            }
+        );
     }
 
     #[test]
@@ -282,6 +326,63 @@ mod tests {
     }
 
     #[test]
+    fn signed_requires_credentials() {
+        // Both an absent and an explicitly disabled `skip_signature` sign requests.
+        for skip in [None, Some("false")] {
+            let mut public = HashMap::from([
+                ("bucket".to_string(), "reads".to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+            ]);
+            if let Some(skip) = skip {
+                public.insert(S3_SKIP_SIGNATURE.to_string(), skip.to_string());
+            }
+
+            let err = validate_connector_input(
+                "signed-s3",
+                SourceConnectorKind::S3,
+                &public,
+                &HashMap::new(),
+            )
+            .unwrap_err();
+
+            assert_eq!(err, ValidationError::MissingCredentials);
+        }
+    }
+
+    #[test]
+    fn requires_both_keys() {
+        let err = validate_connector_input(
+            "signed-s3",
+            SourceConnectorKind::S3,
+            &HashMap::from([
+                ("bucket".to_string(), "reads".to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+            ]),
+            &HashMap::from([("access_key_id".to_string(), "AKIA".to_string())]),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, ValidationError::MissingCredentials);
+    }
+
+    #[test]
+    fn accepts_signed_s3() {
+        validate_connector_input(
+            "signed-s3",
+            SourceConnectorKind::S3,
+            &HashMap::from([
+                ("bucket".to_string(), "reads".to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+            ]),
+            &HashMap::from([
+                ("access_key_id".to_string(), "AKIA".to_string()),
+                ("secret_access_key".to_string(), "secret".to_string()),
+            ]),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn rejects_bad_skip() {
         let err = validate_connector_input(
             "public-s3",
@@ -300,6 +401,53 @@ mod tests {
             ValidationError::InvalidBoolValue {
                 key: S3_SKIP_SIGNATURE.to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn rejects_respelled_endpoint() {
+        // The http client reads each of these as a link-local or loopback host.
+        for host in [
+            "2852039166",
+            "0xa9fea9fe",
+            "169.254.169.254.",
+            "127.1",
+            "2851995650",
+            "0251.0376.0251.0376",
+        ] {
+            let endpoint = format!("https://{host}");
+            let err = validate_connector_input(
+                "http",
+                SourceConnectorKind::Http,
+                &HashMap::from([("endpoint".to_string(), endpoint.clone())]),
+                &HashMap::new(),
+            )
+            .unwrap_err();
+
+            assert_eq!(err, ValidationError::AmbiguousEndpoint(endpoint));
+        }
+    }
+
+    #[test]
+    fn rejects_spliced_bucket() {
+        // A bucket is spliced into the authority under virtual-host style.
+        let err = validate_connector_input(
+            "signed-s3",
+            SourceConnectorKind::S3,
+            &HashMap::from([
+                ("bucket".to_string(), "2852039166/".to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+            ]),
+            &HashMap::from([
+                ("access_key_id".to_string(), "AKIA".to_string()),
+                ("secret_access_key".to_string(), "secret".to_string()),
+            ]),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ValidationError::UnsafeBucket("2852039166/".to_string())
         );
     }
 

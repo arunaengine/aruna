@@ -4,14 +4,12 @@ use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{
-    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
-};
+use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    BackendLocation, BlobVersion, BucketInfo, HashPathIndexKey, Permission, RealmConfigDocument,
-    RealmId, VersionKey, VersionedObjectArn, blob_object_permission_path,
+    BackendLocation, BlobLocationKey, BlobVersion, BucketInfo, HashPathIndexKey, Permission,
+    RealmConfigDocument, RealmId, VersionKey, VersionedObjectArn, blob_object_permission_path,
 };
 use aruna_core::types::Effects;
 use bytes::Bytes;
@@ -21,7 +19,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use super::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget, VersionReplicationMessage};
-use crate::blob::blob_keyspace_helper::iter_hash_path_index_effect;
+use crate::blob::blob_keyspace_helper::{blob_location_read, iter_hash_path_index_effect};
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::realm_peer::ensure_realm_peer;
 
@@ -298,6 +296,7 @@ pub struct IncomingBaoReadOperation {
     candidates: VecDeque<HashPathIndexKey>,
     candidate: Option<HashPathIndexKey>,
     blob_hash: Option<[u8; 32]>,
+    location_key: Option<BlobLocationKey>,
     location: Option<BackendLocation>,
     had_denial: bool,
     refusal: Option<BaoReadRefusal>,
@@ -322,6 +321,7 @@ impl IncomingBaoReadOperation {
             candidates: VecDeque::new(),
             candidate: None,
             blob_hash: None,
+            location_key: None,
             location: None,
             had_denial: false,
             refusal: None,
@@ -387,7 +387,7 @@ impl IncomingBaoReadOperation {
             return self.send_refusal(BaoReadRefusal::InvalidTarget);
         };
         self.state = IncomingBaoReadState::ReadHashAliases;
-        match iter_hash_path_index_effect(&hash, None) {
+        match iter_hash_path_index_effect(&hash, None, None) {
             Ok(effect) => smallvec![effect],
             Err(error) => self.fail(error.into()),
         }
@@ -428,15 +428,11 @@ impl IncomingBaoReadOperation {
     }
 
     fn read_location(&mut self) -> Effects {
-        let Some(blob_hash) = self.blob_hash else {
+        let Some(key) = self.location_key.clone() else {
             return self.send_refusal(BaoReadRefusal::NotFound);
         };
         self.state = IncomingBaoReadState::ReadLocation;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-            key: blob_hash.to_vec().into(),
-            txn_id: None,
-        })]
+        smallvec![blob_location_read(&key, None)]
     }
 
     fn send_accepted(&mut self, location: BackendLocation) -> Effects {
@@ -566,6 +562,7 @@ impl IncomingBaoReadOperation {
             return self.send_refusal(BaoReadRefusal::HashMismatch);
         }
         self.blob_hash = Some(blob_hash);
+        self.location_key = version.location_key();
         self.read_location()
     }
 
@@ -636,6 +633,7 @@ impl IncomingBaoReadOperation {
             return self.next_candidate();
         }
         self.blob_hash = Some(hash);
+        self.location_key = version.location_key();
         let path = self
             .candidate
             .as_ref()
@@ -815,8 +813,8 @@ mod tests {
     use aruna_core::operation::Operation;
     use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BlobVersion, BucketInfo, RealmConfigDocument, RealmId,
-        RealmNodeKind, VersionedObjectArn,
+        AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, RealmConfigDocument,
+        RealmId, RealmNodeKind, VersionedObjectArn,
     };
     use aruna_core::types::Effects;
     use ulid::Ulid;
@@ -867,6 +865,7 @@ mod tests {
     fn version_value(hash: [u8; 32]) -> byteview::ByteView {
         BlobVersion::materialized(
             hash,
+            BackendRef::node_default(),
             SystemTime::UNIX_EPOCH,
             UserId::nil(test_realm()),
             None,
@@ -883,6 +882,7 @@ mod tests {
             created_by: UserId::nil(test_realm()),
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         }
         .to_bytes()
         .unwrap()
@@ -891,6 +891,8 @@ mod tests {
 
     fn location_value(hash: [u8; 32]) -> (BackendLocation, byteview::ByteView) {
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/data".to_string(),
             storage_bucket: "blob-0".to_string(),
             backend_path: "object".to_string(),

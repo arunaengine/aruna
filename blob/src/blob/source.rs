@@ -10,7 +10,7 @@ impl BlobHandler {
         &self,
         access: ResolvedSourceAccess,
     ) -> StagingSourceEvent {
-        match check_staging_source(&access).await {
+        match check_staging_source(&self.egress, &access).await {
             Ok(()) => StagingSourceEvent::CheckResult,
             Err(error) => StagingSourceEvent::Error { error },
         }
@@ -20,7 +20,7 @@ impl BlobHandler {
         &self,
         access: ResolvedSourceAccess,
     ) -> StagingSourceEvent {
-        match head_staging_source(&access).await {
+        match head_staging_source(&self.egress, &access).await {
             Ok(metadata) => StagingSourceEvent::HeadResult { metadata },
             Err(error) => StagingSourceEvent::Error { error },
         }
@@ -31,7 +31,7 @@ impl BlobHandler {
         access: ResolvedSourceAccess,
         range: Option<std::ops::Range<u64>>,
     ) -> StagingSourceEvent {
-        match read_staging_source(&access, range).await {
+        match read_staging_source(&self.egress, &access, range).await {
             Ok((metadata, stream)) => StagingSourceEvent::ReadResult { metadata, stream },
             Err(error) => StagingSourceEvent::Error { error },
         }
@@ -45,7 +45,8 @@ impl BlobHandler {
         recursive: bool,
         files_only: bool,
     ) -> StagingSourceEvent {
-        match list_staging_source(&access, offset, limit, recursive, files_only).await {
+        match list_staging_source(&self.egress, &access, offset, limit, recursive, files_only).await
+        {
             Ok((entries, truncated)) => StagingSourceEvent::ListResult { entries, truncated },
             Err(error) => StagingSourceEvent::Error { error },
         }

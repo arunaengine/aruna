@@ -7,6 +7,20 @@ use std::collections::BTreeMap;
 /// Derived read-only label carrying a node's `RealmNode.kind`; writes are rejected.
 pub const KIND_LABEL_KEY: &str = "aruna-engine.org/kind";
 
+/// Derived read-only label prefix advertising a storage class this node's
+/// operator registered. Capability only: it reaches `NodeInfo` and never the
+/// realm placement map that placement selection reads.
+pub const STORAGE_CLASS_LABEL_PREFIX: &str = "aruna-engine.org/storage-class/";
+
+/// Names the first derived label a write surface tried to set. Every such label
+/// is stamped by the owning node, so no operator input may claim one.
+pub fn reserved_label(labels: &BTreeMap<String, String>) -> Option<&str> {
+    labels
+        .keys()
+        .find(|key| key.as_str() == KIND_LABEL_KEY || key.starts_with(STORAGE_CLASS_LABEL_PREFIX))
+        .map(String::as_str)
+}
+
 /// Storage key for a node's info document. One document per node, so the raw
 /// node id is unambiguous within the dedicated `NODE_INFO_KEYSPACE`.
 pub fn node_info_storage_key(node_id: NodeId) -> Vec<u8> {

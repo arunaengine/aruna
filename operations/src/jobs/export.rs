@@ -593,7 +593,11 @@ async fn resolve_exact(
     let Some(hash) = version.blob_hash().copied() else {
         return Ok(ResolveResult::Missing { hash: None });
     };
-    let Some(location) = storage_value(ctx, BLOB_LOCATIONS_KEYSPACE, hash.to_vec().into()).await?
+    let Some(location_key) = version.location_key() else {
+        return Ok(ResolveResult::Missing { hash: Some(hash) });
+    };
+    let Some(location) =
+        storage_value(ctx, BLOB_LOCATIONS_KEYSPACE, location_key.to_bytes().into()).await?
     else {
         return Ok(ResolveResult::Missing { hash: Some(hash) });
     };
@@ -629,12 +633,11 @@ async fn resolve_alias(
     if version.blob_hash() != Some(&alias.blake3_hash) {
         return Ok(ResolveResult::Missing { hash: None });
     }
-    let Some(location) = storage_value(
-        ctx,
-        BLOB_LOCATIONS_KEYSPACE,
-        alias.blake3_hash.to_vec().into(),
-    )
-    .await?
+    let Some(location_key) = version.location_key() else {
+        return Ok(ResolveResult::Missing { hash: None });
+    };
+    let Some(location) =
+        storage_value(ctx, BLOB_LOCATIONS_KEYSPACE, location_key.to_bytes().into()).await?
     else {
         return Ok(ResolveResult::Missing { hash: None });
     };
@@ -2164,8 +2167,9 @@ mod tests {
         AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::structs::{
-        Actor, AuthContext, Backend, BackendConfig, GroupAuthorizationDocument,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind, RoCrateLimits,
+        Actor, AuthContext, Backend, BackendConfig, BackendRef, BlobLocationKey,
+        GroupAuthorizationDocument, RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
+        RoCrateLimits,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
@@ -2311,10 +2315,16 @@ mod tests {
             created_by: owner,
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         };
         let hash: [u8; 32] = location.get_blake3().unwrap().try_into().unwrap();
-        let version =
-            BlobVersion::materialized(hash, std::time::SystemTime::UNIX_EPOCH, owner, None);
+        let version = BlobVersion::materialized(
+            hash,
+            BackendRef::node_default(),
+            std::time::SystemTime::UNIX_EPOCH,
+            owner,
+            None,
+        );
         let version_key = VersionKey::new("remote", "payload", version_id);
         let writes = vec![
             (
@@ -2344,7 +2354,9 @@ mod tests {
             ),
             (
                 BLOB_LOCATIONS_KEYSPACE.to_string(),
-                hash.to_vec().into(),
+                BlobLocationKey::new(hash, location.backend.clone())
+                    .to_bytes()
+                    .into(),
                 location.to_bytes().unwrap().into(),
             ),
         ];
@@ -2807,6 +2819,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .send_blob_effect(BlobEffect::Write {
+                resolved: aruna_core::structs::ResolvedBackend::node_default(),
                 bucket: "remote".to_string(),
                 key: "payload".to_string(),
                 created_by: owner,

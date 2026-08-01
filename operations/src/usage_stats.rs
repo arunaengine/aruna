@@ -10,15 +10,16 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
-    NODE_USAGE_DIRTY_GLOBAL_KEY, NODE_USAGE_DIRTY_PREFIX, NODE_USAGE_GLOBAL_PREFIX,
-    NODE_USAGE_GROUP_PREFIX, NODE_USAGE_SUMMARY_GLOBAL_KEY, NODE_USAGE_SUMMARY_GROUP_PREFIX,
-    NodeUsageSnapshot, RealmConfigDocument, RealmId, USAGE_GLOBAL_KEY, USAGE_GLOBAL_SHARD_COUNT,
-    UsageCounterError, UsageCounters, UsageDelta, VersionKey, node_usage_dirty_group_id,
-    node_usage_dirty_group_key, node_usage_global_key, node_usage_group_key,
-    node_usage_group_key_group_id, node_usage_group_prefix, node_usage_key_node_id,
-    node_usage_summary_group_key, usage_global_key_for_group, usage_global_shard_index,
-    usage_global_shard_key, usage_global_shard_keys, usage_group_key,
+    BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
+    BucketInfo, CurrentVersionPointer, NODE_USAGE_DIRTY_GLOBAL_KEY, NODE_USAGE_DIRTY_PREFIX,
+    NODE_USAGE_GLOBAL_PREFIX, NODE_USAGE_GROUP_PREFIX, NODE_USAGE_SUMMARY_GLOBAL_KEY,
+    NODE_USAGE_SUMMARY_GROUP_PREFIX, NodeUsageSnapshot, RealmConfigDocument, RealmId,
+    USAGE_GLOBAL_KEY, USAGE_GLOBAL_SHARD_COUNT, UsageCounterError, UsageCounters, UsageDelta,
+    VersionKey, node_usage_dirty_group_id, node_usage_dirty_group_key, node_usage_global_key,
+    node_usage_group_key, node_usage_group_key_group_id, node_usage_group_prefix,
+    node_usage_key_node_id, node_usage_summary_group_key, shard_for_hash, usage_backend_key,
+    usage_global_key_for_group, usage_global_shard_index, usage_global_shard_key,
+    usage_global_shard_keys, usage_group_key, usage_hash_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -58,8 +59,76 @@ enum UsageUpdatePhase {
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageCounterUpdate {
     entries: Vec<(Vec<u8>, UsageDelta)>,
-    dirty_group: GroupId,
+    dirty_group: Option<GroupId>,
     phase: UsageUpdatePhase,
+}
+
+/// One physical copy's contribution to the stored counters.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredDelta {
+    pub blake3: [u8; 32],
+    pub backend: BackendRef,
+    pub blobs: i128,
+    pub bytes: i128,
+}
+
+impl StoredDelta {
+    pub fn new(blake3: [u8; 32], backend: BackendRef, blobs: i128, bytes: i128) -> Self {
+        Self {
+            blake3,
+            backend,
+            blobs,
+            bytes,
+        }
+    }
+
+    /// Credit for a copy a write newly created. An adopted copy adds nothing,
+    /// so its update never joins the counter rows to the transaction.
+    pub fn for_location(location: &BackendLocation, new_blob: bool) -> Option<Self> {
+        let blake3: [u8; 32] = location.get_blake3()?.try_into().ok()?;
+        Some(Self::new(
+            blake3,
+            location.backend.clone(),
+            i128::from(new_blob),
+            if new_blob {
+                i128::from(location.blob_size)
+            } else {
+                0
+            },
+        ))
+    }
+
+    /// The global hash shard carries both stored counters; the backend row
+    /// carries bytes alone, which is all quota admission reads.
+    fn entries(&self) -> Vec<(Vec<u8>, UsageDelta)> {
+        if self.blobs == 0 && self.bytes == 0 {
+            return Vec::new();
+        }
+        vec![
+            (
+                usage_hash_key(&self.blake3),
+                UsageDelta {
+                    stored_blobs: self.blobs,
+                    stored_bytes: self.bytes,
+                    ..Default::default()
+                },
+            ),
+            (
+                usage_backend_key(&self.backend, shard_for_hash(&self.blake3)),
+                UsageDelta {
+                    stored_bytes: self.bytes,
+                    ..Default::default()
+                },
+            ),
+        ]
+    }
+}
+
+fn merge_entry(entries: &mut Vec<(Vec<u8>, UsageDelta)>, key: Vec<u8>, delta: UsageDelta) {
+    match entries.iter_mut().find(|(existing, _)| *existing == key) {
+        Some((_, existing)) => *existing = existing.merge(delta),
+        None => entries.push((key, delta)),
+    }
 }
 
 impl UsageCounterUpdate {
@@ -69,22 +138,34 @@ impl UsageCounterUpdate {
                 (usage_global_key_for_group(group_id), delta),
                 (usage_group_key(group_id), delta),
             ],
-            dirty_group: group_id,
+            dirty_group: Some(group_id),
             phase: UsageUpdatePhase::Pending,
         }
     }
 
-    pub fn with_global(
-        group_id: GroupId,
-        group_delta: UsageDelta,
-        global_delta: UsageDelta,
-    ) -> Self {
+    /// Adds one physical copy's `stored_*` change to a group update. The copy is
+    /// booked against the shard its hash owns and the row of the backend holding
+    /// it, never against the writing group's shard.
+    pub fn with_stored(group_id: GroupId, group_delta: UsageDelta, stored: StoredDelta) -> Self {
+        let mut entries = vec![
+            (usage_global_key_for_group(group_id), group_delta),
+            (usage_group_key(group_id), group_delta),
+        ];
+        for (key, delta) in stored.entries() {
+            merge_entry(&mut entries, key, delta);
+        }
         Self {
-            entries: vec![
-                (usage_global_key_for_group(group_id), global_delta),
-                (usage_group_key(group_id), group_delta),
-            ],
-            dirty_group: group_id,
+            entries,
+            dirty_group: Some(group_id),
+            phase: UsageUpdatePhase::Pending,
+        }
+    }
+
+    /// The reclaim sweep's debit: physical bytes leave, no group counter moves.
+    pub fn for_stored(stored: StoredDelta) -> Self {
+        Self {
+            entries: stored.entries(),
+            dirty_group: None,
             phase: UsageUpdatePhase::Pending,
         }
     }
@@ -96,18 +177,19 @@ impl UsageCounterUpdate {
     /// write that re-dirties a marker mid-publish keeps its retry signal.
     fn dirty_marker_writes(&self) -> Vec<(String, Key, Value)> {
         let generation = ByteView::from(ulid::Ulid::generate().to_bytes().to_vec());
-        vec![
-            (
+        let mut writes = vec![(
+            USAGE_NODE_STATS_KEYSPACE.to_string(),
+            ByteView::from(NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec()),
+            generation.clone(),
+        )];
+        if let Some(group_id) = self.dirty_group {
+            writes.push((
                 USAGE_NODE_STATS_KEYSPACE.to_string(),
-                ByteView::from(NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec()),
-                generation.clone(),
-            ),
-            (
-                USAGE_NODE_STATS_KEYSPACE.to_string(),
-                ByteView::from(node_usage_dirty_group_key(self.dirty_group)),
+                ByteView::from(node_usage_dirty_group_key(group_id)),
                 generation,
-            ),
-        ]
+            ));
+        }
+        writes
     }
 
     pub fn is_noop(&self) -> bool {
@@ -558,6 +640,7 @@ pub struct RebuildUsageStatsOperation {
     current_versions: HashMap<(String, String), ulid::Ulid>,
     global: UsageCounters,
     global_shards: Vec<UsageCounters>,
+    backend_shards: HashMap<Vec<u8>, UsageCounters>,
     groups: HashMap<GroupId, UsageCounters>,
     existing_counter_keys: Vec<Vec<u8>>,
     stale_counter_deletes: Vec<(String, Key)>,
@@ -582,6 +665,7 @@ impl RebuildUsageStatsOperation {
             current_versions: HashMap::new(),
             global: UsageCounters::default(),
             global_shards: vec![UsageCounters::default(); USAGE_GLOBAL_SHARD_COUNT],
+            backend_shards: HashMap::new(),
             groups: HashMap::new(),
             existing_counter_keys: Vec::new(),
             stale_counter_deletes: Vec::new(),
@@ -624,6 +708,12 @@ impl RebuildUsageStatsOperation {
         &mut self.global_shards[usage_global_shard_index(group_id)]
     }
 
+    fn backend_entry(&mut self, backend: &BackendRef, shard: usize) -> &mut UsageCounters {
+        self.backend_shards
+            .entry(usage_backend_key(backend, shard))
+            .or_default()
+    }
+
     fn consume_values(&mut self, values: &[(Key, Value)]) -> Result<(), RebuildUsageStatsError> {
         match self.state {
             RebuildUsageStatsState::ScanBuckets => {
@@ -651,9 +741,16 @@ impl RebuildUsageStatsOperation {
                         stored_bytes: location.blob_size,
                         ..Default::default()
                     };
+                    let hash = BlobLocationKey::from_bytes(key.as_ref())?.blake3_hash;
                     self.global.add(&delta)?;
-                    self.global_shards[0].add(&delta)?;
-                    self.blob_sizes.insert(key.to_vec(), location.blob_size);
+                    self.global_shards[shard_for_hash(&hash)].add(&delta)?;
+                    self.backend_entry(&location.backend, shard_for_hash(&hash))
+                        .add(&UsageCounters {
+                            stored_bytes: location.blob_size,
+                            ..Default::default()
+                        })?;
+                    // Copies of one hash share a size, so the hash prefix keys the map.
+                    self.blob_sizes.insert(hash.to_vec(), location.blob_size);
                 }
             }
             RebuildUsageStatsState::ScanHeads => {
@@ -804,6 +901,18 @@ impl RebuildUsageStatsOperation {
             };
             write_keys.insert(key.clone());
             writes.push((USAGE_STATS_KEYSPACE.to_string(), key.into(), bytes.into()));
+        }
+        for (key, counters) in &self.backend_shards {
+            let bytes = match counters.to_bytes() {
+                Ok(bytes) => bytes,
+                Err(err) => return self.emit_error(err.into()),
+            };
+            write_keys.insert(key.clone());
+            writes.push((
+                USAGE_STATS_KEYSPACE.to_string(),
+                key.clone().into(),
+                bytes.into(),
+            ));
         }
         self.stale_counter_deletes = self
             .existing_counter_keys
@@ -1719,7 +1828,7 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::s3::create_bucket::CreateBucketOperation;
     use aruna_core::structs::{
-        BlobHeadKey, BucketInfo, CurrentVersionPointer, PortableSourceDescriptor,
+        BackendRef, BlobHeadKey, BucketInfo, CurrentVersionPointer, PortableSourceDescriptor,
         SourceConnectorKind, SourceMetadata, StagingStrategy, VersionSourceBinding,
         usage_global_shard_keys,
     };
@@ -1740,6 +1849,8 @@ mod tests {
 
     fn location(blob_size: u64, staging: bool, partial: bool) -> BackendLocation {
         BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "bucket".to_string(),
             backend_path: "path".to_string(),
@@ -1753,6 +1864,87 @@ mod tests {
             blob_size,
             hashes: std::collections::HashMap::new(),
         }
+    }
+
+    fn hash_on_shard(shard: usize) -> [u8; 32] {
+        let mut blake3 = [0u8; 32];
+        blake3[0] = shard as u8;
+        blake3
+    }
+
+    #[test]
+    fn credit_picks_shard() {
+        // Stored bytes belong to the hash's shard and the holding backend's row,
+        // never to the writing group's shard.
+        let group_id = Ulid::from_bytes([1u8; 16]);
+        let blake3 = hash_on_shard((usage_global_shard_index(group_id) + 1) % 64);
+        let backend = BackendRef::Node("cold".to_string());
+
+        let update = UsageCounterUpdate::with_stored(
+            group_id,
+            UsageDelta {
+                objects: 1,
+                logical_bytes: 10,
+                ..Default::default()
+            },
+            StoredDelta::new(blake3, backend.clone(), 1, 10),
+        );
+
+        assert_eq!(update.entries.len(), 4);
+        let shard = shard_for_hash(&blake3);
+        for (key, expected) in [
+            (usage_hash_key(&blake3), (1, 10)),
+            (usage_backend_key(&backend, shard), (0, 10)),
+            (usage_global_key_for_group(group_id), (0, 0)),
+        ] {
+            let (_, delta) = update
+                .entries
+                .iter()
+                .find(|(entry, _)| *entry == key)
+                .expect("entry present");
+            assert_eq!((delta.stored_blobs, delta.stored_bytes), expected);
+        }
+    }
+
+    #[test]
+    fn credit_merges_shard() {
+        // One key must carry both halves when the hash shard is the group shard.
+        let group_id = Ulid::from_bytes([1u8; 16]);
+        let blake3 = hash_on_shard(usage_global_shard_index(group_id));
+
+        let update = UsageCounterUpdate::with_stored(
+            group_id,
+            UsageDelta {
+                objects: 1,
+                logical_bytes: 10,
+                ..Default::default()
+            },
+            StoredDelta::new(blake3, BackendRef::node_default(), 1, 10),
+        );
+
+        assert_eq!(update.entries.len(), 3);
+        let (_, delta) = update
+            .entries
+            .iter()
+            .find(|(key, _)| *key == usage_hash_key(&blake3))
+            .expect("global shard entry");
+        assert_eq!(delta.objects, 1);
+        assert_eq!(delta.logical_bytes, 10);
+        assert_eq!(delta.stored_blobs, 1);
+        assert_eq!(delta.stored_bytes, 10);
+    }
+
+    #[test]
+    fn adopted_credits_nothing() {
+        let update = UsageCounterUpdate::for_stored(StoredDelta::new(
+            [3u8; 32],
+            BackendRef::node_default(),
+            0,
+            0,
+        ));
+
+        assert!(update.entries.is_empty());
+        assert!(update.is_noop());
     }
 
     async fn read_optional_counters(ctx: &DriverContext, key: Vec<u8>) -> Option<UsageCounters> {
@@ -1878,6 +2070,7 @@ mod tests {
                     created_by: Default::default(),
                     cors_configuration: None,
                     replication: None,
+                    storage_routing: Vec::new(),
                 },
             ),
             &ctx,
@@ -1980,6 +2173,7 @@ mod tests {
                 created_by: Default::default(),
                 cors_configuration: None,
                 replication: None,
+                storage_routing: Vec::new(),
             };
             ctx.storage_handle
                 .send_storage_effect(StorageEffect::Write {
@@ -2002,7 +2196,9 @@ mod tests {
             ctx.storage_handle
                 .send_storage_effect(StorageEffect::Write {
                     key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                    key: hash.to_vec().into(),
+                    key: BlobLocationKey::new(hash, loc.backend.clone())
+                        .to_bytes()
+                        .into(),
                     value: loc.to_bytes().unwrap().into(),
                     txn_id: Some(txn_id),
                 })
@@ -2047,13 +2243,13 @@ mod tests {
         let alpha_live_head = write_version(
             "alpha",
             "live.txt",
-            BlobVersion::materialized(hashes[0], now, user, None),
+            BlobVersion::materialized(hashes[0], BackendRef::node_default(), now, user, None),
         )
         .await;
         write_version(
             "alpha",
             "gone.txt",
-            BlobVersion::materialized(hashes[1], now, user, None),
+            BlobVersion::materialized(hashes[1], BackendRef::node_default(), now, user, None),
         )
         .await;
         let alpha_gone_head =
@@ -2061,13 +2257,13 @@ mod tests {
         write_version(
             "beta",
             "shared.bin",
-            BlobVersion::materialized(hashes[1], now, user, None),
+            BlobVersion::materialized(hashes[1], BackendRef::node_default(), now, user, None),
         )
         .await;
         let beta_head = write_version(
             "beta",
             "shared.bin",
-            BlobVersion::materialized(hashes[1], now, user, None),
+            BlobVersion::materialized(hashes[1], BackendRef::node_default(), now, user, None),
         )
         .await;
         let alpha_ref_head = write_version(
@@ -2299,6 +2495,7 @@ mod tests {
                     created_by: Default::default(),
                     cors_configuration: None,
                     replication: None,
+                    storage_routing: Vec::new(),
                 },
             ),
             &ctx,

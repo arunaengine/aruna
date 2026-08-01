@@ -9,6 +9,7 @@ pub mod blobs;
 pub mod connectors;
 pub mod credentials;
 pub mod drs;
+pub mod group_backends;
 pub mod groups;
 pub mod info;
 pub mod jobs;
@@ -18,6 +19,7 @@ pub mod onboarding;
 pub mod rocrate_import;
 pub mod search;
 pub mod staging;
+pub mod storage_routing;
 pub mod sync;
 pub mod tes;
 pub mod users;
@@ -29,6 +31,8 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
         .merge(blobs::router())
         .merge(drs::router())
         .merge(staging::router())
+        .merge(group_backends::router())
+        .merge(storage_routing::router())
         .merge(sync::router())
         .merge(connectors::router())
         .merge(credentials::router())

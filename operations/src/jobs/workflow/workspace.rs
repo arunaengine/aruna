@@ -23,7 +23,7 @@ use ulid::Ulid;
 
 use super::DEFAULT_WALLTIME;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, RoutingInputsError, drive, routing_snapshot};
 use crate::get_realm_config::GetRealmConfigOperation;
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::create_user_access::{CreateUserAccessConfig, CreateUserAccessOperation};
@@ -133,6 +133,7 @@ pub async fn ensure_workspace_bucket(
         created_by: record.created_by,
         cors_configuration: None,
         replication: None,
+        storage_routing: Vec::new(),
     };
     match Box::pin(drive(
         CreateBucketOperation::new(bucket.to_string(), bucket_info),
@@ -646,6 +647,9 @@ async fn put_file_output(
             Err(std::io::Error::other(error))
         }
     }));
+    let routing = routing_snapshot(context, spec.group_id, bucket)
+        .await
+        .map_err(|error| routing_error("output write", error))?;
     Box::pin(drive(
         PutObjectOperation::new(PutObjectConfig {
             user_id: record.created_by,
@@ -664,6 +668,7 @@ async fn put_file_output(
             version_source: None,
             preassigned_version_id: None,
             quota_ceiling,
+            routing,
         }),
         context,
     ))
@@ -840,6 +845,9 @@ async fn stage_one_input(
     .await
     .map_err(|error| JobError::retryable(format!("quota lookup failed: {error}")))?;
     let quota_ceiling = realm_config.quota.effective_group_ceiling(&spec.group_id);
+    let routing = routing_snapshot(context, spec.group_id, bucket)
+        .await
+        .map_err(|error| routing_error("input stage", error))?;
     Box::pin(drive(
         PutObjectOperation::new(PutObjectConfig {
             user_id: record.created_by,
@@ -858,6 +866,7 @@ async fn stage_one_input(
             version_source: None,
             preassigned_version_id: None,
             quota_ceiling,
+            routing,
         }),
         context,
     ))
@@ -906,6 +915,15 @@ fn authorization_error(scope: &str, error: AuthorizationError) -> JobError {
 fn put_object_error(scope: &str, error: PutObjectError) -> JobError {
     let message = format!("{scope} failed: {error}");
     if matches!(&error, PutObjectError::StorageError(error) if storage_retryable(error)) {
+        JobError::retryable(message)
+    } else {
+        JobError::permanent(message)
+    }
+}
+
+fn routing_error(scope: &str, error: RoutingInputsError) -> JobError {
+    let message = format!("{scope} routing lookup failed: {error}");
+    if error.storage().is_some_and(storage_retryable) {
         JobError::retryable(message)
     } else {
         JobError::permanent(message)

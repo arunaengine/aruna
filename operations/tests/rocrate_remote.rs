@@ -23,8 +23,8 @@ use aruna_core::keyspaces::{
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     ARUNA_DATA_PREFIX, Actor, ArtifactRef, AuthContext, Backend, BackendConfig, BackendLocation,
-    BlobVersion, BucketInfo, ExportReportRow, ExportReportSource, ExportRoCrateSpec,
-    GroupAuthorizationDocument, JobId, JobPayload, JobRecord, JobResultPayload,
+    BackendRef, BlobLocationKey, BlobVersion, BucketInfo, ExportReportRow, ExportReportSource,
+    ExportRoCrateSpec, GroupAuthorizationDocument, JobId, JobPayload, JobRecord, JobResultPayload,
     MetadataRegistryRecord, PathRestriction, Permission, RealmAuthorizationDocument,
     RealmConfigDocument, RealmId, RealmNodeKind, ReasonCode, RoCrateLimits, VersionKey,
     VersionedObjectArn,
@@ -311,6 +311,7 @@ async fn write_payload(
         .as_ref()
         .ok_or("holder blob handle is missing")?
         .send_blob_effect(BlobEffect::Write {
+            resolved: aruna_core::structs::ResolvedBackend::node_default(),
             bucket: BUCKET.to_string(),
             key: KEY.to_string(),
             created_by: owner,
@@ -348,13 +349,20 @@ async fn seed_holder(
         created_by: owner,
         cors_configuration: None,
         replication: None,
+        storage_routing: Vec::new(),
     };
     let hash: [u8; 32] = location
         .get_blake3()
         .ok_or("holder payload has no blake3")?
         .try_into()
         .map_err(|_| "holder payload hash is not 32 bytes")?;
-    let version = BlobVersion::materialized(hash, SystemTime::UNIX_EPOCH, owner, None);
+    let version = BlobVersion::materialized(
+        hash,
+        BackendRef::node_default(),
+        SystemTime::UNIX_EPOCH,
+        owner,
+        None,
+    );
     let version_key = VersionKey::new(BUCKET, KEY, version_id);
     let writes = vec![
         (
@@ -384,7 +392,9 @@ async fn seed_holder(
         ),
         (
             BLOB_LOCATIONS_KEYSPACE.to_string(),
-            hash.to_vec().into(),
+            BlobLocationKey::new(hash, location.backend.clone())
+                .to_bytes()
+                .into(),
             location.to_bytes()?.into(),
         ),
     ];

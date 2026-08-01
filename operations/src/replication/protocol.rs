@@ -4,8 +4,8 @@ use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::{
     ArunaArn, AuthContext, BackendLocation, MultipartChecksumType, MultipartObjectPart,
-    MultipartObjectSummary, ReplicationItemKind, ReplicationNegotiationResult, SourceMetadata,
-    VersionSourceBinding, VersionedObjectArn,
+    MultipartObjectSummary, RealmId, ReplicationItemKind, ReplicationNegotiationResult,
+    SourceMetadata, VersionSourceBinding, VersionedObjectArn,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
@@ -148,8 +148,62 @@ pub enum VersionReplicationMessage {
     VersionApplyComplete,
     VersionApplyRejected(String),
     BaoReadRequest(BaoReadRequest),
-    BaoReadAccepted { size: u64, blake3: [u8; 32] },
+    BaoReadAccepted {
+        size: u64,
+        blake3: [u8; 32],
+    },
     BaoReadRefused(BaoReadRefusal),
+    LocationSummaryRequest(LocationSummaryRequest),
+    LocationSummaryResponse(LocationSummary),
+    /// The asking user has no read access to the bucket this node holds the
+    /// copy under, so the caller learns nothing except that it was refused.
+    LocationSummaryDenied,
+}
+
+/// Read-only question a node asks a peer: do you hold this version, and on
+/// what storage? Never mutates the peer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LocationSummaryRequest {
+    pub realm_id: RealmId,
+    pub bucket: String,
+    pub key: String,
+    pub version_id: Option<Ulid>,
+    pub auth_context: AuthContext,
+}
+
+/// What a copy sits on. Node-managed copies carry the storage class only: the
+/// operator's backend names stay out of object-scoped answers.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum LocationCopyStorage {
+    NodeManaged {
+        storage_class: Option<String>,
+    },
+    GroupBackend {
+        backend_id: Ulid,
+        name: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LocationSummary {
+    /// The version the answering node resolved; `None` means it knows none.
+    pub version_id: Option<Ulid>,
+    pub held: bool,
+    pub storage: Option<LocationCopyStorage>,
+    /// Whether the resolved version carries stored bytes at all. A delete
+    /// marker or a reference-only version never will, anywhere.
+    pub materialized: bool,
+}
+
+impl LocationSummary {
+    pub fn absent() -> Self {
+        Self {
+            version_id: None,
+            held: false,
+            storage: None,
+            materialized: false,
+        }
+    }
 }
 
 impl VersionReplicationMessage {

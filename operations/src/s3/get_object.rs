@@ -1,3 +1,4 @@
+use crate::blob::blob_keyspace_helper::blob_location_read;
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
 };
@@ -8,15 +9,14 @@ use aruna_core::errors::{
 };
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
-    MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectSummary,
-    ResolvedSourceAccess, SourceMetadata, VersionKey, VersionSourceBinding,
+    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
+    CurrentVersionPointer, MultipartChecksumType, MultipartObjectMetadataKey,
+    MultipartObjectSummary, ResolvedSourceAccess, SourceMetadata, VersionKey, VersionSourceBinding,
 };
 use aruna_core::types::Effects;
 use bytes::Bytes;
@@ -332,10 +332,14 @@ impl GetObjectOperation {
         self.metadata = version.metadata.clone();
 
         match version.state {
-            BlobVersionState::Materialized { blob_hash, source } => {
+            BlobVersionState::Materialized {
+                blob_hash,
+                backend,
+                source,
+            } => {
                 self.source_binding = source;
                 self.version_created_at = Some(version.created_at);
-                self.read_blob_location(blob_hash)
+                self.read_blob_location(BlobLocationKey::new(blob_hash, backend))
             }
             BlobVersionState::Deleted => self.emit_error(if explicit_version_request {
                 GetObjectError::DeleteMarker
@@ -358,13 +362,9 @@ impl GetObjectOperation {
         }
     }
 
-    fn read_blob_location(&mut self, blob_hash: [u8; 32]) -> Effects {
+    fn read_blob_location(&mut self, key: BlobLocationKey) -> Effects {
         self.state = GetObjectState::GetBlobLocation;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-            key: blob_hash.to_vec().into(),
-            txn_id: self.txn_id,
-        })]
+        smallvec![blob_location_read(&key, self.txn_id)]
     }
 
     fn handle_blob_location_read(&mut self, event: Event) -> Effects {
@@ -710,16 +710,17 @@ mod test {
     use aruna_blob::hash::Hasher;
     use aruna_core::UserId;
     use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
+    use aruna_core::egress::EgressPolicy;
     use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        Backend, BackendConfig, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState,
-        CurrentVersionPointer, MultipartChecksumType, PortableSourceDescriptor, RealmId,
-        ResolvedSourceAccess, SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey,
-        VersionSourceBinding,
+        Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey,
+        BlobVersion, BlobVersionState, CurrentVersionPointer, MultipartChecksumType,
+        PortableSourceDescriptor, RealmId, ResolvedSourceAccess, SourceConnectorKind,
+        SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -808,6 +809,8 @@ mod test {
         });
         let txn_id = Ulid::generate();
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "aruna_test".to_string(),
             backend_path: "s3test/range.txt".to_string(),
@@ -960,7 +963,7 @@ mod test {
         let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
             .await
             .unwrap();
-        let blob_handle = BlobHandler::new(
+        let blob_handle = BlobHandler::with_egress(
             BackendConfig {
                 backend_type: Backend::FileSystem,
                 bucket_prefix: Some("aruna_".to_string()),
@@ -972,6 +975,7 @@ mod test {
             },
             storage_handle.clone(),
             net_handle.clone(),
+            EgressPolicy::loopback(),
         )
         .await
         .unwrap();
@@ -984,6 +988,8 @@ mod test {
         let key = "test.txt".to_string();
         let blob_ulid = Ulid::generate();
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: temp_root.to_string(),
             storage_bucket: format!("aruna_{}", Ulid::generate()),
             backend_path: format!("{bucket}/{key}_{blob_ulid}"),
@@ -1014,7 +1020,9 @@ mod test {
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
                     key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                    key: blake3_hash.to_vec().into(),
+                    key: BlobLocationKey::new(blake3_hash, location.backend.clone())
+                        .to_bytes()
+                        .into(),
                     value: location.clone().to_bytes().unwrap().into(),
                     txn_id: Some(txn_id),
                 })
@@ -1042,6 +1050,7 @@ mod test {
                         .into(),
                     value: BlobVersion::materialized(
                         blake3_hash,
+                        BackendRef::node_default(),
                         location.created_at,
                         location.created_by,
                         None,
@@ -1107,7 +1116,7 @@ mod test {
         let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
             .await
             .unwrap();
-        let blob_handle = BlobHandler::new(
+        let blob_handle = BlobHandler::with_egress(
             BackendConfig {
                 backend_type: Backend::FileSystem,
                 bucket_prefix: Some("aruna_".to_string()),
@@ -1119,6 +1128,7 @@ mod test {
             },
             storage_handle.clone(),
             net_handle.clone(),
+            EgressPolicy::loopback(),
         )
         .await
         .unwrap();
@@ -1132,6 +1142,8 @@ mod test {
         let key = "test.txt".to_string();
         let blob_ulid = Ulid::generate();
         let location = BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: temp_root.to_string(),
             storage_bucket: format!("aruna_{}", Ulid::generate()),
             backend_path: format!("{bucket}/{key}_{blob_ulid}"),
@@ -1161,7 +1173,9 @@ mod test {
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
                     key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                    key: blake3_hash.to_vec().into(),
+                    key: BlobLocationKey::new(blake3_hash, location.backend.clone())
+                        .to_bytes()
+                        .into(),
                     value: location.clone().to_bytes().unwrap().into(),
                     txn_id: Some(txn_id),
                 })
@@ -1189,6 +1203,7 @@ mod test {
                         .into(),
                     value: BlobVersion::materialized(
                         blake3_hash,
+                        BackendRef::node_default(),
                         location.created_at,
                         location.created_by,
                         None,
@@ -1256,7 +1271,7 @@ mod test {
         let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
             .await
             .unwrap();
-        let blob_handle = BlobHandler::new(
+        let blob_handle = BlobHandler::with_egress(
             BackendConfig {
                 backend_type: Backend::FileSystem,
                 bucket_prefix: Some("aruna_".to_string()),
@@ -1268,6 +1283,7 @@ mod test {
             },
             storage_handle.clone(),
             net_handle.clone(),
+            EgressPolicy::loopback(),
         )
         .await
         .unwrap();
@@ -1424,7 +1440,7 @@ mod test {
         let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
             .await
             .unwrap();
-        let blob_handle = BlobHandler::new(
+        let blob_handle = BlobHandler::with_egress(
             BackendConfig {
                 backend_type: Backend::FileSystem,
                 bucket_prefix: Some("aruna_".to_string()),
@@ -1436,6 +1452,7 @@ mod test {
             },
             storage_handle.clone(),
             net_handle.clone(),
+            EgressPolicy::loopback(),
         )
         .await
         .unwrap();

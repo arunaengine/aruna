@@ -518,7 +518,7 @@ mod tests {
     };
     use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::driver::{DriverContext, drive, routing_snapshot};
     use aruna_operations::incoming::initialize_net_incoming;
     use aruna_operations::s3::create_bucket::CreateBucketOperation;
     use aruna_operations::s3::create_user_access::{
@@ -728,6 +728,7 @@ mod tests {
                         created_by: realm_admin,
                         cors_configuration: None,
                         replication: None,
+                        storage_routing: Vec::new(),
                     },
                 ),
                 context.as_ref(),
@@ -738,6 +739,9 @@ mod tests {
             .unwrap();
 
             let data = b"tiny snapshot object";
+            let routing = routing_snapshot(context.as_ref(), group.0.group_id, &bucket_name)
+                .await
+                .unwrap();
             let upload = drive(
                 PutObjectOperation::new(PutObjectConfig {
                     user_id: realm_admin,
@@ -756,6 +760,7 @@ mod tests {
                     preassigned_version_id: None,
                     quota_ceiling: None,
                     exists: false,
+                    routing,
                 }),
                 context.as_ref(),
             )

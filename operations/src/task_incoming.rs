@@ -14,6 +14,7 @@ use aruna_core::structs::{
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
+use aruna_core::types::Key;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
@@ -28,6 +29,9 @@ use crate::blob::cleanup::{BLOB_CLEANUP_AFTER, BLOB_CLEANUP_RETRY, process_clean
 use crate::blob::hidden::{
     HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, process_hidden_sweep, restore_hidden_sweep,
 };
+use crate::blob::reclaim::{
+    RECLAIM_SWEEP_AFTER, RECLAIM_SWEEP_RETRY, process_reclaim_batch, restore_reclaim_sweep,
+};
 use crate::blob_holders::RefreshBlobHoldersOperation;
 use crate::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::document_sync_outbox::{
@@ -35,6 +39,7 @@ use crate::document_sync_outbox::{
     restore_document_sync_outbox_timers,
 };
 use crate::driver::{DriverContext, drive};
+use crate::group_backends::remove::remove_drained_backends;
 use crate::jobs::drain::{JobClassBudget, process_job_queue_batch, restore_job_queue_timer};
 use crate::jobs::prune::{process_job_prune_batch, restore_job_prune_timer};
 use crate::jobs::runtime::JobsRuntime;
@@ -124,6 +129,9 @@ struct OperationsTaskHandler {
     // In-memory retry-attempt counters keyed by timer. Loss on restart is fine:
     // a restarted node simply retries from the base interval.
     retry_backoff: std::sync::Mutex<HashMap<TaskKey, u32>>,
+    // Where a capped reclaim sweep resumes. Loss on restart is fine: the next
+    // sweep starts from the head and reaches the tail over the ticks after it.
+    reclaim_cursor: std::sync::Mutex<Option<Key>>,
 }
 
 struct DrainSubBatch {
@@ -366,6 +374,7 @@ impl OperationsTaskHandler {
             jobs_runtime,
             rocrate_limits: RoCrateLimits::default(),
             retry_backoff: std::sync::Mutex::new(HashMap::new()),
+            reclaim_cursor: std::sync::Mutex::new(None),
         }
     }
 
@@ -463,12 +472,36 @@ impl OperationsTaskHandler {
             .remove(key);
     }
 
+    fn reclaim_start(&self) -> Option<Key> {
+        self.reclaim_cursor
+            .lock()
+            .expect("reclaim cursor mutex poisoned")
+            .clone()
+    }
+
+    fn set_reclaim_start(&self, cursor: Option<Key>) {
+        *self
+            .reclaim_cursor
+            .lock()
+            .expect("reclaim cursor mutex poisoned") = cursor;
+    }
+
     /// Keeps the first missing-topic pull retry prompt, then doubles each
     /// subsequent full placement scan from the pull base up to the placement
     /// interval. A new holder usually only needs its co-holders to apply the
     /// same config change, so the ladder must not cliff to 30s on the second
     /// attempt.
     fn placement_pull_retry_after(&self, key: &TaskKey) -> Duration {
+        self.retry_ladder(
+            key,
+            SHARD_TOPIC_PULL_RETRY_AFTER,
+            SHARD_TOPIC_PULL_RETRY_MAX,
+        )
+    }
+
+    /// Keeps `base` for the first attempt, then doubles each further one up to
+    /// `max`, counting attempts in the shared in-memory ladder.
+    fn retry_ladder(&self, key: &TaskKey, base: Duration, max: Duration) -> Duration {
         let mut backoff = self
             .retry_backoff
             .lock()
@@ -476,15 +509,15 @@ impl OperationsTaskHandler {
         match backoff.entry(key.clone()) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(0);
-                SHARD_TOPIC_PULL_RETRY_AFTER
+                base
             }
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 let attempts = entry.get().saturating_add(1);
                 entry.insert(attempts);
                 Duration::from_millis(retry_after_ms(
                     attempts,
-                    SHARD_TOPIC_PULL_RETRY_AFTER.as_millis() as u64,
-                    SHARD_TOPIC_PULL_RETRY_MAX.as_millis() as u64,
+                    base.as_millis() as u64,
+                    max.as_millis() as u64,
                 ))
             }
         }
@@ -1770,6 +1803,46 @@ impl OperationsTaskHandler {
             .await;
     }
 
+    async fn drain_blob_reclaim(&self) {
+        let key = TaskKey::DrainBlobReclaimQueue;
+        // A failed candidate earns the fast retry, then doubles up to the normal
+        // interval, so a permanently failing one cannot hold a one-minute rescan
+        // of the whole queue forever.
+        let (after, drained) =
+            match process_reclaim_batch(&self.context, self.reclaim_start()).await {
+                Ok(outcome) => {
+                    self.set_reclaim_start(outcome.next_start_after);
+                    match (outcome.capped, outcome.failed) {
+                        (true, _) => {
+                            self.reset_backoff(&key);
+                            (RECLAIM_SWEEP_RETRY, false)
+                        }
+                        (false, 0) => {
+                            self.reset_backoff(&key);
+                            (RECLAIM_SWEEP_AFTER, true)
+                        }
+                        (false, _) => (
+                            self.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER),
+                            true,
+                        ),
+                    }
+                }
+                Err(error) => {
+                    warn!(task_id = ?key, error = %error, "Failed to drain blob reclaim");
+                    (
+                        self.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER),
+                        false,
+                    )
+                }
+            };
+        // Removal walks whole keyspaces too, so it only rides a sweep that
+        // reached the end of the queue, never the fast retries behind a backlog.
+        if drained && let Err(error) = remove_drained_backends(&self.context).await {
+            warn!(error = %error, "Failed to remove drained storage backends");
+        }
+        self.reschedule_timer(key, after).await;
+    }
+
     async fn sweep_hidden_blobs(&self) {
         let after = match process_hidden_sweep(&self.context).await {
             Ok(_) => HIDDEN_SWEEP_AFTER,
@@ -1925,6 +1998,7 @@ async fn initialize_task_handler(
     restore_mirror_timer(&context.storage_handle, &task_handle).await;
     if context.blob_handle.is_some() {
         restore_hidden_sweep(&context.storage_handle, &task_handle).await;
+        restore_reclaim_sweep(&context.storage_handle, &task_handle).await;
         handler
             .reschedule_timer(TaskKey::DrainBlobCleanupQueue, Duration::ZERO)
             .await;
@@ -2030,6 +2104,9 @@ impl InboundTaskHandler for OperationsTaskHandler {
             TaskKey::DrainBlobCleanupQueue => {
                 self.drain_blob_cleanup().await;
             }
+            TaskKey::DrainBlobReclaimQueue => {
+                self.drain_blob_reclaim().await;
+            }
             TaskKey::RefreshBlobHolders => {
                 self.refresh_blob_holders().await;
             }
@@ -2088,6 +2165,41 @@ mod tests {
             drain_delay(&progressing),
             METADATA_MATERIALIZATION_NEXT_BATCH_AFTER
         );
+    }
+
+    #[test]
+    fn reclaim_retry_climbs() {
+        // A failing sweep earns the fast retry, then doubles up to the normal
+        // interval so a candidate that always fails cannot hot-loop a full
+        // rescan every minute.
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let handler = OperationsTaskHandler::new(
+            Arc::new(DriverContext {
+                storage_handle: storage,
+                net_handle: None,
+                blob_handle: None,
+                metadata_handle: None,
+                task_handle: None,
+                compute_handle: None,
+            }),
+            JobsRuntime::new(),
+        );
+        let key = TaskKey::DrainBlobReclaimQueue;
+        let ladder = |handler: &OperationsTaskHandler| {
+            handler.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER)
+        };
+
+        assert_eq!(ladder(&handler), RECLAIM_SWEEP_RETRY);
+        assert_eq!(ladder(&handler), RECLAIM_SWEEP_RETRY * 2);
+        for _ in 0..8 {
+            ladder(&handler);
+        }
+        assert_eq!(ladder(&handler), RECLAIM_SWEEP_AFTER);
+
+        handler.reset_backoff(&key);
+        assert_eq!(ladder(&handler), RECLAIM_SWEEP_RETRY);
     }
 
     struct RecordingTaskHandler {

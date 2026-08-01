@@ -70,6 +70,9 @@ pub(crate) fn describe_event(event: &Event) -> String {
             SubOperationEvent::BucketCreated { .. } => {
                 "Event::SubOperation(SubOperationEvent::BucketCreated)".to_string()
             }
+            SubOperationEvent::GroupRoutingLoaded { .. } => {
+                "Event::SubOperation(SubOperationEvent::GroupRoutingLoaded)".to_string()
+            }
             SubOperationEvent::NotificationsEmitted => {
                 "Event::SubOperation(SubOperationEvent::NotificationsEmitted)".to_string()
             }
@@ -89,6 +92,7 @@ pub(crate) mod test_utils {
     use crate::s3::create_bucket::CreateBucketOperation;
     use aruna_blob::blob::BlobHandler;
     use aruna_core::UserId;
+    use aruna_core::egress::EgressPolicy;
     use aruna_core::structs::{
         Backend, BackendConfig, BucketInfo, SourceConnector, SourceConnectorKind,
     };
@@ -113,7 +117,7 @@ pub(crate) mod test_utils {
         let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
             .await
             .expect("net handle must initialize");
-        let blob_handle = BlobHandler::new(
+        let blob_handle = BlobHandler::with_egress(
             BackendConfig {
                 backend_type: Backend::FileSystem,
                 root: blob_root,
@@ -125,6 +129,7 @@ pub(crate) mod test_utils {
             },
             storage_handle.clone(),
             net_handle,
+            EgressPolicy::loopback(),
         )
         .await
         .expect("blob handle must initialize");
@@ -175,6 +180,7 @@ pub(crate) mod test_utils {
             created_by,
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         };
         drive(
             CreateBucketOperation::new(bucket.to_string(), info.clone()),

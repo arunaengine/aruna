@@ -41,6 +41,49 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --all-targets --all-features --locked
 
+  s3-backend:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y clang mold
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: "1.95.0"
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=aruna-test \
+            -e MINIO_ROOT_PASSWORD=aruna-test-secret \
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            server /data
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "MinIO did not become ready" >&2
+          docker logs minio >&2 || true
+          exit 1
+
+      - name: Run S3 backend tests
+        env:
+          ARUNA_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          ARUNA_TEST_S3_ACCESS_KEY: aruna-test
+          ARUNA_TEST_S3_SECRET_KEY: aruna-test-secret
+          ARUNA_TEST_S3_REGION: us-east-1
+        run: cargo test -p aruna-blob --lib --locked s3_
+
   fmt:
     runs-on: ubuntu-latest
 

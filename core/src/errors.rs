@@ -46,6 +46,9 @@ pub enum BlobError {
     MakeBucketError(String),
     #[error("Operator creation failed: {0}")]
     OperatorCreationFailed(String),
+    /// A stored record names a backend this node does not have registered.
+    #[error("unknown storage backend {0}")]
+    UnknownBackend(String),
     #[error("Outboard creation failed: {0}")]
     OutboardCreationFailed(String),
     #[error("Failed to open connection: {0}")]
@@ -96,6 +99,8 @@ pub enum StagingSourceError {
     ListError(String),
     #[error("Read error: {0}")]
     ReadError(String),
+    #[error(transparent)]
+    EgressDenied(#[from] crate::egress::EgressError),
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -120,6 +125,10 @@ pub enum StorageError {
     KeyNotFound,
     #[error("Transaction conflict")]
     TransactionConflict,
+    /// A commit that neither succeeded nor was refused. Its writes may still
+    /// become durable, so a caller must not undo what the commit would own.
+    #[error("Commit failed")]
+    CommitFailed,
     #[error("Transaction not found")]
     TransactionNotFound,
     #[error("Keyspace error")]
@@ -140,6 +149,16 @@ pub enum StorageError {
     Timeout,
     #[error("Invalid effect type")]
     InvalidEffect,
+}
+
+impl StorageError {
+    /// Whether a failed `CommitTransaction` proves the transaction's writes
+    /// were discarded: refused by the conflict check, or never handed to the
+    /// storage actor at all. Every other failure leaves the commit either
+    /// already applied or unknown, so its records may exist.
+    pub fn proves_no_commit(&self) -> bool {
+        matches!(self, Self::TransactionConflict | Self::QueueFull)
+    }
 }
 
 #[derive(Debug, Error, PartialEq)]

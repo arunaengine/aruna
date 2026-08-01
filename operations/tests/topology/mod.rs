@@ -59,7 +59,9 @@ use ulid::Ulid;
 
 pub type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-pub const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Lost-progress detection, not a speed limit: one queue retry alone backs off
+/// to 30s, and an instrumented run is several times slower than a plain one.
+pub const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Two stable locations, so `distinct_locations` strategies stay satisfiable
 /// and location ranking is exercised rather than degenerate.

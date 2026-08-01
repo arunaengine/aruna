@@ -1,11 +1,12 @@
 use crate::error::CliError;
 use crate::explorer::{
     explore_entries, explore_keyspaces, print_node_state, print_topic_placements,
-    print_topic_status, print_topics_list,
+    print_topic_status, print_topics_list, scan_locations,
 };
 use crate::info::print_info;
 use crate::iroh_check::print_iroh_check;
 use crate::portal::update_portal;
+use crate::reclaim::{print_status as reclaim_status, seed_backend};
 use crate::storage::{import, snapshot};
 use crate::tokens::{create_local_bootstrap_token, create_oidc_token, view_token};
 use clap::{Parser, Subcommand};
@@ -16,6 +17,7 @@ mod explorer;
 mod info;
 mod iroh_check;
 mod portal;
+mod reclaim;
 mod storage;
 #[cfg(test)]
 mod test_support;
@@ -84,6 +86,24 @@ pub enum Commands {
         #[arg(long)]
         token: Option<String>,
     },
+    Reclaim {
+        #[command(subcommand)]
+        command: ReclaimCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ReclaimCommands {
+    /// Queue every stored copy on one backend, for garbage that predates a
+    /// switch to reclaim. Run with the node stopped.
+    Seed {
+        database_path: String,
+        /// Backend key: `n:<name>` for a node backend, `g:<ulid>` for a tenant one.
+        #[arg(long)]
+        backend: String,
+    },
+    /// Queue depth and stuck physical deletes per backend.
+    Status { database_path: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -94,6 +114,14 @@ pub enum ExploreCommands {
     Entries {
         database_path: String,
         keyspace: String,
+    },
+    /// Lists stored locations whose backend no longer resolves.
+    Locations {
+        database_path: String,
+        /// Backends file to resolve node backends against. Without it only the
+        /// implicit `default` backend counts as registered.
+        #[arg(long)]
+        backends_path: Option<String>,
     },
 }
 
@@ -184,6 +212,10 @@ pub async fn main() -> Result<(), CliError> {
                 database_path,
                 keyspace,
             } => explore_entries(database_path, keyspace).await?,
+            ExploreCommands::Locations {
+                database_path,
+                backends_path,
+            } => scan_locations(database_path, backends_path).await?,
         },
         Commands::Topics { command } => match command {
             TopicsCommands::List { database_path } => print_topics_list(database_path).await?,
@@ -225,6 +257,13 @@ pub async fn main() -> Result<(), CliError> {
             }
         },
         Commands::Info { token } => print_info(token).await?,
+        Commands::Reclaim { command } => match command {
+            ReclaimCommands::Seed {
+                database_path,
+                backend,
+            } => seed_backend(database_path, backend).await?,
+            ReclaimCommands::Status { database_path } => reclaim_status(database_path).await?,
+        },
     };
 
     Ok(())

@@ -9,8 +9,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE};
 use aruna_core::structs::{
-    NodeInfoDocument, NodeUrls, NodeUtilization, PlacementRef, RealmConfigDocument, RealmId,
-    node_info_storage_key,
+    BackendCatalog, NodeInfoDocument, NodeUrls, NodeUtilization, PlacementRef, RealmConfigDocument,
+    RealmId, STORAGE_CLASS_LABEL_PREFIX, node_info_storage_key,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, Value};
@@ -53,7 +53,7 @@ pub async fn seed_node_info_document(
     let document = NodeInfoDocument {
         node_id,
         executors,
-        labels: placement_labels(&config, node_id)?,
+        labels: node_labels(ctx, &config, node_id)?,
         urls,
         utilization: NodeUtilization {
             storage_bytes_used: local_storage_bytes(ctx).await?,
@@ -95,7 +95,7 @@ pub async fn refresh_node_info_heartbeat(
     };
     let now = unix_timestamp_millis();
     let config = load_realm_config(ctx, realm_id).await?;
-    document.labels = placement_labels(&config, node_id)?;
+    document.labels = node_labels(ctx, &config, node_id)?;
     document.utilization.storage_bytes_used = local_storage_bytes(ctx).await?;
     document.utilization.documents_held = held_documents(ctx, node_id, &config).await;
     document.utilization.load_permille = read_load_permille();
@@ -124,6 +124,34 @@ fn placement_labels(
         .find(|node| node.node_id == node_id)
         .map(|node| node.labels)
         .ok_or_else(|| format!("node {node_id} is missing from the realm placement view"))
+}
+
+fn class_labels(catalog: &BackendCatalog) -> BTreeMap<String, String> {
+    catalog
+        .classes()
+        .into_iter()
+        .map(|class| {
+            (
+                format!("{STORAGE_CLASS_LABEL_PREFIX}{class}"),
+                "true".to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Derived from the node's own registry, so a class disappears from the labels
+/// as soon as the operator stops offering it. Advertisement only: the class
+/// labels stay in `NodeInfo` and never enter the placement selector input.
+fn node_labels(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    node_id: NodeId,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut labels = placement_labels(config, node_id)?;
+    if let Some(blob_handle) = ctx.blob_handle.as_ref() {
+        labels.extend(class_labels(&blob_handle.routing().catalog));
+    }
+    Ok(labels)
 }
 
 async fn local_storage_bytes(ctx: &DriverContext) -> Result<u64, String> {
@@ -401,6 +429,24 @@ mod tests {
                 .collect(),
             other => panic!("unexpected outbox iter result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn classes_become_labels() {
+        // Operator-only classes are advertised too: placement is operator domain.
+        let catalog = BackendCatalog::new("hot".to_string())
+            .with_backend("hot".to_string(), Some("hot".to_string()))
+            .with_reserved("tape".to_string(), Some("archive".to_string()))
+            .with_backend("plain".to_string(), None);
+
+        let labels = class_labels(&catalog);
+
+        assert_eq!(labels.len(), 2);
+        assert_eq!(
+            labels.get(&format!("{STORAGE_CLASS_LABEL_PREFIX}hot")),
+            Some(&"true".to_string())
+        );
+        assert!(labels.contains_key(&format!("{STORAGE_CLASS_LABEL_PREFIX}archive")));
     }
 
     #[tokio::test]

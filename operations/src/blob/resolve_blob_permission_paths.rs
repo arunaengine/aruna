@@ -58,6 +58,7 @@ impl ResolveBlobPermissionPathsOperation {
     fn emit_read_hash_aliases(&mut self) -> Result<Effects, ResolveBlobPermissionPathsError> {
         Ok(smallvec![iter_hash_path_index_effect(
             &self.blake3_hash,
+            None,
             self.txn_id,
         )?])
     }

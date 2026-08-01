@@ -267,7 +267,7 @@ async fn delete_record(storage: &StorageHandle, key: Key) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{BackendLocation, RealmId, RoCrateMediaType};
+    use aruna_core::structs::{BackendLocation, BackendRef, RealmId, RoCrateMediaType};
     use aruna_core::types::UserId;
     use serde::Serialize;
     use std::collections::HashMap;
@@ -282,6 +282,8 @@ mod tests {
             upload_id,
             owner: UserId::nil(RealmId::from_bytes([1u8; 32])),
             location: BackendLocation {
+                backend: BackendRef::node_default(),
+                storage_class: None,
                 root: "/data".to_string(),
                 storage_bucket: "storage".to_string(),
                 backend_path: format!("_jobs/{upload_id}/input_01"),
@@ -335,6 +337,7 @@ mod tests {
     fn orphan_selection() {
         let namespace = Ulid::from_bytes([7u8; 16]);
         let key = HiddenBlobKey::new(
+            BackendRef::node_default(),
             "/data".to_string(),
             "storage".to_string(),
             format!("_jobs/{namespace}/artifact_01"),

@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use aruna_blob::blob::BlobHandler;
 use aruna_core::effects::{BlobEffect, StorageEffect};
+use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -22,7 +23,7 @@ use aruna_core::structs::{
     ImportRoCrateSpec, ImportRoCrateTarget, JobId, JobPayload, JobRecord, JobResultPayload,
     MetadataRegistryRecord, PathRestriction, Permission, RealmAuthorizationDocument,
     RealmConfigDocument, RealmId, RealmNodeKind, ReasonCode, RoCrateLimits, RoCrateMediaType,
-    RoCrateUploadRecord, SourceConnectorKind, VersionKey,
+    RoCrateUploadRecord, RoutingSnapshot, SourceConnectorKind, VersionKey,
 };
 use aruna_core::types::{GroupId, UserId};
 use aruna_core::util::unix_timestamp_millis;
@@ -1141,7 +1142,7 @@ async fn build_fixture(gated: bool) -> Result<Fixture, Box<dyn std::error::Error
     seed_config(&storage, &actor).await?;
     let group_id = Ulid::generate();
     seed_auth(&storage, &actor, group_id).await?;
-    let blob = BlobHandler::new(
+    let blob = BlobHandler::with_egress(
         BackendConfig {
             backend_type: Backend::FileSystem,
             bucket_prefix: Some("aruna_".to_string()),
@@ -1153,6 +1154,7 @@ async fn build_fixture(gated: bool) -> Result<Fixture, Box<dyn std::error::Error
         },
         storage.clone(),
         net.clone(),
+        EgressPolicy::loopback(),
     )
     .await?;
     let metadata = MetadataHandle::new(
@@ -1355,6 +1357,7 @@ async fn create_bucket(
                 created_by: actor.user_id,
                 cors_configuration: None,
                 replication: None,
+                storage_routing: Vec::new(),
             },
         ),
         context,
@@ -1711,6 +1714,7 @@ async fn put_object(
             version_source: None,
             preassigned_version_id: None,
             quota_ceiling: None,
+            routing: RoutingSnapshot::single(Ulid::generate()),
         }),
         fixture.context.as_ref(),
     )

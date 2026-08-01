@@ -1,8 +1,10 @@
 use crate::blob::blob_keyspace_helper::{
-    HeadAliasContext, add_hash_path_index_effect, build_head_transition_effects,
-    write_blob_location_effect, write_blob_version_effect,
+    HeadAliasContext, add_hash_path_index_effect, blob_location_read,
+    build_head_transition_effects, write_blob_location_effect, write_blob_version_effect,
 };
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
+use crate::group_routing::load_group_inputs;
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
 use crate::replication::queue::{
@@ -11,7 +13,7 @@ use crate::replication::queue::{
 use crate::replication::util::dht_registration_effect;
 use crate::s3::create_bucket::CreateBucketOperation;
 use crate::usage_stats::{
-    QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError,
+    QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_usage_snapshot_publish_effect,
 };
 use aruna_core::document::DocumentSyncTarget;
@@ -19,20 +21,23 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
     S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
-    CurrentVersionPointer, MultipartObjectMetadataKey, Permission, RealmConfigDocument, RealmId,
-    ReplicationItemKind, ReplicationNegotiationResult, RoCrateLimits, UsageDelta, VersionKey,
-    blob_bucket_permission_path, blob_object_permission_path,
+    AuthContext, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
+    BucketInfo, CurrentVersionPointer, GroupRoutingInputs, MultipartObjectMetadataKey, NodeRouting,
+    Permission, RealmConfigDocument, RealmId, ReclaimCandidate, ReclaimCandidateKey,
+    ReplicationItemKind, ReplicationNegotiationResult, ResolvedBackend, RoCrateLimits,
+    RoutingError, StorageRoutingRule, UsageDelta, VersionKey, blob_bucket_permission_path,
+    blob_object_permission_path, resolve_backend,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, NodeId};
 use smallvec::smallvec;
 use std::collections::VecDeque;
+use std::time::SystemTime;
 use thiserror::Error;
 use tracing::{debug, warn};
 use ulid::Ulid;
@@ -42,6 +47,7 @@ enum IncomingVersionReplicationState {
     Init,
     ReadDestinationBucket,
     CreateDestinationBucket,
+    LoadDestinationRouting,
     CheckPermissions,
     CheckWriterPermissions,
     ReadExistingVersion,
@@ -57,6 +63,9 @@ enum IncomingVersionReplicationState {
     VerifyReplaced,
     ReadReplacedMetadata,
     DeleteReplacedMetadata,
+    WriteReclaimCandidate,
+    FenceBackend,
+    VerifyExistingBlob,
     WriteBlobLocation,
     ReadObjectLookup,
     ReadCurrentVersion,
@@ -82,6 +91,10 @@ enum IncomingVersionReplicationState {
 #[derive(Debug, Error, PartialEq)]
 pub enum IncomingVersionReplicationError {
     #[error(transparent)]
+    RoutingFailed(#[from] RoutingError),
+    #[error(transparent)]
+    BackendFenceError(#[from] BackendFenceError),
+    #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
@@ -93,6 +106,8 @@ pub enum IncomingVersionReplicationError {
     RealmMismatch,
     #[error("Destination bucket not found")]
     DestinationBucketNotFound,
+    #[error("could not load the destination group's routing inputs: {0}")]
+    RoutingInputsFailed(String),
     #[error("Replication requires WRITE permission on the destination path")]
     WritePermissionDenied,
     #[error("writer_access_denied")]
@@ -123,6 +138,8 @@ pub enum IncomingVersionReplicationError {
     BlobSizeMismatch,
     #[error("Replicated blob storage flags do not match manifest")]
     BlobStorageFlagsMismatch,
+    #[error("Existing blob copy changed before the version committed")]
+    ExistingBlobChanged,
     #[error("Replaced multipart metadata exceeds the supported part limit")]
     MultipartMetadataOverflow,
     #[error("Unexpected event in state {state}: expected {expected}, got {received:?}")]
@@ -148,6 +165,10 @@ pub struct IncomingVersionReplicationOperation {
     manifest: VersionReplicationManifest,
     txn_id: Option<Ulid>,
     destination_group_id: Option<GroupId>,
+    /// The destination bucket's own rules, so this receiver routes its replica
+    /// with the tenant's rules and its own class table.
+    destination_rules: Vec<StorageRoutingRule>,
+    destination_inputs: GroupRoutingInputs,
     create_attempted: bool,
     negotiation_result: Option<ReplicationNegotiationResult>,
     quota_ceiling: Option<u64>,
@@ -168,6 +189,10 @@ pub struct IncomingVersionReplicationOperation {
     apply_committed: bool,
     output: Option<Result<IncomingVersionReplicationResult, IncomingVersionReplicationError>>,
     rocrate_limits: RoCrateLimits,
+    routing: NodeRouting,
+    /// Set when the destination backend is over its cap, which only refuses a
+    /// negotiation that asks for the bytes.
+    destination_full: Option<RoutingError>,
 }
 
 impl IncomingVersionReplicationOperation {
@@ -185,6 +210,8 @@ impl IncomingVersionReplicationOperation {
             manifest,
             txn_id: None,
             destination_group_id: None,
+            destination_rules: Vec::new(),
+            destination_inputs: GroupRoutingInputs::default(),
             create_attempted: false,
             negotiation_result: None,
             quota_ceiling: None,
@@ -205,7 +232,15 @@ impl IncomingVersionReplicationOperation {
             apply_committed: false,
             output: None,
             rocrate_limits: RoCrateLimits::default(),
+            routing: NodeRouting::default(),
+            destination_full: None,
         }
+    }
+
+    /// Node-local routing, so this receiver picks its own backend.
+    pub fn with_routing(mut self, routing: NodeRouting) -> Self {
+        self.routing = routing;
+        self
     }
 
     pub fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
@@ -218,6 +253,7 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::Init => "Init",
             IncomingVersionReplicationState::ReadDestinationBucket => "ReadDestinationBucket",
             IncomingVersionReplicationState::CreateDestinationBucket => "CreateDestinationBucket",
+            IncomingVersionReplicationState::LoadDestinationRouting => "LoadDestinationRouting",
             IncomingVersionReplicationState::CheckPermissions => "CheckPermissions",
             IncomingVersionReplicationState::CheckWriterPermissions => "CheckWriterPermissions",
             IncomingVersionReplicationState::ReadExistingVersion => "ReadExistingVersion",
@@ -233,6 +269,9 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::VerifyReplaced => "VerifyReplaced",
             IncomingVersionReplicationState::ReadReplacedMetadata => "ReadReplacedMetadata",
             IncomingVersionReplicationState::DeleteReplacedMetadata => "DeleteReplacedMetadata",
+            IncomingVersionReplicationState::WriteReclaimCandidate => "WriteReclaimCandidate",
+            IncomingVersionReplicationState::FenceBackend => "FenceBackend",
+            IncomingVersionReplicationState::VerifyExistingBlob => "VerifyExistingBlob",
             IncomingVersionReplicationState::WriteBlobLocation => "WriteBlobLocation",
             IncomingVersionReplicationState::ReadObjectLookup => "ReadObjectLookup",
             IncomingVersionReplicationState::ReadCurrentVersion => "ReadCurrentVersion",
@@ -454,6 +493,7 @@ impl IncomingVersionReplicationOperation {
             created_by: self.manifest.created_by,
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         }
     }
 
@@ -474,6 +514,16 @@ impl IncomingVersionReplicationOperation {
                 },
             }),
         ))]
+    }
+
+    /// The receiver's own group default and registered backend ids, loaded once
+    /// the destination group is known so that the existing-copy probe and the
+    /// transfer resolve the destination from identical inputs.
+    fn load_destination_routing(&mut self) -> Effects {
+        self.state = IncomingVersionReplicationState::LoadDestinationRouting;
+        smallvec![load_group_inputs(
+            self.destination_group_id.unwrap_or(self.manifest.group_id)
+        )]
     }
 
     fn check_write_permission(&mut self, group_id: Ulid) -> Effects {
@@ -520,13 +570,9 @@ impl IncomingVersionReplicationOperation {
         })]
     }
 
-    fn read_replaced_blob(&mut self, blob_hash: [u8; 32]) -> Effects {
+    fn read_replaced_blob(&mut self, key: BlobLocationKey) -> Effects {
         self.state = IncomingVersionReplicationState::ReadReplacedBlob;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-            key: blob_hash.to_vec().into(),
-            txn_id: None,
-        })]
+        smallvec![blob_location_read(&key, None)]
     }
 
     fn read_quota_config(&mut self) -> Effects {
@@ -578,16 +624,53 @@ impl IncomingVersionReplicationOperation {
         smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
     }
 
+    /// Asks only about the backend this node would route the blob to: a copy on
+    /// any other backend cannot satisfy the destination placement.
     fn read_existing_blob(&mut self) -> Effects {
         let Some(blob) = self.manifest.blob.as_ref() else {
             return self.fail(IncomingVersionReplicationError::MissingBlobInfo);
         };
+        let hash = blob.hash;
+        // A full destination still probes, because a copy it already holds
+        // costs it nothing; the cap only refuses the transfer itself.
+        let backend = match self.resolve_destination() {
+            Ok(resolved) => resolved.backend,
+            Err(IncomingVersionReplicationError::RoutingFailed(RoutingError::BackendFull(
+                backend,
+            ))) => {
+                self.destination_full = Some(RoutingError::BackendFull(backend.clone()));
+                backend
+            }
+            // Still before the negotiation reply, so a node that cannot place
+            // the blob owes the sender a reason rather than a dropped stream.
+            Err(error) => return self.reject_negotiation(error),
+        };
         self.state = IncomingVersionReplicationState::ReadExistingBlob;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-            key: blob.hash.to_vec().into(),
-            txn_id: None,
-        })]
+        smallvec![blob_location_read(
+            &BlobLocationKey::new(hash, backend),
+            None
+        )]
+    }
+
+    /// The only negotiation result that stores bytes, so the destination's cap
+    /// is answered here rather than at the probe that keys the deduplication.
+    fn request_blob_version(&mut self) -> Effects {
+        match self.destination_full.take() {
+            Some(error) => {
+                self.reject_negotiation(IncomingVersionReplicationError::RoutingFailed(error))
+            }
+            None => self.send_negotiation(ReplicationNegotiationResult::NeedBlobAndVersion),
+        }
+    }
+
+    fn resolve_destination(&self) -> Result<ResolvedBackend, IncomingVersionReplicationError> {
+        let snapshot = self
+            .routing
+            .snapshot(self.destination_group_id.unwrap_or(self.manifest.group_id))
+            .with_group_inputs(self.destination_inputs.clone())
+            .with_bucket_rules(self.destination_rules.clone());
+        resolve_backend(&snapshot, &self.manifest.bucket, &self.manifest.key)
+            .map_err(IncomingVersionReplicationError::RoutingFailed)
     }
 
     fn send_negotiation(&mut self, result: ReplicationNegotiationResult) -> Effects {
@@ -605,10 +688,17 @@ impl IncomingVersionReplicationOperation {
     }
 
     fn receive_blob(&mut self) -> Effects {
+        // The receiver routes with its own snapshot; the sender's stamped
+        // backend crossed the wire but is ignored.
+        let resolved = match self.resolve_destination() {
+            Ok(resolved) => resolved,
+            Err(error) => return self.fail(error),
+        };
         self.state = IncomingVersionReplicationState::ReceiveBlob;
         smallvec![Effect::Blob(BlobEffect::HandleReplication {
             replication_id: None,
             stream_id: self.stream_id,
+            resolved,
             keep_alive: true,
         })]
     }
@@ -695,6 +785,36 @@ impl IncomingVersionReplicationOperation {
         })]
     }
 
+    /// The copy the replaced version named, once the replacement stops naming
+    /// it. Nothing else drops that reference, so without this the bytes stay
+    /// charged to the backend forever.
+    fn replaced_reclaim_key(&self) -> Option<ReclaimCandidateKey> {
+        let replaced = self.replaced_version.as_ref()?.location_key()?;
+        let replacement = self.effective_materialized_location().ok().and_then(|it| {
+            let hash: [u8; 32] = it.get_blake3()?.try_into().ok()?;
+            Some(BlobLocationKey::new(hash, it.backend))
+        });
+        (replacement.as_ref() != Some(&replaced))
+            .then(|| ReclaimCandidateKey::new(replaced.backend, replaced.blake3_hash))
+    }
+
+    fn write_replaced_candidate(&mut self, key: ReclaimCandidateKey) -> Effects {
+        let candidate = ReclaimCandidate {
+            enqueued_at: SystemTime::now(),
+        };
+        let value = match candidate.to_bytes() {
+            Ok(value) => value,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.state = IncomingVersionReplicationState::WriteReclaimCandidate;
+        smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: BLOB_RECLAIM_KEYSPACE.to_string(),
+            key: key.to_bytes().into(),
+            value: value.into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
     fn effective_materialized_location(
         &self,
     ) -> Result<BackendLocation, IncomingVersionReplicationError> {
@@ -748,6 +868,41 @@ impl IncomingVersionReplicationOperation {
     }
 
     fn write_blob_location_or_continue(&mut self) -> Effects {
+        let Ok(location) = self.effective_materialized_location() else {
+            return self.write_object_lookup_or_continue();
+        };
+        if let Some(effect) = fence_backend(&location.backend, self.txn_id) {
+            self.state = IncomingVersionReplicationState::FenceBackend;
+            return smallvec![effect];
+        }
+        self.verify_existing_blob()
+    }
+
+    /// A negotiation that adopted an existing copy read it outside the
+    /// transaction. Re-reading it inside makes the commit fail rather than
+    /// leave the version naming bytes another writer has since removed.
+    fn verify_existing_blob(&mut self) -> Effects {
+        if self.received_blob_location.is_some() {
+            return self.write_blob_location();
+        }
+        let Some(location) = self.existing_blob_location.clone() else {
+            return self.write_blob_location();
+        };
+        let Some(blake3_hash) = location.get_blake3() else {
+            return self.write_blob_location();
+        };
+        let hash: [u8; 32] = match blake3_hash.try_into() {
+            Ok(hash) => hash,
+            Err(err) => return self.fail(ConversionError::from(err).into()),
+        };
+        self.state = IncomingVersionReplicationState::VerifyExistingBlob;
+        smallvec![blob_location_read(
+            &BlobLocationKey::new(hash, location.backend),
+            self.txn_id
+        )]
+    }
+
+    fn write_blob_location(&mut self) -> Effects {
         let Ok(location) = self.effective_materialized_location() else {
             return self.write_object_lookup_or_continue();
         };
@@ -891,6 +1046,7 @@ impl IncomingVersionReplicationOperation {
                     (
                         BlobVersion::materialized(
                             hash,
+                            location.backend.clone(),
                             self.manifest.created_at,
                             self.manifest.created_by,
                             self.manifest.source.clone(),
@@ -1031,18 +1187,13 @@ impl IncomingVersionReplicationOperation {
         let Some(blob) = self.manifest.blob.as_ref() else {
             return self.fail(IncomingVersionReplicationError::MissingBlobInfo);
         };
-        let size = i128::from(blob.size);
-        let new_blob = self.received_blob_location.is_some();
-        let global_delta = UsageDelta {
-            stored_blobs: i128::from(new_blob),
-            stored_bytes: if new_blob { size } else { 0 },
-            ..group_delta
-        };
-        self.usage_update = Some(UsageCounterUpdate::with_global(
-            group_id,
-            group_delta,
-            global_delta,
-        ));
+        self.usage_update = Some(match self.received_blob_location.as_ref() {
+            None => UsageCounterUpdate::for_group(group_id, group_delta),
+            Some(location) => match StoredDelta::for_location(location, true) {
+                Some(stored) => UsageCounterUpdate::with_stored(group_id, group_delta, stored),
+                None => return self.fail(IncomingVersionReplicationError::MissingBlobInfo),
+            },
+        });
         let Some(txn_id) = self.txn_id else {
             return self.fail(IncomingVersionReplicationError::StorageError(
                 StorageError::TransactionNotFound,
@@ -1255,7 +1406,28 @@ impl Operation for IncomingVersionReplicationOperation {
                 );
 
                 self.destination_group_id = Some(bucket_info.group_id);
-                self.check_write_permission(bucket_info.group_id)
+                self.destination_rules = bucket_info.storage_routing;
+                self.load_destination_routing()
+            }
+            IncomingVersionReplicationState::LoadDestinationRouting => {
+                let Event::SubOperation(SubOperationEvent::GroupRoutingLoaded { result }) = event
+                else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::SubOperation(SubOperationEvent::GroupRoutingLoaded)",
+                        received: event,
+                    });
+                };
+                match result {
+                    Ok(inputs) => self.destination_inputs = inputs,
+                    Err(error) => {
+                        return self
+                            .fail(IncomingVersionReplicationError::RoutingInputsFailed(error));
+                    }
+                }
+                self.check_write_permission(
+                    self.destination_group_id.unwrap_or(self.manifest.group_id),
+                )
             }
             IncomingVersionReplicationState::CreateDestinationBucket => {
                 let Event::SubOperation(SubOperationEvent::BucketCreated { result }) = event else {
@@ -1378,7 +1550,11 @@ impl Operation for IncomingVersionReplicationOperation {
                                     ReplicationNegotiationResult::AlreadyReplicatedVersion,
                                 );
                             }
-                            return self.read_replaced_blob(*blob_hash);
+                            let Some(key) = existing.location_key() else {
+                                return self
+                                    .fail(IncomingVersionReplicationError::MissingBlobLocation);
+                            };
+                            return self.read_replaced_blob(key);
                         }
                         BlobVersionState::Deleted
                             if self.manifest.kind == ReplicationItemKind::DeleteMarker =>
@@ -1523,9 +1699,7 @@ impl Operation for IncomingVersionReplicationOperation {
                                     existing_blob_size = location.blob_size,
                                     "Existing destination blob differs; requesting blob and version"
                                 );
-                                return self.send_negotiation(
-                                    ReplicationNegotiationResult::NeedBlobAndVersion,
-                                );
+                                return self.request_blob_version();
                             }
                             self.existing_blob_location = Some(location);
                             debug!(
@@ -1545,7 +1719,7 @@ impl Operation for IncomingVersionReplicationOperation {
                                 stream_id = %self.stream_id,
                                 "Destination blob missing or invalid; requesting blob and version"
                             );
-                            self.send_negotiation(ReplicationNegotiationResult::NeedBlobAndVersion)
+                            self.request_blob_version()
                         }
                     }
                 } else {
@@ -1556,7 +1730,7 @@ impl Operation for IncomingVersionReplicationOperation {
                         stream_id = %self.stream_id,
                         "Destination blob absent; requesting blob and version"
                     );
-                    self.send_negotiation(ReplicationNegotiationResult::NeedBlobAndVersion)
+                    self.request_blob_version()
                 }
             }
             IncomingVersionReplicationState::SendNegotiation => {
@@ -1691,8 +1865,48 @@ impl Operation for IncomingVersionReplicationOperation {
                         received: event,
                     });
                 };
+                match self.replaced_reclaim_key() {
+                    Some(key) => self.write_replaced_candidate(key),
+                    None => {
+                        self.replaced_version = None;
+                        self.write_hash_lookup_or_continue()
+                    }
+                }
+            }
+            IncomingVersionReplicationState::WriteReclaimCandidate => {
+                let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::WriteResult)",
+                        received: event,
+                    });
+                };
                 self.replaced_version = None;
                 self.write_hash_lookup_or_continue()
+            }
+            IncomingVersionReplicationState::FenceBackend => match check_fence(event) {
+                Ok(()) => self.verify_existing_blob(),
+                Err(error) => self.fail(error.into()),
+            },
+            IncomingVersionReplicationState::VerifyExistingBlob => {
+                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::ReadResult)",
+                        received: event,
+                    });
+                };
+                let stored = match value
+                    .map(|value| BackendLocation::from_bytes(value.as_ref()))
+                    .transpose()
+                {
+                    Ok(stored) => stored,
+                    Err(error) => return self.fail(error.into()),
+                };
+                if stored != self.existing_blob_location {
+                    return self.fail(IncomingVersionReplicationError::ExistingBlobChanged);
+                }
+                self.write_blob_location()
             }
             IncomingVersionReplicationState::WriteBlobLocation => {
                 let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
@@ -2022,17 +2236,19 @@ mod tests {
     use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-        BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE,
-        S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+        BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+        S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BlobVersion, BlobVersionState, BucketInfo,
-        CurrentVersionPointer, HashPathIndexKey, MultipartObjectMetadataKey, QuotaConfig,
-        RealmConfigDocument, RealmId, ReplicationItemKind, ReplicationNegotiationResult,
-        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionSourceBinding,
+        AuthContext, BackendLocation, BackendRef, BlobLocationKey, BlobVersion, BlobVersionState,
+        BucketInfo, CurrentVersionPointer, GroupRoutingInputs, HashPathIndexKey,
+        MultipartObjectMetadataKey, NodeRouting, QuotaConfig, RealmConfigDocument, RealmId,
+        ReclaimCandidateKey, ReplicationItemKind, ReplicationNegotiationResult, RoutingTarget,
+        SourceConnectorKind, SourceMetadata, StagingStrategy, StorageRoutingRule,
+        VersionSourceBinding,
     };
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::time::SystemTime;
     use ulid::Ulid;
 
@@ -2052,6 +2268,8 @@ mod tests {
         let mut hashes = HashMap::new();
         hashes.insert("blake3".to_string(), vec![1u8; 32]);
         BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
             root: "/tmp".to_string(),
             storage_bucket: "blob-bucket".to_string(),
             backend_path: format!("bucket/key_{}", Ulid::generate()),
@@ -2074,6 +2292,7 @@ mod tests {
             created_by: test_user_id(),
             cors_configuration: None,
             replication: None,
+            storage_routing: Vec::new(),
         }
     }
 
@@ -2172,6 +2391,20 @@ mod tests {
         }
     }
 
+    /// Answers the routing load that follows every destination bucket read.
+    fn load_routing(
+        op: &mut IncomingVersionReplicationOperation,
+        inputs: GroupRoutingInputs,
+    ) -> aruna_core::types::Effects {
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::LoadDestinationRouting
+        );
+        op.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
+            result: Ok(inputs),
+        }))
+    }
+
     fn advance_to_version_lookup(
         op: &mut IncomingVersionReplicationOperation,
         group_id: Ulid,
@@ -2186,10 +2419,11 @@ mod tests {
             Effect::Storage(StorageEffect::Read { .. })
         ));
 
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+        op.step(Event::Storage(StorageEvent::ReadResult {
             key: b"bucket".to_vec().into(),
             value: Some(make_bucket_info(group_id).to_bytes().unwrap().into()),
         }));
+        let effects = load_routing(op, GroupRoutingInputs::default());
         assert_eq!(op.state, IncomingVersionReplicationState::CheckPermissions);
         assert!(matches!(effects[0], Effect::SubOperation(_)));
 
@@ -2279,6 +2513,7 @@ mod tests {
 
         let version = BlobVersion::materialized(
             manifest.blob.as_ref().unwrap().hash,
+            BackendRef::node_default(),
             manifest.created_at,
             manifest.created_by,
             None,
@@ -2409,6 +2644,7 @@ mod tests {
         op.destination_group_id = Some(test_group_id());
         op.replaced_version = Some(BlobVersion::materialized(
             [9u8; 32],
+            BackendRef::node_default(),
             SystemTime::now(),
             test_user_id(),
             None,
@@ -2455,12 +2691,62 @@ mod tests {
         let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
             entries: deletes,
         }));
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::WriteReclaimCandidate
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Write { key_space, .. })]
+                if key_space == BLOB_RECLAIM_KEYSPACE
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: vec![0u8; 4].into(),
+        }));
         assert_eq!(op.state, IncomingVersionReplicationState::ReadObjectLookup);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Read { key_space, .. })]
                 if key_space == BLOB_HEAD_KEYSPACE
         ));
+    }
+
+    #[test]
+    fn replacement_queues_reclaim() {
+        // The copy a replaced materialized version named is unreferenced once
+        // the replacement names a different one, and only this enqueue frees it.
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            make_manifest(ReplicationItemKind::Materialized),
+        );
+        op.txn_id = Some(Ulid::generate());
+        op.replaced_version = Some(BlobVersion::materialized(
+            [9u8; 32],
+            BackendRef::node_default(),
+            SystemTime::now(),
+            test_user_id(),
+            None,
+        ));
+
+        assert_eq!(
+            op.replaced_reclaim_key(),
+            Some(ReclaimCandidateKey::new(
+                BackendRef::node_default(),
+                [9u8; 32]
+            ))
+        );
+
+        // The replacement adopting the very same copy must not queue it.
+        let mut adopted = make_location();
+        adopted.backend = BackendRef::node_default();
+        adopted
+            .hashes
+            .insert("blake3".to_string(), [9u8; 32].to_vec());
+        op.received_blob_location = Some(adopted);
+        assert_eq!(op.replaced_reclaim_key(), None);
     }
 
     #[test]
@@ -2486,8 +2772,13 @@ mod tests {
             [Effect::Storage(StorageEffect::Read { key_space, .. })]
                 if key_space == BLOB_VERSIONS_KEYSPACE
         ));
-        let current =
-            BlobVersion::materialized([9u8; 32], manifest.created_at, manifest.created_by, None);
+        let current = BlobVersion::materialized(
+            [9u8; 32],
+            BackendRef::node_default(),
+            manifest.created_at,
+            manifest.created_by,
+            None,
+        );
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: Some(current.to_bytes().unwrap().into()),
@@ -2672,6 +2963,110 @@ mod tests {
             ) => assert_eq!(reason, "quota"),
             other => panic!("expected quota rejection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn full_backend_rejects() {
+        // Replication now routes through the quota-marked catalog, so a full
+        // destination backend owes the sender a reason before any transfer.
+        let manifest = make_manifest(ReplicationItemKind::Materialized);
+        let group_id = test_group_id();
+        let mut routing = NodeRouting::default();
+        routing.catalog = routing.catalog.mark_full(BackendRef::DEFAULT_NODE_NAME);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            manifest,
+        )
+        .with_routing(routing);
+
+        let _effects = advance_to_version_lookup(&mut op, group_id);
+        let effects = advance_blob_lookup(&mut op);
+        assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        match message_from_effect(&effects[0]) {
+            VersionReplicationMessage::VersionNegotiationResponse(
+                ReplicationNegotiationResult::Rejected(reason),
+            ) => assert!(reason.contains("quota"), "unexpected reason: {reason}"),
+            other => panic!("expected a rejected negotiation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn full_backend_dedupes() {
+        // A blob the destination already holds stores no bytes, so its cap has
+        // nothing left to protect.
+        let manifest = make_manifest(ReplicationItemKind::Materialized);
+        let existing = manifest
+            .blob
+            .as_ref()
+            .map(|blob| blob.location.clone())
+            .unwrap();
+        let group_id = test_group_id();
+        let mut routing = NodeRouting::default();
+        routing.catalog = routing.catalog.mark_full(BackendRef::DEFAULT_NODE_NAME);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            manifest,
+        )
+        .with_routing(routing);
+
+        let _effects = advance_to_version_lookup(&mut op, group_id);
+        advance_blob_lookup(&mut op);
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(existing.to_bytes().unwrap().into()),
+        }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionNegotiationResponse(
+                ReplicationNegotiationResult::NeedVersionOnly
+            )
+        ));
+    }
+
+    #[test]
+    fn marker_ignores_quota() {
+        // A delete marker stores no bytes, so a full destination must still let
+        // the tombstone converge.
+        let group_id = test_group_id();
+        let mut routing = NodeRouting::default();
+        routing.catalog = routing.catalog.mark_full(BackendRef::DEFAULT_NODE_NAME);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            make_manifest(ReplicationItemKind::DeleteMarker),
+        )
+        .with_routing(routing);
+
+        let _effects = advance_to_version_lookup(&mut op, group_id);
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionNegotiationResponse(
+                ReplicationNegotiationResult::NeedVersionOnly
+            )
+        ));
     }
 
     #[test]
@@ -2931,10 +3326,16 @@ mod tests {
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: Some(
-                BlobVersion::materialized([2u8; 32], SystemTime::now(), test_user_id(), None)
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
+                BlobVersion::materialized(
+                    [2u8; 32],
+                    BackendRef::node_default(),
+                    SystemTime::now(),
+                    test_user_id(),
+                    None,
+                )
+                .to_bytes()
+                .unwrap()
+                .into(),
             ),
         }));
 
@@ -3037,10 +3438,16 @@ mod tests {
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: Some(
-                BlobVersion::materialized([2u8; 32], SystemTime::now(), test_user_id(), None)
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
+                BlobVersion::materialized(
+                    [2u8; 32],
+                    BackendRef::node_default(),
+                    SystemTime::now(),
+                    test_user_id(),
+                    None,
+                )
+                .to_bytes()
+                .unwrap()
+                .into(),
             ),
         }));
 
@@ -3170,6 +3577,151 @@ mod tests {
         ));
     }
 
+    /// Drives an incoming materialized version to the existing-copy probe under
+    /// the given bucket rules and group inputs.
+    fn probe_backend(
+        rules: Vec<StorageRoutingRule>,
+        inputs: GroupRoutingInputs,
+    ) -> (
+        IncomingVersionReplicationOperation,
+        aruna_core::types::Effects,
+    ) {
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            make_manifest(ReplicationItemKind::Materialized),
+        );
+        let mut bucket_info = make_bucket_info(test_group_id());
+        bucket_info.storage_routing = rules;
+
+        op.start();
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: Some(bucket_info.to_bytes().unwrap().into()),
+        }));
+        load_routing(&mut op, inputs);
+        op.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+        ));
+        let effects = advance_blob_lookup(&mut op);
+        (op, effects)
+    }
+
+    fn group_backend_key(backend_id: Ulid) -> Vec<u8> {
+        BlobLocationKey::new([1u8; 32], BackendRef::Group(backend_id)).to_bytes()
+    }
+
+    fn probed_key(effects: &aruna_core::types::Effects) -> Vec<u8> {
+        let [Effect::Storage(StorageEffect::Read { key, .. })] = effects.as_slice() else {
+            panic!("expected one location read, got {effects:?}")
+        };
+        key.to_vec()
+    }
+
+    #[test]
+    fn refuses_vanished_copy() {
+        // The adopted copy is re-read in the transaction, so a sweep that
+        // removed it in between must fail the apply instead of committing.
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            make_manifest(ReplicationItemKind::Materialized),
+        );
+        let txn_id = Ulid::generate();
+        op.txn_id = Some(txn_id);
+        op.destination_group_id = Some(test_group_id());
+        op.existing_blob_location = Some(make_location());
+
+        let effects = op.write_blob_location_or_continue();
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::VerifyExistingBlob
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, txn_id: read_txn, .. })]
+                if key_space == BLOB_LOCATIONS_KEYSPACE && *read_txn == Some(txn_id)
+        ));
+
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+
+        assert_eq!(
+            op.output,
+            Some(Err(IncomingVersionReplicationError::ExistingBlobChanged))
+        );
+    }
+
+    #[test]
+    fn probes_rule_backend() {
+        // The probe must ask about the backend the bucket rule names.
+        let backend_id = Ulid::from_bytes([4u8; 16]);
+        let (op, effects) = probe_backend(
+            vec![StorageRoutingRule {
+                key_prefix: String::new(),
+                exact: false,
+                target: RoutingTarget::Backend(BackendRef::Group(backend_id)),
+            }],
+            GroupRoutingInputs {
+                default_target: None,
+                backend_ids: BTreeSet::from([backend_id]),
+            },
+        );
+
+        assert_eq!(
+            op.resolve_destination().unwrap().backend,
+            BackendRef::Group(backend_id)
+        );
+        assert_eq!(probed_key(&effects), group_backend_key(backend_id));
+    }
+
+    #[test]
+    fn probes_group_default() {
+        let backend_id = Ulid::from_bytes([5u8; 16]);
+        let (_op, effects) = probe_backend(
+            Vec::new(),
+            GroupRoutingInputs {
+                default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
+                backend_ids: BTreeSet::from([backend_id]),
+            },
+        );
+
+        assert_eq!(probed_key(&effects), group_backend_key(backend_id));
+    }
+
+    #[test]
+    fn keeps_loaded_inputs() {
+        // The version-only path resolves from the same inputs the probe used.
+        let backend_id = Ulid::from_bytes([6u8; 16]);
+        let (mut op, _effects) = probe_backend(
+            Vec::new(),
+            GroupRoutingInputs {
+                default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
+                backend_ids: BTreeSet::from([backend_id]),
+            },
+        );
+        let mut location = make_location();
+        location.backend = BackendRef::Group(backend_id);
+
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: group_backend_key(backend_id).into(),
+            value: Some(location.to_bytes().unwrap().into()),
+        }));
+
+        assert_eq!(
+            op.negotiation_result,
+            Some(ReplicationNegotiationResult::NeedVersionOnly)
+        );
+        assert_eq!(
+            op.resolve_destination().unwrap().backend,
+            BackendRef::Group(backend_id)
+        );
+    }
+
     #[test]
     fn received_blob_manifest_mismatch_is_rejected_and_cleaned_up() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
@@ -3265,7 +3817,7 @@ mod tests {
         );
 
         op.start();
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+        op.step(Event::Storage(StorageEvent::ReadResult {
             key: b"bucket".to_vec().into(),
             value: Some(
                 make_bucket_info(Ulid::generate())
@@ -3274,6 +3826,7 @@ mod tests {
                     .into(),
             ),
         }));
+        let effects = load_routing(&mut op, GroupRoutingInputs::default());
         assert_eq!(op.state, IncomingVersionReplicationState::CheckPermissions);
         assert!(matches!(effects[0], Effect::SubOperation(_)));
 
@@ -3316,6 +3869,7 @@ mod tests {
                     .into(),
             ),
         }));
+        load_routing(&mut op, GroupRoutingInputs::default());
 
         let effects = op.step(Event::SubOperation(
             SubOperationEvent::AuthorizationResult {

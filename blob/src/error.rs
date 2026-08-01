@@ -8,4 +8,6 @@ pub enum BlobLibError {
     PostcardError(#[from] postcard::Error),
     #[error(transparent)]
     OpenDalError(#[from] opendal::Error),
+    #[error(transparent)]
+    ClientError(#[from] reqwest::Error),
 }

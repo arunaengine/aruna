@@ -412,6 +412,7 @@ mod tests {
                     created_by: owner,
                     cors_configuration: None,
                     replication: None,
+                    storage_routing: Vec::new(),
                 }
                 .to_bytes()
                 .unwrap(),

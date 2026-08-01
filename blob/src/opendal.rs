@@ -1,11 +1,12 @@
+use crate::egress::EgressGuard;
 use aruna_core::errors::{BlobError, StagingSourceError};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
-    Backend, BackendConfig, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata,
+    Backend, GroupBackendKind, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata,
 };
 use bytes::Bytes;
 use futures::TryStreamExt;
-use opendal::layers::{LoggingLayer, RetryLayer};
+use opendal::layers::{HttpClientLayer, LoggingLayer, RetryLayer};
 use opendal::{Builder, EntryMode, Operator, services};
 use std::collections::HashMap;
 
@@ -22,52 +23,55 @@ pub(crate) async fn abort_partial_writer(
     }
 }
 
-pub(crate) fn init_backend_operator(
-    mut config: BackendConfig,
-    bucket: String,
-) -> Result<Operator, BlobError> {
-    config
-        .service_config
-        .insert("root".to_string(), config.root);
-
-    match config.backend_type {
-        Backend::S3 => {
-            config.service_config.insert("bucket".to_string(), bucket);
-            build_service::<services::S3>(s3_operator_config(config.service_config))
-                .map_err(blob_operator_creation_error)
-        }
-        Backend::HTTP => build_service::<services::Http>(config.service_config)
-            .map_err(blob_operator_creation_error),
-        Backend::Postgres => build_service::<services::Postgresql>(config.service_config)
-            .map_err(blob_operator_creation_error),
-        Backend::FileSystem => build_service::<services::Fs>(config.service_config)
-            .map_err(blob_operator_creation_error),
-    }
-}
-
+/// Tenant backends always build through the guarded client; operator backends
+/// are node-local topology and keep the direct one.
 pub(crate) fn init_operator(
     backend_type: Backend,
     config: HashMap<String, String>,
+    guard: &EgressGuard,
 ) -> Result<Operator, BlobError> {
     match backend_type {
-        Backend::S3 => build_service::<services::S3>(s3_operator_config(config))
+        Backend::S3 => build_service::<services::S3>(s3_operator_config(config), None)
             .map_err(blob_operator_creation_error),
-        Backend::HTTP => {
-            build_service::<services::Http>(config).map_err(blob_operator_creation_error)
-        }
-        Backend::Postgres => {
-            build_service::<services::Postgresql>(config).map_err(blob_operator_creation_error)
-        }
         Backend::FileSystem => {
-            build_service::<services::Fs>(config).map_err(blob_operator_creation_error)
+            build_service::<services::Fs>(config, None).map_err(blob_operator_creation_error)
+        }
+        Backend::Group(kind) => {
+            build_group_service(kind, config, guard).map_err(blob_operator_creation_error)
         }
     }
 }
 
+/// Every tenant build pins the provider's ambient-credential switches where the
+/// service exposes them; the others rely on the mandatory static credential.
+pub(crate) fn build_group_service(
+    kind: GroupBackendKind,
+    config: HashMap<String, String>,
+    guard: &EgressGuard,
+) -> Result<Operator, String> {
+    let layer = Some(guard.layer());
+    match kind {
+        GroupBackendKind::S3 => build_service::<services::S3>(s3_operator_config(config), layer),
+        GroupBackendKind::Gcs => build_service::<services::Gcs>(gcs_operator_config(config), layer),
+        GroupBackendKind::Azblob => build_service::<services::Azblob>(config, layer),
+        GroupBackendKind::Azdls => build_service::<services::Azdls>(config, layer),
+        GroupBackendKind::B2 => build_service::<services::B2>(config, layer),
+    }
+}
+
+// gcs is the only tenant kind with explicit kill-switches; both are forced so
+// neither the node's gcloud config nor its VM metadata identity can be used.
+fn gcs_operator_config(mut config: HashMap<String, String>) -> HashMap<String, String> {
+    config.insert("disable_config_load".to_string(), "true".to_string());
+    config.insert("disable_vm_metadata".to_string(), "true".to_string());
+    config
+}
+
 pub(crate) async fn check_staging_source(
+    guard: &EgressGuard,
     access: &ResolvedSourceAccess,
 ) -> Result<(), StagingSourceError> {
-    let (operator, ..) = build_staging_source_operator(access)?;
+    let (operator, ..) = build_source_operator(guard, access).await?;
     let ResolvedSourceAccess::OpenDal { kind, .. } = access;
     check_operator(&operator, *kind).await
 }
@@ -89,9 +93,10 @@ async fn check_operator(
 }
 
 pub(crate) async fn head_staging_source(
+    guard: &EgressGuard,
     access: &ResolvedSourceAccess,
 ) -> Result<SourceMetadata, StagingSourceError> {
-    let (operator, path, version) = build_staging_source_operator(access)?;
+    let (operator, path, version) = build_source_operator(guard, access).await?;
     let metadata = match version {
         Some(version) => operator.stat_with(path).version(version).await,
         None => operator.stat(path).await,
@@ -108,6 +113,7 @@ pub(crate) async fn head_staging_source(
 }
 
 pub(crate) async fn read_staging_source(
+    guard: &EgressGuard,
     access: &ResolvedSourceAccess,
     range: Option<std::ops::Range<u64>>,
 ) -> Result<
@@ -117,8 +123,8 @@ pub(crate) async fn read_staging_source(
     ),
     StagingSourceError,
 > {
-    let (operator, path, version) = build_staging_source_operator(access)?;
-    let metadata = head_staging_source(access).await?;
+    let (operator, path, version) = build_source_operator(guard, access).await?;
+    let metadata = head_staging_source(guard, access).await?;
     let reader = match version {
         Some(version) => operator.reader_with(path).version(version).await,
         None => operator.reader(path).await,
@@ -139,6 +145,7 @@ pub(crate) async fn read_staging_source(
 }
 
 pub(crate) async fn list_staging_source(
+    guard: &EgressGuard,
     access: &ResolvedSourceAccess,
     offset: usize,
     limit: usize,
@@ -151,11 +158,11 @@ pub(crate) async fn list_staging_source(
     if *kind == SourceConnectorKind::Http {
         // opendal's Http service cannot list; walk autoindex pages instead.
         return crate::autoindex::list_http_autoindex(
-            config, path, offset, limit, recursive, files_only,
+            guard, config, path, offset, limit, recursive, files_only,
         )
         .await;
     }
-    let (operator, path, ..) = build_staging_source_operator(access)?;
+    let (operator, path, ..) = build_source_operator(guard, access).await?;
     list_operator(&operator, path, offset, limit, recursive, files_only).await
 }
 
@@ -211,9 +218,11 @@ async fn list_operator(
     Ok((entries, false))
 }
 
-fn build_staging_source_operator(
-    access: &ResolvedSourceAccess,
-) -> Result<(Operator, &str, Option<&str>), StagingSourceError> {
+/// Builds the guarded opendal operator for one resolved staging source.
+async fn build_source_operator<'access>(
+    guard: &EgressGuard,
+    access: &'access ResolvedSourceAccess,
+) -> Result<(Operator, &'access str, Option<&'access str>), StagingSourceError> {
     match access {
         ResolvedSourceAccess::OpenDal {
             kind,
@@ -222,15 +231,22 @@ fn build_staging_source_operator(
             version,
         } => {
             let operator = match kind {
-                SourceConnectorKind::Http => build_service::<services::Http>(config.clone())
-                    .map_err(staging_operator_creation_error)?,
-                SourceConnectorKind::S3 => build_service::<services::S3>(config.clone())
-                    .map_err(staging_operator_creation_error)?,
-                SourceConnectorKind::Webdav => build_service::<services::Webdav>(config.clone())
-                    .map_err(staging_operator_creation_error)?,
-                SourceConnectorKind::Ftp => build_service::<services::Ftp>(config.clone())
-                    .map_err(staging_operator_creation_error)?,
-                SourceConnectorKind::ArunaNative => {
+                SourceConnectorKind::Http => {
+                    build_service::<services::Http>(config.clone(), Some(guard.layer()))
+                        .map_err(staging_operator_creation_error)?
+                }
+                SourceConnectorKind::S3 => build_service::<services::S3>(
+                    s3_operator_config(config.clone()),
+                    Some(guard.layer()),
+                )
+                .map_err(staging_operator_creation_error)?,
+                SourceConnectorKind::Webdav => {
+                    build_service::<services::Webdav>(config.clone(), Some(guard.layer()))
+                        .map_err(staging_operator_creation_error)?
+                }
+                // opendal's ftp service exposes no way to constrain the passive
+                // data address, so the data socket cannot be screened.
+                SourceConnectorKind::Ftp | SourceConnectorKind::ArunaNative => {
                     return Err(StagingSourceError::UnsupportedKind(kind.to_string()));
                 }
             };
@@ -239,23 +255,30 @@ fn build_staging_source_operator(
     }
 }
 
-fn build_service<B>(config: HashMap<String, String>) -> Result<Operator, String>
+fn build_service<B>(
+    config: HashMap<String, String>,
+    guard: Option<HttpClientLayer>,
+) -> Result<Operator, String>
 where
     B: Builder,
 {
-    Ok(Operator::from_iter::<B>(config)
+    let builder = Operator::from_iter::<B>(config)
         .map_err(|error| error.to_string())?
         .layer(LoggingLayer::default())
-        .layer(RetryLayer::new())
-        .finish())
+        .layer(RetryLayer::new());
+    Ok(match guard {
+        Some(guard) => builder.layer(guard).finish(),
+        None => builder.finish(),
+    })
 }
 
-// reqsign resolves credentials when the operator is built, so ambient AWS
-// config and EC2 metadata lookups must be disabled up front. `force_path_style`
-// is our canonical key; opendal speaks `enable_virtual_host_style`.
+// reqsign resolves lazily on every request, so the switches live in the config.
+// These two are all opendal exposes; sso, web identity, process and ecs stay in
+// the chain, closed only by the static credential both surfaces require.
 fn s3_operator_config(mut config: HashMap<String, String>) -> HashMap<String, String> {
     config.insert("disable_config_load".to_string(), "true".to_string());
     config.insert("disable_ec2_metadata".to_string(), "true".to_string());
+    // `force_path_style` is our key; opendal speaks `enable_virtual_host_style`.
     let path_style = config
         .remove("force_path_style")
         .map(|value| value.trim().parse::<bool>().unwrap_or(true))
@@ -290,7 +313,440 @@ fn map_staging_source_error(error: opendal::Error, stat: bool) -> StagingSourceE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::egress::EgressPolicy;
+    use std::sync::Arc;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
+
+    fn test_guard() -> EgressGuard {
+        EgressGuard::new(EgressPolicy::loopback()).unwrap()
+    }
+
+    /// Ambient AWS inputs cleared before a zero-connect proof, so no provider
+    /// ahead of the metadata slot can short-circuit the chain.
+    const AWS_ENV_KEYS: [&str; 11] = [
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_ROLE_ARN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+        "AWS_EC2_METADATA_DISABLED",
+    ];
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Restores every swapped variable on drop, so a test that panics first
+    /// still hands the process environment back unchanged.
+    struct EnvGuard {
+        previous: Vec<(String, Option<String>)>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.previous.drain(..) {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+        }
+    }
+
+    fn swap_env(entries: &[(&str, Option<String>)]) -> EnvGuard {
+        EnvGuard {
+            previous: entries
+                .iter()
+                .map(|(key, value)| {
+                    let previous = std::env::var(key).ok();
+                    match value {
+                        Some(value) => unsafe { std::env::set_var(key, value) },
+                        None => unsafe { std::env::remove_var(key) },
+                    }
+                    ((*key).to_string(), previous)
+                })
+                .collect(),
+        }
+    }
+
+    /// Loopback endpoint that counts inbound connections and answers 404, so a
+    /// credential fetch that escapes hardening is observable as an accept.
+    struct CountingListener {
+        endpoint: String,
+        hits: Arc<AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl CountingListener {
+        async fn bind() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counter = hits.clone();
+            let task = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = socket.shutdown().await;
+                }
+            });
+            Self {
+                endpoint,
+                hits,
+                task,
+            }
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for CountingListener {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_skips_imds() {
+        // Counterfactual: without the lockdown keys the metadata port accepts.
+        let _guard = env_lock().lock().await;
+        let metadata = CountingListener::bind().await;
+        let data = CountingListener::bind().await;
+        let empty = tempdir().unwrap();
+        let missing = empty.path().join("absent").to_string_lossy().into_owned();
+
+        let mut entries: Vec<(&str, Option<String>)> =
+            AWS_ENV_KEYS.iter().map(|key| (*key, None)).collect();
+        entries.push(("AWS_CONFIG_FILE", Some(missing.clone())));
+        entries.push(("AWS_SHARED_CREDENTIALS_FILE", Some(missing)));
+        entries.push((
+            "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+            Some(metadata.endpoint.clone()),
+        ));
+        let _env = swap_env(&entries);
+
+        let access = ResolvedSourceAccess::OpenDal {
+            kind: SourceConnectorKind::S3,
+            config: HashMap::from([
+                ("bucket".to_string(), "reads".to_string()),
+                ("endpoint".to_string(), data.endpoint.clone()),
+                ("region".to_string(), "eu-central-1".to_string()),
+            ]),
+            path: "file.txt".to_string(),
+            version: None,
+        };
+        let (operator, path, ..) = build_source_operator(&test_guard(), &access).await.unwrap();
+        let _ = operator.stat(path).await;
+
+        assert_eq!(metadata.hits(), 0);
+    }
+
+    const AZURE_ENV_KEYS: [&str; 8] = [
+        "AZURE_STORAGE_ACCOUNT_NAME",
+        "AZURE_STORAGE_ACCOUNT_KEY",
+        "AZURE_STORAGE_SAS_TOKEN",
+        "AZURE_TENANT_ID",
+        "AZURE_CLIENT_ID",
+        "AZURE_CLIENT_SECRET",
+        "AZURE_CLIENT_CERTIFICATE_PATH",
+        "AZURE_AUTHORITY_HOST",
+    ];
+
+    fn group_config(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn gcs_skips_metadata() {
+        // Counterfactual: the same build without the two forced kill-switches
+        // walks the VM metadata service, which the hardened build never does.
+        let _guard = env_lock().lock().await;
+        let metadata = CountingListener::bind().await;
+        let data = CountingListener::bind().await;
+        let host = metadata.endpoint.trim_start_matches("http://").to_string();
+        // APPDATA short-circuits the well-known-file lookup onto an empty dir,
+        // so no gcloud credential on the machine can pre-empt the chain.
+        let empty = tempdir().unwrap();
+        let _env = swap_env(&[
+            ("GCE_METADATA_HOST", Some(host)),
+            ("GOOGLE_APPLICATION_CREDENTIALS", None),
+            ("APPDATA", Some(empty.path().to_string_lossy().into_owned())),
+        ]);
+        let config = group_config(&[("bucket", "data"), ("endpoint", &data.endpoint)]);
+
+        let unhardened =
+            build_service::<services::Gcs>(config.clone(), Some(test_guard().layer())).unwrap();
+        let _ = unhardened.stat("probe").await;
+        let ambient = metadata.hits();
+
+        let hardened = build_group_service(GroupBackendKind::Gcs, config, &test_guard()).unwrap();
+        let _ = hardened.stat("probe").await;
+
+        assert!(
+            ambient > 0,
+            "counterfactual never reached the metadata host"
+        );
+        assert_eq!(metadata.hits(), ambient);
+    }
+
+    #[tokio::test]
+    async fn azblob_skips_ambient() {
+        // Azure has no kill-switch: the static key is what keeps the ambient
+        // chain unreachable, because it is pushed ahead of every provider.
+        let _guard = env_lock().lock().await;
+        let authority = CountingListener::bind().await;
+        let data = CountingListener::bind().await;
+        let mut entries: Vec<(&str, Option<String>)> =
+            AZURE_ENV_KEYS.iter().map(|key| (*key, None)).collect();
+        entries.push(("AZURE_TENANT_ID", Some("tenant".to_string())));
+        entries.push(("AZURE_CLIENT_ID", Some("client".to_string())));
+        entries.push(("AZURE_CLIENT_SECRET", Some("secret".to_string())));
+        entries.push(("AZURE_AUTHORITY_HOST", Some(authority.endpoint.clone())));
+        let _env = swap_env(&entries);
+        let base = [
+            ("container", "data"),
+            ("endpoint", data.endpoint.as_str()),
+            ("account_name", "acct"),
+        ];
+
+        let ambient_only =
+            build_group_service(GroupBackendKind::Azblob, group_config(&base), &test_guard())
+                .unwrap();
+        let _ = ambient_only.stat("probe").await;
+        let ambient = authority.hits();
+
+        let mut with_key = group_config(&base);
+        with_key.insert("account_key".to_string(), "a2V5c2VjcmV0".to_string());
+        let hardened =
+            build_group_service(GroupBackendKind::Azblob, with_key, &test_guard()).unwrap();
+        let _ = hardened.stat("probe").await;
+
+        assert!(
+            ambient > 0,
+            "counterfactual never reached the authority host"
+        );
+        assert_eq!(authority.hits(), ambient);
+    }
+
+    #[tokio::test]
+    async fn azdls_fetches_nothing() {
+        // azdls cannot be pointed at a local authority host, so the proof is
+        // that a signed request opens exactly one connection and no other.
+        let _guard = env_lock().lock().await;
+        let data = CountingListener::bind().await;
+        let _env = swap_env(&AZURE_ENV_KEYS.map(|key| (key, None)));
+        let config = group_config(&[
+            ("filesystem", "data"),
+            ("endpoint", data.endpoint.as_str()),
+            ("account_name", "acct"),
+            ("account_key", "a2V5c2VjcmV0"),
+        ]);
+
+        let operator = build_group_service(GroupBackendKind::Azdls, config, &test_guard()).unwrap();
+        let _ = operator.stat("probe").await;
+
+        assert_eq!(data.hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn staging_refuses_denied() {
+        // Every http-family kind must fail before a socket is opened.
+        let listener = CountingListener::bind().await;
+        let guard = EgressGuard::new(EgressPolicy::strict()).unwrap();
+
+        for kind in [
+            SourceConnectorKind::Http,
+            SourceConnectorKind::S3,
+            SourceConnectorKind::Webdav,
+        ] {
+            let mut config = HashMap::from([("endpoint".to_string(), listener.endpoint.clone())]);
+            if kind == SourceConnectorKind::S3 {
+                config.insert("bucket".to_string(), "reads".to_string());
+                config.insert("region".to_string(), "eu-central-1".to_string());
+                config.insert("access_key_id".to_string(), "AKIA".to_string());
+                config.insert("secret_access_key".to_string(), "secret".to_string());
+            }
+            let access = ResolvedSourceAccess::OpenDal {
+                kind,
+                config,
+                path: "file.txt".to_string(),
+                version: None,
+            };
+
+            let (operator, path, ..) = build_source_operator(&guard, &access).await.unwrap();
+            let error = operator.stat(path).await.unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("egress policy denied the target"),
+                "{kind}: {error}"
+            );
+        }
+
+        assert_eq!(listener.hits(), 0);
+    }
+
+    /// Hosts `std` refuses to read as addresses and the parser opendal re-runs
+    /// turns into denied ones. `127.1` reaches the fixture listener, so a screen
+    /// that missed it would be observable as an accept.
+    const RESPELLINGS: [&str; 6] = [
+        "2852039166",
+        "0xa9fea9fe",
+        "169.254.169.254.",
+        "127.1",
+        "2851995650",
+        "0251.0376.0251.0376",
+    ];
+
+    fn assert_denied(error: opendal::Error, label: &str) {
+        assert_eq!(
+            error.kind(),
+            opendal::ErrorKind::PermissionDenied,
+            "{label}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_respelled_hosts() {
+        // Both tenant surfaces, every spelling, no socket opened.
+        let listener = CountingListener::bind().await;
+        let guard = EgressGuard::new(EgressPolicy::strict()).unwrap();
+        let port = listener.endpoint.rsplit(':').next().unwrap().to_string();
+
+        for host in RESPELLINGS {
+            let endpoint = format!("http://{host}:{port}");
+            for kind in [
+                SourceConnectorKind::Http,
+                SourceConnectorKind::S3,
+                SourceConnectorKind::Webdav,
+            ] {
+                let mut config = HashMap::from([("endpoint".to_string(), endpoint.clone())]);
+                if kind == SourceConnectorKind::S3 {
+                    config.insert("bucket".to_string(), "reads".to_string());
+                    config.insert("region".to_string(), "eu-central-1".to_string());
+                    config.insert("access_key_id".to_string(), "AKIA".to_string());
+                    config.insert("secret_access_key".to_string(), "secret".to_string());
+                }
+                let access = ResolvedSourceAccess::OpenDal {
+                    kind,
+                    config,
+                    path: "file.txt".to_string(),
+                    version: None,
+                };
+
+                let (operator, path, ..) = build_source_operator(&guard, &access).await.unwrap();
+                assert_denied(
+                    operator.stat(path).await.unwrap_err(),
+                    &format!("{kind} {host}"),
+                );
+            }
+
+            let s3 = build_group_service(
+                GroupBackendKind::S3,
+                group_config(&[
+                    ("bucket", "data"),
+                    ("endpoint", &endpoint),
+                    ("region", "eu-central-1"),
+                    ("access_key_id", "AKIA"),
+                    ("secret_access_key", "secret"),
+                ]),
+                &guard,
+            )
+            .unwrap();
+            assert_denied(s3.stat("probe").await.unwrap_err(), &format!("s3 {host}"));
+
+            let azblob = build_group_service(
+                GroupBackendKind::Azblob,
+                group_config(&[
+                    ("container", "data"),
+                    ("endpoint", &endpoint),
+                    ("account_name", "acct"),
+                    ("account_key", "a2V5c2VjcmV0"),
+                ]),
+                &guard,
+            )
+            .unwrap();
+            assert_denied(
+                azblob.stat("probe").await.unwrap_err(),
+                &format!("azblob {host}"),
+            );
+        }
+
+        assert_eq!(listener.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn refuses_spliced_bucket() {
+        // Virtual-host style splices the bucket into the authority after the
+        // endpoint was parsed, so only the outgoing uri carries the real host.
+        let listener = CountingListener::bind().await;
+        let guard = EgressGuard::new(EgressPolicy::strict()).unwrap();
+        let port = listener.endpoint.rsplit(':').next().unwrap().to_string();
+
+        // Opendal refuses a dotted bucket here, so both spellings are decimal:
+        // the second normalizes onto the fixture listener and would accept.
+        for bucket in ["2852039166/", &format!("2130706433:{port}/")] {
+            let operator = build_group_service(
+                GroupBackendKind::S3,
+                group_config(&[
+                    ("bucket", bucket),
+                    ("endpoint", &listener.endpoint),
+                    ("region", "eu-central-1"),
+                    ("access_key_id", "AKIA"),
+                    ("secret_access_key", "secret"),
+                    ("force_path_style", "false"),
+                ]),
+                &guard,
+            )
+            .unwrap();
+
+            assert_denied(operator.stat("probe").await.unwrap_err(), bucket);
+        }
+
+        assert_eq!(listener.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn refuses_ftp_kind() {
+        // A stored ftp record must never reach a socket: the passive data
+        // address is server-chosen and cannot be screened.
+        let listener = CountingListener::bind().await;
+        let endpoint = listener.endpoint.replace("http://", "ftp://");
+        let access = ResolvedSourceAccess::OpenDal {
+            kind: SourceConnectorKind::Ftp,
+            config: HashMap::from([("endpoint".to_string(), endpoint)]),
+            path: "file.txt".to_string(),
+            version: None,
+        };
+
+        let error = build_source_operator(&test_guard(), &access)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, StagingSourceError::UnsupportedKind(kind) if kind == "ftp"));
+        assert_eq!(listener.hits(), 0);
+    }
 
     #[tokio::test]
     async fn filesystem_like_http_config_is_not_required_for_build_helper_tests() {
@@ -301,28 +757,9 @@ mod tests {
             version: Some("v42".to_string()),
         };
 
-        let (.., path, version) = build_staging_source_operator(&access).unwrap();
+        let (.., path, version) = build_source_operator(&test_guard(), &access).await.unwrap();
         assert_eq!(path, "file.txt");
         assert_eq!(version, Some("v42"));
-    }
-
-    #[tokio::test]
-    async fn ftp_build_helper_accepts_expected_keys() {
-        let access = ResolvedSourceAccess::OpenDal {
-            kind: SourceConnectorKind::Ftp,
-            config: HashMap::from([
-                ("endpoint".to_string(), "ftp://example.org:21".to_string()),
-                ("root".to_string(), "/datasets".to_string()),
-                ("user".to_string(), "alice".to_string()),
-                ("password".to_string(), "secret".to_string()),
-            ]),
-            path: "run-1/data.txt".to_string(),
-            version: None,
-        };
-
-        let (.., path, version) = build_staging_source_operator(&access).unwrap();
-        assert_eq!(path, "run-1/data.txt");
-        assert_eq!(version, None);
     }
 
     #[tokio::test]
@@ -334,7 +771,8 @@ mod tests {
             .unwrap();
 
         let operator =
-            build_service::<services::Fs>(HashMap::from([("root".to_string(), root)])).unwrap();
+            build_service::<services::Fs>(HashMap::from([("root".to_string(), root)]), None)
+                .unwrap();
         let metadata = operator.stat("hello.txt").await.unwrap();
         assert_eq!(metadata.content_length(), 11);
     }
@@ -342,20 +780,26 @@ mod tests {
     #[tokio::test]
     async fn builds_unsigned_s3() {
         // `skip_signature` must stay a valid S3 config key across opendal upgrades.
-        build_service::<services::S3>(HashMap::from([
-            ("bucket".to_string(), "public-data".to_string()),
-            ("endpoint".to_string(), "https://s3.example.org".to_string()),
-            ("region".to_string(), "eu-central-1".to_string()),
-            ("skip_signature".to_string(), "true".to_string()),
-        ]))
+        build_service::<services::S3>(
+            HashMap::from([
+                ("bucket".to_string(), "public-data".to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+                ("region".to_string(), "eu-central-1".to_string()),
+                ("skip_signature".to_string(), "true".to_string()),
+            ]),
+            None,
+        )
         .unwrap();
 
-        build_service::<services::S3>(HashMap::from([
-            ("bucket".to_string(), "public-data".to_string()),
-            ("endpoint".to_string(), "https://s3.example.org".to_string()),
-            ("region".to_string(), "eu-central-1".to_string()),
-            ("skip_signature".to_string(), "nope".to_string()),
-        ]))
+        build_service::<services::S3>(
+            HashMap::from([
+                ("bucket".to_string(), "public-data".to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+                ("region".to_string(), "eu-central-1".to_string()),
+                ("skip_signature".to_string(), "nope".to_string()),
+            ]),
+            None,
+        )
         .unwrap_err();
     }
 
@@ -383,16 +827,16 @@ mod tests {
             Some("true")
         );
         assert!(!config.contains_key("force_path_style"));
-        build_service::<services::S3>(config).unwrap();
+        build_service::<services::S3>(config, None).unwrap();
     }
 
     #[tokio::test]
     async fn check_reports_success() {
         let dir = tempdir().unwrap();
-        let operator = build_service::<services::Fs>(HashMap::from([(
-            "root".to_string(),
-            dir.path().to_str().unwrap().to_string(),
-        )]))
+        let operator = build_service::<services::Fs>(
+            HashMap::from([("root".to_string(), dir.path().to_str().unwrap().to_string())]),
+            None,
+        )
         .unwrap();
 
         check_operator(&operator, SourceConnectorKind::S3)
@@ -412,10 +856,10 @@ mod tests {
         tokio::fs::write(dir.path().join("prefix/b.txt"), b"bb")
             .await
             .unwrap();
-        let operator = build_service::<services::Fs>(HashMap::from([(
-            "root".to_string(),
-            dir.path().to_str().unwrap().to_string(),
-        )]))
+        let operator = build_service::<services::Fs>(
+            HashMap::from([("root".to_string(), dir.path().to_str().unwrap().to_string())]),
+            None,
+        )
         .unwrap();
 
         let (entries, truncated) = list_operator(&operator, "prefix/", 0, 1, false, false)
@@ -442,10 +886,10 @@ mod tests {
         tokio::fs::write(dir.path().join("prefix/nested/file.txt"), b"data")
             .await
             .unwrap();
-        let operator = build_service::<services::Fs>(HashMap::from([(
-            "root".to_string(),
-            dir.path().to_str().unwrap().to_string(),
-        )]))
+        let operator = build_service::<services::Fs>(
+            HashMap::from([("root".to_string(), dir.path().to_str().unwrap().to_string())]),
+            None,
+        )
         .unwrap();
 
         let (entries, truncated) = list_operator(&operator, "prefix/", 0, 10, true, true)
@@ -469,10 +913,10 @@ mod tests {
         tokio::fs::write(dir.path().join("prefix/nested/b.txt"), b"b")
             .await
             .unwrap();
-        let operator = build_service::<services::Fs>(HashMap::from([(
-            "root".to_string(),
-            dir.path().to_str().unwrap().to_string(),
-        )]))
+        let operator = build_service::<services::Fs>(
+            HashMap::from([("root".to_string(), dir.path().to_str().unwrap().to_string())]),
+            None,
+        )
         .unwrap();
 
         let (entries, truncated) = list_operator(&operator, "prefix/", 0, 1, true, true)

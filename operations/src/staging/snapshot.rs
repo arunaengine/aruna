@@ -1,4 +1,4 @@
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, RoutingInputsError, drive, routing_snapshot};
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::descriptor::build_version_source_binding;
 use crate::staging::read_source::{
@@ -40,7 +40,7 @@ pub struct MaterializeSnapshotResult {
     pub version_id: Ulid,
 }
 
-use aruna_core::structs::BackendLocation;
+use aruna_core::structs::{BackendLocation, BlobLocationKey};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum MaterializeSnapshotError {
@@ -52,6 +52,8 @@ pub enum MaterializeSnapshotError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
+    #[error(transparent)]
+    Routing(#[from] RoutingInputsError),
 }
 
 pub async fn materialize_snapshot(
@@ -101,6 +103,7 @@ pub async fn materialize_snapshot(
             version_id,
         });
     }
+    let routing = routing_snapshot(context, input.group_id, &input.bucket).await?;
     let put_result = drive(
         PutObjectOperation::new(PutObjectConfig {
             user_id: input.user_id,
@@ -119,6 +122,7 @@ pub async fn materialize_snapshot(
             version_source: Some(version_source.clone()),
             preassigned_version_id: None,
             quota_ceiling: input.quota_ceiling,
+            routing,
         })
         .with_bucket_guard(input.expected_bucket),
         context,
@@ -163,6 +167,7 @@ async fn find_snapshot(
     };
     let BlobVersionState::Materialized {
         blob_hash,
+        backend,
         source: Some(source),
     } = version.state
     else {
@@ -171,7 +176,8 @@ async fn find_snapshot(
     if &source != version_source {
         return Ok(None);
     }
-    let Some(location) = read_value(context, BLOB_LOCATIONS_KEYSPACE, blob_hash.to_vec().into())
+    let location_key = BlobLocationKey::new(blob_hash, backend).to_bytes().into();
+    let Some(location) = read_value(context, BLOB_LOCATIONS_KEYSPACE, location_key)
         .await?
         .map(|value| BackendLocation::from_bytes(value.as_ref()))
         .transpose()?

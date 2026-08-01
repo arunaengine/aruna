@@ -148,6 +148,7 @@ async fn create_sync_bucket(
                 created_by: relationship.created_by,
                 cors_configuration: None,
                 replication: None,
+                storage_routing: Vec::new(),
             },
         ),
         context,

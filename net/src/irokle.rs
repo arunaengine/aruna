@@ -48,12 +48,11 @@ use aruna_core::storage_entries::{
     stale_admin_document_conflict_delete_entries, subject_index_key, subject_index_value,
 };
 use aruna_core::structs::{
-    Group, GroupAuthorizationDocument, KIND_LABEL_KEY, MetadataRegistryRecord,
-    NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument, NodeUsageSnapshot, PlacementRef,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, Role, User,
-    WatchEventMask, WatchInterestDigest, WatchSubscription, group_owner_index_key,
-    node_usage_key_node_id, watch_interest_dirty_key, watch_interest_key_node_id,
-    watch_interest_key_realm_id,
+    Group, GroupAuthorizationDocument, MetadataRegistryRecord, NOTIFICATION_WATCH_MAX_PREFIX_LEN,
+    NodeInfoDocument, NodeUsageSnapshot, PlacementRef, RealmAuthorizationDocument,
+    RealmConfigDocument, RealmId, RealmNodeKind, Role, User, WatchEventMask, WatchInterestDigest,
+    WatchSubscription, group_owner_index_key, node_usage_key_node_id, reserved_label,
+    watch_interest_dirty_key, watch_interest_key_node_id, watch_interest_key_realm_id,
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::{RoleId, TxnId, UserId, Value};
@@ -5081,20 +5080,19 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. } => {}
-        AdminDocumentOperation::RealmConfigNodePlacementSet { entry }
-            if entry.labels.contains_key(KIND_LABEL_KEY) =>
-        {
-            return reject(&format!(
-                "placement entry must not set reserved label {KIND_LABEL_KEY}"
-            ));
+        AdminDocumentOperation::RealmConfigNodePlacementSet { entry } => {
+            if let Some(label) = reserved_label(&entry.labels) {
+                return reject(&format!(
+                    "placement entry must not set derived label {label}"
+                ));
+            }
         }
         AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy }
             if strategy.replica_count == Some(0) =>
         {
             return reject("placement strategy replica count must be greater than zero");
         }
-        AdminDocumentOperation::RealmConfigNodePlacementSet { .. }
-        | AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { .. } => {}
+        AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { .. } => {}
     }
 
     let previous_state = read_admin_reducer_state(storage, &event.target).await?;

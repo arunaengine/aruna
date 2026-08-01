@@ -1,6 +1,7 @@
 use crate::error::CliError;
 use aruna_api::routes::info::InfoResponse;
 use aruna_api::server_state::client_base_url_from_bind_address;
+use aruna_core::structs::BackendsFile;
 use reqwest::Client;
 use serde::Serialize;
 use std::net::SocketAddr;
@@ -17,6 +18,9 @@ struct ConfigView {
     storage_path: String,
     metadata_storage_path: String,
     blob_root: String,
+    /// Backends declared in `BLOB_BACKENDS_PATH`; empty means the implicit
+    /// single filesystem backend rooted at `blob_root`.
+    blob_backends: Vec<BackendView>,
     blob_bucket_prefix: Option<String>,
     blob_max_bucket_size: Option<u64>,
     blob_multipart_bucket: Option<String>,
@@ -36,6 +40,40 @@ struct ConfigView {
     s3_address: String,
     onboarding_secret_present: bool,
     oidc_providers: Vec<OidcProviderView>,
+}
+
+#[derive(Debug, Serialize)]
+struct BackendView {
+    name: String,
+    backend: String,
+    class: Option<String>,
+    allow_tenants: bool,
+    /// Advisory only; never enforced against writes.
+    quota_bytes: Option<u64>,
+    default: bool,
+}
+
+/// Reads the operator's backends file through the shared core parser, so the
+/// doctor never re-implements the node's schema.
+fn backend_views() -> Result<Vec<BackendView>, CliError> {
+    let Ok(path) = dotenvy::var("BLOB_BACKENDS_PATH") else {
+        return Ok(Vec::new());
+    };
+    let text = std::fs::read_to_string(&path)?;
+    let file =
+        BackendsFile::parse(&text).map_err(|error| CliError::BackendsFile(error.to_string()))?;
+    Ok(file
+        .backend
+        .into_iter()
+        .map(|(name, entry)| BackendView {
+            name,
+            backend: entry.kind,
+            class: entry.class,
+            allow_tenants: entry.allow_tenants,
+            quota_bytes: entry.quota_bytes,
+            default: entry.default,
+        })
+        .collect())
 }
 
 #[derive(Debug, Serialize)]
@@ -150,6 +188,7 @@ impl ConfigView {
             storage_path: storage_path.unwrap_or_default(),
             metadata_storage_path: metadata_storage_path.unwrap_or_default(),
             blob_root: blob_root.unwrap_or_default(),
+            blob_backends: backend_views()?,
             blob_bucket_prefix: dotenvy::var("BLOB_BUCKET_PREFIX").ok(),
             blob_max_bucket_size: parse_optional_env("BLOB_MAX_BUCKET_SIZE")?,
             blob_multipart_bucket: dotenvy::var("BLOB_MULTIPART_BUCKET")

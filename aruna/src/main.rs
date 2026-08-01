@@ -14,11 +14,11 @@ use aruna_api::ops::{OpsState, Readiness, serve_ops};
 use aruna_api::s3::s3_server::S3Server;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
-use aruna_blob::blob::BlobHandler;
+use aruna_blob::blob::{BackendRegistry, BlobHandler};
 use aruna_core::UserId;
+use aruna_core::egress::EgressPolicy;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::onboarding::OnboardingPhase;
-use aruna_core::structs::BackendConfig;
 use aruna_core::structs::NodeCapabilities;
 use aruna_core::structs::{Actor, NodeUrls, RealmNodeKind};
 use aruna_net::{NetConfig, NetHandle};
@@ -104,18 +104,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .with_search_storage(config.metadata_search_storage)
             .with_document_sync_persist_policy(config.fjall_persist_policy),
     )?;
-    let blob_handle = BlobHandler::new(
-        BackendConfig {
-            backend_type: config.blob_backend.clone(),
-            root: config.blob_root.clone(),
-            service_config: config.blob_service_config.clone(),
-            bucket_prefix: config.blob_bucket_prefix.clone(),
-            max_bucket_size: config.blob_max_bucket_size,
-            multipart_bucket: config.blob_multipart_bucket.clone(),
-            timeouts: config.blob_timeout_config(),
-        },
+    let blob_handle = BlobHandler::with_registry(
+        BackendRegistry::from_config(&config.blob_backends).map_err(std::io::Error::other)?,
         storage_handle.clone(),
         net_handle.clone(),
+        EgressPolicy::strict().with_deny(config.blob_backends.extra_deny.clone()),
     )
     .await?;
 
