@@ -783,8 +783,9 @@ impl DeleteObjectOperation {
                     version_id,
                     delete_marker,
                 }));
-                // No reclaim nudge: the shortest grace is hours, so an
-                // immediate sweep could never find this candidate due.
+                // No reclaim nudge: the sweep owns its cadence, so even a
+                // candidate a one-second grace makes due waits for the next
+                // tick rather than re-arming the timer on every delete.
                 return smallvec![schedule_usage_snapshot_publish_effect()];
             }
             return self.emit_error(DeleteObjectError::InvalidOperationState);
