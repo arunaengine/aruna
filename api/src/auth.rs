@@ -407,6 +407,13 @@ async fn extract_auth_context_and_bearer_token(
         Ok(auth_context) => auth_context,
         Err(_) => return (None, None),
     };
+    // Reject tokens whose restriction set exceeds the fail-closed size limits so
+    // an oversized delegation never reaches the permission evaluator.
+    if let Some(restrictions) = auth_context.path_restrictions.as_deref()
+        && aruna_core::permission_path::validate_restriction_limits(restrictions).is_err()
+    {
+        return (None, None);
+    }
     (
         Some(auth_context),
         Some(ValidatedArunaBearerTokenCarrier::new(

@@ -271,12 +271,26 @@ pub async fn create_s3_credentials(
 
     let user_identity = auth.user_id;
     let group_id = Ulid::from_str(&request.group_id).map_err(|_| ServerError::BadRequest)?;
+    if request
+        .path_restrictions
+        .as_ref()
+        .is_some_and(|restrictions| {
+            restrictions.len() > aruna_core::permission_path::MAX_TOKEN_RESTRICTIONS
+        })
+    {
+        return Err(ServerError::BadRequest);
+    }
     let group_root = blob_group_permission_path(realm_id, group_id, state.get_node_id());
     let path_restrictions =
         build_credential_restrictions(&auth, &state, group_id, request.path_restrictions.clone())
             .await?;
     authorize_credential_issuance(&auth, &state, &group_root, path_restrictions.as_deref()).await?;
     let path_restrictions = path_restrictions.as_deref().map(serialize_restrictions);
+    if let Some(restrictions) = path_restrictions.as_deref()
+        && aruna_core::permission_path::validate_restriction_limits(restrictions).is_err()
+    {
+        return Err(ServerError::BadRequest);
+    }
     let expiry = credential_expiry(SystemTime::now(), request.expires_in_seconds)?;
     let result = drive(
         CreateUserAccessOperation::new(CreateUserAccessConfig {
