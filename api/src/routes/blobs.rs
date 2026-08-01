@@ -463,7 +463,7 @@ pub async fn blob_locations(
     };
     // Queue records and holder entries carry the source path, so they are asked
     // about it. A relationship that rewrites the key already contributed the
-    // stored path above, and the more informative answer wins.
+    // stored path above, and both destinations get their own entry.
     for node_id in queued.nodes.iter().filter(|node| **node != local_node) {
         let destination = (*node_id, query.bucket.clone(), query.path.clone());
         expected.insert(destination.clone());

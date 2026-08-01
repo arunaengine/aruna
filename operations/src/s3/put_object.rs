@@ -1,8 +1,8 @@
-use crate::blob::cleanup::PendingCleanup;
 use crate::blob::blob_keyspace_helper::{
     HeadAliasContext, add_hash_path_index_effect, blob_location_read, write_blob_head_effect,
     write_blob_location_effect, write_blob_version_effect,
 };
+use crate::blob::cleanup::PendingCleanup;
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::replication::queue::write_live_replication_obligation_effect;
 use crate::replication::util::dht_registration_effect;

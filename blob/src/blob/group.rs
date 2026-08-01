@@ -11,8 +11,8 @@ use aruna_core::structs::{
     GroupStorageBackendSecret,
 };
 use aruna_core::types::Key;
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex};
 use ulid::Ulid;
 
@@ -167,7 +167,10 @@ impl Drop for BackendClaim {
 impl BlobHandler {
     /// Taken before the credentials are read, so a claimed backend is refused
     /// before any bytes exist and a held one cannot be claimed.
-    pub(super) fn hold_backends(&self, effect: &BlobEffect) -> Result<Option<GroupHold>, BlobError> {
+    pub(super) fn hold_backends(
+        &self,
+        effect: &BlobEffect,
+    ) -> Result<Option<GroupHold>, BlobError> {
         let ids = group_ids(effect);
         if ids.is_empty() {
             return Ok(None);
