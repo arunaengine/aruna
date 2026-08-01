@@ -35,7 +35,8 @@ fn mint_job_id(now_ms: u64) -> JobId {
     let entropy = Ulid::generate().to_bytes();
     let shard = shard_for_subject(&entropy, DEFAULT_SHARD_COUNT) as u16;
     let bucket = BucketId::new(shard).expect("shard within bucket space");
-    let nonce = u64::from_be_bytes(entropy[8..16].try_into().expect("8 bytes")) & ((1u64 << 48) - 1);
+    let nonce =
+        u64::from_be_bytes(entropy[8..16].try_into().expect("8 bytes")) & ((1u64 << 48) - 1);
     let routable =
         RoutableJobId::from_parts(now_ms, handle, bucket, nonce).expect("structured job id");
     JobId(routable.as_ulid())

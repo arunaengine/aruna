@@ -286,7 +286,11 @@ mod tests {
         seed_config_with_range(
             &context,
             &actor,
-            range(actor.node_id, FIRST_GRANTABLE_HANDLE, FIRST_GRANTABLE_HANDLE + 1024),
+            range(
+                actor.node_id,
+                FIRST_GRANTABLE_HANDLE,
+                FIRST_GRANTABLE_HANDLE + 1024,
+            ),
         )
         .await;
 
@@ -317,7 +321,11 @@ mod tests {
         let document = seed_config_with_range(
             &context,
             &actor,
-            range(actor.node_id, FIRST_GRANTABLE_HANDLE, FIRST_GRANTABLE_HANDLE + 1024),
+            range(
+                actor.node_id,
+                FIRST_GRANTABLE_HANDLE,
+                FIRST_GRANTABLE_HANDLE + 1024,
+            ),
         )
         .await;
         let strategy_id = document.default_strategy_id.unwrap();
@@ -348,7 +356,11 @@ mod tests {
         seed_config_with_range(
             &context,
             &actor,
-            range(actor.node_id, FIRST_GRANTABLE_HANDLE, FIRST_GRANTABLE_HANDLE + 1),
+            range(
+                actor.node_id,
+                FIRST_GRANTABLE_HANDLE,
+                FIRST_GRANTABLE_HANDLE + 1,
+            ),
         )
         .await;
 

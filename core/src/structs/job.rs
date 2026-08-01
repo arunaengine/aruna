@@ -1158,8 +1158,11 @@ fn child_job_id(job_id: JobId, domain: &[u8]) -> JobId {
     let mut hasher = blake3::Hasher::new();
     hasher.update(domain);
     hasher.update(&job_id.to_bytes());
-    let nonce = u64::from_be_bytes(hasher.finalize().as_bytes()[..8].try_into().expect("8 bytes"))
-        & ((1u64 << 48) - 1);
+    let nonce = u64::from_be_bytes(
+        hasher.finalize().as_bytes()[..8]
+            .try_into()
+            .expect("8 bytes"),
+    ) & ((1u64 << 48) - 1);
     let routable = RoutableJobId::from_parts(job_id.timestamp_ms(), handle, bucket, nonce)
         .expect("structured child job id");
     JobId(routable.as_ulid())

@@ -2,8 +2,8 @@ use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::structs::{Permission, Role};
 use crate::structs::{
-    Actor, BindingDirectory, BindingScope, DEFAULT_SHARD_COUNT, DocumentClass, JOBCONTROL_HANDLE,
-    HandleRange, HandleRangeDirectory, METADATA_HANDLE, NodePlacementEntry, PlacementBinding,
+    Actor, BindingDirectory, BindingScope, DEFAULT_SHARD_COUNT, DocumentClass, HandleRange,
+    HandleRangeDirectory, JOBCONTROL_HANDLE, METADATA_HANDLE, NodePlacementEntry, PlacementBinding,
     PlacementOverride, PlacementScope, PlacementStrategy, StrategyBinding,
 };
 use crate::structured_id::PlacementHandle;
