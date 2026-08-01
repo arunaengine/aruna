@@ -32,6 +32,7 @@ jsonwebtoken = { workspace = true }
 lru = { workspace = true }
 opentelemetry = { workspace = true }
 postcard = { workspace = true }
+quick-xml = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
