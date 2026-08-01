@@ -679,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn deleted_bucket_not_found() {
+    fn deleted_bucket_fails() {
         // A bucket that vanished mid-read has no answer to give.
         let mut operation = authorized(Some(Ulid::from_bytes([3u8; 16])));
         operation.step(read_result(None));
