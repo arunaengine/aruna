@@ -43,6 +43,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior};
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
@@ -575,6 +576,7 @@ struct UnreadStreamState {
     local_node_id: NodeId,
     recipient: UserId,
     mode: UnreadStreamMode,
+    shutdown: CancellationToken,
     initial_done: bool,
     last_emitted: Option<u64>,
     remote_poll: Duration,
@@ -641,14 +643,15 @@ async fn fetch_unread_count(state: &UnreadStreamState) -> Option<(u64, bool)> {
 }
 
 /// Yields the recipient's unread count: once initially, then whenever it may have
-/// changed. Ends only when the wake channel closes or the consumer drops the
-/// stream (client disconnect); transient count-fetch failures are skipped so a
-/// blip never tears the stream down.
+/// changed. Ends when the node shutdown token fires, the wake channel closes, or
+/// the consumer drops the stream (client disconnect); transient count-fetch
+/// failures are skipped so a blip never tears the stream down.
 fn unread_count_stream(
     context: Arc<DriverContext>,
     local_node_id: NodeId,
     recipient: UserId,
     mode: UnreadStreamMode,
+    shutdown: CancellationToken,
     remote_poll: Duration,
     local_recheck: Duration,
 ) -> impl Stream<Item = (u64, bool)> + Send {
@@ -657,6 +660,7 @@ fn unread_count_stream(
         local_node_id,
         recipient,
         mode,
+        shutdown,
         initial_done: false,
         last_emitted: None,
         remote_poll,
@@ -665,6 +669,9 @@ fn unread_count_stream(
     };
     stream::unfold(state, |mut state| async move {
         loop {
+            if state.shutdown.is_cancelled() {
+                return None;
+            }
             if !state.initial_done {
                 state.initial_done = true;
                 if let Some((count, capped)) = fetch_unread_count(&state).await {
@@ -676,14 +683,23 @@ fn unread_count_stream(
             let recipient = state.recipient;
             let remote_poll = state.remote_poll;
             let recheck_deadline = state.next_holder_recheck;
-            let step = match &mut state.mode {
-                UnreadStreamMode::Local(rx) => {
-                    next_local_stream_step(rx, recipient, recheck_deadline).await
-                }
-                UnreadStreamMode::Remote => {
-                    tokio::time::sleep(remote_poll).await;
-                    StreamStep::EmitOnChange
-                }
+            let shutdown = state.shutdown.clone();
+            // The wake wait and the remote poll are the open-ended awaits: the
+            // ingress drain waits for this response, so shutdown must end them.
+            let step = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => StreamStep::End,
+                step = async {
+                    match &mut state.mode {
+                        UnreadStreamMode::Local(rx) => {
+                            next_local_stream_step(rx, recipient, recheck_deadline).await
+                        }
+                        UnreadStreamMode::Remote => {
+                            tokio::time::sleep(remote_poll).await;
+                            StreamStep::EmitOnChange
+                        }
+                    }
+                } => step,
             };
 
             match step {
@@ -882,6 +898,7 @@ pub async fn stream_notifications(
         local_node_id,
         recipient,
         mode,
+        state.shutdown_token(),
         NOTIFICATION_STREAM_REMOTE_POLL,
         NOTIFICATION_STREAM_LOCAL_RECHECK,
     );
@@ -1513,6 +1530,7 @@ mod tests {
             state.get_node_id(),
             user_id,
             UnreadStreamMode::Local(net.subscribe_notification_wakes()),
+            CancellationToken::new(),
             Duration::from_secs(5),
             // Long recheck so this test exercises only the wake path.
             Duration::from_secs(60),
@@ -1667,6 +1685,7 @@ mod tests {
             state.get_node_id(),
             user_id,
             UnreadStreamMode::Local(net.subscribe_notification_wakes()),
+            CancellationToken::new(),
             Duration::from_secs(60),
             // Short recheck so the backstop refetch fires promptly.
             Duration::from_millis(150),
@@ -1726,6 +1745,7 @@ mod tests {
             state.get_node_id(),
             user_id,
             UnreadStreamMode::Remote,
+            CancellationToken::new(),
             Duration::from_millis(100),
             Duration::from_secs(60),
         ));
@@ -1750,6 +1770,41 @@ mod tests {
         assert_eq!(changed, 1);
     }
 
+    // The stream must end promptly once node shutdown begins: an open SSE
+    // response otherwise pins the ingress drain until the client disconnects.
+    #[tokio::test]
+    async fn shutdown_ends_stream() {
+        let realm_id = realm_id(16);
+        let (_dir, state, net) = build_state_with_net(realm_id, [16u8; 32]).await;
+        install_local_holder_config(&state, realm_id, state.get_node_id()).await;
+        let user_id = UserId::new(Ulid::generate(), realm_id);
+        let shutdown = CancellationToken::new();
+
+        let mut events = Box::pin(unread_count_stream(
+            state.get_ctx(),
+            state.get_node_id(),
+            user_id,
+            UnreadStreamMode::Local(net.subscribe_notification_wakes()),
+            shutdown.clone(),
+            // Both waits are far longer than the test: only the token can end it.
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ));
+
+        let (initial, _) = timeout(Duration::from_secs(2), events.next())
+            .await
+            .expect("initial event arrives")
+            .expect("stream open");
+        assert_eq!(initial, 0);
+
+        shutdown.cancel();
+
+        let ended = timeout(Duration::from_secs(2), events.next())
+            .await
+            .expect("stream reacts to shutdown promptly");
+        assert!(ended.is_none(), "stream must end, got {ended:?}");
+    }
+
     // A poll that cannot reach the holder is skipped silently: the stream neither
     // emits nor ends, it just keeps polling.
     #[tokio::test]
@@ -1765,6 +1820,7 @@ mod tests {
             state.get_node_id(),
             user_id,
             UnreadStreamMode::Remote,
+            CancellationToken::new(),
             Duration::from_millis(100),
             Duration::from_secs(60),
         ));
