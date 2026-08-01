@@ -544,6 +544,16 @@ impl AdminDocumentReducerState {
             }
             (
                 AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigPoliciesSet { policies },
+            ) => {
+                self.apply_realm_config_setting(
+                    event,
+                    REALM_CONFIG_POLICIES_PATH,
+                    policies_value(policies),
+                );
+            }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
                 AdminDocumentOperation::RealmConfigNodePlacementSet { entry },
             ) => {
                 if let Some(label) = reserved_label(&entry.labels) {
@@ -911,6 +921,19 @@ impl AdminDocumentReducerState {
         self.user_subject_ids
             .get(REALM_CONFIG_DESCRIPTION_PATH)
             .and_then(|version| version.value.clone())
+    }
+
+    pub fn materialized_realm_config_policies(
+        &self,
+    ) -> Option<Vec<crate::request_policy::RequestPolicy>> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return None;
+        }
+
+        self.user_subject_ids
+            .get(REALM_CONFIG_POLICIES_PATH)
+            .and_then(|version| version.value.as_deref())
+            .and_then(policies_from_value)
     }
 
     pub fn materialized_realm_config_quota(&self) -> Option<QuotaConfig> {
@@ -1528,6 +1551,7 @@ pub const REALM_CONFIG_METADATA_REPLICATION_PATH: &str =
 pub const REALM_CONFIG_DISCOVERY_PATH: &str = "realm_config.settings.discovery";
 pub const REALM_CONFIG_DESCRIPTION_PATH: &str = "realm_config.description";
 pub const REALM_CONFIG_QUOTA_PATH: &str = "realm_config.quota";
+pub const REALM_CONFIG_POLICIES_PATH: &str = "realm_config.deny_policies";
 pub const REALM_CONFIG_DEFAULT_STRATEGY_PATH: &str = "realm_config.placement.default_strategy";
 
 fn event_observes_dot(event: &AdminDocumentEvent, dot: &AdminDocumentDot) -> bool {
@@ -1584,6 +1608,9 @@ fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         }
         AdminDocumentOperation::RealmConfigQuotaSet { .. } => {
             vec![REALM_CONFIG_QUOTA_PATH.to_string()]
+        }
+        AdminDocumentOperation::RealmConfigPoliciesSet { .. } => {
+            vec![REALM_CONFIG_POLICIES_PATH.to_string()]
         }
         AdminDocumentOperation::RealmConfigNodePlacementSet { entry } => {
             vec![realm_config_placement_node_path(&entry.node_id)]
@@ -1736,6 +1763,14 @@ fn metadata_replication_value(metadata_replication: &MetadataReplicationConfig) 
 
 fn realm_discovery_value(discovery: &RealmDiscoveryConfig) -> String {
     serde_json::to_string(discovery).expect("admin document realm discovery config serializes")
+}
+
+fn policies_value(policies: &[crate::request_policy::RequestPolicy]) -> String {
+    serde_json::to_string(policies).expect("admin document policies serialize")
+}
+
+fn policies_from_value(value: &str) -> Option<Vec<crate::request_policy::RequestPolicy>> {
+    serde_json::from_str(value).ok()
 }
 
 fn quota_value(quota: &QuotaConfig) -> String {

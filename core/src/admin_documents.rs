@@ -198,6 +198,9 @@ pub enum AdminDocumentOperation {
     RealmConfigBandPoolAssigned {
         pool: BandPool,
     },
+    RealmConfigPoliciesSet {
+        policies: Vec<crate::request_policy::RequestPolicy>,
+    },
 }
 
 #[cfg(test)]

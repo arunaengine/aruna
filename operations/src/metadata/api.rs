@@ -1846,13 +1846,14 @@ async fn ensure_permission(
     if auth.realm_id != realm_id {
         return Err(MetadataApiError::Forbidden);
     }
+    let auth_user = auth.user_id;
     let allowed = aruna_core::telemetry::time_stage(
         "permission",
         drive(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
                 auth_context: auth,
-                path,
-                required_permission,
+                path: path.clone(),
+                required_permission: required_permission.clone(),
             }),
             context,
         ),
@@ -1865,11 +1866,17 @@ async fn ensure_permission(
         | AuthorizationError::AuthDocNotFound => MetadataApiError::Forbidden,
         _ => MetadataApiError::Internal(err.to_string()),
     })?;
-    if allowed {
-        Ok(())
-    } else {
-        Err(MetadataApiError::Forbidden)
+    if !allowed {
+        return Err(MetadataApiError::Forbidden);
     }
+    crate::request_policy::enforce_policies(
+        context,
+        realm_id,
+        &crate::request_policy::policy_request(&path, &required_permission, Some(&auth_user)),
+    )
+    .await
+    .map_err(|_| MetadataApiError::Forbidden)?;
+    Ok(())
 }
 
 fn metadata_record_matches_filters(

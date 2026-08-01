@@ -502,8 +502,8 @@ pub(crate) async fn ensure_permission(
         drive(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
                 auth_context: auth.clone(),
-                path,
-                required_permission,
+                path: path.clone(),
+                required_permission: required_permission.clone(),
             }),
             &state.get_ctx(),
         ),
@@ -511,11 +511,22 @@ pub(crate) async fn ensure_permission(
     .await
     .map_err(|err| ServerError::InternalError(err.to_string()))?;
 
-    if allowed {
-        Ok(())
-    } else {
-        Err(ServerError::Forbidden)
+    if !allowed {
+        return Err(ServerError::Forbidden);
     }
+    // Deny-only request policies narrow what authorization allowed.
+    aruna_operations::request_policy::enforce_policies(
+        &state.get_ctx(),
+        state.get_realm_id(),
+        &aruna_operations::request_policy::policy_request(
+            &path,
+            &required_permission,
+            Some(&auth.user_id),
+        ),
+    )
+    .await
+    .map_err(|_| ServerError::Forbidden)?;
+    Ok(())
 }
 
 pub(crate) fn bucket_blob_permission_path(

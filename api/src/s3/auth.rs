@@ -135,9 +135,9 @@ impl S3Access for AuthProvider {
         if cx.s3_op().name() != "DeleteObjects" {
             let allowed = drive(
                 CheckPermissionsOperation::new(CheckPermissionsConfig {
-                    auth_context,
-                    path,
-                    required_permission,
+                    auth_context: auth_context.clone(),
+                    path: path.clone(),
+                    required_permission: required_permission.clone(),
                 }),
                 self.driver_ctx.as_ref(),
             )
@@ -149,12 +149,32 @@ impl S3Access for AuthProvider {
             }
         }
 
+        // Deny-only request policies narrow what authorization allowed; for
+        // DeleteObjects they run against the bucket path like the deferred check.
+        self.enforce_policies(&path, &required_permission, Some(&auth_context.user_id))
+            .await?;
+
         cx.extensions_mut().insert(user_access);
         Ok(())
     }
 }
 
 impl AuthProvider {
+    async fn enforce_policies(
+        &self,
+        path: &str,
+        permission: &Permission,
+        user: Option<&UserId>,
+    ) -> S3Result<()> {
+        aruna_operations::request_policy::enforce_policies(
+            &self.driver_ctx,
+            self.realm_id,
+            &aruna_operations::request_policy::policy_request(path, permission, user),
+        )
+        .await
+        .map_err(|_| s3_error!(AccessDenied, "Request denied by policy"))
+    }
+
     /// Anonymous access: object bytes only, addressed to a concrete object, and
     /// allowed only when a public role — one assigned to the Everyone principal
     /// — grants READ on the object permission path. The bucket's own group
@@ -189,7 +209,7 @@ impl AuthProvider {
         let allowed = drive(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
                 auth_context: AuthContext::anonymous(self.realm_id),
-                path,
+                path: path.clone(),
                 required_permission: Permission::READ,
             }),
             self.driver_ctx.as_ref(),
@@ -200,6 +220,9 @@ impl AuthProvider {
         if !allowed {
             return Err(s3_error!(AccessDenied, "Permission denied"));
         }
+
+        self.enforce_policies(&path, &Permission::READ, None)
+            .await?;
 
         // Handlers read UserAccess/BucketInfo from the request extensions;
         // hand them the Everyone principal scoped to the bucket's group. The

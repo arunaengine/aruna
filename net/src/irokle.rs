@@ -8,8 +8,8 @@ use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{
     AdminDocumentApplyStatus, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
     GROUP_REALM_ID_PATH, REALM_CONFIG_DESCRIPTION_PATH, REALM_CONFIG_DISCOVERY_PATH,
-    REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_QUOTA_PATH, USER_NAME_PATH,
-    decode_admin_document_reducer_state, group_role_id_from_path, group_role_path,
+    REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_POLICIES_PATH, REALM_CONFIG_QUOTA_PATH,
+    USER_NAME_PATH, decode_admin_document_reducer_state, group_role_id_from_path, group_role_path,
     group_role_user_assignment_from_path, group_role_user_assignment_path,
     overlay_realm_config_placement_reducer_materialization, realm_config_node_id_from_path,
     realm_config_node_path, realm_config_oidc_provider_id_from_path, realm_role_path,
@@ -3339,6 +3339,14 @@ fn overlay_realm_config_reducer_materialization(
         config.quota = quota;
     }
 
+    if !reducer_state
+        .conflicts
+        .contains_key(REALM_CONFIG_POLICIES_PATH)
+        && let Some(deny_policies) = reducer_state.materialized_realm_config_policies()
+    {
+        config.deny_policies = deny_policies;
+    }
+
     for path in reducer_state.conflicts.keys() {
         if let Some(node_id) = realm_config_node_id_from_path(path) {
             remove_realm_config_node(config, &node_id);
@@ -3391,6 +3399,9 @@ fn realm_config_from_reducer_materialization(
         nodes: Vec::new(),
         quota: reducer_state
             .materialized_realm_config_quota()
+            .unwrap_or_default(),
+        deny_policies: reducer_state
+            .materialized_realm_config_policies()
             .unwrap_or_default(),
         description: String::new(),
         placement_map: Vec::new(),
@@ -5279,7 +5290,8 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
         | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
-        | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. } => {
+        | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
+        | AdminDocumentOperation::RealmConfigPoliciesSet { .. } => {
             AdminOperationFamily::RealmConfig
         }
     };
@@ -5398,6 +5410,11 @@ async fn validate_replicated_admin_event(
             return reject("placement strategy replica count must be greater than zero");
         }
         AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { .. } => {}
+        AdminDocumentOperation::RealmConfigPoliciesSet { policies } => {
+            if let Err(error) = aruna_core::request_policy::validate_policy_set(policies) {
+                return reject(&format!("invalid policy set: {error}"));
+            }
+        }
     }
 
     let previous_state = read_admin_reducer_state(storage, &event.target).await?;

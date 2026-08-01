@@ -30,8 +30,6 @@ pub struct PolicyRequest {
     pub permission: String,
     /// Caller's user id, empty for anonymous callers.
     pub user: String,
-    /// Request plane, `rest` or `s3`.
-    pub plane: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,7 +80,6 @@ fn policy_context(request: &PolicyRequest) -> Context<'_> {
     context.add_variable_from_value("permission", request.permission.clone());
     context.add_variable_from_value("user", request.user.clone());
     context.add_variable_from_value("anonymous", request.user.is_empty());
-    context.add_variable_from_value("plane", request.plane.clone());
     context
 }
 
@@ -147,7 +144,6 @@ mod tests {
             path: path.to_string(),
             permission: permission.to_string(),
             user: user.to_string(),
-            plane: "rest".to_string(),
         }
     }
 
@@ -193,10 +189,8 @@ mod tests {
 
     #[test]
     fn exposes_anonymous() {
-        let policies = [policy("anonymous && plane == 's3'")];
-        let mut anonymous = request("/p", "read", "");
-        anonymous.plane = "s3".to_string();
-        assert!(evaluate_policies(&policies, &anonymous).is_denied());
+        let policies = [policy("anonymous")];
+        assert!(evaluate_policies(&policies, &request("/p", "read", "")).is_denied());
         assert_eq!(
             evaluate_policies(&policies, &request("/p", "read", "u")),
             PolicyDecision::Allowed
