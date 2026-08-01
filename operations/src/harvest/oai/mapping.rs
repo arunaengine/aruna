@@ -111,10 +111,10 @@ pub fn jsonld_to_oai_dc(jsonld: &str, fallback_title: &str) -> Vec<(String, Stri
         .map(|element| (*element, Vec::new()))
         .collect();
 
-    if let Ok(value) = serde_json::from_str::<Value>(jsonld) {
-        if let Some(entity) = main_entity(&value) {
-            collect_dc_elements(entity, &mut collected);
-        }
+    if let Ok(value) = serde_json::from_str::<Value>(jsonld)
+        && let Some(entity) = main_entity(&value)
+    {
+        collect_dc_elements(entity, &mut collected);
     }
 
     if title_slot(&collected).is_empty() {
