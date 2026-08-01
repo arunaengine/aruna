@@ -92,6 +92,10 @@ const DOCUMENT_SYNC_PEER_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT: usize = 1_024;
 const DOCUMENT_SYNC_INBOUND_SYNC_MESSAGE_LIMIT: usize = 4_096;
 const DOCUMENT_SYNC_INBOUND_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
+// Admission budgets: worst-case inbound cost is bounded before any stream is
+// drained, per pushing peer and for the node as a whole.
+const DOCUMENT_SYNC_INBOUND_PEER_STREAMS: usize = 8;
+const DOCUMENT_SYNC_INBOUND_GLOBAL_STREAMS: usize = 64;
 const DOCUMENT_SYNC_FRAME_LEN_LIMIT: usize = 16 * 1024 * 1024;
 const MAX_DEFERRED_TOPICS: usize = 1_024;
 const MAX_DEFERRED_TOPICS_PER_DEPENDENCY: usize = 256;
@@ -164,6 +168,56 @@ pub struct ShardGenesisProbe {
     pub unreachable: Vec<NodeId>,
 }
 
+/// Concurrent inbound sync stream counters. A stream takes its permit before
+/// any byte of the payload is read, so an abusive peer costs one table entry
+/// instead of a 256 MiB drain per stream.
+#[derive(Debug, Default)]
+struct InboundSyncBudget {
+    state: Mutex<InboundSyncCounters>,
+}
+
+#[derive(Debug, Default)]
+struct InboundSyncCounters {
+    global: usize,
+    per_peer: BTreeMap<PeerId, usize>,
+}
+
+impl InboundSyncBudget {
+    fn acquire(self: &Arc<Self>, peer: PeerId) -> Option<InboundSyncPermit> {
+        let mut state = self.state.lock();
+        let held = state.per_peer.get(&peer).copied().unwrap_or(0);
+        if state.global >= DOCUMENT_SYNC_INBOUND_GLOBAL_STREAMS
+            || held >= DOCUMENT_SYNC_INBOUND_PEER_STREAMS
+        {
+            return None;
+        }
+        state.global += 1;
+        *state.per_peer.entry(peer).or_insert(0) += 1;
+        Some(InboundSyncPermit {
+            budget: self.clone(),
+            peer,
+        })
+    }
+}
+
+struct InboundSyncPermit {
+    budget: Arc<InboundSyncBudget>,
+    peer: PeerId,
+}
+
+impl Drop for InboundSyncPermit {
+    fn drop(&mut self) {
+        let mut state = self.budget.state.lock();
+        state.global = state.global.saturating_sub(1);
+        if let Some(held) = state.per_peer.get_mut(&self.peer) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                state.per_peer.remove(&self.peer);
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct DocumentSyncService {
     node: irokle_crate::Irokle<irokle_crate::FjallStorage>,
@@ -184,6 +238,7 @@ pub struct DocumentSyncService {
     // Realm this service serves; shard-classed targets carry no realm id of
     // their own, so their topic derivation reads it from here.
     realm_id: RealmId,
+    inbound_budget: Arc<InboundSyncBudget>,
 }
 
 impl std::fmt::Debug for DocumentSyncService {
@@ -269,6 +324,7 @@ impl DocumentSyncService {
             eviction_tx,
             eviction_rx: Arc::new(Mutex::new(Some(eviction_rx))),
             realm_id,
+            inbound_budget: Arc::new(InboundSyncBudget::default()),
         })
     }
 
@@ -728,12 +784,30 @@ impl DocumentSyncService {
             .note_peer_reachable(node_id_to_peer_id(&connection.remote_id()));
     }
 
+    /// Admission for one inbound sync stream, decided before any payload byte
+    /// is read: the pusher must be a configured realm peer and within the
+    /// per-peer and global stream budgets.
+    fn admit_inbound(&self, peer: NodeId) -> Result<InboundSyncPermit> {
+        let peer_id = node_id_to_peer_id(&peer);
+        if !self.default_peers.read().contains(&peer_id) {
+            return Err(NetError::Stream(format!(
+                "document sync peer {peer_id} is not a configured realm peer"
+            )));
+        }
+        self.inbound_budget.acquire(peer_id).ok_or_else(|| {
+            NetError::Stream(format!(
+                "document sync stream budget exhausted for peer {peer_id}"
+            ))
+        })
+    }
+
     pub async fn handle_inbound_stream(
         &self,
         stream: BiStream,
         peer: NodeId,
     ) -> Result<Vec<irokle_crate::TopicId>> {
         let stream_started = Instant::now();
+        let _permit = self.admit_inbound(peer)?;
         self.net.note_peer_reachable(node_id_to_peer_id(&peer));
         let BiStream(mut send, mut recv, _) = stream;
         let (messages, touched_topics) = read_inbound_sync_messages(&mut recv).await?;
@@ -6461,6 +6535,48 @@ mod tests {
 
     fn peer(seed: u8) -> PeerId {
         node_id_to_peer_id(&iroh::SecretKey::from_bytes(&[seed; 32]).public())
+    }
+
+    #[test]
+    fn budget_caps_streams() {
+        // Per-peer and global caps hold, and dropping a permit restores both.
+        let budget = Arc::new(InboundSyncBudget::default());
+        let mut held = Vec::new();
+        for _ in 0..DOCUMENT_SYNC_INBOUND_PEER_STREAMS {
+            held.push(budget.acquire(peer(1)).expect("within per-peer budget"));
+        }
+        assert!(budget.acquire(peer(1)).is_none());
+        assert!(budget.acquire(peer(2)).is_some());
+
+        held.pop();
+        assert!(budget.acquire(peer(1)).is_some());
+
+        let mut fill = Vec::new();
+        for seed in 10..u8::MAX {
+            match budget.acquire(peer(seed)) {
+                Some(permit) => fill.push(permit),
+                None => break,
+            }
+        }
+        assert!(budget.acquire(peer(3)).is_none());
+        fill.clear();
+        assert!(budget.acquire(peer(3)).is_some());
+    }
+
+    #[tokio::test]
+    async fn admits_known_peers() {
+        // An inbound sync stream is refused before any read unless the pusher
+        // is a configured realm peer.
+        let root = TempDir::new().expect("tempdir");
+        let service = open_restart_service(root.path(), "storage").await;
+        let stranger = iroh::SecretKey::from_bytes(&[41u8; 32]).public();
+
+        assert!(service.admit_inbound(stranger).is_err());
+        service
+            .add_potential_peer_node(stranger)
+            .expect("peer added");
+        let permit = service.admit_inbound(stranger);
+        assert!(permit.is_ok());
     }
 
     fn topic(seed: u8) -> irokle_crate::TopicId {
