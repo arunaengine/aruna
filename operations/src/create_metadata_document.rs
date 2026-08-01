@@ -231,11 +231,12 @@ impl CreateMetadataDocumentOperation {
         };
         // Hard-error on an unstructured document id: routing/placement must never
         // silently treat a non-structured id as absent (guardrail).
-        let id = MetaResourceId::from_bytes(self.config.document_id.to_bytes()).map_err(|error| {
-            CreateMetadataDocumentError::PlacementBindingUnavailable(format!(
-                "document id is not a structured id: {error}"
-            ))
-        })?;
+        let id =
+            MetaResourceId::from_bytes(self.config.document_id.to_bytes()).map_err(|error| {
+                CreateMetadataDocumentError::PlacementBindingUnavailable(format!(
+                    "document id is not a structured id: {error}"
+                ))
+            })?;
         let tuple = config
             .binding_directory()
             .resolve(id.placement_handle())
@@ -645,14 +646,14 @@ pub fn mint_deterministic_create_id(
     seed: Ulid,
 ) -> Result<MetaResourceId, CreateMetadataDocumentError> {
     let normalized = MetadataRegistryRecord::normalize_document_path(document_path);
-    let (handle, placement) =
-        resolve_create_placement(config, actor, group_id, &normalized, true)?;
+    let (handle, placement) = resolve_create_placement(config, actor, group_id, &normalized, true)?;
     let bucket = bucket_from_placement(&placement)?;
     // Mask the seed's low 8 bytes to the 48-bit nonce field.
     let nonce = u64::from_be_bytes(seed.to_bytes()[8..16].try_into().expect("8 bytes"))
         & ((1u64 << 48) - 1);
-    MetaResourceId::from_parts(seed.timestamp_ms(), handle, bucket, nonce)
-        .map_err(|error| CreateMetadataDocumentError::PlacementBindingUnavailable(error.to_string()))
+    MetaResourceId::from_parts(seed.timestamp_ms(), handle, bucket, nonce).map_err(|error| {
+        CreateMetadataDocumentError::PlacementBindingUnavailable(error.to_string())
+    })
 }
 
 /// The blind-hash bucket a forwarded create is offered to and stamps: the D8
@@ -666,7 +667,8 @@ pub fn forward_bucket_placement(
     document_path: &str,
 ) -> Result<PlacementRef, CreateMetadataDocumentError> {
     let normalized = MetadataRegistryRecord::normalize_document_path(document_path);
-    resolve_create_placement(config, actor, group_id, &normalized, true).map(|(_, placement)| placement)
+    resolve_create_placement(config, actor, group_id, &normalized, true)
+        .map(|(_, placement)| placement)
 }
 
 /// Mints the held-bucket structured id a local create embeds, given an
@@ -680,6 +682,19 @@ pub fn mint_local_document_id(
     document_path: &str,
 ) -> Result<MetaResourceId, CreateMetadataDocumentError> {
     mint_document_id_for(config, actor, group_id, document_path, false)
+}
+
+/// Mints the D8 blind-hash-bucket structured id a forwarded create carries, given
+/// an already-loaded config. The origin need not hold the bucket; the create
+/// routes to that shard's holders. Exposed for callers that drive a forwarded
+/// create directly (integration tests).
+pub fn mint_forward_document_id(
+    config: &RealmConfigDocument,
+    actor: &Actor,
+    group_id: GroupId,
+    document_path: &str,
+) -> Result<MetaResourceId, CreateMetadataDocumentError> {
+    mint_document_id_for(config, actor, group_id, document_path, true)
 }
 
 fn mint_document_id_for(
@@ -773,8 +788,9 @@ fn bucket_from_placement(
             placement.shard
         ))
     })?;
-    BucketId::new(shard)
-        .map_err(|error| CreateMetadataDocumentError::PlacementBindingUnavailable(error.to_string()))
+    BucketId::new(shard).map_err(|error| {
+        CreateMetadataDocumentError::PlacementBindingUnavailable(error.to_string())
+    })
 }
 
 fn mint_document_id(
@@ -802,11 +818,11 @@ async fn load_realm_config_for_create(
         Event::Storage(StorageEvent::ReadResult {
             value: Some(bytes), ..
         }) => Ok(RealmConfigDocument::from_bytes(&bytes)?),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Err(
-            CreateMetadataDocumentError::PlacementBindingUnavailable(
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+            Err(CreateMetadataDocumentError::PlacementBindingUnavailable(
                 "realm config document missing".to_string(),
-            ),
-        ),
+            ))
+        }
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(CreateMetadataDocumentError::PlacementBindingUnavailable(
             format!("unexpected storage event reading realm config: {other:?}"),
@@ -977,7 +993,6 @@ mod tests {
         MetadataEvent, MetadataRequestDurability,
     };
     use aruna_core::operation::Operation;
-    use aruna_core::{MetaResourceId, StructuredId};
     use aruna_core::storage_entries::{
         metadata_create_acceptance_key, metadata_event_log_prefix, metadata_path_key,
         metadata_pending_projection_key,
@@ -986,6 +1001,7 @@ mod tests {
         Actor, MetadataRegistryRecord, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
     };
     use aruna_core::types::{Effects, GroupId, Key};
+    use aruna_core::{MetaResourceId, StructuredId};
     use aruna_storage::storage::EffectReceiver;
     use aruna_storage::{FjallStorage, StorageHandle};
     use ulid::Ulid;
@@ -1829,7 +1845,9 @@ mod tests {
         let context = conflict_test_context(storage, temp.path());
 
         let operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
-            actor, group_id, document_id,
+            actor,
+            group_id,
+            document_id,
         ));
         let result = create_metadata_document(operation, context.clone()).await;
         assert!(result.is_ok(), "retry recovers conflict: {result:?}");
@@ -1856,7 +1874,9 @@ mod tests {
         let context = conflict_test_context(storage, temp.path());
 
         let operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
-            actor, group_id, document_id,
+            actor,
+            group_id,
+            document_id,
         ));
         let result = create_metadata_document(operation, context.clone()).await;
         assert!(matches!(
