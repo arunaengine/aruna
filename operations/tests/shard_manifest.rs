@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aruna_core::StructuredId;
 use aruna_core::document::{DocumentSyncTarget, ShardManifest};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -16,6 +17,7 @@ use aruna_operations::announce_realm_presence::{
 };
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    mint_local_document_id,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
@@ -45,15 +47,17 @@ async fn document_manifest_row_lands_on_origin_and_receiver_with_matching_digest
     let realm_id = RealmId([120u8; 32]);
     let (nodes, config) = build_realm_nodes(&realm_id, 2).await?;
     let group_id = Ulid::generate();
-    let document_id = Ulid::generate();
+    let actor = Actor {
+        node_id: nodes[0].net.node_id(),
+        user_id: UserId::local(Ulid::generate(), realm_id),
+        realm_id,
+    };
+    let document_id =
+        mint_local_document_id(&config, &actor, group_id, "datasets/manifest-canary")?.as_ulid();
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
-            actor: Actor {
-                node_id: nodes[0].net.node_id(),
-                user_id: UserId::local(Ulid::generate(), realm_id),
-                realm_id,
-            },
+            actor: actor.clone(),
             group_id,
             document_id,
             document_path: "datasets/manifest-canary".to_string(),
