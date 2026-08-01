@@ -105,7 +105,10 @@ fn iter_effect(start: IterStart) -> Effect {
     })
 }
 
-fn parse_iter(event: Event) -> Result<(Vec<(Key, Value)>, Option<Key>), StorageReadError> {
+/// A scanned index batch: its entries and the storage cursor to resume after.
+type IndexBatch = (Vec<(Key, Value)>, Option<Key>);
+
+fn parse_iter(event: Event) -> Result<IndexBatch, StorageReadError> {
     match event {
         Event::Storage(StorageEvent::IterResult {
             values,
