@@ -171,14 +171,14 @@ current version.
 }
 ```
 
-Candidates come from four places: the bucket's outbound sync relationships, its
-configured replication targets, the queued replication jobs for the version, and
-the durable holder index the DHT keeps per content hash. Relationships cover the
-windows the queue leaves open, before the job for a new version is written and
-after a drained job is deleted. The holder index is what finds a copy on a node
-that is no longer a configured target, or whose queue record was already
-consumed by a completed replication. Every candidate is then asked directly, so
-the reported state is always the answering node's own.
+Candidates come from four places: the bucket's configured replication targets,
+the queued replication jobs for the version, the durable holder index the DHT
+keeps per content hash, and the bucket's outbound sync relationships. The holder
+index is what finds a copy on a node that is no longer a configured target, or
+whose queue record was already consumed by a completed replication.
+Relationships cover the windows the queue leaves open, before the job for a new
+version is written and after a drained job is deleted. Every candidate is then
+asked directly, so the reported state is always the answering node's own.
 
 - `present` means that node confirmed it holds the version.
 - `pending` means a copy is expected there and has not arrived yet: an enabled

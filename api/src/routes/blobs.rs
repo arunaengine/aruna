@@ -391,36 +391,6 @@ pub async fn blob_locations(
         expected.insert(target.node_id);
         capped |= !add_candidate(&mut candidates, target.node_id, &target.bucket);
     }
-    // Relationships close the windows the queue leaves open: before the live
-    // job is written, and after a drained job is deleted but before the
-    // destination publishes its holder entry.
-    match drive(
-        RelationshipReplicaNodesOperation::new(
-            local_node,
-            query.bucket.clone(),
-            query.path.clone(),
-            delete_marker,
-        ),
-        ctx.as_ref(),
-    )
-    .await
-    {
-        Ok(targets) => {
-            for (node_id, bucket) in targets {
-                expected.insert(node_id);
-                capped |= !add_candidate(&mut candidates, node_id, &bucket);
-            }
-        }
-        Err(error) => {
-            warn!(
-                bucket = %query.bucket,
-                key = %query.path,
-                error = %error,
-                "Sync relationship scan failed; relationship copies are unknown"
-            );
-            limits.push(LocationScanLimit::RelationshipScanFailed);
-        }
-    }
     let queued = match drive(
         QueuedReplicaNodesOperation::new(
             query.bucket.clone(),
@@ -465,6 +435,36 @@ pub async fn blob_locations(
                 "Blob holder lookup failed; copies outside the configuration are unknown"
             );
             limits.push(LocationScanLimit::HolderLookupFailed);
+        }
+    }
+    // Last, so a node another source already named keeps the bucket that source
+    // chose. In the windows this covers, before the live job exists and after a
+    // drained job is deleted, no other source names the destination at all.
+    match drive(
+        RelationshipReplicaNodesOperation::new(
+            local_node,
+            query.bucket.clone(),
+            query.path.clone(),
+            delete_marker,
+        ),
+        ctx.as_ref(),
+    )
+    .await
+    {
+        Ok(targets) => {
+            for (node_id, bucket) in targets {
+                expected.insert(node_id);
+                capped |= !add_candidate(&mut candidates, node_id, &bucket);
+            }
+        }
+        Err(error) => {
+            warn!(
+                bucket = %query.bucket,
+                key = %query.path,
+                error = %error,
+                "Sync relationship scan failed; relationship copies are unknown"
+            );
+            limits.push(LocationScanLimit::RelationshipScanFailed);
         }
     }
     if queued.truncated {

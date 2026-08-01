@@ -148,7 +148,8 @@ pub struct ReclaimStatusResponse {
     /// timer, so a non-zero count is normal; reclaim is blocked when
     /// `oldest_enqueued_at` stops moving forward.
     pub queued_cleanups: usize,
-    /// When the oldest queued candidate was enqueued.
+    /// When the oldest item in either queue was enqueued, so a stalled physical
+    /// delete still dates itself once its candidate row is gone.
     pub oldest_enqueued_at: Option<String>,
     /// A scan hit its cap, so the counts are lower bounds.
     pub truncated: bool,
