@@ -19,7 +19,7 @@ use crate::keyspaces::{
     METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE, METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
     METADATA_MATERIALIZATION_JOB_KEYSPACE, METADATA_MATERIALIZATION_PRUNE_KEYSPACE,
     METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
-    METADATA_RAW_BUDGET_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
+    METADATA_RAW_BUDGET_KEYSPACE, METADATA_UPDATED_INDEX_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
     NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE,
     NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
     USER_SUBJECT_INDEX_KEYSPACE,
@@ -87,6 +87,42 @@ pub fn metadata_registry_key(group_id: GroupId, document_id: Ulid) -> Key {
     bytes.extend_from_slice(&group_id.to_bytes());
     bytes.extend_from_slice(&document_id.to_bytes());
     ByteView::from(bytes)
+}
+
+/// Time-ordered registry index key: `updated_at_ms (big-endian) || document_id`.
+///
+/// No realm prefix: single-realm-per-node is the current assumption (multi-realm
+/// is spec ch.17, out of scope) and registry rows are realm-complete on every
+/// node (bridge B1), so a local scan is realm-complete. Add a realm prefix here
+/// if that ever changes.
+pub fn metadata_updated_index_key(updated_at_ms: u64, document_id: Ulid) -> Key {
+    let mut bytes = Vec::with_capacity(24);
+    bytes.extend_from_slice(&updated_at_ms.to_be_bytes());
+    bytes.extend_from_slice(&document_id.to_bytes());
+    ByteView::from(bytes)
+}
+
+pub fn parse_metadata_updated_index_key(key: &[u8]) -> Result<(u64, Ulid), ConversionError> {
+    if key.len() != 24 {
+        return Err(ConversionError::InvalidLength(format!(
+            "expected 24-byte metadata updated index key, got {}",
+            key.len()
+        )));
+    }
+    let updated_at_ms = u64::from_be_bytes(key[..8].try_into()?);
+    let document_id = Ulid::from_bytes(key[8..24].try_into()?);
+    Ok((updated_at_ms, document_id))
+}
+
+/// The timestamp-index entry for a registry record. Written in the same batch as
+/// the record so the new key is atomic; the prior key (at the old timestamp) is
+/// left for lazy cleanup, which only ever over-lists and never under-lists.
+pub fn metadata_updated_index_entry(record: &MetadataRegistryRecord) -> (KeySpace, Key, Value) {
+    (
+        METADATA_UPDATED_INDEX_KEYSPACE.to_string(),
+        metadata_updated_index_key(record.updated_at_ms, record.document_id),
+        ByteView::from(Vec::new()),
+    )
 }
 
 pub fn metadata_registry_prefix(group_id: GroupId) -> Key {
@@ -764,6 +800,7 @@ pub fn metadata_registry_write_entries(
             metadata_registry_key(record.group_id, record.document_id),
             postcard::to_allocvec(&record.holder_node_ids)?.into(),
         ),
+        metadata_updated_index_entry(record),
     ])
 }
 

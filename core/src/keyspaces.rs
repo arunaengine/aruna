@@ -6,6 +6,9 @@ pub const METADATA_INDEX_KEYSPACE: &str = "metadata_index";
 pub const METADATA_DOCUMENT_INDEX_KEYSPACE: &str = "metadata_document_index";
 pub const METADATA_IRI_REFERENCE_INDEX_KEYSPACE: &str = "metadata_iri_reference_index";
 pub const METADATA_HOLDERS_KEYSPACE: &str = "metadata_holders";
+/// Time-ordered index of registry records by `updated_at_ms`, for OAI-PMH
+/// datestamp enumeration (#320). Written atomically with each registry record.
+pub const METADATA_UPDATED_INDEX_KEYSPACE: &str = "metadata_updated_index";
 pub const METADATA_AUDIT_KEYSPACE: &str = "metadata_audit";
 pub const METADATA_EVENT_LOG_KEYSPACE: &str = "metadata_event_log";
 pub const METADATA_CREATE_ACCEPTANCE_KEYSPACE: &str = "metadata_create_acceptance";
