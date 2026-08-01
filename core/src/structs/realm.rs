@@ -2,9 +2,9 @@ use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::structs::{Permission, Role};
 use crate::structs::{
-    Actor, BindingDirectory, BindingScope, DEFAULT_SHARD_COUNT, DocumentClass, FIRST_HANDLE,
-    HandleRange, HandleRangeDirectory, NodePlacementEntry, PlacementBinding, PlacementOverride,
-    PlacementScope, PlacementStrategy, StrategyBinding,
+    Actor, BindingDirectory, BindingScope, DEFAULT_SHARD_COUNT, DocumentClass, JOBCONTROL_HANDLE,
+    HandleRange, HandleRangeDirectory, METADATA_HANDLE, NodePlacementEntry, PlacementBinding,
+    PlacementOverride, PlacementScope, PlacementStrategy, StrategyBinding,
 };
 use crate::structured_id::PlacementHandle;
 use crate::types::{GroupId, RoleId, UserId};
@@ -430,19 +430,30 @@ impl RealmConfigDocument {
             strategy_id: everywhere_strategy.strategy_id,
         })
         .collect();
-        // Pre-provision the realm-scoped Metadata placement binding a shared
-        // create needs to mint a structured id (DEC-ONBOARD): handle 1 is the
-        // first allocatable handle. Coordinator-granted ranges (layer 1) must
-        // therefore start above this reserved default.
-        self.placement_bindings = vec![PlacementBinding {
-            handle: PlacementHandle::new(FIRST_HANDLE).expect("handle 1 is allocatable"),
-            scope: PlacementScope::Realm(self.realm_id),
-            document_class: DocumentClass::Metadata,
-            strategy_id: default_strategy.strategy_id,
-            allocator_range_id: None,
-            allocated_by: None,
-            allocated_at_ms: None,
-        }];
+        // Pre-provision the realm-scoped default bindings a shared create needs
+        // to mint a structured id (DEC-ONBOARD): metadata documents and
+        // job-control records occupy the reserved low band, so coordinator
+        // grants start at `FIRST_GRANTABLE_HANDLE`.
+        self.placement_bindings = vec![
+            PlacementBinding {
+                handle: PlacementHandle::new(METADATA_HANDLE).expect("handle is allocatable"),
+                scope: PlacementScope::Realm(self.realm_id),
+                document_class: DocumentClass::Metadata,
+                strategy_id: default_strategy.strategy_id,
+                allocator_range_id: None,
+                allocated_by: None,
+                allocated_at_ms: None,
+            },
+            PlacementBinding {
+                handle: PlacementHandle::new(JOBCONTROL_HANDLE).expect("handle is allocatable"),
+                scope: PlacementScope::Realm(self.realm_id),
+                document_class: DocumentClass::JobControl,
+                strategy_id: default_strategy.strategy_id,
+                allocator_range_id: None,
+                allocated_by: None,
+                allocated_at_ms: None,
+            },
+        ];
         self.strategies = vec![default_strategy, everywhere_strategy];
     }
 
