@@ -86,11 +86,13 @@ write instead of routing past the cap, and `/info` omits `used_bytes` for that
 backend. Hidden blobs and job spool never count.
 
 Inbound replication routes through the same catalog, so a full backend refuses
-it too: the sending node gets the quota as its rejection reason and reschedules
-the transfer with backoff instead of overshooting the cap. A node whose
-**default** backend is full therefore refuses inbound replication for every
-bucket with no class rule, and a counter it cannot read refuses it the same
-way until the read succeeds.
+a transfer it would have to store: the sending node gets the quota as its
+rejection reason and reschedules with backoff instead of overshooting the cap.
+A node whose **default** backend is full therefore refuses inbound transfers for
+every bucket with no class rule. What stores no bytes is unaffected: delete
+markers, reference items and a blob the destination already holds still apply
+at a full backend. A counter this node cannot read closes the stream before any
+reply, and the sender retries.
 
 ## Cleanup strategy
 

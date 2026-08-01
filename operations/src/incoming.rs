@@ -6,7 +6,7 @@ use crate::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, schedule_outbox_drain_effect, write_outbox_effect,
 };
-use crate::driver::{DriverContext, drive, quota_marked_routing};
+use crate::driver::{DriverContext, drive, node_routing, quota_marked_routing};
 use crate::metadata::MetadataHandle;
 use crate::metadata::projector::{
     METADATA_PROJECTION_RETRY_AFTER, project_metadata_create_events,
@@ -339,7 +339,11 @@ impl InboundEventHandler for OperationsInboundHandler {
                                             "Received inbound version replication manifest"
                                         );
                                         let watch_manifest = manifest.clone();
-                                        let routing =
+                                        // Only a materialized item can place a
+                                        // blob, so only it reads the caps.
+                                        let routing = if manifest.kind
+                                            == ReplicationItemKind::Materialized
+                                        {
                                             match quota_marked_routing(self.context.as_ref()).await
                                             {
                                                 Ok(routing) => routing,
@@ -348,7 +352,10 @@ impl InboundEventHandler for OperationsInboundHandler {
                                                     close_failed_bao(&blob_handle, stream_id).await;
                                                     return;
                                                 }
-                                            };
+                                            }
+                                        } else {
+                                            node_routing(self.context.as_ref())
+                                        };
                                         let op = IncomingVersionReplicationOperation::new(
                                             stream_id,
                                             net_handle.node_id(),

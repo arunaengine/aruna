@@ -26,7 +26,7 @@ use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use ulid::Ulid;
 
 use super::protocol::{ReplicationMode, SyncOrigin};
@@ -1472,9 +1472,16 @@ async fn process_blob_replication_job(
     context: &DriverContext,
     job: &BlobReplicationJobRecord,
 ) -> Result<BlobReplicationJobOutcome, String> {
-    let routing = quota_marked_routing(context)
-        .await
-        .map_err(|error| error.to_string())?;
+    let routing = match quota_marked_routing(context).await {
+        Ok(routing) => routing,
+        // Retrying a record that will never decode only pins the queue at its
+        // backoff ceiling; the drain repair re-enqueues once it is repaired.
+        Err(error) if error.storage().is_none() => {
+            error!(error = %error, "Dropping blob replication job with undecodable routing inputs");
+            return Ok(BlobReplicationJobOutcome::TerminalFailure);
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     let mut operation = ReplicateScopeOperation::new(job.input.clone()).with_routing(routing);
     let mut watch_group_id = None;
     let mut relationship = if let Some(relationship_id) = job.relationship_id {

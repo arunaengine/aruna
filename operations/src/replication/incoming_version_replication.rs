@@ -190,6 +190,9 @@ pub struct IncomingVersionReplicationOperation {
     output: Option<Result<IncomingVersionReplicationResult, IncomingVersionReplicationError>>,
     rocrate_limits: RoCrateLimits,
     routing: NodeRouting,
+    /// Set when the destination backend is over its cap, which only refuses a
+    /// negotiation that asks for the bytes.
+    destination_full: Option<RoutingError>,
 }
 
 impl IncomingVersionReplicationOperation {
@@ -230,6 +233,7 @@ impl IncomingVersionReplicationOperation {
             output: None,
             rocrate_limits: RoCrateLimits::default(),
             routing: NodeRouting::default(),
+            destination_full: None,
         }
     }
 
@@ -627,17 +631,36 @@ impl IncomingVersionReplicationOperation {
             return self.fail(IncomingVersionReplicationError::MissingBlobInfo);
         };
         let hash = blob.hash;
-        // Still before the negotiation reply, so a node that cannot place the
-        // blob owes the sender a reason rather than a dropped stream.
-        let resolved = match self.resolve_destination() {
-            Ok(resolved) => resolved,
+        // A full destination still probes, because a copy it already holds
+        // costs it nothing; the cap only refuses the transfer itself.
+        let backend = match self.resolve_destination() {
+            Ok(resolved) => resolved.backend,
+            Err(IncomingVersionReplicationError::RoutingFailed(RoutingError::BackendFull(
+                backend,
+            ))) => {
+                self.destination_full = Some(RoutingError::BackendFull(backend.clone()));
+                backend
+            }
+            // Still before the negotiation reply, so a node that cannot place
+            // the blob owes the sender a reason rather than a dropped stream.
             Err(error) => return self.reject_negotiation(error),
         };
         self.state = IncomingVersionReplicationState::ReadExistingBlob;
         smallvec![blob_location_read(
-            &BlobLocationKey::new(hash, resolved.backend),
+            &BlobLocationKey::new(hash, backend),
             None
         )]
+    }
+
+    /// The only negotiation result that stores bytes, so the destination's cap
+    /// is answered here rather than at the probe that keys the deduplication.
+    fn need_blob_and_version(&mut self) -> Effects {
+        match self.destination_full.take() {
+            Some(error) => {
+                self.reject_negotiation(IncomingVersionReplicationError::RoutingFailed(error))
+            }
+            None => self.send_negotiation(ReplicationNegotiationResult::NeedBlobAndVersion),
+        }
     }
 
     fn resolve_destination(&self) -> Result<ResolvedBackend, IncomingVersionReplicationError> {
@@ -1676,9 +1699,7 @@ impl Operation for IncomingVersionReplicationOperation {
                                     existing_blob_size = location.blob_size,
                                     "Existing destination blob differs; requesting blob and version"
                                 );
-                                return self.send_negotiation(
-                                    ReplicationNegotiationResult::NeedBlobAndVersion,
-                                );
+                                return self.need_blob_and_version();
                             }
                             self.existing_blob_location = Some(location);
                             debug!(
@@ -1698,7 +1719,7 @@ impl Operation for IncomingVersionReplicationOperation {
                                 stream_id = %self.stream_id,
                                 "Destination blob missing or invalid; requesting blob and version"
                             );
-                            self.send_negotiation(ReplicationNegotiationResult::NeedBlobAndVersion)
+                            self.need_blob_and_version()
                         }
                     }
                 } else {
@@ -1709,7 +1730,7 @@ impl Operation for IncomingVersionReplicationOperation {
                         stream_id = %self.stream_id,
                         "Destination blob absent; requesting blob and version"
                     );
-                    self.send_negotiation(ReplicationNegotiationResult::NeedBlobAndVersion)
+                    self.need_blob_and_version()
                 }
             }
             IncomingVersionReplicationState::SendNegotiation => {
@@ -2961,10 +2982,12 @@ mod tests {
         .with_routing(routing);
 
         let _effects = advance_to_version_lookup(&mut op, group_id);
-        op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![0u8; 4].into(),
-            value: None,
-        }));
+        let effects = advance_blob_lookup(&mut op);
+        assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: None,
@@ -2977,6 +3000,73 @@ mod tests {
             ) => assert!(reason.contains("quota"), "unexpected reason: {reason}"),
             other => panic!("expected a rejected negotiation, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn full_backend_dedupes() {
+        // A blob the destination already holds stores no bytes, so its cap has
+        // nothing left to protect.
+        let manifest = make_manifest(ReplicationItemKind::Materialized);
+        let existing = manifest
+            .blob
+            .as_ref()
+            .map(|blob| blob.location.clone())
+            .unwrap();
+        let group_id = test_group_id();
+        let mut routing = NodeRouting::default();
+        routing.catalog = routing.catalog.mark_full(BackendRef::DEFAULT_NODE_NAME);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            manifest,
+        )
+        .with_routing(routing);
+
+        let _effects = advance_to_version_lookup(&mut op, group_id);
+        advance_blob_lookup(&mut op);
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(existing.to_bytes().unwrap().into()),
+        }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionNegotiationResponse(
+                ReplicationNegotiationResult::NeedVersionOnly
+            )
+        ));
+    }
+
+    #[test]
+    fn marker_ignores_quota() {
+        // A delete marker stores no bytes, so a full destination must still let
+        // the tombstone converge.
+        let group_id = test_group_id();
+        let mut routing = NodeRouting::default();
+        routing.catalog = routing.catalog.mark_full(BackendRef::DEFAULT_NODE_NAME);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            make_manifest(ReplicationItemKind::DeleteMarker),
+        )
+        .with_routing(routing);
+
+        let _effects = advance_to_version_lookup(&mut op, group_id);
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionNegotiationResponse(
+                ReplicationNegotiationResult::NeedVersionOnly
+            )
+        ));
     }
 
     #[test]
