@@ -3,6 +3,7 @@
 
 mod local;
 mod queued;
+mod relationships;
 mod remote;
 
 use aruna_core::errors::{BlobError, ConversionError};
@@ -10,6 +11,7 @@ use thiserror::Error;
 
 pub use local::{LocalSummary, LocationSummaryOperation};
 pub use queued::{QueuedReplicaNodesOperation, QueuedReplicas};
+pub use relationships::RelationshipReplicaNodesOperation;
 pub use remote::RemoteLocationSummaryOperation;
 
 #[derive(Debug, Error, PartialEq)]

@@ -9,7 +9,7 @@ use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissio
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::replication::location_summary::{
     LocationSummaryError, LocationSummaryOperation, QueuedReplicaNodesOperation, QueuedReplicas,
-    RemoteLocationSummaryOperation,
+    RelationshipReplicaNodesOperation, RemoteLocationSummaryOperation,
 };
 use aruna_operations::replication::protocol::{
     LocationCopyStorage, LocationSummary, LocationSummaryRequest, ReplicationMode,
@@ -248,6 +248,9 @@ pub enum LocationScanLimit {
     QueuedScanTruncated,
     /// The queued-replication scan itself failed, so no queued copy is known.
     QueuedScanFailed,
+    /// The sync-relationship scan failed, so the destinations a relationship
+    /// will place a copy on are unknown.
+    RelationshipScanFailed,
     /// Queued job records could not be decoded and were skipped.
     QueuedRecordUnreadable,
     /// More candidate nodes than one request asks; the rest were not asked.
@@ -372,6 +375,7 @@ pub async fn blob_locations(
     };
     let blake3 = local.blake3;
     let bucket_info = local.bucket;
+    let delete_marker = local.delete_marker;
 
     let mut copies = vec![copy_response(local_node, true, local.summary)];
     let mut limits = Vec::new();
@@ -387,8 +391,43 @@ pub async fn blob_locations(
         expected.insert(target.node_id);
         capped |= !add_candidate(&mut candidates, target.node_id, &target.bucket);
     }
+    // Relationships close the windows the queue leaves open: before the live
+    // job is written, and after a drained job is deleted but before the
+    // destination publishes its holder entry.
+    match drive(
+        RelationshipReplicaNodesOperation::new(
+            local_node,
+            query.bucket.clone(),
+            query.path.clone(),
+            delete_marker,
+        ),
+        ctx.as_ref(),
+    )
+    .await
+    {
+        Ok(targets) => {
+            for (node_id, bucket) in targets {
+                expected.insert(node_id);
+                capped |= !add_candidate(&mut candidates, node_id, &bucket);
+            }
+        }
+        Err(error) => {
+            warn!(
+                bucket = %query.bucket,
+                key = %query.path,
+                error = %error,
+                "Sync relationship scan failed; relationship copies are unknown"
+            );
+            limits.push(LocationScanLimit::RelationshipScanFailed);
+        }
+    }
     let queued = match drive(
-        QueuedReplicaNodesOperation::new(query.bucket.clone(), query.path.clone(), resolved),
+        QueuedReplicaNodesOperation::new(
+            query.bucket.clone(),
+            query.path.clone(),
+            resolved,
+            delete_marker,
+        ),
         ctx.as_ref(),
     )
     .await

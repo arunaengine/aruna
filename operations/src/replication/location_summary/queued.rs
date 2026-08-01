@@ -40,6 +40,7 @@ pub struct QueuedReplicaNodesOperation {
     bucket: String,
     key: String,
     version_id: Ulid,
+    delete_marker: bool,
     pages: usize,
     found: QueuedReplicas,
     state: QueuedState,
@@ -47,11 +48,12 @@ pub struct QueuedReplicaNodesOperation {
 }
 
 impl QueuedReplicaNodesOperation {
-    pub fn new(bucket: String, key: String, version_id: Ulid) -> Self {
+    pub fn new(bucket: String, key: String, version_id: Ulid, delete_marker: bool) -> Self {
         Self {
             bucket,
             key,
             version_id,
+            delete_marker,
             pages: 0,
             found: QueuedReplicas::default(),
             state: QueuedState::Init,
@@ -71,8 +73,10 @@ impl QueuedReplicaNodesOperation {
         })]
     }
 
+    /// Mirrors `ReplicateScopeOperation::should_enqueue_version`: a job that
+    /// declines delete markers will skip this version rather than copy it.
     fn covers(&self, input: &ReplicateScopeInput) -> bool {
-        if input.bucket != self.bucket {
+        if input.bucket != self.bucket || (self.delete_marker && !input.replicate_delete_markers) {
             return false;
         }
         match &input.target {
@@ -164,13 +168,21 @@ mod tests {
     use ulid::Ulid;
 
     fn job(target: ReplicateScopeTarget, target_node: NodeId) -> BlobReplicationJobRecord {
+        marker_job(target, target_node, true)
+    }
+
+    fn marker_job(
+        target: ReplicateScopeTarget,
+        target_node: NodeId,
+        markers: bool,
+    ) -> BlobReplicationJobRecord {
         BlobReplicationJobRecord::new(
             ReplicateScopeInput {
                 bucket: "raw".to_string(),
                 target,
                 target_node_id: target_node,
                 auth_context: auth(),
-                replicate_delete_markers: true,
+                replicate_delete_markers: markers,
                 mode: crate::replication::protocol::ReplicationMode::OnDemand,
             },
             None,
@@ -179,11 +191,42 @@ mod tests {
     }
 
     #[test]
+    fn skips_declined_markers() {
+        // A scoped job that does not replicate delete markers will skip this
+        // version, so reporting its target as pending would promise a copy
+        // that is never coming.
+        let mut operation = QueuedReplicaNodesOperation::new(
+            "raw".to_string(),
+            "run1.tar".to_string(),
+            Ulid::from_bytes([3u8; 16]),
+            true,
+        );
+        operation.start();
+
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![(
+                b"a".to_vec().into(),
+                marker_job(ReplicateScopeTarget::Bucket, node_id(6), false)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            )],
+            next_start_after: None,
+        }));
+
+        assert!(operation.finalize().unwrap().nodes.is_empty());
+    }
+
+    #[test]
     fn names_queued_nodes() {
         let version_id = Ulid::from_bytes([3u8; 16]);
         let wanted = node_id(6);
-        let mut operation =
-            QueuedReplicaNodesOperation::new("raw".to_string(), "run1.tar".to_string(), version_id);
+        let mut operation = QueuedReplicaNodesOperation::new(
+            "raw".to_string(),
+            "run1.tar".to_string(),
+            version_id,
+            false,
+        );
         operation.start();
 
         operation.step(Event::Storage(StorageEvent::IterResult {
@@ -225,6 +268,7 @@ mod tests {
             "raw".to_string(),
             "run1.tar".to_string(),
             Ulid::from_bytes([3u8; 16]),
+            false,
         );
         operation.start();
 
@@ -247,6 +291,7 @@ mod tests {
             "raw".to_string(),
             "run1.tar".to_string(),
             Ulid::from_bytes([3u8; 16]),
+            false,
         );
         operation.start();
 

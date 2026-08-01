@@ -171,17 +171,21 @@ current version.
 }
 ```
 
-Candidates come from three places: the bucket's configured replication
-targets, the queued replication jobs for the version, and the durable holder
-index the DHT keeps per content hash. The holder index is what finds a copy on
-a node that is no longer a configured target, or whose queue record was already
+Candidates come from four places: the bucket's outbound sync relationships, its
+configured replication targets, the queued replication jobs for the version, and
+the durable holder index the DHT keeps per content hash. Relationships cover the
+windows the queue leaves open, before the job for a new version is written and
+after a drained job is deleted. The holder index is what finds a copy on a node
+that is no longer a configured target, or whose queue record was already
 consumed by a completed replication. Every candidate is then asked directly, so
 the reported state is always the answering node's own.
 
 - `present` means that node confirmed it holds the version.
-- `pending` means a copy is expected there and has not arrived yet, either
-  because the node is a configured replication target or because a
-  replication job for the version is queued for it. A node found only through
+- `pending` means a copy is expected there and has not arrived yet: an enabled
+  sync relationship names the node, it is a configured replication target, or a
+  replication job for the version is queued for it. A relationship or job that
+  does not replicate delete markers is not counted for a delete marker, because
+  no copy of one is coming through it. A node found only through
   the holder index and answering that it does not hold the version is left out
   entirely: it stores the same bytes under some other object, and no copy of
   this one is on its way there. That answer sets `holder-path-unknown` below,
@@ -203,13 +207,15 @@ caller without it sees the node listed as `denied` and learns nothing else
 about it, not even whether a copy exists there. Ask a destination-bucket
 reader, or have the destination bucket's admin grant you READ.
 
-`complete` is the honesty flag. It is true only when every node that could
-hold a copy was enumerated and asked. When it is false, `limits` names each
+`complete` is the honesty flag. It is true only when every node the four
+sources named was enumerated and asked. When it is false, `limits` names each
 reason, and a node absent from `copies` may still hold a copy:
 
 - `queued-scan-truncated`: the queued-replication scan hit its page cap.
 - `queued-scan-failed`: that scan failed, so no queued copy is known at all.
 - `queued-record-unreadable`: some queued job records would not decode.
+- `relationship-scan-failed`: the sync-relationship scan failed, so the
+  destinations a relationship will place a copy on are unknown.
 - `candidate-cap-reached`: more nodes than one request asks were candidates.
 - `holder-lookup-failed`: the holder index could not be queried, so copies
   outside the current configuration and queue are unknown.
@@ -221,8 +227,9 @@ reason, and a node absent from `copies` may still hold a copy:
   copy is unknown. Its entry is still listed, with state `unreachable`.
 
 The holder index is refreshed on a TTL, so a copy made moments ago may not be
-published yet. `complete` does not promise otherwise: it promises that every
-node the three sources named was asked.
+published yet. `complete` does not promise otherwise, and it does not promise
+that no other node exists: it promises that every node the four sources named
+was asked.
 
 The whole request is bounded: the holder-index lookup is given 5 seconds, at
 most 64 nodes are asked, no peer is waited on for more than 5 seconds, and the

@@ -47,6 +47,9 @@ pub struct LocalSummary {
     pub summary: LocationSummary,
     pub blake3: Option<[u8; 32]>,
     pub bucket: Option<BucketInfo>,
+    /// The resolved version is a delete marker. Relationship and queue policy
+    /// may decline to replicate one, so no copy is coming for it.
+    pub delete_marker: bool,
 }
 
 /// Answers "which copy does THIS node hold" for one version. One state machine
@@ -62,6 +65,7 @@ pub struct LocationSummaryOperation {
     state: SummaryState,
     version_id: Option<Ulid>,
     blake3: Option<[u8; 32]>,
+    delete_marker: bool,
     summary: LocationSummary,
     output: Option<Result<LocalSummary, LocationSummaryError>>,
 }
@@ -98,6 +102,7 @@ impl LocationSummaryOperation {
             state: SummaryState::Init,
             version_id,
             blake3: None,
+            delete_marker: false,
             summary: LocationSummary::absent(),
             output: None,
         }
@@ -143,6 +148,7 @@ impl LocationSummaryOperation {
             summary: self.summary.clone(),
             blake3: self.blake3,
             bucket: self.bucket.clone(),
+            delete_marker: self.delete_marker,
         }
     }
 
@@ -336,6 +342,7 @@ impl LocationSummaryOperation {
             Ok(version) => version,
             Err(error) => return self.fail(error.into()),
         };
+        self.delete_marker = version.is_deleted();
         match version.location_key() {
             Some(key) => {
                 self.blake3 = Some(key.blake3_hash);
