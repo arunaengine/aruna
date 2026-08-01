@@ -1153,9 +1153,30 @@ impl CompleteMultipartUploadOperation {
         }
     }
 
+    /// A commit whose outcome is unknown may already own the composed object,
+    /// so only a proven refusal rolls it back: an unreferenced copy is
+    /// recoverable, a deleted one that a committed version names is not.
+    fn handle_finalize_failure(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::Error { error }) = event else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+        if !error.proves_no_commit()
+            && let Some(location) = self.composed_location.take()
+        {
+            warn!(
+                event = "complete_multipart_upload.commit_outcome_unknown",
+                backend = %location.backend,
+                blob_size = location.blob_size,
+                error = %error,
+                "Keeping the composed object after an unknown commit outcome"
+            );
+        }
+        self.schedule_error(error.into())
+    }
+
     fn handle_finalize_committed(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.handle_finalize_failure(event);
         };
         self.txn_id = None;
         self.composed_location = None;
@@ -1647,6 +1668,46 @@ mod tests {
             .is_empty()
         );
         assert!(op.is_complete());
+    }
+
+    #[test]
+    fn commit_keeps_composed() {
+        // A finalize commit that may have landed already owns the composed
+        // object, so nothing here may delete it.
+        let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+        op.composed_location = Some(composed_location(Ulid::from_bytes([5u8; 16])));
+        op.state = CompleteMultipartUploadState::CommitFinalizeTransaction;
+
+        let effects = op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::CommitFailed,
+        }));
+
+        assert!(effects.is_empty(), "the composed object must survive");
+        assert!(op.composed_location.is_none());
+        assert!(op.is_complete());
+        assert!(matches!(
+            op.finalize(),
+            Err(CompleteMultipartUploadError::StorageError(
+                StorageError::CommitFailed
+            ))
+        ));
+    }
+
+    #[test]
+    fn conflict_deletes_composed() {
+        // A refused finalize proves no version names the composed object.
+        let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+        op.composed_location = Some(composed_location(Ulid::from_bytes([5u8; 16])));
+        op.state = CompleteMultipartUploadState::CommitFinalizeTransaction;
+
+        let effects = op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Delete { .. })]
+        ));
     }
 
     #[test]
