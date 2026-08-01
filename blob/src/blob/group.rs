@@ -12,9 +12,8 @@ use aruna_core::structs::{
 };
 use aruna_core::types::Key;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 use ulid::Ulid;
 
 /// Uniform tenant write chunk. azblob and azdls declare no minimum, so without
@@ -114,23 +113,24 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
     ids
 }
 
-/// How a tenant backend is being used: effects running on it now, and when the
-/// last one finished. The metadata transaction that names the bytes commits
-/// after the effect returns, so the idle stamp is what bounds that gap.
+/// How a tenant backend is being used: how many holds it carries, and whether
+/// removal has claimed it. The two are mutually exclusive, which is what keeps
+/// the credentials alive for as long as anything can still need them.
 #[derive(Debug, Default)]
 pub(super) struct GroupBackendUse {
-    active: usize,
-    idle_since: Option<Instant>,
+    held: usize,
+    claimed: bool,
 }
 
-/// Keeps every tenant backend an executing effect names off the removable list
-/// until the effect returns and its quiet period has passed.
-pub(super) struct GroupEffectGuard {
+/// Keeps every tenant backend an operation named off the removable list. The
+/// driver holds it for the whole operation, so it also covers the metadata
+/// transaction that commits after the effect returns and that commit's rollback.
+pub struct GroupHold {
     counts: Arc<Mutex<HashMap<Ulid, GroupBackendUse>>>,
     ids: Vec<Ulid>,
 }
 
-impl Drop for GroupEffectGuard {
+impl Drop for GroupHold {
     fn drop(&mut self) {
         let Ok(mut counts) = self.counts.lock() else {
             return;
@@ -138,50 +138,84 @@ impl Drop for GroupEffectGuard {
         for backend_id in &self.ids {
             if let Entry::Occupied(mut entry) = counts.entry(*backend_id) {
                 let usage = entry.get_mut();
-                usage.active = usage.active.saturating_sub(1);
-                if usage.active == 0 {
-                    usage.idle_since = Some(Instant::now());
+                usage.held = usage.held.saturating_sub(1);
+                if usage.held == 0 && !usage.claimed {
+                    entry.remove();
                 }
             }
         }
     }
 }
 
+/// Removal's exclusive reservation on one tenant backend.
+pub struct BackendClaim {
+    counts: Arc<Mutex<HashMap<Ulid, GroupBackendUse>>>,
+    backend_id: Ulid,
+}
+
+impl Drop for BackendClaim {
+    fn drop(&mut self) {
+        let Ok(mut counts) = self.counts.lock() else {
+            return;
+        };
+        if let Entry::Occupied(mut entry) = counts.entry(self.backend_id) {
+            entry.get_mut().claimed = false;
+            if entry.get().held == 0 {
+                entry.remove();
+            }
+        }
+    }
+}
+
 impl BlobHandler {
-    /// Taken before the credentials are read, so a removal either sees the
-    /// backend as busy or wins the race before any bytes exist.
-    pub(super) fn hold_group_backends(&self, effect: &BlobEffect) -> Option<GroupEffectGuard> {
+    /// Taken before the credentials are read, so a claimed backend is refused
+    /// before any bytes exist and a held one cannot be claimed.
+    pub(super) fn hold_backends(&self, effect: &BlobEffect) -> Result<Option<GroupHold>, BlobError> {
         let ids = group_ids(effect);
         if ids.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let mut counts = self.group_effects.lock().ok()?;
+        let Ok(mut counts) = self.group_effects.lock() else {
+            return Err(BlobError::UnknownBackend(
+                "tenant backend registry is unusable".to_string(),
+            ));
+        };
+        if let Some(claimed) = ids
+            .iter()
+            .find(|id| counts.get(*id).is_some_and(|usage| usage.claimed))
+        {
+            return Err(BlobError::UnknownBackend(format!(
+                "group backend {claimed} is being removed"
+            )));
+        }
         for backend_id in &ids {
             let usage = counts.entry(*backend_id).or_default();
-            usage.active = usage.active.saturating_add(1);
-            usage.idle_since = None;
+            usage.held = usage.held.saturating_add(1);
         }
         drop(counts);
-        Some(GroupEffectGuard {
+        Ok(Some(GroupHold {
             counts: self.group_effects.clone(),
             ids,
-        })
+        }))
     }
 
-    /// Backends still running an effect, plus those whose last effect finished
-    /// less than `quiet` ago. Entries older than that are dropped as they are
-    /// read, so the map only holds backends this node has just written to.
-    pub(super) fn busy_group_backends(&self, quiet: Duration) -> BTreeSet<Ulid> {
-        let Ok(mut counts) = self.group_effects.lock() else {
-            return BTreeSet::new();
-        };
-        counts.retain(|_, usage| {
-            usage.active > 0
-                || usage
-                    .idle_since
-                    .is_some_and(|since| since.elapsed() < quiet)
-        });
-        counts.keys().copied().collect()
+    /// Refused while any operation holds the backend, and refusing every new
+    /// hold while it lives. Removal takes it before it reads anything, so the
+    /// durable state it then observes can no longer change.
+    pub(super) fn claim_backend(&self, backend_id: Ulid) -> Option<BackendClaim> {
+        let mut counts = self.group_effects.lock().ok()?;
+        if counts
+            .get(&backend_id)
+            .is_some_and(|usage| usage.held > 0 || usage.claimed)
+        {
+            return None;
+        }
+        counts.entry(backend_id).or_default().claimed = true;
+        drop(counts);
+        Some(BackendClaim {
+            counts: self.group_effects.clone(),
+            backend_id,
+        })
     }
 
     /// Loads every tenant backend the effect names into a handler of its own.

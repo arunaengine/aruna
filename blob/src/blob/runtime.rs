@@ -1,3 +1,4 @@
+use super::group::{BackendClaim, GroupHold};
 use super::{BackendRegistry, BlobHandle, BlobHandler};
 use crate::egress::EgressGuard;
 use crate::error::BlobLibError;
@@ -222,15 +223,17 @@ impl BlobHandle {
         self.handler.registry.routing()
     }
 
-    /// Tenant backends an effect is running against, plus those whose last
-    /// effect finished under `quiet` ago. Their credentials must outlive the
-    /// metadata transaction behind that effect, or its rollback cannot reach
-    /// the bytes it wrote.
-    pub fn busy_group_backends(
-        &self,
-        quiet: std::time::Duration,
-    ) -> std::collections::BTreeSet<Ulid> {
-        self.handler.busy_group_backends(quiet)
+    /// Holds every tenant backend an effect names for as long as the guard
+    /// lives. The driver keeps it for the whole operation, so the metadata
+    /// transaction behind the bytes and its rollback are both covered.
+    pub fn hold_backends(&self, effect: &BlobEffect) -> Result<Option<GroupHold>, BlobError> {
+        self.handler.hold_backends(effect)
+    }
+
+    /// Reserves one tenant backend for removal, or refuses while an operation
+    /// still holds it.
+    pub fn claim_backend(&self, backend_id: Ulid) -> Option<BackendClaim> {
+        self.handler.claim_backend(backend_id)
     }
 
     /// Per-backend health for `/info`.
@@ -336,7 +339,10 @@ impl BlobHandler {
     // Effects run concurrently on their caller's task; per-operation ordering
     // is preserved by the driver awaiting each effect before the next.
     pub(super) async fn execute_effect(&self, effect: BlobEffect) -> BlobEvent {
-        let _hold = self.hold_group_backends(&effect);
+        let _hold = match self.hold_backends(&effect) {
+            Ok(hold) => hold,
+            Err(error) => return BlobEvent::Error(error),
+        };
         let handler = match self.with_group_backends(&effect).await {
             Ok(handler) => handler,
             Err(error) => return BlobEvent::Error(error),

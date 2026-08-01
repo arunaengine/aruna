@@ -2120,8 +2120,9 @@ async fn routes_backends_apart() {
 }
 
 #[tokio::test]
-async fn effect_holds_backend() {
-    // A tenant backend an effect names must not look removable while it runs.
+async fn hold_excludes_claim() {
+    // A hold and removal's claim are mutually exclusive in both directions, so
+    // credentials outlive every operation that could still roll back onto them.
     let ctx = setup_blob_handle(1).await;
     let handler = &ctx.blob_handle.handler;
     let backend_id = Ulid::from_bytes([4u8; 16]);
@@ -2129,30 +2130,25 @@ async fn effect_holds_backend() {
     location.backend = BackendRef::Group(backend_id);
     let effect = BlobEffect::Delete { location };
 
-    let hold = handler.hold_group_backends(&effect);
+    let hold = handler.hold_backends(&effect).unwrap();
     assert!(hold.is_some());
-    assert!(
-        handler
-            .busy_group_backends(Duration::from_secs(60))
-            .contains(&backend_id)
-    );
+    assert!(handler.claim_backend(backend_id).is_none());
 
-    // The metadata transaction naming the bytes commits after the effect
-    // returns, so the backend stays busy until the quiet period has passed.
     drop(hold);
-    assert!(
-        handler
-            .busy_group_backends(Duration::from_secs(60))
-            .contains(&backend_id)
-    );
-    assert!(handler.busy_group_backends(Duration::ZERO).is_empty());
+    let claim = handler.claim_backend(backend_id).unwrap();
+    assert!(handler.claim_backend(backend_id).is_none());
+    assert!(handler.hold_backends(&effect).is_err());
 
-    // A node backend never enters the set, so removal never waits on one.
+    drop(claim);
+    assert!(handler.hold_backends(&effect).unwrap().is_some());
+
+    // A node backend never enters the map, so removal never waits on one.
     assert!(
         handler
-            .hold_group_backends(&BlobEffect::Delete {
+            .hold_backends(&BlobEffect::Delete {
                 location: make_test_location()
             })
+            .unwrap()
             .is_none()
     );
 }

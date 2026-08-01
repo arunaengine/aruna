@@ -19,6 +19,7 @@ mod replication;
 mod runtime;
 mod source;
 
+pub use group::{BackendClaim, GroupHold};
 pub use registry::{BackendRegistry, NodeBackend};
 
 #[cfg(test)]
@@ -52,8 +53,8 @@ pub struct BlobHandler {
     read_slots: Arc<Semaphore>,
     spool_slots: Arc<Semaphore>,
     inflight: Arc<AtomicUsize>,
-    /// Effects currently executing against a tenant backend. Erasing its
-    /// credentials while one runs would leave that work unable to roll back.
+    /// Holds and removal claims on tenant backends. Erasing credentials an
+    /// operation still holds would leave that work unable to roll back.
     group_effects: Arc<StdMutex<HashMap<Ulid, group::GroupBackendUse>>>,
 }
 

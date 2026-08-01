@@ -1,4 +1,4 @@
-use aruna_blob::blob::BlobHandle;
+use aruna_blob::blob::{BlobHandle, GroupHold};
 use aruna_compute::ExecutorRegistry;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::BlobError;
@@ -406,6 +406,19 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
     event
 }
 
+/// Reserves every tenant backend an effect names for the rest of the operation.
+/// The bytes land inside one effect, but the transaction naming them commits
+/// after it returns, and that commit's rollback runs later still.
+fn hold_backends(context: &DriverContext, effect: &Effect, holds: &mut Vec<GroupHold>) {
+    let (Effect::Blob(blob_effect), Some(blob_handle)) = (effect, context.blob_handle.as_ref())
+    else {
+        return;
+    };
+    if let Ok(Some(hold)) = blob_handle.hold_backends(blob_effect) {
+        holds.push(hold);
+    }
+}
+
 fn task_effect_key(effect: &TaskEffect) -> Option<TaskKey> {
     match effect {
         TaskEffect::ResetTimer { key, .. }
@@ -431,9 +444,11 @@ fn drive_suboperation<'a>(
                 "Starting suboperation"
             );
             let mut queue: VecDeque<_> = operation.start().into_iter().collect();
+            let mut holds = Vec::new();
 
             while !operation.is_complete() {
                 while let Some(effect) = queue.pop_front() {
+                    hold_backends(context, &effect, &mut holds);
                     let event = dispatch_effect(effect, context, depth).await;
                     queue.extend(operation.step(event));
                 }
@@ -475,9 +490,11 @@ pub async fn drive_until<O: Operation>(
 ) -> Result<O::Output, O::Error> {
     let mut queue: VecDeque<_> = operation.start().into_iter().collect();
     let mut expired = false;
+    let mut holds = Vec::new();
 
     while !operation.is_complete() {
         while let Some(effect) = queue.pop_front() {
+            hold_backends(context, &effect, &mut holds);
             let dispatch = Box::pin(dispatch_effect(effect, context, 0));
             let event = if expired {
                 dispatch.await
@@ -528,9 +545,11 @@ pub async fn drive<O: Operation>(
     );
 
     let mut queue: VecDeque<_> = operation.start().into_iter().collect();
+    let mut holds = Vec::new();
 
     while !operation.is_complete() {
         while let Some(effect) = queue.pop_front() {
+            hold_backends(context, &effect, &mut holds);
             let event = Box::pin(dispatch_effect(effect, context, 0)).await;
             queue.extend(operation.step(event));
         }

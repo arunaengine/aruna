@@ -11,10 +11,10 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::{
     BackendRef, BlobCleanupWork, BlobLocationKey, GroupStorageBackend, MultipartUpload,
 };
+use aruna_blob::blob::BackendClaim;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use std::collections::BTreeSet;
-use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tracing::{info, warn};
 use ulid::Ulid;
@@ -23,34 +23,25 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::store::iter_prefix_page;
 
 const SCAN_PAGE_SIZE: usize = 512;
-/// How long a backend must sit untouched before removal considers it. Bytes
-/// land inside a blob effect, but the transaction naming them commits after
-/// that effect returns, in steps each bounded by the storage request timeout.
-const REMOVAL_QUIET_PERIOD: Duration = Duration::from_secs(60);
 
 /// Deletes the record and credentials of every disabled tenant backend that no
 /// longer holds anything. Runs after the reclaim sweep, which is what empties
 /// them; a backend on `retain` keeps its rows and so is never removed.
 pub async fn remove_drained_backends(context: &DriverContext) -> Result<usize, String> {
-    remove_at(context, SystemTime::now()).await
-}
-
-async fn remove_at(context: &DriverContext, now: SystemTime) -> Result<usize, String> {
     let disabled = disabled_backends(context).await?;
     if disabled.is_empty() {
+        return Ok(0);
+    }
+    let claimed = claim_backends(context, disabled);
+    if claimed.is_empty() {
         return Ok(0);
     }
     let holding = backends_holding_data(context).await?;
 
     let mut removed = 0usize;
-    for record in disabled {
+    for (record, _claim) in &claimed {
         let backend = BackendRef::Group(record.backend_id);
-        if !settled(&record, now) {
-            continue;
-        }
-        // Read per backend rather than once: a write that resolved the backend
-        // just before it was disabled must still finish with its credentials.
-        if holding.contains(&backend) || busy_backends(context).contains(&record.backend_id) {
+        if holding.contains(&backend) {
             continue;
         }
         match drive(
@@ -69,25 +60,25 @@ async fn remove_at(context: &DriverContext, now: SystemTime) -> Result<usize, St
     Ok(removed)
 }
 
-/// Covers the one window the blob adapter cannot see: routing resolved this
-/// backend just before the disable, and the effect carrying the bytes has not
-/// reached the adapter yet, so nothing holds it.
-fn settled(record: &GroupStorageBackend, now: SystemTime) -> bool {
-    record
-        .updated_at
-        .checked_add(REMOVAL_QUIET_PERIOD)
-        .is_some_and(|ready| ready <= now)
-}
-
-/// Anchored on the last effect rather than on the disable: blob streaming has
-/// no time bound, so a delay measured from the disable proves nothing about a
-/// write that is still running.
-fn busy_backends(context: &DriverContext) -> BTreeSet<Ulid> {
-    context
-        .blob_handle
-        .as_ref()
-        .map(|handle| handle.busy_group_backends(REMOVAL_QUIET_PERIOD))
-        .unwrap_or_default()
+/// Claims come first and outlive the scan below: a claim is refused while any
+/// operation still holds the backend, and it refuses every new hold, so a
+/// claimed backend can gain no further copy and no further cleanup row.
+fn claim_backends(
+    context: &DriverContext,
+    disabled: Vec<GroupStorageBackend>,
+) -> Vec<(GroupStorageBackend, Option<BackendClaim>)> {
+    let Some(blob_handle) = context.blob_handle.as_ref() else {
+        // Nothing in this process can run a blob effect, so nothing to exclude.
+        return disabled.into_iter().map(|record| (record, None)).collect();
+    };
+    disabled
+        .into_iter()
+        .filter_map(|record| {
+            blob_handle
+                .claim_backend(record.backend_id)
+                .map(|claim| (record, Some(claim)))
+        })
+        .collect()
 }
 
 async fn disabled_backends(context: &DriverContext) -> Result<Vec<GroupStorageBackend>, String> {
@@ -521,28 +512,6 @@ mod tests {
             )
             .await
             .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn fresh_disable_survives() {
-        // A write that resolved the backend just before it was disabled commits
-        // its location row after the blob guard is gone; removal must outwait
-        // that window instead of trusting the scan it already ran.
-        let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
-        let backend_id = Ulid::from_bytes([4u8; 16]);
-        seed(&ctx, backend_id, true).await;
-
-        assert_eq!(remove_at(&ctx, SystemTime::UNIX_EPOCH).await.unwrap(), 0);
-        assert!(
-            read(
-                &ctx,
-                GROUP_STORAGE_BACKEND_KEYSPACE,
-                backend_key(backend_id)
-            )
-            .await
-            .is_some()
         );
     }
 
