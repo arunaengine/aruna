@@ -351,6 +351,8 @@ pub async fn refresh_reference_metadata_with_context(
             if refresh.refreshed_at <= last_refresh {
                 None
             } else {
+                // referenced_bytes usage on a size-changing refresh is accounted
+                // by the verified-reference arc that wires this path; no delta here.
                 Some(
                     match (BlobVersion {
                         published_by,
