@@ -636,7 +636,9 @@ impl GetObjectOperation {
         self.drift_attempts = self.drift_attempts.saturating_add(1);
         self.advance_observation = Some(observation);
         self.state = GetObjectState::StartAdvanceTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction { read: false })]
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
     }
 
     fn handle_advance_transaction_started(&mut self, event: Event) -> Effects {
@@ -690,14 +692,18 @@ impl GetObjectOperation {
 
         let new_version_id = Ulid::generate();
         let now = SystemTime::now();
-        let successor =
-            BlobVersion::reference(source_binding, observation, now, self.input.user_identity, now);
-        let version_key = match VersionKey::new(&self.input.bucket, &self.input.key, new_version_id)
-            .to_bytes()
-        {
-            Ok(key) => key.into(),
-            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
-        };
+        let successor = BlobVersion::reference(
+            source_binding,
+            observation,
+            now,
+            self.input.user_identity,
+            now,
+        );
+        let version_key =
+            match VersionKey::new(&self.input.bucket, &self.input.key, new_version_id).to_bytes() {
+                Ok(key) => key.into(),
+                Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
+            };
         let version_value = match successor.to_bytes() {
             Ok(value) => value.into(),
             Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
@@ -716,7 +722,11 @@ impl GetObjectOperation {
         self.state = GetObjectState::WriteSuccessor;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes: vec![
-                (BLOB_VERSIONS_KEYSPACE.to_string(), version_key, version_value),
+                (
+                    BLOB_VERSIONS_KEYSPACE.to_string(),
+                    version_key,
+                    version_value
+                ),
                 (BLOB_HEAD_KEYSPACE.to_string(), head_key, head_value),
             ],
             txn_id: Some(txn_id),
@@ -833,7 +843,9 @@ impl GetObjectOperation {
         self.usage_update = None;
         self.resolved_version_id = None;
         self.state = GetObjectState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction { read: true })]
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: true
+        })]
     }
 
     pub fn handle_received_blob(&mut self, event: Event) -> Effects {
@@ -1864,7 +1876,10 @@ mod test {
         let successor_id = CurrentVersionPointer::from_bytes(value.unwrap().as_ref())
             .unwrap()
             .version_id;
-        assert_ne!(successor_id, version_id, "a successor must have been created");
+        assert_ne!(
+            successor_id, version_id,
+            "a successor must have been created"
+        );
 
         let successor = read_reference_version(&driver_ctx, successor_id).await;
         assert_eq!(successor.content_length, 15);
