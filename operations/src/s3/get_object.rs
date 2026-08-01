@@ -595,7 +595,10 @@ impl GetObjectOperation {
         };
         self.source_metadata = Some(metadata);
         self.state = GetObjectState::ReadReferenceSource;
-        smallvec![Effect::StagingSource(StagingSourceEffect::Read { access, range })]
+        smallvec![Effect::StagingSource(StagingSourceEffect::Read {
+            access,
+            range
+        })]
     }
 
     pub fn handle_received_blob(&mut self, event: Event) -> Effects {
