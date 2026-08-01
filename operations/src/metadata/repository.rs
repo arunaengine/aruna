@@ -212,6 +212,11 @@ pub fn delete_holders_effect(
     })
 }
 
+// DEFERRED (#280 audit trail): these durable audit records back the generic audit
+// read endpoint (auth-security branch); the authoritative causal-event contract
+// (retained events, actor/cursor pagination) is the deferred remainder.
+// DEFERRED (#364 lineage, #293 historical replay): both are read/dashboard
+// projections over these audit and event-log records; not built (enhancements).
 pub fn write_audit_effect(
     record: &MetadataAuditRecord,
     audit_id: Ulid,

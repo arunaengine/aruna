@@ -39,6 +39,11 @@ const SEARCH_TYPE_USERS: &str = "users";
 )]
 pub struct SearchApiDoc;
 
+// DEFERRED (#260 typed S3 inventory search): needs the signed inventory-generations
+// subsystem (spec 8.6/9.1), which does not exist yet; not built.
+// DEFERRED (#266 directories): the /search groups/users and /search/buckets core
+// landed (#427); visibility tiers, public profiles, and the signed bucket
+// directory are the deferred enhancements.
 pub fn router() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/search", get(unified_search))
