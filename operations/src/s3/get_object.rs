@@ -2,6 +2,7 @@ use crate::blob::blob_keyspace_helper::blob_location_read;
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
 };
+use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{
@@ -16,7 +17,8 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, MultipartChecksumType, MultipartObjectMetadataKey,
-    MultipartObjectSummary, ResolvedSourceAccess, SourceMetadata, VersionKey, VersionSourceBinding,
+    MultipartObjectSummary, ResolvedSourceAccess, SourceMetadata, UsageDelta, VersionKey,
+    VersionSourceBinding,
 };
 use aruna_core::types::Effects;
 use bytes::Bytes;
@@ -25,6 +27,11 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::time::SystemTime;
 use thiserror::Error;
+
+/// Bounds successor creation on a genuinely still-changing source: after this
+/// many advance attempts a drifting current read serves the latest observation
+/// live rather than spinning on new successors.
+const MAX_DRIFT_ADVANCE_ATTEMPTS: u8 = 3;
 use ulid::Ulid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -38,6 +45,12 @@ pub enum GetObjectState {
     ReadMultipartSummary,
     CommitTransaction,
     HeadReferenceSource,
+    StartAdvanceTransaction,
+    ReadHeadForAdvance,
+    WriteSuccessor,
+    UpdateReferenceUsage,
+    CommitAdvance,
+    RestartReference,
     GetBlob,
     ReadReferenceSource,
     Finish,
@@ -75,6 +88,8 @@ pub enum GetObjectError {
     ReferenceSourceChanged,
     #[error("The historical reference version is no longer available.")]
     HistoricalReferenceUnavailable,
+    #[error(transparent)]
+    UsageError(#[from] UsageUpdateError),
     #[error(transparent)]
     ResolveReferenceError(#[from] SourceConnectorResolutionError),
     #[error(transparent)]
@@ -173,6 +188,12 @@ pub struct GetObjectOperation {
     reference_last_refresh: Option<SystemTime>,
     /// Whether the caller pinned an explicit version (a historical read).
     reference_explicit: bool,
+    /// Fresh observation to record in the successor and then serve.
+    advance_observation: Option<SourceMetadata>,
+    /// Embedded `referenced_bytes` counter update for the successor.
+    usage_update: Option<UsageCounterUpdate>,
+    /// Advance attempts so a still-drifting source cannot spin forever.
+    drift_attempts: u8,
     metadata: HashMap<String, String>,
     source_metadata: Option<SourceMetadata>,
     source_binding: Option<VersionSourceBinding>,
@@ -198,6 +219,9 @@ impl GetObjectOperation {
             reference_cached: None,
             reference_last_refresh: None,
             reference_explicit: false,
+            advance_observation: None,
+            usage_update: None,
+            drift_attempts: 0,
             metadata: HashMap::new(),
             source_metadata: None,
             source_binding: None,
@@ -550,20 +574,25 @@ impl GetObjectOperation {
                     .map(SourceMetadata::observation_fingerprint);
                 let drifted = baseline != Some(metadata.observation_fingerprint());
 
-                // A pinned historical version whose live observation has drifted
-                // cannot be served: its bytes were never cached (#375 deferred).
-                if drifted && self.reference_explicit {
-                    return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
+                if drifted {
+                    // A pinned historical version whose live observation drifted
+                    // cannot serve current bytes: its bytes were never cached
+                    // (#375 deferred).
+                    if self.reference_explicit {
+                        return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
+                    }
+                    // Current-version drift records a same-binding successor. A
+                    // source that keeps changing falls through to serving the
+                    // latest observation live rather than spinning on successors.
+                    if self.drift_attempts < MAX_DRIFT_ADVANCE_ATTEMPTS {
+                        return self.begin_reference_advance(metadata);
+                    }
+                    self.last_refresh = Some(SystemTime::now());
+                    return self.serve_reference_source(metadata);
                 }
 
-                // Undrifted current or pinned read serves the recorded observation;
-                // a drifted current read still floats live here. The successor-on-
-                // drift write path (#256) replaces that float in the next step.
-                self.last_refresh = if drifted {
-                    Some(SystemTime::now())
-                } else {
-                    self.reference_last_refresh
-                };
+                // Undrifted: serve the recorded observation unchanged.
+                self.last_refresh = self.reference_last_refresh;
                 self.serve_reference_source(metadata)
             }
             Event::StagingSource(StagingSourceEvent::Error { error }) => {
@@ -599,6 +628,212 @@ impl GetObjectOperation {
             access,
             range
         })]
+    }
+
+    /// Opens the write transaction that records a same-binding successor for a
+    /// drifted current-version read.
+    fn begin_reference_advance(&mut self, observation: SourceMetadata) -> Effects {
+        self.drift_attempts = self.drift_attempts.saturating_add(1);
+        self.advance_observation = Some(observation);
+        self.state = GetObjectState::StartAdvanceTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction { read: false })]
+    }
+
+    fn handle_advance_transaction_started(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
+            return self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::TransactionStarted)",
+                received: event,
+            });
+        };
+        self.txn_id = Some(txn_id);
+        let key = match BlobHeadKey::new(&self.input.bucket, &self.input.key).to_bytes() {
+            Ok(key) => key.into(),
+            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
+        };
+        self.state = GetObjectState::ReadHeadForAdvance;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
+            key,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn handle_advance_head_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        let Some(value) = value else {
+            return self.restart_after_conflict();
+        };
+        let pointer = match CurrentVersionPointer::from_bytes(value.as_ref()) {
+            Ok(pointer) => pointer,
+            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
+        };
+        // CAS: only advance while the head still names the version we headed;
+        // otherwise a concurrent writer won and we serve its successor instead.
+        if Some(pointer.version_id) != self.resolved_version_id {
+            return self.restart_after_conflict();
+        }
+        let (Some(observation), Some(source_binding), Some(txn_id)) = (
+            self.advance_observation.clone(),
+            self.source_binding.clone(),
+            self.txn_id,
+        ) else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+
+        let new_version_id = Ulid::generate();
+        let now = SystemTime::now();
+        let successor =
+            BlobVersion::reference(source_binding, observation, now, self.input.user_identity, now);
+        let version_key = match VersionKey::new(&self.input.bucket, &self.input.key, new_version_id)
+            .to_bytes()
+        {
+            Ok(key) => key.into(),
+            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
+        };
+        let version_value = match successor.to_bytes() {
+            Ok(value) => value.into(),
+            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
+        };
+        let head_key = match BlobHeadKey::new(&self.input.bucket, &self.input.key).to_bytes() {
+            Ok(key) => key.into(),
+            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
+        };
+        let head_value =
+            match CurrentVersionPointer::next_for(Some(&pointer), new_version_id).to_bytes() {
+                Ok(value) => value.into(),
+                Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
+            };
+
+        self.resolved_version_id = Some(new_version_id);
+        self.state = GetObjectState::WriteSuccessor;
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes: vec![
+                (BLOB_VERSIONS_KEYSPACE.to_string(), version_key, version_value),
+                (BLOB_HEAD_KEYSPACE.to_string(), head_key, head_value),
+            ],
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn handle_successor_written(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
+            return self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::BatchWriteResult)",
+                received: event,
+            });
+        };
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(GetObjectError::NoTransactionFound);
+        };
+        let (Some(observation), Some(baseline)) = (
+            self.advance_observation.as_ref(),
+            self.reference_cached.as_ref(),
+        ) else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+        // Adjust the same group's referenced_bytes by the size change so the
+        // count tracks the current version across the whole chain.
+        let referenced_bytes =
+            i128::from(observation.content_length) - i128::from(baseline.content_length);
+        let mut update = UsageCounterUpdate::for_group(
+            self.input.group_id,
+            UsageDelta {
+                referenced_bytes,
+                ..Default::default()
+            },
+        );
+        if update.is_noop() {
+            self.state = GetObjectState::CommitAdvance;
+            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+        }
+        self.state = GetObjectState::UpdateReferenceUsage;
+        let effects = update.start(txn_id);
+        self.usage_update = Some(update);
+        effects
+    }
+
+    fn handle_advance_usage(&mut self, event: Event) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(GetObjectError::NoTransactionFound);
+        };
+        let Some(update) = self.usage_update.as_mut() else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+        match update.step(event, txn_id) {
+            Ok(Some(effects)) => effects,
+            Ok(None) => {
+                self.state = GetObjectState::CommitAdvance;
+                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            }
+            Err(err) => self.emit_error(err.into()),
+        }
+    }
+
+    fn handle_advance_committed(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                self.txn_id = None;
+                let Some(observation) = self.advance_observation.take() else {
+                    return self.emit_error(GetObjectError::GetObjectFailed);
+                };
+                self.last_refresh = Some(SystemTime::now());
+                self.serve_reference_source(observation)
+            }
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            }) => {
+                self.txn_id = None;
+                self.restart_after_conflict()
+            }
+            Event::Storage(StorageEvent::Error { .. }) => {
+                self.emit_error(GetObjectError::GetObjectFailed)
+            }
+            other => self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
+                received: other,
+            }),
+        }
+    }
+
+    /// Aborts an in-flight advance transaction and re-reads against the winner.
+    fn restart_after_conflict(&mut self) -> Effects {
+        match self.txn_id.take() {
+            Some(txn_id) => {
+                self.state = GetObjectState::RestartReference;
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            }
+            None => self.restart_reference_read(),
+        }
+    }
+
+    fn handle_restart_reference(&mut self, _event: Event) -> Effects {
+        self.restart_reference_read()
+    }
+
+    /// Re-reads the reference from the current head so a restarted access
+    /// observes the winner's successor. The advance counter is preserved so a
+    /// still-drifting source eventually falls through to serving live.
+    fn restart_reference_read(&mut self) -> Effects {
+        self.txn_id = None;
+        self.reference_access = None;
+        self.reference_cached = None;
+        self.reference_last_refresh = None;
+        self.source_metadata = None;
+        self.advance_observation = None;
+        self.usage_update = None;
+        self.resolved_version_id = None;
+        self.state = GetObjectState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction { read: true })]
     }
 
     pub fn handle_received_blob(&mut self, event: Event) -> Effects {
@@ -705,6 +940,14 @@ impl Operation for GetObjectOperation {
             GetObjectState::ReadMultipartSummary => self.handle_multipart_summary_read(event),
             GetObjectState::CommitTransaction => self.handle_transaction_committed(event),
             GetObjectState::HeadReferenceSource => self.handle_reference_source_head(event),
+            GetObjectState::StartAdvanceTransaction => {
+                self.handle_advance_transaction_started(event)
+            }
+            GetObjectState::ReadHeadForAdvance => self.handle_advance_head_read(event),
+            GetObjectState::WriteSuccessor => self.handle_successor_written(event),
+            GetObjectState::UpdateReferenceUsage => self.handle_advance_usage(event),
+            GetObjectState::CommitAdvance => self.handle_advance_committed(event),
+            GetObjectState::RestartReference => self.handle_restart_reference(event),
             GetObjectState::GetBlob => self.handle_received_blob(event),
             GetObjectState::ReadReferenceSource => self.handle_received_reference_source(event),
             GetObjectState::Finish => smallvec![],
@@ -914,6 +1157,8 @@ mod test {
             last_modified: None,
             source_version: None,
         };
+        // Baseline matches the live head, so this undrifted read serves directly.
+        operation.reference_cached = Some(metadata.clone());
         let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
             metadata: metadata.clone(),
         }));
