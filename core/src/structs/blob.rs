@@ -239,6 +239,14 @@ impl BlobCleanupWork {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
     }
+
+    /// The physical object this row is about, for the variants that name one.
+    pub fn location(&self) -> Option<&BackendLocation> {
+        match self {
+            Self::DeleteBlob { location } | Self::ReconcileWrite { location, .. } => Some(location),
+            Self::RegisterDht { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

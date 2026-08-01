@@ -12,9 +12,11 @@ use aruna_core::structs::{
     BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, GroupStorageBackend,
     MultipartUploadPart, MultipartUploadPartKey, WriteOwner,
 };
+use aruna_core::errors::StorageError;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
 use tracing::{error, warn};
+use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::group_backends::{backend_key, parse_read};
@@ -23,6 +25,72 @@ use crate::jobs::store::iter_prefix_page;
 pub const BLOB_CLEANUP_AFTER: Duration = Duration::from_secs(300);
 pub const BLOB_CLEANUP_RETRY: Duration = Duration::from_secs(30);
 const CLEANUP_PAGE_SIZE: usize = 128;
+
+/// A cleanup row an operation has emitted but storage has not yet accepted.
+/// The row is the only durable record that the written object exists, so the
+/// work is held until the write succeeds and retried once when it does not.
+#[derive(Debug, Default, PartialEq)]
+pub struct PendingCleanup {
+    work: Option<BlobCleanupWork>,
+    retried: bool,
+}
+
+impl PendingCleanup {
+    /// The write effect for one row. `None` means the row will never encode,
+    /// leaving the caller with the failure it already carries.
+    pub fn queue(&mut self, work: BlobCleanupWork) -> Option<Effect> {
+        let effect = cleanup_row_write(&work)?;
+        self.work = Some(work);
+        Some(effect)
+    }
+
+    pub fn accepted(&mut self) {
+        self.work = None;
+    }
+
+    /// One retry, then the object is logged: after that nothing but this line
+    /// names the bytes that were written.
+    pub fn retry(&mut self, error: &StorageError) -> Option<Effect> {
+        let work = self.work.take()?;
+        if self.retried {
+            log_refused_row(&work, error);
+            return None;
+        }
+        self.retried = true;
+        self.queue(work)
+    }
+}
+
+fn cleanup_row_write(work: &BlobCleanupWork) -> Option<Effect> {
+    match work.to_bytes() {
+        Ok(bytes) => Some(Effect::Storage(StorageEffect::Write {
+            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            key: Ulid::generate().to_bytes().to_vec().into(),
+            value: bytes.into(),
+            txn_id: None,
+        })),
+        Err(error) => {
+            warn!(error = %error, "Blob cleanup row could not be encoded");
+            None
+        }
+    }
+}
+
+fn log_refused_row(work: &BlobCleanupWork, error: &StorageError) {
+    let Some(location) = work.location() else {
+        warn!(error = %error, "Blob cleanup row could not be queued");
+        return;
+    };
+    error!(
+        event = "blob.cleanup.row_refused",
+        backend = %location.backend,
+        storage_bucket = %location.storage_bucket,
+        backend_path = %location.backend_path,
+        blob_size = location.blob_size,
+        error = %error,
+        "Cleanup row refused; the written object is named nowhere else"
+    );
+}
 
 pub fn schedule_blob_cleanup_effect() -> Effect {
     Effect::Task(TaskEffect::ShortenTimer {
@@ -96,11 +164,7 @@ pub async fn process_cleanup_batch(context: &DriverContext) -> Result<BlobCleanu
 
 /// The backend a row needs credentials for, if it needs any.
 fn work_backend(work: &BlobCleanupWork) -> Option<&BackendRef> {
-    match work {
-        BlobCleanupWork::DeleteBlob { location }
-        | BlobCleanupWork::ReconcileWrite { location, .. } => Some(&location.backend),
-        BlobCleanupWork::RegisterDht { .. } => None,
-    }
+    work.location().map(|location| &location.backend)
 }
 
 /// Only a tenant backend whose record is provably absent counts as removed; an
@@ -244,7 +308,7 @@ async fn owns_write(
 
 #[cfg(test)]
 mod tests {
-    use super::{CLEANUP_PAGE_SIZE, process_cleanup_batch};
+    use super::{CLEANUP_PAGE_SIZE, PendingCleanup, process_cleanup_batch};
     use crate::driver::DriverContext;
     use crate::jobs::store::iter_prefix_page;
     use aruna_core::effects::StorageEffect;
@@ -296,6 +360,29 @@ mod tests {
         }
         .to_bytes()
         .unwrap()
+    }
+
+    #[test]
+    fn retries_refused_row() {
+        // The row is the only durable record of the written bytes, so it is
+        // held until storage accepts it and retried once when it does not.
+        let work = BlobCleanupWork::from_bytes(&delete_work()).unwrap();
+        let error = aruna_core::errors::StorageError::QueueFull;
+        let mut pending = PendingCleanup::default();
+
+        assert!(pending.queue(work).is_some());
+        assert!(pending.retry(&error).is_some());
+        assert!(pending.retry(&error).is_none());
+        assert!(pending.retry(&error).is_none());
+
+        let mut pending = PendingCleanup::default();
+        assert!(
+            pending
+                .queue(BlobCleanupWork::from_bytes(&delete_work()).unwrap())
+                .is_some()
+        );
+        pending.accepted();
+        assert!(pending.retry(&error).is_none());
     }
 
     fn group_delete_work() -> Vec<u8> {

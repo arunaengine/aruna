@@ -1,10 +1,9 @@
+use crate::blob::cleanup::PendingCleanup;
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
-};
+use aruna_core::keyspaces::{S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
@@ -99,6 +98,7 @@ pub struct UploadPartOperation {
     written_location: Option<BackendLocation>,
     replaced_location: Option<BackendLocation>,
     rollback_location: Option<BackendLocation>,
+    pending_cleanup: PendingCleanup,
     pending_error: Option<UploadPartError>,
     output: Option<Result<UploadPartResult, UploadPartError>>,
 }
@@ -112,6 +112,7 @@ impl UploadPartOperation {
             written_location: None,
             replaced_location: None,
             rollback_location: None,
+            pending_cleanup: PendingCleanup::default(),
             pending_error: None,
             output: None,
         }
@@ -254,30 +255,27 @@ impl UploadPartOperation {
     }
 
     /// Hands one row to the durable cleanup queue outside any transaction. The
-    /// pending error follows once the row is written or provably lost.
+    /// row keeps the location until storage accepts it, so a refused write can
+    /// still be retried rather than losing the only record of the bytes.
     fn queue_cleanup_work(&mut self, work: BlobCleanupWork) -> Effects {
-        let work = match work.to_bytes() {
-            Ok(work) => work,
-            Err(error) => {
-                warn!(error = %error, "Orphaned part could not be encoded for cleanup");
-                return self.emit_pending_error();
-            }
+        let Some(effect) = self.pending_cleanup.queue(work) else {
+            return self.emit_pending_error();
         };
         self.state = UploadPartState::QueueCleanupRow;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
-            key: Ulid::generate().to_bytes().to_vec().into(),
-            value: work.into(),
-            txn_id: None,
-        })]
+        smallvec![effect]
     }
 
     fn handle_cleanup_queued(&mut self, event: Event) -> Effects {
         match event {
-            Event::Storage(StorageEvent::WriteResult { .. }) => self.emit_pending_error(),
-            Event::Storage(StorageEvent::Error { error }) => {
-                warn!(error = %error, "Blob cleanup row could not be queued");
+            Event::Storage(StorageEvent::WriteResult { .. }) => {
+                self.pending_cleanup.accepted();
                 self.emit_pending_error()
+            }
+            Event::Storage(StorageEvent::Error { error }) => {
+                match self.pending_cleanup.retry(&error) {
+                    Some(effect) => smallvec![effect],
+                    None => self.emit_pending_error(),
+                }
             }
             _ => self.emit_error(UploadPartError::InvalidOperationState),
         }
@@ -531,6 +529,7 @@ impl Operation for UploadPartOperation {
 mod test {
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
     use aruna_core::structs::RealmId;
     use aruna_storage::storage;
     use tempfile::tempdir;

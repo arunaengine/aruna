@@ -1,3 +1,4 @@
+use crate::blob::cleanup::PendingCleanup;
 use crate::blob::blob_keyspace_helper::{
     HeadAliasContext, add_hash_path_index_effect, blob_location_read, write_blob_head_effect,
     write_blob_location_effect, write_blob_version_effect,
@@ -12,9 +13,7 @@ use crate::usage_stats::{
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
-use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
-};
+use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
@@ -149,6 +148,7 @@ pub struct PutObjectOperation {
     written_location: Option<BackendLocation>,
     cleanup_location: Option<BackendLocation>,
     rollback_location: Option<BackendLocation>,
+    pending_cleanup: PendingCleanup,
     existing_pointer: Option<CurrentVersionPointer>,
     new_blob: bool,
     was_live: bool,
@@ -172,6 +172,7 @@ impl PutObjectOperation {
             written_location: None,
             cleanup_location: None,
             rollback_location: None,
+            pending_cleanup: PendingCleanup::default(),
             existing_pointer: None,
             new_blob: false,
             was_live: false,
@@ -931,30 +932,27 @@ impl PutObjectOperation {
     }
 
     /// Hands one row to the durable cleanup queue outside any transaction. The
-    /// pending error follows once the row is written or provably lost.
+    /// row keeps the location until storage accepts it, so a refused write can
+    /// still be retried rather than losing the only record of the bytes.
     fn queue_cleanup_work(&mut self, work: BlobCleanupWork) -> Effects {
-        let work = match work.to_bytes() {
-            Ok(work) => work,
-            Err(error) => {
-                warn!(error = %error, "Orphaned blob could not be encoded for cleanup");
-                return self.emit_pending_error();
-            }
+        let Some(effect) = self.pending_cleanup.queue(work) else {
+            return self.emit_pending_error();
         };
         self.state = PutObjectState::QueueCleanupRow;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
-            key: Ulid::generate().to_bytes().to_vec().into(),
-            value: work.into(),
-            txn_id: None,
-        })]
+        smallvec![effect]
     }
 
     fn handle_cleanup_queued(&mut self, event: Event) -> Effects {
         match event {
-            Event::Storage(StorageEvent::WriteResult { .. }) => self.emit_pending_error(),
-            Event::Storage(StorageEvent::Error { error }) => {
-                warn!(error = %error, "Blob cleanup row could not be queued");
+            Event::Storage(StorageEvent::WriteResult { .. }) => {
+                self.pending_cleanup.accepted();
                 self.emit_pending_error()
+            }
+            Event::Storage(StorageEvent::Error { error }) => {
+                match self.pending_cleanup.retry(&error) {
+                    Some(effect) => smallvec![effect],
+                    None => self.emit_pending_error(),
+                }
             }
             _ => self.emit_error(PutObjectError::InvalidOperationState),
         }
