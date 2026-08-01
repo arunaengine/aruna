@@ -44,7 +44,12 @@ pub struct AuthProvider {
     pub(crate) driver_ctx: Arc<DriverContext>,
     pub(crate) realm_id: RealmId,
     pub(crate) node_id: NodeId,
+    pub(crate) rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
 }
+
+/// Client address of the S3 connection, inserted by the connection service.
+#[derive(Clone, Copy, Debug)]
+pub struct S3ClientAddr(pub std::net::IpAddr);
 
 #[async_trait::async_trait]
 impl S3Auth for AuthProvider {
@@ -67,10 +72,27 @@ impl S3Access for AuthProvider {
         let action = get_s3_operation_permission(&operation_name)
             .ok_or_else(|| s3_error!(InvalidRequest, "Unknown Operation"))?;
 
+        // Per-IP and per-access-key budgets, before any storage read.
+        let client_ip = cx
+            .extensions_mut()
+            .get::<S3ClientAddr>()
+            .map(|addr| addr.0)
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        let principal = cx
+            .credentials()
+            .map(|credentials| credentials.access_key.clone());
+        if self
+            .rate_limits
+            .check(client_ip, principal.as_deref())
+            .is_err()
+        {
+            return Err(s3_error!(SlowDown, "Reduce your request rate"));
+        }
+
         // Unsigned requests are checked as the Everyone principal, but only for
         // the public object-byte read surface.
-        let access_key_id = match cx.credentials() {
-            Some(credentials) => credentials.access_key.clone(),
+        let access_key_id = match principal {
+            Some(access_key_id) => access_key_id,
             None => return self.check_anonymous(cx, action).await,
         };
 
@@ -332,6 +354,7 @@ mod tests {
             driver_ctx,
             realm_id: RealmId([1u8; 32]),
             node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+            rate_limits: Arc::new(crate::rate_limit::ApiRateLimits::default()),
         }
     }
 

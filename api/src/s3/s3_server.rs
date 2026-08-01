@@ -145,6 +145,8 @@ pub struct WrappingService {
     domain: String,
     driver_ctx: Arc<DriverContext>,
     metrics: Arc<NodeMetrics>,
+    // The accepted connection's peer, stamped into every request it carries.
+    peer_ip: Option<std::net::IpAddr>,
 }
 
 impl S3Server {
@@ -169,6 +171,7 @@ impl S3Server {
             driver_ctx: driver_ctx.clone(),
             realm_id,
             node_id,
+            rate_limits: Arc::new(crate::rate_limit::ApiRateLimits::default()),
         };
 
         let service = {
@@ -201,19 +204,21 @@ impl S3Server {
             domain: self.domain,
             driver_ctx: self.driver_ctx,
             metrics: self.metrics,
+            peer_ip: None,
         };
         let connection = ConnBuilder::new(TokioExecutor::new());
 
         let server = async move {
             loop {
-                let (socket, _) = match listener.accept().await {
+                let (socket, peer) = match listener.accept().await {
                     Ok(ok) => ok,
                     Err(err) => {
                         error!("error accepting connection: {err}");
                         continue;
                     }
                 };
-                let service = service.clone();
+                let mut service = service.clone();
+                service.peer_ip = Some(peer.ip());
                 let conn = connection.clone();
                 tokio::spawn(async move {
                     let _ = conn.serve_connection(TokioIo::new(socket), service).await;
@@ -250,6 +255,11 @@ impl Service<Request<Incoming>> for WrappingService {
         // reaches the check through the request extensions.
         let op_label = S3OpLabel::new();
         parts.extensions.insert(op_label.clone());
+        if let Some(peer_ip) = self.peer_ip {
+            parts
+                .extensions
+                .insert(crate::s3::auth::S3ClientAddr(peer_ip));
+        }
         let span = make_request_span("s3", &parts.headers, &method, &path);
         let started = Instant::now();
         {

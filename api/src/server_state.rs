@@ -76,6 +76,7 @@ pub struct ServerState {
     rocrate_limits: RoCrateLimits,
     // Peers allowed to set `x-forwarded-*`; empty means no proxy is trusted.
     trusted_proxies: Vec<ipnet::IpNet>,
+    rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -181,6 +182,7 @@ impl ServerState {
             s3_mounts_available: false,
             rocrate_limits: RoCrateLimits::default(),
             trusted_proxies: Vec::new(),
+            rate_limits: Arc::new(crate::rate_limit::ApiRateLimits::default()),
         };
         state.persist_trusted_realms().await;
         state
@@ -228,6 +230,10 @@ impl ServerState {
 
     pub fn trusted_proxies(&self) -> &[ipnet::IpNet] {
         &self.trusted_proxies
+    }
+
+    pub fn rate_limits(&self) -> &crate::rate_limit::ApiRateLimits {
+        &self.rate_limits
     }
 
     pub fn jobs_runtime(&self) -> Arc<JobsRuntime> {
