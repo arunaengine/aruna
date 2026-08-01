@@ -382,6 +382,39 @@ impl BlobLocationKey {
     }
 }
 
+/// Durable evidence that a stored copy failed hash/bao verification (§8.2). Keyed
+/// by (hash, backend) so re-detecting the same corrupt copy overwrites its row.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BlobQuarantineRecord {
+    pub blake3: [u8; 32],
+    pub backend: BackendRef,
+    pub reason: String,
+    pub detected_at_ms: u64,
+}
+
+impl BlobQuarantineRecord {
+    pub fn new(blake3: [u8; 32], backend: BackendRef, reason: String, detected_at_ms: u64) -> Self {
+        Self {
+            blake3,
+            backend,
+            reason,
+            detected_at_ms,
+        }
+    }
+
+    pub fn key(&self) -> Vec<u8> {
+        BlobLocationKey::new(self.blake3, self.backend.clone()).to_bytes()
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct HiddenBlobKey {
     pub backend: BackendRef,

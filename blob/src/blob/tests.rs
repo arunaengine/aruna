@@ -2272,6 +2272,56 @@ async fn seal_rejects_blob_writes() {
     ));
 }
 
+// A copy that fails verification is tracked durably, keyed per (hash, backend)
+// so re-detecting the same corrupt copy overwrites its own row (§8.2).
+#[tokio::test]
+async fn quarantine_persists_and_overwrites() {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::BLOB_QUARANTINE_KEYSPACE;
+    use aruna_core::structs::{BackendRef, BlobQuarantineRecord};
+
+    let context = setup_blob_handle(64).await;
+    let blake3 = [7u8; 32];
+    let backend = BackendRef::node_default();
+    let key = BlobQuarantineRecord::new(blake3, backend.clone(), String::new(), 0).key();
+
+    let read_record = |key: Vec<u8>| {
+        let storage = context.storage_handle.clone();
+        async move {
+            let Event::Storage(StorageEvent::ReadResult {
+                value: Some(bytes), ..
+            }) = storage
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: BLOB_QUARANTINE_KEYSPACE.to_string(),
+                    key: key.into(),
+                    txn_id: None,
+                })
+                .await
+            else {
+                panic!("expected a quarantine record");
+            };
+            BlobQuarantineRecord::from_bytes(bytes.as_ref()).unwrap()
+        }
+    };
+
+    context
+        .blob_handle
+        .handler
+        .quarantine_corrupt_blob(blake3, &backend, "bao read source hash mismatch")
+        .await;
+    let record = read_record(key.clone()).await;
+    assert_eq!(record.blake3, blake3);
+    assert_eq!(record.backend, backend);
+    assert_eq!(record.reason, "bao read source hash mismatch");
+
+    context
+        .blob_handle
+        .handler
+        .quarantine_corrupt_blob(blake3, &backend, "blake3 hash mismatch")
+        .await;
+    assert_eq!(read_record(key).await.reason, "blake3 hash mismatch");
+}
+
 // With no mutation in flight the drain returns immediately.
 #[tokio::test]
 async fn drain_writes_when_idle() {
