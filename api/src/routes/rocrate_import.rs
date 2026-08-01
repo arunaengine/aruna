@@ -662,11 +662,13 @@ mod tests {
     use aruna_blob::blob::BlobHandler;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+    };
     use aruna_core::structs::{
         Actor, Backend, BackendConfig, BackendLocation, BackendRef, BucketInfo, Group,
         GroupAuthorizationDocument, NodeCapabilities, PathRestriction, RealmAuthorizationDocument,
-        RealmId, RoCrateLimits, RoCrateUploadRecord,
+        RealmConfigDocument, RealmId, RealmNodeKind, RoCrateLimits, RoCrateUploadRecord,
     };
     use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -873,6 +875,21 @@ mod tests {
             .await
             .with_rocrate_limits(limits),
         );
+        let mut config = RealmConfigDocument::default_for_realm(realm(), Vec::new());
+        config.seed_default_placement();
+        config.ensure_node(node_id, RealmNodeKind::Server);
+        let actor = Actor {
+            node_id,
+            user_id: user,
+            realm_id: realm(),
+        };
+        write_doc(
+            &state,
+            REALM_CONFIG_KEYSPACE,
+            realm().as_bytes().to_vec().into(),
+            config.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
         (dir, state, user)
     }
 
