@@ -2,7 +2,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::structs::{
-    AuthContext, Permission, blob_bucket_permission_path, blob_object_permission_path,
+    AuthContext, BucketInfo, Permission, blob_bucket_permission_path, blob_object_permission_path,
 };
 use aruna_operations::blob_holders::{GetBlobHoldersError, GetBlobHoldersOperation};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -382,14 +382,9 @@ pub async fn blob_locations(
     let mut candidates = BTreeMap::new();
     let mut expected: BTreeSet<NodeId> = BTreeSet::new();
     let mut capped = false;
-    for target in bucket_info
-        .iter()
-        .flat_map(|bucket| bucket.replication.iter())
-        .flat_map(|config| config.targets.iter())
-        .filter(|target| target.node_id != local_node)
-    {
-        expected.insert(target.node_id);
-        capped |= !add_candidate(&mut candidates, target.node_id, &target.bucket);
+    for (node_id, bucket) in configured_targets(bucket_info.as_ref(), local_node, delete_marker) {
+        expected.insert(node_id);
+        capped |= !add_candidate(&mut candidates, node_id, &bucket);
     }
     let queued = match drive(
         QueuedReplicaNodesOperation::new(
@@ -589,6 +584,24 @@ async fn holder_nodes(
     .await
 }
 
+/// Legacy bucket replication targets that will receive this version. A target
+/// declining delete markers never gets a job for one, so reporting it would
+/// promise a copy that is not coming.
+fn configured_targets(
+    bucket: Option<&BucketInfo>,
+    local_node: NodeId,
+    delete_marker: bool,
+) -> Vec<(NodeId, String)> {
+    bucket
+        .iter()
+        .flat_map(|bucket| bucket.replication.iter())
+        .flat_map(|config| config.targets.iter())
+        .filter(|target| target.node_id != local_node)
+        .filter(|target| !delete_marker || target.replicate_delete_markers)
+        .map(|target| (target.node_id, target.bucket.clone()))
+        .collect()
+}
+
 /// Adds a candidate node unless the request is already at its cap. `false`
 /// means the node was dropped, which the answer has to admit.
 fn add_candidate(candidates: &mut BTreeMap<NodeId, String>, node: NodeId, bucket: &str) -> bool {
@@ -604,14 +617,56 @@ fn add_candidate(candidates: &mut BTreeMap<NodeId, String>, node: NodeId, bucket
 
 #[cfg(test)]
 mod tests {
-    use super::{BlobCopyState, BlobCopyStorage, copy_response, pending_copy};
+    use super::{BlobCopyState, BlobCopyStorage, configured_targets, copy_response, pending_copy};
     use crate::openapi::ApiDoc;
+    use aruna_core::structs::{
+        BucketInfo, BucketReplicationConfig, BucketReplicationTarget, RealmId,
+    };
     use aruna_operations::replication::location_summary::LocationSummaryError;
     use aruna_operations::replication::protocol::{LocationCopyStorage, LocationSummary};
     use ulid::Ulid;
 
     fn node_id() -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[3u8; 32]).public()
+    }
+
+    fn peer_id() -> aruna_core::NodeId {
+        iroh::SecretKey::from_bytes(&[4u8; 32]).public()
+    }
+
+    fn configured(markers: bool) -> BucketInfo {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        BucketInfo {
+            group_id: Ulid::from_bytes([2u8; 16]),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: aruna_core::types::UserId::nil(realm_id),
+            cors_configuration: None,
+            replication: Some(BucketReplicationConfig {
+                targets: vec![BucketReplicationTarget {
+                    node_id: peer_id(),
+                    realm_id,
+                    bucket: "mirror".to_string(),
+                    arn: String::new(),
+                    replicate_delete_markers: markers,
+                }],
+            }),
+            storage_routing: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn skips_declined_markers() {
+        // A legacy target that declines delete markers gets no job for one, so
+        // reporting it as pending would promise a copy that never arrives.
+        assert!(configured_targets(Some(&configured(false)), node_id(), true).is_empty());
+        assert_eq!(
+            configured_targets(Some(&configured(true)), node_id(), true),
+            vec![(peer_id(), "mirror".to_string())]
+        );
+        assert_eq!(
+            configured_targets(Some(&configured(false)), node_id(), false),
+            vec![(peer_id(), "mirror".to_string())]
+        );
     }
 
     #[test]
