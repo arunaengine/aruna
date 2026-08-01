@@ -54,7 +54,7 @@ pub struct BlobHandler {
     inflight: Arc<AtomicUsize>,
     /// Effects currently executing against a tenant backend. Erasing its
     /// credentials while one runs would leave that work unable to roll back.
-    group_effects: Arc<StdMutex<HashMap<Ulid, usize>>>,
+    group_effects: Arc<StdMutex<HashMap<Ulid, group::GroupBackendUse>>>,
 }
 
 #[derive(Clone, Debug)]

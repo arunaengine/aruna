@@ -2131,10 +2131,21 @@ async fn effect_holds_backend() {
 
     let hold = handler.hold_group_backends(&effect);
     assert!(hold.is_some());
-    assert!(handler.active_group_backends().contains(&backend_id));
+    assert!(
+        handler
+            .busy_group_backends(Duration::from_secs(60))
+            .contains(&backend_id)
+    );
 
+    // The metadata transaction naming the bytes commits after the effect
+    // returns, so the backend stays busy until the quiet period has passed.
     drop(hold);
-    assert!(handler.active_group_backends().is_empty());
+    assert!(
+        handler
+            .busy_group_backends(Duration::from_secs(60))
+            .contains(&backend_id)
+    );
+    assert!(handler.busy_group_backends(Duration::ZERO).is_empty());
 
     // A node backend never enters the set, so removal never waits on one.
     assert!(

@@ -14,6 +14,7 @@ use aruna_core::types::Key;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use ulid::Ulid;
 
 /// Uniform tenant write chunk. azblob and azdls declare no minimum, so without
@@ -113,10 +114,19 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
     ids
 }
 
+/// How a tenant backend is being used: effects running on it now, and when the
+/// last one finished. The metadata transaction that names the bytes commits
+/// after the effect returns, so the idle stamp is what bounds that gap.
+#[derive(Debug, Default)]
+pub(super) struct GroupBackendUse {
+    active: usize,
+    idle_since: Option<Instant>,
+}
+
 /// Keeps every tenant backend an executing effect names off the removable list
-/// until the effect returns.
+/// until the effect returns and its quiet period has passed.
 pub(super) struct GroupEffectGuard {
-    counts: Arc<Mutex<HashMap<Ulid, usize>>>,
+    counts: Arc<Mutex<HashMap<Ulid, GroupBackendUse>>>,
     ids: Vec<Ulid>,
 }
 
@@ -127,11 +137,10 @@ impl Drop for GroupEffectGuard {
         };
         for backend_id in &self.ids {
             if let Entry::Occupied(mut entry) = counts.entry(*backend_id) {
-                match entry.get().checked_sub(1) {
-                    Some(0) | None => {
-                        entry.remove();
-                    }
-                    Some(left) => *entry.get_mut() = left,
+                let usage = entry.get_mut();
+                usage.active = usage.active.saturating_sub(1);
+                if usage.active == 0 {
+                    usage.idle_since = Some(Instant::now());
                 }
             }
         }
@@ -148,7 +157,9 @@ impl BlobHandler {
         }
         let mut counts = self.group_effects.lock().ok()?;
         for backend_id in &ids {
-            *counts.entry(*backend_id).or_insert(0) += 1;
+            let usage = counts.entry(*backend_id).or_default();
+            usage.active = usage.active.saturating_add(1);
+            usage.idle_since = None;
         }
         drop(counts);
         Some(GroupEffectGuard {
@@ -157,11 +168,20 @@ impl BlobHandler {
         })
     }
 
-    pub(super) fn active_group_backends(&self) -> BTreeSet<Ulid> {
-        self.group_effects
-            .lock()
-            .map(|counts| counts.keys().copied().collect())
-            .unwrap_or_default()
+    /// Backends still running an effect, plus those whose last effect finished
+    /// less than `quiet` ago. Entries older than that are dropped as they are
+    /// read, so the map only holds backends this node has just written to.
+    pub(super) fn busy_group_backends(&self, quiet: Duration) -> BTreeSet<Ulid> {
+        let Ok(mut counts) = self.group_effects.lock() else {
+            return BTreeSet::new();
+        };
+        counts.retain(|_, usage| {
+            usage.active > 0
+                || usage
+                    .idle_since
+                    .is_some_and(|since| since.elapsed() < quiet)
+        });
+        counts.keys().copied().collect()
     }
 
     /// Loads every tenant backend the effect names into a handler of its own.

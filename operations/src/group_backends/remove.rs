@@ -23,9 +23,9 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::store::iter_prefix_page;
 
 const SCAN_PAGE_SIZE: usize = 512;
-/// How long a record must sit unchanged before removal considers it. A blob
-/// write holds no durable intent while its bytes land, so this has to clear the
-/// 10s storage request timeout by a wide margin.
+/// How long a backend must sit untouched before removal considers it. Bytes
+/// land inside a blob effect, but the transaction naming them commits after
+/// that effect returns, in steps each bounded by the storage request timeout.
 const REMOVAL_QUIET_PERIOD: Duration = Duration::from_secs(60);
 
 /// Deletes the record and credentials of every disabled tenant backend that no
@@ -50,7 +50,7 @@ async fn remove_at(context: &DriverContext, now: SystemTime) -> Result<usize, St
         }
         // Read per backend rather than once: a write that resolved the backend
         // just before it was disabled must still finish with its credentials.
-        if holding.contains(&backend) || active_backends(context).contains(&record.backend_id) {
+        if holding.contains(&backend) || busy_backends(context).contains(&record.backend_id) {
             continue;
         }
         match drive(
@@ -69,9 +69,9 @@ async fn remove_at(context: &DriverContext, now: SystemTime) -> Result<usize, St
     Ok(removed)
 }
 
-/// A write that resolved this backend before it was disabled commits its
-/// location row after the blob adapter has already let go, so removal must
-/// outwait that gap rather than trust a snapshot taken inside it.
+/// Covers the one window the blob adapter cannot see: routing resolved this
+/// backend just before the disable, and the effect carrying the bytes has not
+/// reached the adapter yet, so nothing holds it.
 fn settled(record: &GroupStorageBackend, now: SystemTime) -> bool {
     record
         .updated_at
@@ -79,11 +79,14 @@ fn settled(record: &GroupStorageBackend, now: SystemTime) -> bool {
         .is_some_and(|ready| ready <= now)
 }
 
-fn active_backends(context: &DriverContext) -> BTreeSet<Ulid> {
+/// Anchored on the last effect rather than on the disable: blob streaming has
+/// no time bound, so a delay measured from the disable proves nothing about a
+/// write that is still running.
+fn busy_backends(context: &DriverContext) -> BTreeSet<Ulid> {
     context
         .blob_handle
         .as_ref()
-        .map(aruna_blob::blob::BlobHandle::active_group_backends)
+        .map(|handle| handle.busy_group_backends(REMOVAL_QUIET_PERIOD))
         .unwrap_or_default()
 }
 

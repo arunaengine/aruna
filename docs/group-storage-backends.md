@@ -135,12 +135,19 @@ one. The reclaim-status response does not count open uploads, because that would
 mean scanning every upload on the node per request.
 
 A write that is streaming has no record of any kind yet, so the node also holds
-the backend for as long as any transfer against it is running. Disabling stops
-new writes from choosing the backend, so that set only drains. It is tracked in
-memory: a node restart forgets it, but a killed transfer's bytes are orphaned in
-your bucket either way, because writes are not sealed on shutdown. A rollback
-delete the backend refuses is queued instead, and the node drops that queued
-delete once the backend record is gone, since nothing can reach the bytes then.
+the backend for as long as any transfer against it is running, and for a minute
+after the last one finishes: the transaction that records the bytes commits
+after the transfer has ended. Disabling stops new writes from choosing the
+backend, so that set only drains. It is tracked in memory: a node restart
+forgets it, but a killed transfer's bytes are orphaned in your bucket either
+way, because writes are not sealed on shutdown. A rollback delete the backend
+refuses is queued instead, and the node drops that queued delete once the
+backend record is gone, since nothing can reach the bytes then.
+
+A commit whose outcome the node never learns leaves bytes that may or may not be
+owned by a version. Those are queued for reconciliation rather than deleted: the
+node checks the committed record later and deletes the copy only if nothing
+names it. Such a row holds the backend the same way a queued delete does.
 
 ## Where your data actually is
 

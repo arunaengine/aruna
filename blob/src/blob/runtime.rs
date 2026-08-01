@@ -222,11 +222,15 @@ impl BlobHandle {
         self.handler.registry.routing()
     }
 
-    /// Tenant backends with an effect running against them right now. Their
-    /// credentials must outlive that effect or its rollback cannot reach the
-    /// bytes it wrote.
-    pub fn active_group_backends(&self) -> std::collections::BTreeSet<Ulid> {
-        self.handler.active_group_backends()
+    /// Tenant backends an effect is running against, plus those whose last
+    /// effect finished under `quiet` ago. Their credentials must outlive the
+    /// metadata transaction behind that effect, or its rollback cannot reach
+    /// the bytes it wrote.
+    pub fn busy_group_backends(
+        &self,
+        quiet: std::time::Duration,
+    ) -> std::collections::BTreeSet<Ulid> {
+        self.handler.busy_group_backends(quiet)
     }
 
     /// Per-backend health for `/info`.
