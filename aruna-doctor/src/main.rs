@@ -8,7 +8,9 @@ use crate::iroh_check::print_iroh_check;
 use crate::portal::update_portal;
 use crate::reclaim::{print_status as reclaim_status, seed_backend};
 use crate::storage::{import, snapshot};
-use crate::tokens::{create_local_bootstrap_token, create_oidc_token, view_token};
+use crate::tokens::{
+    create_local_bootstrap_token, create_oidc_token, recover_initial_admin, view_token,
+};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -48,6 +50,8 @@ pub enum Commands {
     ViewToken {
         token: String,
     },
+    /// Re-mint an initial-administrator onboarding secret on local storage.
+    RecoverAdmin,
     Snapshot {
         database_path: String,
         target_path: String,
@@ -199,6 +203,10 @@ pub async fn main() -> Result<(), CliError> {
         Commands::ViewToken { token } => {
             let token = view_token(token).await?;
             println!("{}", token);
+        }
+        Commands::RecoverAdmin => {
+            let secret = recover_initial_admin().await?;
+            println!("{}", secret);
         }
         Commands::Snapshot {
             database_path,

@@ -7,7 +7,9 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
-use aruna_core::onboarding::{OnboardingMode, OnboardingSecret, OnboardingSyncTicket};
+use aruna_core::onboarding::{
+    OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingSyncTicket,
+};
 use aruna_core::{DocumentSyncEffect, NodeId, UserId};
 use aruna_operations::create_onboarding_secret::{
     CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
@@ -338,6 +340,7 @@ pub async fn ensure_initial_local_onboarding_secret(
     driver_ctx: &DriverContext,
     seed_url: String,
     net_secret_key: &[u8; 32],
+    realm_id: aruna_core::structs::RealmId,
 ) -> Result<OnboardingSecret, Box<dyn std::error::Error>> {
     if let Some(sealed) = load_persisted_state::<SealedOnboardingSecret>(
         driver_ctx,
@@ -359,11 +362,14 @@ pub async fn ensure_initial_local_onboarding_secret(
         enrollment_id: ulid::Ulid::generate(),
         secret: secret_bytes,
         mode: OnboardingMode::Local,
+        realm_id,
+        purpose: OnboardingPurpose::InitialAdministrator,
     };
     let record = aruna_core::onboarding::OnboardingSecretRecord {
         enrollment_id: onboarding_secret.enrollment_id,
         secret_hash: onboarding_secret.secret_hash(),
         mode: OnboardingMode::Local,
+        purpose: OnboardingPurpose::InitialAdministrator,
         expires_at: u64::MAX,
         claimed_node_id: None,
     };

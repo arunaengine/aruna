@@ -213,6 +213,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     driver_ctx.as_ref(),
                     format!("http://{}", config.http_socket_addr),
                     &config.node_state.net_secret_key,
+                    config.realm_id,
                 )
                 .await
                 {

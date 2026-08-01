@@ -2,7 +2,7 @@ use crate::auth::{OidcIdentity, bearer_token};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::UserId;
-use aruna_core::onboarding::{OnboardingMode, OnboardingSecret};
+use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecret};
 use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, Role, User,
 };
@@ -462,6 +462,9 @@ async fn register_admin(
 ) -> Result<User, ServerError> {
     let onboarding_secret =
         OnboardingSecret::decode(&onboarding_secret).map_err(|_| ServerError::Unauthorized)?;
+    if onboarding_secret.realm_id != state.get_realm_id() {
+        return Err(ServerError::Unauthorized);
+    }
     let secret_hash = onboarding_secret.secret_hash();
     let inspected = drive(
         InspectOnboardingSecretOperation::new(InspectOnboardingSecretInput {
@@ -474,7 +477,7 @@ async fn register_admin(
     )
     .await
     .map_err(map_inspect_onboarding_error)?;
-    if inspected.mode != OnboardingMode::Local {
+    if inspected.purpose != OnboardingPurpose::InitialAdministrator {
         return Err(ServerError::Forbidden);
     }
 
@@ -1006,7 +1009,9 @@ mod tests {
     use aruna_core::handle::Handle;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
-    use aruna_core::onboarding::{OnboardingMode, OnboardingSecret, OnboardingSecretRecord};
+    use aruna_core::onboarding::{
+        OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingSecretRecord,
+    };
     use aruna_core::structs::{
         Actor, NodeCapabilities, OidcProviderConfig, PathRestriction, Permission,
         RealmConfigDocument, RealmId, TokenClaims, User, oidc_subject_key,
@@ -1402,6 +1407,8 @@ mod tests {
             enrollment_id: Ulid::generate(),
             secret: [7u8; 32],
             mode: OnboardingMode::Local,
+            realm_id: node.realm_id,
+            purpose: OnboardingPurpose::InitialAdministrator,
         };
         drive(
             CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
@@ -1409,6 +1416,7 @@ mod tests {
                     enrollment_id: onboarding_secret.enrollment_id,
                     secret_hash: onboarding_secret.secret_hash(),
                     mode: OnboardingMode::Local,
+                    purpose: OnboardingPurpose::InitialAdministrator,
                     expires_at: u64::MAX,
                     claimed_node_id: None,
                 },

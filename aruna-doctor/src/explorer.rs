@@ -1496,7 +1496,7 @@ mod tests {
         S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
         SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
     };
-    use aruna_core::onboarding::{OnboardingMode, OnboardingSecretRecord};
+    use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_core::structs::{
         Actor, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
         BucketReplicationConfig, BucketReplicationTarget, Group, HashPathIndexKey,
@@ -1831,6 +1831,7 @@ mod tests {
             enrollment_id: Ulid::generate(),
             secret_hash: "hash123".to_string(),
             mode: OnboardingMode::Server,
+            purpose: OnboardingPurpose::NodeEnrollment,
             expires_at: 1234,
             claimed_node_id: None,
         };

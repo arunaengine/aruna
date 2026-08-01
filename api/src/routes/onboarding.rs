@@ -3,7 +3,8 @@ use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, CreateOnboardingSecretRequest,
-    CreateOnboardingSecretResponse, OnboardingMode, OnboardingSecret, OnboardingSecretRecord,
+    CreateOnboardingSecretResponse, OnboardingMode, OnboardingPurpose, OnboardingSecret,
+    OnboardingSecretRecord,
     OnboardingSecretState, bootstrap_issuer_proof_message, bootstrap_node_proof_message,
 };
 use aruna_core::structs::{AuthContext, NodeCapabilities, Permission};
@@ -221,6 +222,8 @@ pub async fn create_onboarding_secret(
         enrollment_id: ulid::Ulid::generate(),
         secret: secret_bytes,
         mode: request.mode,
+        realm_id: state.get_realm_id(),
+        purpose: OnboardingPurpose::NodeEnrollment,
     };
     let encoded_secret = onboarding_secret
         .encode()
@@ -229,6 +232,7 @@ pub async fn create_onboarding_secret(
         enrollment_id: onboarding_secret.enrollment_id,
         secret_hash: onboarding_secret.secret_hash(),
         mode: onboarding_secret.mode,
+        purpose: OnboardingPurpose::NodeEnrollment,
         expires_at,
         claimed_node_id: None,
     };
@@ -602,7 +606,8 @@ mod tests {
     use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::onboarding::{
         BootstrapOnboardingRequest, CreateOnboardingSecretRequest, OnboardingMode,
-        OnboardingSecretRecord, bootstrap_issuer_proof_message, bootstrap_node_proof_message,
+        OnboardingPurpose, OnboardingSecretRecord, bootstrap_issuer_proof_message,
+        bootstrap_node_proof_message,
     };
     use aruna_core::storage_entries::admin_document_reducer_state_key;
     use aruna_core::structs::{
@@ -914,6 +919,7 @@ mod tests {
                     enrollment_id: finalizing_id,
                     secret_hash: "finalizing".to_string(),
                     mode: OnboardingMode::Server,
+                    purpose: OnboardingPurpose::NodeEnrollment,
                     expires_at: 1,
                     claimed_node_id: None,
                 },
@@ -943,6 +949,7 @@ mod tests {
                     enrollment_id: stale_id,
                     secret_hash: "stale".to_string(),
                     mode: OnboardingMode::Local,
+                    purpose: OnboardingPurpose::NodeEnrollment,
                     expires_at: 1,
                     claimed_node_id: None,
                 },

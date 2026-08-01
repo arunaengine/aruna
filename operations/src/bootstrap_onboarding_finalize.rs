@@ -387,8 +387,8 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE, ONBOARDING_KEYSPACE};
     use aruna_core::onboarding::{
-        OnboardingMode, OnboardingSecretRecord, OnboardingSecretState, OnboardingSecretStateRecord,
-        OnboardingSyncTicket,
+        OnboardingMode, OnboardingPurpose, OnboardingSecretRecord, OnboardingSecretState,
+        OnboardingSecretStateRecord, OnboardingSyncTicket,
     };
     use aruna_core::structs::{
         Actor, BindingScope, DocumentClass, KIND_LABEL_KEY, NotificationKind,
@@ -459,6 +459,7 @@ mod tests {
                     enrollment_id,
                     secret_hash: "abc".to_string(),
                     mode: OnboardingMode::Server,
+                    purpose: OnboardingPurpose::NodeEnrollment,
                     expires_at: ONBOARDING_SECRET_EXPIRES_AT,
                     claimed_node_id: None,
                 },

@@ -4,14 +4,20 @@ use aruna_api::routes::users::{GetTokenResponse, RegisterUserRequest, RegisterUs
 use aruna_api::server_state::load_persisted_state;
 use aruna_core::UserId;
 use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
-use aruna_core::onboarding::{OnboardingMode, OnboardingSecret};
+use aruna_core::onboarding::{
+    OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingSecretRecord,
+};
 use aruna_core::structs::{Actor, OidcProviderConfig, RealmId, TokenClaims};
 use aruna_operations::auth::{ArunaBearerTokenValidationState, decode_aruna_bearer_token};
 use aruna_operations::claim_initial_realm_admin::{
-    ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
+    ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
+    ClaimInitialRealmAdminResult,
 };
 use aruna_operations::consume_onboarding_secret::{
     ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
+};
+use aruna_operations::create_onboarding_secret::{
+    CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
 };
 use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::{DriverContext, drive};
@@ -25,6 +31,7 @@ use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use async_trait::async_trait;
 use jsonwebtoken::dangerous::insecure_decode;
+use rand::Rng;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -106,6 +113,9 @@ async fn create_direct_local_bootstrap_token(bootstrap_secret: String) -> Result
     };
 
     let onboarding_secret = OnboardingSecret::decode(&bootstrap_secret)?;
+    if onboarding_secret.realm_id != config.realm_id {
+        return Err(std::io::Error::other("bootstrap secret is not bound to this realm").into());
+    }
     let now = chrono::Utc::now().timestamp().max(0) as u64;
     let user_id = UserId::local(Ulid::generate(), config.realm_id);
     let inspected = drive(
@@ -119,10 +129,11 @@ async fn create_direct_local_bootstrap_token(bootstrap_secret: String) -> Result
     )
     .await
     .map_err(|err| std::io::Error::other(err.to_string()))?;
-    if inspected.mode != OnboardingMode::Local {
-        return Err(
-            std::io::Error::other("bootstrap secret is not a local onboarding secret").into(),
-        );
+    if inspected.purpose != OnboardingPurpose::InitialAdministrator {
+        return Err(std::io::Error::other(
+            "bootstrap secret is not an initial administrator secret",
+        )
+        .into());
     }
 
     drive(
@@ -155,7 +166,7 @@ async fn create_direct_local_bootstrap_token(bootstrap_secret: String) -> Result
     .await
     .map_err(|err| std::io::Error::other(err.to_string()))?;
 
-    drive(
+    let claim_result = drive(
         ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
             actor: Actor {
                 user_id: user.user_id,
@@ -166,6 +177,12 @@ async fn create_direct_local_bootstrap_token(bootstrap_secret: String) -> Result
     )
     .await
     .map_err(|err| std::io::Error::other(err.to_string()))?;
+    if matches!(claim_result, ClaimInitialRealmAdminResult::AlreadyClaimed) {
+        return Err(std::io::Error::other(
+            ClaimInitialRealmAdminError::InitialAdministratorAlreadyClaimed.to_string(),
+        )
+        .into());
+    }
 
     let token = drive(
         CreateTokenOperation::new(CreateTokenConfig {
@@ -181,6 +198,47 @@ async fn create_direct_local_bootstrap_token(bootstrap_secret: String) -> Result
     .map_err(|err| std::io::Error::other(err.to_string()))?;
 
     Ok(token)
+}
+
+/// Mint a fresh initial-administrator onboarding secret on this node's storage
+/// so an operator can recover admin access when the original secret is lost.
+pub async fn recover_initial_admin() -> Result<String, CliError> {
+    let (config, storage_handle) = load().await.map_err(Box::new)?;
+    let driver_ctx = DriverContext {
+        storage_handle,
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: Some(TaskHandle::new()),
+        compute_handle: None,
+    };
+
+    let mut secret_bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut secret_bytes);
+    let onboarding_secret = OnboardingSecret {
+        seed_url: format!("http://{}", config.http_socket_addr),
+        enrollment_id: Ulid::generate(),
+        secret: secret_bytes,
+        mode: OnboardingMode::Local,
+        realm_id: config.realm_id,
+        purpose: OnboardingPurpose::InitialAdministrator,
+    };
+    let record = OnboardingSecretRecord {
+        enrollment_id: onboarding_secret.enrollment_id,
+        secret_hash: onboarding_secret.secret_hash(),
+        mode: OnboardingMode::Local,
+        purpose: OnboardingPurpose::InitialAdministrator,
+        expires_at: u64::MAX,
+        claimed_node_id: None,
+    };
+    drive(
+        CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput { record }),
+        &driver_ctx,
+    )
+    .await
+    .map_err(|err| std::io::Error::other(err.to_string()))?;
+
+    Ok(onboarding_secret.encode()?)
 }
 
 pub async fn create_oidc_token(
@@ -1169,6 +1227,7 @@ mod tests {
             node.context.as_ref(),
             node.base_url.clone(),
             &[7u8; 32],
+            *node.net.realm_id(),
         )
         .await?
         .encode()?;
