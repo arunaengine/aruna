@@ -624,7 +624,7 @@ pub async fn create_metadata_document(
                     realm_id: state.get_realm_id(),
                 },
                 group_id,
-                document_id: Ulid::generate(),
+                document_id: Ulid::nil(),
                 document_path: path,
                 public,
                 payload,

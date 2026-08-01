@@ -1,3 +1,4 @@
+use aruna_core::StructuredId;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
     Actor, AuthContext, ExecutionSpec, InputSource, JobError, JobId, JobPayload, JobRecord,
@@ -18,7 +19,7 @@ use super::super::store::{put_run_crate_status, read_job_record, read_run_crate_
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload,
+    CreateMetadataDocumentPayload, mint_job_create_id,
 };
 use crate::driver::drive;
 use crate::metadata::MetadataAuthToken;
@@ -73,13 +74,30 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
     let Some(net_handle) = context.net_handle.as_ref() else {
         return JobRunOutcome::Failed(JobError::retryable("run crate needs a net handle"));
     };
-    let document_id = Ulid::from_bytes(for_job.to_bytes());
     let document_path = format!("runs/{for_job}");
     let node_id = net_handle.node_id();
     let actor = Actor {
         node_id,
         user_id: parent.created_by,
         realm_id: parent.created_by.realm_id,
+    };
+    // Deterministic structured id keyed on the job id, minted before the RO-Crate
+    // content embeds it, so a restart re-derives the identical id (idempotent).
+    let document_id = match mint_job_create_id(
+        context,
+        &actor,
+        spec.group_id,
+        &document_path,
+        Ulid::from_bytes(for_job.to_bytes()),
+    )
+    .await
+    {
+        Ok(id) => id.as_ulid(),
+        Err(error) => {
+            return JobRunOutcome::Failed(JobError::retryable(format!(
+                "run crate mint document id failed: {error}"
+            )));
+        }
     };
     let denied = match drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {

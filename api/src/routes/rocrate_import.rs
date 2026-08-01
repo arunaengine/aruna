@@ -3,16 +3,18 @@ use std::sync::{Arc, Mutex};
 
 use aruna_core::errors::{BlobError, SourceConnectorResolutionError, StagingSourceError};
 use aruna_core::stream::BackendStream;
+use aruna_core::StructuredId;
 use aruna_core::structs::{
-    AuthContext, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget,
-    JobPayload, MetadataRegistryRecord, Permission, RoCrateMediaType, blob_bucket_permission_path,
-    blob_object_permission_path, user_dedup_key,
+    Actor, AuthContext, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
+    ImportRoCrateTarget, JobPayload, MetadataRegistryRecord, Permission, RoCrateMediaType,
+    blob_bucket_permission_path, blob_object_permission_path, user_dedup_key,
 };
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::import::{
     CreateRoCrateUploadConfig, CreateRoCrateUploadError, CreateRoCrateUploadOperation,
     load_rocrate_upload,
 };
+use aruna_operations::create_metadata_document::mint_job_create_id;
 use aruna_operations::jobs::service::{lookup_job_dedup, read_owned_job, submit_rocrate_import};
 use aruna_operations::list_metadata_documents::ListMetadataDocumentsOperation;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
@@ -207,10 +209,27 @@ pub async fn submit_import(
     Json(request): Json<SubmitImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
-    let document_id = Ulid::generate();
     let source = parse_import_source(request.source)?;
     let target = parse_import_target(request.target, state.rocrate_limits().key_bytes)?;
     let metadata = parse_import_metadata(request.metadata, state.rocrate_limits().key_bytes)?;
+    // Mint the imported document's structured id at submission (seeded fresh, then
+    // stored in the spec), so the import job's create routes by a real handle and
+    // bucket instead of an unstructured ULID.
+    let actor = Actor {
+        node_id: state.get_node_id(),
+        user_id: auth.user_id,
+        realm_id: state.get_realm_id(),
+    };
+    let document_id = mint_job_create_id(
+        state.get_ctx().as_ref(),
+        &actor,
+        metadata.group_id,
+        &metadata.path,
+        Ulid::generate(),
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.to_string()))?
+    .as_ulid();
     let spec = ImportRoCrateSpec {
         auth_context: auth,
         source,
