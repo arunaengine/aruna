@@ -96,10 +96,10 @@ pub fn parse_list_page(xml: &str) -> Result<OaiPage, OaiParseError> {
                     &mut error_message,
                 );
                 text.clear();
-                if stack.last().map(Vec::as_slice) == Some(b"record") {
-                    if let Some(done) = record.take() {
-                        records.push(done);
-                    }
+                if stack.last().map(Vec::as_slice) == Some(b"record")
+                    && let Some(done) = record.take()
+                {
+                    records.push(done);
                 }
                 stack.pop();
             }
@@ -109,13 +109,13 @@ pub fn parse_list_page(xml: &str) -> Result<OaiPage, OaiParseError> {
         }
     }
 
-    if let Some(code) = error_code {
-        if code != "noRecordsMatch" {
-            return Err(OaiParseError::Protocol {
-                code,
-                message: error_message,
-            });
-        }
+    if let Some(code) = error_code
+        && code != "noRecordsMatch"
+    {
+        return Err(OaiParseError::Protocol {
+            code,
+            message: error_message,
+        });
     }
 
     Ok(OaiPage {
