@@ -1626,4 +1626,109 @@ mod test {
         assert_eq!(cached_metadata.etag.as_deref(), Some("stale-etag"));
         assert_eq!(last_refresh, SystemTime::UNIX_EPOCH);
     }
+
+    // A pinned historical reference version whose live source has drifted from
+    // its recorded observation cannot serve current bytes: #375 caching is
+    // deferred, so there are no historical bytes to return.
+    #[tokio::test]
+    async fn explicit_reference_version_drift_is_unavailable() {
+        let endpoint = spawn_reference_server(b"hello reference").await;
+        let temp_handle = tempdir().unwrap();
+        let temp_root = temp_handle.path().to_str().unwrap();
+        let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+        let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+            .await
+            .unwrap();
+        let blob_handle = BlobHandler::with_egress(
+            BackendConfig {
+                backend_type: Backend::FileSystem,
+                bucket_prefix: Some("aruna_".to_string()),
+                max_bucket_size: Some(100000),
+                multipart_bucket: Some("multipart".to_string()),
+                root: temp_root.to_string(),
+                service_config: HashMap::new(),
+                timeouts: Default::default(),
+            },
+            storage_handle.clone(),
+            net_handle.clone(),
+            EgressPolicy::loopback(),
+        )
+        .await
+        .unwrap();
+
+        let driver_ctx = DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: Some(net_handle),
+            blob_handle: Some(blob_handle),
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+
+        let version_id = Ulid::generate();
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::from([("endpoint".to_string(), endpoint)]),
+                source_path: "folder/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: Some(Ulid::generate()),
+        };
+
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        else {
+            panic!("Failed to start transaction");
+        };
+        let _ = storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                key: VersionKey::new("s3test", "refresh.txt", version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                value: BlobVersion::reference(
+                    source,
+                    SourceMetadata {
+                        content_length: 1,
+                        content_type: Some("application/octet-stream".to_string()),
+                        etag: Some("stale-etag".to_string()),
+                        last_modified: None,
+                        source_version: None,
+                    },
+                    SystemTime::UNIX_EPOCH,
+                    Default::default(),
+                    SystemTime::UNIX_EPOCH,
+                )
+                .to_bytes()
+                .unwrap()
+                .into(),
+                txn_id: Some(txn_id),
+            })
+            .await;
+        let _ = storage_handle
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await;
+
+        let error = drive(
+            GetObjectOperation::new(GetObjectInput {
+                bucket: "s3test".to_string(),
+                key: "refresh.txt".to_string(),
+                version_id: Some(version_id),
+                range: None,
+                group_id: Ulid::generate(),
+                user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, GetObjectError::HistoricalReferenceUnavailable);
+    }
 }
