@@ -6,14 +6,16 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{JOB_ACTIVE_USER_KEYSPACE, JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    JobId, JobPayload, JobRecord, WorkspaceMode, job_active_prefix, job_record_key,
-    parse_job_dedup_value,
+    DEFAULT_SHARD_COUNT, JOBCONTROL_HANDLE, JobId, JobPayload, JobRecord, WorkspaceMode,
+    job_active_prefix, job_record_key, parse_job_dedup_value, shard_for_subject,
 };
+use aruna_core::structured_id::{BucketId, JobId as RoutableJobId, PlacementHandle, StructuredId};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, NodeId, TxnId, UserId};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
+use ulid::Ulid;
 
 use super::store::{decode_job_record, job_dedup_index_key, job_insert_entries};
 
@@ -23,6 +25,20 @@ pub fn schedule_job_drain_effect() -> Effect {
         key: TaskKey::DrainJobQueue,
         after: Duration::ZERO,
     })
+}
+
+/// Fresh routable id for a new top-level job: creation-ordered by `now_ms`,
+/// placed in the reserved JobControl band, with a random subject spreading jobs
+/// across shards and a random nonce keeping each id unique.
+fn mint_job_id(now_ms: u64) -> JobId {
+    let handle = PlacementHandle::new(JOBCONTROL_HANDLE).expect("job-control handle is reserved");
+    let entropy = Ulid::generate().to_bytes();
+    let shard = shard_for_subject(&entropy, DEFAULT_SHARD_COUNT) as u16;
+    let bucket = BucketId::new(shard).expect("shard within bucket space");
+    let nonce = u64::from_be_bytes(entropy[8..16].try_into().expect("8 bytes")) & ((1u64 << 48) - 1);
+    let routable =
+        RoutableJobId::from_parts(now_ms, handle, bucket, nonce).expect("structured job id");
+    JobId(routable.as_ulid())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,7 +126,7 @@ impl SubmitJobOperation {
             .rocrate_limits()
             .map(|limits| limits.max_active_jobs);
         let mut record = JobRecord::new(
-            JobId::new(),
+            mint_job_id(spec.now_ms),
             spec.payload,
             spec.created_by,
             spec.owner_node_id,
