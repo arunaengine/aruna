@@ -105,19 +105,31 @@ mod tests {
     #[test]
     fn fingerprint_is_stable_and_field_sensitive() {
         let base = metadata();
-        assert_eq!(base.observation_fingerprint(), base.observation_fingerprint());
+        assert_eq!(
+            base.observation_fingerprint(),
+            base.observation_fingerprint()
+        );
 
         let mut longer = base.clone();
         longer.content_length = 43;
-        assert_ne!(base.observation_fingerprint(), longer.observation_fingerprint());
+        assert_ne!(
+            base.observation_fingerprint(),
+            longer.observation_fingerprint()
+        );
 
         let mut retagged = base.clone();
         retagged.etag = Some("def".to_string());
-        assert_ne!(base.observation_fingerprint(), retagged.observation_fingerprint());
+        assert_ne!(
+            base.observation_fingerprint(),
+            retagged.observation_fingerprint()
+        );
 
         let mut touched = base.clone();
         touched.last_modified = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2000));
-        assert_ne!(base.observation_fingerprint(), touched.observation_fingerprint());
+        assert_ne!(
+            base.observation_fingerprint(),
+            touched.observation_fingerprint()
+        );
     }
 
     // source_version is transient (not persisted), so it must not perturb the
