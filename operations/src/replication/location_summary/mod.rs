@@ -11,7 +11,7 @@ use thiserror::Error;
 
 pub use local::{LocalSummary, LocationSummaryOperation};
 pub use queued::{QueuedReplicaNodesOperation, QueuedReplicas};
-pub use relationships::RelationshipReplicaNodesOperation;
+pub use relationships::{RelationshipReplicaNodesOperation, ReplicaTarget};
 pub use remote::RemoteLocationSummaryOperation;
 
 #[derive(Debug, Error, PartialEq)]

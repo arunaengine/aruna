@@ -25,6 +25,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -379,12 +380,43 @@ pub async fn blob_locations(
 
     let mut copies = vec![copy_response(local_node, true, local.summary)];
     let mut limits = Vec::new();
-    let mut candidates = BTreeMap::new();
+    let mut candidates = BTreeSet::new();
     let mut expected: BTreeSet<NodeId> = BTreeSet::new();
     let mut capped = false;
+    // First, because these are the only candidates that carry the path the copy
+    // is actually stored under; the source path every other source has is a
+    // guess whenever a relationship rewrites the key.
+    match drive(
+        RelationshipReplicaNodesOperation::new(
+            local_node,
+            query.bucket.clone(),
+            query.path.clone(),
+            delete_marker,
+        ),
+        ctx.as_ref(),
+    )
+    .await
+    {
+        Ok(targets) => {
+            for target in targets {
+                expected.insert(target.node_id);
+                capped |=
+                    !add_candidate(&mut candidates, target.node_id, &target.bucket, &target.key);
+            }
+        }
+        Err(error) => {
+            warn!(
+                bucket = %query.bucket,
+                key = %query.path,
+                error = %error,
+                "Sync relationship scan failed; relationship copies are unknown"
+            );
+            limits.push(LocationScanLimit::RelationshipScanFailed);
+        }
+    }
     for (node_id, bucket) in configured_targets(bucket_info.as_ref(), local_node, delete_marker) {
         expected.insert(node_id);
-        capped |= !add_candidate(&mut candidates, node_id, &bucket);
+        capped |= !add_candidate(&mut candidates, node_id, &bucket, &query.path);
     }
     let queued = match drive(
         QueuedReplicaNodesOperation::new(
@@ -409,9 +441,12 @@ pub async fn blob_locations(
             QueuedReplicas::default()
         }
     };
+    // Queue records and holder entries carry the source path, so they are asked
+    // about it. A relationship that rewrites the key already contributed the
+    // stored path above, and the more informative answer wins.
     for node_id in queued.nodes.iter().filter(|node| **node != local_node) {
         expected.insert(*node_id);
-        capped |= !add_candidate(&mut candidates, *node_id, &query.bucket);
+        capped |= !add_candidate(&mut candidates, *node_id, &query.bucket, &query.path);
     }
     // Config and queue only name copies that are planned. A destination dropped
     // from the config, or one whose queue record is already consumed, still
@@ -419,7 +454,7 @@ pub async fn blob_locations(
     match holder_nodes(&ctx, blake3, state.get_realm_id(), local_node).await {
         Ok(holders) => {
             for node_id in holders {
-                capped |= !add_candidate(&mut candidates, node_id, &query.bucket);
+                capped |= !add_candidate(&mut candidates, node_id, &query.bucket, &query.path);
             }
         }
         Err(error) => {
@@ -430,36 +465,6 @@ pub async fn blob_locations(
                 "Blob holder lookup failed; copies outside the configuration are unknown"
             );
             limits.push(LocationScanLimit::HolderLookupFailed);
-        }
-    }
-    // Last, so a node another source already named keeps the bucket that source
-    // chose. In the windows this covers, before the live job exists and after a
-    // drained job is deleted, no other source names the destination at all.
-    match drive(
-        RelationshipReplicaNodesOperation::new(
-            local_node,
-            query.bucket.clone(),
-            query.path.clone(),
-            delete_marker,
-        ),
-        ctx.as_ref(),
-    )
-    .await
-    {
-        Ok(targets) => {
-            for (node_id, bucket) in targets {
-                expected.insert(node_id);
-                capped |= !add_candidate(&mut candidates, node_id, &bucket);
-            }
-        }
-        Err(error) => {
-            warn!(
-                bucket = %query.bucket,
-                key = %query.path,
-                error = %error,
-                "Sync relationship scan failed; relationship copies are unknown"
-            );
-            limits.push(LocationScanLimit::RelationshipScanFailed);
         }
     }
     if queued.truncated {
@@ -491,9 +496,10 @@ pub async fn blob_locations(
     // One deadline for the whole fan-out, so a wall of stalled peers costs the
     // caller the deadline rather than the deadline times the candidate count.
     let deadline = Instant::now() + LOCATION_REQUEST_DEADLINE;
-    let answers = stream::iter(candidates.into_iter().map(|(node_id, bucket)| {
+    let answers = stream::iter(candidates.into_iter().map(|(node_id, bucket, key)| {
         let request = LocationSummaryRequest {
             bucket,
+            key,
             version_id: Some(resolved),
             ..request.clone()
         };
@@ -512,17 +518,29 @@ pub async fn blob_locations(
     .collect::<Vec<_>>()
     .await;
 
-    let mut path_unknown = false;
-    let mut unreachable = false;
+    let mut asked: BTreeSet<NodeId> = BTreeSet::new();
+    let mut answered: BTreeMap<NodeId, BlobCopyResponse> = BTreeMap::new();
     for (node_id, answer) in answers {
-        match peer_copy(node_id, expected.contains(&node_id), answer) {
-            Some(copy) => {
-                unreachable |= copy.state == BlobCopyState::Unreachable;
-                copies.push(copy);
+        asked.insert(node_id);
+        let Some(copy) = peer_copy(node_id, expected.contains(&node_id), answer) else {
+            continue;
+        };
+        match answered.entry(node_id) {
+            Entry::Vacant(slot) => {
+                slot.insert(copy);
             }
-            None => path_unknown = true,
+            Entry::Occupied(mut slot) => {
+                if copy_rank(copy.state) < copy_rank(slot.get().state) {
+                    slot.insert(copy);
+                }
+            }
         }
     }
+    let path_unknown = asked.iter().any(|node| !answered.contains_key(node));
+    let unreachable = answered
+        .values()
+        .any(|copy| copy.state == BlobCopyState::Unreachable);
+    copies.extend(answered.into_values());
     if unreachable {
         limits.push(LocationScanLimit::HolderUnreachable);
     }
@@ -602,16 +620,36 @@ fn configured_targets(
         .collect()
 }
 
-/// Adds a candidate node unless the request is already at its cap. `false`
-/// means the node was dropped, which the answer has to admit.
-fn add_candidate(candidates: &mut BTreeMap<NodeId, String>, node: NodeId, bucket: &str) -> bool {
-    if candidates.contains_key(&node) {
+/// How much an answer says. A node asked under several destination paths keeps
+/// its most informative one: a path that holds the copy outranks one that only
+/// knows a copy is expected there.
+fn copy_rank(state: BlobCopyState) -> u8 {
+    match state {
+        BlobCopyState::Present => 0,
+        BlobCopyState::NotStored => 1,
+        BlobCopyState::Pending => 2,
+        BlobCopyState::Denied => 3,
+        BlobCopyState::Unreachable => 4,
+    }
+}
+
+/// Adds one destination unless the request is already at its cap. Candidates
+/// are whole paths, so two mappings onto one node are two questions. `false`
+/// means the destination was dropped, which the answer has to admit.
+fn add_candidate(
+    candidates: &mut BTreeSet<(NodeId, String, String)>,
+    node: NodeId,
+    bucket: &str,
+    key: &str,
+) -> bool {
+    let candidate = (node, bucket.to_string(), key.to_string());
+    if candidates.contains(&candidate) {
         return true;
     }
     if candidates.len() >= LOCATION_CANDIDATE_LIMIT {
         return false;
     }
-    candidates.insert(node, bucket.to_string());
+    candidates.insert(candidate);
     true
 }
 
@@ -754,19 +792,58 @@ mod tests {
 
     #[test]
     fn caps_candidates() {
-        // Past the cap a node is dropped, and the caller has to be told.
-        let mut candidates = std::collections::BTreeMap::new();
+        // Past the cap a destination is dropped, and the caller has to be told.
+        let mut candidates = std::collections::BTreeSet::new();
         for seed in 0..super::LOCATION_CANDIDATE_LIMIT {
             let node = iroh::SecretKey::from_bytes(&[seed as u8 + 1; 32]).public();
-            assert!(super::add_candidate(&mut candidates, node, "raw"));
+            assert!(super::add_candidate(&mut candidates, node, "raw", "a.tar"));
         }
 
         let extra = iroh::SecretKey::from_bytes(&[0u8; 32]).public();
-        assert!(!super::add_candidate(&mut candidates, extra, "raw"));
+        assert!(!super::add_candidate(
+            &mut candidates,
+            extra,
+            "raw",
+            "a.tar"
+        ));
         assert_eq!(candidates.len(), super::LOCATION_CANDIDATE_LIMIT);
 
-        let known = *candidates.keys().next().unwrap();
-        assert!(super::add_candidate(&mut candidates, known, "raw"));
+        let known = candidates.iter().next().unwrap().0;
+        assert!(super::add_candidate(&mut candidates, known, "raw", "a.tar"));
+    }
+
+    #[test]
+    fn keeps_mapped_path() {
+        // The same node under two destination paths is two questions: dropping
+        // one would hide the copy stored under the other.
+        let mut candidates = std::collections::BTreeSet::new();
+        let node = node_id();
+        assert!(super::add_candidate(
+            &mut candidates,
+            node,
+            "archive",
+            "images/a.jpg"
+        ));
+        assert!(super::add_candidate(
+            &mut candidates,
+            node,
+            "raw",
+            "photos/a.jpg"
+        ));
+
+        assert_eq!(candidates.len(), 2);
+    }
+
+    #[test]
+    fn present_outranks_pending() {
+        // A node that holds the copy under its mapped path must not be reported
+        // as pending because another path it was asked about knows nothing.
+        assert!(
+            super::copy_rank(BlobCopyState::Present) < super::copy_rank(BlobCopyState::Pending)
+        );
+        assert!(
+            super::copy_rank(BlobCopyState::Pending) < super::copy_rank(BlobCopyState::Unreachable)
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use super::LocationSummaryError;
+use crate::replication::version_replication::map_sync_key;
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -7,7 +8,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, sync_relationship_prefix};
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 const RELATIONSHIP_PAGE_SIZE: usize = 256;
 
@@ -19,18 +20,28 @@ enum RelationshipState {
     Error,
 }
 
+/// One destination a copy of this version lands on: the node, plus the bucket
+/// and key it is stored under there. Two relationships to one node with
+/// different mappings are two destinations, not one.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ReplicaTarget {
+    pub node_id: NodeId,
+    pub bucket: String,
+    pub key: String,
+}
+
 /// Destinations an enabled outbound sync relationship will replicate this
-/// version to, mapped to the bucket the copy lands in. Between the local commit
-/// and the queue job that follows it, no other source names them.
+/// version to, each carrying the path the copy is stored under. Between the
+/// local commit and the queue job that follows it, no other source names them.
 #[derive(Debug, PartialEq)]
 pub struct RelationshipReplicaNodesOperation {
     local_node: NodeId,
     bucket: String,
     key: String,
     delete_marker: bool,
-    found: BTreeMap<NodeId, String>,
+    found: BTreeSet<ReplicaTarget>,
     state: RelationshipState,
-    output: Option<Result<BTreeMap<NodeId, String>, LocationSummaryError>>,
+    output: Option<Result<BTreeSet<ReplicaTarget>, LocationSummaryError>>,
 }
 
 impl RelationshipReplicaNodesOperation {
@@ -40,7 +51,7 @@ impl RelationshipReplicaNodesOperation {
             bucket,
             key,
             delete_marker,
-            found: BTreeMap::new(),
+            found: BTreeSet::new(),
             state: RelationshipState::Init,
             output: None,
         }
@@ -58,27 +69,30 @@ impl RelationshipReplicaNodesOperation {
     }
 
     /// The live queue's own admission rule, minus the loop guards that need the
-    /// inbound origin of a write this query does not have.
-    fn target_of(&self, relationship: &SyncRelationship) -> Option<(NodeId, String)> {
+    /// inbound origin of a write this query does not have. The key runs through
+    /// replication's own mapping, so a prefix rewrite is asked about where the
+    /// copy actually lands.
+    fn target_of(&self, relationship: &SyncRelationship) -> Option<ReplicaTarget> {
         if !matches!(
             relationship.mode,
             SyncMode::Continuous | SyncMode::Reference
         ) || relationship.state != SyncState::Enabled
             || relationship.source.node_id != self.local_node
             || relationship.source.bucket() != Some(self.bucket.as_str())
-            || relationship
-                .source
-                .key_prefix()
-                .is_some_and(|prefix| !self.key.starts_with(prefix))
             || (self.delete_marker && !relationship.replicate_deletes)
             || relationship.target.node_id == self.local_node
         {
             return None;
         }
-        relationship
-            .target
-            .bucket()
-            .map(|bucket| (relationship.target.node_id, bucket.to_string()))
+        Some(ReplicaTarget {
+            node_id: relationship.target.node_id,
+            bucket: relationship.target.bucket()?.to_string(),
+            key: map_sync_key(
+                &self.key,
+                relationship.source.key_prefix(),
+                relationship.target.key_prefix(),
+            )?,
+        })
     }
 
     fn fail(&mut self, error: LocationSummaryError) -> Effects {
@@ -89,7 +103,7 @@ impl RelationshipReplicaNodesOperation {
 }
 
 impl Operation for RelationshipReplicaNodesOperation {
-    type Output = BTreeMap<NodeId, String>;
+    type Output = BTreeSet<ReplicaTarget>;
     type Error = LocationSummaryError;
 
     fn start(&mut self) -> Effects {
@@ -115,8 +129,8 @@ impl Operation for RelationshipReplicaNodesOperation {
                         Ok(relationship) => relationship,
                         Err(error) => return self.fail(error.into()),
                     };
-                    if let Some((node_id, bucket)) = self.target_of(&relationship) {
-                        self.found.insert(node_id, bucket);
+                    if let Some(target) = self.target_of(&relationship) {
+                        self.found.insert(target);
                     }
                 }
                 match next_start_after {
@@ -153,7 +167,7 @@ impl Operation for RelationshipReplicaNodesOperation {
 
 #[cfg(test)]
 mod tests {
-    use super::RelationshipReplicaNodesOperation;
+    use super::{RelationshipReplicaNodesOperation, ReplicaTarget};
     use crate::replication::location_summary::fixtures::{node_id, realm_id};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
@@ -206,8 +220,73 @@ mod tests {
 
         op.step(page(&link("raw", "mirror", true)));
 
+        assert_eq!(
+            op.finalize().unwrap().into_iter().collect::<Vec<_>>(),
+            vec![ReplicaTarget {
+                node_id: node_id(6),
+                bucket: "mirror".to_string(),
+                key: "run1.tar".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn maps_destination_key() {
+        // A prefix rewrite stores the copy under the mapped key, so asking the
+        // destination about the source key would miss it.
+        let mut op = RelationshipReplicaNodesOperation::new(
+            node_id(4),
+            "raw".to_string(),
+            "photos/a.jpg".to_string(),
+            false,
+        );
+        op.start();
+        let mut relationship = link("raw", "archive", true);
+        relationship.source =
+            ArunaArn::s3_object_prefix(realm_id(), node_id(4), "raw", "photos/").unwrap();
+        relationship.target =
+            ArunaArn::s3_object_prefix(realm_id(), node_id(6), "archive", "images/").unwrap();
+
+        op.step(page(&relationship));
+
+        assert_eq!(
+            op.finalize().unwrap().into_iter().collect::<Vec<_>>(),
+            vec![ReplicaTarget {
+                node_id: node_id(6),
+                bucket: "archive".to_string(),
+                key: "images/a.jpg".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn keeps_both_mappings() {
+        // Two relationships to one node place two copies; collapsing them to
+        // one destination loses whichever mapping came second.
+        let mut op = RelationshipReplicaNodesOperation::new(
+            node_id(4),
+            "raw".to_string(),
+            "photos/a.jpg".to_string(),
+            false,
+        );
+        op.start();
+        let mut second = link("raw", "second", true);
+        second.id = Ulid::from_bytes([2u8; 16]);
+
+        op.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![
+                (
+                    b"a".to_vec().into(),
+                    link("raw", "mirror", true).to_bytes().unwrap().into(),
+                ),
+                (b"b".to_vec().into(), second.to_bytes().unwrap().into()),
+            ],
+            next_start_after: None,
+        }));
+
         let targets = op.finalize().unwrap();
-        assert_eq!(targets.get(&node_id(6)).map(String::as_str), Some("mirror"));
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().all(|target| target.node_id == node_id(6)));
     }
 
     #[test]

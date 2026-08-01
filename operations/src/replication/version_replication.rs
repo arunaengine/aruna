@@ -470,7 +470,7 @@ impl ReplicateScopeOperation {
     }
 }
 
-fn map_sync_key(
+pub(crate) fn map_sync_key(
     source_key: &str,
     source_prefix: Option<&str>,
     target_prefix: Option<&str>,
