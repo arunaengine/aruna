@@ -347,6 +347,9 @@ impl GetObjectOperation {
                 GetObjectError::NoSuchKey
             }),
             BlobVersionState::Reference { source, .. } => {
+                // The access-driven successor-on-drift core (#256) lands on this
+                // path. Deferred as enhancements: verified cache + singleflight
+                // (#375), general one-hop origin relay (#380), sync poller (#314).
                 self.source_binding = Some(source.clone());
                 self.location = None;
                 self.reference_access = None;
