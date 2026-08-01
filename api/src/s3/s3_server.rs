@@ -40,6 +40,8 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{Instrument, error, info, trace};
 
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -880,9 +882,12 @@ impl S3Server {
         self
     }
 
+    /// Accepts until `shutdown` is cancelled. Connection tasks are tracked, so
+    /// the returned handle only resolves once every request has finished.
     pub fn run_with_listener(
         self,
         listener: TcpListener,
+        shutdown: CancellationToken,
     ) -> Result<(SocketAddr, JoinHandle<()>), S3ServerError> {
         let local_addr = listener.local_addr()?;
         let connection_limit = self.connection_limit.clone();
@@ -907,15 +912,21 @@ impl S3Server {
             .http1()
             .timer(hyper_util::rt::TokioTimer::new())
             .header_read_timeout(INITIAL_REQUEST_TIMEOUT);
+        let connections = TaskTracker::new();
+        let abort_connections = CancellationToken::new();
 
         let server = async move {
+            let _abort_connections = abort_connections.clone().drop_guard();
             loop {
-                let (socket, peer) = match listener.accept().await {
-                    Ok(ok) => ok,
-                    Err(err) => {
-                        error!("error accepting connection: {err}");
-                        continue;
-                    }
+                let (socket, peer) = tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    accepted = listener.accept() => match accepted {
+                        Ok(ok) => ok,
+                        Err(err) => {
+                            error!("error accepting connection: {err}");
+                            continue;
+                        }
+                    },
                 };
                 // Bound concurrent connections without retaining sockets at capacity.
                 let permit = match connection_limit.clone().try_acquire_owned() {
@@ -930,16 +941,37 @@ impl S3Server {
                 service.peer_ip = Some(peer.ip());
                 let activity = Arc::new(ConnectionActivity::default());
                 service.activity = Some(activity.clone());
-                let conn = connection.clone();
-                tokio::spawn(async move {
+                let builder = connection.clone();
+                let connection_shutdown = shutdown.clone();
+                let connection_abort = abort_connections.clone();
+                connections.spawn(async move {
                     let _permit = permit;
-                    run_connection(
-                        activity.clone(),
-                        conn.serve_connection(TokioIo::new(socket), service),
-                    )
-                    .await;
+                    let conn = builder.serve_connection(TokioIo::new(socket), service);
+                    let mut conn = std::pin::pin!(conn);
+                    tokio::select! {
+                        biased;
+                        _ = connection_abort.cancelled() => {}
+                        _ = run_connection(activity.clone(), conn.as_mut()) => {}
+                        _ = connection_shutdown.cancelled() => {
+                            // Finish the request being served, then close the
+                            // connection instead of waiting out its keep-alive.
+                            conn.as_mut().graceful_shutdown();
+                            tokio::select! {
+                                biased;
+                                _ = connection_abort.cancelled() => {}
+                                _ = run_connection(activity, conn.as_mut()) => {}
+                            }
+                        }
+                    }
                 });
             }
+
+            connections.close();
+            let in_flight = connections.len();
+            if in_flight > 0 {
+                info!(in_flight, "Draining in-flight S3 connections");
+            }
+            connections.wait().await;
         };
 
         let task = tokio::spawn(server);
@@ -948,10 +980,10 @@ impl S3Server {
         Ok((local_addr, task))
     }
 
-    #[tracing::instrument(level = "trace", skip(self))]
-    pub async fn run(self) -> Result<JoinHandle<()>, S3ServerError> {
+    #[tracing::instrument(level = "trace", skip(self, shutdown))]
+    pub async fn run(self, shutdown: CancellationToken) -> Result<JoinHandle<()>, S3ServerError> {
         let listener = TcpListener::bind(&self.address).await?;
-        let (_, task) = self.run_with_listener(listener)?;
+        let (_, task) = self.run_with_listener(listener, shutdown)?;
         Ok(task)
     }
 }

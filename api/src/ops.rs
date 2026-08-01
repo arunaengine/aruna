@@ -92,6 +92,11 @@ impl Readiness {
     pub fn is_draining(&self) -> bool {
         self.draining.load(Ordering::SeqCst)
     }
+
+    /// The node's own lifecycle gate: ready once started and not yet draining.
+    pub fn is_ready(&self) -> bool {
+        self.is_started() && !self.is_draining()
+    }
 }
 
 /// Shared state behind the ops router.
