@@ -14,6 +14,7 @@ use aruna_core::structs::{
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use std::collections::BTreeSet;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tracing::{info, warn};
 use ulid::Ulid;
@@ -22,11 +23,19 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::store::iter_prefix_page;
 
 const SCAN_PAGE_SIZE: usize = 512;
+/// How long a record must sit unchanged before removal considers it. A blob
+/// write holds no durable intent while its bytes land, so this has to clear the
+/// 10s storage request timeout by a wide margin.
+const REMOVAL_QUIET_PERIOD: Duration = Duration::from_secs(60);
 
 /// Deletes the record and credentials of every disabled tenant backend that no
 /// longer holds anything. Runs after the reclaim sweep, which is what empties
 /// them; a backend on `retain` keeps its rows and so is never removed.
 pub async fn remove_drained_backends(context: &DriverContext) -> Result<usize, String> {
+    remove_at(context, SystemTime::now()).await
+}
+
+async fn remove_at(context: &DriverContext, now: SystemTime) -> Result<usize, String> {
     let disabled = disabled_backends(context).await?;
     if disabled.is_empty() {
         return Ok(0);
@@ -36,6 +45,9 @@ pub async fn remove_drained_backends(context: &DriverContext) -> Result<usize, S
     let mut removed = 0usize;
     for record in disabled {
         let backend = BackendRef::Group(record.backend_id);
+        if !settled(&record, now) {
+            continue;
+        }
         // Read per backend rather than once: a write that resolved the backend
         // just before it was disabled must still finish with its credentials.
         if holding.contains(&backend) || active_backends(context).contains(&record.backend_id) {
@@ -55,6 +67,16 @@ pub async fn remove_drained_backends(context: &DriverContext) -> Result<usize, S
         }
     }
     Ok(removed)
+}
+
+/// A write that resolved this backend before it was disabled commits its
+/// location row after the blob adapter has already let go, so removal must
+/// outwait that gap rather than trust a snapshot taken inside it.
+fn settled(record: &GroupStorageBackend, now: SystemTime) -> bool {
+    record
+        .updated_at
+        .checked_add(REMOVAL_QUIET_PERIOD)
+        .is_some_and(|ready| ready <= now)
 }
 
 fn active_backends(context: &DriverContext) -> BTreeSet<Ulid> {
@@ -94,7 +116,8 @@ async fn disabled_backends(context: &DriverContext) -> Result<Vec<GroupStorageBa
 
 /// Every backend still named by a stored copy, a queued physical delete or an
 /// open multipart upload. Uploaded parts have no location row, so only the
-/// upload record names the backend their abort needs credentials for.
+/// upload record names the backend their abort needs credentials for; parts are
+/// deleted in the same transaction as that record, so it outlives all of them.
 async fn backends_holding_data(context: &DriverContext) -> Result<BTreeSet<BackendRef>, String> {
     let mut holding = BTreeSet::new();
     let mut start_after = None;
@@ -494,6 +517,28 @@ mod tests {
             )
             .await
             .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_disable_survives() {
+        // A write that resolved the backend just before it was disabled commits
+        // its location row after the blob guard is gone; removal must outwait
+        // that window instead of trusting the scan it already ran.
+        let dir = tempdir().unwrap();
+        let ctx = context(dir.path().to_str().unwrap());
+        let backend_id = Ulid::from_bytes([4u8; 16]);
+        seed(&ctx, backend_id, true).await;
+
+        assert_eq!(remove_at(&ctx, SystemTime::UNIX_EPOCH).await.unwrap(), 0);
+        assert!(
+            read(
+                &ctx,
+                GROUP_STORAGE_BACKEND_KEYSPACE,
+                backend_key(backend_id)
+            )
+            .await
+            .is_some()
         );
     }
 

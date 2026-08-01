@@ -7,6 +7,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::GroupStorageBackend;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
+use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -110,8 +111,11 @@ impl SetDisabledOperation {
             return self.commit();
         }
 
+        // The stamp is what removal waits on: a writer that resolved the
+        // backend just before this commit needs its credentials to survive.
         let updated = GroupStorageBackend {
             disabled: self.disabled,
+            updated_at: SystemTime::now(),
             ..record
         };
         let writes = match record_writes(&updated) {
@@ -283,6 +287,20 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionCommitted {
             txn_id: TxnId::from(7),
         }));
+    }
+
+    #[test]
+    fn disable_stamps_record() {
+        // Removal waits on this stamp, so a disable has to move it.
+        let group_id = Ulid::from_bytes([1u8; 16]);
+        let mut operation = SetDisabledOperation::new(group_id, backend_id(), true);
+        reading(&mut operation);
+
+        operation.step(read_result(record(group_id, false)));
+        written(&mut operation);
+        committed(&mut operation);
+
+        assert!(operation.finalize().unwrap().updated_at > SystemTime::UNIX_EPOCH);
     }
 
     #[test]
