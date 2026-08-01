@@ -654,7 +654,7 @@ impl IncomingVersionReplicationOperation {
 
     /// The only negotiation result that stores bytes, so the destination's cap
     /// is answered here rather than at the probe that keys the deduplication.
-    fn need_blob_and_version(&mut self) -> Effects {
+    fn request_blob_version(&mut self) -> Effects {
         match self.destination_full.take() {
             Some(error) => {
                 self.reject_negotiation(IncomingVersionReplicationError::RoutingFailed(error))
@@ -1699,7 +1699,7 @@ impl Operation for IncomingVersionReplicationOperation {
                                     existing_blob_size = location.blob_size,
                                     "Existing destination blob differs; requesting blob and version"
                                 );
-                                return self.need_blob_and_version();
+                                return self.request_blob_version();
                             }
                             self.existing_blob_location = Some(location);
                             debug!(
@@ -1719,7 +1719,7 @@ impl Operation for IncomingVersionReplicationOperation {
                                 stream_id = %self.stream_id,
                                 "Destination blob missing or invalid; requesting blob and version"
                             );
-                            self.need_blob_and_version()
+                            self.request_blob_version()
                         }
                     }
                 } else {
@@ -1730,7 +1730,7 @@ impl Operation for IncomingVersionReplicationOperation {
                         stream_id = %self.stream_id,
                         "Destination blob absent; requesting blob and version"
                     );
-                    self.need_blob_and_version()
+                    self.request_blob_version()
                 }
             }
             IncomingVersionReplicationState::SendNegotiation => {

@@ -685,7 +685,7 @@ mod test {
     }
 
     #[test]
-    fn commit_unknown_keeps_part() {
+    fn unknown_keeps_part() {
         // Only a proven refusal rolls the part back; every other commit failure
         // may already have committed the record that names these bytes.
         for error in [
@@ -711,7 +711,7 @@ mod test {
     }
 
     #[test]
-    fn commit_conflict_deletes_part() {
+    fn conflict_deletes_part() {
         let mut op = upload_part_op(Ulid::from_bytes([5u8; 16]));
         op.state = UploadPartState::CommitTransaction;
         op.txn_id = Some(Ulid::from_bytes([3u8; 16]));
@@ -734,7 +734,7 @@ mod test {
     }
 
     #[test]
-    fn commit_conflict_queues_delete() {
+    fn conflict_queues_delete() {
         // A rollback delete the backend refuses has to survive as cleanup work.
         let mut op = upload_part_op(Ulid::from_bytes([5u8; 16]));
         op.state = UploadPartState::CommitTransaction;

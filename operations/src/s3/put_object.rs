@@ -1694,7 +1694,7 @@ mod test {
     }
 
     #[test]
-    fn commit_unknown_keeps_blob() {
+    fn unknown_keeps_blob() {
         // Only a proven refusal rolls the blob back; every other commit failure
         // may already have committed the version that names these bytes.
         for error in [

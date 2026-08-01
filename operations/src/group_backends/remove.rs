@@ -114,10 +114,9 @@ async fn disabled_backends(context: &DriverContext) -> Result<Vec<GroupStorageBa
     }
 }
 
-/// Every backend still named by a stored copy, a queued physical delete or an
-/// open multipart upload. Uploaded parts have no location row, so only the
-/// upload record names the backend their abort needs credentials for; parts are
-/// deleted in the same transaction as that record, so it outlives all of them.
+/// Every backend still named by a stored copy, a queued cleanup row or an open
+/// multipart upload. Parts have no location row, and they are deleted in the
+/// same transaction as the upload record, so that record covers them.
 async fn backends_holding_data(context: &DriverContext) -> Result<BTreeSet<BackendRef>, String> {
     let mut holding = BTreeSet::new();
     let mut start_after = None;
