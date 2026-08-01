@@ -580,11 +580,15 @@ impl NetHandle {
             .unwrap_or_else(|| {
                 std::env::temp_dir().join(format!("aruna-document-sync-{}", ulid::Ulid::generate()))
             });
+        // Configured bootstrap peers join the persisted realm peers so a fresh
+        // joiner admits its seed's pushes before the first realm config applies.
+        let mut document_sync_peers = realm_peer_nodes.clone();
+        document_sync_peers.extend(peer_hints.iter().copied());
         let document_sync = Arc::new(DocumentSyncService::open_with_persist_policy(
             endpoint.clone(),
             storage.clone(),
             document_sync_path,
-            &realm_peer_nodes,
+            &document_sync_peers,
             app_alpns,
             config.document_sync_runtime.unwrap_or_default(),
             config.fjall_persist_policy,

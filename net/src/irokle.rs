@@ -239,6 +239,9 @@ pub struct DocumentSyncService {
     // their own, so their topic derivation reads it from here.
     realm_id: RealmId,
     inbound_budget: Arc<InboundSyncBudget>,
+    // Peers configured at open. A realm-config refresh replaces `default_peers`,
+    // but a configured bootstrap peer stays admitted for inbound sync.
+    configured_peers: BTreeSet<PeerId>,
 }
 
 impl std::fmt::Debug for DocumentSyncService {
@@ -317,7 +320,7 @@ impl DocumentSyncService {
             db,
             persist_policy,
             storage,
-            default_peers: Arc::new(RwLock::new(default_peers)),
+            default_peers: Arc::new(RwLock::new(default_peers.clone())),
             shard_publishers: Arc::new(RwLock::new(BTreeMap::new())),
             storage_path,
             reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -325,6 +328,7 @@ impl DocumentSyncService {
             eviction_rx: Arc::new(Mutex::new(Some(eviction_rx))),
             realm_id,
             inbound_budget: Arc::new(InboundSyncBudget::default()),
+            configured_peers: default_peers,
         })
     }
 
@@ -789,7 +793,9 @@ impl DocumentSyncService {
     /// per-peer and global stream budgets.
     fn admit_inbound(&self, peer: NodeId) -> Result<InboundSyncPermit> {
         let peer_id = node_id_to_peer_id(&peer);
-        if !self.default_peers.read().contains(&peer_id) {
+        if !self.configured_peers.contains(&peer_id)
+            && !self.default_peers.read().contains(&peer_id)
+        {
             return Err(NetError::Stream(format!(
                 "document sync peer {peer_id} is not a configured realm peer"
             )));
