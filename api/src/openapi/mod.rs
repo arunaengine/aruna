@@ -23,6 +23,7 @@ pub struct ApiDoc;
 impl ApiDoc {
     pub fn openapi() -> utoipa::openapi::OpenApi {
         let mut openapi = BaseApiDoc::openapi();
+        openapi.merge(crate::routes::audit::AuditApiDoc::openapi());
         openapi.merge(crate::routes::groups::GroupsApiDoc::openapi());
         openapi.merge(crate::routes::connectors::ConnectorsApiDoc::openapi());
         openapi.merge(crate::routes::staging::StagingApiDoc::openapi());
@@ -91,6 +92,7 @@ mod tests {
         ("/metadata", "post"),
         ("/metadata/{document_id}", "delete"),
         ("/metadata/references", "get"),
+        ("/audit", "get"),
     ];
 
     fn operation_security(doc: &Value, path: &str, method: &str) -> Vec<Value> {
