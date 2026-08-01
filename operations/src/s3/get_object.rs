@@ -1709,8 +1709,11 @@ mod test {
         assert_eq!(last_refresh, SystemTime::UNIX_EPOCH);
     }
 
+    // A drifted current-version reference read records a same-binding successor
+    // (spec REQ-S3-DATA-MODEL-001) rather than silently floating, and the prior
+    // version stays immutable.
     #[tokio::test]
-    async fn test_get_reference_object_returns_fresh_metadata_without_persisting() {
+    async fn reference_drift_creates_successor() {
         let endpoint = spawn_reference_server(b"hello reference").await;
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
@@ -1843,7 +1846,96 @@ mod test {
         );
         while let Some(Ok(_)) = stream.next().await {}
 
+        // The head now points at a fresh successor, not the drifted version.
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = driver_ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                key: BlobHeadKey::new("s3test", "refresh.txt")
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("missing head pointer");
+        };
+        let successor_id = CurrentVersionPointer::from_bytes(value.unwrap().as_ref())
+            .unwrap()
+            .version_id;
+        assert_ne!(successor_id, version_id, "a successor must have been created");
+
+        let successor = read_reference_version(&driver_ctx, successor_id).await;
+        assert_eq!(successor.content_length, 15);
+        assert_eq!(successor.etag.as_deref(), Some("etag-123"));
+        assert_eq!(successor.content_type.as_deref(), Some("text/plain"));
+
+        // The superseded version is untouched: successors, never mutation.
+        let original = read_reference_version(&driver_ctx, version_id).await;
+        assert_eq!(original.content_length, 1);
+        assert_eq!(original.etag.as_deref(), Some("stale-etag"));
+    }
+
+    // CAS guard: if the head advanced under a drifted read (a concurrent reader
+    // already wrote the successor), this read must not write a second one — it
+    // aborts and restarts against the winner.
+    #[test]
+    fn advance_restarts_when_head_moved() {
+        let mut operation = GetObjectOperation::new(GetObjectInput {
+            bucket: "s3test".to_string(),
+            key: "range.txt".to_string(),
+            version_id: None,
+            range: None,
+            group_id: Ulid::generate(),
+            user_identity: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+        });
+        let headed = Ulid::generate();
+        let winner = Ulid::generate();
+        let txn_id = Ulid::generate();
+        operation.resolved_version_id = Some(headed);
+        operation.txn_id = Some(txn_id);
+        operation.state = GetObjectState::ReadHeadForAdvance;
+        operation.advance_observation = Some(SourceMetadata {
+            content_length: 9,
+            content_type: None,
+            etag: Some("new".to_string()),
+            last_modified: None,
+            source_version: None,
+        });
+        operation.source_binding = Some(VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::new(),
+                source_path: "folder/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: Some(Ulid::generate()),
+        });
+
+        // The head already names a different (winning) successor.
+        let head_value = CurrentVersionPointer::new(winner).to_bytes().unwrap();
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: BlobHeadKey::new("s3test", "range.txt")
+                .to_bytes()
+                .unwrap()
+                .into(),
+            value: Some(head_value.into()),
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })]
+                if *aborted == txn_id
+        ));
+        assert_eq!(operation.state, GetObjectState::RestartReference);
+    }
+
+    async fn read_reference_version(ctx: &DriverContext, version_id: Ulid) -> SourceMetadata {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = ctx
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
                 key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
@@ -1857,22 +1949,14 @@ mod test {
         else {
             panic!("missing version metadata");
         };
-        let metadata = BlobVersion::from_bytes(value.unwrap().as_ref()).unwrap();
+        let version = BlobVersion::from_bytes(value.unwrap().as_ref()).unwrap();
         let BlobVersionState::Reference {
-            cached_metadata,
-            last_refresh,
-            ..
-        } = metadata.state
+            cached_metadata, ..
+        } = version.state
         else {
             panic!("expected reference metadata");
         };
-        assert_eq!(cached_metadata.content_length, 1);
-        assert_eq!(
-            cached_metadata.content_type.as_deref(),
-            Some("application/octet-stream")
-        );
-        assert_eq!(cached_metadata.etag.as_deref(), Some("stale-etag"));
-        assert_eq!(last_refresh, SystemTime::UNIX_EPOCH);
+        cached_metadata
     }
 
     // A pinned historical reference version whose live source has drifted from
