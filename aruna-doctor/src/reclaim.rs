@@ -13,6 +13,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::SystemTime;
+use ulid::Ulid;
 
 #[derive(Debug, Serialize)]
 pub struct SeedOutput {
@@ -59,6 +60,11 @@ pub async fn print_status(database_path: String) -> Result<(), CliError> {
 
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
+}
+
+fn fold_oldest(oldest: &mut Option<DateTime<Utc>>, time: SystemTime) {
+    let time = DateTime::<Utc>::from(time);
+    *oldest = Some(oldest.map_or(time, |current| current.min(time)));
 }
 
 fn parse_backend(backend: &str) -> Result<BackendRef, ExplorerError> {
@@ -108,8 +114,8 @@ fn seed_output(database_path: &str, backend: &str) -> Result<SeedOutput, Explore
     })
 }
 
-/// Queue depth and stuck physical deletes per backend. A backend whose failing
-/// count never falls is the reclaim-blocked signal.
+/// Queue depth and stuck physical deletes per backend. A backend whose
+/// `oldest_enqueued_at` never advances is the reclaim-blocked signal.
 fn status_output(database_path: &str) -> Result<ReclaimStatusOutput, ExplorerError> {
     let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
     let mut backends: BTreeMap<String, BackendReclaim> = BTreeMap::new();
@@ -123,24 +129,26 @@ fn status_output(database_path: &str) -> Result<ReclaimStatusOutput, ExplorerErr
         let row = backends.entry(key.backend.to_string()).or_default();
         row.candidates += 1;
         if let Ok(candidate) = ReclaimCandidate::from_bytes(value.as_ref()) {
-            let enqueued_at = DateTime::<Utc>::from(candidate.enqueued_at);
-            row.oldest_enqueued_at = Some(match row.oldest_enqueued_at {
-                Some(oldest) => oldest.min(enqueued_at),
-                None => enqueued_at,
-            });
+            fold_oldest(&mut row.oldest_enqueued_at, candidate.enqueued_at);
         }
     }
 
     let cleanups = db.keyspace(BLOB_CLEANUP_KEYSPACE, KeyspaceCreateOptions::default)?;
     for entry in db.read_tx().iter(&cleanups) {
-        let (_, value) = entry.into_inner()?;
+        let (key, value) = entry.into_inner()?;
         if let Ok(BlobCleanupWork::DeleteBlob { location }) =
             BlobCleanupWork::from_bytes(value.as_ref())
         {
-            backends
-                .entry(location.backend.to_string())
-                .or_default()
-                .queued_cleanups += 1;
+            let row = backends.entry(location.backend.to_string()).or_default();
+            row.queued_cleanups += 1;
+            // Cleanup keys are generated ULIDs, so a stalled physical delete
+            // dates itself even after its candidate row is gone.
+            if let Ok(bytes) = <[u8; 16]>::try_from(key.as_ref()) {
+                fold_oldest(
+                    &mut row.oldest_enqueued_at,
+                    Ulid::from_bytes(bytes).datetime(),
+                );
+            }
         }
     }
 

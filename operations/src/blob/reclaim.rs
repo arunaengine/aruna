@@ -255,8 +255,21 @@ pub struct ReclaimStatus {
     /// timer, so a non-zero count is normal; `oldest_enqueued_at` is what says
     /// whether the queue is moving.
     pub queued_cleanups: usize,
+    /// Oldest of both queues: candidates by their stored enqueue time, queued
+    /// cleanups by the ULID they are keyed under.
     pub oldest_enqueued_at: Option<SystemTime>,
     pub truncated: bool,
+}
+
+fn fold_oldest(oldest: &mut Option<SystemTime>, time: SystemTime) {
+    *oldest = Some(oldest.map_or(time, |current| current.min(time)));
+}
+
+/// Cleanup keys are generated ULIDs, so a row carries its own queue time.
+fn cleanup_time(key: &Key) -> Option<SystemTime> {
+    <[u8; 16]>::try_from(key.as_ref())
+        .ok()
+        .map(|bytes| Ulid::from_bytes(bytes).datetime())
 }
 
 const STATUS_SCAN_LIMIT: usize = 10_000;
@@ -285,10 +298,7 @@ pub async fn backend_status(
     status.truncated = next.is_some();
     for (_, value) in candidates {
         if let Ok(candidate) = ReclaimCandidate::from_bytes(value.as_ref()) {
-            status.oldest_enqueued_at = Some(match status.oldest_enqueued_at {
-                Some(oldest) => oldest.min(candidate.enqueued_at),
-                None => candidate.enqueued_at,
-            });
+            fold_oldest(&mut status.oldest_enqueued_at, candidate.enqueued_at);
         }
     }
 
@@ -302,15 +312,20 @@ pub async fn backend_status(
     )
     .await?;
     status.truncated = status.truncated || next.is_some();
-    status.queued_cleanups = cleanups
-        .iter()
-        .filter(
-            |(_, value)| match BlobCleanupWork::from_bytes(value.as_ref()) {
-                Ok(BlobCleanupWork::DeleteBlob { location }) => &location.backend == backend,
-                _ => false,
-            },
-        )
-        .count();
+    for (key, value) in cleanups {
+        let Ok(BlobCleanupWork::DeleteBlob { location }) =
+            BlobCleanupWork::from_bytes(value.as_ref())
+        else {
+            continue;
+        };
+        if &location.backend != backend {
+            continue;
+        }
+        status.queued_cleanups = status.queued_cleanups.saturating_add(1);
+        if let Some(queued_at) = cleanup_time(&key) {
+            fold_oldest(&mut status.oldest_enqueued_at, queued_at);
+        }
+    }
 
     Ok(status)
 }
@@ -1241,6 +1256,34 @@ mod tests {
         assert_eq!(status.queued_cleanups, 0);
         assert_eq!(status.oldest_enqueued_at, Some(SystemTime::UNIX_EPOCH));
         assert!(!status.truncated);
+    }
+
+    #[tokio::test]
+    async fn status_dates_cleanups() {
+        // A stalled physical delete outlives its candidate row, so the queue
+        // time has to come from the cleanup key itself.
+        let dir = tempdir().unwrap();
+        let context = context(dir.path().to_str().unwrap());
+        let queued = Ulid::from_datetime(SystemTime::UNIX_EPOCH + Duration::from_secs(120));
+        write(
+            &context,
+            BLOB_CLEANUP_KEYSPACE,
+            queued.to_bytes().to_vec(),
+            BlobCleanupWork::DeleteBlob {
+                location: location(10),
+            }
+            .to_bytes()
+            .unwrap(),
+        )
+        .await;
+
+        let status = backend_status(&context, &BackendRef::node_default())
+            .await
+            .unwrap();
+
+        assert_eq!(status.pending_candidates, 0);
+        assert_eq!(status.queued_cleanups, 1);
+        assert_eq!(status.oldest_enqueued_at, Some(queued.datetime()));
     }
 
     #[test]
