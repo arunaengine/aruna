@@ -4018,6 +4018,8 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
             | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
             | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
+            | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
+            | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
     ) {
         return Err(NetError::Bootstrap(
             "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, description updates, quota updates, and placement updates"
@@ -4990,7 +4992,9 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
         | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
-        | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. } => {
+        | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
+        | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
+        | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. } => {
             AdminOperationFamily::RealmConfig
         }
     };
@@ -5038,6 +5042,17 @@ async fn validate_replicated_admin_event(
     if target_realm.is_some_and(|realm_id| realm_id != event.actor.realm_id) {
         return reject("admin event target and actor realms do not match");
     }
+    if matches!(
+        &event.op,
+        AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding }
+            if matches!(
+                binding.scope,
+                aruna_core::structs::PlacementScope::Realm(binding_realm_id)
+                    if binding_realm_id != event.actor.realm_id
+            )
+    ) {
+        return reject("placement binding realm does not match the admin event target");
+    }
 
     match &event.op {
         AdminDocumentOperation::GroupCreated {
@@ -5081,7 +5096,9 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
         | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
-        | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. } => {}
+        | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
+        | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
+        | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. } => {}
         AdminDocumentOperation::RealmConfigNodePlacementSet { entry } => {
             if let Some(label) = reserved_label(&entry.labels) {
                 return reject(&format!(
@@ -5209,8 +5226,15 @@ async fn validate_realm_config_admin_authority(
         }
         return Ok(
             if matches!(
-                configured_node_kind(config, &event.origin_node_id),
-                Some(RealmNodeKind::Management)
+                (
+                    configured_node_kind(config, &event.origin_node_id),
+                    &event.op
+                ),
+                (Some(RealmNodeKind::Management), _)
+                    | (
+                        Some(RealmNodeKind::Server),
+                        AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
+                    )
             ) {
                 AdminEventValidation::Accepted
             } else {
