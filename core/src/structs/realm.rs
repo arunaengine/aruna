@@ -2,9 +2,11 @@ use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::structs::{Permission, Role};
 use crate::structs::{
-    Actor, BindingScope, DEFAULT_SHARD_COUNT, DocumentClass, NodePlacementEntry, PlacementOverride,
-    PlacementStrategy, StrategyBinding,
+    Actor, BindingDirectory, BindingScope, DEFAULT_SHARD_COUNT, DocumentClass, FIRST_HANDLE,
+    HandleRange, HandleRangeDirectory, NodePlacementEntry, PlacementBinding, PlacementOverride,
+    PlacementScope, PlacementStrategy, StrategyBinding,
 };
+use crate::structured_id::PlacementHandle;
 use crate::types::{GroupId, RoleId, UserId};
 use core::fmt;
 use ed25519_dalek::VerifyingKey;
@@ -157,6 +159,17 @@ pub struct RealmConfigDocument {
     pub default_strategy_id: Option<Ulid>,
     pub strategy_bindings: Vec<StrategyBinding>,
     pub placement_overrides: Vec<PlacementOverride>,
+    /// Append-only Placement Binding set, replicated across nodes via the
+    /// `RealmConfigPlacementBindingAppended` admin operation and materialized by
+    /// the reducer overlay. The reducer/overlay is the sole writer: divergent
+    /// same-handle bindings are all retained so the derived directory fails
+    /// closed as `Conflicted`.
+    pub placement_bindings: Vec<PlacementBinding>,
+    /// Append-only handle-range grants, replicated via the
+    /// `RealmConfigHandleRangeGranted` admin operation and materialized by the
+    /// reducer overlay. Overlapping grants are retained so the derived
+    /// [`HandleRangeDirectory`] fails them closed.
+    pub placement_handle_ranges: Vec<HandleRange>,
 }
 
 /// Realm-wide quota policy. Lives in the realm config (Class-1, replicated
@@ -360,6 +373,8 @@ impl RealmConfigDocument {
             default_strategy_id: None,
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
+            placement_bindings: Vec::new(),
+            placement_handle_ranges: Vec::new(),
         }
     }
 
@@ -415,6 +430,19 @@ impl RealmConfigDocument {
             strategy_id: everywhere_strategy.strategy_id,
         })
         .collect();
+        // Pre-provision the realm-scoped Metadata placement binding a shared
+        // create needs to mint a structured id (DEC-ONBOARD): handle 1 is the
+        // first allocatable handle. Coordinator-granted ranges (layer 1) must
+        // therefore start above this reserved default.
+        self.placement_bindings = vec![PlacementBinding {
+            handle: PlacementHandle::new(FIRST_HANDLE).expect("handle 1 is allocatable"),
+            scope: PlacementScope::Realm(self.realm_id),
+            document_class: DocumentClass::Metadata,
+            strategy_id: default_strategy.strategy_id,
+            allocator_range_id: None,
+            allocated_by: None,
+            allocated_at_ms: None,
+        }];
         self.strategies = vec![default_strategy, everywhere_strategy];
     }
 
@@ -480,6 +508,16 @@ impl RealmConfigDocument {
         self.strategies
             .iter()
             .find(|strategy| strategy.strategy_id == *strategy_id)
+    }
+
+    /// Rebuilds the derived Placement Binding Directory from the stored set.
+    pub fn binding_directory(&self) -> BindingDirectory {
+        BindingDirectory::from_bindings(&self.placement_bindings)
+    }
+
+    /// Rebuilds the derived Handle Range Directory from the granted set.
+    pub fn handle_range_directory(&self) -> HandleRangeDirectory {
+        HandleRangeDirectory::from_ranges(&self.placement_handle_ranges)
     }
 
     pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {
@@ -636,6 +674,8 @@ mod test {
             default_strategy_id: None,
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
+            placement_bindings: Vec::new(),
+            placement_handle_ranges: Vec::new(),
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -744,6 +784,8 @@ mod test {
             default_strategy_id: None,
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
+            placement_bindings: Vec::new(),
+            placement_handle_ranges: Vec::new(),
         };
 
         assert_eq!(
@@ -851,5 +893,39 @@ mod test {
 
         assert_eq!(document.node_ids().unwrap(), vec![server, user_device]);
         assert_eq!(document.sync_eligible_node_ids().unwrap(), vec![server]);
+    }
+
+    #[test]
+    fn binding_directory_rebuilds_from_stored_set() {
+        use crate::structs::{DocumentClass, PlacementBinding, PlacementScope};
+        use crate::structured_id::PlacementHandle;
+
+        fn binding(handle: u32, seed: u8) -> PlacementBinding {
+            PlacementBinding {
+                handle: PlacementHandle::new(handle).unwrap(),
+                scope: PlacementScope::Group(Ulid::from_bytes([seed; 16])),
+                document_class: DocumentClass::Metadata,
+                strategy_id: Ulid::from_bytes([seed.wrapping_add(1); 16]),
+                allocator_range_id: None,
+                allocated_by: None,
+                allocated_at_ms: None,
+            }
+        }
+
+        let mut config = RealmConfigDocument::new(RealmId([2u8; 32]), Vec::new(), 3);
+        let first = binding(10, 1);
+        config.placement_bindings.push(first.clone());
+
+        let directory = config.binding_directory();
+        assert_eq!(
+            directory.resolve(first.handle).map(|t| t.strategy_id),
+            Ok(first.strategy_id)
+        );
+        assert_eq!(directory.allocated(), 1);
+
+        // A same-handle, different-tuple entry fails closed as conflicted.
+        config.placement_bindings.push(binding(10, 2));
+        assert!(config.binding_directory().resolve(first.handle).is_err());
+        assert_eq!(config.binding_directory().conflicted(), 1);
     }
 }
