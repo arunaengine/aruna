@@ -85,6 +85,12 @@ pub const GROUP_STORAGE_BACKEND_INDEX_KEYSPACE: &str = "group_storage_backend_in
 pub const SOURCE_CONNECTOR_INDEX_KEYSPACE: &str = "source_connector_index";
 pub const SOURCE_CONNECTOR_SECRET_KEYSPACE: &str = "source_connector_secret";
 
+// Repository interop: metadata harvest framework (#442).
+pub const REPOSITORY_CONNECTOR_INDEX_KEYSPACE: &str = "repository_connector_index";
+pub const REPOSITORY_CONNECTOR_SECRET_KEYSPACE: &str = "repository_connector_secret";
+pub const HARVEST_SOURCE_KEYSPACE: &str = "harvest_source";
+pub const HARVEST_PROVENANCE_KEYSPACE: &str = "harvest_provenance";
+
 // Durable job framework keyspaces (#318).
 pub const JOB_KEYSPACE: &str = "jobs";
 pub const JOB_SCHEDULE_INDEX_KEYSPACE: &str = "job_schedule_index";

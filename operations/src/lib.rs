@@ -40,6 +40,7 @@ pub mod get_realm_nodes;
 pub mod get_user;
 pub mod group_backends;
 pub mod group_routing;
+pub mod harvest;
 pub mod incoming;
 pub mod inspect_onboarding_secret;
 pub mod issue_onboarding_sync_ticket;
