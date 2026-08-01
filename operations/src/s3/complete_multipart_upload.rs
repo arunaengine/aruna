@@ -31,6 +31,7 @@ use smallvec::smallvec;
 use std::collections::HashMap;
 use std::time::SystemTime;
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -64,6 +65,7 @@ pub enum CompleteMultipartUploadState {
     WriteUploadReset,
     CommitResetTransaction,
     CleanupFailedCompose,
+    QueueRollbackDelete,
     Finish,
     Error,
 }
@@ -163,6 +165,7 @@ pub struct CompleteMultipartUploadOperation {
     upload_parts: Vec<MultipartUploadPart>,
     resolved_parts: Vec<MultipartUploadPart>,
     composed_location: Option<BackendLocation>,
+    rollback_location: Option<BackendLocation>,
     final_location: Option<BackendLocation>,
     composite_hashes: HashMap<String, Vec<u8>>,
     version_id: Option<Ulid>,
@@ -187,6 +190,7 @@ impl CompleteMultipartUploadOperation {
             upload_parts: Vec::new(),
             resolved_parts: Vec::new(),
             composed_location: None,
+            rollback_location: None,
             final_location: None,
             composite_hashes: HashMap::new(),
             version_id: None,
@@ -235,16 +239,53 @@ impl CompleteMultipartUploadOperation {
             smallvec![Effect::Storage(StorageEffect::StartTransaction {
                 read: false,
             })]
-        } else if self.composed_location.is_some() {
-            self.state = CompleteMultipartUploadState::CleanupFailedCompose;
-            smallvec![Effect::Blob(BlobEffect::Delete {
-                location: self
-                    .composed_location
-                    .clone()
-                    .expect("composed_location checked above"),
-            })]
         } else {
-            self.emit_pending_error()
+            self.rollback_composed_blob()
+        }
+    }
+
+    /// Takes the location: once its delete is queued the rollback in `abort`
+    /// must not queue a second one. A copy stays behind so a delete that fails
+    /// can still be handed to the durable cleanup queue.
+    fn rollback_composed_blob(&mut self) -> Effects {
+        self.state = CompleteMultipartUploadState::CleanupFailedCompose;
+        match self.composed_location.take() {
+            Some(location) => {
+                self.rollback_location = Some(location.clone());
+                smallvec![Effect::Blob(BlobEffect::Delete { location })]
+            }
+            None => self.emit_pending_error(),
+        }
+    }
+
+    fn queue_rollback_delete(&mut self) -> Effects {
+        let Some(location) = self.rollback_location.take() else {
+            return self.emit_pending_error();
+        };
+        let work = match (BlobCleanupWork::DeleteBlob { location }).to_bytes() {
+            Ok(work) => work,
+            Err(error) => {
+                warn!(error = %error, "Composed object could not be encoded for cleanup");
+                return self.emit_pending_error();
+            }
+        };
+        self.state = CompleteMultipartUploadState::QueueRollbackDelete;
+        smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            key: Ulid::generate().to_bytes().to_vec().into(),
+            value: work.into(),
+            txn_id: None,
+        })]
+    }
+
+    fn handle_rollback_queued(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::WriteResult { .. }) => self.emit_pending_error(),
+            Event::Storage(StorageEvent::Error { error }) => {
+                warn!(error = %error, "Rollback delete could not be queued");
+                self.emit_pending_error()
+            }
+            _ => self.emit_error(CompleteMultipartUploadError::InvalidOperationState),
         }
     }
 
@@ -1183,12 +1224,7 @@ impl CompleteMultipartUploadOperation {
             self.state = CompleteMultipartUploadState::CleanupFailedCompose;
             return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
         }
-        self.state = CompleteMultipartUploadState::CleanupFailedCompose;
-        if let Some(location) = self.composed_location.clone() {
-            smallvec![Effect::Blob(BlobEffect::Delete { location })]
-        } else {
-            self.emit_pending_error()
-        }
+        self.rollback_composed_blob()
     }
 
     fn handle_upload_reset_written(&mut self, event: Event) -> Effects {
@@ -1207,19 +1243,21 @@ impl CompleteMultipartUploadOperation {
             return self.emit_error(CompleteMultipartUploadError::InvalidOperationState);
         };
         self.txn_id = None;
-        self.state = CompleteMultipartUploadState::CleanupFailedCompose;
-        if let Some(location) = self.composed_location.clone() {
-            smallvec![Effect::Blob(BlobEffect::Delete { location })]
-        } else {
-            self.emit_pending_error()
-        }
+        self.rollback_composed_blob()
     }
 
     fn handle_failed_compose_cleanup(&mut self, event: Event) -> Effects {
         match event {
-            Event::Blob(BlobEvent::DeleteFinished)
-            | Event::Blob(BlobEvent::Error(_))
-            | Event::Storage(StorageEvent::TransactionAborted { .. }) => self.emit_pending_error(),
+            Event::Storage(StorageEvent::TransactionAborted { .. }) => {
+                self.rollback_composed_blob()
+            }
+            Event::Blob(BlobEvent::DeleteFinished) => {
+                self.rollback_location = None;
+                self.emit_pending_error()
+            }
+            // The composed object is still on the backend and this operation is
+            // over; only a queued delete can still reach it.
+            Event::Blob(BlobEvent::Error(_)) => self.queue_rollback_delete(),
             _ => self.emit_error(CompleteMultipartUploadError::InvalidOperationState),
         }
     }
@@ -1300,6 +1338,7 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::CleanupFailedCompose => {
                 self.handle_failed_compose_cleanup(event)
             }
+            CompleteMultipartUploadState::QueueRollbackDelete => self.handle_rollback_queued(event),
             CompleteMultipartUploadState::Finish => smallvec![],
             CompleteMultipartUploadState::Error => self.abort(),
         }
@@ -1324,11 +1363,14 @@ impl Operation for CompleteMultipartUploadOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id
-            .take()
-            .map_or_else(smallvec::SmallVec::new, |txn_id| {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            })
+        let mut effects: Effects = smallvec![];
+        if let Some(location) = self.composed_location.take() {
+            effects.push(Effect::Blob(BlobEffect::Delete { location }));
+        }
+        if let Some(txn_id) = self.txn_id.take() {
+            effects.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
+        }
+        effects
     }
 }
 
@@ -1570,6 +1612,60 @@ mod tests {
                 BackendFenceError::Read(_)
             ))
         ));
+    }
+
+    #[test]
+    fn rollback_queues_cleanup() {
+        // A backend that refuses the rollback delete would otherwise leave a
+        // composed object no location or cleanup row can find.
+        let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+        op.composed_location = Some(composed_location(Ulid::from_bytes([5u8; 16])));
+        op.state = CompleteMultipartUploadState::FenceBackend;
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"x".to_vec().into(),
+            value: Some(disabled_record(Ulid::from_bytes([5u8; 16])).into()),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Delete { .. })]
+        ));
+
+        let effects = op.step(Event::Blob(BlobEvent::Error(
+            aruna_core::errors::BlobError::DeleteError("unreachable".to_string()),
+        )));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Write { key_space, .. })]
+                if key_space == BLOB_CLEANUP_KEYSPACE
+        ));
+        assert!(
+            op.step(Event::Storage(StorageEvent::WriteResult {
+                key: b"x".to_vec().into(),
+            }))
+            .is_empty()
+        );
+        assert!(op.is_complete());
+    }
+
+    #[test]
+    fn abort_deletes_composed() {
+        // The reset transaction never commits, so nothing else can reach the
+        // composed object once this operation ends.
+        let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+        op.composed_location = Some(composed_location(Ulid::from_bytes([5u8; 16])));
+        op.state = CompleteMultipartUploadState::CommitResetTransaction;
+
+        let effects = op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Delete { .. })]
+        ));
+        assert!(op.composed_location.is_none());
     }
 
     fn composed_location(backend_id: Ulid) -> BackendLocation {
