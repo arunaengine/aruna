@@ -20,6 +20,7 @@ pub mod metrics;
 pub mod onboarding;
 pub mod operation;
 pub mod permission_path;
+pub mod request_policy;
 pub mod storage_entries;
 pub mod stream;
 pub mod structs;
