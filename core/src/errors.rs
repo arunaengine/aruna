@@ -10,6 +10,8 @@ pub enum AuthorizationError {
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
     GlobError(#[from] globset::Error),
+    #[error(transparent)]
+    RestrictionLimit(#[from] crate::permission_path::RestrictionLimitError),
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("Invalid realm id")]

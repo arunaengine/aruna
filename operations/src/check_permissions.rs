@@ -458,7 +458,7 @@ mod test {
                 role_id: Ulid::generate(),
                 name: "denied".to_string(),
                 permissions: HashMap::from([(
-                    format!("{}/g/{}/**", realm_id, group_id),
+                    format!("/{}/g/{}/**", realm_id, group_id),
                     Permission::DENY,
                 )]),
                 assigned_users: HashSet::from([denied_user]),

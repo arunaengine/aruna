@@ -5,12 +5,13 @@ use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::operation::Operation;
+use aruna_core::permission_path::{compile_permission_matcher, validate_restriction_limits};
 use aruna_core::structs::{
     AuthContext, GroupAuthorizationDocument, MetadataRegistryRecord, PathRestriction, Permission,
     RealmAuthorizationDocument, RealmId, Role,
 };
 use aruna_core::types::{Effects, GroupId, TxnId};
-use globset::{Glob, GlobMatcher};
+use globset::GlobMatcher;
 use smallvec::smallvec;
 use ulid::Ulid;
 
@@ -79,7 +80,7 @@ impl PermissionRules {
         {
             for (pattern, permission) in role.permissions {
                 rules.push(CompiledRule {
-                    matcher: Glob::new(&pattern)?.compile_matcher(),
+                    matcher: compile_permission_matcher(&pattern)?,
                     permission,
                     direct,
                     public,
@@ -89,11 +90,14 @@ impl PermissionRules {
 
         let restrictions = restrictions
             .map(|restrictions| {
+                // Defense in depth: an over-limit restriction set fails the
+                // collection (deny), mirroring the issuance-time rejection.
+                validate_restriction_limits(restrictions)?;
                 restrictions
                     .iter()
                     .map(|restriction| {
                         Ok(CompiledRestriction {
-                            matcher: Glob::new(&restriction.pattern)?.compile_matcher(),
+                            matcher: compile_permission_matcher(&restriction.pattern)?,
                             permission: restriction.permission.clone(),
                         })
                     })
@@ -671,6 +675,73 @@ mod test {
         assert!(rules.allows(&granted, &Permission::READ));
         assert!(!rules.allows(&other, &Permission::READ));
         assert!(!rules.allows(&granted, &Permission::WRITE));
+    }
+
+    #[test]
+    fn star_stays_bounded() {
+        // A single-segment grant must not silently become recursive: `*` and
+        // `?` never cross `/`, only `**` spans segments.
+        let realm_id = RealmId([11u8; 32]);
+        let group_id = Ulid::generate();
+        let rules = direct_rules(HashMap::from([(
+            format!("/{realm_id}/g/{group_id}/*"),
+            Permission::READ,
+        )]));
+
+        assert!(rules.allows(&format!("/{realm_id}/g/{group_id}/data"), &Permission::READ));
+        assert!(!rules.allows(
+            &format!("/{realm_id}/g/{group_id}/data/node/bucket/key"),
+            &Permission::READ
+        ));
+    }
+
+    #[test]
+    fn malformed_fails_collection() {
+        // An uncompilable pattern denies the whole collection, never grants.
+        let realm_id = RealmId([12u8; 32]);
+        let group_id = Ulid::generate();
+        assert!(
+            PermissionRules::from_roles(
+                vec![CollectedRole {
+                    role: role(
+                        HashMap::from([(format!("/{realm_id}/g/{group_id}/["), Permission::READ)]),
+                        HashSet::new(),
+                    ),
+                    direct: true,
+                    public: false,
+                }],
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn oversized_restrictions_deny() {
+        let realm_id = RealmId([13u8; 32]);
+        let group_id = Ulid::generate();
+        let pattern = format!("/{realm_id}/g/{group_id}/meta/**");
+        let restrictions = vec![
+            PathRestriction {
+                pattern: pattern.clone(),
+                permission: Permission::READ,
+            };
+            aruna_core::permission_path::MAX_TOKEN_RESTRICTIONS + 1
+        ];
+        assert!(
+            PermissionRules::from_roles(
+                vec![CollectedRole {
+                    role: role(
+                        HashMap::from([(pattern, Permission::READ)]),
+                        HashSet::new()
+                    ),
+                    direct: true,
+                    public: false,
+                }],
+                Some(&restrictions),
+            )
+            .is_err()
+        );
     }
 
     #[test]
