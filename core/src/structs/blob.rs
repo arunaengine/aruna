@@ -215,6 +215,20 @@ pub enum BlobCleanupWork {
         realm_id: RealmId,
         ttl_ms: u64,
     },
+    /// Bytes written for a transaction whose commit outcome was never learned.
+    /// They are deleted only once `owner` proves the commit never landed, so a
+    /// commit that did land keeps the copy it already owns.
+    ReconcileWrite {
+        location: BackendLocation,
+        owner: WriteOwner,
+    },
+}
+
+/// The record a write's commit would have made the owner of its bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum WriteOwner {
+    Blob { blake3: [u8; 32] },
+    UploadPart { upload_id: Ulid, part_number: u16 },
 }
 
 impl BlobCleanupWork {
@@ -295,6 +309,15 @@ impl BackendLocation {
 
     pub fn get_blake3(&self) -> Option<&[u8]> {
         self.hashes.get(HASH_BLAKE3).map(|h| h.as_slice())
+    }
+
+    /// Whether both name the same physical object. The path carries a per-write
+    /// id, so this distinguishes two copies of identical content.
+    pub fn same_object(&self, other: &Self) -> bool {
+        self.backend == other.backend
+            && self.root == other.root
+            && self.storage_bucket == other.storage_bucket
+            && self.backend_path == other.backend_path
     }
 }
 

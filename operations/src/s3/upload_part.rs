@@ -10,7 +10,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
     BackendLocation, BlobCleanupWork, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
-    MultipartUploadStatus, ResolvedBackend,
+    MultipartUploadStatus, ResolvedBackend, WriteOwner,
 };
 use aruna_core::types::{Effects, TxnId, UserId};
 use bytes::Bytes;
@@ -26,7 +26,7 @@ pub enum UploadPartState {
     ReadUpload,
     WritePart,
     CleanupFailedWrite,
-    QueueRollbackDelete,
+    QueueCleanupRow,
     StartTransaction,
     FenceBackend,
     ReReadUpload,
@@ -250,14 +250,20 @@ impl UploadPartOperation {
         let Some(location) = self.rollback_location.take() else {
             return self.emit_pending_error();
         };
-        let work = match (BlobCleanupWork::DeleteBlob { location }).to_bytes() {
+        self.queue_cleanup_work(BlobCleanupWork::DeleteBlob { location })
+    }
+
+    /// Hands one row to the durable cleanup queue outside any transaction. The
+    /// pending error follows once the row is written or provably lost.
+    fn queue_cleanup_work(&mut self, work: BlobCleanupWork) -> Effects {
+        let work = match work.to_bytes() {
             Ok(work) => work,
             Err(error) => {
                 warn!(error = %error, "Orphaned part could not be encoded for cleanup");
                 return self.emit_pending_error();
             }
         };
-        self.state = UploadPartState::QueueRollbackDelete;
+        self.state = UploadPartState::QueueCleanupRow;
         smallvec![Effect::Storage(StorageEffect::Write {
             key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
             key: Ulid::generate().to_bytes().to_vec().into(),
@@ -266,11 +272,11 @@ impl UploadPartOperation {
         })]
     }
 
-    fn handle_rollback_queued(&mut self, event: Event) -> Effects {
+    fn handle_cleanup_queued(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::WriteResult { .. }) => self.emit_pending_error(),
             Event::Storage(StorageEvent::Error { error }) => {
-                warn!(error = %error, "Rollback delete could not be queued");
+                warn!(error = %error, "Blob cleanup row could not be queued");
                 self.emit_pending_error()
             }
             _ => self.emit_error(UploadPartError::InvalidOperationState),
@@ -425,9 +431,9 @@ impl UploadPartOperation {
         }
     }
 
-    /// A commit whose outcome is unknown may already own the part bytes, so
-    /// only a proven refusal rolls them back: an unreferenced copy is
-    /// recoverable, a deleted one that a committed part record names is not.
+    /// A commit whose outcome is unknown may already own the part bytes, so only
+    /// a proven refusal rolls them back. The rest go to the reconciliation
+    /// queue: the committed part record is what decides their fate.
     fn handle_commit_failure(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::Error { error }) = event else {
             return self.emit_error(UploadPartError::InvalidOperationState);
@@ -436,16 +442,24 @@ impl UploadPartOperation {
         if error.proves_no_commit() {
             return self.cleanup_failed_write(UploadPartError::StorageError(error));
         }
-        if let Some(location) = self.written_location.take() {
-            warn!(
-                event = "upload_part.commit_outcome_unknown",
-                backend = %location.backend,
-                blob_size = location.blob_size,
-                error = %error,
-                "Keeping the written part after an unknown commit outcome"
-            );
-        }
-        self.emit_error(error.into())
+        let Some(location) = self.written_location.take() else {
+            return self.emit_error(error.into());
+        };
+        warn!(
+            event = "upload_part.commit_outcome_unknown",
+            backend = %location.backend,
+            blob_size = location.blob_size,
+            error = %error,
+            "Queuing the written part for reconciliation"
+        );
+        self.pending_error = Some(error.into());
+        self.queue_cleanup_work(BlobCleanupWork::ReconcileWrite {
+            location,
+            owner: WriteOwner::UploadPart {
+                upload_id: self.input.upload_id,
+                part_number: self.input.part_number,
+            },
+        })
     }
 
     fn handle_replaced_part_cleanup(&mut self, event: Event) -> Effects {
@@ -473,7 +487,7 @@ impl Operation for UploadPartOperation {
             UploadPartState::ReadUpload => self.handle_upload_read(event),
             UploadPartState::WritePart => self.handle_write_finished(event),
             UploadPartState::CleanupFailedWrite => self.handle_failed_write_cleanup(event),
-            UploadPartState::QueueRollbackDelete => self.handle_rollback_queued(event),
+            UploadPartState::QueueCleanupRow => self.handle_cleanup_queued(event),
             UploadPartState::StartTransaction => self.handle_transaction_started(event),
             UploadPartState::FenceBackend => self.handle_backend_fenced(event),
             UploadPartState::ReReadUpload => self.handle_upload_reread(event),
@@ -687,7 +701,8 @@ mod test {
     #[test]
     fn unknown_keeps_part() {
         // Only a proven refusal rolls the part back; every other commit failure
-        // may already have committed the record that names these bytes.
+        // may already have committed the record that names these bytes, so the
+        // copy is handed to reconciliation instead of deleted or forgotten.
         for error in [
             StorageError::CommitFailed,
             StorageError::PersistError("journal".to_string()),
@@ -696,12 +711,35 @@ mod test {
             let mut op = upload_part_op(Ulid::from_bytes([5u8; 16]));
             op.state = UploadPartState::CommitTransaction;
             op.txn_id = Some(Ulid::from_bytes([3u8; 16]));
+            let upload_id = op.input.upload_id;
 
             let effects = op.step(Event::Storage(StorageEvent::Error {
                 error: error.clone(),
             }));
 
-            assert!(effects.is_empty(), "{error} must not delete the part");
+            let [
+                Effect::Storage(StorageEffect::Write {
+                    key_space, value, ..
+                }),
+            ] = effects.as_slice()
+            else {
+                panic!("{error} must queue reconciliation, got {effects:?}")
+            };
+            assert_eq!(key_space, BLOB_CLEANUP_KEYSPACE);
+            assert_eq!(
+                BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
+                BlobCleanupWork::ReconcileWrite {
+                    location: part_location(Ulid::from_bytes([5u8; 16])),
+                    owner: WriteOwner::UploadPart {
+                        upload_id,
+                        part_number: 1,
+                    },
+                }
+            );
+
+            op.step(Event::Storage(StorageEvent::WriteResult {
+                key: b"k".to_vec().into(),
+            }));
             assert!(op.is_complete());
             assert!(matches!(
                 op.finalize(),

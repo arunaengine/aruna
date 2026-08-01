@@ -313,8 +313,10 @@ pub async fn backend_status(
     .await?;
     status.truncated = status.truncated || next.is_some();
     for (key, value) in cleanups {
-        let Ok(BlobCleanupWork::DeleteBlob { location }) =
-            BlobCleanupWork::from_bytes(value.as_ref())
+        let Ok(
+            BlobCleanupWork::DeleteBlob { location }
+            | BlobCleanupWork::ReconcileWrite { location, .. },
+        ) = BlobCleanupWork::from_bytes(value.as_ref())
         else {
             continue;
         };

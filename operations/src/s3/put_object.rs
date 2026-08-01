@@ -21,7 +21,7 @@ use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
     BucketInfo, CurrentVersionPointer, RealmId, RoCrateLimits, RoutingError, RoutingSnapshot,
-    UsageDelta, VersionKey, VersionSourceBinding, resolve_backend,
+    UsageDelta, VersionKey, VersionSourceBinding, WriteOwner, resolve_backend,
 };
 use aruna_core::types::{Effects, GroupId, NodeId, UserId};
 use bytes::Bytes;
@@ -39,7 +39,7 @@ pub enum PutObjectState {
     ReadPreassignedLocation,
     WriteBlob,
     CleanupFailedWrite,
-    QueueRollbackDelete,
+    QueueCleanupRow,
     StartTransaction,
     CheckBucket,
     FenceBackend,
@@ -819,26 +819,37 @@ impl PutObjectOperation {
                 if error.proves_no_commit() {
                     return self.cleanup_failed_write(PutObjectError::StorageError(error));
                 }
-                self.keep_written_blob(&error);
-                self.emit_error(error.into())
+                self.keep_written_blob(error)
             }
             _ => self.emit_error(PutObjectError::InvalidOperationState),
         }
     }
 
-    /// A commit whose outcome is unknown may already own these bytes, so the
-    /// reclaim sweep decides their fate later: an unreferenced copy is
-    /// recoverable, a deleted one that a committed version names is not.
-    fn keep_written_blob(&mut self, error: &StorageError) {
-        if let Some(location) = self.written_location.take() {
-            warn!(
-                event = "put_object.commit_outcome_unknown",
-                backend = %location.backend,
-                blob_size = location.blob_size,
-                error = %error,
-                "Keeping the written blob after an unknown commit outcome"
-            );
-        }
+    /// A commit whose outcome is unknown may already own these bytes, so they go
+    /// to the reconciliation queue rather than being deleted or dropped: the
+    /// committed blob location row is what decides their fate.
+    fn keep_written_blob(&mut self, error: StorageError) -> Effects {
+        let Some(location) = self.written_location.take() else {
+            return self.emit_error(error.into());
+        };
+        warn!(
+            event = "put_object.commit_outcome_unknown",
+            backend = %location.backend,
+            blob_size = location.blob_size,
+            error = %error,
+            "Queuing the written blob for reconciliation"
+        );
+        self.pending_error = Some(error.into());
+        let Some(blake3) = location
+            .get_blake3()
+            .and_then(|hash| <[u8; 32]>::try_from(hash).ok())
+        else {
+            return self.emit_pending_error();
+        };
+        self.queue_cleanup_work(BlobCleanupWork::ReconcileWrite {
+            location,
+            owner: WriteOwner::Blob { blake3 },
+        })
     }
 
     fn register_blob_in_dht_or_continue(&mut self) -> Effects {
@@ -916,14 +927,20 @@ impl PutObjectOperation {
         let Some(location) = self.rollback_location.take() else {
             return self.emit_pending_error();
         };
-        let work = match (BlobCleanupWork::DeleteBlob { location }).to_bytes() {
+        self.queue_cleanup_work(BlobCleanupWork::DeleteBlob { location })
+    }
+
+    /// Hands one row to the durable cleanup queue outside any transaction. The
+    /// pending error follows once the row is written or provably lost.
+    fn queue_cleanup_work(&mut self, work: BlobCleanupWork) -> Effects {
+        let work = match work.to_bytes() {
             Ok(work) => work,
             Err(error) => {
                 warn!(error = %error, "Orphaned blob could not be encoded for cleanup");
                 return self.emit_pending_error();
             }
         };
-        self.state = PutObjectState::QueueRollbackDelete;
+        self.state = PutObjectState::QueueCleanupRow;
         smallvec![Effect::Storage(StorageEffect::Write {
             key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
             key: Ulid::generate().to_bytes().to_vec().into(),
@@ -932,11 +949,11 @@ impl PutObjectOperation {
         })]
     }
 
-    fn handle_rollback_queued(&mut self, event: Event) -> Effects {
+    fn handle_cleanup_queued(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::WriteResult { .. }) => self.emit_pending_error(),
             Event::Storage(StorageEvent::Error { error }) => {
-                warn!(error = %error, "Rollback delete could not be queued");
+                warn!(error = %error, "Blob cleanup row could not be queued");
                 self.emit_pending_error()
             }
             _ => self.emit_error(PutObjectError::InvalidOperationState),
@@ -987,7 +1004,7 @@ impl Operation for PutObjectOperation {
             PutObjectState::ReadPreassignedLocation => self.handle_preassigned_location(event),
             PutObjectState::WriteBlob => self.handle_write_finished(event),
             PutObjectState::CleanupFailedWrite => self.handle_failed_write_cleanup(event),
-            PutObjectState::QueueRollbackDelete => self.handle_rollback_queued(event),
+            PutObjectState::QueueCleanupRow => self.handle_cleanup_queued(event),
             PutObjectState::StartTransaction => self.handle_transaction_started(event),
             PutObjectState::CheckBucket => self.handle_bucket_checked(event),
             PutObjectState::FenceBackend => self.handle_backend_fenced(event),
@@ -1696,7 +1713,8 @@ mod test {
     #[test]
     fn unknown_keeps_blob() {
         // Only a proven refusal rolls the blob back; every other commit failure
-        // may already have committed the version that names these bytes.
+        // may already have committed the version that names these bytes, so the
+        // copy is handed to reconciliation instead of deleted or forgotten.
         for error in [
             StorageError::CommitFailed,
             StorageError::PersistError("journal".to_string()),
@@ -1707,13 +1725,37 @@ mod test {
             let mut op = PutObjectOperation::new(put_config(realm_id, Ulid::generate(), node_id));
             op.state = PutObjectState::CommitTransaction;
             op.txn_id = Some(Ulid::generate());
-            op.written_location = Some(test_location(op.config.user_id));
+            let mut location = test_location(op.config.user_id);
+            location.hashes.insert(
+                aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+                vec![7u8; 32],
+            );
+            op.written_location = Some(location.clone());
 
             let effects = op.step(Event::Storage(StorageEvent::Error {
                 error: error.clone(),
             }));
 
-            assert!(effects.is_empty(), "{error} must not delete the blob");
+            let [
+                Effect::Storage(StorageEffect::Write {
+                    key_space, value, ..
+                }),
+            ] = effects.as_slice()
+            else {
+                panic!("{error} must queue reconciliation, got {effects:?}")
+            };
+            assert_eq!(key_space, aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE);
+            assert_eq!(
+                super::BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
+                super::BlobCleanupWork::ReconcileWrite {
+                    location,
+                    owner: super::WriteOwner::Blob { blake3: [7u8; 32] },
+                }
+            );
+
+            op.step(Event::Storage(StorageEvent::WriteResult {
+                key: b"k".to_vec().into(),
+            }));
             assert!(op.is_complete());
             assert!(matches!(
                 op.finalize(),

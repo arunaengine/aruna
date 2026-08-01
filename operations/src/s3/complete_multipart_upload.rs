@@ -25,6 +25,7 @@ use aruna_core::structs::{
     CurrentVersionPointer, MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
     MultipartObjectSummary, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
     MultipartUploadStatus, RealmId, ResolvedBackend, RoCrateLimits, UsageDelta, VersionKey,
+    WriteOwner,
 };
 use aruna_core::types::{Effects, NodeId, TxnId, UserId};
 use smallvec::smallvec;
@@ -65,7 +66,7 @@ pub enum CompleteMultipartUploadState {
     WriteUploadReset,
     CommitResetTransaction,
     CleanupFailedCompose,
-    QueueRollbackDelete,
+    QueueCleanupRow,
     Finish,
     Error,
 }
@@ -165,6 +166,9 @@ pub struct CompleteMultipartUploadOperation {
     upload_parts: Vec<MultipartUploadPart>,
     resolved_parts: Vec<MultipartUploadPart>,
     composed_location: Option<BackendLocation>,
+    /// The composed object after a commit whose outcome is unknown. Held apart
+    /// from `composed_location` so `abort` cannot delete bytes a commit owns.
+    reconcile_location: Option<BackendLocation>,
     rollback_location: Option<BackendLocation>,
     final_location: Option<BackendLocation>,
     composite_hashes: HashMap<String, Vec<u8>>,
@@ -190,6 +194,7 @@ impl CompleteMultipartUploadOperation {
             upload_parts: Vec::new(),
             resolved_parts: Vec::new(),
             composed_location: None,
+            reconcile_location: None,
             rollback_location: None,
             final_location: None,
             composite_hashes: HashMap::new(),
@@ -248,6 +253,9 @@ impl CompleteMultipartUploadOperation {
     /// must not queue a second one. A copy stays behind so a delete that fails
     /// can still be handed to the durable cleanup queue.
     fn rollback_composed_blob(&mut self) -> Effects {
+        if let Some(location) = self.reconcile_location.take() {
+            return self.queue_reconcile_write(location);
+        }
         self.state = CompleteMultipartUploadState::CleanupFailedCompose;
         match self.composed_location.take() {
             Some(location) => {
@@ -258,18 +266,37 @@ impl CompleteMultipartUploadOperation {
         }
     }
 
+    fn queue_reconcile_write(&mut self, location: BackendLocation) -> Effects {
+        let Some(blake3) = location
+            .get_blake3()
+            .and_then(|hash| <[u8; 32]>::try_from(hash).ok())
+        else {
+            return self.emit_pending_error();
+        };
+        self.queue_cleanup_work(BlobCleanupWork::ReconcileWrite {
+            location,
+            owner: WriteOwner::Blob { blake3 },
+        })
+    }
+
     fn queue_rollback_delete(&mut self) -> Effects {
         let Some(location) = self.rollback_location.take() else {
             return self.emit_pending_error();
         };
-        let work = match (BlobCleanupWork::DeleteBlob { location }).to_bytes() {
+        self.queue_cleanup_work(BlobCleanupWork::DeleteBlob { location })
+    }
+
+    /// Hands one row to the durable cleanup queue outside any transaction. The
+    /// pending error follows once the row is written or provably lost.
+    fn queue_cleanup_work(&mut self, work: BlobCleanupWork) -> Effects {
+        let work = match work.to_bytes() {
             Ok(work) => work,
             Err(error) => {
                 warn!(error = %error, "Composed object could not be encoded for cleanup");
                 return self.emit_pending_error();
             }
         };
-        self.state = CompleteMultipartUploadState::QueueRollbackDelete;
+        self.state = CompleteMultipartUploadState::QueueCleanupRow;
         smallvec![Effect::Storage(StorageEffect::Write {
             key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
             key: Ulid::generate().to_bytes().to_vec().into(),
@@ -278,11 +305,11 @@ impl CompleteMultipartUploadOperation {
         })]
     }
 
-    fn handle_rollback_queued(&mut self, event: Event) -> Effects {
+    fn handle_cleanup_queued(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::WriteResult { .. }) => self.emit_pending_error(),
             Event::Storage(StorageEvent::Error { error }) => {
-                warn!(error = %error, "Rollback delete could not be queued");
+                warn!(error = %error, "Blob cleanup row could not be queued");
                 self.emit_pending_error()
             }
             _ => self.emit_error(CompleteMultipartUploadError::InvalidOperationState),
@@ -1153,9 +1180,10 @@ impl CompleteMultipartUploadOperation {
         }
     }
 
-    /// A commit whose outcome is unknown may already own the composed object,
-    /// so only a proven refusal rolls it back: an unreferenced copy is
-    /// recoverable, a deleted one that a committed version names is not.
+    /// A commit whose outcome is unknown may already own the composed object, so
+    /// only a proven refusal rolls it back. The rest moves to the reconciliation
+    /// queue, out of reach of `abort`, and the committed blob location row
+    /// decides its fate.
     fn handle_finalize_failure(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::Error { error }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
@@ -1168,8 +1196,9 @@ impl CompleteMultipartUploadOperation {
                 backend = %location.backend,
                 blob_size = location.blob_size,
                 error = %error,
-                "Keeping the composed object after an unknown commit outcome"
+                "Queuing the composed object for reconciliation"
             );
+            self.reconcile_location = Some(location);
         }
         self.schedule_error(error.into())
     }
@@ -1359,7 +1388,7 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::CleanupFailedCompose => {
                 self.handle_failed_compose_cleanup(event)
             }
-            CompleteMultipartUploadState::QueueRollbackDelete => self.handle_rollback_queued(event),
+            CompleteMultipartUploadState::QueueCleanupRow => self.handle_cleanup_queued(event),
             CompleteMultipartUploadState::Finish => smallvec![],
             CompleteMultipartUploadState::Error => self.abort(),
         }
@@ -1673,17 +1702,42 @@ mod tests {
     #[test]
     fn commit_keeps_composed() {
         // A finalize commit that may have landed already owns the composed
-        // object, so nothing here may delete it.
+        // object, so nothing here may delete it; it goes to reconciliation with
+        // the blob location row that decides whether the commit landed.
         let mut op = CompleteMultipartUploadOperation::new(finalize_input());
-        op.composed_location = Some(composed_location(Ulid::from_bytes([5u8; 16])));
+        let mut location = composed_location(Ulid::from_bytes([5u8; 16]));
+        location.hashes.insert(
+            aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+            vec![7u8; 32],
+        );
+        op.composed_location = Some(location.clone());
         op.state = CompleteMultipartUploadState::CommitFinalizeTransaction;
 
         let effects = op.step(Event::Storage(StorageEvent::Error {
             error: StorageError::CommitFailed,
         }));
 
-        assert!(effects.is_empty(), "the composed object must survive");
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space, value, ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected reconciliation to be queued, got {effects:?}")
+        };
+        assert_eq!(key_space, BLOB_CLEANUP_KEYSPACE);
+        assert_eq!(
+            BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
+            BlobCleanupWork::ReconcileWrite {
+                location,
+                owner: WriteOwner::Blob { blake3: [7u8; 32] },
+            }
+        );
         assert!(op.composed_location.is_none());
+
+        op.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"k".to_vec().into(),
+        }));
         assert!(op.is_complete());
         assert!(matches!(
             op.finalize(),

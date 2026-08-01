@@ -4,8 +4,14 @@ use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffec
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::DhtKeyId;
-use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE};
-use aruna_core::structs::{BackendRef, BlobCleanupWork, GroupStorageBackend};
+use aruna_core::keyspaces::{
+    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
+    S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+};
+use aruna_core::structs::{
+    BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, GroupStorageBackend,
+    MultipartUploadPart, MultipartUploadPartKey, WriteOwner,
+};
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
 use tracing::{error, warn};
@@ -51,30 +57,31 @@ pub async fn process_cleanup_batch(context: &DriverContext) -> Result<BlobCleanu
 
         let mut done: Vec<(String, Key)> = Vec::new();
         for (key, value) in values {
-            match BlobCleanupWork::from_bytes(&value) {
-                // A row nobody can decode would wedge the drain forever.
+            // A row nobody can decode would wedge the drain forever.
+            let work = match BlobCleanupWork::from_bytes(&value) {
+                Ok(work) => work,
                 Err(error) => {
                     warn!(error = %error, "Dropping undecodable blob cleanup row");
                     done.push((BLOB_CLEANUP_KEYSPACE.to_string(), key));
                     outcome.dropped = outcome.dropped.saturating_add(1);
+                    continue;
                 }
-                // A tenant backend that is gone can never resolve credentials,
-                // so retrying this row forever would wedge the drain.
-                Ok(BlobCleanupWork::DeleteBlob { location })
-                    if is_removed_backend(context, &location.backend).await =>
-                {
-                    error!(backend = %location.backend, "Dropping blob cleanup for a removed backend");
-                    done.push((BLOB_CLEANUP_KEYSPACE.to_string(), key));
-                    outcome.dropped = outcome.dropped.saturating_add(1);
-                }
-                Ok(work) => {
-                    if run_cleanup_work(context, work).await {
-                        done.push((BLOB_CLEANUP_KEYSPACE.to_string(), key));
-                        outcome.processed = outcome.processed.saturating_add(1);
-                    } else {
-                        outcome.failed = outcome.failed.saturating_add(1);
-                    }
-                }
+            };
+            // A tenant backend that is gone can never resolve credentials, so
+            // retrying this row forever would wedge the drain.
+            if let Some(backend) = work_backend(&work)
+                && is_removed_backend(context, backend).await
+            {
+                error!(backend = %backend, "Dropping blob cleanup for a removed backend");
+                done.push((BLOB_CLEANUP_KEYSPACE.to_string(), key));
+                outcome.dropped = outcome.dropped.saturating_add(1);
+                continue;
+            }
+            if run_cleanup_work(context, work).await {
+                done.push((BLOB_CLEANUP_KEYSPACE.to_string(), key));
+                outcome.processed = outcome.processed.saturating_add(1);
+            } else {
+                outcome.failed = outcome.failed.saturating_add(1);
             }
         }
 
@@ -84,6 +91,15 @@ pub async fn process_cleanup_batch(context: &DriverContext) -> Result<BlobCleanu
             return Ok(outcome);
         };
         start_after = Some(next);
+    }
+}
+
+/// The backend a row needs credentials for, if it needs any.
+pub fn work_backend(work: &BlobCleanupWork) -> Option<&BackendRef> {
+    match work {
+        BlobCleanupWork::DeleteBlob { location }
+        | BlobCleanupWork::ReconcileWrite { location, .. } => Some(&location.backend),
+        BlobCleanupWork::RegisterDht { .. } => None,
     }
 }
 
@@ -128,19 +144,14 @@ async fn delete_cleanup_rows(
 // Best-effort execution: a failed entry stays queued and retries next drain.
 async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> bool {
     match work {
-        BlobCleanupWork::DeleteBlob { location } => {
-            let Some(blob_handle) = context.blob_handle.as_ref() else {
-                return false;
-            };
-            match blob_handle
-                .send_blob_effect(BlobEffect::Delete { location })
-                .await
-            {
-                Event::Blob(BlobEvent::DeleteFinished) => true,
-                event => {
-                    warn!(?event, "Deferred blob delete failed");
-                    false
-                }
+        BlobCleanupWork::DeleteBlob { location } => delete_blob(context, location).await,
+        // The committed metadata decides. An unreadable owner is not a proof of
+        // either outcome, so the row waits for a drain that can read it.
+        BlobCleanupWork::ReconcileWrite { location, owner } => {
+            match owns_write(context, &owner, &location).await {
+                None => false,
+                Some(true) => true,
+                Some(false) => delete_blob(context, location).await,
             }
         }
         BlobCleanupWork::RegisterDht {
@@ -168,6 +179,69 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> boo
     }
 }
 
+async fn delete_blob(context: &DriverContext, location: BackendLocation) -> bool {
+    let Some(blob_handle) = context.blob_handle.as_ref() else {
+        return false;
+    };
+    match blob_handle
+        .send_blob_effect(BlobEffect::Delete { location })
+        .await
+    {
+        Event::Blob(BlobEvent::DeleteFinished) => true,
+        event => {
+            warn!(?event, "Deferred blob delete failed");
+            false
+        }
+    }
+}
+
+/// Whether committed metadata still names this exact physical copy. `None`
+/// means the record could not be read or decoded, so nothing is proven.
+async fn owns_write(
+    context: &DriverContext,
+    owner: &WriteOwner,
+    location: &BackendLocation,
+) -> Option<bool> {
+    let (key_space, key): (&str, Key) = match owner {
+        WriteOwner::Blob { blake3 } => (
+            BLOB_LOCATIONS_KEYSPACE,
+            BlobLocationKey::new(*blake3, location.backend.clone())
+                .to_bytes()
+                .into(),
+        ),
+        WriteOwner::UploadPart {
+            upload_id,
+            part_number,
+        } => (
+            S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+            MultipartUploadPartKey::new(*upload_id, *part_number)
+                .to_bytes()
+                .ok()?
+                .into(),
+        ),
+    };
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key,
+            txn_id: None,
+        })
+        .await;
+    let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        warn!(?event, "Ambiguous write owner could not be read");
+        return None;
+    };
+    let Some(value) = value else {
+        return Some(false);
+    };
+    let owned = match owner {
+        WriteOwner::Blob { .. } => BackendLocation::from_bytes(&value).ok()?,
+        WriteOwner::UploadPart { .. } => MultipartUploadPart::from_bytes(&value).ok()?.location,
+    };
+    Some(owned.same_object(location))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CLEANUP_PAGE_SIZE, process_cleanup_batch};
@@ -175,8 +249,10 @@ mod tests {
     use crate::jobs::store::iter_prefix_page;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
-    use aruna_core::structs::{BackendLocation, BackendRef, BlobCleanupWork};
+    use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE};
+    use aruna_core::structs::{
+        BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, WriteOwner,
+    };
     use aruna_core::types::UserId;
     use aruna_storage::storage::{FjallStorage, StorageHandle};
     use std::collections::HashMap;
@@ -290,6 +366,68 @@ mod tests {
         assert_eq!(outcome.dropped, 1);
         assert_eq!(outcome.failed, 0);
         assert_eq!(remaining_rows(&storage).await, 0);
+    }
+
+    fn reconcile_work(location: &BackendLocation) -> Vec<u8> {
+        BlobCleanupWork::ReconcileWrite {
+            location: location.clone(),
+            owner: WriteOwner::Blob { blake3: [7u8; 32] },
+        }
+        .to_bytes()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn owned_write_reconciles() {
+        // The location row proves the ambiguous commit landed, so the row is
+        // done without any delete being attempted.
+        let (_dir, storage, context) = setup_context();
+        let BlobCleanupWork::DeleteBlob { location } =
+            BlobCleanupWork::from_bytes(&delete_work()).unwrap()
+        else {
+            panic!("expected a delete row")
+        };
+        let event = storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+                key: BlobLocationKey::new([7u8; 32], location.backend.clone())
+                    .to_bytes()
+                    .into(),
+                value: location.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        write_rows(&storage, vec![reconcile_work(&location)]).await;
+
+        let outcome = process_cleanup_batch(&context).await.unwrap();
+
+        assert_eq!(outcome.processed, 1);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(remaining_rows(&storage).await, 0);
+    }
+
+    #[tokio::test]
+    async fn unowned_write_deletes() {
+        // Without a location row naming this copy the commit never landed, so
+        // the bytes have to go; this context has no blob handle, so the delete
+        // fails and the row stays for the next drain.
+        let (_dir, storage, context) = setup_context();
+        let BlobCleanupWork::DeleteBlob { location } =
+            BlobCleanupWork::from_bytes(&delete_work()).unwrap()
+        else {
+            panic!("expected a delete row")
+        };
+        write_rows(&storage, vec![reconcile_work(&location)]).await;
+
+        let outcome = process_cleanup_batch(&context).await.unwrap();
+
+        assert_eq!(outcome.processed, 0);
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(remaining_rows(&storage).await, 1);
     }
 
     #[tokio::test]
