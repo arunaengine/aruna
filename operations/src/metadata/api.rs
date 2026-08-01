@@ -1779,10 +1779,13 @@ async fn ensure_record_readable(
     if record.public {
         return Ok(());
     }
+    // Read-by-id must not distinguish an unreadable record from an absent one:
+    // present-but-unreadable, including anonymous callers, maps to NotFound so
+    // existence cannot be probed (anonymous returns NotFound, never 401).
     let Some(auth) = auth.cloned() else {
-        return Err(MetadataApiError::Unauthorized);
+        return Err(MetadataApiError::NotFound);
     };
-    ensure_permission(
+    match ensure_permission(
         context,
         realm_id,
         auth,
@@ -1790,6 +1793,13 @@ async fn ensure_record_readable(
         Permission::READ,
     )
     .await
+    {
+        Ok(()) => Ok(()),
+        Err(MetadataApiError::Forbidden | MetadataApiError::Unauthorized) => {
+            Err(MetadataApiError::NotFound)
+        }
+        Err(other) => Err(other),
+    }
 }
 
 async fn can_read_record(

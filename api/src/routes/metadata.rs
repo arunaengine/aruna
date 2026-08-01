@@ -2971,7 +2971,73 @@ mod tests {
             Query(MetadataRoCrateExportParams::default()),
         )
         .await;
-        assert!(matches!(result, Err(ServerError::Unauthorized)));
+        assert!(matches!(result, Err(ServerError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn hides_document_existence() {
+        // Present-but-unreadable and truly-absent both answer NotFound so a
+        // caller cannot probe document existence by id.
+        let test = setup_state().await;
+        let realm_id = test.auth.realm_id;
+
+        let (_, Json(created)) = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Extension(None),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/secret".to_string(),
+                    name: "Secret".to_string(),
+                    description: "Secret metadata".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+                    public: false,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
+        let document_id = created.summary.document_id.clone();
+
+        let owner = get_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Path(document_id.clone()),
+        )
+        .await;
+        assert!(owner.is_ok());
+
+        let stranger = AuthContext {
+            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            realm_id,
+            path_restrictions: None,
+        };
+        let stranger_result = get_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(stranger)),
+            Path(document_id.clone()),
+        )
+        .await;
+        assert!(matches!(stranger_result, Err(ServerError::NotFound)));
+
+        let anonymous_result = get_metadata_document(
+            State(test.state.clone()),
+            Extension(None),
+            Path(document_id),
+        )
+        .await;
+        assert!(matches!(anonymous_result, Err(ServerError::NotFound)));
+
+        let absent = get_metadata_document(
+            State(test.state.clone()),
+            Extension(None),
+            Path(Ulid::generate().to_string()),
+        )
+        .await;
+        assert!(matches!(absent, Err(ServerError::NotFound)));
     }
 
     #[tokio::test]
