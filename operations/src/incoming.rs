@@ -41,6 +41,7 @@ use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
+use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::{
     AuthContext, HashPathIndexKey, Permission, RealmId, ReplicationItemKind, RoCrateLimits,
     WatchEvent, WatchEventDetail, WatchEventKind, blob_bucket_permission_path,
@@ -72,9 +73,11 @@ impl OperationsInboundHandler {
         context: Arc<DriverContext>,
         rocrate_limits: RoCrateLimits,
         jobs_runtime: Arc<JobsRuntime>,
+        shutdown: Shutdown,
     ) -> Self {
-        let document_sync_reconcile = Arc::new(DocumentSyncReconcileCoalescer::default());
-        spawn_reconcile_queue_gauge(Arc::downgrade(&document_sync_reconcile));
+        let document_sync_reconcile =
+            Arc::new(DocumentSyncReconcileCoalescer::new(shutdown.clone()));
+        spawn_reconcile_queue_gauge(Arc::downgrade(&document_sync_reconcile), &shutdown);
         Self {
             context,
             document_sync_reconcile,
@@ -344,6 +347,7 @@ async fn bao_policy(
 #[derive(Debug, Default)]
 struct DocumentSyncReconcileCoalescer {
     state: Mutex<DocumentSyncReconcileQueue>,
+    shutdown: Shutdown,
 }
 
 #[derive(Debug, Default)]
@@ -354,7 +358,19 @@ struct DocumentSyncReconcileQueue {
 }
 
 impl DocumentSyncReconcileCoalescer {
+    fn new(shutdown: Shutdown) -> Self {
+        Self {
+            state: Mutex::default(),
+            shutdown,
+        }
+    }
+
     fn trigger(self: &Arc<Self>, context: Arc<DriverContext>, topics: Vec<irokle::TopicId>) {
+        // Reconcile runs write metadata and storage: none may start once
+        // shutdown has begun draining.
+        if self.shutdown.is_triggered() {
+            return;
+        }
         {
             let mut state = self.state.lock().unwrap_or_else(|lock| lock.into_inner());
             state.queued.extend(topics);
@@ -367,7 +383,7 @@ impl DocumentSyncReconcileCoalescer {
             state.running = true;
         }
         let coalescer = self.clone();
-        tokio::spawn(async move {
+        self.shutdown.spawn(async move {
             let mut failures = 0u32;
             loop {
                 let batch: Vec<irokle::TopicId> = {
@@ -420,14 +436,21 @@ impl DocumentSyncReconcileCoalescer {
 
 // Emits a `queue.lag` line every tick while the coalescer holds queued topics
 // or a reconcile run is in flight, plus one final line once it drains.
-fn spawn_reconcile_queue_gauge(coalescer: Weak<DocumentSyncReconcileCoalescer>) {
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+fn spawn_reconcile_queue_gauge(
+    coalescer: Weak<DocumentSyncReconcileCoalescer>,
+    shutdown: &Shutdown,
+) {
+    if tokio::runtime::Handle::try_current().is_err() {
         return;
-    };
-    runtime.spawn(async move {
+    }
+    let cancelled = shutdown.token();
+    shutdown.spawn(async move {
         let mut was_active = false;
         loop {
-            sleep(QUEUE_LAG_INTERVAL).await;
+            tokio::select! {
+                _ = cancelled.cancelled() => return,
+                _ = sleep(QUEUE_LAG_INTERVAL) => {}
+            }
             let Some(coalescer) = coalescer.upgrade() else {
                 return;
             };
@@ -503,13 +526,19 @@ async fn reconcile_inbound_document_sync_topics(
 }
 
 pub fn initialize_net_incoming(context: Arc<DriverContext>) {
-    initialize_net_holder(context, RoCrateLimits::default(), JobsRuntime::new());
+    initialize_net_holder(
+        context,
+        RoCrateLimits::default(),
+        JobsRuntime::new(),
+        &Shutdown::new(),
+    );
 }
 
 pub fn initialize_net_holder(
     context: Arc<DriverContext>,
     rocrate_limits: RoCrateLimits,
     jobs_runtime: Arc<JobsRuntime>,
+    shutdown: &Shutdown,
 ) {
     let Some(net_handle) = context.net_handle.clone() else {
         warn!("Cannot initialize inbound handling without net handle");
@@ -520,6 +549,7 @@ pub fn initialize_net_holder(
         context.clone(),
         rocrate_limits,
         jobs_runtime,
+        shutdown.clone(),
     ));
 
     net_handle.set_inbound_handler(inbound_handler.clone());
@@ -528,6 +558,7 @@ pub fn initialize_net_holder(
             context,
             Arc::downgrade(&inbound_handler.document_sync_reconcile),
             metadata_handle,
+            shutdown,
         );
     }
 }
@@ -986,6 +1017,7 @@ fn schedule_periodic_metadata_document_sync_maintenance(
     context: Arc<DriverContext>,
     coalescer: Weak<DocumentSyncReconcileCoalescer>,
     metadata_handle: MetadataHandle,
+    shutdown: &Shutdown,
 ) {
     let jitter = Duration::from_secs(
         std::time::SystemTime::now()
@@ -993,10 +1025,16 @@ fn schedule_periodic_metadata_document_sync_maintenance(
             .map(|now| now.subsec_nanos() as u64 % METADATA_DOCUMENT_SYNC_MAINTENANCE_JITTER_SECS)
             .unwrap_or(0),
     );
-    tokio::spawn(async move {
+    // This loop writes the metadata store, so it has to stop before the
+    // shutdown flushes it.
+    let cancelled = shutdown.token();
+    shutdown.spawn(async move {
         let mut cycle = 0usize;
         loop {
-            sleep(METADATA_DOCUMENT_SYNC_MAINTENANCE_INTERVAL + jitter).await;
+            tokio::select! {
+                _ = cancelled.cancelled() => return,
+                _ = sleep(METADATA_DOCUMENT_SYNC_MAINTENANCE_INTERVAL + jitter) => {}
+            }
             let Some(coalescer) = coalescer.upgrade() else {
                 return;
             };
@@ -1099,6 +1137,7 @@ mod tests {
             }),
             RoCrateLimits::default(),
             JobsRuntime::new(),
+            Shutdown::new(),
         );
 
         assert!(handler.peer_sync_eligible(realm_id, server).await);
@@ -1158,6 +1197,7 @@ mod tests {
             }),
             RoCrateLimits::default(),
             JobsRuntime::new(),
+            Shutdown::new(),
         );
 
         let mut outbound = net_a.open_stream(net_b.node_id(), Alpn::Bao).await.unwrap();

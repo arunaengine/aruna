@@ -12,6 +12,7 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::{
     JobExecutionClass, NotificationRecord, RealmConfigDocument, RealmId, RoCrateLimits,
 };
+use aruna_core::shutdown::Shutdown;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::Key;
@@ -20,6 +21,7 @@ use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use async_trait::async_trait;
 use byteview::ByteView;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::announce_realm_presence::{
@@ -1867,20 +1869,32 @@ impl OperationsTaskHandler {
     }
 }
 
-fn spawn_durable_queue_rearm(context: &Arc<DriverContext>, task_handle: &TaskHandle) {
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+fn spawn_durable_queue_rearm(
+    context: &Arc<DriverContext>,
+    task_handle: &TaskHandle,
+    shutdown: &Shutdown,
+) {
+    if tokio::runtime::Handle::try_current().is_err() {
         return;
-    };
-    runtime.spawn(durable_queue_rearm_loop(
+    }
+    shutdown.spawn(durable_queue_rearm_loop(
         Arc::downgrade(context),
         task_handle.clone(),
+        shutdown.token(),
     ));
 }
 
-async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: TaskHandle) {
+async fn durable_queue_rearm_loop(
+    context: Weak<DriverContext>,
+    task_handle: TaskHandle,
+    cancelled: CancellationToken,
+) {
     let mut ticks = 0usize;
     loop {
-        tokio::time::sleep(DURABLE_QUEUE_REARM_AFTER).await;
+        tokio::select! {
+            _ = cancelled.cancelled() => return,
+            _ = tokio::time::sleep(DURABLE_QUEUE_REARM_AFTER) => {}
+        }
         let Some(context) = context.upgrade() else {
             return;
         };
@@ -1942,6 +1956,7 @@ pub async fn initialize_task_incoming(
         jobs_runtime,
         RoCrateLimits::default(),
         false,
+        &Shutdown::new(),
     )
     .await;
 }
@@ -1951,8 +1966,10 @@ pub async fn initialize_task_holder(
     task_handle: TaskHandle,
     jobs_runtime: Arc<JobsRuntime>,
     rocrate_limits: RoCrateLimits,
+    shutdown: &Shutdown,
 ) {
-    initialize_task_handler(context, task_handle, jobs_runtime, rocrate_limits, true).await;
+    initialize_task_handler(context, task_handle, jobs_runtime, rocrate_limits, true, shutdown)
+        .await;
 }
 
 async fn initialize_task_handler(
@@ -1961,6 +1978,7 @@ async fn initialize_task_handler(
     jobs_runtime: Arc<JobsRuntime>,
     rocrate_limits: RoCrateLimits,
     refresh_holders: bool,
+    shutdown: &Shutdown,
 ) {
     let handler_context = context.clone();
     if context.compute_handle.is_some() {
@@ -1988,7 +2006,7 @@ async fn initialize_task_handler(
         let table = rebuild_watch_interest_table(&context.storage_handle).await;
         net_handle.replace_watch_interest(table);
     }
-    spawn_durable_queue_rearm(&context, &task_handle);
+    spawn_durable_queue_rearm(&context, &task_handle, shutdown);
     restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
     restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
     restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
