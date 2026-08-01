@@ -110,20 +110,20 @@ impl Server {
         let abort_requests = CancellationToken::new();
         let request_abort = abort_requests.clone();
         let _abort_requests = abort_requests.drop_guard();
-        let router =
-            self.build_router()
-                .layer(from_fn(move |request: Request, next: Next| {
-                    let request_abort = request_abort.clone();
-                    async move {
-                        tokio::select! {
-                            biased;
-                            _ = request_abort.cancelled() => {
-                                StatusCode::SERVICE_UNAVAILABLE.into_response()
-                            }
-                            response = next.run(request) => response,
+        let router = self
+            .build_router()
+            .layer(from_fn(move |request: Request, next: Next| {
+                let request_abort = request_abort.clone();
+                async move {
+                    tokio::select! {
+                        biased;
+                        _ = request_abort.cancelled() => {
+                            StatusCode::SERVICE_UNAVAILABLE.into_response()
                         }
+                        response = next.run(request) => response,
                     }
-                }));
+                }
+            }));
 
         axum::serve(
             listener,

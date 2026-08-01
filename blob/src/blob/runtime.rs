@@ -215,9 +215,7 @@ impl BlobHandle {
                 .read()
                 .expect("blob seal lock poisoned");
             if self.handler.is_sealed() {
-                self.handler
-                    .rejected_writes
-                    .fetch_add(1, Ordering::Relaxed);
+                self.handler.rejected_writes.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     event = "blob.write.after_seal",
                     effect = kind,

@@ -9,10 +9,10 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::{
     JobExecutionClass, NotificationRecord, RealmConfigDocument, RealmId, RoCrateLimits,
 };
-use aruna_core::shutdown::Shutdown;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::Key;
@@ -1968,8 +1968,15 @@ pub async fn initialize_task_holder(
     rocrate_limits: RoCrateLimits,
     shutdown: &Shutdown,
 ) {
-    initialize_task_handler(context, task_handle, jobs_runtime, rocrate_limits, true, shutdown)
-        .await;
+    initialize_task_handler(
+        context,
+        task_handle,
+        jobs_runtime,
+        rocrate_limits,
+        true,
+        shutdown,
+    )
+    .await;
 }
 
 async fn initialize_task_handler(
