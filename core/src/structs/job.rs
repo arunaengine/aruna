@@ -676,6 +676,13 @@ impl JobPayload {
                 spec.document_id = Ulid::nil();
                 postcard::to_allocvec(&JobPayload::ImportRoCrate(spec))
             }
+            // Idempotency is the document id alone: a re-mint by a different user
+            // must match, not conflict, so the minter is excluded from the digest.
+            JobPayload::MintPersistentId(spec) => {
+                let mut spec = spec.clone();
+                spec.minted_by = UserId::default();
+                postcard::to_allocvec(&JobPayload::MintPersistentId(spec))
+            }
             _ => postcard::to_allocvec(self),
         }
         .expect("payload postcard is infallible");
@@ -1411,6 +1418,20 @@ mod tests {
 
     fn user(realm: u8, byte: u8) -> UserId {
         UserId::new(Ulid::from_bytes([byte; 16]), RealmId([realm; 32]))
+    }
+
+    #[test]
+    fn mint_digest_ignores_the_minter() {
+        let document_id = Ulid::from_bytes([1; 16]);
+        let first = JobPayload::MintPersistentId(MintPersistentIdSpec {
+            document_id,
+            minted_by: user(1, 2),
+        });
+        let second = JobPayload::MintPersistentId(MintPersistentIdSpec {
+            document_id,
+            minted_by: user(3, 4),
+        });
+        assert_eq!(first.plan_digest(), second.plan_digest());
     }
 
     fn probe_record(job_id: JobId, created_at_ms: u64) -> JobRecord {
