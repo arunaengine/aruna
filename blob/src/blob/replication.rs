@@ -36,8 +36,12 @@ impl BlobHandler {
         backend: &BackendRef,
         reason: &str,
     ) {
-        let record =
-            BlobQuarantineRecord::new(blake3, backend.clone(), reason.to_string(), unix_timestamp_millis());
+        let record = BlobQuarantineRecord::new(
+            blake3,
+            backend.clone(),
+            reason.to_string(),
+            unix_timestamp_millis(),
+        );
         let value = match record.to_bytes() {
             Ok(value) => value,
             Err(error) => {
