@@ -597,6 +597,7 @@ fn map_add_role_error(error: AddGroupRoleError) -> ServerError {
         AddGroupRoleError::Unauthorized => ServerError::Forbidden,
         AddGroupRoleError::InvalidPublicRole
         | AddGroupRoleError::InvalidAssignedUser
+        | AddGroupRoleError::UnconfinedRolePath
         | AddGroupRoleError::ReservedRoleName => ServerError::BadRequest,
         AddGroupRoleError::GroupNotFound => ServerError::NotFound,
         AddGroupRoleError::CheckPermissionsError(

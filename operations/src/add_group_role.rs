@@ -141,6 +141,8 @@ pub enum AddGroupRoleError {
     InvalidPublicRole,
     #[error("Invalid assigned user")]
     InvalidAssignedUser,
+    #[error("Role path escapes the group subtree")]
+    UnconfinedRolePath,
     #[error("Reserved role name")]
     ReservedRoleName,
     #[error(transparent)]
@@ -159,6 +161,16 @@ const RESERVED_GROUP_ROLE_NAMES: &[&str] = &["admin", "user"];
 
 fn is_reserved_group_role_name(name: &str) -> bool {
     RESERVED_GROUP_ROLE_NAMES.contains(&name.trim())
+}
+
+/// A group role may only grant on its own group subtree. The pattern must
+/// compile and be the subtree root or literally prefixed by it, so wildcards
+/// cannot reach another group, realm, or admin namespace.
+fn role_path_confined(pattern: &str, subtree_root: &str) -> bool {
+    if aruna_core::permission_path::compile_permission_matcher(pattern).is_err() {
+        return false;
+    }
+    pattern == subtree_root || pattern.starts_with(&format!("{subtree_root}/"))
 }
 
 impl AddGroupRoleOperation {
@@ -194,6 +206,17 @@ impl AddGroupRoleOperation {
                 .any(|permission| permission != &Permission::READ)
         {
             return Err(AddGroupRoleError::InvalidPublicRole);
+        }
+
+        let subtree_root = format!("/{}/g/{}", self.input.realm_id, self.input.group_id);
+        if self
+            .input
+            .role
+            .permissions
+            .keys()
+            .any(|pattern| !role_path_confined(pattern, &subtree_root))
+        {
+            return Err(AddGroupRoleError::UnconfinedRolePath);
         }
 
         Ok(())
@@ -1201,6 +1224,51 @@ pub mod test {
         );
     }
 
+    #[test]
+    fn rejects_unconfined_paths() {
+        // Patterns outside the group subtree (other group, realm admin, wildcard
+        // group, unrooted) must be refused before any effect is emitted.
+        let realm_id = aruna_core::structs::RealmId([1u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([3u8; 16]);
+        let other_group = Ulid::from_bytes([9u8; 16]);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
+            user_id,
+            realm_id,
+        };
+
+        for pattern in [
+            format!("/{realm_id}/g/{other_group}/data/**"),
+            format!("/{realm_id}/admin/**"),
+            format!("/{realm_id}/g/*/data/**"),
+            format!("{realm_id}/g/{group_id}/data/**"),
+        ] {
+            let mut operation = AddGroupRoleOperation::new(AddGroupRoleConfig {
+                auth_context: aruna_core::structs::AuthContext {
+                    user_id,
+                    realm_id,
+                    path_restrictions: None,
+                },
+                actor: actor.clone(),
+                realm_id,
+                group_id,
+                role: Role {
+                    role_id: Ulid::generate(),
+                    name: "escaping".to_string(),
+                    permissions: HashMap::from([(pattern, Permission::READ)]),
+                    assigned_users: HashSet::from([user_id]),
+                },
+            });
+
+            assert!(operation.start().is_empty());
+            assert_eq!(
+                operation.finalize(),
+                Err(AddGroupRoleError::UnconfinedRolePath)
+            );
+        }
+    }
+
     #[tokio::test]
     pub async fn test_add_role() {
         //
@@ -1240,7 +1308,7 @@ pub mod test {
                 name: "test_role".to_string(),
                 permissions: HashMap::from([(
                     format!(
-                        "{}/g/{}/meta/{}",
+                        "/{}/g/{}/meta/{}",
                         realm_id,
                         group_id.to_string(),
                         Ulid::generate(),
