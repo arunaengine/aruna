@@ -75,7 +75,11 @@ impl ApiRateLimits {
     /// One request against the caller's buckets. `Err` carries the seconds
     /// after which a retry can conform (never zero).
     pub fn check(&self, ip: IpAddr, principal: Option<&str>) -> Result<(), u64> {
-        if self.checks.fetch_add(1, Ordering::Relaxed) % MAINTENANCE_INTERVAL == 0 {
+        if self
+            .checks
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(MAINTENANCE_INTERVAL)
+        {
             self.per_ip.retain_recent();
             self.per_principal.retain_recent();
         }
@@ -100,11 +104,17 @@ fn retry_secs(secs: u64) -> u64 {
 /// caller is attributed to its principal on top of its client address.
 pub async fn rate_limit_middleware(
     State(state): State<std::sync::Arc<ServerState>>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     request: Request,
     next: Next,
 ) -> Response {
-    let ip = client_ip(state.trusted_proxies(), peer.ip(), request.headers());
+    // Direct router calls (tests) carry no connect info; production serves
+    // with connect info and always attributes the transport peer.
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0.ip())
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    let ip = client_ip(state.trusted_proxies(), peer, request.headers());
     let principal = request
         .extensions()
         .get::<Option<AuthContext>>()
