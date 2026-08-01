@@ -2851,6 +2851,12 @@ mod tests {
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => panic!("unexpected realm config write: {other:?}"),
         }
+        // The ex-holder keeps the realm config that rebalanced it out, so it
+        // still admits inbound sync from the current holders.
+        ex_holder
+            .refresh_realm_peers_from_document(&config)
+            .await
+            .expect("ex-holder refreshes realm peers");
 
         let strategy_id = config.strategies.first().expect("a strategy").strategy_id;
         let placement = aruna_core::structs::PlacementRef {
