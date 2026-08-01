@@ -20,7 +20,7 @@ pub use aruna_core::storage_entries::{
     metadata_materialization_document_job_write_entry, metadata_materialization_job_key,
     metadata_materialization_job_write_entry, metadata_materialization_status_key,
     metadata_materialization_status_write_entry, metadata_registry_key, metadata_registry_prefix,
-    shard_manifest_write_entry,
+    metadata_updated_index_entry, shard_manifest_write_entry,
 };
 use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
@@ -287,6 +287,7 @@ pub fn create_records_and_outbox_write_entries(
             metadata_registry_key(record.group_id, record.document_id),
             postcard::to_allocvec(&record.holder_node_ids)?.into(),
         ),
+        metadata_updated_index_entry(record),
         (
             METADATA_AUDIT_KEYSPACE.to_string(),
             metadata_audit_key(record.group_id, record.document_id, audit_id),

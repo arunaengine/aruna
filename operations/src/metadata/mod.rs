@@ -15,6 +15,7 @@ mod search_cursor;
 mod search_enrichment;
 pub mod stats;
 mod summary_cache;
+pub mod timestamp_index;
 
 use std::sync::Arc;
 
