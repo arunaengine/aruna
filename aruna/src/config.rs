@@ -85,6 +85,7 @@ pub struct Config {
     pub s3_host: String,
     pub api_public_url: Option<String>,
     pub s3_public_url: Option<String>,
+    pub trusted_proxies: Vec<ipnet::IpNet>,
     pub rocrate_limits: RoCrateLimits,
     pub s3_address: String,
     pub onboarding_secret: Option<String>,
@@ -376,6 +377,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     let s3_host = dotenvy::var("S3_HOST")?;
     let api_public_url = optional_public_url_env("API_PUBLIC_URL")?;
     let s3_public_url = optional_public_url_env("S3_PUBLIC_URL")?;
+    let trusted_proxies = trusted_proxies_env()?;
     let rocrate_limits = rocrate_limits_env()?;
     let s3_address = dotenvy::var("S3_ADDRESS")?;
     SocketAddr::from_str(&s3_address)?;
@@ -515,6 +517,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             s3_host,
             api_public_url,
             s3_public_url,
+            trusted_proxies,
             rocrate_limits,
             s3_address,
             onboarding_secret,
@@ -704,6 +707,25 @@ fn required_nonempty_env(key: &'static str) -> Result<String, SetupError> {
         Ok(value) => Err(invalid_config_value(key, value, "must not be empty")),
         Err(_) => Err(SetupError::MissingConfigValue(key)),
     }
+}
+
+/// `TRUSTED_PROXIES` is a comma-separated list of CIDR networks or bare IPs
+/// whose `x-forwarded-*` headers the node honors. Empty trusts no proxy.
+fn trusted_proxies_env() -> Result<Vec<ipnet::IpNet>, SetupError> {
+    let Some(value) = optional_nonempty_env("TRUSTED_PROXIES")? else {
+        return Ok(Vec::new());
+    };
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            entry
+                .parse::<ipnet::IpNet>()
+                .or_else(|_| entry.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+                .map_err(|error| invalid_config_value("TRUSTED_PROXIES", entry, error))
+        })
+        .collect()
 }
 
 fn optional_public_url_env(key: &'static str) -> Result<Option<String>, SetupError> {

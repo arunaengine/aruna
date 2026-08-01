@@ -21,7 +21,7 @@ use aruna_operations::jobs::service::{
     submit_execution_job,
 };
 use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
-use axum::extract::{Path, Query, RawQuery, State};
+use axum::extract::{ConnectInfo, Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -34,6 +34,7 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::auth::{ValidatedArunaBearerTokenCarrier, require_unrestricted_realm_auth};
 use crate::error::ServerError;
+use crate::forwarded::external_base_url;
 use crate::server_state::ServerState;
 
 /// GA4GH TES version this facade implements.
@@ -401,8 +402,12 @@ fn parse_tag_filters(raw_query: Option<&str>) -> Vec<(String, String)> {
     tag = "tes",
     responses((status = 200, body = TesServiceInfo))
 )]
-pub async fn service_info(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response {
-    let base_url = external_base_url(&headers);
+pub async fn service_info(
+    State(state): State<Arc<ServerState>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     let info = TesServiceInfo {
         id: format!("org.aruna.{}", state.get_realm_id()),
         name: format!("Aruna Realm {}", state.get_realm_id()),
@@ -526,6 +531,7 @@ pub async fn get_task(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
     Query(query): Query<ViewQuery>,
@@ -559,7 +565,7 @@ pub async fn get_task(
         return TesError::not_found("TES task not found").into_response();
     }
 
-    let base_url = external_base_url(&headers);
+    let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     tes_json_response(StatusCode::OK, project_task(&record, view, &base_url))
 }
 
@@ -586,6 +592,7 @@ pub async fn get_task(
 pub async fn list_tasks(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
     Query(query): Query<ListTasksQuery>,
@@ -625,7 +632,7 @@ pub async fn list_tasks(
         Err(error) => return TesError::internal(error).into_response(),
     };
 
-    let base_url = external_base_url(&headers);
+    let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     let tasks = records
         .iter()
         .map(|record| project_task(record, view, &base_url))
@@ -1404,19 +1411,6 @@ fn rfc3339(ms: u64) -> String {
     chrono::DateTime::from_timestamp_millis(ms as i64)
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_default()
-}
-
-fn external_base_url(headers: &HeaderMap) -> String {
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("http");
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get(http::header::HOST))
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("localhost");
-    format!("{scheme}://{host}")
 }
 
 fn tes_json_response<T: Serialize>(status: StatusCode, value: T) -> Response {
@@ -2442,6 +2436,7 @@ mod tests {
             State(state.clone()),
             Extension(None),
             Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
             headers.clone(),
             Path(visible_id.to_string()),
             Query(ViewQuery::default()),
@@ -2452,6 +2447,7 @@ mod tests {
             State(state.clone()),
             Extension(None),
             Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
             headers.clone(),
             Path(hidden_id.to_string()),
             Query(ViewQuery::default()),
@@ -2481,6 +2477,7 @@ mod tests {
         let listed = list_tasks(
             State(state),
             Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
             headers,
             RawQuery(None),
             Query(ListTasksQuery::default()),
@@ -2515,6 +2512,7 @@ mod tests {
         let listed = list_tasks(
             State(state),
             Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
             headers,
             RawQuery(None),
             Query(ListTasksQuery {
@@ -2549,6 +2547,7 @@ mod tests {
             State(state.clone()),
             Extension(auth_for(owner)),
             Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
             HeaderMap::new(),
             Path(job_id.to_string()),
             Query(ViewQuery {
@@ -2563,6 +2562,7 @@ mod tests {
             State(state.clone()),
             Extension(auth_for(user(3))),
             Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
             HeaderMap::new(),
             Path(job_id.to_string()),
             Query(ViewQuery::default()),

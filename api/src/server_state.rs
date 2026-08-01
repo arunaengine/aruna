@@ -74,6 +74,8 @@ pub struct ServerState {
     // True when this node can mount S3 inputs (Kubernetes with a CSI driver).
     s3_mounts_available: bool,
     rocrate_limits: RoCrateLimits,
+    // Peers allowed to set `x-forwarded-*`; empty means no proxy is trusted.
+    trusted_proxies: Vec<ipnet::IpNet>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -178,6 +180,7 @@ impl ServerState {
             metrics: Arc::new(NodeMetrics::new()),
             s3_mounts_available: false,
             rocrate_limits: RoCrateLimits::default(),
+            trusted_proxies: Vec::new(),
         };
         state.persist_trusted_realms().await;
         state
@@ -216,6 +219,15 @@ impl ServerState {
 
     pub fn rocrate_limits(&self) -> &RoCrateLimits {
         &self.rocrate_limits
+    }
+
+    pub fn with_trusted_proxies(mut self, proxies: Vec<ipnet::IpNet>) -> Self {
+        self.trusted_proxies = proxies;
+        self
+    }
+
+    pub fn trusted_proxies(&self) -> &[ipnet::IpNet] {
+        &self.trusted_proxies
     }
 
     pub fn jobs_runtime(&self) -> Arc<JobsRuntime> {

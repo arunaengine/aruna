@@ -37,6 +37,7 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 crypto_box = { workspace = true }
 ed25519-dalek = { workspace = true }
+ipnet = { workspace = true }
 jsonwebtoken = { workspace = true }
 postcard = { workspace = true }
 rand = { workspace = true }

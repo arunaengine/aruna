@@ -6,6 +6,7 @@ pub mod auth;
 pub mod cors;
 pub mod csp;
 pub mod error;
+pub mod forwarded;
 pub mod openapi;
 pub mod ops;
 mod portal;

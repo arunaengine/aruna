@@ -1,5 +1,6 @@
 use crate::auth::{ensure_permission, require_realm_auth};
 use crate::error::ServerError;
+use crate::forwarded::external_base_url;
 use crate::server_state::ServerState;
 use aruna_core::structs::{
     ArunaArn, ArunaArnType, AuthContext, BackendLocation, Permission, SourceMetadata,
@@ -11,7 +12,7 @@ use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOpe
 use aruna_operations::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, options, post};
@@ -191,9 +192,10 @@ enum ResolveOutcome {
 )]
 pub async fn get_service_info(
     State(state): State<Arc<ServerState>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
 ) -> (StatusCode, Json<DrsServiceInfoResponse>) {
-    let base_url = external_base_url(&headers);
+    let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     (
         StatusCode::OK,
         Json(DrsServiceInfoResponse {
@@ -264,9 +266,11 @@ pub async fn get_authorizations(
 pub async fn get_object(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Path(object_id): Path<String>,
 ) -> Response {
+    let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     let anonymous = auth.is_none();
     let auth = match drs_auth_or_anonymous(state.as_ref(), auth) {
         Ok(auth) => auth,
@@ -275,7 +279,7 @@ pub async fn get_object(
 
     match resolve_object(state.as_ref(), &auth, &object_id).await {
         Ok(ResolveOutcome::Found(resolved)) => {
-            drs_json_response(StatusCode::OK, build_object_response(&headers, &resolved))
+            drs_json_response(StatusCode::OK, build_object_response(&base_url, &resolved))
         }
         Ok(ResolveOutcome::Denied) => drs_denied_error(anonymous).into_response(),
         Ok(ResolveOutcome::NotFound) => DrsError::not_found("DRS object not found").into_response(),
@@ -298,9 +302,11 @@ pub async fn get_object(
 pub async fn post_objects(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<DrsBulkObjectsRequestBody>,
 ) -> Response {
+    let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     let anonymous = auth.is_none();
     let auth = match drs_auth_or_anonymous(state.as_ref(), auth) {
         Ok(auth) => auth,
@@ -311,7 +317,7 @@ pub async fn post_objects(
     for object_id in body.object_ids {
         let result = match resolve_object(state.as_ref(), &auth, &object_id).await {
             Ok(ResolveOutcome::Found(resolved)) => serde_json::to_value(build_object_response(
-                &headers, &resolved,
+                &base_url, &resolved,
             ))
             .unwrap_or_else(|_| json!({ "status_code": 500, "msg": "serialization failed" })),
             Ok(ResolveOutcome::Denied) => {
@@ -403,10 +409,9 @@ pub async fn download_object(
     response
 }
 
-fn build_object_response(headers: &HeaderMap, resolved: &ResolvedObject) -> DrsObjectResponse {
+fn build_object_response(base_url: &str, resolved: &ResolvedObject) -> DrsObjectResponse {
     let self_uri = format!(
-        "{}/api/v1/ga4gh/drs/v1/objects/{}",
-        external_base_url(headers),
+        "{base_url}/api/v1/ga4gh/drs/v1/objects/{}",
         encode_component(&resolved.requested_id)
     );
     let hash = resolved
@@ -434,8 +439,7 @@ fn build_object_response(headers: &HeaderMap, resolved: &ResolvedObject) -> DrsO
         region: None,
         access_url: Some(DrsAccessUrl {
             url: format!(
-                "{}/api/v1/ga4gh/drs/v1/download?object_id={}",
-                external_base_url(headers),
+                "{base_url}/api/v1/ga4gh/drs/v1/download?object_id={}",
                 encode_component(&resolved.requested_id)
             ),
             headers: HashMap::new(),
@@ -729,19 +733,6 @@ fn decode_blake3_hex(hash_hex: &str) -> Result<[u8; 32], DrsError> {
         .map_err(|_| DrsError::bad_request("content hash is invalid"))
 }
 
-fn external_base_url(headers: &HeaderMap) -> String {
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("http");
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get(http::header::HOST))
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("localhost");
-    format!("{scheme}://{host}")
-}
-
 fn encode_component(value: &str) -> String {
     byte_serialize(value.as_bytes()).collect()
 }
@@ -832,24 +823,14 @@ mod tests {
     use aruna_storage::storage::FjallStorage;
     use axum::Extension;
     use axum::body::to_bytes;
-    use axum::extract::{Path, State};
-    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::extract::{ConnectInfo, Path, State};
+    use axum::http::{HeaderMap, StatusCode};
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::sync::Arc;
     use std::time::SystemTime;
     use tempfile::TempDir;
     use ulid::Ulid;
-
-    fn forwarded_headers() -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-        headers.insert(
-            "x-forwarded-host",
-            HeaderValue::from_static("drs.example.test"),
-        );
-        headers
-    }
 
     fn materialized_location(blake3: [u8; 32]) -> BackendLocation {
         let mut hashes = HashMap::new();
@@ -1156,6 +1137,7 @@ mod tests {
             let response = get_object(
                 State(state.clone()),
                 Extension(Some(auth.clone())),
+                ConnectInfo("127.0.0.1:1".parse().unwrap()),
                 HeaderMap::new(),
                 Path(arn.to_string()),
             )
@@ -1198,6 +1180,7 @@ mod tests {
         let response = get_object(
             State(state),
             Extension(Some(auth)),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
             HeaderMap::new(),
             Path(missing.to_string()),
         )
@@ -1232,7 +1215,7 @@ mod tests {
             }),
         };
 
-        let response = build_object_response(&forwarded_headers(), &resolved);
+        let response = build_object_response("https://drs.example.test", &resolved);
 
         assert!(response.aliases.is_empty());
         assert_eq!(response.id, canonical_w3id);
@@ -1285,7 +1268,7 @@ mod tests {
             }),
         };
 
-        let response = build_object_response(&forwarded_headers(), &resolved);
+        let response = build_object_response("https://drs.example.test", &resolved);
 
         assert_eq!(response.id, requested_id);
         assert_eq!(response.aliases, vec![canonical_w3id.clone()]);
