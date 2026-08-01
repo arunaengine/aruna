@@ -8,11 +8,14 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aruna_core::UserId;
-use aruna_core::structs::{Actor, RealmId};
+use aruna_core::effects::StorageEffect;
+use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::structs::{Actor, RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::types::GroupId;
+use aruna_core::{StructuredId, UserId};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    mint_local_document_id,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
@@ -114,12 +117,20 @@ async fn run_writer(
     group_id: GroupId,
     writer: usize,
     context: Arc<DriverContext>,
+    config: Arc<RealmConfigDocument>,
 ) -> Result<Vec<Duration>, BoxError> {
     let node_id = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+    let actor = Actor {
+        node_id,
+        user_id: UserId::local(Ulid::generate(), realm_id),
+        realm_id,
+    };
     let mut latencies = Vec::with_capacity(PER_WRITER);
     let mut batch = Vec::new();
     for index in 0..PER_WRITER {
-        let document_id = Ulid::generate();
+        let document_path = format!("datasets/probe-{writer}-{index}");
+        let document_id =
+            mint_local_document_id(&config, &actor, group_id, &document_path)?.as_ulid();
         let payload = if index % 2 == 0 {
             scaffold_payload(writer, index)
         } else {
@@ -129,14 +140,10 @@ async fn run_writer(
         let created = drive(
             CreateMetadataDocumentOperation::new_for_generated_document_id(
                 CreateMetadataDocumentConfig {
-                    actor: Actor {
-                        node_id,
-                        user_id: UserId::local(Ulid::generate(), realm_id),
-                        realm_id,
-                    },
+                    actor: actor.clone(),
                     group_id,
                     document_id,
-                    document_path: format!("datasets/probe-{writer}-{index}"),
+                    document_path,
                     public: true,
                     payload,
                 },
@@ -166,12 +173,35 @@ async fn run_phase(label: &str, with_drains: bool) -> Result<(), BoxError> {
     let realm_id = RealmId([55u8; 32]);
     let group_id = Ulid::generate();
 
+    // The writers create on node [9; 32]; seed a realm config that provisions the
+    // metadata binding and makes that node a holder so the minted ids resolve.
+    let writer_node = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+    let seed_actor = Actor {
+        node_id: writer_node,
+        user_id: UserId::local(Ulid::generate(), realm_id),
+        realm_id,
+    };
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    config.seed_default_placement();
+    config.ensure_node(writer_node, RealmNodeKind::Server);
+    node.context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: (*realm_id.as_bytes()).into(),
+            value: config.to_bytes(&seed_actor)?.into(),
+            txn_id: None,
+        })
+        .await;
+    let config = Arc::new(config);
+
     let started = Instant::now();
     let mut handles = Vec::with_capacity(WRITERS);
     for writer in 0..WRITERS {
         let context = node.context.clone();
+        let config = config.clone();
         handles.push(tokio::spawn(async move {
-            run_writer(realm_id, group_id, writer, context).await
+            run_writer(realm_id, group_id, writer, context, config).await
         }));
     }
     let mut latencies = Vec::with_capacity(WRITERS * PER_WRITER);
