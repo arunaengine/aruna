@@ -37,7 +37,7 @@ use aruna_core::keyspaces::{
     DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, GROUP_OWNER_INDEX_KEYSPACE,
     METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
     METADATA_GRAPH_LIFECYCLE_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
+    SYNC_QUARANTINE_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
@@ -60,10 +60,10 @@ use aruna_core::structs::{
     HANDLE_RANGE_SIZE, MetadataRegistryRecord, NOTIFICATION_WATCH_INTEREST_BYTES_CAP,
     NOTIFICATION_WATCH_INTEREST_ENTRY_CAP, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument,
     NodeUsageSnapshot, PlacementRef, PlacementScope, PoolAdmission, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId, RealmNodeKind, Role, User, WatchEventMask, WatchInterestDigest,
-    WatchSubscription, admit_band_pool, coordinator_spans, group_owner_index_key,
-    node_usage_key_node_id, reserved_label, watch_interest_dirty_key, watch_interest_key_node_id,
-    watch_interest_key_realm_id,
+    RealmConfigDocument, RealmId, RealmNodeKind, Role, SyncQuarantineRecord, User, WatchEventMask,
+    WatchInterestDigest, WatchSubscription, admit_band_pool, coordinator_spans,
+    group_owner_index_key, node_usage_key_node_id, reserved_label, sync_quarantine_key,
+    watch_interest_dirty_key, watch_interest_key_node_id, watch_interest_key_realm_id,
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::{RoleId, TxnId, UserId, Value};
@@ -2642,6 +2642,12 @@ impl DocumentSyncService {
                         {
                             AdminEventValidation::Accepted => {}
                             AdminEventValidation::Rejected(reason) => {
+                                self.quarantine_admin_event(
+                                    topic_id.as_bytes(),
+                                    event.as_ref(),
+                                    &reason,
+                                )
+                                .await;
                                 warn!(
                                     %topic_id,
                                     event_id = %event.event_id,
@@ -2713,12 +2719,16 @@ impl DocumentSyncService {
                             applied_targets.push(target);
                             progressed = true;
                         }
-                        AdminEventValidation::Rejected(reason) => warn!(
-                            %topic_id,
-                            event_id = %event.event_id,
-                            %reason,
-                            "Rejecting deferred admin operation after prerequisite replay"
-                        ),
+                        AdminEventValidation::Rejected(reason) => {
+                            self.quarantine_admin_event(topic_id.as_bytes(), &event, &reason)
+                                .await;
+                            warn!(
+                                %topic_id,
+                                event_id = %event.event_id,
+                                %reason,
+                                "Rejecting deferred admin operation after prerequisite replay"
+                            );
+                        }
                         AdminEventValidation::Deferred { dependency, reason } => {
                             retry.push((target, event, placement, actor_id, dependency, reason))
                         }
@@ -2729,6 +2739,8 @@ impl DocumentSyncService {
                         if let Some(dependency) = dependency {
                             cross_topic_dependencies.insert(dependency);
                         } else {
+                            self.quarantine_admin_event(topic_id.as_bytes(), &event, &reason)
+                                .await;
                             warn!(
                                 %topic_id,
                                 event_id = %event.event_id,
@@ -3517,6 +3529,49 @@ impl DocumentSyncService {
 
     async fn storage_batch_write(&self, writes: Vec<(String, ByteView, Value)>) -> Result<()> {
         storage_batch_write_to(&self.storage, writes).await
+    }
+
+    /// Durably retain a permanently-rejected admin sync event for inspection
+    /// instead of only logging it, so the topic can advance without losing the
+    /// poison event. Best-effort: a persistence failure is logged, not fatal.
+    async fn quarantine_admin_event(&self, topic: &[u8], event: &AdminDocumentEvent, reason: &str) {
+        let record = quarantine_record(topic, event, reason, unix_timestamp_millis());
+        let value = match record.to_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(%error, "failed to encode sync quarantine record");
+                return;
+            }
+        };
+        let key = ByteView::from(sync_quarantine_key(topic, event.event_id));
+        if let Err(error) = self
+            .storage_batch_write(vec![(
+                SYNC_QUARANTINE_KEYSPACE.to_string(),
+                key,
+                value.into(),
+            )])
+            .await
+        {
+            warn!(%error, event_id = %event.event_id, "failed to quarantine rejected sync event");
+        }
+    }
+}
+
+/// Build the durable record for a permanently-rejected admin sync event. The
+/// event is preserved verbatim in `event_bytes` for later inspection.
+fn quarantine_record(
+    topic: &[u8],
+    event: &AdminDocumentEvent,
+    reason: &str,
+    quarantined_at_ms: u64,
+) -> SyncQuarantineRecord {
+    SyncQuarantineRecord {
+        topic: topic.to_vec(),
+        event_id: event.event_id,
+        origin_node_id: event.origin_node_id,
+        reason: reason.to_string(),
+        quarantined_at_ms,
+        event_bytes: postcard::to_allocvec(event).unwrap_or_default(),
     }
 }
 
@@ -8552,6 +8607,33 @@ mod tests {
             actor: actor.clone(),
             op,
         }
+    }
+
+    #[test]
+    fn quarantine_record_preserves_the_event() {
+        // A rejected admin event is retained verbatim for later inspection (#338).
+        let realm_id = RealmId::from_bytes([42; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([3; 16]), realm_id);
+        let actor = test_actor(4, user_id, realm_id);
+        let event_id = Ulid::from_bytes([7; 16]);
+        let event = test_admin_event(
+            event_id,
+            AdminDocumentTarget::User { user_id },
+            &actor,
+            1,
+            AdminDocumentOperation::UserNameSet {
+                name: "Mallory".to_string(),
+            },
+        );
+
+        let record = quarantine_record(&[9u8; 32], &event, "unauthorized", 55);
+
+        assert_eq!(record.event_id, event_id);
+        assert_eq!(record.origin_node_id, actor.node_id);
+        assert_eq!(record.reason, "unauthorized");
+        assert_eq!(record.quarantined_at_ms, 55);
+        let decoded: AdminDocumentEvent = postcard::from_bytes(&record.event_bytes).unwrap();
+        assert_eq!(decoded, event);
     }
 
     async fn apply_conflicting_user_name_and_attribute(
