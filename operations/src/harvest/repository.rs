@@ -120,9 +120,7 @@ pub fn iter_provenance_effect(
     })
 }
 
-pub fn parse_connector_read(
-    event: Event,
-) -> Result<Option<RepositoryConnector>, StorageReadError> {
+pub fn parse_connector_read(event: Event) -> Result<Option<RepositoryConnector>, StorageReadError> {
     parse_storage_read(event, RepositoryConnector::from_bytes)
 }
 
@@ -130,9 +128,7 @@ pub fn parse_source_read(event: Event) -> Result<Option<HarvestSource>, StorageR
     parse_storage_read(event, HarvestSource::from_bytes)
 }
 
-pub fn parse_provenance_read(
-    event: Event,
-) -> Result<Option<HarvestProvenance>, StorageReadError> {
+pub fn parse_provenance_read(event: Event) -> Result<Option<HarvestProvenance>, StorageReadError> {
     parse_storage_read(event, HarvestProvenance::from_bytes)
 }
 

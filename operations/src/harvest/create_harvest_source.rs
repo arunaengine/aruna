@@ -9,9 +9,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::harvest::repository::{
-    StorageReadError, read_connector_effect, write_source_effect,
-};
+use crate::harvest::repository::{StorageReadError, read_connector_effect, write_source_effect};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateSourceInput {
@@ -243,10 +241,8 @@ mod tests {
 
     #[test]
     fn missing_connector_errors_not_found() {
-        let mut op = CreateSourceOperation::new(input(
-            ulid::Ulid::generate(),
-            ulid::Ulid::generate(),
-        ));
+        let mut op =
+            CreateSourceOperation::new(input(ulid::Ulid::generate(), ulid::Ulid::generate()));
         assert_eq!(op.start().len(), 1);
         op.step(Event::Storage(StorageEvent::ReadResult {
             key: byteview::ByteView::from(Vec::new()),
