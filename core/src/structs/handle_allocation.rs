@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::structs::{FIRST_HANDLE, HandleRange};
+use crate::structs::{FIRST_GRANTABLE_HANDLE, HandleRange};
 use crate::structured_id::PlacementHandle;
 
 /// The derived view over the replicated handle-range set. Overlapping grants —
@@ -80,13 +80,14 @@ impl HandleRangeDirectory {
 
     /// The start of the next range a coordinator should grant: one past the
     /// highest end already carved out (conflicted grants included, so a bad
-    /// overlap is never re-granted), or [`FIRST_HANDLE`] when nothing is granted.
+    /// overlap is never re-granted), or [`FIRST_GRANTABLE_HANDLE`] when nothing
+    /// is granted, keeping grants clear of the reserved default-binding band.
     pub fn next_grantable_start(&self) -> u32 {
         self.by_id
             .values()
             .map(|range| range.end)
             .max()
-            .unwrap_or(FIRST_HANDLE)
+            .unwrap_or(FIRST_GRANTABLE_HANDLE)
     }
 }
 
@@ -101,7 +102,9 @@ pub struct HandleAllocationCursor {
 
 impl Default for HandleAllocationCursor {
     fn default() -> Self {
-        Self { next: FIRST_HANDLE }
+        Self {
+            next: FIRST_GRANTABLE_HANDLE,
+        }
     }
 }
 
@@ -174,7 +177,7 @@ mod tests {
     #[test]
     fn cursor_walks_ranges_and_skips_gaps() {
         let owner = node(1);
-        let low = range(1, owner, 1, 3);
+        let low = range(1, owner, 3, 5);
         let high = range(2, owner, 2049, 2051);
         let mut cursor = HandleAllocationCursor::new();
         let drawn: Vec<u32> = std::iter::from_fn(|| {
@@ -183,7 +186,7 @@ mod tests {
                 .map(|(handle, _)| handle.get())
         })
         .collect();
-        assert_eq!(drawn, vec![1, 2, 2049, 2050]);
+        assert_eq!(drawn, vec![3, 4, 2049, 2050]);
         assert!(cursor.allocate(&[low, high]).is_none());
     }
 

@@ -237,6 +237,13 @@ impl PlacementBinding {
 /// First allocatable handle: handle zero is reserved by the id codec, so every
 /// grant starts at one.
 pub const FIRST_HANDLE: u32 = 1;
+/// Realm-scoped default class binding for metadata documents.
+pub const METADATA_HANDLE: u32 = FIRST_HANDLE;
+/// Realm-scoped default class binding for job-control records.
+pub const JOBCONTROL_HANDLE: u32 = 2;
+/// First handle a coordinator may grant; the low band below it is reserved for
+/// the realm-scoped default class bindings above.
+pub const FIRST_GRANTABLE_HANDLE: u32 = 3;
 /// Exclusive upper bound of the 20-bit handle space (one past the highest
 /// allocatable handle).
 pub const HANDLE_SPACE_END: u32 = crate::structured_id::MAX_PLACEMENT_HANDLE + 1;

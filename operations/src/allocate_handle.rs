@@ -213,7 +213,7 @@ pub async fn allocate_placement_binding(
 mod tests {
     use super::*;
     use aruna_core::events::Event;
-    use aruna_core::structs::{HandleRange, RealmNodeKind};
+    use aruna_core::structs::{FIRST_GRANTABLE_HANDLE, HandleRange, RealmNodeKind};
     use aruna_core::types::UserId;
     use tempfile::tempdir;
 
@@ -283,7 +283,12 @@ mod tests {
         let context = context(temp.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([60; 32]);
         let actor = actor(realm_id);
-        seed_config_with_range(&context, &actor, range(actor.node_id, 1, 1025)).await;
+        seed_config_with_range(
+            &context,
+            &actor,
+            range(actor.node_id, FIRST_GRANTABLE_HANDLE, FIRST_GRANTABLE_HANDLE + 1024),
+        )
+        .await;
 
         let first = allocate_handle(&context, realm_id, actor.node_id)
             .await
@@ -291,8 +296,8 @@ mod tests {
         let second = allocate_handle(&context, realm_id, actor.node_id)
             .await
             .unwrap();
-        assert_eq!(first.handle.get(), 1);
-        assert_eq!(second.handle.get(), 2);
+        assert_eq!(first.handle.get(), FIRST_GRANTABLE_HANDLE);
+        assert_eq!(second.handle.get(), FIRST_GRANTABLE_HANDLE + 1);
         assert_eq!(first.allocator_range_id, Ulid::from_bytes([9; 16]));
 
         // "Restart": a fresh allocation reads the persisted cursor and does not
@@ -300,7 +305,7 @@ mod tests {
         let third = allocate_handle(&context, realm_id, actor.node_id)
             .await
             .unwrap();
-        assert_eq!(third.handle.get(), 3);
+        assert_eq!(third.handle.get(), FIRST_GRANTABLE_HANDLE + 2);
     }
 
     #[tokio::test]
@@ -309,8 +314,12 @@ mod tests {
         let context = context(temp.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([61; 32]);
         let actor = actor(realm_id);
-        let document =
-            seed_config_with_range(&context, &actor, range(actor.node_id, 1, 1025)).await;
+        let document = seed_config_with_range(
+            &context,
+            &actor,
+            range(actor.node_id, FIRST_GRANTABLE_HANDLE, FIRST_GRANTABLE_HANDLE + 1024),
+        )
+        .await;
         let strategy_id = document.default_strategy_id.unwrap();
 
         let binding = allocate_placement_binding(
@@ -326,7 +335,7 @@ mod tests {
         assert_eq!(binding.allocator_range_id, Some(Ulid::from_bytes([9; 16])));
         assert_eq!(binding.allocated_by, Some(actor.node_id));
         assert!(binding.allocated_at_ms.is_some());
-        assert_eq!(binding.handle.get(), 1);
+        assert_eq!(binding.handle.get(), FIRST_GRANTABLE_HANDLE);
     }
 
     #[tokio::test]
@@ -336,7 +345,12 @@ mod tests {
         let realm_id = RealmId::from_bytes([62; 32]);
         let actor = actor(realm_id);
         // A single-handle range: one allocation succeeds, the next is exhausted.
-        seed_config_with_range(&context, &actor, range(actor.node_id, 1, 2)).await;
+        seed_config_with_range(
+            &context,
+            &actor,
+            range(actor.node_id, FIRST_GRANTABLE_HANDLE, FIRST_GRANTABLE_HANDLE + 1),
+        )
+        .await;
 
         assert_eq!(
             allocate_handle(&context, realm_id, actor.node_id)
@@ -344,7 +358,7 @@ mod tests {
                 .unwrap()
                 .handle
                 .get(),
-            1
+            FIRST_GRANTABLE_HANDLE
         );
         assert!(matches!(
             allocate_handle(&context, realm_id, actor.node_id).await,
