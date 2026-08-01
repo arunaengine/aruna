@@ -54,12 +54,22 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
+use aruna_core::{MetaResourceId, StructuredId};
+
 const BUCKET: &str = "remote";
 const KEY: &str = "payload";
 const DOC_PATH: &str = "datasets/remote";
 const PAYLOAD: &[u8] = b"remote bao export payload";
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+/// A fixed structured id (handle 1, bucket 0); the RF-3 realm over two nodes
+/// makes every node hold every bucket, so bucket 0 is always held.
+fn doc_id(seed: u64) -> Ulid {
+    MetaResourceId::try_from((1u128 << 60) | u128::from(seed))
+        .unwrap()
+        .as_ulid()
+}
 
 struct Node {
     _root: TempDir,
@@ -74,7 +84,7 @@ async fn remote_export_streams() -> TestResult {
     let owner = UserId::local(Ulid::generate(), realm_id);
     let group_id = Ulid::generate();
     let version_id = Ulid::generate();
-    let document_id = Ulid::generate();
+    let document_id = doc_id(1);
 
     let (holder, exporter) =
         setup_remote(realm_id, owner, group_id, version_id, document_id).await?;
@@ -147,7 +157,7 @@ async fn remote_denial_omits() -> TestResult {
     let owner = UserId::local(Ulid::generate(), realm_id);
     let group_id = Ulid::generate();
     let version_id = Ulid::generate();
-    let document_id = Ulid::generate();
+    let document_id = doc_id(1);
 
     let (holder, exporter) =
         setup_remote(realm_id, owner, group_id, version_id, document_id).await?;
