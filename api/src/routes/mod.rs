@@ -16,6 +16,7 @@ pub mod info;
 pub mod jobs;
 pub mod metadata;
 pub mod notifications;
+pub mod oai;
 pub mod onboarding;
 pub mod policies;
 pub mod rocrate_import;
@@ -43,6 +44,7 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
         .merge(groups::router())
         .merge(jobs::router())
         .merge(metadata::router())
+        .merge(oai::router())
         .merge(rocrate_import::router())
         .merge(notifications::router())
         .merge(policies::router())
