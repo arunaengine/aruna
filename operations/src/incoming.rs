@@ -7,6 +7,7 @@ use crate::document_sync_outbox::{
     new_outbox_record_with_id, schedule_outbox_drain_effect, write_outbox_effect,
 };
 use crate::driver::{DriverContext, drive, node_routing, quota_marked_routing};
+use crate::get_realm_config::GetRealmConfigOperation;
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
 use crate::metadata::projector::{
@@ -34,7 +35,7 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::structs::{
-    ReplicationItemKind, RoCrateLimits, WatchEvent, WatchEventDetail, WatchEventKind,
+    RealmId, ReplicationItemKind, RoCrateLimits, WatchEvent, WatchEventDetail, WatchEventKind,
     data_watch_resource_path,
 };
 use aruna_core::task::{TaskEvent, TaskKey};
@@ -70,6 +71,25 @@ impl OperationsInboundHandler {
             document_sync_reconcile,
             rocrate_limits,
             jobs_runtime,
+        }
+    }
+
+    /// Blob replication is trusted only from realm nodes eligible to hold and
+    /// sync data; unknown or user-kind peers are rejected. Fails closed when
+    /// the realm config cannot be read.
+    async fn peer_is_sync_eligible(&self, realm_id: RealmId, peer: NodeId) -> bool {
+        match drive(GetRealmConfigOperation::new(realm_id), self.context.as_ref()).await {
+            Ok(config) => match config.sync_eligible_node_ids() {
+                Ok(ids) => ids.contains(&peer),
+                Err(error) => {
+                    warn!(peer = %peer, error = %error, "Failed to resolve sync-eligible peers");
+                    false
+                }
+            },
+            Err(error) => {
+                warn!(peer = %peer, error = %error, "Failed to read realm config for replication gate");
+                false
+            }
         }
     }
 }
@@ -321,17 +341,25 @@ impl InboundEventHandler for OperationsInboundHandler {
             match alpn {
                 Alpn::Bao => {
                     if let Some(blob_handle) = self.context.blob_handle.clone() {
+                        let Some(net_handle) = self.context.net_handle.clone() else {
+                            error!(peer = %node_id, "Cannot handle incoming bao stream without net handle");
+                            return;
+                        };
+                        // #332: only an authenticated sync-eligible realm peer
+                        // may open the blob replication plane at all.
+                        if !self
+                            .peer_is_sync_eligible(*net_handle.realm_id(), node_id)
+                            .await
+                        {
+                            warn!(peer = %node_id, "Rejecting bao stream from non-sync-eligible peer");
+                            return;
+                        }
                         let stream_id = match blob_handle.store_connection(node_id, stream).await {
                             Ok(stream_id) => stream_id,
                             Err(err) => {
                                 error!(peer = %node_id, error = ?err, "Failed to register inbound bao stream");
                                 return;
                             }
-                        };
-                        let Some(net_handle) = self.context.net_handle.as_ref() else {
-                            error!(peer = %node_id, "Cannot handle incoming bao stream without net handle");
-                            close_failed_bao(&blob_handle, stream_id).await;
-                            return;
                         };
                         let first_event = blob_handle
                             .send_blob_effect(BlobEffect::ReadMessage { stream_id })
@@ -735,6 +763,52 @@ mod tests {
         async fn handle_incoming_stream(&self, alpn: Alpn, stream: BiStream, node_id: NodeId) {
             self.0.send((alpn, stream, node_id)).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_foreign_peer() {
+        // The blob replication plane must refuse peers that are unknown or not
+        // sync-eligible before any manifest is read.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let realm_id = aruna_core::structs::RealmId::from_bytes([3u8; 32]);
+        let server = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let user = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let mut config =
+            aruna_core::structs::RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.ensure_node(server, aruna_core::structs::RealmNodeKind::Server);
+        config.ensure_node(user, aruna_core::structs::RealmNodeKind::User);
+        let actor = aruna_core::structs::Actor {
+            node_id: server,
+            user_id: aruna_core::UserId::nil(realm_id),
+            realm_id,
+        };
+        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        storage
+            .send_storage_effect(aruna_core::effects::StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: config.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+
+        let handler = OperationsInboundHandler::new(
+            Arc::new(DriverContext {
+                storage_handle: storage,
+                net_handle: None,
+                blob_handle: None,
+                metadata_handle: None,
+                task_handle: None,
+                compute_handle: None,
+            }),
+            RoCrateLimits::default(),
+        );
+
+        assert!(handler.peer_is_sync_eligible(realm_id, server).await);
+        assert!(!handler.peer_is_sync_eligible(realm_id, user).await);
+        let unknown = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+        assert!(!handler.peer_is_sync_eligible(realm_id, unknown).await);
     }
 
     #[tokio::test]

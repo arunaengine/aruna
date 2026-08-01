@@ -26,8 +26,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    BucketInfo, CurrentVersionPointer, GroupRoutingInputs, MultipartObjectMetadataKey, NodeRouting,
+    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
+    CurrentVersionPointer, GroupRoutingInputs, MultipartObjectMetadataKey, NodeRouting,
     Permission, RealmConfigDocument, RealmId, ReclaimCandidate, ReclaimCandidateKey,
     ReplicationItemKind, ReplicationNegotiationResult, ResolvedBackend, RoCrateLimits,
     RoutingError, StorageRoutingRule, UsageDelta, VersionKey, blob_bucket_permission_path,
@@ -48,7 +48,6 @@ enum IncomingVersionReplicationState {
     ReadDestinationBucket,
     CreateDestinationBucket,
     LoadDestinationRouting,
-    CheckPermissions,
     CheckWriterPermissions,
     ReadExistingVersion,
     ReadReplacedBlob,
@@ -108,8 +107,6 @@ pub enum IncomingVersionReplicationError {
     DestinationBucketNotFound,
     #[error("could not load the destination group's routing inputs: {0}")]
     RoutingInputsFailed(String),
-    #[error("Replication requires WRITE permission on the destination path")]
-    WritePermissionDenied,
     #[error("writer_access_denied")]
     WriterPermissionDenied,
     #[error("Replication hop limit exceeded")]
@@ -254,7 +251,6 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::ReadDestinationBucket => "ReadDestinationBucket",
             IncomingVersionReplicationState::CreateDestinationBucket => "CreateDestinationBucket",
             IncomingVersionReplicationState::LoadDestinationRouting => "LoadDestinationRouting",
-            IncomingVersionReplicationState::CheckPermissions => "CheckPermissions",
             IncomingVersionReplicationState::CheckWriterPermissions => "CheckWriterPermissions",
             IncomingVersionReplicationState::ReadExistingVersion => "ReadExistingVersion",
             IncomingVersionReplicationState::ReadReplacedBlob => "ReadReplacedBlob",
@@ -357,10 +353,6 @@ impl IncomingVersionReplicationOperation {
             self.manifest.version_id,
         )
         .to_bytes()
-    }
-
-    fn auth_context(&self) -> AuthContext {
-        self.manifest.auth_context.clone()
     }
 
     fn target_authorization_path(&self, group_id: Ulid) -> String {
@@ -526,20 +518,9 @@ impl IncomingVersionReplicationOperation {
         )]
     }
 
-    fn check_write_permission(&mut self, group_id: Ulid) -> Effects {
-        self.state = IncomingVersionReplicationState::CheckPermissions;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.auth_context(),
-                path: self.target_authorization_path(group_id),
-                required_permission: Permission::WRITE,
-            }),
-            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                allowed: result
-            }),
-        ))]
-    }
-
+    /// #332: the pushing peer authorizes by its authenticated node identity at
+    /// the ingress gate, never by the forgeable manifest auth context. The
+    /// original writer's context can only narrow, so it stays as a deny check.
     fn check_writer_permission(&mut self, group_id: Ulid) -> Effects {
         let Some(auth_context) = self.manifest.writer_auth_context.clone() else {
             return self.read_existing_version();
@@ -1425,7 +1406,7 @@ impl Operation for IncomingVersionReplicationOperation {
                             .fail(IncomingVersionReplicationError::RoutingInputsFailed(error));
                     }
                 }
-                self.check_write_permission(
+                self.check_writer_permission(
                     self.destination_group_id.unwrap_or(self.manifest.group_id),
                 )
             }
@@ -1446,34 +1427,6 @@ impl Operation for IncomingVersionReplicationOperation {
                     );
                 }
                 self.read_destination_bucket()
-            }
-            IncomingVersionReplicationState::CheckPermissions => {
-                let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
-                else {
-                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::SubOperation(SubOperationEvent::AuthorizationResult)",
-                        received: event,
-                    });
-                };
-
-                match allowed {
-                    Ok(true) => {
-                        debug!(
-                            bucket = %self.manifest.bucket,
-                            key = %self.manifest.key,
-                            version_id = %self.manifest.version_id,
-                            stream_id = %self.stream_id,
-                            "Incoming replication write permission granted"
-                        );
-                        self.check_writer_permission(
-                            self.destination_group_id.unwrap_or(self.manifest.group_id),
-                        )
-                    }
-                    Ok(false) => self
-                        .reject_negotiation(IncomingVersionReplicationError::WritePermissionDenied),
-                    Err(err) => self.reject_negotiation(err.into()),
-                }
             }
             IncomingVersionReplicationState::CheckWriterPermissions => {
                 let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
@@ -2423,13 +2376,7 @@ mod tests {
             key: b"bucket".to_vec().into(),
             value: Some(make_bucket_info(group_id).to_bytes().unwrap().into()),
         }));
-        let effects = load_routing(op, GroupRoutingInputs::default());
-        assert_eq!(op.state, IncomingVersionReplicationState::CheckPermissions);
-        assert!(matches!(effects[0], Effect::SubOperation(_)));
-
-        let mut effects = op.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ));
+        let mut effects = load_routing(op, GroupRoutingInputs::default());
         assert_eq!(
             op.state,
             IncomingVersionReplicationState::ReadExistingVersion
@@ -3601,9 +3548,6 @@ mod tests {
             value: Some(bucket_info.to_bytes().unwrap().into()),
         }));
         load_routing(&mut op, inputs);
-        op.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ));
         let effects = advance_blob_lookup(&mut op);
         (op, effects)
     }
@@ -3806,8 +3750,11 @@ mod tests {
     }
 
     #[test]
-    fn denied_write_permission_is_rejected_during_negotiation() {
-        let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+    fn rejects_denied_writer() {
+        // A replica whose original writer lacks WRITE on the destination path
+        // is refused during negotiation.
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.writer_auth_context = Some(manifest.auth_context.clone());
         let stream_id = Ulid::generate();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
@@ -3827,7 +3774,10 @@ mod tests {
             ),
         }));
         let effects = load_routing(&mut op, GroupRoutingInputs::default());
-        assert_eq!(op.state, IncomingVersionReplicationState::CheckPermissions);
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::CheckWriterPermissions
+        );
         assert!(matches!(effects[0], Effect::SubOperation(_)));
 
         let effects = op.step(Event::SubOperation(
@@ -3836,7 +3786,7 @@ mod tests {
         assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
         expect_rejected_negotiation(
             &effects[0],
-            IncomingVersionReplicationError::WritePermissionDenied
+            IncomingVersionReplicationError::WriterPermissionDenied
                 .to_string()
                 .as_str(),
         );
@@ -3850,8 +3800,9 @@ mod tests {
     }
 
     #[test]
-    fn authorization_errors_are_rejected_during_negotiation() {
-        let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+    fn rejects_authorization_errors() {
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.writer_auth_context = Some(manifest.auth_context.clone());
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::generate(),
             iroh::SecretKey::generate().public(),
