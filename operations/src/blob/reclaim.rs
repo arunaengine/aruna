@@ -84,6 +84,9 @@ pub struct ReclaimOutcome {
 
 /// Pages the queue from `start_after` so a candidate that keeps failing cannot
 /// starve the rows behind it: the cap moves the cursor past it either way.
+// Deferred (#359): recount / candidate-persistence hardening on top of this
+// already-working per-(hash,backend) reclaim sweep. The reference-cache GC part
+// of #359 is moot while the verified reference cache (#375) is deferred.
 pub async fn process_reclaim_batch(
     context: &DriverContext,
     start_after: Option<Key>,
