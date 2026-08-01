@@ -32,6 +32,8 @@ pub const DOCUMENT_SYNC_OUTBOX_KEYSPACE: &str = "document_sync_outbox";
 pub const TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE: &str = "token_revocation_outbox_index";
 pub const DOCUMENT_SYNC_REVISION_KEYSPACE: &str = "document_sync_revisions";
 pub const DOCUMENT_SYNC_CONFLICT_KEYSPACE: &str = "document_sync_conflicts";
+/// Durable store for permanently-invalid replicated sync events (#338).
+pub const SYNC_QUARANTINE_KEYSPACE: &str = "sync_quarantine";
 pub const SYNC_PLACEMENT_KEYSPACE: &str = "sync_placements";
 pub const SHARD_MANIFEST_KEYSPACE: &str = "shard_manifest";
 pub const SHARD_VERIFICATION_KEYSPACE: &str = "shard_verification";
