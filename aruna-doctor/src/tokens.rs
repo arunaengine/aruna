@@ -596,6 +596,7 @@ mod tests {
         base_url: String,
         context: Arc<DriverContext>,
         net: NetHandle,
+        realm_id: RealmId,
         server_task: JoinHandle<()>,
     }
 
@@ -905,6 +906,7 @@ mod tests {
             context,
             base_url: format!("http://{addr}"),
             net,
+            realm_id,
             server_task,
         }
     }
@@ -1227,7 +1229,7 @@ mod tests {
             node.context.as_ref(),
             node.base_url.clone(),
             &[7u8; 32],
-            *node.net.realm_id(),
+            node.realm_id,
         )
         .await?
         .encode()?;
