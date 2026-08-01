@@ -3,6 +3,7 @@ use std::time::Duration;
 pub mod drain;
 pub mod executor;
 pub mod export;
+pub mod harvest;
 pub mod import;
 pub(crate) mod protocol;
 pub mod prune;

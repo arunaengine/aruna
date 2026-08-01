@@ -10,7 +10,9 @@ use ulid::Ulid;
 use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::invert_timestamp_ms;
-use crate::structs::{AuthContext, BackendLocation, HiddenBlobKey, StagingStrategy};
+use crate::structs::{
+    AuthContext, BackendLocation, HarvestJobSpec, HiddenBlobKey, StagingStrategy,
+};
 use crate::structured_id::{
     BucketId, FieldError, JobId as RoutableJobId, PlacementHandle, StructuredId,
 };
@@ -586,6 +588,9 @@ pub enum JobPayload {
     Staging(StagingJobSpec),
     ImportRoCrate(ImportRoCrateSpec),
     ExportRoCrate(ExportRoCrateSpec),
+    /// One run of a repository harvest source. Idempotent by harvest provenance
+    /// keyed on `(namespace, source record id)`; safe to requeue.
+    Harvest(HarvestJobSpec),
 }
 
 impl JobPayload {
@@ -599,6 +604,7 @@ impl JobPayload {
             JobPayload::ExportRoCrate(_) => "export_rocrate",
             JobPayload::WriteRunCrate { .. } => "write_run_crate",
             JobPayload::TerminalCleanup { .. } => "terminal_cleanup",
+            JobPayload::Harvest(_) => "harvest",
         }
     }
 
@@ -610,6 +616,7 @@ impl JobPayload {
             JobPayload::Staging(_)
             | JobPayload::ImportRoCrate(_)
             | JobPayload::ExportRoCrate(_) => "items",
+            JobPayload::Harvest(_) => "records",
             JobPayload::WriteRunCrate { .. } | JobPayload::TerminalCleanup { .. } => "steps",
         }
     }
@@ -622,6 +629,7 @@ impl JobPayload {
             | JobPayload::Staging(_)
             | JobPayload::ImportRoCrate(_)
             | JobPayload::ExportRoCrate(_)
+            | JobPayload::Harvest(_)
             | JobPayload::WriteRunCrate { .. }
             | JobPayload::TerminalCleanup { .. } => JobExecutionClass::InProcess,
             JobPayload::Execution(_) => JobExecutionClass::ExternalAttempt,
@@ -766,6 +774,12 @@ pub enum JobResultPayload {
     },
     ImportRoCrate(ImportRoCrateResult),
     ExportRoCrate(ExportRoCrateResult),
+    Harvest {
+        minted: u64,
+        updated: u64,
+        tombstoned: u64,
+        skipped: u64,
+    },
 }
 
 impl JobResultPayload {
@@ -778,6 +792,7 @@ impl JobResultPayload {
             JobResultPayload::Staging { .. } => "staging",
             JobResultPayload::ImportRoCrate(_) => "import_rocrate",
             JobResultPayload::ExportRoCrate(_) => "export_rocrate",
+            JobResultPayload::Harvest { .. } => "harvest",
         }
     }
 
@@ -843,6 +858,17 @@ impl JobResultPayload {
                     "unsupported": result.omitted.unsupported,
                 },
                 "report_digest": hex::encode(result.report_digest),
+            }),
+            JobResultPayload::Harvest {
+                minted,
+                updated,
+                tombstoned,
+                skipped,
+            } => serde_json::json!({
+                "minted": minted,
+                "updated": updated,
+                "tombstoned": tombstoned,
+                "skipped": skipped,
             }),
         }
     }
