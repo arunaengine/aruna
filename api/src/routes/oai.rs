@@ -17,12 +17,16 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use aruna_core::storage_entries::metadata_updated_index_key;
-use aruna_core::structs::MetadataRegistryRecord;
+use aruna_core::structs::{MetadataRegistryRecord, RealmId};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::get_metadata_document::load_metadata_record_by_document;
 use aruna_operations::harvest::oai::mapping::jsonld_to_oai_dc;
 use aruna_operations::harvest::oai::parse::parse_datestamp_ms;
 use aruna_operations::harvest::oai::request::format_from;
+use aruna_operations::metadata::api::{
+    ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, MetadataRoCrateExportView,
+    export_metadata_rocrate,
+};
 use aruna_operations::metadata::timestamp_index::enumerate_updated;
 
 use crate::server_state::ServerState;
@@ -77,6 +81,7 @@ async fn handle_oai(
     Query(params): Query<OaiParams>,
 ) -> Response {
     let ctx = state.get_ctx();
+    let realm_id = state.get_realm_id();
     let outcome = match params.verb.as_deref() {
         Some("Identify") => identify(&ctx).await,
         Some("ListMetadataFormats") => Ok(list_metadata_formats()),
@@ -84,9 +89,9 @@ async fn handle_oai(
             "noSetHierarchy",
             "This repository does not support sets",
         )),
-        Some("ListIdentifiers") => list(&ctx, &params, false).await,
-        Some("ListRecords") => list(&ctx, &params, true).await,
-        Some("GetRecord") => get_record(&ctx, &params).await,
+        Some("ListIdentifiers") => list(&ctx, realm_id, &params, false).await,
+        Some("ListRecords") => list(&ctx, realm_id, &params, true).await,
+        Some("GetRecord") => get_record(&ctx, realm_id, &params).await,
         Some(_) => Err(protocol("badVerb", "Illegal OAI-PMH verb")),
         None => Err(protocol("badVerb", "Missing verb argument")),
     };
@@ -116,6 +121,7 @@ fn list_metadata_formats() -> String {
 
 async fn list(
     ctx: &DriverContext,
+    realm_id: RealmId,
     params: &OaiParams,
     include_metadata: bool,
 ) -> Result<String, OaiFault> {
@@ -159,7 +165,7 @@ async fn list(
     let mut body = format!("<{tag}>");
     for record in &collected {
         if include_metadata {
-            body.push_str(&render_record(ctx, record).await);
+            body.push_str(&render_record(ctx, realm_id, record).await);
         } else {
             body.push_str(&render_header(record));
         }
@@ -235,7 +241,11 @@ fn parse_bound(value: Option<&str>) -> Result<Option<u64>, OaiFault> {
     }
 }
 
-async fn get_record(ctx: &DriverContext, params: &OaiParams) -> Result<String, OaiFault> {
+async fn get_record(
+    ctx: &DriverContext,
+    realm_id: RealmId,
+    params: &OaiParams,
+) -> Result<String, OaiFault> {
     match params.metadata_prefix.as_deref() {
         None => return Err(protocol("badArgument", "metadataPrefix is required")),
         Some(METADATA_PREFIX) => {}
@@ -261,7 +271,7 @@ async fn get_record(ctx: &DriverContext, params: &OaiParams) -> Result<String, O
     };
     Ok(format!(
         "<GetRecord>{}</GetRecord>",
-        render_record(ctx, &record).await
+        render_record(ctx, realm_id, &record).await
     ))
 }
 
@@ -284,8 +294,12 @@ fn render_header(record: &MetadataRegistryRecord) -> String {
     )
 }
 
-async fn render_record(ctx: &DriverContext, record: &MetadataRegistryRecord) -> String {
-    let jsonld = read_jsonld(ctx, &record.graph_iri).await;
+async fn render_record(
+    ctx: &DriverContext,
+    realm_id: RealmId,
+    record: &MetadataRegistryRecord,
+) -> String {
+    let jsonld = read_jsonld(ctx, realm_id, record.document_id).await;
     let mut elements = String::new();
     for (element, value) in jsonld_to_oai_dc(&jsonld, &record.graph_iri) {
         elements.push_str(&format!(
@@ -299,13 +313,20 @@ async fn render_record(ctx: &DriverContext, record: &MetadataRegistryRecord) -> 
     )
 }
 
-async fn read_jsonld(ctx: &DriverContext, graph_iri: &str) -> String {
-    match ctx.metadata_handle.as_ref() {
-        Some(handle) => handle
-            .export_rocrate_jsonld(graph_iri.to_string())
-            .await
-            .unwrap_or_default(),
-        None => String::new(),
+/// Read the document's RO-Crate JSON-LD through the operations export path, which
+/// enforces visibility, so effect orchestration stays out of the transport layer.
+async fn read_jsonld(ctx: &DriverContext, realm_id: RealmId, document_id: Ulid) -> String {
+    let request = ExportMetadataRoCrateRequest {
+        document_id,
+        auth: None,
+        view: MetadataRoCrateExportView::Full,
+        limit: None,
+        offset: None,
+        after: None,
+    };
+    match export_metadata_rocrate(ctx, realm_id, request).await {
+        Ok(ExportMetadataRoCrateResult::Full { jsonld, .. }) => jsonld,
+        _ => String::new(),
     }
 }
 
