@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -213,6 +213,13 @@ struct StorageMetrics {
     conflicts_total: AtomicU64,
     in_flight: AtomicU64,
     channel_closed: Arc<AtomicBool>,
+    sealed: AtomicBool,
+    /// Serializes sealing against mutating enqueues: `seal` takes it for
+    /// writing, every mutating dispatch holds it for reading across the seal
+    /// check and the send, so a write either sits in the queue before `seal`
+    /// returns (ahead of the final `SyncAll`) or observes the seal.
+    seal_lock: RwLock<()>,
+    rejected_writes: AtomicU64,
     last_error: Mutex<Option<String>>,
 }
 
@@ -248,6 +255,8 @@ pub struct StorageMetricsSnapshot {
     pub conflicts_total: u64,
     pub failed_total: u64,
     pub channel_closed: bool,
+    pub sealed: bool,
+    pub rejected_writes: u64,
     pub last_error: Option<String>,
 }
 
@@ -418,6 +427,27 @@ impl StorageHandle {
         self.metrics.channel_closed.load(Ordering::Relaxed)
     }
 
+    /// Closes the write path before the final sync. Every mutating effect that
+    /// arrives afterwards is rejected and counted, so a leaked child task can
+    /// never commit behind a completed `sync_all`.
+    pub fn seal(&self) {
+        let _guard = self
+            .metrics
+            .seal_lock
+            .write()
+            .expect("storage seal lock poisoned");
+        self.metrics.sealed.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_sealed(&self) -> bool {
+        self.metrics.sealed.load(Ordering::SeqCst)
+    }
+
+    /// Mutating effects rejected because storage was already sealed.
+    pub fn rejected_writes(&self) -> u64 {
+        self.metrics.rejected_writes.load(Ordering::Relaxed)
+    }
+
     pub fn snapshot_metrics(&self) -> StorageMetricsSnapshot {
         let errors_total = self.metrics.errors_total.load(Ordering::Relaxed);
         StorageMetricsSnapshot {
@@ -426,6 +456,8 @@ impl StorageHandle {
             conflicts_total: self.metrics.conflicts_total.load(Ordering::Relaxed),
             failed_total: errors_total,
             channel_closed: self.metrics.channel_closed.load(Ordering::Relaxed),
+            sealed: self.is_sealed(),
+            rejected_writes: self.rejected_writes(),
             last_error: self
                 .metrics
                 .last_error
@@ -566,64 +598,93 @@ impl StorageHandle {
             return self
                 .observe_storage_event(StorageEvent::TransactionCommitted { txn_id: *txn_id });
         }
-        let send_result: Result<(), StorageError> = if let Some((txn_id, kind)) = cleanup {
-            let mut pending = self
-                .transaction_cleanup
-                .lock()
-                .expect("transaction cleanup mutex poisoned");
-            let admission = match reserve_cleanup(&mut pending, txn_id, kind) {
-                Ok(admission) => admission,
-                Err(error) => {
-                    return self.observe_storage_event(StorageEvent::Error { error });
-                }
-            };
-            let response_tx = ResponseSender::new(sender, ResponseToken::new(self, &effect));
-            let span = storage_effect_span(&effect);
-            let in_flight = InFlightGuard::acquire(&self.metrics);
-            match self.channel_for(&effect).try_send((
-                effect,
-                response_tx,
-                span,
-                Instant::now(),
-                in_flight,
-            )) {
-                Ok(()) => {
-                    if let Some(entry) = pending.get_mut(&txn_id) {
-                        entry.queued = true;
+        let mut deferred = None;
+        let send_result: Result<(), StorageError> = {
+            // Guard held across the seal check and the queue send (never an
+            // await), so a concurrent `seal` cannot slip between them.
+            let _seal_guard = storage_effect_mutates(&effect).then(|| {
+                self.metrics
+                    .seal_lock
+                    .read()
+                    .expect("storage seal lock poisoned")
+            });
+            if _seal_guard.is_some() && self.is_sealed() {
+                self.metrics.rejected_writes.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    event = "storage.write.after_seal",
+                    operation, "Rejected a storage write issued after the shutdown seal"
+                );
+                return self.observe_storage_event(StorageEvent::Error {
+                    error: StorageError::Sealed,
+                });
+            }
+            if let Some((txn_id, kind)) = cleanup {
+                let mut pending = self
+                    .transaction_cleanup
+                    .lock()
+                    .expect("transaction cleanup mutex poisoned");
+                let admission = match reserve_cleanup(&mut pending, txn_id, kind) {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        return self.observe_storage_event(StorageEvent::Error { error });
                     }
-                    Ok(())
+                };
+                let response_tx = ResponseSender::new(sender, ResponseToken::new(self, &effect));
+                let span = storage_effect_span(&effect);
+                let in_flight = InFlightGuard::acquire(&self.metrics);
+                match self.channel_for(&effect).try_send((
+                    effect,
+                    response_tx,
+                    span,
+                    Instant::now(),
+                    in_flight,
+                )) {
+                    Ok(()) => {
+                        if let Some(entry) = pending.get_mut(&txn_id) {
+                            entry.queued = true;
+                        }
+                        Ok(())
+                    }
+                    Err(TrySendError::Full(item)) => {
+                        rollback_cleanup(&mut pending, admission);
+                        // The item's ResponseToken re-locks the cleanup mutex on drop.
+                        drop(pending);
+                        drop(item);
+                        Err(StorageError::QueueFull)
+                    }
+                    Err(TrySendError::Disconnected(item)) => {
+                        rollback_cleanup(&mut pending, admission);
+                        drop(pending);
+                        drop(item);
+                        Err(StorageError::ChannelClosed)
+                    }
                 }
-                Err(TrySendError::Full(item)) => {
-                    rollback_cleanup(&mut pending, admission);
-                    // The item's ResponseToken re-locks the cleanup mutex on drop.
-                    drop(pending);
-                    drop(item);
-                    Err(StorageError::QueueFull)
-                }
-                Err(TrySendError::Disconnected(item)) => {
-                    rollback_cleanup(&mut pending, admission);
-                    drop(pending);
-                    drop(item);
-                    Err(StorageError::ChannelClosed)
+            } else {
+                let response_tx = ResponseSender::new(sender, ResponseToken::new(self, &effect));
+                let span = storage_effect_span(&effect);
+                let in_flight = InFlightGuard::acquire(&self.metrics);
+                let item = (effect, response_tx, span, Instant::now(), in_flight);
+                match self.channel_for(&item.0).try_send(item) {
+                    Ok(()) => Ok(()),
+                    Err(TrySendError::Full(item)) if cleanup_write => {
+                        // Awaiting a slot needs the seal guard released first.
+                        deferred = Some(item);
+                        Ok(())
+                    }
+                    Err(TrySendError::Full(_)) => Err(StorageError::QueueFull),
+                    Err(TrySendError::Disconnected(_)) => Err(StorageError::ChannelClosed),
                 }
             }
-        } else {
-            let response_tx = ResponseSender::new(sender, ResponseToken::new(self, &effect));
-            let span = storage_effect_span(&effect);
-            let in_flight = InFlightGuard::acquire(&self.metrics);
-            let item = (effect, response_tx, span, Instant::now(), in_flight);
-            match self.channel_for(&item.0).try_send(item) {
-                Ok(()) => Ok(()),
-                Err(TrySendError::Full(item)) if cleanup_write => {
-                    let channel = self.async_channel_for(&item.0).clone();
-                    match channel.send(item).await {
-                        Ok(()) => Ok(()),
-                        Err(_) => Err(StorageError::ChannelClosed),
-                    }
+        };
+        let send_result = match deferred {
+            Some(item) => {
+                let channel = self.async_channel_for(&item.0).clone();
+                match channel.send(item).await {
+                    Ok(()) => Ok(()),
+                    Err(_) => Err(StorageError::ChannelClosed),
                 }
-                Err(TrySendError::Full(_)) => Err(StorageError::QueueFull),
-                Err(TrySendError::Disconnected(_)) => Err(StorageError::ChannelClosed),
             }
+            None => send_result,
         };
         match send_result {
             Ok(()) => {}
@@ -790,6 +851,24 @@ impl StorageHandle {
         if matches!(error, StorageError::ChannelClosed) {
             self.metrics.channel_closed.store(true, Ordering::Relaxed);
         }
+    }
+}
+
+/// Effects that can commit durable state. Reads, iterations, transaction aborts
+/// and `SyncAll` stay open after the seal.
+fn storage_effect_mutates(effect: &StorageEffect) -> bool {
+    match effect {
+        StorageEffect::Write { .. }
+        | StorageEffect::BatchWrite { .. }
+        | StorageEffect::Delete { .. }
+        | StorageEffect::BatchDelete { .. }
+        | StorageEffect::CommitTransaction { .. } => true,
+        StorageEffect::StartTransaction { read } => !read,
+        StorageEffect::Read { .. }
+        | StorageEffect::BatchRead { .. }
+        | StorageEffect::Iter { .. }
+        | StorageEffect::AbortTransaction { .. }
+        | StorageEffect::SyncAll => false,
     }
 }
 
@@ -3385,6 +3464,89 @@ mod tests {
         assert!(metrics.channel_closed.load(Ordering::Relaxed));
     }
 
+    // The seal is the write-after-sync barrier: a leaked child that survives the
+    // drain gets an error instead of committing behind the final sync.
+    #[tokio::test]
+    async fn seal_rejects_writes() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        handle.seal();
+
+        let event = handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: "sealed".to_string(),
+                key: b"key".to_vec().into(),
+                value: b"value".to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Sealed
+            })
+        ));
+        assert_eq!(handle.rejected_writes(), 1);
+        assert!(handle.snapshot_metrics().sealed);
+    }
+
+    // Shutdown still has to read and fsync after the barrier is up.
+    #[tokio::test]
+    async fn seal_allows_reads_and_sync() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: "sealed".to_string(),
+                key: b"key".to_vec().into(),
+                value: b"value".to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+        handle.seal();
+
+        let read = handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: "sealed".to_string(),
+                key: b"key".to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+
+        assert!(matches!(
+            read,
+            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. })
+        ));
+        assert!(handle.sync_all().await.is_ok());
+        assert_eq!(handle.rejected_writes(), 0);
+    }
+
+    #[tokio::test]
+    async fn seal_rejects_write_transactions() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        handle.seal();
+
+        let write_txn = handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await;
+        let read_txn = handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: true })
+            .await;
+
+        assert!(matches!(
+            write_txn,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Sealed
+            })
+        ));
+        assert!(matches!(
+            read_txn,
+            Event::Storage(StorageEvent::TransactionStarted { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn sync_all_handle_surfaces_persist_errors() {
         let (handle, receivers) = StorageHandle::new();
@@ -4554,6 +4716,8 @@ mod tests {
                 conflicts_total: 0,
                 failed_total: 1,
                 channel_closed: false,
+                sealed: false,
+                rejected_writes: 0,
                 last_error: Some("Transaction not found".to_string()),
             }
         );
