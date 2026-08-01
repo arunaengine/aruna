@@ -1661,6 +1661,7 @@ pub fn binding_scope_key(scope: &BindingScope) -> String {
             DocumentClass::User => "class:user",
             DocumentClass::Metadata => "class:metadata",
             DocumentClass::MetadataRegistry => "class:metadata_registry",
+            DocumentClass::JobControl => "class:job_control",
         }
         .to_string(),
         BindingScope::MetadataPathPrefix(prefix) => format!(
@@ -4103,6 +4104,10 @@ mod tests {
             (
                 BindingScope::Class(DocumentClass::MetadataRegistry),
                 "class:metadata_registry".to_string(),
+            ),
+            (
+                BindingScope::Class(DocumentClass::JobControl),
+                "class:job_control".to_string(),
             ),
             (
                 BindingScope::MetadataPathPrefix(" /datasets/important/ ".to_string()),

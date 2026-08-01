@@ -121,6 +121,7 @@ pub enum DocumentClass {
     User,
     Metadata,
     MetadataRegistry,
+    JobControl,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
