@@ -125,6 +125,10 @@ pub enum StorageError {
     KeyNotFound,
     #[error("Transaction conflict")]
     TransactionConflict,
+    /// A commit that neither succeeded nor was refused. Its writes may still
+    /// become durable, so a caller must not undo what the commit would own.
+    #[error("Commit failed")]
+    CommitFailed,
     #[error("Transaction not found")]
     TransactionNotFound,
     #[error("Keyspace error")]
@@ -145,6 +149,16 @@ pub enum StorageError {
     Timeout,
     #[error("Invalid effect type")]
     InvalidEffect,
+}
+
+impl StorageError {
+    /// Whether a failed `CommitTransaction` proves the transaction's writes
+    /// were discarded: refused by the conflict check, or never handed to the
+    /// storage actor at all. Every other failure leaves the commit either
+    /// already applied or unknown, so its records may exist.
+    pub fn proves_no_commit(&self) -> bool {
+        matches!(self, Self::TransactionConflict | Self::QueueFull)
+    }
 }
 
 #[derive(Debug, Error, PartialEq)]

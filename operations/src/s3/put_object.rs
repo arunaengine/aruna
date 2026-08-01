@@ -814,19 +814,30 @@ impl PutObjectOperation {
                 self.written_location = None;
                 self.register_blob_in_dht_or_continue()
             }
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::TransactionConflict,
-            }) => {
-                self.txn_id = None;
-                self.cleanup_failed_write(PutObjectError::StorageError(
-                    StorageError::TransactionConflict,
-                ))
-            }
             Event::Storage(StorageEvent::Error { error }) => {
                 self.txn_id = None;
+                if error.proves_no_commit() {
+                    return self.cleanup_failed_write(PutObjectError::StorageError(error));
+                }
+                self.keep_written_blob(&error);
                 self.emit_error(error.into())
             }
             _ => self.emit_error(PutObjectError::InvalidOperationState),
+        }
+    }
+
+    /// A commit whose outcome is unknown may already own these bytes, so the
+    /// reclaim sweep decides their fate later: an unreferenced copy is
+    /// recoverable, a deleted one that a committed version names is not.
+    fn keep_written_blob(&mut self, error: &StorageError) {
+        if let Some(location) = self.written_location.take() {
+            warn!(
+                event = "put_object.commit_outcome_unknown",
+                backend = %location.backend,
+                blob_size = location.blob_size,
+                error = %error,
+                "Keeping the written blob after an unknown commit outcome"
+            );
         }
     }
 
@@ -1680,6 +1691,35 @@ mod test {
                 StorageError::TransactionConflict
             ))
         ));
+    }
+
+    #[test]
+    fn commit_unknown_keeps_blob() {
+        // Only a proven refusal rolls the blob back; every other commit failure
+        // may already have committed the version that names these bytes.
+        for error in [
+            StorageError::CommitFailed,
+            StorageError::PersistError("journal".to_string()),
+            StorageError::Timeout,
+        ] {
+            let realm_id = RealmId::from_bytes([1u8; 32]);
+            let node_id = iroh::SecretKey::generate().public();
+            let mut op = PutObjectOperation::new(put_config(realm_id, Ulid::generate(), node_id));
+            op.state = PutObjectState::CommitTransaction;
+            op.txn_id = Some(Ulid::generate());
+            op.written_location = Some(test_location(op.config.user_id));
+
+            let effects = op.step(Event::Storage(StorageEvent::Error {
+                error: error.clone(),
+            }));
+
+            assert!(effects.is_empty(), "{error} must not delete the blob");
+            assert!(op.is_complete());
+            assert!(matches!(
+                op.finalize(),
+                Err(PutObjectError::StorageError(observed)) if observed == error
+            ));
+        }
     }
 
     #[tokio::test]

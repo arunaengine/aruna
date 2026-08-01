@@ -406,7 +406,7 @@ impl UploadPartOperation {
 
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.emit_error(UploadPartError::InvalidOperationState);
+            return self.handle_commit_failure(event);
         };
         self.txn_id = None;
         // The committed part record owns the blob now, so the rollback must not
@@ -423,6 +423,29 @@ impl UploadPartOperation {
             self.state = UploadPartState::Finish;
             smallvec![]
         }
+    }
+
+    /// A commit whose outcome is unknown may already own the part bytes, so
+    /// only a proven refusal rolls them back: an unreferenced copy is
+    /// recoverable, a deleted one that a committed part record names is not.
+    fn handle_commit_failure(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::Error { error }) = event else {
+            return self.emit_error(UploadPartError::InvalidOperationState);
+        };
+        self.txn_id = None;
+        if error.proves_no_commit() {
+            return self.cleanup_failed_write(UploadPartError::StorageError(error));
+        }
+        if let Some(location) = self.written_location.take() {
+            warn!(
+                event = "upload_part.commit_outcome_unknown",
+                backend = %location.backend,
+                blob_size = location.blob_size,
+                error = %error,
+                "Keeping the written part after an unknown commit outcome"
+            );
+        }
+        self.emit_error(error.into())
     }
 
     fn handle_replaced_part_cleanup(&mut self, event: Event) -> Effects {
@@ -658,6 +681,76 @@ mod test {
             Err(UploadPartError::BackendFenceError(BackendFenceError::Read(
                 _
             )))
+        ));
+    }
+
+    #[test]
+    fn commit_unknown_keeps_part() {
+        // Only a proven refusal rolls the part back; every other commit failure
+        // may already have committed the record that names these bytes.
+        for error in [
+            StorageError::CommitFailed,
+            StorageError::PersistError("journal".to_string()),
+            StorageError::Timeout,
+        ] {
+            let mut op = upload_part_op(Ulid::from_bytes([5u8; 16]));
+            op.state = UploadPartState::CommitTransaction;
+            op.txn_id = Some(Ulid::from_bytes([3u8; 16]));
+
+            let effects = op.step(Event::Storage(StorageEvent::Error {
+                error: error.clone(),
+            }));
+
+            assert!(effects.is_empty(), "{error} must not delete the part");
+            assert!(op.is_complete());
+            assert!(matches!(
+                op.finalize(),
+                Err(UploadPartError::StorageError(observed)) if observed == error
+            ));
+        }
+    }
+
+    #[test]
+    fn commit_conflict_deletes_part() {
+        let mut op = upload_part_op(Ulid::from_bytes([5u8; 16]));
+        op.state = UploadPartState::CommitTransaction;
+        op.txn_id = Some(Ulid::from_bytes([3u8; 16]));
+
+        let effects = op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Delete { .. })]
+        ));
+        assert!(op.step(Event::Blob(BlobEvent::DeleteFinished)).is_empty());
+        assert!(matches!(
+            op.finalize(),
+            Err(UploadPartError::StorageError(
+                StorageError::TransactionConflict
+            ))
+        ));
+    }
+
+    #[test]
+    fn commit_conflict_queues_delete() {
+        // A rollback delete the backend refuses has to survive as cleanup work.
+        let mut op = upload_part_op(Ulid::from_bytes([5u8; 16]));
+        op.state = UploadPartState::CommitTransaction;
+        op.txn_id = Some(Ulid::from_bytes([3u8; 16]));
+
+        op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+        let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::DeleteError(
+            "gone".to_string(),
+        ))));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Write { key_space, .. })]
+                if key_space == BLOB_CLEANUP_KEYSPACE
         ));
     }
 
