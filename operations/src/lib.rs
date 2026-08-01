@@ -56,6 +56,7 @@ pub mod node_info;
 pub mod notifications;
 pub mod onboarding_secret_state;
 pub mod permission_rules;
+pub mod persistent_id;
 pub mod placement;
 pub mod process_placements;
 mod queue_backoff;

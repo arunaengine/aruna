@@ -767,13 +767,15 @@ pub async fn delete_metadata_document_routed(
     }
     let local_holds = holders.contains(&local_node_id);
     if local_holds && let Some(record) = record {
-        return delete_metadata_document(
+        delete_metadata_document(
             DeleteMetadataDocumentOperation::new(actor, record.group_id, document_id),
             context.as_ref(),
             document_id,
         )
         .await
-        .map_err(Into::into);
+        .map_err(MetadataWriteError::from)?;
+        withdraw_pid_for_deleted(context, document_id).await;
+        return Ok(());
     }
     let response = forward_to_holders(
         context,
@@ -1111,7 +1113,10 @@ pub(crate) async fn apply_forwarded_write(
                 document_id,
             );
             match delete_metadata_document(operation, context.as_ref(), document_id).await {
-                Ok(()) => MetadataTransportMessage::ForwardedDelete,
+                Ok(()) => {
+                    withdraw_pid_for_deleted(context, document_id).await;
+                    MetadataTransportMessage::ForwardedDelete
+                }
                 Err(error) => reject(format!("forwarded metadata delete failed: {error}")),
             }
         }
@@ -1119,6 +1124,21 @@ pub(crate) async fn apply_forwarded_write(
             "unexpected forwarded metadata message: {}",
             super::handle::transport_message_kind(&other)
         )),
+    }
+}
+
+/// Flip a minted PID to a permanent tombstone when its document is deleted.
+/// Best-effort: the landing route also derives 410 from a missing target, so a
+/// failure here still cannot 404 a minted PID.
+async fn withdraw_pid_for_deleted(context: &Arc<DriverContext>, document_id: ulid::Ulid) {
+    if let Err(error) = crate::persistent_id::withdraw_persistent_id(
+        context.as_ref(),
+        document_id,
+        aruna_core::util::unix_timestamp_millis(),
+    )
+    .await
+    {
+        tracing::warn!(%document_id, ?error, "failed to withdraw persistent id on delete");
     }
 }
 

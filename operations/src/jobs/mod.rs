@@ -5,6 +5,7 @@ pub mod executor;
 pub mod export;
 pub mod harvest;
 pub mod import;
+pub mod persistent_id;
 pub(crate) mod protocol;
 pub mod prune;
 pub mod reconcile;

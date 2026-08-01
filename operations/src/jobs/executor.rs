@@ -114,6 +114,9 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
         JobPayload::ExportRoCrate(spec) => crate::jobs::export::run_export_job(ctx, spec).await,
         JobPayload::ImportRoCrate(spec) => crate::jobs::import::run_rocrate_import(ctx, spec).await,
         JobPayload::Harvest(spec) => crate::jobs::harvest::run_harvest_job(ctx, spec).await,
+        JobPayload::MintPersistentId(spec) => {
+            crate::jobs::persistent_id::run_mint_persistent_id(ctx, spec).await
+        }
         // Guard: an execution job must run through the external attempt path.
         JobPayload::Execution(_) => JobRunOutcome::Failed(JobError::permanent(
             "execution payload dispatched through the in-process seam",
@@ -135,6 +138,7 @@ pub fn run_cleanup(payload: &JobPayload) {
         | JobPayload::ImportRoCrate(_)
         | JobPayload::ExportRoCrate(_)
         | JobPayload::Harvest(_)
+        | JobPayload::MintPersistentId(_)
         | JobPayload::WriteRunCrate { .. }
         | JobPayload::TerminalCleanup { .. } => {}
     }
