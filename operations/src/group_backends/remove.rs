@@ -11,7 +11,6 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::{
     BackendRef, BlobCleanupWork, BlobLocationKey, GroupStorageBackend, MultipartUpload,
 };
-use aruna_blob::blob::BackendClaim;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use std::collections::BTreeSet;
@@ -32,18 +31,27 @@ pub async fn remove_drained_backends(context: &DriverContext) -> Result<usize, S
     if disabled.is_empty() {
         return Ok(0);
     }
-    let claimed = claim_backends(context, disabled);
-    if claimed.is_empty() {
+    // Read before the scan: a backend held at no point since here can have
+    // gained neither a copy nor a cleanup row that the scan would then miss.
+    let idle = idle_backends(context, disabled);
+    if idle.is_empty() {
         return Ok(0);
     }
     let holding = backends_holding_data(context).await?;
 
     let mut removed = 0usize;
-    for (record, _claim) in &claimed {
+    for (record, generation) in idle {
         let backend = BackendRef::Group(record.backend_id);
         if holding.contains(&backend) {
             continue;
         }
+        let _claim = match context.blob_handle.as_ref() {
+            Some(blob_handle) => match blob_handle.claim_backend(record.backend_id, generation) {
+                Some(claim) => Some(claim),
+                None => continue,
+            },
+            None => None,
+        };
         match drive(
             RemoveBackendOperation::new(record.group_id, record.backend_id),
             context,
@@ -60,23 +68,22 @@ pub async fn remove_drained_backends(context: &DriverContext) -> Result<usize, S
     Ok(removed)
 }
 
-/// Claims come first and outlive the scan below: a claim is refused while any
-/// operation still holds the backend, and it refuses every new hold, so a
-/// claimed backend can gain no further copy and no further cleanup row.
-fn claim_backends(
+/// Every disabled backend nothing is currently holding, with the hold
+/// generation the later claim has to still match.
+fn idle_backends(
     context: &DriverContext,
     disabled: Vec<GroupStorageBackend>,
-) -> Vec<(GroupStorageBackend, Option<BackendClaim>)> {
+) -> Vec<(GroupStorageBackend, u64)> {
     let Some(blob_handle) = context.blob_handle.as_ref() else {
         // Nothing in this process can run a blob effect, so nothing to exclude.
-        return disabled.into_iter().map(|record| (record, None)).collect();
+        return disabled.into_iter().map(|record| (record, 0)).collect();
     };
     disabled
         .into_iter()
         .filter_map(|record| {
             blob_handle
-                .claim_backend(record.backend_id)
-                .map(|claim| (record, Some(claim)))
+                .idle_generation(record.backend_id)
+                .map(|generation| (record, generation))
         })
         .collect()
 }

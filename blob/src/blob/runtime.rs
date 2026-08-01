@@ -230,10 +230,15 @@ impl BlobHandle {
         self.handler.hold_backends(effect)
     }
 
-    /// Reserves one tenant backend for removal, or refuses while an operation
-    /// still holds it.
-    pub fn claim_backend(&self, backend_id: Ulid) -> Option<BackendClaim> {
-        self.handler.claim_backend(backend_id)
+    /// The backend's hold generation while nothing holds or claims it.
+    pub fn idle_generation(&self, backend_id: Ulid) -> Option<u64> {
+        self.handler.idle_generation(backend_id)
+    }
+
+    /// Reserves one tenant backend for removal, or refuses when it has been
+    /// held at any point since `generation`.
+    pub fn claim_backend(&self, backend_id: Ulid, generation: u64) -> Option<BackendClaim> {
+        self.handler.claim_backend(backend_id, generation)
     }
 
     /// Per-backend health for `/info`.

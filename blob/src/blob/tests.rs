@@ -2130,13 +2130,20 @@ async fn hold_excludes_claim() {
     location.backend = BackendRef::Group(backend_id);
     let effect = BlobEffect::Delete { location };
 
+    let generation = handler.idle_generation(backend_id).unwrap();
     let hold = handler.hold_backends(&effect).unwrap();
     assert!(hold.is_some());
-    assert!(handler.claim_backend(backend_id).is_none());
+    assert!(handler.idle_generation(backend_id).is_none());
+    assert!(handler.claim_backend(backend_id, generation).is_none());
 
+    // A hold taken and released since the generation was read still refuses the
+    // claim: whatever removal scanned in between may already be stale.
     drop(hold);
-    let claim = handler.claim_backend(backend_id).unwrap();
-    assert!(handler.claim_backend(backend_id).is_none());
+    assert!(handler.claim_backend(backend_id, generation).is_none());
+
+    let generation = handler.idle_generation(backend_id).unwrap();
+    let claim = handler.claim_backend(backend_id, generation).unwrap();
+    assert!(handler.claim_backend(backend_id, generation).is_none());
     assert!(handler.hold_backends(&effect).is_err());
 
     drop(claim);

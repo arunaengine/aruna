@@ -113,13 +113,16 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
     ids
 }
 
-/// How a tenant backend is being used: how many holds it carries, and whether
-/// removal has claimed it. The two are mutually exclusive, which is what keeps
-/// the credentials alive for as long as anything can still need them.
+/// How a tenant backend is being used: how many holds it carries, whether
+/// removal has claimed it, and how many holds it has ever carried. Holds and
+/// claims are mutually exclusive, which is what keeps the credentials alive for
+/// as long as anything can still need them. Entries are never dropped, or the
+/// generation a removal compares against would restart at zero.
 #[derive(Debug, Default)]
 pub(super) struct GroupBackendUse {
     held: usize,
     claimed: bool,
+    generation: u64,
 }
 
 /// Keeps every tenant backend an operation named off the removable list. The
@@ -139,9 +142,6 @@ impl Drop for GroupHold {
             if let Entry::Occupied(mut entry) = counts.entry(*backend_id) {
                 let usage = entry.get_mut();
                 usage.held = usage.held.saturating_sub(1);
-                if usage.held == 0 && !usage.claimed {
-                    entry.remove();
-                }
             }
         }
     }
@@ -160,9 +160,6 @@ impl Drop for BackendClaim {
         };
         if let Entry::Occupied(mut entry) = counts.entry(self.backend_id) {
             entry.get_mut().claimed = false;
-            if entry.get().held == 0 {
-                entry.remove();
-            }
         }
     }
 }
@@ -191,6 +188,7 @@ impl BlobHandler {
         for backend_id in &ids {
             let usage = counts.entry(*backend_id).or_default();
             usage.held = usage.held.saturating_add(1);
+            usage.generation = usage.generation.wrapping_add(1);
         }
         drop(counts);
         Ok(Some(GroupHold {
@@ -199,18 +197,28 @@ impl BlobHandler {
         }))
     }
 
-    /// Refused while any operation holds the backend, and refusing every new
-    /// hold while it lives. Removal takes it before it reads anything, so the
-    /// durable state it then observes can no longer change.
-    pub(super) fn claim_backend(&self, backend_id: Ulid) -> Option<BackendClaim> {
+    /// The backend's hold generation while nothing holds or claims it. Removal
+    /// reads it before its scan and hands it back to `claim_backend`.
+    pub(super) fn idle_generation(&self, backend_id: Ulid) -> Option<u64> {
+        let counts = self.group_effects.lock().ok()?;
+        match counts.get(&backend_id) {
+            None => Some(0),
+            Some(usage) if usage.held == 0 && !usage.claimed => Some(usage.generation),
+            Some(_) => None,
+        }
+    }
+
+    /// Granted only when the backend has been idle continuously since
+    /// `generation`, which is what keeps removal's scan result true, and
+    /// refusing every hold while it lives, which keeps it true until the record
+    /// is gone.
+    pub(super) fn claim_backend(&self, backend_id: Ulid, generation: u64) -> Option<BackendClaim> {
         let mut counts = self.group_effects.lock().ok()?;
-        if counts
-            .get(&backend_id)
-            .is_some_and(|usage| usage.held > 0 || usage.claimed)
-        {
+        let usage = counts.entry(backend_id).or_default();
+        if usage.held > 0 || usage.claimed || usage.generation != generation {
             return None;
         }
-        counts.entry(backend_id).or_default().claimed = true;
+        usage.claimed = true;
         drop(counts);
         Some(BackendClaim {
             counts: self.group_effects.clone(),
