@@ -93,6 +93,8 @@ pub const REPOSITORY_CONNECTOR_INDEX_KEYSPACE: &str = "repository_connector_inde
 pub const REPOSITORY_CONNECTOR_SECRET_KEYSPACE: &str = "repository_connector_secret";
 pub const HARVEST_SOURCE_KEYSPACE: &str = "harvest_source";
 pub const HARVEST_PROVENANCE_KEYSPACE: &str = "harvest_provenance";
+/// w3id persistent-identifier mappings, keyed by document id (#442, spec 3.5).
+pub const PERSISTENT_ID_MAPPING_KEYSPACE: &str = "persistent_id_mapping";
 
 // Durable job framework keyspaces (#318).
 pub const JOB_KEYSPACE: &str = "jobs";

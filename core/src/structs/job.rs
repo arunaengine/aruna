@@ -11,7 +11,8 @@ use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::invert_timestamp_ms;
 use crate::structs::{
-    AuthContext, BackendLocation, HarvestJobSpec, HiddenBlobKey, StagingStrategy,
+    AuthContext, BackendLocation, HarvestJobSpec, HiddenBlobKey, MintPersistentIdSpec,
+    StagingStrategy,
 };
 use crate::structured_id::{
     BucketId, FieldError, JobId as RoutableJobId, PlacementHandle, StructuredId,
@@ -591,6 +592,9 @@ pub enum JobPayload {
     /// One run of a repository harvest source. Idempotent by harvest provenance
     /// keyed on `(namespace, source record id)`; safe to requeue.
     Harvest(HarvestJobSpec),
+    /// Idempotent w3id persistent-identifier registration for a document.
+    /// Idempotency key is the document id; a re-mint returns the same PID.
+    MintPersistentId(MintPersistentIdSpec),
 }
 
 impl JobPayload {
@@ -605,6 +609,7 @@ impl JobPayload {
             JobPayload::WriteRunCrate { .. } => "write_run_crate",
             JobPayload::TerminalCleanup { .. } => "terminal_cleanup",
             JobPayload::Harvest(_) => "harvest",
+            JobPayload::MintPersistentId(_) => "mint_persistent_id",
         }
     }
 
@@ -617,7 +622,9 @@ impl JobPayload {
             | JobPayload::ImportRoCrate(_)
             | JobPayload::ExportRoCrate(_) => "items",
             JobPayload::Harvest(_) => "records",
-            JobPayload::WriteRunCrate { .. } | JobPayload::TerminalCleanup { .. } => "steps",
+            JobPayload::MintPersistentId(_)
+            | JobPayload::WriteRunCrate { .. }
+            | JobPayload::TerminalCleanup { .. } => "steps",
         }
     }
 
@@ -630,6 +637,7 @@ impl JobPayload {
             | JobPayload::ImportRoCrate(_)
             | JobPayload::ExportRoCrate(_)
             | JobPayload::Harvest(_)
+            | JobPayload::MintPersistentId(_)
             | JobPayload::WriteRunCrate { .. }
             | JobPayload::TerminalCleanup { .. } => JobExecutionClass::InProcess,
             JobPayload::Execution(_) => JobExecutionClass::ExternalAttempt,
@@ -780,6 +788,10 @@ pub enum JobResultPayload {
         tombstoned: u64,
         skipped: u64,
     },
+    PersistentId {
+        pid: String,
+        newly_minted: bool,
+    },
 }
 
 impl JobResultPayload {
@@ -793,6 +805,7 @@ impl JobResultPayload {
             JobResultPayload::ImportRoCrate(_) => "import_rocrate",
             JobResultPayload::ExportRoCrate(_) => "export_rocrate",
             JobResultPayload::Harvest { .. } => "harvest",
+            JobResultPayload::PersistentId { .. } => "persistent_id",
         }
     }
 
@@ -869,6 +882,10 @@ impl JobResultPayload {
                 "updated": updated,
                 "tombstoned": tombstoned,
                 "skipped": skipped,
+            }),
+            JobResultPayload::PersistentId { pid, newly_minted } => serde_json::json!({
+                "pid": pid,
+                "newly_minted": newly_minted,
             }),
         }
     }
