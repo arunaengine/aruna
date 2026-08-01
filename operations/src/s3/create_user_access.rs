@@ -1,19 +1,16 @@
-use crate::replicate_documents::replicate_documents_effect;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{PathRestriction, UserAccess};
 use aruna_core::types::{Effects, GroupId};
-use aruna_core::{NodeId, UserId};
 use rand::distr::Alphanumeric;
 use rand::{RngExt, rng};
 use smallvec::smallvec;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
-use tracing::warn;
 use ulid::Ulid;
 
 pub const DEFAULT_CREDENTIAL_TTL: Duration = Duration::from_secs(24 * 60 * 60 * 365);
@@ -22,7 +19,6 @@ pub const DEFAULT_CREDENTIAL_TTL: Duration = Duration::from_secs(24 * 60 * 60 * 
 pub enum CreateUserAccessState {
     Init,
     CreateUserAccess(UserAccess),
-    ReplicateAccess,
     Finish,
     Error,
 }
@@ -144,36 +140,9 @@ impl CreateUserAccessOperation {
                 return self.handle_error(CreateUserAccessError::ConversionError(err.into()));
             }
         };
-        self.output = Ok((access_key.clone(), access.clone()));
-        self.replicate_access(access_key)
-    }
-
-    /// Queues realm-wide replication of the committed credential so the same
-    /// access key authenticates on every realm node. A malformed issuer id
-    /// (never produced by a real node) skips replication rather than panicking.
-    fn replicate_access(&mut self, access_key: String) -> Effects {
-        let realm_id = self.config.user_identity.realm_id;
-        let Ok(local_node_id) = NodeId::from_bytes(&self.config.issued_by) else {
-            self.state = CreateUserAccessState::Finish;
-            return smallvec![];
-        };
-        self.state = CreateUserAccessState::ReplicateAccess;
-        smallvec![replicate_documents_effect(
-            realm_id,
-            local_node_id,
-            vec![DocumentSyncTarget::UserAccess {
-                realm_id,
-                access_key,
-            }],
-        )]
-    }
-
-    fn handle_access_replicated(&mut self, event: Event) -> Effects {
-        if let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event
-            && let Err(error) = result
-        {
-            warn!(%error, "user access replication failed; credential stored locally");
-        }
+        // Issuer-local by design: the credential is never replicated, so it
+        // only ever authenticates on the node that issued it.
+        self.output = Ok((access_key, access.clone()));
         self.state = CreateUserAccessState::Finish;
         smallvec![]
     }
@@ -197,7 +166,6 @@ impl Operation for CreateUserAccessOperation {
         match self.state {
             CreateUserAccessState::Init => self.handle_init(),
             CreateUserAccessState::CreateUserAccess(_) => self.handle_user_access_created(event),
-            CreateUserAccessState::ReplicateAccess => self.handle_access_replicated(event),
             CreateUserAccessState::Finish => smallvec![],
             CreateUserAccessState::Error => self.abort(),
         }
@@ -291,18 +259,10 @@ mod tests {
         assert_eq!(access.issued_by, test_issuer());
         assert_eq!(access.revoked_at, None);
 
-        // 2. Feed WriteResult -> replicates the credential realm-wide
+        // 2. Feed WriteResult -> issuer-local: no replication, straight to Finish
         let write_key = key.clone();
         let event = Event::Storage(StorageEvent::WriteResult { key: write_key });
         let effects = op.step(event);
-        assert_eq!(effects.len(), 1);
-        assert!(matches!(effects[0], Effect::SubOperation(_)));
-        assert_eq!(op.state, CreateUserAccessState::ReplicateAccess);
-
-        // 3. Replication result -> Finish
-        let effects = op.step(Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-            result: Ok(()),
-        }));
         assert_eq!(effects.len(), 0);
         assert_eq!(op.state, CreateUserAccessState::Finish);
         assert!(op.is_complete());

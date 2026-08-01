@@ -345,8 +345,7 @@ impl AnnounceTopicOperation {
             // generation from this node.
             DocumentSyncTarget::NodeUsage { .. }
             | DocumentSyncTarget::WatchInterest { .. }
-            | DocumentSyncTarget::NodeInfo { .. }
-            | DocumentSyncTarget::UserAccess { .. } => {
+            | DocumentSyncTarget::NodeInfo { .. } => {
                 let now = aruna_core::util::unix_timestamp_millis();
                 Ok(DocumentSyncChange {
                     base: None,

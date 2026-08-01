@@ -213,8 +213,7 @@ pub fn document_class(target: &DocumentSyncTarget) -> DocumentClass {
         | DocumentSyncTarget::NodeUsage { .. }
         | DocumentSyncTarget::WatchInterest { .. }
         | DocumentSyncTarget::WatchSubscription { .. }
-        | DocumentSyncTarget::NodeInfo { .. }
-        | DocumentSyncTarget::UserAccess { .. } => DocumentClass::Admin,
+        | DocumentSyncTarget::NodeInfo { .. } => DocumentClass::Admin,
     }
 }
 
