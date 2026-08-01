@@ -18,8 +18,9 @@ use aruna_core::structs::{
     CurrentVersionPointer, GroupStorageBackend, Permission, RealmConfigDocument, VersionKey,
     blob_object_permission_path,
 };
-use aruna_core::types::Effects;
+use aruna_core::types::{Effects, UserId};
 use smallvec::smallvec;
+use std::time::SystemTime;
 use ulid::Ulid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,6 +33,7 @@ enum SummaryState {
     ReadVersion,
     ReadLocation,
     ReadBackend,
+    VerifyBucket,
     SendSummary,
     SendDenial,
     Close,
@@ -62,6 +64,8 @@ pub struct LocationSummaryOperation {
     local_node: Option<NodeId>,
     stream_id: Option<Ulid>,
     bucket: Option<BucketInfo>,
+    /// Identity of the bucket record the READ check was evaluated against.
+    authorized: Option<(Ulid, SystemTime, UserId)>,
     state: SummaryState,
     version_id: Option<Ulid>,
     blake3: Option<[u8; 32]>,
@@ -99,6 +103,7 @@ impl LocationSummaryOperation {
             local_node,
             stream_id,
             bucket: None,
+            authorized: None,
             state: SummaryState::Init,
             version_id,
             blake3: None,
@@ -118,6 +123,7 @@ impl LocationSummaryOperation {
             SummaryState::ReadVersion => "read_version",
             SummaryState::ReadLocation => "read_location",
             SummaryState::ReadBackend => "read_backend",
+            SummaryState::VerifyBucket => "verify_bucket",
             SummaryState::SendSummary => "send_summary",
             SummaryState::SendDenial => "send_denial",
             SummaryState::Close => "close",
@@ -161,13 +167,17 @@ impl LocationSummaryOperation {
         })]
     }
 
-    fn read_bucket(&mut self) -> Effects {
-        self.state = SummaryState::ReadBucket;
-        smallvec![Effect::Storage(StorageEffect::Read {
+    fn bucket_read(&self) -> Effect {
+        Effect::Storage(StorageEffect::Read {
             key_space: S3_BUCKET_KEYSPACE.to_string(),
             key: self.request.bucket.as_bytes().to_vec().into(),
             txn_id: None,
-        })]
+        })
+    }
+
+    fn read_bucket(&mut self) -> Effects {
+        self.state = SummaryState::ReadBucket;
+        smallvec![self.bucket_read()]
     }
 
     fn read_head(&mut self) -> Effects {
@@ -214,7 +224,35 @@ impl LocationSummaryOperation {
         })]
     }
 
+    /// The head, version, location and backend reads share no snapshot with the
+    /// bucket the caller was authorized against, so that record is read once
+    /// more before anything ships.
     fn answer(&mut self) -> Effects {
+        self.state = SummaryState::VerifyBucket;
+        smallvec![self.bucket_read()]
+    }
+
+    /// A bucket deleted and recreated under the same name is a different bucket
+    /// with a different group, and a delete always stamps a fresh `created_at`,
+    /// so an unchanged identity proves no replacement happened in between.
+    fn handle_verify(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.unexpected(event);
+        };
+        let current = match value {
+            Some(value) => match BucketInfo::from_bytes(&value) {
+                Ok(bucket) => bucket.identity(),
+                Err(error) => return self.fail(error.into()),
+            },
+            None => return self.fail(LocationSummaryError::BucketNotFound),
+        };
+        if Some(current) != self.authorized {
+            return self.deny();
+        }
+        self.send_answer()
+    }
+
+    fn send_answer(&mut self) -> Effects {
         self.summary.version_id = self.version_id;
         let summary = self.summary.clone();
         let Some(stream_id) = self.stream_id else {
@@ -262,6 +300,7 @@ impl LocationSummaryOperation {
             return self.fail(LocationSummaryError::PeerDenied);
         };
         let group_id = bucket.group_id;
+        self.authorized = Some(bucket.identity());
         self.bucket = Some(bucket);
         let path = blob_object_permission_path(
             self.request.realm_id,
@@ -418,6 +457,7 @@ impl Operation for LocationSummaryOperation {
             SummaryState::ReadVersion => self.handle_version(event),
             SummaryState::ReadLocation => self.handle_location(event),
             SummaryState::ReadBackend => self.handle_backend(event),
+            SummaryState::VerifyBucket => self.handle_verify(event),
             SummaryState::SendSummary => {
                 let Event::Blob(BlobEvent::MessageSent { stream_id }) = event else {
                     return self.unexpected(event);
@@ -522,6 +562,11 @@ mod tests {
         operation
     }
 
+    /// Answers the closing re-read with the same record the check ran against.
+    fn verify(operation: &mut LocationSummaryOperation) {
+        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
+    }
+
     fn read_result(value: Option<Vec<u8>>) -> Event {
         Event::Storage(StorageEvent::ReadResult {
             key: b"k".to_vec().into(),
@@ -549,6 +594,7 @@ mod tests {
                 .to_bytes()
                 .unwrap(),
         )));
+        verify(&mut operation);
 
         let local = operation.finalize().unwrap();
         assert_eq!(local.blake3, Some([7u8; 32]));
@@ -575,6 +621,7 @@ mod tests {
                 .unwrap(),
         )));
         operation.step(read_result(None));
+        verify(&mut operation);
 
         let summary = operation.finalize().unwrap().summary;
         assert_eq!(
@@ -591,6 +638,7 @@ mod tests {
         // An unknown version is no copy anywhere, not a copy in an unknown state.
         let mut operation = authorized(Some(Ulid::from_bytes([3u8; 16])));
         operation.step(read_result(None));
+        verify(&mut operation);
 
         let local = operation.finalize().unwrap();
         assert!(local.blake3.is_none());
@@ -603,8 +651,45 @@ mod tests {
         // The caller must fan out from the record the answer was authorized on.
         let mut operation = authorized(Some(Ulid::from_bytes([3u8; 16])));
         operation.step(read_result(None));
+        verify(&mut operation);
 
         assert_eq!(operation.finalize().unwrap().bucket, Some(bucket_info()));
+    }
+
+    #[test]
+    fn replaced_bucket_denied() {
+        // A bucket deleted and recreated under another group must not answer to
+        // a caller authorized against the generation the read started on.
+        let mut operation = authorized(Some(Ulid::from_bytes([3u8; 16])));
+        operation.step(read_result(Some(materialized().to_bytes().unwrap())));
+        operation.step(read_result(Some(
+            location(BackendRef::node_default(), None)
+                .to_bytes()
+                .unwrap(),
+        )));
+
+        let replaced = BucketInfo {
+            group_id: Ulid::from_bytes([9u8; 16]),
+            created_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+            ..bucket_info()
+        };
+        operation.step(read_result(Some(replaced.to_bytes().unwrap())));
+
+        assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
+    }
+
+    #[test]
+    fn deleted_bucket_not_found() {
+        // A bucket that vanished mid-read has no answer to give.
+        let mut operation = authorized(Some(Ulid::from_bytes([3u8; 16])));
+        operation.step(read_result(None));
+
+        operation.step(read_result(None));
+
+        assert_eq!(
+            operation.finalize(),
+            Err(LocationSummaryError::BucketNotFound)
+        );
     }
 
     #[test]

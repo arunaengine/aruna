@@ -492,7 +492,11 @@ impl OperationsTaskHandler {
     /// same config change, so the ladder must not cliff to 30s on the second
     /// attempt.
     fn placement_pull_retry_after(&self, key: &TaskKey) -> Duration {
-        self.retry_ladder(key, SHARD_TOPIC_PULL_RETRY_AFTER, SHARD_TOPIC_PULL_RETRY_MAX)
+        self.retry_ladder(
+            key,
+            SHARD_TOPIC_PULL_RETRY_AFTER,
+            SHARD_TOPIC_PULL_RETRY_MAX,
+        )
     }
 
     /// Keeps `base` for the first attempt, then doubles each further one up to
@@ -1804,33 +1808,33 @@ impl OperationsTaskHandler {
         // A failed candidate earns the fast retry, then doubles up to the normal
         // interval, so a permanently failing one cannot hold a one-minute rescan
         // of the whole queue forever.
-        let (after, drained) = match process_reclaim_batch(&self.context, self.reclaim_start()).await
-        {
-            Ok(outcome) => {
-                self.set_reclaim_start(outcome.next_start_after);
-                match (outcome.capped, outcome.failed) {
-                    (true, _) => {
-                        self.reset_backoff(&key);
-                        (RECLAIM_SWEEP_RETRY, false)
+        let (after, drained) =
+            match process_reclaim_batch(&self.context, self.reclaim_start()).await {
+                Ok(outcome) => {
+                    self.set_reclaim_start(outcome.next_start_after);
+                    match (outcome.capped, outcome.failed) {
+                        (true, _) => {
+                            self.reset_backoff(&key);
+                            (RECLAIM_SWEEP_RETRY, false)
+                        }
+                        (false, 0) => {
+                            self.reset_backoff(&key);
+                            (RECLAIM_SWEEP_AFTER, true)
+                        }
+                        (false, _) => (
+                            self.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER),
+                            true,
+                        ),
                     }
-                    (false, 0) => {
-                        self.reset_backoff(&key);
-                        (RECLAIM_SWEEP_AFTER, true)
-                    }
-                    (false, _) => (
-                        self.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER),
-                        true,
-                    ),
                 }
-            }
-            Err(error) => {
-                warn!(task_id = ?key, error = %error, "Failed to drain blob reclaim");
-                (
-                    self.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER),
-                    false,
-                )
-            }
-        };
+                Err(error) => {
+                    warn!(task_id = ?key, error = %error, "Failed to drain blob reclaim");
+                    (
+                        self.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER),
+                        false,
+                    )
+                }
+            };
         // Removal walks whole keyspaces too, so it only rides a sweep that
         // reached the end of the queue, never the fast retries behind a backlog.
         if drained && let Err(error) = remove_drained_backends(&self.context).await {
