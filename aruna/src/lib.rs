@@ -5,4 +5,5 @@
 pub mod bootstrap;
 pub mod config;
 pub mod portal;
+pub mod shutdown;
 pub mod telemetry;

@@ -6,6 +6,9 @@ use aruna::bootstrap::{
 };
 use aruna::config::{Config, StartupMode, load, mark_node_state_complete, mark_onboarding_phase};
 use aruna::portal;
+use aruna::shutdown::{
+    NodeShutdown, escalate_on_second_signal, shutdown_grace_from_env, wait_for_signal,
+};
 use aruna::telemetry::{init_tracing, shutdown_tracing};
 use aruna_api::auth::OidcValidator;
 use aruna_api::cors::CorsConfig;
@@ -17,6 +20,7 @@ use aruna_api::server_state::ServerState;
 use aruna_blob::blob::{BackendRegistry, BlobHandler};
 use aruna_core::UserId;
 use aruna_core::egress::EgressPolicy;
+use aruna_core::shutdown::Shutdown;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::onboarding::OnboardingPhase;
 use aruna_core::structs::NodeCapabilities;
@@ -29,7 +33,6 @@ use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_operations::incoming::initialize_net_holder;
-use aruna_operations::jobs::JOB_SHUTDOWN_GRACE;
 use aruna_operations::jobs::drain::restore_job_queue_timer;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
@@ -37,7 +40,6 @@ use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_me
 use aruna_operations::replication::migration::migrate_legacy_sync;
 use aruna_operations::startup::restore_shard_subscriptions;
 use aruna_operations::task_incoming::initialize_task_holder;
-use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -125,21 +127,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         compute_handle: compute_handle.clone(),
     });
 
+    // One cancellation path for the whole node: background children register
+    // here so an ordered shutdown can drain them before storage is sealed.
+    let shutdown = Shutdown::new();
+
     // Start the ops listener before realm bootstrap so `/readyz` reports 503
     // (startup) and `/metrics` is scrapable while the node is still coming up.
+    // Its handle is held so shutdown can keep it answering probes through the
+    // drain and abort it only after the final storage sync.
     let metrics = Arc::new(NodeMetrics::new());
     let readiness = Readiness::new();
-    {
+    let ops_handle = {
         let ops_state = OpsState::new(driver_ctx.clone(), metrics.clone(), readiness.clone()).await;
         let ops_listener = TcpListener::bind(config.ops_socket_addr).await?;
         let bound = ops_listener.local_addr()?;
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(error) = serve_ops(ops_listener, ops_state).await {
                 error!(error = %error, "Ops server stopped");
             }
         });
         info!(ops_address = %bound, "Ops server listening");
-    }
+        handle
+    };
 
     ensure_usage_counters(driver_ctx.as_ref()).await?;
 
@@ -149,12 +158,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         driver_ctx.clone(),
         config.rocrate_limits.clone(),
         jobs_runtime.clone(),
+        &shutdown,
     );
     initialize_task_holder(
         driver_ctx.clone(),
         task_handle.clone(),
         jobs_runtime.clone(),
         config.rocrate_limits.clone(),
+        &shutdown,
     )
     .await;
 
@@ -179,7 +190,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "Replayed metadata event log during startup"
         );
     }
-    spawn_metadata_warmup(driver_ctx.clone());
+    spawn_metadata_warmup(driver_ctx.clone(), &shutdown);
 
     match &config.startup_mode {
         StartupMode::InitializeRealm { realm_description } => {
@@ -391,7 +402,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config.rate_limits.ip_burst,
             config.rate_limits.principal_per_minute,
             config.rate_limits.principal_burst,
-        )),
+        ))
+        .with_shutdown_token(shutdown.token()),
     );
     portal::initialize(config.portal.clone(), state.clone()).await;
 
@@ -440,7 +452,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config.s3_public_url.as_deref().unwrap_or(&config.s3_host),
         )
         .await;
-    let (_s3_addr, server_handle) = s3_server.run_with_listener(s3_listener).unwrap();
+    let (_s3_addr, server_handle) = s3_server
+        .run_with_listener(s3_listener, shutdown.token())
+        .unwrap();
     if let Err(error) = jobs_runtime
         .recover_stale_jobs(&driver_ctx.storage_handle)
         .await
@@ -451,40 +465,74 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     restore_job_queue_timer(&driver_ctx.storage_handle, &task_handle).await;
 
     let rest_listener = TcpListener::bind(config.http_socket_addr).await?;
+    let rest_handle = tokio::spawn(server.run_with_listener(rest_listener, shutdown.token()));
 
     // Both request listeners are bound and bootstrap has completed: the node is
     // ready to serve, so `/readyz` may now return 200.
     readiness.set_ready();
 
+    let mut signal = tokio::spawn(wait_for_signal());
+    let mut rest_handle = Some(rest_handle);
+    let mut s3_handle = Some(server_handle);
+
+    // A server that returns before shutdown was requested has failed: the node
+    // is no longer serving, so it must not exit as success.
+    let mut failure: Option<String> = None;
     tokio::select! {
-        res = server_handle => {
-            match res {
-                Ok(_) => info!("S3 Server stopped normally"),
-                Err(e) => error!("S3 Server panicked: {:?}", e),
-            }
+        result = s3_handle.as_mut().expect("s3 server handle is present") => {
+            s3_handle = None;
+            failure = Some(match result {
+                Ok(()) => "S3 server stopped unexpectedly".to_string(),
+                Err(error) => format!("S3 server panicked: {error}"),
+            });
         }
-        res = server.run_with_listener(rest_listener) => {
-            match res {
-                Ok(_) => info!("REST Server stopped normally"),
-                Err(e) => error!("REST Server panicked: {:?}", e),
-            }
+        result = rest_handle.as_mut().expect("rest server handle is present") => {
+            rest_handle = None;
+            failure = Some(match result {
+                Ok(Ok(())) => "REST server stopped unexpectedly".to_string(),
+                Ok(Err(error)) => format!("REST server failed: {error}"),
+                Err(error) => format!("REST server panicked: {error}"),
+            });
         }
-        // You can add other signals here, e.g., Ctrl+C
-        _ = tokio::signal::ctrl_c() => {
-            info!("Shutting down S3 interface");
-        }
+        _ = &mut signal => {}
     }
 
-    shutdown_runtime(
-        &readiness,
-        driver_ctx.net_handle.as_ref(),
-        driver_ctx.metadata_handle.as_ref(),
-        &driver_ctx.storage_handle,
-        jobs_runtime.clone(),
-    )
+    if let Some(failure) = failure.as_ref() {
+        error!(error = %failure, "Shutting down after a server failure");
+    }
+
+    // A second termination signal means "stop now". After a server failure no
+    // signal has arrived yet, so wait for the first before arming escalation.
+    if failure.is_some() {
+        tokio::spawn(async move {
+            let _ = signal.await;
+            let _ = escalate_on_second_signal().await;
+        });
+    } else {
+        escalate_on_second_signal();
+    }
+
+    NodeShutdown {
+        shutdown,
+        readiness,
+        rest: rest_handle,
+        s3: s3_handle,
+        task_handle,
+        jobs_runtime,
+        net_handle: driver_ctx.net_handle.clone(),
+        metadata_handle: driver_ctx.metadata_handle.clone(),
+        blob_handle: driver_ctx.blob_handle.clone(),
+        storage_handle: driver_ctx.storage_handle.clone(),
+        ops: Some(ops_handle),
+        grace: shutdown_grace_from_env(),
+    }
+    .run()
     .await;
 
-    Ok(())
+    match failure {
+        Some(failure) => Err(failure.into()),
+        None => Ok(()),
+    }
 }
 
 async fn build_compute_registry(
@@ -757,36 +805,6 @@ async fn seed_local_node_info(ctx: &DriverContext, config: &Config) -> Result<()
     .await
 }
 
-async fn shutdown_runtime(
-    readiness: &Readiness,
-    net_handle: Option<&NetHandle>,
-    metadata_handle: Option<&MetadataHandle>,
-    storage_handle: &StorageHandle,
-    jobs_runtime: Arc<JobsRuntime>,
-) {
-    readiness.begin_drain();
-
-    jobs_runtime
-        .shutdown(storage_handle, JOB_SHUTDOWN_GRACE)
-        .await;
-
-    if let Some(net_handle) = net_handle {
-        info!("Shutting down network services");
-        net_handle.shutdown().await;
-    }
-
-    if let Some(metadata_handle) = metadata_handle {
-        info!("Flushing metadata persistence");
-        if let Err(error) = metadata_handle.flush_persistence().await {
-            error!(error = %error, "Failed to flush metadata persistence during shutdown");
-        }
-    }
-
-    if let Err(error) = storage_handle.sync_all().await {
-        error!(error = %error, "Failed to sync storage during shutdown");
-    }
-}
-
 #[cfg(any(feature = "docker", feature = "apptainer", feature = "kubernetes"))]
 /// Containers may need a different S3 endpoint than browsers: the override
 /// keeps the portal-facing url on loopback (strict CSP) while container
@@ -867,6 +885,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
     use aruna_core::structs::{UsageCounters, usage_global_shard_keys};
+    use aruna_storage::StorageHandle;
     use std::thread;
     use tempfile::tempdir;
 
@@ -906,31 +925,6 @@ mod tests {
         assert!(parse_s3_cidrs("10.0.0.0/33").is_err());
         assert!(parse_s3_cidrs("2001:db8::/129").is_err());
         assert!(parse_s3_cidrs("invalid/8").is_err());
-    }
-
-    #[tokio::test]
-    async fn shutdown_drains_syncs() {
-        let readiness = Readiness::new();
-        readiness.set_ready();
-        let observed_readiness = readiness.clone();
-        let (storage_handle, receivers) = StorageHandle::new();
-        let receiver = receivers.foreground;
-        let worker = thread::spawn(move || {
-            let (effect, response_tx, _span, _queued_at, _in_flight) = receiver
-                .recv()
-                .expect("shutdown should request storage sync_all");
-            assert!(
-                observed_readiness.is_draining(),
-                "readiness should drain before storage sync"
-            );
-            assert!(matches!(effect, StorageEffect::SyncAll));
-            response_tx.send(StorageEvent::SyncAllFinished);
-        });
-
-        shutdown_runtime(&readiness, None, None, &storage_handle, JobsRuntime::new()).await;
-
-        assert!(readiness.is_draining());
-        worker.join().expect("storage responder should finish");
     }
 
     #[tokio::test]
