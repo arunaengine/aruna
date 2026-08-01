@@ -14,6 +14,7 @@ use aruna_core::structs::{
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
+use aruna_core::types::Key;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
@@ -128,6 +129,9 @@ struct OperationsTaskHandler {
     // In-memory retry-attempt counters keyed by timer. Loss on restart is fine:
     // a restarted node simply retries from the base interval.
     retry_backoff: std::sync::Mutex<HashMap<TaskKey, u32>>,
+    // Where a capped reclaim sweep resumes. Loss on restart is fine: the next
+    // sweep starts from the head and reaches the tail over the ticks after it.
+    reclaim_cursor: std::sync::Mutex<Option<Key>>,
 }
 
 struct DrainSubBatch {
@@ -370,6 +374,7 @@ impl OperationsTaskHandler {
             jobs_runtime,
             rocrate_limits: RoCrateLimits::default(),
             retry_backoff: std::sync::Mutex::new(HashMap::new()),
+            reclaim_cursor: std::sync::Mutex::new(None),
         }
     }
 
@@ -465,6 +470,20 @@ impl OperationsTaskHandler {
             .lock()
             .expect("retry backoff mutex poisoned")
             .remove(key);
+    }
+
+    fn reclaim_start(&self) -> Option<Key> {
+        self.reclaim_cursor
+            .lock()
+            .expect("reclaim cursor mutex poisoned")
+            .clone()
+    }
+
+    fn set_reclaim_start(&self, cursor: Option<Key>) {
+        *self
+            .reclaim_cursor
+            .lock()
+            .expect("reclaim cursor mutex poisoned") = cursor;
     }
 
     /// Keeps the first missing-topic pull retry prompt, then doubles each
@@ -1775,16 +1794,24 @@ impl OperationsTaskHandler {
     }
 
     async fn drain_blob_reclaim(&self) {
-        let (after, drained) = match process_reclaim_batch(&self.context).await {
-            Ok(outcome) if outcome.capped || outcome.failed > 0 => (RECLAIM_SWEEP_RETRY, false),
-            Ok(_) => (RECLAIM_SWEEP_AFTER, true),
+        let (after, drained) = match process_reclaim_batch(&self.context, self.reclaim_start())
+            .await
+        {
+            Ok(outcome) => {
+                self.set_reclaim_start(outcome.next_start_after);
+                match outcome.capped {
+                    true => (RECLAIM_SWEEP_RETRY, false),
+                    false => (RECLAIM_SWEEP_AFTER, true),
+                }
+            }
             Err(error) => {
                 warn!(task_id = ?TaskKey::DrainBlobReclaimQueue, error = %error, "Failed to drain blob reclaim");
                 (RECLAIM_SWEEP_RETRY, false)
             }
         };
         // Removal walks whole keyspaces too, so it only rides a sweep that
-        // finished its queue, never the fast retries behind a backlog.
+        // reached the end of the queue, never the fast retries behind a
+        // backlog. A failed candidate no longer holds it back.
         if drained && let Err(error) = remove_drained_backends(&self.context).await {
             warn!(error = %error, "Failed to remove drained storage backends");
         }

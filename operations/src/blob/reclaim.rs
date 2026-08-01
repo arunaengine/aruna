@@ -77,19 +77,28 @@ pub struct ReclaimOutcome {
     pub failed: usize,
     /// The tick stopped at its work cap with candidates still queued.
     pub capped: bool,
+    /// Where the next tick resumes. `None` means the queue ended, so the next
+    /// tick starts from the head again.
+    pub next_start_after: Option<Key>,
 }
 
-/// Pages the whole queue so a candidate that keeps conflicting cannot starve
-/// the rows behind it.
-pub async fn process_reclaim_batch(context: &DriverContext) -> Result<ReclaimOutcome, String> {
-    sweep_at(context, SystemTime::now()).await
+/// Pages the queue from `start_after` so a candidate that keeps failing cannot
+/// starve the rows behind it: the cap moves the cursor past it either way.
+pub async fn process_reclaim_batch(
+    context: &DriverContext,
+    start_after: Option<Key>,
+) -> Result<ReclaimOutcome, String> {
+    sweep_at(context, SystemTime::now(), start_after).await
 }
 
-async fn sweep_at(context: &DriverContext, now: SystemTime) -> Result<ReclaimOutcome, String> {
+async fn sweep_at(
+    context: &DriverContext,
+    now: SystemTime,
+    mut start_after: Option<Key>,
+) -> Result<ReclaimOutcome, String> {
     let catalog = node_routing(context).catalog;
     let mut records: HashMap<Ulid, Option<GroupStorageBackend>> = HashMap::new();
     let mut outcome = ReclaimOutcome::default();
-    let mut start_after = None;
     let mut driven = 0usize;
 
     loop {
@@ -148,6 +157,7 @@ async fn sweep_at(context: &DriverContext, now: SystemTime) -> Result<ReclaimOut
             driven = driven.saturating_add(1);
             if driven >= RECLAIM_TICK_LIMIT {
                 outcome.capped = true;
+                outcome.next_start_after = Some(key);
                 break;
             }
         }
@@ -1054,7 +1064,9 @@ mod tests {
         let context = context(dir.path().to_str().unwrap());
         seed(&context, 10).await;
 
-        let outcome = sweep_at(&context, SystemTime::UNIX_EPOCH).await.unwrap();
+        let outcome = sweep_at(&context, SystemTime::UNIX_EPOCH, None)
+            .await
+            .unwrap();
 
         assert_eq!(outcome.not_due, 1);
         assert_eq!(outcome.freed, 0);
@@ -1074,7 +1086,7 @@ mod tests {
             + CleanupStrategy::DEFAULT_RECLAIM_AFTER
             + Duration::from_secs(1);
 
-        let outcome = sweep_at(&context, due).await.unwrap();
+        let outcome = sweep_at(&context, due, None).await.unwrap();
 
         assert_eq!(outcome.freed, 1);
         assert_eq!(outcome.freed_bytes, 10);
@@ -1105,10 +1117,19 @@ mod tests {
             + CleanupStrategy::DEFAULT_RECLAIM_AFTER
             + Duration::from_secs(1);
 
-        let outcome = sweep_at(&context, due).await.unwrap();
+        let outcome = sweep_at(&context, due, None).await.unwrap();
 
         assert!(outcome.capped);
         assert_eq!(outcome.dropped, RECLAIM_TICK_LIMIT);
+
+        // The cursor resumes past the capped tick, so the tail is not starved.
+        let resumed = sweep_at(&context, due, outcome.next_start_after)
+            .await
+            .unwrap();
+
+        assert!(!resumed.capped);
+        assert_eq!(resumed.dropped, 1);
+        assert!(resumed.next_start_after.is_none());
     }
 
     #[test]
