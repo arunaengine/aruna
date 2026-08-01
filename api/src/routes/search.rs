@@ -515,10 +515,12 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE, USER_KEYSPACE};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USER_KEYSPACE,
+    };
     use aruna_core::structs::{
         Actor, BucketInfo, Group, GroupAuthorizationDocument, NodeCapabilities,
-        RealmAuthorizationDocument, RealmId, User,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, User,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::metadata::MetadataHandle;
@@ -663,6 +665,17 @@ mod tests {
             RealmAuthorizationDocument::new_default_realm_doc(realm)
                 .to_bytes(&actor)
                 .unwrap(),
+        )
+        .await;
+
+        let mut config = RealmConfigDocument::default_for_realm(realm, Vec::new());
+        config.seed_default_placement();
+        config.ensure_node(node_id, RealmNodeKind::Server);
+        write_bytes(
+            &state,
+            REALM_CONFIG_KEYSPACE,
+            realm.as_bytes().to_vec(),
+            config.to_bytes(&actor).unwrap(),
         )
         .await;
 
