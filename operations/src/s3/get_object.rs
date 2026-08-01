@@ -73,6 +73,8 @@ pub enum GetObjectError {
     InvalidRange,
     #[error("Reference source metadata changed during ranged read.")]
     ReferenceSourceChanged,
+    #[error("The historical reference version is no longer available.")]
+    HistoricalReferenceUnavailable,
     #[error(transparent)]
     ResolveReferenceError(#[from] SourceConnectorResolutionError),
     #[error(transparent)]
@@ -165,6 +167,12 @@ pub struct GetObjectOperation {
     location: Option<BackendLocation>,
     reference_access: Option<ResolvedSourceAccess>,
     reference_stream: Option<BackendStream<Result<Bytes, StreamError>>>,
+    /// Stored observation of the reference version being read, the drift baseline.
+    reference_cached: Option<SourceMetadata>,
+    /// `last_refresh` of the stored reference version; served when undrifted.
+    reference_last_refresh: Option<SystemTime>,
+    /// Whether the caller pinned an explicit version (a historical read).
+    reference_explicit: bool,
     metadata: HashMap<String, String>,
     source_metadata: Option<SourceMetadata>,
     source_binding: Option<VersionSourceBinding>,
@@ -187,6 +195,9 @@ impl GetObjectOperation {
             location: None,
             reference_access: None,
             reference_stream: None,
+            reference_cached: None,
+            reference_last_refresh: None,
+            reference_explicit: false,
             metadata: HashMap::new(),
             source_metadata: None,
             source_binding: None,
@@ -346,11 +357,18 @@ impl GetObjectOperation {
             } else {
                 GetObjectError::NoSuchKey
             }),
-            BlobVersionState::Reference { source, .. } => {
+            BlobVersionState::Reference {
+                source,
+                cached_metadata,
+                last_refresh,
+            } => {
                 // The access-driven successor-on-drift core (#256) lands on this
                 // path. Deferred as enhancements: verified cache + singleflight
                 // (#375), general one-hop origin relay (#380), sync poller (#314).
                 self.source_binding = Some(source.clone());
+                self.reference_cached = Some(cached_metadata);
+                self.reference_last_refresh = Some(last_refresh);
+                self.reference_explicit = explicit_version_request;
                 self.location = None;
                 self.reference_access = None;
                 self.reference_stream = None;
@@ -495,39 +513,24 @@ impl GetObjectOperation {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(GetObjectError::NoTransactionFound);
         };
-        let Some(access) = self.reference_access.clone() else {
+        if self.reference_access.is_none() {
             return self.emit_error(GetObjectError::GetObjectFailed);
-        };
-
-        self.state = GetObjectState::CommitTransaction;
-        if self.input.range.is_some() {
-            smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-        } else {
-            smallvec![
-                Effect::Storage(StorageEffect::CommitTransaction { txn_id }),
-                Effect::StagingSource(StagingSourceEffect::Read {
-                    access,
-                    range: None,
-                })
-            ]
         }
+
+        // Release the read snapshot, then HEAD the source: the fresh observation
+        // decides whether this read serves, advances the binding, or 404s.
+        self.state = GetObjectState::CommitTransaction;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
     pub fn handle_transaction_committed(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event {
             self.txn_id = None;
-            if self.reference_access.is_some() && self.input.range.is_some() {
-                let Some(access) = self.reference_access.clone() else {
-                    return self.emit_error(GetObjectError::GetObjectFailed);
-                };
+            if let Some(access) = self.reference_access.clone() {
                 self.state = GetObjectState::HeadReferenceSource;
                 return smallvec![Effect::StagingSource(StagingSourceEffect::Head { access })];
             }
-            self.state = if self.reference_access.is_some() {
-                GetObjectState::ReadReferenceSource
-            } else {
-                GetObjectState::GetBlob
-            };
+            self.state = GetObjectState::GetBlob;
             smallvec![]
         } else {
             self.emit_error(GetObjectError::InvalidStateEvent {
@@ -541,24 +544,27 @@ impl GetObjectOperation {
     pub fn handle_reference_source_head(&mut self, event: Event) -> Effects {
         match event {
             Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) => {
-                let Some(range_request) = self.input.range.as_ref() else {
-                    return self.emit_error(GetObjectError::GetObjectFailed);
-                };
-                let resolved_range = match range_request.resolve(metadata.content_length) {
-                    Ok(range) => range,
-                    Err(err) => return self.emit_error(err),
-                };
-                let Some(access) = self.reference_access.clone() else {
-                    return self.emit_error(GetObjectError::GetObjectFailed);
-                };
+                let baseline = self
+                    .reference_cached
+                    .as_ref()
+                    .map(SourceMetadata::observation_fingerprint);
+                let drifted = baseline != Some(metadata.observation_fingerprint());
 
-                self.source_metadata = Some(metadata);
-                self.resolved_range = Some(resolved_range.clone());
-                self.state = GetObjectState::ReadReferenceSource;
-                smallvec![Effect::StagingSource(StagingSourceEffect::Read {
-                    access,
-                    range: Some(resolved_range.range),
-                })]
+                // A pinned historical version whose live observation has drifted
+                // cannot be served: its bytes were never cached (#375 deferred).
+                if drifted && self.reference_explicit {
+                    return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
+                }
+
+                // Undrifted current or pinned read serves the recorded observation;
+                // a drifted current read still floats live here. The successor-on-
+                // drift write path (#256) replaces that float in the next step.
+                self.last_refresh = if drifted {
+                    Some(SystemTime::now())
+                } else {
+                    self.reference_last_refresh
+                };
+                self.serve_reference_source(metadata)
             }
             Event::StagingSource(StagingSourceEvent::Error { error }) => {
                 self.emit_error(error.into())
@@ -569,6 +575,27 @@ impl GetObjectOperation {
                 received: other,
             }),
         }
+    }
+
+    /// Issues the source read for the observation `metadata`, resolving the
+    /// requested range against its live content length.
+    fn serve_reference_source(&mut self, metadata: SourceMetadata) -> Effects {
+        let Some(access) = self.reference_access.clone() else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+        let range = match self.input.range.as_ref() {
+            Some(range_request) => match range_request.resolve(metadata.content_length) {
+                Ok(resolved) => {
+                    self.resolved_range = Some(resolved.clone());
+                    Some(resolved.range)
+                }
+                Err(err) => return self.emit_error(err),
+            },
+            None => None,
+        };
+        self.source_metadata = Some(metadata);
+        self.state = GetObjectState::ReadReferenceSource;
+        smallvec![Effect::StagingSource(StagingSourceEffect::Read { access, range })]
     }
 
     pub fn handle_received_blob(&mut self, event: Event) -> Effects {
@@ -612,7 +639,7 @@ impl GetObjectOperation {
                 {
                     return self.emit_error(GetObjectError::ReferenceSourceChanged);
                 }
-                self.last_refresh = Some(SystemTime::now());
+                // `last_refresh` was set by the head handler from the drift check.
                 self.source_metadata = Some(metadata);
                 self.reference_stream = Some(stream);
                 self.finish_reference_output()

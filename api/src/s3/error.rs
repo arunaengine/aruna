@@ -310,6 +310,12 @@ impl IntoS3Error for GetObjectError {
     fn into_s3_error(self) -> S3Error {
         match self {
             GetObjectError::NoSuchVersion => no_such_version_error(),
+            GetObjectError::HistoricalReferenceUnavailable => {
+                s3_error!(
+                    NoSuchVersion,
+                    "The requested reference version is no longer available."
+                )
+            }
             GetObjectError::DeleteMarker => delete_marker_error(),
             GetObjectError::NoSuchKey => no_such_key_error(),
             GetObjectError::InvalidRange => {
