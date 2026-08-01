@@ -443,7 +443,10 @@ mod tests {
             },
         );
         let server_task = tokio::spawn(async move {
-            server.run_with_listener(listener).await.unwrap();
+            server
+                .run_with_listener(listener, tokio_util::sync::CancellationToken::new())
+                .await
+                .unwrap();
         });
 
         TestNode {

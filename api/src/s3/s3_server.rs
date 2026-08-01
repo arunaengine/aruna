@@ -2300,7 +2300,9 @@ mod tests {
         .with_trusted_proxies(vec!["127.0.0.1/32".parse().expect("valid proxy net")])
         .with_rate_limits(crate::rate_limit::ApiRateLimits::for_test(1))
         .expect("rate limits install");
-        let (_bound, task) = server.run_with_listener(listener).expect("server runs");
+        let (_bound, task) = server
+            .run_with_listener(listener, CancellationToken::new())
+            .expect("server runs");
 
         let client = reqwest::Client::new();
         let charge = async |forwarded: &str| {
