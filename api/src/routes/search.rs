@@ -7,7 +7,7 @@ use crate::routes::metadata::{
 use crate::routes::users::MIN_SEARCH_QUERY_CHARS;
 use crate::server_state::ServerState;
 use aruna_core::UserId;
-use aruna_core::structs::AuthContext;
+use aruna_core::structs::{AuthContext, Permission};
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::{
     BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
@@ -315,7 +315,14 @@ pub async fn unified_search(
             params.mode.clone(),
         ),
         run_buckets(&state, &auth, types.buckets, &q, bearer, limit),
-        run_groups(&state, types.groups, &q, limit, params.cursor.clone()),
+        run_groups(
+            &state,
+            &auth,
+            types.groups,
+            &q,
+            limit,
+            params.cursor.clone()
+        ),
         run_users(&state, types.users, &q, limit, params.cursor.clone()),
     );
 
@@ -438,6 +445,7 @@ fn map_documents_section(result: MetadataSearchExecution) -> DocumentsSection {
 
 async fn run_groups(
     state: &ServerState,
+    auth: &AuthContext,
     requested: bool,
     query: &str,
     limit: usize,
@@ -456,15 +464,24 @@ async fn run_groups(
     )
     .await
     .map_err(|err| ServerError::InternalError(err.to_string()))?;
-    Ok(Some(GroupsSection {
-        hits: output
-            .groups
-            .into_iter()
-            .map(|group| GroupHit {
+    let realm_id = state.get_realm_id();
+    let mut hits = Vec::new();
+    for group in output.groups {
+        // Per-result visibility: only disclose a group the caller can read,
+        // mirroring document search (READ on the group's data root).
+        let path = format!("/{realm_id}/g/{}/data/**", group.group_id);
+        if crate::auth::ensure_permission(state, auth, path, Permission::READ)
+            .await
+            .is_ok()
+        {
+            hits.push(GroupHit {
                 group_id: group.group_id.to_string(),
                 display_name: group.display_name,
-            })
-            .collect(),
+            });
+        }
+    }
+    Ok(Some(GroupsSection {
+        hits,
         next_cursor: output.next_start_after,
     }))
 }
@@ -832,6 +849,41 @@ mod tests {
         assert_eq!(unified.buckets.unwrap().hits.len(), 1);
         assert!(unified.groups.is_none());
         assert!(unified.users.is_none());
+    }
+
+    #[tokio::test]
+    async fn filters_group_hits() {
+        // A same-realm caller who is not a group member sees no group hits,
+        // while a member still sees both matching groups.
+        let fx = setup().await;
+        let stranger = AuthContext {
+            user_id: UserId::local(Ulid::from_bytes([77u8; 16]), fx.realm_id),
+            realm_id: fx.realm_id,
+            path_restrictions: None,
+        };
+        let (_, Json(resp)) = unified_search(
+            State(fx.state.clone()),
+            Extension(Some(stranger)),
+            Extension(None),
+            Query(SearchParams {
+                types: Some("groups".to_string()),
+                ..params("alpha")
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(resp.groups.unwrap().hits.is_empty());
+
+        let member = search(
+            &fx,
+            SearchParams {
+                types: Some("groups".to_string()),
+                ..params("alpha")
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(member.groups.unwrap().hits.len(), 2);
     }
 
     #[tokio::test]
