@@ -2240,6 +2240,50 @@ fn group_effect(backend_id: Ulid) -> BlobEffect {
     }
 }
 
+// The seal stops new blob mutations before storage is sealed, so a restart
+// cannot find a backend write whose location never reached storage.
+#[tokio::test]
+async fn seal_rejects_blob_writes() {
+    let context = setup_blob_handle(64).await;
+    context.blob_handle.seal();
+    assert!(context.blob_handle.is_sealed());
+
+    let rejected = context
+        .blob_handle
+        .send_blob_effect(group_effect(Ulid::generate()))
+        .await;
+    assert!(matches!(
+        rejected,
+        Event::Blob(BlobEvent::Error(BlobError::Sealed))
+    ));
+    assert_eq!(context.blob_handle.rejected_writes(), 1);
+
+    // A non-mutating effect still runs after the seal.
+    let listed = context
+        .blob_handle
+        .send_blob_effect(BlobEffect::ListHidden {
+            namespace: None,
+            cursor: None,
+        })
+        .await;
+    assert!(!matches!(
+        listed,
+        Event::Blob(BlobEvent::Error(BlobError::Sealed))
+    ));
+}
+
+// With no mutation in flight the drain returns immediately.
+#[tokio::test]
+async fn drain_writes_when_idle() {
+    let context = setup_blob_handle(64).await;
+    assert!(
+        context
+            .blob_handle
+            .drain_writes(std::time::Duration::from_secs(5))
+            .await
+    );
+}
+
 #[tokio::test]
 async fn pins_effect_snapshot() {
     // A shared entry could be replaced or dropped while this effect still runs.
