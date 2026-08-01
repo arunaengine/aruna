@@ -712,6 +712,7 @@ mod test {
             op.state = UploadPartState::CommitTransaction;
             op.txn_id = Some(Ulid::from_bytes([3u8; 16]));
             let upload_id = op.input.upload_id;
+            let location = op.written_location.clone().unwrap();
 
             let effects = op.step(Event::Storage(StorageEvent::Error {
                 error: error.clone(),
@@ -729,7 +730,7 @@ mod test {
             assert_eq!(
                 BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
                 BlobCleanupWork::ReconcileWrite {
-                    location: part_location(Ulid::from_bytes([5u8; 16])),
+                    location,
                     owner: WriteOwner::UploadPart {
                         upload_id,
                         part_number: 1,
