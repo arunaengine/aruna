@@ -95,7 +95,7 @@ pub async fn process_cleanup_batch(context: &DriverContext) -> Result<BlobCleanu
 }
 
 /// The backend a row needs credentials for, if it needs any.
-pub fn work_backend(work: &BlobCleanupWork) -> Option<&BackendRef> {
+fn work_backend(work: &BlobCleanupWork) -> Option<&BackendRef> {
     match work {
         BlobCleanupWork::DeleteBlob { location }
         | BlobCleanupWork::ReconcileWrite { location, .. } => Some(&location.backend),
