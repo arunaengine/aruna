@@ -42,9 +42,12 @@ use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperat
 use crate::blob_holders::GetBlobHoldersOperation;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
-use crate::get_metadata_document::load_metadata_record_by_document;
-use crate::metadata::raw::load_raw_view;
-use crate::metadata::repository::StorageReadError;
+use crate::metadata::MetadataAuthToken;
+use crate::metadata::api::{
+    ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, MetadataApiError,
+    MetadataRoCrateExportView,
+};
+use crate::metadata::forward::export_metadata_rocrate_routed;
 use crate::replication::bao_read::{BaoReadError, BaoReadOperation, BaoReadOutput};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 
@@ -329,30 +332,29 @@ async fn snapshot_export(
     spec: &ExportRoCrateSpec,
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<(), ExportFailure> {
-    let record = load_metadata_record_by_document(&ctx.driver, spec.document_id)
-        .await
-        .map_err(|error| match error {
-            StorageReadError::Storage(error) => ExportFailure::Retryable(error.to_string()),
-            StorageReadError::Conversion(error) => ExportFailure::Retryable(error.to_string()),
-        })?
-        .ok_or_else(|| ExportFailure::Permanent("metadata document not found".to_string()))?;
-    if record.permission_path.is_empty() {
+    // Route the raw revision from a document holder; a job placed on a
+    // job-control bucket rarely also holds the document's bucket. The holder
+    // re-checks the job principal's READ, attested by this authenticated peer.
+    let export = export_metadata_rocrate_routed(
+        &ctx.driver,
+        spec.auth_context.realm_id,
+        ExportMetadataRoCrateRequest {
+            document_id: spec.document_id,
+            auth: Some(spec.auth_context.clone()),
+            view: MetadataRoCrateExportView::Raw,
+            limit: None,
+            offset: None,
+            after: None,
+        },
+        Some(MetadataAuthToken::internal(spec.auth_context.clone())),
+    )
+    .await
+    .map_err(snapshot_read_failure)?;
+    let ExportMetadataRoCrateResult::Raw { raw, .. } = export else {
         return Err(ExportFailure::Permanent(
-            "metadata document has no permission path".to_string(),
+            "raw export returned an unexpected view".to_string(),
         ));
-    }
-    if !check_read(ctx, spec, record.permission_path).await? {
-        return Err(ExportFailure::Permanent(
-            "metadata document READ permission denied".to_string(),
-        ));
-    }
-
-    let raw = load_raw_view(&ctx.driver, spec.document_id)
-        .await
-        .map_err(|error| ExportFailure::Permanent(error.to_string()))?
-        .ok_or_else(|| {
-            ExportFailure::Permanent("metadata document has no raw RO-Crate revision".to_string())
-        })?;
+    };
     if raw.revision.jsonld.len() as u64 > spec.limits.metadata_bytes {
         return Err(ExportFailure::Permanent(format!(
             "RO-Crate metadata exceeds the {} byte limit",
@@ -652,6 +654,26 @@ async fn resolve_alias(
         resolved_version: Some(alias.version_id),
         expected_blake3: Some(alias.blake3_hash),
     }))
+}
+
+fn snapshot_read_failure(error: MetadataApiError) -> ExportFailure {
+    match error {
+        MetadataApiError::NotFound => {
+            ExportFailure::Permanent("metadata document has no raw RO-Crate revision".to_string())
+        }
+        MetadataApiError::Unauthorized | MetadataApiError::Forbidden => {
+            ExportFailure::Permanent("metadata document READ permission denied".to_string())
+        }
+        MetadataApiError::BadRequest => {
+            ExportFailure::Permanent("invalid metadata export request".to_string())
+        }
+        MetadataApiError::ServiceUnavailable => {
+            ExportFailure::Retryable("metadata document is unavailable".to_string())
+        }
+        MetadataApiError::InvalidCursor(message) | MetadataApiError::Internal(message) => {
+            ExportFailure::Retryable(message)
+        }
+    }
 }
 
 async fn check_read(
