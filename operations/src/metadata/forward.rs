@@ -762,12 +762,8 @@ async fn create_forward_holders(
     config: &CreateMetadataDocumentConfig,
     document_id: Ulid,
 ) -> Option<(PlacementRef, Vec<NodeId>)> {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return None;
-    };
-    let Some(realm_config) = load_realm_config(context, *net_handle.realm_id()).await else {
-        return None;
-    };
+    let net_handle = context.net_handle.as_ref()?;
+    let realm_config = load_realm_config(context, *net_handle.realm_id()).await?;
     let placement = resolve_metadata_id(
         &realm_config,
         config.actor.realm_id,
