@@ -971,6 +971,7 @@ mod tests {
             holder_node_ids: vec![node(1)],
             created_at_ms: 1,
             updated_at_ms: 1,
+            establishing_event_id: event_id,
             last_event_id: event_id,
         };
         MetadataCreateEventRecord {

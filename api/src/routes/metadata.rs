@@ -13,6 +13,7 @@ use aruna_core::structs::{
     WatchEventDetail, WatchEventKind,
 };
 use aruna_core::util::unix_timestamp_millis;
+use aruna_core::{MetaResourceId, StructuredId};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
@@ -28,7 +29,6 @@ use aruna_operations::metadata::api::{
     MetadataReferenceEntry, MetadataReferencesExecution, MetadataReferencesRequest,
     MetadataRoCrateExportView as OperationMetadataRoCrateExportView, MetadataSearchRequest,
     export_metadata_rocrate as run_export_metadata_rocrate,
-    get_visible_metadata_document as run_get_visible_metadata_document,
     list_visible_metadata_documents as run_list_visible_metadata_documents,
     metadata_auth_token_from_bearer, query_metadata as run_query_metadata,
     query_metadata_document as run_query_metadata_document,
@@ -37,6 +37,7 @@ use aruna_operations::metadata::api::{
 use aruna_operations::metadata::forward::{
     MetadataWriteError, create_metadata_document_routed as run_create_metadata_document,
     delete_metadata_document_routed as run_delete_metadata_document,
+    get_metadata_routed as run_get_visible_metadata_document,
     update_metadata_document_routed as run_update_metadata_document,
 };
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
@@ -207,6 +208,7 @@ pub struct MetadataDocumentListItem {
     pub document_path: String,
     pub graph_iri: String,
     pub public: bool,
+    pub path_conflicted: bool,
     pub replicas: usize,
     pub created_at: String,
     pub updated_at: String,
@@ -483,13 +485,18 @@ impl From<&MetadataRegistryRecord> for MetadataDocumentSummary {
 }
 
 impl MetadataDocumentListItem {
-    fn from_record(record: &MetadataRegistryRecord, rocrate_summary: Option<Value>) -> Self {
+    fn from_record(
+        record: &MetadataRegistryRecord,
+        path_conflicted: bool,
+        rocrate_summary: Option<Value>,
+    ) -> Self {
         Self {
             document_id: record.document_id.to_string(),
             group_id: record.group_id.to_string(),
             document_path: record.document_path.clone(),
             graph_iri: record.graph_iri.clone(),
             public: record.public,
+            path_conflicted,
             replicas: record.holder_node_ids.len(),
             created_at: format_timestamp_ms(record.created_at_ms),
             updated_at: format_timestamp_ms(record.updated_at_ms),
@@ -577,7 +584,8 @@ impl MetadataDocumentListItem {
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 409, description = "Concurrent create conflict; retry", body = ErrorResponse)
+        (status = 409, description = "Concurrent create conflict; retry", body = ErrorResponse),
+        (status = 503, description = "Placement binding unavailable or conflicted", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -738,7 +746,8 @@ pub async fn list_metadata_documents(
         (status = 400, description = "Invalid id", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Not found", body = ErrorResponse)
+        (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 503, description = "Placement or holders unavailable", body = ErrorResponse)
     ),
     security((), ("bearer_auth" = []))
 )]
@@ -750,7 +759,7 @@ pub async fn get_metadata_document(
     let document_id = parse_document_id(&document_id)?;
     let ctx = state.get_ctx();
     let record = run_get_visible_metadata_document(
-        ctx.as_ref(),
+        &ctx,
         state.get_realm_id(),
         GetVisibleMetadataDocumentRequest { document_id, auth },
     )
@@ -1490,7 +1499,9 @@ fn map_reference_entry(entry: MetadataReferenceEntry) -> MetadataReferenceItem {
 }
 
 fn parse_document_id(document_id: &str) -> ServerResult<Ulid> {
-    Ulid::from_string(document_id).map_err(|_| ServerError::BadRequest)
+    MetaResourceId::parse(document_id)
+        .map(|id| id.as_ulid())
+        .map_err(|_| ServerError::BadRequest)
 }
 
 async fn run_list_metadata_documents(
@@ -1526,6 +1537,7 @@ async fn run_list_metadata_documents(
             .transpose()?;
         documents.push(MetadataDocumentListItem::from_record(
             &document.record,
+            document.path_conflicted,
             rocrate_summary,
         ));
     }
@@ -1595,7 +1607,7 @@ fn serialize_jsonld_entity(value: &Value) -> ServerResult<String> {
 /// answered `201` for a record that can never replicate.
 fn map_metadata_write_error(error: MetadataWriteError) -> ServerError {
     match error {
-        MetadataWriteError::Create(error) => map_create_metadata_error(error),
+        MetadataWriteError::Create(error) => map_create_error(error),
         MetadataWriteError::Update(error) => map_update_metadata_error(error),
         MetadataWriteError::Delete(error) => ServerError::InternalError(error.to_string()),
         MetadataWriteError::Undeliverable(error) => ServerError::ServiceUnavailableReason(format!(
@@ -1604,13 +1616,23 @@ fn map_metadata_write_error(error: MetadataWriteError) -> ServerError {
     }
 }
 
-fn map_create_metadata_error(error: CreateMetadataDocumentError) -> ServerError {
+pub(super) fn map_create_error(error: CreateMetadataDocumentError) -> ServerError {
     match error {
         CreateMetadataDocumentError::MetadataError(metadata_error) => {
             map_metadata_error(metadata_error)
         }
         CreateMetadataDocumentError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent metadata create conflict; retry".to_string())
+        }
+        CreateMetadataDocumentError::PlacementBinding(
+            aruna_core::structs::BindingError::Conflicted(_),
+        ) => ServerError::ServiceUnavailableReason("placement_binding_conflict".to_string()),
+        CreateMetadataDocumentError::PlacementBinding(_)
+        | CreateMetadataDocumentError::PlacementBindingUnavailable(_) => {
+            ServerError::ServiceUnavailableReason("placement_binding_unavailable".to_string())
+        }
+        CreateMetadataDocumentError::ClockHealth(_) => {
+            ServerError::ServiceUnavailableReason("structured_id_clock_unhealthy".to_string())
         }
         other => ServerError::InternalError(other.to_string()),
     }
@@ -2039,7 +2061,7 @@ mod tests {
     #[test]
     fn maps_conflict_409() {
         use axum::response::IntoResponse;
-        let mapped = map_create_metadata_error(CreateMetadataDocumentError::StorageError(
+        let mapped = map_create_error(CreateMetadataDocumentError::StorageError(
             StorageError::TransactionConflict,
         ));
         assert!(matches!(mapped, ServerError::Conflict(_)));

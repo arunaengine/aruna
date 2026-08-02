@@ -36,7 +36,7 @@ use aruna_operations::announce_realm_presence::{
 };
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document_id,
+    mint_local_document,
 };
 use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::document_sync_outbox::read_outbox_records;
@@ -75,7 +75,7 @@ fn mint_local(
     group_id: Ulid,
     path: &str,
 ) -> Ulid {
-    mint_local_document_id(
+    mint_local_document(
         config,
         &Actor {
             node_id,
@@ -798,11 +798,12 @@ async fn batched_metadata_create_projection_materializes_many_documents()
     let mut events = Vec::new();
 
     for index in 0..8u8 {
-        let document_id = Ulid::generate();
+        let placement_seed = Ulid::generate();
         let now = unix_timestamp_millis().saturating_add(index.into());
         let document_path = format!("datasets/batch-{index}");
-        let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
-        let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: placement_seed,
+        };
         let (strategy, _) = strategy_for_target(
             &config,
             &target,
@@ -819,6 +820,13 @@ async fn batched_metadata_create_projection_materializes_many_documents()
             &subject_bytes(&target),
         )
         .expect("origin holds a bucket");
+        let document_id = MetaResourceId::try_from(
+            (1u128 << 60) | (u128::from(placement.shard) << 48) | u128::from(index + 1),
+        )
+        .unwrap()
+        .as_ulid();
+        let event_id = Ulid::generate();
+        let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
         let record = MetadataRegistryRecord {
             realm_id,
             group_id,
@@ -836,10 +844,11 @@ async fn batched_metadata_create_projection_materializes_many_documents()
             holder_node_ids: vec![node.net.node_id()],
             created_at_ms: now,
             updated_at_ms: now,
-            last_event_id: Ulid::nil(),
+            establishing_event_id: event_id,
+            last_event_id: event_id,
         };
         events.push(MetadataCreateEventRecord {
-            event_id: Ulid::generate(),
+            event_id,
             record,
             user_id: UserId::local(Ulid::generate(), realm_id),
             node_id: node.net.node_id(),
@@ -918,6 +927,7 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
         holder_node_ids: vec![nodes[0].net.node_id(), nodes[1].net.node_id()],
         created_at_ms: 1,
         updated_at_ms: 1,
+        establishing_event_id: event_id,
         last_event_id: event_id,
     };
     let create_event = MetadataCreateEventRecord {

@@ -20,10 +20,11 @@ use aruna_core::storage_entries::{
     metadata_event_log_key, metadata_graph_lifecycle_key, metadata_pending_projection_target,
 };
 use aruna_core::structs::{
-    AuthContext, MetadataRegistryRecord, Permission, RealmConfigDocument, RealmId,
+    AuthContext, MetadataRegistryRecord, PathClaimRecord, Permission, RealmConfigDocument, RealmId,
 };
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::GroupId;
+use aruna_core::{MetaResourceId, StructuredId};
 use futures_util::StreamExt;
 use futures_util::future::{BoxFuture, FutureExt};
 use futures_util::stream;
@@ -115,6 +116,7 @@ pub struct ListVisibleMetadataDocumentsRequest {
 #[derive(Debug, Clone)]
 pub struct ListedMetadataDocument {
     pub record: MetadataRegistryRecord,
+    pub path_conflicted: bool,
     pub rocrate_summary_jsonld: Option<String>,
 }
 
@@ -356,6 +358,7 @@ pub async fn list_visible_metadata_documents(
         }
         records.extend(group_records);
     }
+    let path_winners = path_winners(&records)?;
 
     // Ordering precedes both the estimate scan and the offset window so that
     // pagination and the early exit page the same sequence.
@@ -384,6 +387,17 @@ pub async fn list_visible_metadata_documents(
             .map(|record| record.group_id),
     )
     .await;
+    let visible_ids: HashSet<Ulid> = records
+        .iter()
+        .filter(|record| permissions.record_visible(record))
+        .map(|record| record.document_id)
+        .collect();
+    let record_visible = |record: &MetadataRegistryRecord| {
+        permissions.record_visible(record)
+            && path_winners
+                .get(&record.document_id)
+                .is_none_or(|winner_id| visible_ids.contains(winner_id))
+    };
 
     let mut total_estimate = None;
     if limit >= METADATA_ESTIMATE_MIN_LIMIT {
@@ -392,7 +406,7 @@ pub async fn list_visible_metadata_documents(
             .filter(|record| {
                 metadata_record_matches_filters(record, request.path_prefix.as_deref())
             })
-            .filter(|record| permissions.record_visible(record))
+            .filter(|record| record_visible(record))
             .count();
         total_estimate = Some(matching);
     }
@@ -404,7 +418,7 @@ pub async fn list_visible_metadata_documents(
         if !metadata_record_matches_filters(&record, request.path_prefix.as_deref()) {
             continue;
         }
-        if !permissions.record_visible(&record) {
+        if !record_visible(&record) {
             continue;
         }
         visible_count += 1;
@@ -442,12 +456,14 @@ pub async fn list_visible_metadata_documents(
                 Err(error) => return Err(error),
             };
             documents.push(ListedMetadataDocument {
+                path_conflicted: path_winners.contains_key(&record.document_id),
                 record,
                 rocrate_summary_jsonld,
             });
         }
     } else {
         documents.extend(selected.into_iter().map(|record| ListedMetadataDocument {
+            path_conflicted: path_winners.contains_key(&record.document_id),
             record,
             rocrate_summary_jsonld: None,
         }));
@@ -462,6 +478,45 @@ pub async fn list_visible_metadata_documents(
         // Never report fewer than the page already discloses.
         total_estimate: total_estimate.map(|estimate| estimate.max(total_returned)),
     })
+}
+
+fn path_winners(
+    records: &[MetadataRegistryRecord],
+) -> Result<HashMap<Ulid, Ulid>, MetadataApiError> {
+    let mut claims: HashMap<(RealmId, GroupId, String), Vec<PathClaimRecord>> = HashMap::new();
+    for record in records {
+        let document_id = MetaResourceId::from_bytes(record.document_id.to_bytes())
+            .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+        claims
+            .entry((
+                record.realm_id,
+                record.group_id,
+                record.document_path.clone(),
+            ))
+            .or_default()
+            .push(PathClaimRecord {
+                realm_id: record.realm_id,
+                group_id: record.group_id,
+                document_id,
+                establishing_event_id: record.establishing_event_id,
+                requested_path: record.document_path.clone(),
+            });
+    }
+
+    let mut winners = HashMap::new();
+    for resolution in claims
+        .values()
+        .filter_map(|claims| aruna_core::structs::resolve_path_claim(claims))
+    {
+        let winner_id = resolution.winner.document_id.as_ulid();
+        winners.extend(
+            resolution
+                .conflicts
+                .into_iter()
+                .map(|claim| (claim.document_id.as_ulid(), winner_id)),
+        );
+    }
+    Ok(winners)
 }
 
 pub async fn get_visible_metadata_document(
@@ -2389,6 +2444,7 @@ mod tests {
     use aruna_core::structs::{
         Actor, GroupAuthorizationDocument, PlacementRef, RealmAuthorizationDocument, Role,
     };
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::{Key, RoleId};
     use aruna_storage::storage;
     use tempfile::{TempDir, tempdir};
@@ -2433,6 +2489,15 @@ mod tests {
     }
 
     fn public_record(group_id: GroupId, document_id: Ulid) -> MetadataRegistryRecord {
+        let event_id = Ulid::generate();
+        let document_id = MetaResourceId::from_parts(
+            document_id.timestamp_ms(),
+            PlacementHandle::new(1).unwrap(),
+            BucketId::new(0).unwrap(),
+            document_id.0 as u64 & ((1_u64 << 48) - 1),
+        )
+        .unwrap()
+        .as_ulid();
         MetadataRegistryRecord {
             realm_id: TEST_REALM_ID,
             group_id,
@@ -2450,7 +2515,8 @@ mod tests {
             holder_node_ids: Vec::new(),
             created_at_ms: 1,
             updated_at_ms: 1,
-            last_event_id: Ulid::generate(),
+            establishing_event_id: event_id,
+            last_event_id: event_id,
         }
     }
 
@@ -2717,6 +2783,59 @@ mod tests {
         assert_eq!(result.documents.len(), 1);
         assert_eq!(result.documents[0].record.document_id, readable.document_id);
         assert_eq!(result.total_estimate, Some(1));
+    }
+
+    #[tokio::test]
+    async fn private_winner_hidden() {
+        let test = metadata_test();
+        let group_id = Ulid::generate();
+        let mut first = public_record(group_id, Ulid::generate());
+        let mut second = public_record(group_id, Ulid::generate());
+        let winners = path_winners(&[first.clone(), second.clone()]).unwrap();
+        let (&loser_id, &winner_id) = winners.iter().next().unwrap();
+        first.last_event_id = Ulid::generate();
+        second.last_event_id = Ulid::generate();
+        assert_eq!(
+            path_winners(&[first.clone(), second.clone()]).unwrap(),
+            winners
+        );
+        first.public = first.document_id == loser_id;
+        second.public = second.document_id == loser_id;
+        seed_registry_cache(&test, &first).await;
+        seed_registry_cache(&test, &second).await;
+
+        let hidden = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            summary_request(group_id, false),
+        )
+        .await
+        .unwrap();
+        assert!(hidden.documents.is_empty());
+
+        if first.document_id == winner_id {
+            first.public = true;
+            seed_registry_cache(&test, &first).await;
+        } else {
+            second.public = true;
+            seed_registry_cache(&test, &second).await;
+        }
+        let visible = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            summary_request(group_id, false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(visible.documents.len(), 2);
+        assert_eq!(
+            visible
+                .documents
+                .iter()
+                .filter(|document| document.path_conflicted)
+                .count(),
+            1
+        );
     }
 
     fn auth_for(user_id: UserId) -> AuthContext {
@@ -3230,6 +3349,7 @@ mod tests {
             holder_node_ids: vec![stale_node_id],
             created_at_ms: 0,
             updated_at_ms: 0,
+            establishing_event_id: Ulid::nil(),
             last_event_id: Ulid::nil(),
         };
 

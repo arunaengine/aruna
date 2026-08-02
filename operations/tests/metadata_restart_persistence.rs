@@ -14,7 +14,7 @@ use aruna_core::metadata::{MetadataEffect, MetadataEvent};
 use aruna_core::structs::{Actor, RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document_id,
+    mint_local_document,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_metadata_document::GetMetadataDocumentOperation;
@@ -115,8 +115,7 @@ async fn create_and_materialize_document(
     config: &RealmConfigDocument,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let document_id =
-        mint_local_document_id(config, &actor, group_id(), "datasets/restart-persistence")?
-            .as_ulid();
+        mint_local_document(config, &actor, group_id(), "datasets/restart-persistence")?.as_ulid();
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
             actor,

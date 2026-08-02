@@ -20,7 +20,7 @@ use aruna_operations::announce_realm_presence::{
 };
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document_id,
+    mint_local_document,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_metadata_document::GetMetadataDocumentOperation;
@@ -463,7 +463,7 @@ async fn run_writer(
             user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
         };
-        let document_id = mint_local_document_id(&config, &actor, group_id, &document_path)
+        let document_id = mint_local_document(&config, &actor, group_id, &document_path)
             .map_err(|error| format!("mint failed writer={writer} index={index}: {error:?}"))?
             .as_ulid();
         let payload = if index % 2 == 0 {

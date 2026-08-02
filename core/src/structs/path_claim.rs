@@ -1,14 +1,6 @@
 //! Deterministic metadata path claims (spec 6.3.6, DEC-PATH, #416).
-//!
-//! Path uniqueness is NOT enforced at commit time: two authorized creates for
-//! one normalized path both commit, each keeping its own unique
-//! `MetaResourceId`. Instead every committed claim is retained and a single
-//! deterministic winner is served under the path; the losers are surfaced as an
-//! authorized conflict list under that same path. The winner is a pure function
-//! of the retained candidate set: arrival time, wall-clock, event ULID order,
-//! and serving node are never inputs, so every causally complete holder
-//! converges on the same winner. Mirrors the binding conflict register's
-//! order-independence, but resolves a winner rather than failing closed.
+//! Every committed claim is retained; the lowest digest over its stable record
+//! and establishing event identity wins independently of arrival order.
 
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -39,9 +31,7 @@ pub struct PathClaimRecord {
 }
 
 impl PathClaimRecord {
-    /// The domain-separated winner digest over `(path, document_id, event id)`.
-    /// Deliberately excludes any arrival/wall-clock/serving-node input so the
-    /// order-independence and cross-node convergence hold.
+    /// The domain-separated digest over path, document, and establishing event.
     fn winner_digest(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(PATH_CLAIM_WINNER_DOMAIN);
@@ -51,9 +41,7 @@ impl PathClaimRecord {
         *hasher.finalize().as_bytes()
     }
 
-    /// Total order over candidates: lowest winner digest wins, tie-broken by the
-    /// document id then the establishing event id so the order is total even on
-    /// an (astronomically unlikely) digest collision.
+    /// Total order over candidates, with identity tie-breakers for digest collisions.
     fn winner_order(&self) -> ([u8; 32], u128, u128) {
         (
             self.winner_digest(),
@@ -83,23 +71,12 @@ impl PathResolution {
     }
 }
 
-/// Reduces a causally closed candidate set for one normalized path to its
-/// deterministic winner and retained conflicts. `None` for an empty set.
-///
-/// Duplicate claims (same document id, e.g. an idempotent create retry or a
-/// re-delivered event) collapse to one candidate: a retry never adds a rival.
-/// The result is invariant under the input order, so two nodes holding the same
-/// claim set produce the same winner and conflict list.
+/// Resolves a causally closed claim set, retaining the lowest event per document.
+/// Returns `None` for an empty set and is invariant under input order.
 pub fn resolve_path_claim(claims: &[PathClaimRecord]) -> Option<PathResolution> {
-    let mut deduped: Vec<PathClaimRecord> = Vec::with_capacity(claims.len());
-    for claim in claims {
-        if !deduped
-            .iter()
-            .any(|kept| kept.document_id == claim.document_id)
-        {
-            deduped.push(claim.clone());
-        }
-    }
+    let mut deduped = claims.to_vec();
+    deduped.sort_by_key(|claim| (claim.document_id, claim.establishing_event_id));
+    deduped.dedup_by_key(|claim| claim.document_id);
     deduped.sort_by_key(|claim| claim.winner_order());
     let mut ordered = deduped.into_iter();
     let winner = ordered.next()?;
@@ -124,12 +101,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_has_no_winner() {
+    fn empty_has_none() {
         assert_eq!(resolve_path_claim(&[]), None);
     }
 
     #[test]
-    fn single_claim_wins_uncontested() {
+    fn single_claim_wins() {
         let resolution = resolve_path_claim(&[claim(10, 11, "datasets/x")]).unwrap();
         assert_eq!(
             resolution.winner_id(),
@@ -139,7 +116,7 @@ mod tests {
     }
 
     #[test]
-    fn winner_is_order_independent() {
+    fn winner_ignores_order() {
         // Same candidate set in every permutation resolves to the same winner
         // and the same conflict set: convergent regardless of arrival order.
         let a = claim(10, 40, "datasets/x");
@@ -154,7 +131,19 @@ mod tests {
     }
 
     #[test]
-    fn loser_is_retained_as_conflict() {
+    fn duplicate_uses_lowest() {
+        let low = claim(10, 40, "datasets/x");
+        let high = claim(10, 99, "datasets/x");
+        let forward = resolve_path_claim(&[high.clone(), low.clone()]).unwrap();
+        let reverse = resolve_path_claim(&[low.clone(), high]).unwrap();
+
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.winner, low);
+        assert!(forward.conflicts.is_empty());
+    }
+
+    #[test]
+    fn loser_is_retained() {
         let a = claim(10, 40, "datasets/x");
         let b = claim(20, 41, "datasets/x");
         let resolution = resolve_path_claim(&[a.clone(), b.clone()]).unwrap();
@@ -169,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_claim_never_adds_a_rival() {
+    fn duplicate_claim_collapses() {
         // An idempotent retry / re-delivered event for the same id collapses.
         let a = claim(10, 40, "datasets/x");
         let resolution = resolve_path_claim(&[a.clone(), a.clone(), a]).unwrap();
@@ -177,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn repathing_the_loser_clears_the_conflict() {
+    fn repathing_clears_conflict() {
         let a = claim(10, 40, "datasets/x");
         let b = claim(20, 41, "datasets/x");
         let contested = resolve_path_claim(&[a.clone(), b.clone()]).unwrap();

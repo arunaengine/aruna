@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{
     AdminDocumentApplyStatus, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
@@ -30,8 +31,9 @@ use aruna_core::id::short_display_id;
 use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
     DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, GROUP_OWNER_INDEX_KEYSPACE,
-    METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
+    METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+    NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE,
+    USER_SUBJECT_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
@@ -40,19 +42,21 @@ use aruna_core::metadata::{
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, document_sync_revision_key,
-    document_sync_revision_write_entry, metadata_create_event_and_pending_projection_write_entries,
-    metadata_document_lifecycle_key, metadata_document_lifecycle_write_entry,
-    metadata_graph_lifecycle_key, metadata_graph_lifecycle_write_entry,
-    metadata_graph_prune_job_write_entry, metadata_registry_delete_entries,
-    metadata_registry_write_entries, shard_manifest_write_entry,
+    document_sync_revision_write_entry, metadata_create_acceptance_key,
+    metadata_create_acceptance_write_entry,
+    metadata_create_event_and_pending_projection_write_entries, metadata_document_lifecycle_key,
+    metadata_document_lifecycle_write_entry, metadata_graph_lifecycle_key,
+    metadata_graph_lifecycle_write_entry, metadata_graph_prune_job_write_entry,
+    metadata_registry_delete_entries, metadata_registry_write_entries, shard_manifest_write_entry,
     stale_admin_document_conflict_delete_entries, subject_index_key, subject_index_value,
 };
 use aruna_core::structs::{
-    Group, GroupAuthorizationDocument, MetadataRegistryRecord, NOTIFICATION_WATCH_MAX_PREFIX_LEN,
-    NodeInfoDocument, NodeUsageSnapshot, PlacementRef, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId, RealmNodeKind, Role, User, WatchEventMask, WatchInterestDigest,
-    WatchSubscription, group_owner_index_key, node_usage_key_node_id, reserved_label,
-    watch_interest_dirty_key, watch_interest_key_node_id, watch_interest_key_realm_id,
+    BindingError, DocumentClass, Group, GroupAuthorizationDocument, MetadataRegistryRecord,
+    NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument, NodeUsageSnapshot, PlacementRef,
+    PlacementScope, RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, Role,
+    User, WatchEventMask, WatchInterestDigest, WatchSubscription, group_owner_index_key,
+    node_usage_key_node_id, reserved_label, watch_interest_dirty_key, watch_interest_key_node_id,
+    watch_interest_key_realm_id,
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::{RoleId, TxnId, UserId, Value};
@@ -2586,6 +2590,15 @@ impl DocumentSyncService {
         }
         let mut candidates = Vec::with_capacity(pending.len());
         for apply in pending {
+            if let Err(error) = validate_metadata_event(&apply.record) {
+                warn!(
+                    topic_id = %apply.topic_id,
+                    document_id = %apply.record.record.document_id,
+                    %error,
+                    "Rejecting replicated metadata event with inconsistent identity"
+                );
+                continue;
+            }
             if self.metadata_create_fenced(&apply.record).await? {
                 continue;
             }
@@ -2617,6 +2630,12 @@ impl DocumentSyncService {
                 *value = ByteView::from(apply.bytes.clone());
             }
             entries.extend(event_entries);
+            if event_is_create(&apply.record) {
+                entries.push(
+                    metadata_create_acceptance_write_entry(&apply.record)
+                        .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+                );
+            }
             candidates.push((apply, entries));
         }
 
@@ -2624,6 +2643,7 @@ impl DocumentSyncService {
         let mut writes = Vec::with_capacity(candidates.len() * 3 + cursor_writes.len());
         let mut accepted = Vec::with_capacity(candidates.len());
         let mut accepted_candidates = Vec::with_capacity(candidates.len());
+        let mut create_acceptances: BTreeMap<Ulid, MetadataCreateEventRecord> = BTreeMap::new();
         let mut deferred_cursor_topics = BTreeSet::new();
         for (apply, entries) in candidates {
             match metadata_placement_fence_in_transaction(
@@ -2673,12 +2693,90 @@ impl DocumentSyncService {
                     return Err(error);
                 }
             };
+            let document_id = apply.record.record.document_id;
+            let accepted_create = if let Some(event) = create_acceptances.get(&document_id) {
+                Some(event.clone())
+            } else {
+                let value = match storage_read_from_transaction(
+                    &self.storage,
+                    METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+                    metadata_create_acceptance_key(document_id),
+                    Some(txn_id),
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = self
+                            .storage
+                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                            .await;
+                        return Err(error);
+                    }
+                };
+                let event = match value
+                    .as_deref()
+                    .map(postcard::from_bytes::<MetadataCreateEventRecord>)
+                    .transpose()
+                {
+                    Ok(event) => event,
+                    Err(error) => {
+                        let _ = self
+                            .storage
+                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                            .await;
+                        return Err(NetError::Bootstrap(error.to_string()));
+                    }
+                };
+                if let Some(event) = &event {
+                    if !event_is_create(event) {
+                        let _ = self
+                            .storage
+                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                            .await;
+                        return Err(NetError::Bootstrap(
+                            "metadata create acceptance contains a non-create event".to_string(),
+                        ));
+                    }
+                    if let Err(error) = validate_metadata_event(event) {
+                        let _ = self
+                            .storage
+                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                            .await;
+                        return Err(error);
+                    }
+                    create_acceptances.insert(document_id, event.clone());
+                }
+                event
+            };
+            if event_is_create(&apply.record) {
+                if accepted_create
+                    .as_ref()
+                    .is_some_and(|accepted| !same_create_event(accepted, &apply.record))
+                {
+                    warn!(
+                        topic_id = %apply.topic_id,
+                        %document_id,
+                        "Rejecting divergent replicated metadata create"
+                    );
+                    continue;
+                }
+                create_acceptances
+                    .entry(document_id)
+                    .or_insert_with(|| apply.record.clone());
+            } else if accepted_create.as_ref().is_none_or(|accepted| {
+                !registry_identity_matches(&accepted.record, &apply.record.record)
+            }) {
+                warn!(
+                    topic_id = %apply.topic_id,
+                    %document_id,
+                    "Rejecting replicated metadata update without a matching accepted create"
+                );
+                continue;
+            }
             accepted_candidates.push((apply, entries));
         }
         for (apply, entries) in accepted_candidates {
-            if deferred_cursor_topics.contains(&apply.topic_id) {
-                continue;
-            }
             writes.extend(entries);
             accepted.push(apply);
         }
@@ -2744,6 +2842,7 @@ impl DocumentSyncService {
                     record.record.document_id, record.event_id
                 )));
             }
+            validate_metadata_event(&record)?;
             if self.metadata_create_fenced(&record).await? {
                 return Ok(());
             }
@@ -3269,6 +3368,9 @@ async fn apply_metadata_registry_upsert_to_storage(
     record: MetadataRegistryRecord,
     primary_bytes: Vec<u8>,
 ) -> Result<MetadataPlacementOutcome<()>> {
+    if !registry_identity_valid(&record) {
+        return Ok(MetadataPlacementOutcome::Rejected);
+    }
     if metadata_graph_deleted_in_storage(storage, &record.graph_iri).await? {
         storage_batch_delete_to(
             storage,
@@ -3338,6 +3440,24 @@ async fn apply_metadata_registry_upsert_to_storage(
                 return Err(NetError::Bootstrap(error.to_string()));
             }
         };
+        if existing.is_none()
+            && (record.last_event_id != record.establishing_event_id
+                || record.updated_at_ms != record.created_at_ms)
+        {
+            let _ = storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Ok(MetadataPlacementOutcome::Rejected);
+        }
+        if existing
+            .as_ref()
+            .is_some_and(|existing| !registry_identity_matches(existing, &record))
+        {
+            let _ = storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Ok(MetadataPlacementOutcome::Rejected);
+        }
         if existing
             .as_ref()
             .is_some_and(|existing| incoming_metadata_registry_stale_or_equal(existing, &record))
@@ -4336,10 +4456,11 @@ async fn metadata_document_lifecycle_write_entries_if_current(
     if incoming_metadata_document_lifecycle_stale_or_equal(storage, &target, change).await? {
         return Ok(None);
     }
-    if let MetadataDocumentLifecycleRecord::Upsert { event } = record
-        && metadata_create_fenced_in_storage(storage, event).await?
-    {
-        return Ok(None);
+    if let MetadataDocumentLifecycleRecord::Upsert { event } = record {
+        validate_metadata_event(event)?;
+        if metadata_create_fenced_in_storage(storage, event).await? {
+            return Ok(None);
+        }
     }
 
     let mut entries = match record {
@@ -4387,6 +4508,70 @@ fn incoming_metadata_registry_stale_or_equal(
     incoming: &MetadataRegistryRecord,
 ) -> bool {
     metadata_registry_freshness(incoming) <= metadata_registry_freshness(existing)
+}
+
+fn registry_identity_matches(
+    existing: &MetadataRegistryRecord,
+    incoming: &MetadataRegistryRecord,
+) -> bool {
+    existing.realm_id == incoming.realm_id
+        && existing.group_id == incoming.group_id
+        && existing.document_id == incoming.document_id
+        && existing.document_path == incoming.document_path
+        && existing.graph_iri == incoming.graph_iri
+        && existing.permission_path == incoming.permission_path
+        && existing.placement == incoming.placement
+        && existing.created_at_ms == incoming.created_at_ms
+        && existing.establishing_event_id == incoming.establishing_event_id
+}
+
+fn registry_identity_valid(record: &MetadataRegistryRecord) -> bool {
+    let normalized_path = MetadataRegistryRecord::normalize_document_path(&record.document_path);
+    record.establishing_event_id != Ulid::nil()
+        && record.document_path == normalized_path
+        && record.graph_iri == MetadataRegistryRecord::graph_iri_for(record.document_id)
+        && record.permission_path
+            == MetadataRegistryRecord::permission_path_for(
+                &record.realm_id,
+                record.group_id,
+                &normalized_path,
+                record.document_id,
+            )
+}
+
+fn validate_metadata_event(event: &MetadataCreateEventRecord) -> Result<()> {
+    if !registry_identity_valid(&event.record)
+        || event.record.last_event_id != event.event_id
+        || event_is_create(event) && event.record.establishing_event_id != event.event_id
+    {
+        return Err(NetError::Bootstrap(
+            "replicated metadata event has inconsistent event identity".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn event_is_create(event: &MetadataCreateEventRecord) -> bool {
+    matches!(
+        &event.payload,
+        aruna_core::metadata::MetadataCreateEventPayload::Scaffold { .. }
+            | aruna_core::metadata::MetadataCreateEventPayload::RoCrate { .. }
+    )
+}
+
+fn same_create_event(
+    accepted: &MetadataCreateEventRecord,
+    incoming: &MetadataCreateEventRecord,
+) -> bool {
+    accepted.event_id == incoming.event_id
+        && registry_identity_matches(&accepted.record, &incoming.record)
+        && accepted.record.public == incoming.record.public
+        && accepted.record.updated_at_ms == incoming.record.updated_at_ms
+        && accepted.record.last_event_id == incoming.record.last_event_id
+        && accepted.user_id == incoming.user_id
+        && accepted.node_id == incoming.node_id
+        && accepted.payload == incoming.payload
+        && accepted.occurred_at_ms == incoming.occurred_at_ms
 }
 
 fn metadata_registry_freshness(record: &MetadataRegistryRecord) -> (u64, Ulid) {
@@ -4453,7 +4638,7 @@ async fn metadata_placement_fence_in_transaction(
         realm_id: record.realm_id,
         strategy_id: record.placement.strategy_id,
     };
-    if record.placement != PlacementRef::NIL && record.placement.strategy_id.is_nil() {
+    if record.placement == PlacementRef::NIL || record.placement.strategy_id.is_nil() {
         return Ok(MetadataPlacementOutcome::Rejected);
     }
     let target = DocumentSyncTarget::RealmConfig {
@@ -4467,21 +4652,51 @@ async fn metadata_placement_fence_in_transaction(
     )
     .await?;
     let Some(value) = value else {
-        return if record.placement == PlacementRef::NIL {
-            Ok(MetadataPlacementOutcome::Accepted(MetadataPlacementFence))
-        } else {
-            Ok(MetadataPlacementOutcome::Deferred(dependency))
-        };
+        return Ok(MetadataPlacementOutcome::Deferred(
+            DocumentSyncDependency::RealmConfig(record.realm_id),
+        ));
     };
     let config = RealmConfigDocument::from_bytes(&value)
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
     if config.realm_id != record.realm_id {
         return Ok(MetadataPlacementOutcome::Rejected);
     }
-    if record.placement != PlacementRef::NIL
-        && config.strategy(&record.placement.strategy_id).is_none()
+    let id = match MetaResourceId::from_bytes(record.document_id.to_bytes()) {
+        Ok(id) => id,
+        Err(_) => return Ok(MetadataPlacementOutcome::Rejected),
+    };
+    let resolved = match config.binding_directory().resolve_id(&id, |strategy_id| {
+        config
+            .strategy(&strategy_id)
+            .and_then(|strategy| u16::try_from(strategy.shard_count).ok())
+    }) {
+        Ok(resolved) => resolved,
+        Err(BindingError::UnknownStrategy(_)) => {
+            return Ok(MetadataPlacementOutcome::Deferred(dependency));
+        }
+        Err(BindingError::Unknown(_)) => {
+            return Ok(MetadataPlacementOutcome::Deferred(
+                DocumentSyncDependency::RealmConfig(record.realm_id),
+            ));
+        }
+        Err(BindingError::Conflicted(_) | BindingError::BucketOutOfRange(_)) => {
+            return Ok(MetadataPlacementOutcome::Rejected);
+        }
+    };
+    let scope_matches = match resolved.scope {
+        PlacementScope::Realm(realm_id) => realm_id == record.realm_id,
+        PlacementScope::Group(group_id) => group_id == record.group_id,
+    };
+    let derived = PlacementRef {
+        strategy_id: resolved.strategy_id,
+        epoch: 0,
+        shard: u32::from(resolved.bucket.get()),
+    };
+    if resolved.document_class != DocumentClass::Metadata
+        || !scope_matches
+        || derived != record.placement
     {
-        return Ok(MetadataPlacementOutcome::Deferred(dependency));
+        return Ok(MetadataPlacementOutcome::Rejected);
     }
     Ok(MetadataPlacementOutcome::Accepted(MetadataPlacementFence))
 }
@@ -5097,8 +5312,8 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
-        | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
-        | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. } => {}
+        | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. } => {}
+        AdminDocumentOperation::RealmConfigHandleRangeGranted { .. } => {}
         AdminDocumentOperation::RealmConfigNodePlacementSet { entry } => {
             if let Some(label) = reserved_label(&entry.labels) {
                 return reject(&format!(
@@ -5224,18 +5439,37 @@ async fn validate_realm_config_admin_authority(
                 "stored realm config has the wrong realm".to_string(),
             ));
         }
+        let server_binding = match (
+            configured_node_kind(config, &event.origin_node_id),
+            &event.op,
+        ) {
+            (
+                Some(RealmNodeKind::Server),
+                AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding },
+            ) => {
+                binding.allocated_by == Some(event.origin_node_id)
+                    && binding.has_valid_provenance(&config.handle_range_directory())
+            }
+            _ => false,
+        };
+        if matches!(
+            configured_node_kind(config, &event.origin_node_id),
+            Some(RealmNodeKind::Management)
+        ) && matches!(
+            &event.op,
+            AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding }
+                if !binding.has_valid_provenance(&config.handle_range_directory())
+        ) {
+            return Ok(AdminEventValidation::Rejected(
+                "placement binding provenance is invalid".to_string(),
+            ));
+        }
         return Ok(
             if matches!(
-                (
-                    configured_node_kind(config, &event.origin_node_id),
-                    &event.op
-                ),
-                (Some(RealmNodeKind::Management), _)
-                    | (
-                        Some(RealmNodeKind::Server),
-                        AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
-                    )
-            ) {
+                configured_node_kind(config, &event.origin_node_id),
+                Some(RealmNodeKind::Management)
+            ) || server_binding
+            {
                 AdminEventValidation::Accepted
             } else {
                 AdminEventValidation::Rejected(
@@ -6130,7 +6364,6 @@ fn peer_id_to_endpoint_addr(peer_id: PeerId) -> Result<iroh::EndpointAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::admin_document_reducer::REALM_CONFIG_DEFAULT_STRATEGY_PATH;
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation,
@@ -6140,25 +6373,27 @@ mod tests {
     use aruna_core::document::{DocumentSyncChangeKind, DocumentSyncRevision};
     use aruna_core::keyspaces::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE,
-        DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
-        METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
-        METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
-        METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, USER_KEYSPACE,
-        USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
+        DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+        METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
+        METADATA_GRAPH_PRUNE_JOB_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+        USER_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
     };
     use aruna_core::metadata::MetadataCreateEventPayload;
     use aruna_core::storage_entries::{
         admin_document_reducer_conflict_key, admin_document_reducer_state_key,
-        metadata_document_key, metadata_event_log_key, metadata_registry_key, subject_index_key,
-        subject_index_value,
+        metadata_create_acceptance_key, metadata_document_key, metadata_event_log_key,
+        metadata_registry_key, subject_index_key, subject_index_value,
     };
     use aruna_core::structs::{
         Actor, BindingScope, DocumentClass, Group, GroupAuthorizationDocument, GroupQuotaOverride,
-        MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
-        PlacementOverride, PlacementRef, PlacementStrategy, QuotaConfig,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
-        RealmNodeKind, Role, StaticRealmEndpoint, StrategyBinding, UserGroupCapOverride,
+        METADATA_HANDLE, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig,
+        Permission, PlacementBinding, PlacementOverride, PlacementRef, PlacementStrategy,
+        QuotaConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig,
+        RealmId, RealmNodeKind, Role, StaticRealmEndpoint, StrategyBinding, UserGroupCapOverride,
     };
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
+    use aruna_core::{MetaResourceId, StructuredId, UserId};
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::{env, process::Command};
     use tempfile::TempDir;
@@ -6316,6 +6551,7 @@ mod tests {
             holder_node_ids: vec![node(1)],
             created_at_ms: 1,
             updated_at_ms,
+            establishing_event_id: last_event_id,
             last_event_id,
         }
     }
@@ -10073,8 +10309,19 @@ mod tests {
         );
         assert_eq!(actor.node_id, local_node);
 
+        let strategy_id = Ulid::from_parts(2_111, 1);
+        let handle = PlacementHandle::new(METADATA_HANDLE).unwrap();
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         config.ensure_node(local_node, RealmNodeKind::Management);
+        config.placement_bindings.push(PlacementBinding {
+            handle,
+            scope: PlacementScope::Realm(realm_id),
+            document_class: DocumentClass::Metadata,
+            strategy_id,
+            allocator_range_id: None,
+            allocated_by: None,
+            allocated_at_ms: None,
+        });
         let config_target = DocumentSyncTarget::RealmConfig { realm_id };
         storage_batch_write_to(
             &storage,
@@ -10090,7 +10337,7 @@ mod tests {
         .expect("realm config writes");
 
         let strategy = PlacementStrategy {
-            strategy_id: Ulid::from_parts(2_111, 1),
+            strategy_id,
             name: "deferred".to_string(),
             replica_count: Some(1),
             distinct_locations: false,
@@ -10103,7 +10350,14 @@ mod tests {
             shard: 4,
         };
         let group_id = Ulid::from_parts(2_112, 1);
-        let document_id = Ulid::from_parts(2_113, 1);
+        let document_id = MetaResourceId::from_parts(
+            2_113,
+            handle,
+            BucketId::new(placement.shard as u16).unwrap(),
+            1,
+        )
+        .unwrap()
+        .as_ulid();
         let create_event_id = Ulid::from_parts(2_114, 1);
         let mut record = registry_record(
             group_id,
@@ -10290,6 +10544,18 @@ mod tests {
                 .expect("create event decodes"),
             create
         );
+        let acceptance = read_storage_value(
+            &storage,
+            METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+            metadata_create_acceptance_key(document_id),
+        )
+        .await
+        .expect("create acceptance exists");
+        assert_eq!(
+            postcard::from_bytes::<MetadataCreateEventRecord>(&acceptance)
+                .expect("create acceptance decodes"),
+            create
+        );
         let applied_cursor: irokle_crate::ActorClock = postcard::from_bytes(
             &read_storage_value(
                 &storage,
@@ -10308,6 +10574,108 @@ mod tests {
                 .expect("accepted metadata is idempotent")
                 .metadata_create_events
                 .is_empty()
+        );
+
+        let update_event_id = Ulid::from_parts(2_118, 1);
+        let mut update = create.clone();
+        update.event_id = update_event_id;
+        update.record.updated_at_ms = 200;
+        update.record.last_event_id = update_event_id;
+        update.payload = MetadataCreateEventPayload::ReplaceRoCrate {
+            jsonld: "{}".to_string(),
+        };
+        update.occurred_at_ms = 200;
+        let update_target = DocumentSyncTarget::MetadataCreateEvent {
+            document_id,
+            event_id: update_event_id,
+        };
+        let published = service
+            .publish_documents(
+                vec![DocumentSyncPublish::Upsert {
+                    event_id: update_event_id,
+                    target: update_target,
+                    bytes: postcard::to_allocvec(&update).expect("update serializes"),
+                    change: change(update_event_id),
+                    allow_genesis: true,
+                }],
+                Vec::new(),
+            )
+            .await;
+        assert!(matches!(
+            published,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+        service
+            .reconcile_document_topics([metadata_topic])
+            .await
+            .expect("metadata update reconciles");
+        let acceptance = read_storage_value(
+            &storage,
+            METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+            metadata_create_acceptance_key(document_id),
+        )
+        .await
+        .expect("create acceptance remains");
+        assert_eq!(
+            postcard::from_bytes::<MetadataCreateEventRecord>(&acceptance).unwrap(),
+            create
+        );
+
+        let divergent_id = Ulid::from_parts(2_119, 1);
+        let mut divergent = create.clone();
+        divergent.event_id = divergent_id;
+        divergent.record.establishing_event_id = divergent_id;
+        divergent.record.last_event_id = divergent_id;
+        let divergent_target = DocumentSyncTarget::MetadataCreateEvent {
+            document_id,
+            event_id: divergent_id,
+        };
+        service
+            .publish_documents(
+                vec![DocumentSyncPublish::Upsert {
+                    event_id: divergent_id,
+                    target: divergent_target,
+                    bytes: postcard::to_allocvec(&divergent).expect("create serializes"),
+                    change: change(divergent_id),
+                    allow_genesis: true,
+                }],
+                Vec::new(),
+            )
+            .await;
+        let rejected = service
+            .reconcile_document_topics([metadata_topic])
+            .await
+            .expect("divergent create is rejected");
+        assert!(rejected.metadata_create_events.is_empty());
+        let acceptance = read_storage_value(
+            &storage,
+            METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+            metadata_create_acceptance_key(document_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            postcard::from_bytes::<MetadataCreateEventRecord>(&acceptance).unwrap(),
+            create
+        );
+        let cursor: irokle_crate::ActorClock = postcard::from_bytes(
+            &read_storage_value(
+                &storage,
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+                topic_cursor_key(metadata_topic),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            cursor.dominates(
+                &service
+                    .node()
+                    .storage()
+                    .actor_clock(&metadata_topic)
+                    .unwrap()
+            )
         );
 
         service.shutdown().await;
@@ -10607,69 +10975,6 @@ mod tests {
         assert_eq!(primary, record);
         assert_eq!(document_index, record);
         assert_eq!(holders, record.holder_node_ids);
-    }
-
-    #[tokio::test]
-    async fn metadata_registry_delete_with_matching_lifecycle_tombstone_deletes_indexes() {
-        let (_dir, storage) = test_storage();
-        let group_id = Ulid::from_parts(40, 1);
-        let document_id = Ulid::from_parts(41, 1);
-        let record = registry_record(
-            group_id,
-            document_id,
-            "datasets/deleted",
-            100,
-            Ulid::from_parts(42, 1),
-        );
-        write_registry_record(&storage, &record).await;
-        let lifecycle = metadata_delete_lifecycle(
-            group_id,
-            document_id,
-            200,
-            Ulid::from_parts(43, 1),
-            record.last_event_id,
-        );
-        storage_batch_write_to(
-            &storage,
-            vec![
-                metadata_document_lifecycle_write_entry(&lifecycle)
-                    .expect("lifecycle entry builds"),
-            ],
-        )
-        .await
-        .expect("lifecycle tombstone writes");
-
-        apply_metadata_registry_delete_to_storage(&storage, group_id, document_id)
-            .await
-            .expect("registry delete applies with tombstone");
-
-        assert!(
-            read_storage_value(
-                &storage,
-                METADATA_INDEX_KEYSPACE,
-                metadata_registry_key(group_id, document_id),
-            )
-            .await
-            .is_none()
-        );
-        assert!(
-            read_storage_value(
-                &storage,
-                METADATA_DOCUMENT_INDEX_KEYSPACE,
-                metadata_document_key(document_id),
-            )
-            .await
-            .is_none()
-        );
-        assert!(
-            read_storage_value(
-                &storage,
-                METADATA_HOLDERS_KEYSPACE,
-                metadata_registry_key(group_id, document_id),
-            )
-            .await
-            .is_none()
-        );
     }
 
     #[tokio::test]

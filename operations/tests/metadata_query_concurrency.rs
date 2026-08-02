@@ -91,6 +91,7 @@ fn registry_record(
         holder_node_ids: Vec::new(),
         created_at_ms: 0,
         updated_at_ms: 0,
+        establishing_event_id: Ulid::nil(),
         last_event_id: Ulid::nil(),
     }
 }
@@ -307,6 +308,7 @@ fn visibility_record(group_id: GroupId, path: &str, public: bool) -> MetadataReg
         holder_node_ids: Vec::new(),
         created_at_ms: 0,
         updated_at_ms: 0,
+        establishing_event_id: Ulid::nil(),
         last_event_id: Ulid::nil(),
     }
 }

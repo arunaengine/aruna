@@ -15,7 +15,7 @@ use aruna_core::StructuredId;
 use aruna_core::metadata::MetadataError;
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_forward_document_id, mint_local_document_id,
+    mint_forward_document, mint_local_document,
 };
 use aruna_operations::driver::drive;
 use aruna_operations::get_metadata_document::{
@@ -92,7 +92,7 @@ async fn create_stamps_origin() -> TestResult<()> {
     let path = "datasets/stamped-by-origin";
     let origin = realm.node(0);
     let document_id =
-        mint_local_document_id(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
     let expected = realm
         .origin_placement(origin, group_id, document_id, path)
         .expect("a Management node holds buckets");
@@ -143,7 +143,7 @@ async fn read_misses_nonholder() -> TestResult<()> {
     let path = "datasets/read-off-holders";
     let origin = realm.node(0);
     let document_id =
-        mint_local_document_id(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
     let placement = create_document(&realm, origin, group_id, document_id, path).await?;
     let holders = realm.assert_holder(origin.node_id(), &placement);
 
@@ -203,7 +203,7 @@ async fn bystander_writes_forward() -> TestResult<()> {
     let path = "datasets/bystander-writes";
     let origin = realm.node(0);
     let document_id =
-        mint_local_document_id(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
     let placement = create_document(&realm, origin, group_id, document_id, path).await?;
     let holders = realm.assert_holder(origin.node_id(), &placement);
     for holder in &holders {
@@ -302,7 +302,7 @@ async fn user_create_forwards() -> TestResult<()> {
     let path = "datasets/forwarded-by-user";
     let user = realm.user_node();
     let document_id =
-        mint_forward_document_id(&realm.config, &realm.actor(user), group_id, path)?.as_ulid();
+        mint_forward_document(&realm.config, &realm.actor(user), group_id, path)?.as_ulid();
     assert_eq!(
         realm.origin_placement(user, group_id, document_id, path),
         None

@@ -19,7 +19,7 @@ use aruna_operations::announce_realm_presence::{
 };
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document_id,
+    mint_local_document,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
@@ -137,7 +137,7 @@ async fn new_holder_verifies_shard_against_co_holder() -> Result<(), Box<dyn std
         realm_id,
     };
     let document_id =
-        mint_local_document_id(&config, &actor, group_id, "datasets/verify-canary")?.as_ulid();
+        mint_local_document(&config, &actor, group_id, "datasets/verify-canary")?.as_ulid();
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {

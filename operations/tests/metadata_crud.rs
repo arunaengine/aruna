@@ -26,7 +26,7 @@ use aruna_core::structs::{
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload, mint_local_document_id,
+    CreateMetadataDocumentPayload, mint_local_document,
 };
 use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::driver::{DriverContext, drive};
@@ -66,7 +66,7 @@ struct TestContext {
 async fn lost_response_retries() -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
     let group_id = Ulid::generate();
-    let document_id = mint_local_document_id(
+    let document_id = mint_local_document(
         &test.config,
         &test.actor,
         group_id,
@@ -169,7 +169,7 @@ impl TestContext {
 async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context().await?;
     let group_id = Ulid::generate();
-    let document_id = mint_local_document_id(
+    let document_id = mint_local_document(
         &test.config,
         &test.actor,
         group_id,
@@ -328,7 +328,7 @@ async fn generated_metadata_create_foreground_storage_effect_count_is_reduced()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
     let group_id = Ulid::generate();
-    let document_id = mint_local_document_id(
+    let document_id = mint_local_document(
         &test.config,
         &test.actor,
         group_id,
@@ -402,6 +402,7 @@ async fn metadata_event_log_replay_repairs_wal_only_create()
         holder_node_ids: vec![test.actor.node_id],
         created_at_ms: 1,
         updated_at_ms: 1,
+        establishing_event_id: event_id,
         last_event_id: event_id,
     };
     let create_event = MetadataCreateEventRecord {
@@ -797,6 +798,7 @@ fn build_create_event(
         holder_node_ids: vec![test.actor.node_id],
         created_at_ms: 1,
         updated_at_ms: 1,
+        establishing_event_id: event_id,
         last_event_id: event_id,
     };
     let event = MetadataCreateEventRecord {

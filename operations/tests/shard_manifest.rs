@@ -17,7 +17,7 @@ use aruna_operations::announce_realm_presence::{
 };
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document_id,
+    mint_local_document,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
@@ -53,7 +53,7 @@ async fn document_manifest_row_lands_on_origin_and_receiver_with_matching_digest
         realm_id,
     };
     let document_id =
-        mint_local_document_id(&config, &actor, group_id, "datasets/manifest-canary")?.as_ulid();
+        mint_local_document(&config, &actor, group_id, "datasets/manifest-canary")?.as_ulid();
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {

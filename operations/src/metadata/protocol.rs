@@ -1,6 +1,6 @@
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
-use aruna_core::structs::{MetadataRegistryRecord, RealmId, SyncRelationship};
-use aruna_core::types::{GroupId, UserId};
+use aruna_core::structs::{AuthContext, MetadataRegistryRecord, SyncRelationship};
+use aruna_core::types::GroupId;
 use aruna_net::streams::BiStream;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
@@ -17,7 +17,7 @@ pub const MAX_METADATA_BEARER_TOKEN_LEN: usize = 4096;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetadataAuthToken {
     Bearer(MetadataBearerToken),
-    Internal { user_id: UserId, realm_id: RealmId },
+    Internal(AuthContext),
 }
 
 impl MetadataAuthToken {
@@ -25,8 +25,8 @@ impl MetadataAuthToken {
         MetadataBearerToken::new(token).map(Self::Bearer)
     }
 
-    pub fn internal(user_id: UserId, realm_id: RealmId) -> Self {
-        Self::Internal { user_id, realm_id }
+    pub fn internal(auth: AuthContext) -> Self {
+        Self::Internal(auth)
     }
 }
 
@@ -158,6 +158,21 @@ pub enum MetadataTransportMessage {
     },
     SyncMirrorCreated,
     SyncMirrorDeleted,
+    ForwardReadDocument {
+        auth_token: Option<MetadataAuthToken>,
+        document_id: Ulid,
+    },
+    ForwardedRead {
+        result: Result<Box<MetadataRegistryRecord>, MetadataReadError>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataReadError {
+    Unauthorized,
+    Forbidden,
+    NotFound,
+    Unavailable,
 }
 
 pub async fn write_message(
@@ -219,6 +234,8 @@ pub async fn read_message(stream: &mut BiStream) -> Result<MetadataTransportMess
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::structs::{PathRestriction, Permission, RealmId};
+    use aruna_core::types::UserId;
 
     #[test]
     fn transport_messages_use_auth_token_fields() {
@@ -345,6 +362,26 @@ mod tests {
             panic!("expected bearer token");
         };
         assert_eq!(bearer.as_str(), "bearer-token");
+    }
+
+    #[test]
+    fn internal_auth_roundtrip() {
+        let realm_id = RealmId([7; 32]);
+        let auth = AuthContext {
+            user_id: UserId::new(Ulid::from_bytes([8; 16]), realm_id),
+            realm_id,
+            path_restrictions: Some(vec![PathRestriction {
+                pattern: format!("/{realm_id}/g/**"),
+                permission: Permission::READ,
+            }]),
+        };
+        let token = MetadataAuthToken::internal(auth);
+        let bytes = postcard::to_allocvec(&token).unwrap();
+
+        assert_eq!(
+            postcard::from_bytes::<MetadataAuthToken>(&bytes).unwrap(),
+            token
+        );
     }
 
     #[test]

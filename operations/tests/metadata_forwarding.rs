@@ -26,7 +26,7 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_forward_document_id, mint_local_document_id,
+    mint_forward_document, mint_local_document,
 };
 use aruna_operations::document_sync_outbox::{
     new_outbox_record, outbox_key, read_outbox_record, schedule_outbox_drain_effect,
@@ -382,7 +382,7 @@ async fn nonholder_resolves_document() -> Result<(), Box<dyn std::error::Error>>
         realm_id: realm.realm_id,
     };
     let document_id =
-        mint_local_document_id(&config, &actor, group_id, "datasets/nonholder")?.as_ulid();
+        mint_local_document(&config, &actor, group_id, "datasets/nonholder")?.as_ulid();
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
@@ -612,7 +612,7 @@ fn forward_id(
     group_id: Ulid,
     path: &str,
 ) -> Result<Ulid, Box<dyn std::error::Error>> {
-    Ok(mint_forward_document_id(
+    Ok(mint_forward_document(
         config,
         &Actor {
             node_id: node.net.node_id(),

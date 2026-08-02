@@ -19,7 +19,7 @@ use aruna_operations::announce_realm_presence::{
 };
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document_id,
+    mint_local_document,
 };
 use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::driver::{DriverContext, drive};
@@ -82,7 +82,7 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
                 user_id: UserId::local(Ulid::generate(), realm_id),
                 realm_id,
             };
-            mint_local_document_id(&config, &actor, group_id, CONVERGE_PATH).map(|id| id.as_ulid())
+            mint_local_document(&config, &actor, group_id, CONVERGE_PATH).map(|id| id.as_ulid())
         })
         .collect::<Result<Vec<_>, _>>()?;
 

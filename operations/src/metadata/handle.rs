@@ -1310,7 +1310,8 @@ impl MetadataHandle {
             }
             forward @ (MetadataTransportMessage::ForwardCreateDocument { .. }
             | MetadataTransportMessage::ForwardUpdateDocument { .. }
-            | MetadataTransportMessage::ForwardDeleteDocument { .. }) => {
+            | MetadataTransportMessage::ForwardDeleteDocument { .. }
+            | MetadataTransportMessage::ForwardReadDocument { .. }) => {
                 super::forward::apply_forwarded_write(context, peer, forward).await
             }
             MetadataTransportMessage::QueryResults { .. }
@@ -1319,6 +1320,7 @@ impl MetadataHandle {
             | MetadataTransportMessage::SyncMirrorCreated
             | MetadataTransportMessage::SyncMirrorDeleted
             | MetadataTransportMessage::ForwardedRecord { .. }
+            | MetadataTransportMessage::ForwardedRead { .. }
             | MetadataTransportMessage::ForwardedDelete
             | MetadataTransportMessage::ForwardedUpdateInvalidInput { .. }
             | MetadataTransportMessage::Reject(_) => {
@@ -1996,34 +1998,31 @@ async fn authorize_remote_metadata_peer<S>(
 where
     S: ArunaBearerTokenValidationState + ?Sized,
 {
-    let internal_auth = matches!(&auth_token, Some(MetadataAuthToken::Internal { .. }));
+    let internal_auth = matches!(&auth_token, Some(MetadataAuthToken::Internal(_)));
     let auth_context = match auth_token {
-        Some(MetadataAuthToken::Internal { user_id, realm_id }) if allow_internal => {
+        Some(MetadataAuthToken::Internal(auth)) if allow_internal => {
             let local_realm_id = local_realm_id.ok_or_else(|| {
                 MetadataError::InvalidInput(
                     "internal metadata auth requires a local serving realm".to_string(),
                 )
             })?;
-            if realm_id != local_realm_id {
+            if auth.realm_id != local_realm_id {
                 return Err(MetadataError::InvalidInput(format!(
-                    "internal metadata auth realm `{realm_id}` does not match local realm `{local_realm_id}`"
+                    "internal metadata auth realm `{}` does not match local realm `{local_realm_id}`",
+                    auth.realm_id
                 )));
             }
-            if user_id.realm_id != realm_id {
+            if auth.user_id.realm_id != auth.realm_id {
                 return Err(MetadataError::InvalidInput(format!(
-                    "internal metadata auth user realm `{}` does not match token realm `{realm_id}`",
-                    user_id.realm_id
+                    "internal metadata auth user realm `{}` does not match token realm `{}`",
+                    auth.user_id.realm_id, auth.realm_id
                 )));
             }
-            Some(AuthContext {
-                user_id,
-                realm_id,
-                path_restrictions: None,
-            })
+            Some(auth)
         }
-        Some(MetadataAuthToken::Internal { .. }) => {
+        Some(MetadataAuthToken::Internal(_)) => {
             return Err(MetadataError::Backend(
-                "internal metadata auth is limited to forwarded writes".to_string(),
+                "internal metadata auth is limited to forwarded requests".to_string(),
             ));
         }
         auth_token => remote_metadata_auth_context(state, auth_token).await?,
@@ -3786,7 +3785,9 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardCreateDocument { .. } => "forward_create_document",
         MetadataTransportMessage::ForwardUpdateDocument { .. } => "forward_update_document",
         MetadataTransportMessage::ForwardDeleteDocument { .. } => "forward_delete_document",
+        MetadataTransportMessage::ForwardReadDocument { .. } => "forward_read_document",
         MetadataTransportMessage::ForwardedRecord { .. } => "forwarded_record",
+        MetadataTransportMessage::ForwardedRead { .. } => "forwarded_read",
         MetadataTransportMessage::ForwardedDelete => "forwarded_delete",
         MetadataTransportMessage::Reject(_) => "reject",
         MetadataTransportMessage::ForwardedUpdateInvalidInput { .. } => {
@@ -6059,6 +6060,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_auth_preserves() {
+        let realm_id = RealmId([13; 32]);
+        let peer = node_id_from_seed(14);
+        let user_id = UserId::new(Ulid::from_bytes([15; 16]), realm_id);
+        let restrictions = vec![PathRestriction {
+            pattern: format!("/{realm_id}/g/**"),
+            permission: Permission::READ,
+        }];
+        let expected = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: Some(restrictions),
+        };
+        let (_dir, storage) = auth_storage();
+        persist_realm_config(&storage, realm_id, &[peer]).await;
+
+        let auth = authorize_remote_metadata_peer(
+            &MetadataAuthValidationState::new(storage.clone()),
+            &storage,
+            peer,
+            Some(realm_id),
+            Some(MetadataAuthToken::internal(expected.clone())),
+            true,
+        )
+        .await
+        .expect("internal peer accepted");
+
+        assert_eq!(auth, Some(expected));
+    }
+
+    #[tokio::test]
     async fn bad_bucket_token() {
         let (_dir, storage) = auth_storage();
         let realm_id = RealmId([17u8; 32]);
@@ -6374,6 +6406,7 @@ mod tests {
             holder_node_ids: Vec::new(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            establishing_event_id: Ulid::nil(),
             last_event_id: Ulid::nil(),
         }
     }

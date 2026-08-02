@@ -15,7 +15,7 @@ use aruna_core::types::GroupId;
 use aruna_core::{StructuredId, UserId};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document_id,
+    mint_local_document,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
@@ -129,8 +129,7 @@ async fn run_writer(
     let mut batch = Vec::new();
     for index in 0..PER_WRITER {
         let document_path = format!("datasets/probe-{writer}-{index}");
-        let document_id =
-            mint_local_document_id(&config, &actor, group_id, &document_path)?.as_ulid();
+        let document_id = mint_local_document(&config, &actor, group_id, &document_path)?.as_ulid();
         let payload = if index % 2 == 0 {
             scaffold_payload(writer, index)
         } else {

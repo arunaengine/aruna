@@ -206,6 +206,7 @@ mod tests {
                 holder_node_ids: Vec::new(),
                 created_at_ms: now,
                 updated_at_ms: now,
+                establishing_event_id: Ulid::nil(),
                 last_event_id: Ulid::nil(),
             };
             let event = storage_handle
@@ -372,6 +373,7 @@ mod tests {
             holder_node_ids: Vec::new(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            establishing_event_id: Ulid::nil(),
             last_event_id: Ulid::nil(),
         }
     }

@@ -238,12 +238,7 @@ macro_rules! structured_id_newtype {
         }
 
         impl $name {
-            /// Reconstructs an id from its 16 big-endian bytes (the inverse of
-            /// [`StructuredId::to_bytes`]), rejecting the reserved zero handle.
-            /// This is the explicit, fallible entry used to decode a structured
-            /// id back out of a storage key and to build fixed ids in tests; it
-            /// deliberately validates so no unstructured/zero-handle value can
-            /// re-enter as a document id.
+            /// Reconstructs validated structured-id bytes, rejecting handle zero.
             pub fn from_bytes(bytes: [u8; 16]) -> Result<Self, FieldError> {
                 Self::try_from(u128::from_be_bytes(bytes))
             }
@@ -425,8 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_ulid_distinguishable() {
-        // A structured id always carries a non-zero handle and round-trips.
+    fn plain_ulid_rejected() {
         let structured = MetaResourceId::from_parts(
             1,
             PlacementHandle::new(42).unwrap(),
@@ -437,27 +431,19 @@ mod tests {
         assert_ne!(structured.placement_handle().get(), 0);
         assert!(MetaResourceId::parse(&structured.to_string()).is_ok());
 
-        // A generic ULID does not preserve the structured fields: a zero handle
-        // is rejected on parse, and a bucket outside a small bucket_count is
-        // flagged by validation.
-        let bucket_count = 8u16;
-        let mut flagged = 0;
-        for _ in 0..512 {
-            let generic = Ulid::generate();
-            let fields = layout::unpack(generic.0);
-            match MetaResourceId::parse(&generic.to_string()) {
-                Err(ParseError::ReservedHandle) => assert_eq!(fields.handle, 0),
-                Ok(parsed) => {
-                    assert_ne!(fields.handle, 0);
-                    if fields.bucket >= bucket_count {
-                        assert!(parsed.validate_bucket(bucket_count).is_err());
-                        flagged += 1;
-                    }
-                }
-                Err(other) => panic!("unexpected parse error: {other:?}"),
-            }
-        }
-        assert!(flagged > 0);
+        let plain = Ulid::from_parts(1, 0);
+        assert_eq!(
+            MetaResourceId::parse(&plain.to_string()),
+            Err(ParseError::ReservedHandle)
+        );
+        let out_of_range = MetaResourceId::from_parts(
+            1,
+            PlacementHandle::new(42).unwrap(),
+            BucketId::new(8).unwrap(),
+            9,
+        )
+        .unwrap();
+        assert!(out_of_range.validate_bucket(8).is_err());
     }
 
     #[test]
@@ -506,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn serde_bytes_match_raw_ulid() {
+    fn serde_matches_ulid() {
         // The typed id must serialize to the exact same bytes a raw `Ulid` would,
         // so migrating a `document_id` field never changes the on-the-wire or
         // on-disk record layout (postcard is the record codec; JSON the API one).
