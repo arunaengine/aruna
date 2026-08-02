@@ -3440,15 +3440,6 @@ async fn apply_metadata_registry_upsert_to_storage(
                 return Err(NetError::Bootstrap(error.to_string()));
             }
         };
-        if existing.is_none()
-            && (record.last_event_id != record.establishing_event_id
-                || record.updated_at_ms != record.created_at_ms)
-        {
-            let _ = storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
-            return Ok(MetadataPlacementOutcome::Rejected);
-        }
         if existing
             .as_ref()
             .is_some_and(|existing| !registry_identity_matches(existing, &record))
@@ -9979,18 +9970,32 @@ mod tests {
         // must not write it back: an identical write only conflicts the config's
         // readers, which is how inbound sync used to stall concurrent creates.
         let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([42; 32]);
         let group_id = Ulid::from_parts(2_130, 1);
-        let document_id = Ulid::from_parts(2_131, 1);
-        let record = registry_record(
+        let actor = test_actor(1, UserId::nil(realm_id), realm_id);
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.seed_default_placement();
+        let placement = PlacementRef {
+            strategy_id: config.default_strategy_id.unwrap(),
+            epoch: 0,
+            shard: 4,
+        };
+        let document_id = MetaResourceId::from_parts(
+            2_131,
+            PlacementHandle::new(METADATA_HANDLE).unwrap(),
+            BucketId::new(placement.shard as u16).unwrap(),
+            1,
+        )
+        .unwrap()
+        .as_ulid();
+        let mut record = registry_record(
             group_id,
             document_id,
             "datasets/config-untouched",
             100,
             Ulid::from_parts(2_132, 1),
         );
-        let actor = test_actor(1, UserId::nil(record.realm_id), record.realm_id);
-        let mut config = RealmConfigDocument::default_for_realm(record.realm_id, Vec::new());
-        config.seed_default_placement();
+        record.placement = placement;
         let config_target = DocumentSyncTarget::RealmConfig {
             realm_id: record.realm_id,
         };
@@ -10055,8 +10060,19 @@ mod tests {
         );
         assert_eq!(actor.node_id, local_node);
 
+        let strategy_id = Ulid::from_parts(2_121, 1);
+        let handle = PlacementHandle::new(METADATA_HANDLE).unwrap();
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         config.ensure_node(local_node, RealmNodeKind::Management);
+        config.placement_bindings.push(PlacementBinding {
+            handle,
+            scope: PlacementScope::Realm(realm_id),
+            document_class: DocumentClass::Metadata,
+            strategy_id,
+            allocator_range_id: None,
+            allocated_by: None,
+            allocated_at_ms: None,
+        });
         storage_batch_write_to(
             &storage,
             vec![target_write_entry(
@@ -10070,7 +10086,6 @@ mod tests {
         .await
         .expect("realm config writes");
 
-        let strategy_id = Ulid::from_parts(2_121, 1);
         assert!(config.strategy(&strategy_id).is_none());
         let registry_placement = PlacementRef {
             strategy_id,
@@ -10083,7 +10098,14 @@ mod tests {
             shard: 5,
         };
         let registry_group_id = Ulid::from_parts(2_122, 1);
-        let registry_document_id = Ulid::from_parts(2_123, 1);
+        let registry_document_id = MetaResourceId::from_parts(
+            2_123,
+            handle,
+            BucketId::new(registry_placement.shard as u16).unwrap(),
+            1,
+        )
+        .unwrap()
+        .as_ulid();
         let registry_event_id = Ulid::from_parts(2_124, 1);
         let mut registry = registry_record(
             registry_group_id,
@@ -10099,7 +10121,14 @@ mod tests {
         };
 
         let create_group_id = Ulid::from_parts(2_125, 1);
-        let create_document_id = Ulid::from_parts(2_126, 1);
+        let create_document_id = MetaResourceId::from_parts(
+            2_126,
+            handle,
+            BucketId::new(create_placement.shard as u16).unwrap(),
+            1,
+        )
+        .unwrap()
+        .as_ulid();
         let create_event_id = Ulid::from_parts(2_127, 1);
         let mut create = metadata_create_event(
             create_group_id,
