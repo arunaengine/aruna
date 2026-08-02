@@ -101,6 +101,7 @@ impl CreateRealmOperation {
         let realm_id = self.config.actor.realm_id;
         let mut config_doc =
             RealmConfigDocument::default_for_realm(realm_id, self.config.oidc_providers.clone());
+        config_doc.handle_allocator_node_id = Some(self.config.actor.node_id);
         config_doc.description = self.config.realm_description.clone();
         config_doc.ensure_node(self.config.actor.node_id, RealmNodeKind::Management);
         seed_placement_defaults(&mut config_doc);
@@ -171,6 +172,12 @@ impl CreateRealmOperation {
             },
         )?;
         let mut config_events = vec![config_node_event];
+        config_events.push(config_state.apply_operation(
+            &self.config.actor,
+            AdminDocumentOperation::RealmConfigHandleAllocatorSet {
+                node_id: self.config.actor.node_id,
+            },
+        )?);
         let mut oidc_providers = self.config.oidc_providers.clone();
         oidc_providers.sort_by(|left, right| left.id.cmp(&right.id));
         for provider in oidc_providers {
