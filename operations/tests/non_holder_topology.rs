@@ -32,6 +32,10 @@ use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, read_job_routed, read_owned_job, submit_execution_job,
 };
+use aruna_core::metadata::MetadataQueryResults;
+use aruna_operations::metadata::api::{
+    MetadataApiQueryMode, MetadataDocumentQueryRequest, query_metadata_document,
+};
 use aruna_operations::metadata::forward::{
     create_metadata_document_routed, delete_metadata_document_routed, origin_holds_document,
     update_metadata_document_routed,
@@ -427,6 +431,58 @@ async fn bystander_writes_forward() -> TestResult<()> {
         })
         .await?;
     }
+
+    realm.shutdown().await;
+    Ok(())
+}
+
+// A per-document SPARQL query arriving at a non-holder must route to a holder
+// rather than fail on a graph the bystander never materialized.
+#[tokio::test]
+async fn document_sparql_routes() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+
+    let group_id = Ulid::from_bytes([61; 16]);
+    let path = "datasets/sparql-routes";
+    let origin = realm.node(0);
+    let document_id =
+        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    let placement = create_document(&realm, origin, group_id, document_id, path).await?;
+    let holders = realm.assert_holder(origin.node_id(), &placement);
+    for holder in &holders {
+        let node = realm.find(*holder);
+        wait_until("document reaches holder", node.node_id(), || {
+            document_present(node, group_id, document_id)
+        })
+        .await?;
+    }
+
+    let bystander = realm.non_holder(&placement);
+    wait_until(
+        "registry row reaches non-holder",
+        bystander.node_id(),
+        || registry_row_present(bystander, document_id),
+    )
+    .await?;
+
+    let execution = query_metadata_document(
+        bystander.context.as_ref(),
+        realm.realm_id,
+        bystander.node_id(),
+        MetadataDocumentQueryRequest {
+            document_id,
+            auth: None,
+            bearer_token: Some(realm.bearer_string()),
+            query: "ASK { ?s ?p ?o }".to_string(),
+            mode: Some(MetadataApiQueryMode::Distributed),
+            allow_partial: false,
+        },
+    )
+    .await?;
+    assert!(
+        matches!(execution.results, MetadataQueryResults::Boolean(true)),
+        "non-holder query did not route to a holder graph"
+    );
 
     realm.shutdown().await;
     Ok(())

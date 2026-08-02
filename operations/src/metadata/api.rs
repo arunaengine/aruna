@@ -1041,11 +1041,18 @@ pub async fn query_metadata_document(
     ensure_supported_query_form(&request.query)?;
     let record = load_record_by_document(context, request.document_id).await?;
     ensure_record_readable(context, realm_id, request.auth.as_ref(), &record).await?;
-    ensure_record_materialized_for_graph_read(context, &record).await?;
     let config = load_realm_config(context, realm_id).await;
+    let holders = document_replica_query_nodes(config.as_ref(), &record, local_node_id);
+    // A non-holder routes the read to the document's holders instead of
+    // materializing a graph it does not carry.
+    let mode = if holders.contains(&local_node_id) {
+        ensure_record_materialized_for_graph_read(context, &record).await?;
+        request.mode
+    } else {
+        Some(MetadataApiQueryMode::Distributed)
+    };
     let discovery_failed = context.net_handle.is_some()
-        && request.mode.unwrap_or(MetadataApiQueryMode::Distributed)
-            == MetadataApiQueryMode::Distributed
+        && mode.unwrap_or(MetadataApiQueryMode::Distributed) == MetadataApiQueryMode::Distributed
         && config.is_none();
     if discovery_failed && !request.allow_partial {
         return Err(MetadataApiError::ServiceUnavailable);
@@ -1060,12 +1067,8 @@ pub async fn query_metadata_document(
             bearer_token: request.bearer_token,
             graph_iris: Some(vec![record.graph_iri.clone()]),
             query: request.query,
-            mode: request.mode,
-            target_nodes: Some(document_replica_query_nodes(
-                config.as_ref(),
-                &record,
-                local_node_id,
-            )),
+            mode,
+            target_nodes: Some(holders),
             allow_partial: request.allow_partial,
         },
     )

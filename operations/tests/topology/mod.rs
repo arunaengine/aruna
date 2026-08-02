@@ -190,6 +190,12 @@ impl Topology {
     /// A bearer token for [`Topology::user_id`], signed by the realm key that the
     /// realm id is. A holder re-validates this before applying a forwarded write.
     pub fn bearer_token(&self) -> MetadataAuthToken {
+        MetadataAuthToken::bearer(self.bearer_string()).expect("token is within the length bound")
+    }
+
+    /// The raw signed JWT backing [`Topology::bearer_token`], for callers that pass
+    /// a bearer string rather than a [`MetadataAuthToken`].
+    pub fn bearer_string(&self) -> String {
         let now = chrono::Utc::now().timestamp().max(0) as u64;
         let claims = TokenClaims {
             sub: self.user_id.to_string(),
@@ -205,13 +211,12 @@ impl Topology {
             .signing_key
             .to_pkcs8_pem(LineEnding::LF)
             .expect("realm key encodes");
-        let token = encode(
+        encode(
             &Header::new(Algorithm::EdDSA),
             &claims,
             &EncodingKey::from_ed_pem(key_pem.as_bytes()).expect("realm key is an ed25519 key"),
         )
-        .expect("token signs");
-        MetadataAuthToken::bearer(token).expect("token is within the length bound")
+        .expect("token signs")
     }
 
     /// A group owned by [`Topology::user_id`], replicated to every sync-eligible
