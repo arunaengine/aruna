@@ -2498,17 +2498,18 @@ mod tests {
         )
         .unwrap()
         .as_ulid();
+        let document_path = format!("datasets/cached/{document_id}");
         MetadataRegistryRecord {
             realm_id: TEST_REALM_ID,
             group_id,
             document_id,
-            document_path: "datasets/cached".to_string(),
+            document_path: document_path.clone(),
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
             public: true,
             permission_path: MetadataRegistryRecord::permission_path_for(
                 &TEST_REALM_ID,
                 group_id,
-                "datasets/cached",
+                &document_path,
                 document_id,
             ),
             placement: PlacementRef::NIL,
@@ -2791,6 +2792,13 @@ mod tests {
         let group_id = Ulid::generate();
         let mut first = public_record(group_id, Ulid::generate());
         let mut second = public_record(group_id, Ulid::generate());
+        second.document_path = first.document_path.clone();
+        second.permission_path = MetadataRegistryRecord::permission_path_for(
+            &TEST_REALM_ID,
+            group_id,
+            &second.document_path,
+            second.document_id,
+        );
         let winners = path_winners(&[first.clone(), second.clone()]).unwrap();
         let (&loser_id, &winner_id) = winners.iter().next().unwrap();
         first.last_event_id = Ulid::generate();
