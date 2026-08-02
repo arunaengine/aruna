@@ -1,13 +1,5 @@
-//! Derived handle-range directory and the node-local allocation cursor.
-//!
-//! Coordinator grants ([`HandleRange`]) are replicated realm config, immutable
-//! and append-only. The [`HandleRangeDirectory`] is each node's derived view over
-//! that set: it fails closed when two grants overlap (both converge to
-//! `Conflicted` on every node, independent of arrival order, because the verdict
-//! is a pure function of the set). The [`HandleAllocationCursor`] is the opposite
-//! kind of state — durable, node-local, never replicated — tracking the next
-//! unused handle inside a node's own granted ranges so a restart never re-issues
-//! a spent handle.
+//! Fail-closed directory over replicated handle grants plus the node-local
+//! durable allocation cursor. Overlapping grants never become allocatable.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -78,10 +70,14 @@ impl HandleRangeDirectory {
         ranges
     }
 
-    /// The start of the next range a coordinator should grant: one past the
-    /// highest end already carved out (conflicted grants included, so a bad
-    /// overlap is never re-granted), or [`FIRST_GRANTABLE_HANDLE`] when nothing
-    /// is granted, keeping grants clear of the reserved default-binding band.
+    pub fn owned_range(&self, range_id: &Ulid, owner: &NodeId) -> Option<HandleRange> {
+        self.by_id
+            .get(range_id)
+            .copied()
+            .filter(|range| range.owner == *owner && !self.conflicted.contains(&range.range_id))
+    }
+
+    /// Next ungranted start, including conflicted ranges in the occupied span.
     pub fn next_grantable_start(&self) -> u32 {
         self.by_id
             .values()
@@ -153,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn disjoint_grants_are_usable() {
+    fn disjoint_grants_work() {
         let owner = node(1);
         let ranges = [range(1, owner, 1, 1025), range(2, owner, 1025, 2049)];
         let directory = HandleRangeDirectory::from_ranges(&ranges);
@@ -163,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_grants_fail_closed() {
+    fn overlap_fails_closed() {
         let owner = node(1);
         let ranges = [range(1, owner, 1, 1025), range(2, owner, 512, 2049)];
         let directory = HandleRangeDirectory::from_ranges(&ranges);
@@ -175,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_walks_ranges_and_skips_gaps() {
+    fn cursor_skips_gaps() {
         let owner = node(1);
         let low = range(1, owner, 3, 5);
         let high = range(2, owner, 2049, 2051);
@@ -191,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_reload_does_not_reuse() {
+    fn cursor_avoids_reuse() {
         let owner = node(1);
         let ranges = [range(1, owner, 1, HANDLE_RANGE_SIZE + 1)];
         let mut cursor = HandleAllocationCursor::new();
@@ -204,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn full_space_last_range_is_bounded() {
+    fn last_range_bounded() {
         let owner = node(1);
         let last = range(1, owner, HANDLE_SPACE_END - 1, HANDLE_SPACE_END);
         let mut cursor = HandleAllocationCursor { next: last.start };

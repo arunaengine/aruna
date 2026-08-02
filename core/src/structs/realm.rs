@@ -159,16 +159,10 @@ pub struct RealmConfigDocument {
     pub default_strategy_id: Option<Ulid>,
     pub strategy_bindings: Vec<StrategyBinding>,
     pub placement_overrides: Vec<PlacementOverride>,
-    /// Append-only Placement Binding set, replicated across nodes via the
-    /// `RealmConfigPlacementBindingAppended` admin operation and materialized by
-    /// the reducer overlay. The reducer/overlay is the sole writer: divergent
-    /// same-handle bindings are all retained so the derived directory fails
-    /// closed as `Conflicted`.
+    /// Append-only bindings materialized by the reducer overlay. Divergent
+    /// same-handle values remain available to the fail-closed directory.
     pub placement_bindings: Vec<PlacementBinding>,
-    /// Append-only handle-range grants, replicated via the
-    /// `RealmConfigHandleRangeGranted` admin operation and materialized by the
-    /// reducer overlay. Overlapping grants are retained so the derived
-    /// [`HandleRangeDirectory`] fails them closed.
+    /// Append-only grants retained for fail-closed overlap detection.
     pub placement_handle_ranges: Vec<HandleRange>,
 }
 
@@ -430,10 +424,7 @@ impl RealmConfigDocument {
             strategy_id: everywhere_strategy.strategy_id,
         })
         .collect();
-        // Pre-provision the realm-scoped default bindings a shared create needs
-        // to mint a structured id (DEC-ONBOARD): metadata documents and
-        // job-control records occupy the reserved low band, so coordinator
-        // grants start at `FIRST_GRANTABLE_HANDLE`.
+        // Reserve low-band Metadata and JobControl bindings before grants begin.
         self.placement_bindings = vec![
             PlacementBinding {
                 handle: PlacementHandle::new(METADATA_HANDLE).expect("handle is allocatable"),
@@ -523,7 +514,7 @@ impl RealmConfigDocument {
 
     /// Rebuilds the derived Placement Binding Directory from the stored set.
     pub fn binding_directory(&self) -> BindingDirectory {
-        BindingDirectory::from_bindings(&self.placement_bindings)
+        BindingDirectory::from_parts(&self.placement_bindings, &self.handle_range_directory())
     }
 
     /// Rebuilds the derived Handle Range Directory from the granted set.
@@ -907,24 +898,32 @@ mod test {
     }
 
     #[test]
-    fn binding_directory_rebuilds_from_stored_set() {
-        use crate::structs::{DocumentClass, PlacementBinding, PlacementScope};
+    fn directory_rebuilds_state() {
+        use crate::structs::{DocumentClass, HandleRange, PlacementBinding, PlacementScope};
         use crate::structured_id::PlacementHandle;
 
-        fn binding(handle: u32, seed: u8) -> PlacementBinding {
+        let owner = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let range_id = Ulid::from_bytes([8; 16]);
+        fn binding(handle: u32, seed: u8, owner: NodeId, range_id: Ulid) -> PlacementBinding {
             PlacementBinding {
                 handle: PlacementHandle::new(handle).unwrap(),
                 scope: PlacementScope::Group(Ulid::from_bytes([seed; 16])),
                 document_class: DocumentClass::Metadata,
                 strategy_id: Ulid::from_bytes([seed.wrapping_add(1); 16]),
-                allocator_range_id: None,
-                allocated_by: None,
-                allocated_at_ms: None,
+                allocator_range_id: Some(range_id),
+                allocated_by: Some(owner),
+                allocated_at_ms: Some(1),
             }
         }
 
         let mut config = RealmConfigDocument::new(RealmId([2u8; 32]), Vec::new(), 3);
-        let first = binding(10, 1);
+        config.placement_handle_ranges.push(HandleRange {
+            range_id,
+            owner,
+            start: 3,
+            end: 20,
+        });
+        let first = binding(10, 1, owner, range_id);
         config.placement_bindings.push(first.clone());
 
         let directory = config.binding_directory();
@@ -934,8 +933,18 @@ mod test {
         );
         assert_eq!(directory.allocated(), 1);
 
+        let mut provenance_conflict = config.clone();
+        let mut divergent_provenance = first.clone();
+        divergent_provenance.allocated_at_ms = Some(2);
+        provenance_conflict
+            .placement_bindings
+            .push(divergent_provenance);
+        assert_eq!(provenance_conflict.binding_directory().conflicted(), 1);
+
         // A same-handle, different-tuple entry fails closed as conflicted.
-        config.placement_bindings.push(binding(10, 2));
+        config
+            .placement_bindings
+            .push(binding(10, 2, owner, range_id));
         assert!(config.binding_directory().resolve(first.handle).is_err());
         assert_eq!(config.binding_directory().conflicted(), 1);
     }

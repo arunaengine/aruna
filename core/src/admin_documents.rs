@@ -188,11 +188,8 @@ pub enum AdminDocumentOperation {
     RealmConfigPlacementBindingAppended {
         binding: PlacementBinding,
     },
-    /// Grants a disjoint handle-allocation range to a node (append-only, no
-    /// remove twin). Management-only admin op (K1, never relayed): the coordinator
-    /// role of carving up the handle space is not a binding append, so the Server
-    /// exception does not extend to it. Overlapping grants converge to a
-    /// fail-closed conflict in the derived range directory.
+    /// Grants an append-only handle range. Only Management may emit it;
+    /// overlapping grants fail closed in the derived directory.
     RealmConfigHandleRangeGranted {
         range: HandleRange,
     },

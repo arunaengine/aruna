@@ -200,6 +200,14 @@ impl CreateRealmOperation {
                 },
             )?);
         }
+        for binding in &config_doc.placement_bindings {
+            config_events.push(config_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                    binding: binding.clone(),
+                },
+            )?);
+        }
         if let Some(default_strategy_id) = config_doc.default_strategy_id {
             config_events.push(config_state.apply_operation(
                 &self.config.actor,
@@ -696,6 +704,7 @@ mod test {
         let seeded_strategies = config_doc.strategies.clone();
         let seeded_default_strategy_id = config_doc.default_strategy_id.unwrap();
         let seeded_bindings = config_doc.strategy_bindings.clone();
+        let seeded_placements = config_doc.placement_bindings.clone();
         assert_eq!(seeded_strategies.len(), 2);
         assert_eq!(seeded_strategies[0].name, "default");
         assert_eq!(seeded_strategies[0].replica_count, Some(3));
@@ -706,6 +715,7 @@ mod test {
             Some(seeded_strategies[0].strategy_id)
         );
         assert_eq!(seeded_bindings.len(), 4);
+        assert_eq!(seeded_placements.len(), 2);
         assert_eq!(
             config_state.materialized_realm_config_default_strategy(),
             Some(seeded_default_strategy_id)
@@ -722,13 +732,13 @@ mod test {
                 .len(),
             4
         );
+        assert_eq!(config_state.materialized_placement_bindings().len(), 2);
 
         let outbox_records = write_values(writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)
             .into_iter()
             .map(|value| postcard::from_bytes::<DocumentSyncOutboxRecord>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
-        // Two more than the strategies alone: the group and user class bindings.
-        assert_eq!(outbox_records.len(), 14);
+        assert_eq!(outbox_records.len(), 16);
         assert!(outbox_records.iter().any(|record| {
             record.target == DocumentSyncTarget::RealmAuthorization { realm_id }
                 && matches!(
@@ -809,36 +819,48 @@ mod test {
                 ),
                 (
                     8,
+                    AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                        binding: seeded_placements[0].clone(),
+                    },
+                ),
+                (
+                    9,
+                    AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                        binding: seeded_placements[1].clone(),
+                    },
+                ),
+                (
+                    10,
                     AdminDocumentOperation::RealmConfigDefaultStrategySet {
                         strategy_id: seeded_default_strategy_id,
                     },
                 ),
                 (
-                    9,
+                    11,
                     AdminDocumentOperation::RealmConfigStrategyBindingSet {
                         binding: seeded_bindings[0].clone(),
                     },
                 ),
                 (
-                    10,
+                    12,
                     AdminDocumentOperation::RealmConfigStrategyBindingSet {
                         binding: seeded_bindings[1].clone(),
                     },
                 ),
                 (
-                    11,
+                    13,
                     AdminDocumentOperation::RealmConfigStrategyBindingSet {
                         binding: seeded_bindings[2].clone(),
                     },
                 ),
                 (
-                    12,
+                    14,
                     AdminDocumentOperation::RealmConfigStrategyBindingSet {
                         binding: seeded_bindings[3].clone(),
                     },
                 ),
                 (
-                    13,
+                    15,
                     AdminDocumentOperation::RealmConfigNodePlacementSet {
                         entry: NodePlacementEntry {
                             node_id: actor.node_id,

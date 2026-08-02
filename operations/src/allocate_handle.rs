@@ -1,17 +1,8 @@
-//! Node-local placement-handle allocation (spec 6.3.4, layer 1).
-//!
-//! A node mints handles OFFLINE from the disjoint ranges a coordinator granted
-//! it (DEC-ONBOARD). The next-unused position is a durable, node-local cursor —
-//! never replicated: peers rely on non-overlapping grants, not on knowing this
-//! node's progress. The cursor is persisted BEFORE an allocation is acknowledged,
-//! so a crash can only ever skip a handle, never re-issue a spent one.
-//!
-//! This is the production handle source. The caller-supplied
-//! `AppendPlacementBinding` mutation stays for internal/test use; production
-//! bindings flow through [`allocate_placement_binding`], which stamps the three
-//! provenance fields mandatorily. Wiring allocation into document creation is
-//! layer 2 and deliberately not done here.
+//! Node-local placement-handle allocation from coordinator-granted ranges.
+//! The durable cursor is persisted before returning, so crashes may skip a
+//! handle but cannot reissue one.
 
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aruna_core::NodeId;
@@ -38,7 +29,7 @@ use crate::mutate_realm_placement::{
 /// Node-local key for the durable allocation cursor. Kept in the non-replicated
 /// node-state keyspace, one record per realm, distinct from the singleton
 /// `node_state` record.
-fn handle_allocation_cursor_key(realm_id: &RealmId) -> Key {
+fn allocation_cursor_key(realm_id: &RealmId) -> Key {
     let mut bytes = b"handle_allocation_cursor:".to_vec();
     bytes.extend_from_slice(realm_id.as_bytes());
     Key::from(bytes)
@@ -111,7 +102,7 @@ async fn read_cursor(
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: NODE_STATE_KEYSPACE.to_string(),
-            key: handle_allocation_cursor_key(&realm_id),
+            key: allocation_cursor_key(&realm_id),
             txn_id: None,
         })
         .await;
@@ -139,7 +130,7 @@ async fn persist_cursor(
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
             key_space: NODE_STATE_KEYSPACE.to_string(),
-            key: handle_allocation_cursor_key(&realm_id),
+            key: allocation_cursor_key(&realm_id),
             value: value.into(),
             txn_id: None,
         })
@@ -161,6 +152,7 @@ pub async fn allocate_handle(
     realm_id: RealmId,
     node_id: NodeId,
 ) -> Result<AllocatedHandle, HandleAllocationError> {
+    let _guard = allocation_lock().lock().await;
     let config = read_realm_config(context, realm_id).await?;
     let ranges = config.handle_range_directory().granted_to(&node_id);
     let mut cursor = read_cursor(context, realm_id).await?;
@@ -176,6 +168,11 @@ pub async fn allocate_handle(
         allocated_by: node_id,
         allocated_at_ms: now_ms(),
     })
+}
+
+fn allocation_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// Allocates a fresh handle for a `(scope, class, strategy)` and appends its
@@ -240,7 +237,7 @@ mod tests {
         }
     }
 
-    async fn seed_config_with_range(
+    async fn seed_range_config(
         context: &DriverContext,
         actor: &Actor,
         range: HandleRange,
@@ -278,12 +275,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allocation_advances_and_survives_restart() {
+    async fn allocation_survives_restart() {
         let temp = tempdir().unwrap();
         let context = context(temp.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([60; 32]);
         let actor = actor(realm_id);
-        seed_config_with_range(
+        seed_range_config(
             &context,
             &actor,
             range(
@@ -313,12 +310,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allocation_sets_all_provenance_fields() {
+    async fn concurrent_allocation_unique() {
+        let temp = tempdir().unwrap();
+        let context = context(temp.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([64; 32]);
+        let actor = actor(realm_id);
+        seed_range_config(
+            &context,
+            &actor,
+            range(
+                actor.node_id,
+                FIRST_GRANTABLE_HANDLE,
+                FIRST_GRANTABLE_HANDLE + 1024,
+            ),
+        )
+        .await;
+
+        let (left, right) = tokio::join!(
+            allocate_handle(&context, realm_id, actor.node_id),
+            allocate_handle(&context, realm_id, actor.node_id),
+        );
+        let left = left.unwrap();
+        let right = right.unwrap();
+        assert_ne!(left.handle, right.handle);
+        let mut handles = [left.handle.get(), right.handle.get()];
+        handles.sort_unstable();
+        assert_eq!(
+            handles,
+            [FIRST_GRANTABLE_HANDLE, FIRST_GRANTABLE_HANDLE + 1]
+        );
+    }
+
+    #[tokio::test]
+    async fn allocation_sets_provenance() {
         let temp = tempdir().unwrap();
         let context = context(temp.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([61; 32]);
         let actor = actor(realm_id);
-        let document = seed_config_with_range(
+        let document = seed_range_config(
             &context,
             &actor,
             range(
@@ -347,13 +376,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exhaustion_returns_placement_handle_exhausted() {
+    async fn exhaustion_returns_error() {
         let temp = tempdir().unwrap();
         let context = context(temp.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([62; 32]);
         let actor = actor(realm_id);
         // A single-handle range: one allocation succeeds, the next is exhausted.
-        seed_config_with_range(
+        seed_range_config(
             &context,
             &actor,
             range(
@@ -379,13 +408,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_granted_range_is_exhausted() {
+    async fn no_range_exhausted() {
         let temp = tempdir().unwrap();
         let context = context(temp.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([63; 32]);
         let actor = actor(realm_id);
         // A range owned by a different node grants this node nothing.
-        seed_config_with_range(&context, &actor, range(node(2), 1, 1025)).await;
+        seed_range_config(&context, &actor, range(node(2), 1, 1025)).await;
 
         assert!(matches!(
             allocate_handle(&context, realm_id, actor.node_id).await,

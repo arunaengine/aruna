@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{
     AdminDocumentReducerError, AdminDocumentReducerState,
@@ -20,10 +22,10 @@ use aruna_core::storage_entries::{
     stale_admin_document_conflict_delete_entries,
 };
 use aruna_core::structs::{
-    Actor, BindingError, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, HANDLE_RANGE_SIZE,
-    HANDLE_SPACE_END, HandleRange, MetadataRegistryRecord, NodePlacementEntry, PlacementBinding,
-    PlacementOverride, PlacementRef, PlacementScope, PlacementStrategy, RealmConfigDocument,
-    StrategyBinding,
+    Actor, BindingError, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DocumentClass,
+    HANDLE_RANGE_SIZE, HANDLE_SPACE_END, HandleRange, MetadataRegistryRecord, NodePlacementEntry,
+    PlacementBinding, PlacementOverride, PlacementRef, PlacementScope, PlacementStrategy,
+    RealmConfigDocument, StrategyBinding,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -55,11 +57,8 @@ pub enum RealmPlacementMutation {
     GrantHandleRange(HandleRange),
 }
 
-/// Builds the next disjoint handle range for `owner` from the realm's current
-/// grant set. The range starts one past the highest end already carved out, so
-/// sequential grants never overlap; concurrent grants from different
-/// coordinators are caught by the overlap conflict after replication. `None` ⇒
-/// the 20-bit handle space is fully granted.
+/// Builds the next disjoint range after all current grants.
+/// Returns `None` when the handle space is exhausted.
 pub fn next_handle_range(config: &RealmConfigDocument, owner: NodeId) -> Option<HandleRange> {
     let start = config.handle_range_directory().next_grantable_start();
     if start >= HANDLE_SPACE_END {
@@ -156,10 +155,28 @@ impl RealmPlacementMutation {
                 ))
             }
             Self::SetDefaultStrategy(strategy_id) => {
-                require_strategy(document, strategy_id, "default strategy")
+                require_strategy(document, strategy_id, "default strategy")?;
+                require_metadata_binding(
+                    document,
+                    PlacementScope::Realm(document.realm_id),
+                    *strategy_id,
+                )
             }
             Self::SetBinding(binding) => {
-                require_strategy(document, &binding.strategy_id, "binding")
+                require_strategy(document, &binding.strategy_id, "binding")?;
+                let scope = match binding.scope {
+                    BindingScope::Group(group_id) => Some(PlacementScope::Group(group_id)),
+                    BindingScope::Realm
+                    | BindingScope::MetadataPathPrefix(_)
+                    | BindingScope::Class(DocumentClass::Metadata) => {
+                        Some(PlacementScope::Realm(document.realm_id))
+                    }
+                    BindingScope::Class(_) => None,
+                };
+                match scope {
+                    Some(scope) => require_metadata_binding(document, scope, binding.strategy_id),
+                    None => Ok(()),
+                }
             }
             Self::AppendPlacementBinding(binding) => {
                 require_strategy(document, &binding.strategy_id, "placement binding")?;
@@ -170,6 +187,12 @@ impl RealmPlacementMutation {
                 ) {
                     return Err(MutateRealmPlacementError::InvalidInput(
                         "placement binding realm does not match the realm config".to_string(),
+                    ));
+                }
+                if !binding.has_valid_provenance(&document.handle_range_directory()) {
+                    return Err(MutateRealmPlacementError::InvalidInput(
+                        "placement binding provenance does not match an owned handle range"
+                            .to_string(),
                     ));
                 }
                 match document.binding_directory().resolve(binding.handle) {
@@ -195,10 +218,8 @@ impl RealmPlacementMutation {
                         range.start, range.end
                     )));
                 }
-                // Overlaps are NOT rejected here: a concurrent grant from another
-                // coordinator arrives via replication and must converge to a
-                // fail-closed conflict, not be silently dropped. Only a same-id
-                // re-grant with divergent bounds is a local error.
+                // Cross-id overlap converges to a derived conflict after replication.
+                // A divergent value under the same id is rejected locally.
                 if document
                     .placement_handle_ranges
                     .iter()
@@ -250,6 +271,31 @@ fn require_strategy(
     if document.strategy(strategy_id).is_none() {
         return Err(MutateRealmPlacementError::InvalidInput(format!(
             "{reference} references missing strategy {strategy_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_metadata_binding(
+    document: &RealmConfigDocument,
+    scope: PlacementScope,
+    strategy_id: Ulid,
+) -> Result<(), MutateRealmPlacementError> {
+    let directory = document.binding_directory();
+    let exact = directory
+        .handle_for(scope, DocumentClass::Metadata, strategy_id)
+        .is_some();
+    let realm_fallback = matches!(scope, PlacementScope::Group(_))
+        && directory
+            .handle_for(
+                PlacementScope::Realm(document.realm_id),
+                DocumentClass::Metadata,
+                strategy_id,
+            )
+            .is_some();
+    if !exact && !realm_fallback {
+        return Err(MutateRealmPlacementError::InvalidInput(format!(
+            "metadata policy strategy {strategy_id} has no binding for {scope:?}"
         )));
     }
     Ok(())
@@ -855,15 +901,13 @@ pub async fn drive_realm_placement_mutation(
     outcome
 }
 
-/// Grants the next disjoint handle range to `owner`: reads the current realm
-/// config, computes the next non-overlapping range from its grant cursor, and
-/// replicates the grant as a Management-only admin op. This is the grant
-/// MECHANISM onboarding (#342) drives; it does not itself decide when to grant.
-pub async fn grant_next_handle_range(
+/// Persists the next disjoint range as a Management-only admin operation.
+pub async fn grant_handle_range(
     actor: Actor,
     owner: NodeId,
     context: &crate::driver::DriverContext,
 ) -> Result<HandleRange, MutateRealmPlacementError> {
+    let _guard = grant_lock().lock().await;
     let document_target = DocumentSyncTarget::RealmConfig {
         realm_id: actor.realm_id,
     };
@@ -895,6 +939,11 @@ pub async fn grant_next_handle_range(
     Ok(range)
 }
 
+fn grant_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -907,8 +956,9 @@ mod tests {
     };
     use aruna_core::structs::{
         AffinityEffect, AffinityRule, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT, DocumentClass,
-        FIRST_HANDLE, HANDLE_SPACE_END, HandleRange, LabelMatch, MetadataRegistryRecord,
-        PlacementBinding, PlacementRef, PlacementScope, RealmId, RealmNodeKind,
+        FIRST_GRANTABLE_HANDLE, FIRST_HANDLE, HANDLE_SPACE_END, HandleRange, LabelMatch,
+        MetadataRegistryRecord, PlacementBinding, PlacementRef, PlacementScope, RealmId,
+        RealmNodeKind,
     };
     use aruna_core::structured_id::PlacementHandle;
     use aruna_core::task::{TaskEffect, TaskKey};
@@ -1015,6 +1065,7 @@ mod tests {
                 holder_node_ids: vec![actor.node_id],
                 created_at_ms: 1,
                 updated_at_ms: 1,
+                establishing_event_id: event_id,
                 last_event_id: event_id,
             },
             user_id: actor.user_id,
@@ -1059,6 +1110,44 @@ mod tests {
             &context,
             &actor,
             RealmPlacementMutation::UpsertStrategy(strategy(strategy_id)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            mutate(
+                &context,
+                &actor,
+                RealmPlacementMutation::SetDefaultStrategy(strategy_id),
+            )
+            .await,
+            Err(MutateRealmPlacementError::InvalidInput(reason))
+                if reason.contains("has no binding")
+        ));
+        let range_id = Ulid::from_bytes([9; 16]);
+        mutate(
+            &context,
+            &actor,
+            RealmPlacementMutation::GrantHandleRange(HandleRange {
+                range_id,
+                owner: actor.node_id,
+                start: FIRST_GRANTABLE_HANDLE,
+                end: FIRST_GRANTABLE_HANDLE + 1024,
+            }),
+        )
+        .await
+        .unwrap();
+        mutate(
+            &context,
+            &actor,
+            RealmPlacementMutation::AppendPlacementBinding(PlacementBinding {
+                handle: PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
+                scope: PlacementScope::Realm(realm_id),
+                document_class: DocumentClass::Metadata,
+                strategy_id,
+                allocator_range_id: Some(range_id),
+                allocated_by: Some(actor.node_id),
+                allocated_at_ms: Some(1),
+            }),
         )
         .await
         .unwrap();
@@ -1125,18 +1214,22 @@ mod tests {
         )
         .await
         .unwrap();
-        mutate(
+        assert!(matches!(
+            mutate(
             &context,
             &actor,
             RealmPlacementMutation::RemoveStrategy(strategy_id),
         )
-        .await
-        .unwrap();
+            .await,
+            Err(MutateRealmPlacementError::StrategyReferenced {
+                strategy_id: referenced
+            }) if referenced == strategy_id
+        ));
 
         let stored = drive(GetRealmConfigOperation::new(realm_id), &context)
             .await
             .unwrap();
-        assert!(stored.strategy(&strategy_id).is_none());
+        assert!(stored.strategy(&strategy_id).is_some());
         assert_eq!(stored.default_strategy_id, Some(initial_default));
         assert!(
             !stored
@@ -1253,6 +1346,20 @@ mod tests {
                 Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("missing strategy")
             ));
         }
+    }
+
+    #[test]
+    fn group_reuses_realm() {
+        let realm_id = RealmId::from_bytes([14; 32]);
+        let mut document = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        document.seed_default_placement();
+        let strategy_id = document.default_strategy_id.unwrap();
+        let mutation = RealmPlacementMutation::SetBinding(StrategyBinding {
+            scope: BindingScope::Group(Ulid::generate()),
+            strategy_id,
+        });
+
+        assert_eq!(mutation.validate(&document), Ok(()));
     }
 
     #[tokio::test]
@@ -1615,7 +1722,7 @@ mod tests {
     }
 
     #[test]
-    fn append_placement_binding_requires_strategy() {
+    fn binding_requires_strategy() {
         let realm_id = RealmId::from_bytes([31; 32]);
         let document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         let binding = placement_binding(realm_id, 5, Ulid::from_bytes([9; 16]));
@@ -1626,28 +1733,42 @@ mod tests {
     }
 
     #[test]
-    fn append_placement_binding_rejects_divergent_rebind() {
+    fn rejects_divergent_rebind() {
         let realm_id = RealmId::from_bytes([32; 32]);
         let strategy_a = Ulid::from_bytes([1; 16]);
         let strategy_b = Ulid::from_bytes([2; 16]);
         let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         document.strategies.push(strategy(strategy_a));
         document.strategies.push(strategy(strategy_b));
-        document
-            .placement_bindings
-            .push(placement_binding(realm_id, 5, strategy_a));
+        let handle = FIRST_GRANTABLE_HANDLE;
+        let mut existing = placement_binding(realm_id, handle, strategy_a);
+        existing.allocated_by = Some(node(4));
+        existing.allocated_at_ms = Some(1);
+        document.placement_handle_ranges.push(HandleRange {
+            range_id: Ulid::from_bytes([44; 16]),
+            owner: node(4),
+            start: handle,
+            end: handle + 1024,
+        });
+        document.placement_bindings.push(existing.clone());
 
-        // A same-tuple re-append (differing only in provenance) stays allowed.
-        let mut same = placement_binding(realm_id, 5, strategy_a);
-        same.allocator_range_id = Some(Ulid::from_bytes([77; 16]));
         assert!(
-            RealmPlacementMutation::AppendPlacementBinding(same)
+            RealmPlacementMutation::AppendPlacementBinding(existing)
                 .validate(&document)
                 .is_ok()
         );
+        let mut same = placement_binding(realm_id, handle, strategy_a);
+        same.allocated_by = Some(node(4));
+        same.allocated_at_ms = Some(1);
+        same.allocator_range_id = Some(Ulid::from_bytes([77; 16]));
+        assert!(matches!(
+            RealmPlacementMutation::AppendPlacementBinding(same).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("provenance")
+        ));
 
-        // A divergent tuple on the already-bound handle is rejected.
-        let divergent = placement_binding(realm_id, 5, strategy_b);
+        let mut divergent = placement_binding(realm_id, handle, strategy_b);
+        divergent.allocated_by = Some(node(4));
+        divergent.allocated_at_ms = Some(1);
         assert!(matches!(
             RealmPlacementMutation::AppendPlacementBinding(divergent).validate(&document),
             Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("different tuple")
@@ -1661,7 +1782,7 @@ mod tests {
     }
 
     #[test]
-    fn realm_space_exhaustion_yields_none() {
+    fn realm_exhaustion_none() {
         let realm_id = RealmId::from_bytes([52; 32]);
         let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         document.placement_handle_ranges.push(HandleRange {
@@ -1674,21 +1795,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sequential_grants_do_not_overlap() {
+    async fn grant_ranges_disjoint() {
         let temp = tempdir().unwrap();
         let context = context(temp.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([51; 32]);
         let actor = actor(realm_id);
         seed_config(&context, &actor).await;
 
-        let first = grant_next_handle_range(actor.clone(), node(2), &context)
+        let first = grant_handle_range(actor.clone(), node(2), &context)
             .await
             .unwrap();
-        let second = grant_next_handle_range(actor.clone(), node(3), &context)
+        let second = grant_handle_range(actor.clone(), node(3), &context)
             .await
             .unwrap();
         assert!(!first.overlaps(&second));
         assert_eq!(second.start, first.end);
+
+        let stored = drive(GetRealmConfigOperation::new(realm_id), &context)
+            .await
+            .unwrap();
+        assert_eq!(stored.handle_range_directory().conflicts(), 0);
+        assert_eq!(stored.placement_handle_ranges.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_grants_disjoint() {
+        let temp = tempdir().unwrap();
+        let context = context(temp.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([53; 32]);
+        let actor = actor(realm_id);
+        seed_config(&context, &actor).await;
+
+        let (left, right) = tokio::join!(
+            grant_handle_range(actor.clone(), node(2), &context),
+            grant_handle_range(actor.clone(), node(3), &context),
+        );
+        let left = left.unwrap();
+        let right = right.unwrap();
+        assert!(!left.overlaps(&right));
 
         let stored = drive(GetRealmConfigOperation::new(realm_id), &context)
             .await

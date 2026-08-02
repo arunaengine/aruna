@@ -1,18 +1,14 @@
-//! The Placement Binding Directory and resolver (spec 6.3.4).
-//!
-//! The directory is each node's derived, in-memory, two-way index over the
-//! immutable Placement Binding set: `handle -> tuple` for O(1) resolution and
-//! `tuple -> handles` for provision/create-time reuse. It is fail-closed: two
-//! different tuples for one handle mark that handle conflicted and are retained
-//! for diagnosis (REQ-META-PLACEMENT-CONFLICT-001/SYNC-001); a winner is never
-//! selected by arrival or wall-clock order.
+//! Fail-closed two-way index over immutable Placement Bindings (spec 6.3.4).
+//! Divergent tuples conflict without selecting an arrival-order winner.
 
 use std::collections::{BTreeSet, HashMap};
 
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::structs::{BindingTuple, DocumentClass, PlacementBinding, PlacementScope};
+use crate::structs::{
+    BindingTuple, DocumentClass, HandleRangeDirectory, PlacementBinding, PlacementScope,
+};
 use crate::structured_id::{
     ALLOCATABLE_HANDLES, BucketId, BucketNotInRange, PlacementHandle, StructuredId,
 };
@@ -60,12 +56,35 @@ pub struct BindingDirectory {
 }
 
 impl BindingDirectory {
-    /// Rebuilds the directory from the authoritative binding set. Duplicate
-    /// entries collapse; same-handle tuple conflicts are retained fail-closed.
+    #[cfg(test)]
     pub fn from_bindings(bindings: &[PlacementBinding]) -> Self {
         let mut directory = Self::default();
         for binding in bindings {
             directory.insert(binding.handle, binding.tuple());
+        }
+        directory
+    }
+
+    /// Builds a fail-closed directory from bindings and live allocator ranges.
+    pub fn from_parts(bindings: &[PlacementBinding], ranges: &HandleRangeDirectory) -> Self {
+        let mut directory = Self::default();
+        let mut seen = HashMap::new();
+        for binding in bindings {
+            match seen.get(&binding.handle) {
+                Some(existing) if existing != binding => {
+                    directory.reject(binding.handle, binding.tuple());
+                    continue;
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(binding.handle, binding.clone());
+                }
+            }
+            if binding.has_valid_provenance(ranges) {
+                directory.insert(binding.handle, binding.tuple());
+            } else {
+                directory.reject(binding.handle, binding.tuple());
+            }
         }
         directory
     }
@@ -93,6 +112,29 @@ impl BindingDirectory {
             }
             Some(HandleState::Conflicted(tuples)) => {
                 tuples.insert(tuple);
+            }
+        }
+    }
+
+    fn reject(&mut self, handle: PlacementHandle, tuple: BindingTuple) {
+        match self.by_handle.remove(&handle) {
+            Some(HandleState::Bound(existing)) => {
+                if let Some(handles) = self.by_tuple.get_mut(&existing) {
+                    handles.remove(&handle);
+                }
+                self.by_handle.insert(
+                    handle,
+                    HandleState::Conflicted(BTreeSet::from([existing, tuple])),
+                );
+            }
+            Some(HandleState::Conflicted(mut tuples)) => {
+                tuples.insert(tuple);
+                self.by_handle
+                    .insert(handle, HandleState::Conflicted(tuples));
+            }
+            None => {
+                self.by_handle
+                    .insert(handle, HandleState::Conflicted(BTreeSet::from([tuple])));
             }
         }
     }
@@ -149,11 +191,6 @@ impl BindingDirectory {
         })
     }
 
-    /// A borrowing resolver façade over this directory (for A4 create/read).
-    pub fn resolver(&self) -> BindingResolver<'_> {
-        BindingResolver { directory: self }
-    }
-
     /// Count of handles bound to exactly one tuple (REQ-META-PLACEMENT-SCALE-001).
     pub fn allocated(&self) -> usize {
         self.by_handle
@@ -174,43 +211,6 @@ impl BindingDirectory {
     pub fn remaining(&self) -> u32 {
         let used = u32::try_from(self.by_handle.len()).unwrap_or(u32::MAX);
         ALLOCATABLE_HANDLES.saturating_sub(used)
-    }
-}
-
-/// A lightweight resolution façade over a [`BindingDirectory`].
-pub struct BindingResolver<'a> {
-    directory: &'a BindingDirectory,
-}
-
-impl<'a> BindingResolver<'a> {
-    pub fn new(directory: &'a BindingDirectory) -> Self {
-        Self { directory }
-    }
-
-    pub fn resolve(&self, handle: PlacementHandle) -> Result<BindingTuple, BindingError> {
-        self.directory.resolve(handle)
-    }
-
-    pub fn handle_for(
-        &self,
-        scope: PlacementScope,
-        document_class: DocumentClass,
-        strategy_id: Ulid,
-    ) -> Option<PlacementHandle> {
-        self.directory
-            .handle_for(scope, document_class, strategy_id)
-    }
-
-    pub fn resolve_id<I, F>(
-        &self,
-        id: &I,
-        bucket_count_of: F,
-    ) -> Result<ResolvedBinding, BindingError>
-    where
-        I: StructuredId,
-        F: FnOnce(Ulid) -> Option<u16>,
-    {
-        self.directory.resolve_id(id, bucket_count_of)
     }
 }
 
@@ -357,9 +357,6 @@ mod tests {
             allocated_at_ms: None,
         };
         let directory = BindingDirectory::from_bindings(&[binding]);
-        assert_eq!(
-            directory.resolver().resolve(handle(7)).map(|t| t.scope),
-            Ok(scope)
-        );
+        assert_eq!(directory.resolve(handle(7)).map(|t| t.scope), Ok(scope));
     }
 }

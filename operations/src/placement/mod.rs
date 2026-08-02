@@ -227,6 +227,10 @@ pub fn first_empty_referenced_shard(config: &RealmConfigDocument) -> Option<Plac
                 .iter()
                 .any(|binding| binding.strategy_id == id)
             || config
+                .placement_bindings
+                .iter()
+                .any(|binding| binding.strategy_id == id)
+            || config
                 .placement_overrides
                 .iter()
                 .any(|record| record.strategy_id == Some(id));
@@ -519,6 +523,7 @@ mod tests {
             holder_node_ids: Vec::new(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            establishing_event_id: Ulid::from_bytes([9u8; 16]),
             last_event_id: Ulid::from_bytes([9u8; 16]),
         };
 
