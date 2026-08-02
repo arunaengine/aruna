@@ -3,10 +3,10 @@ use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    ArtifactRef, DEFAULT_SHARD_COUNT, DocumentClass, ExecutionSpec, ExportRoCrateSpec,
+    ArtifactRef, AuthContext, DEFAULT_SHARD_COUNT, DocumentClass, ExecutionSpec, ExportRoCrateSpec,
     ImportRoCrateSpec, JOBCONTROL_HANDLE, JobError, JobId, JobPayload, JobProgress, JobRecord,
     JobResultPayload, JobState, PlacementScope, RealmId, RunCrateStatus, StagingJobSpec,
-    WorkspaceMode, shard_for_subject, user_dedup_key,
+    WorkspaceMode, job_owner_cursor, shard_for_subject, user_dedup_key,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
@@ -21,12 +21,14 @@ use tracing::warn;
 
 use super::JOB_REPORT_MAX_ROWS;
 use super::protocol::{
-    JobRequest, JobResponse, JobRouteError, WireRange, resolve_job_holders, send_job_request,
+    JobRequest, JobResponse, JobRouteError, WireRange, resolve_job_holders, resolve_user_route,
+    send_job_request,
 };
 use super::runtime::JobsRuntime;
 use super::store::{
-    CancelRequestOutcome, JobMutationError, find_dedup_plan, list_job_entries, list_jobs_for_user,
-    read_artifact_tombstone, read_job_record, read_run_crate_status, set_cancel_requested,
+    CancelRequestOutcome, JobMutationError, UserIndexError, find_dedup_plan, list_job_entries,
+    list_jobs_for_user, read_artifact_tombstone, read_job_record, read_run_crate_status,
+    reserve_user_index, set_cancel_requested, update_user_index,
 };
 use super::submit::{
     SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_job_id,
@@ -34,6 +36,7 @@ use super::submit::{
 };
 use super::workflow::finalize_followups;
 use crate::driver::{DriverContext, drive};
+use crate::metadata::MetadataAuthToken;
 use crate::metadata::api::load_realm_config;
 use crate::metadata::repository::StorageReadError;
 use crate::placement::choose_origin_bucket;
@@ -42,12 +45,14 @@ async fn mint_local_job(
     context: &DriverContext,
     realm_id: RealmId,
     owner_node_id: NodeId,
+    dedup_key: Option<&[u8]>,
 ) -> Result<JobId, SubmitJobError> {
     let handle = PlacementHandle::new(JOBCONTROL_HANDLE)
         .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
     let entropy = ulid::Ulid::generate().to_bytes();
+    let subject = dedup_key.unwrap_or(&entropy);
     let Some(net_handle) = context.net_handle.as_ref() else {
-        let shard = shard_for_subject(&entropy, DEFAULT_SHARD_COUNT);
+        let shard = shard_for_subject(subject, DEFAULT_SHARD_COUNT);
         let bucket = BucketId::new(shard as u16)
             .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
         return Ok(mint_job_id(handle, bucket)?);
@@ -74,19 +79,147 @@ async fn mint_local_job(
     let strategy = config.strategy(&tuple.strategy_id).ok_or_else(|| {
         SubmitJobError::PlacementUnavailable("job-control strategy unavailable".to_string())
     })?;
-    let placement =
-        choose_origin_bucket(&config, strategy, owner_node_id, &entropy).ok_or_else(|| {
-            SubmitJobError::PlacementUnavailable(
-                "serving node holds no job-control bucket".to_string(),
-            )
-        })?;
-    let bucket = u16::try_from(placement.shard)
+    let shard = match dedup_key {
+        Some(key) => shard_for_subject(key, strategy.shard_count),
+        None => {
+            choose_origin_bucket(&config, strategy, owner_node_id, &entropy)
+                .ok_or_else(|| {
+                    SubmitJobError::PlacementUnavailable(
+                        "serving node holds no job-control bucket".to_string(),
+                    )
+                })?
+                .shard
+        }
+    };
+    let bucket = u16::try_from(shard)
         .ok()
         .and_then(|shard| BucketId::new(shard).ok())
         .ok_or_else(|| {
             SubmitJobError::PlacementUnavailable("job bucket is out of range".to_string())
         })?;
     Ok(mint_job_id(handle, bucket)?)
+}
+
+async fn reserve_job_index(
+    context: &DriverContext,
+    record: &JobRecord,
+) -> Result<JobId, SubmitJobError> {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return reserve_user_index(&context.storage_handle, record)
+            .await
+            .map_err(|error| match error {
+                UserIndexError::ActiveLimit { limit } => SubmitJobError::ActiveJobLimit { limit },
+                error => SubmitJobError::UnexpectedEvent(error.to_string()),
+            });
+    };
+    let route = resolve_user_route(context, record.created_by)
+        .await
+        .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
+    let holder = route.holders[0];
+    if holder == net_handle.node_id() {
+        return reserve_user_index(&context.storage_handle, record)
+            .await
+            .map_err(|error| match error {
+                UserIndexError::ActiveLimit { limit } => SubmitJobError::ActiveJobLimit { limit },
+                error => SubmitJobError::UnexpectedEvent(error.to_string()),
+            });
+    }
+    let auth_token = MetadataAuthToken::internal(AuthContext {
+        user_id: record.created_by,
+        realm_id: record.created_by.realm_id,
+        path_restrictions: None,
+    });
+    let reply = send_job_request(
+        context,
+        holder,
+        JobRequest::Index {
+            auth_token,
+            record: record.clone(),
+            config_digest: route.config_digest,
+        },
+    )
+    .await
+    .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
+    match reply.response {
+        JobResponse::Indexed(job_id) => Ok(job_id),
+        JobResponse::SubmitCap(limit) => Err(SubmitJobError::ActiveJobLimit { limit }),
+        JobResponse::Unavailable(error) => Err(SubmitJobError::UnexpectedEvent(error)),
+        response => Err(SubmitJobError::UnexpectedEvent(format!(
+            "unexpected user index response: {response:?}"
+        ))),
+    }
+}
+
+pub(crate) async fn submit_local_job(
+    context: &DriverContext,
+    mut spec: SubmitJobSpec,
+    job_id: JobId,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    let operation = if let Some(net_handle) = context.net_handle.as_ref() {
+        spec.owner_node_id = net_handle.node_id();
+        let preview = SubmitJobOperation::reserved(spec.clone(), job_id);
+        let indexed_job_id = reserve_job_index(context, preview.record()).await?;
+        SubmitJobOperation::reserved(spec, indexed_job_id)
+    } else {
+        SubmitJobOperation::new(spec, job_id)
+    };
+    let result = drive(operation, context).await?;
+    replicate_job_record(context, result.job_id).await;
+    if result.created {
+        kick_drain(context).await;
+    }
+    Ok(result)
+}
+
+async fn submit_job_routed(
+    context: &DriverContext,
+    spec: SubmitJobSpec,
+    job_id: JobId,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return submit_local_job(context, spec, job_id).await;
+    };
+    let route = resolve_job_holders(context, job_id)
+        .await
+        .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
+    let runner = route.holders[0];
+    if runner == net_handle.node_id() {
+        return submit_local_job(context, spec, job_id).await;
+    }
+    let auth_token = MetadataAuthToken::internal(AuthContext {
+        user_id: spec.created_by,
+        realm_id: spec.created_by.realm_id,
+        path_restrictions: None,
+    });
+    let reply = send_job_request(
+        context,
+        runner,
+        JobRequest::Submit {
+            auth_token,
+            job_id,
+            spec,
+            config_digest: route.config_digest,
+        },
+    )
+    .await
+    .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
+    match reply.response {
+        JobResponse::Submitted(result) => Ok(result),
+        JobResponse::SubmitConflict(existing_job_id) => {
+            Err(SubmitJobError::JobPlanConflict { existing_job_id })
+        }
+        JobResponse::SubmitCap(limit) => Err(SubmitJobError::ActiveJobLimit { limit }),
+        JobResponse::Unauthorized => Err(SubmitJobError::UnexpectedEvent(
+            "rank-0 job holder rejected forwarding authentication".to_string(),
+        )),
+        JobResponse::Forbidden => Err(SubmitJobError::UnexpectedEvent(
+            "rank-0 job holder rejected the forwarded principal".to_string(),
+        )),
+        JobResponse::Unavailable(error) => Err(SubmitJobError::UnexpectedEvent(error)),
+        response => Err(SubmitJobError::UnexpectedEvent(format!(
+            "unexpected submit response: {response:?}"
+        ))),
+    }
 }
 
 /// Submit a container execution job on behalf of `created_by`. The drain claims it
@@ -148,22 +281,26 @@ pub async fn submit_execution_job(
         ));
     }
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
-    let job_id = mint_local_job(context, created_by.realm_id, owner_node_id).await?;
-    drive(
-        SubmitJobOperation::new(
-            SubmitJobSpec {
-                payload: JobPayload::Execution(spec),
-                created_by,
-                owner_node_id,
-                dedup_key,
-                now_ms: unix_timestamp_millis(),
-                retention_ms,
-                workspace_mode,
-                workspace_bucket,
-            },
-            job_id,
-        ),
+    let job_id = mint_local_job(
         context,
+        created_by.realm_id,
+        owner_node_id,
+        dedup_key.as_deref(),
+    )
+    .await?;
+    submit_job_routed(
+        context,
+        SubmitJobSpec {
+            payload: JobPayload::Execution(spec),
+            created_by,
+            owner_node_id,
+            dedup_key,
+            now_ms: unix_timestamp_millis(),
+            retention_ms,
+            workspace_mode,
+            workspace_bucket,
+        },
+        job_id,
     )
     .await
 }
@@ -175,22 +312,20 @@ pub async fn submit_staging_job(
     retention_ms: u64,
 ) -> Result<SubmitJobResult, SubmitJobError> {
     let created_by = spec.auth_context.user_id;
-    let job_id = mint_local_job(context, created_by.realm_id, owner_node_id).await?;
-    drive(
-        SubmitJobOperation::new(
-            SubmitJobSpec {
-                payload: JobPayload::Staging(spec),
-                created_by,
-                owner_node_id,
-                dedup_key: None,
-                now_ms: unix_timestamp_millis(),
-                retention_ms,
-                workspace_mode: WorkspaceMode::default(),
-                workspace_bucket: None,
-            },
-            job_id,
-        ),
+    let job_id = mint_local_job(context, created_by.realm_id, owner_node_id, None).await?;
+    submit_job_routed(
         context,
+        SubmitJobSpec {
+            payload: JobPayload::Staging(spec),
+            created_by,
+            owner_node_id,
+            dedup_key: None,
+            now_ms: unix_timestamp_millis(),
+            retention_ms,
+            workspace_mode: WorkspaceMode::default(),
+            workspace_bucket: None,
+        },
+        job_id,
     )
     .await
 }
@@ -204,22 +339,26 @@ pub async fn submit_rocrate_import(
     let created_by = spec.auth_context.user_id;
     let retention_ms = spec.limits.artifact_retention_ms;
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
-    let job_id = mint_local_job(context, created_by.realm_id, owner_node_id).await?;
-    drive(
-        SubmitJobOperation::new(
-            SubmitJobSpec {
-                payload: JobPayload::ImportRoCrate(spec),
-                created_by,
-                owner_node_id,
-                dedup_key,
-                now_ms: unix_timestamp_millis(),
-                retention_ms,
-                workspace_mode: WorkspaceMode::default(),
-                workspace_bucket: None,
-            },
-            job_id,
-        ),
+    let job_id = mint_local_job(
         context,
+        created_by.realm_id,
+        owner_node_id,
+        dedup_key.as_deref(),
+    )
+    .await?;
+    submit_job_routed(
+        context,
+        SubmitJobSpec {
+            payload: JobPayload::ImportRoCrate(spec),
+            created_by,
+            owner_node_id,
+            dedup_key,
+            now_ms: unix_timestamp_millis(),
+            retention_ms,
+            workspace_mode: WorkspaceMode::default(),
+            workspace_bucket: None,
+        },
+        job_id,
     )
     .await
 }
@@ -265,22 +404,26 @@ pub async fn submit_export_job(
     let created_by = spec.auth_context.user_id;
     let retention_ms = spec.limits.artifact_retention_ms;
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
-    let job_id = mint_local_job(context, created_by.realm_id, owner_node_id).await?;
-    drive(
-        SubmitJobOperation::new(
-            SubmitJobSpec {
-                payload: JobPayload::ExportRoCrate(spec),
-                created_by,
-                owner_node_id,
-                dedup_key,
-                now_ms: unix_timestamp_millis(),
-                workspace_mode: WorkspaceMode::default(),
-                workspace_bucket: None,
-                retention_ms,
-            },
-            job_id,
-        ),
+    let job_id = mint_local_job(
         context,
+        created_by.realm_id,
+        owner_node_id,
+        dedup_key.as_deref(),
+    )
+    .await?;
+    submit_job_routed(
+        context,
+        SubmitJobSpec {
+            payload: JobPayload::ExportRoCrate(spec),
+            created_by,
+            owner_node_id,
+            dedup_key,
+            now_ms: unix_timestamp_millis(),
+            workspace_mode: WorkspaceMode::default(),
+            workspace_bucket: None,
+            retention_ms,
+        },
+        job_id,
     )
     .await
 }
@@ -301,7 +444,68 @@ pub async fn list_owned_jobs(
     limit: usize,
     filter: impl Fn(&JobRecord) -> bool,
 ) -> Result<(Vec<JobRecord>, Option<Vec<u8>>), String> {
-    list_jobs_for_user(&context.storage_handle, user_id, cursor, limit, filter).await
+    if limit == 0 || context.net_handle.is_none() {
+        return list_jobs_for_user(&context.storage_handle, user_id, cursor, limit, filter).await;
+    }
+    let route = resolve_user_route(context, user_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let holder = route.holders[0];
+    if Some(holder) == local_node {
+        return list_jobs_for_user(&context.storage_handle, user_id, cursor, limit, filter).await;
+    }
+    let auth_token = MetadataAuthToken::internal(AuthContext {
+        user_id,
+        realm_id: user_id.realm_id,
+        path_restrictions: None,
+    });
+    let batch_limit = u16::try_from(limit.min(usize::from(u16::MAX))).unwrap_or(u16::MAX);
+    let mut scan_cursor = cursor;
+    let mut records = Vec::new();
+    let mut page_cursor = None;
+    loop {
+        let reply = send_job_request(
+            context,
+            holder,
+            JobRequest::List {
+                auth_token: auth_token.clone(),
+                user_id,
+                cursor: scan_cursor,
+                limit: batch_limit,
+                config_digest: route.config_digest,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let (page, next_cursor) = match reply.response {
+            JobResponse::Listed {
+                records,
+                next_cursor,
+            } => (records, next_cursor),
+            JobResponse::Unauthorized => return Err("job listing is unauthorized".to_string()),
+            JobResponse::Forbidden => return Err("job listing is forbidden".to_string()),
+            JobResponse::Unavailable(error) => return Err(error),
+            response => return Err(format!("unexpected job listing response: {response:?}")),
+        };
+        for record in page {
+            if record.created_by != user_id || record.payload.is_internal() || !filter(&record) {
+                continue;
+            }
+            if records.len() == limit {
+                return Ok((records, page_cursor));
+            }
+            let cursor = job_owner_cursor(record.created_at_ms, record.job_id);
+            records.push(record);
+            if records.len() == limit {
+                page_cursor = Some(cursor);
+            }
+        }
+        let Some(next_cursor) = next_cursor else {
+            return Ok((records, None));
+        };
+        scan_cursor = Some(next_cursor);
+    }
 }
 
 pub async fn read_owned_job(
@@ -317,6 +521,109 @@ pub async fn read_owned_job(
             _ => None,
         },
     )
+}
+
+pub(crate) async fn replicate_job_record(context: &DriverContext, job_id: JobId) {
+    let record = match read_job_record(&context.storage_handle, job_id, None).await {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            warn!(job_id = %job_id, "Cannot replicate a missing job record");
+            return;
+        }
+        Err(error) => {
+            warn!(job_id = %job_id, error = %error, "Failed to read job for replication");
+            return;
+        }
+    };
+    if record.state != JobState::Queued && !record.state.is_terminal() {
+        return;
+    }
+    sync_user_record(context, &record).await;
+    let route = match resolve_job_holders(context, job_id).await {
+        Ok(route) => route,
+        Err(error) => {
+            warn!(job_id = %job_id, error = %error, "Failed to resolve job replicas");
+            return;
+        }
+    };
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let auth_token = MetadataAuthToken::internal(AuthContext {
+        user_id: record.created_by,
+        realm_id: record.created_by.realm_id,
+        path_restrictions: None,
+    });
+    for holder in route.holders {
+        if Some(holder) == local_node {
+            continue;
+        }
+        match send_job_request(
+            context,
+            holder,
+            JobRequest::Replicate {
+                auth_token: auth_token.clone(),
+                record: record.clone(),
+                config_digest: route.config_digest,
+            },
+        )
+        .await
+        {
+            Ok(reply) if matches!(reply.response, JobResponse::Replicated) => {}
+            Ok(reply) => {
+                warn!(job_id = %job_id, %holder, response = ?reply.response, "Job replica was rejected")
+            }
+            Err(error) => {
+                warn!(job_id = %job_id, %holder, error = %error, "Failed to replicate job record")
+            }
+        }
+    }
+}
+
+async fn sync_user_record(context: &DriverContext, record: &JobRecord) {
+    if record.payload.is_internal() {
+        return;
+    }
+    let route = match resolve_user_route(context, record.created_by).await {
+        Ok(route) => route,
+        Err(error) => {
+            warn!(job_id = %record.job_id, error = %error, "Failed to resolve job owner index");
+            return;
+        }
+    };
+    let holder = route.holders[0];
+    if context
+        .net_handle
+        .as_ref()
+        .is_some_and(|net| net.node_id() == holder)
+    {
+        if let Err(error) = update_user_index(&context.storage_handle, record).await {
+            warn!(job_id = %record.job_id, error = %error, "Failed to update job owner index");
+        }
+        return;
+    }
+    let auth_token = MetadataAuthToken::internal(AuthContext {
+        user_id: record.created_by,
+        realm_id: record.created_by.realm_id,
+        path_restrictions: None,
+    });
+    match send_job_request(
+        context,
+        holder,
+        JobRequest::Index {
+            auth_token,
+            record: record.clone(),
+            config_digest: route.config_digest,
+        },
+    )
+    .await
+    {
+        Ok(reply) if matches!(reply.response, JobResponse::Indexed(_)) => {}
+        Ok(reply) => {
+            warn!(job_id = %record.job_id, response = ?reply.response, "Job owner index was rejected")
+        }
+        Err(error) => {
+            warn!(job_id = %record.job_id, error = %error, "Failed to update remote job owner index")
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -455,6 +762,7 @@ pub async fn read_job_routed(
     let route = resolve_job_holders(context, job_id).await?;
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     let mut not_found = 0usize;
+    let mut freshest = None;
     for holder in &route.holders {
         if Some(*holder) == local_node {
             let record = match read_owned_job(context, user_id, job_id).await {
@@ -469,10 +777,16 @@ pub async fn read_job_routed(
                 Ok(status) => status.map(|status| status.to_public_json()),
                 Err(_) => continue,
             };
-            return Ok(RoutedJobStatus {
+            let candidate = RoutedJobStatus {
                 job: JobStatusView::from(&record),
                 run_crate,
-            });
+            };
+            if freshest.as_ref().is_none_or(|current: &RoutedJobStatus| {
+                candidate.job.updated_at_ms > current.job.updated_at_ms
+            }) {
+                freshest = Some(candidate);
+            }
+            continue;
         }
         let token = auth_token.clone().ok_or(JobRouteError::Unauthorized)?;
         let reply = match send_job_request(
@@ -497,13 +811,21 @@ pub async fn read_job_routed(
                 else {
                     continue;
                 };
-                return Ok(RoutedJobStatus { job, run_crate });
+                let candidate = RoutedJobStatus { job, run_crate };
+                if freshest.as_ref().is_none_or(|current: &RoutedJobStatus| {
+                    candidate.job.updated_at_ms > current.job.updated_at_ms
+                }) {
+                    freshest = Some(candidate);
+                }
             }
             JobResponse::Unauthorized => return Err(JobRouteError::Unauthorized),
             JobResponse::Forbidden => return Err(JobRouteError::Forbidden),
             JobResponse::NotFound => not_found += 1,
             _ => {}
         }
+    }
+    if let Some(freshest) = freshest {
+        return Ok(freshest);
     }
     route_miss(not_found, route.holders.len())
 }
@@ -937,6 +1259,9 @@ pub async fn cancel_owned_job(
             if matches!(&record.payload, JobPayload::Execution(_)) {
                 finalize_followups(context, job_id).await;
             }
+            if can_replicate_terminal(context, &record).await {
+                replicate_job_record(context, job_id).await;
+            }
             CancelJobOutcome::Requested(record)
         }
         CancelRequestOutcome::Flagged(record) => {
@@ -945,6 +1270,24 @@ pub async fn cancel_owned_job(
             CancelJobOutcome::Requested(record)
         }
     })
+}
+
+async fn can_replicate_terminal(context: &DriverContext, record: &JobRecord) -> bool {
+    let Some(local_node) = context.net_handle.as_ref().map(|net| net.node_id()) else {
+        return false;
+    };
+    let runner = record
+        .claim
+        .as_ref()
+        .map_or(record.owner_node_id, |claim| claim.holder_node_id);
+    if runner == local_node {
+        return true;
+    }
+    resolve_job_holders(context, record.job_id)
+        .await
+        .is_ok_and(|route| {
+            route.holders.first().copied() == Some(local_node) && !route.holders.contains(&runner)
+        })
 }
 
 pub async fn cancel_job_routed(
@@ -971,6 +1314,7 @@ pub async fn cancel_job_routed(
     let route = resolve_job_holders(context, job_id).await?;
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     let mut not_found = 0usize;
+    let mut freshest = None;
     for holder in &route.holders {
         if Some(*holder) == local_node {
             match cancel_owned_job(context, runtime, user_id, job_id).await {
@@ -979,12 +1323,28 @@ pub async fn cancel_job_routed(
                     continue;
                 }
                 Ok(CancelJobOutcome::AlreadyTerminal(record)) => {
-                    return Ok(RoutedCancelOutcome::AlreadyTerminal(JobStatusView::from(
-                        &record,
-                    )));
+                    let job = JobStatusView::from(&record);
+                    if freshest
+                        .as_ref()
+                        .is_none_or(|(current, _): &(JobStatusView, bool)| {
+                            job.updated_at_ms > current.updated_at_ms
+                        })
+                    {
+                        freshest = Some((job, true));
+                    }
+                    continue;
                 }
                 Ok(CancelJobOutcome::Requested(record)) => {
-                    return Ok(RoutedCancelOutcome::Requested(JobStatusView::from(&record)));
+                    let job = JobStatusView::from(&record);
+                    if freshest
+                        .as_ref()
+                        .is_none_or(|(current, _): &(JobStatusView, bool)| {
+                            job.updated_at_ms > current.updated_at_ms
+                        })
+                    {
+                        freshest = Some((job, false));
+                    }
+                    continue;
                 }
                 Err(_) => continue,
             }
@@ -1008,17 +1368,27 @@ pub async fn cancel_job_routed(
             JobResponse::Cancelled { job, terminal }
                 if routed_job_matches(&job, user_id, job_id) =>
             {
-                return Ok(if terminal {
-                    RoutedCancelOutcome::AlreadyTerminal(job)
-                } else {
-                    RoutedCancelOutcome::Requested(job)
-                });
+                if freshest
+                    .as_ref()
+                    .is_none_or(|(current, _): &(JobStatusView, bool)| {
+                        job.updated_at_ms > current.updated_at_ms
+                    })
+                {
+                    freshest = Some((job, terminal));
+                }
             }
             JobResponse::Unauthorized => return Err(JobRouteError::Unauthorized),
             JobResponse::Forbidden => return Err(JobRouteError::Forbidden),
             JobResponse::NotFound => not_found += 1,
             _ => {}
         }
+    }
+    if let Some((job, terminal)) = freshest {
+        return Ok(if terminal {
+            RoutedCancelOutcome::AlreadyTerminal(job)
+        } else {
+            RoutedCancelOutcome::Requested(job)
+        });
     }
     route_miss(not_found, route.holders.len())
 }
@@ -1058,7 +1428,7 @@ async fn kick_drain(context: &DriverContext) {
         && let Event::Task(TaskEvent::Error { message, .. }) =
             task_handle.send_effect(schedule_job_drain_effect()).await
     {
-        warn!(message = %message, "Failed to kick job drain after cancel");
+        warn!(message = %message, "Failed to kick job drain");
     }
 }
 

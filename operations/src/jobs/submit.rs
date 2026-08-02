@@ -15,6 +15,7 @@ use aruna_core::structured_id::{
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, NodeId, TxnId, UserId};
+use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
@@ -43,7 +44,7 @@ fn job_id_generator() -> &'static Mutex<StructuredIdGenerator> {
     GENERATOR.get_or_init(|| Mutex::new(StructuredIdGenerator::new()))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmitJobSpec {
     pub payload: JobPayload,
     pub created_by: UserId,
@@ -55,7 +56,7 @@ pub struct SubmitJobSpec {
     pub workspace_bucket: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmitJobResult {
     pub job_id: JobId,
     /// `false` when a job with the same `dedup_key` already existed.
@@ -121,6 +122,7 @@ enum SubmitState {
 pub struct SubmitJobOperation {
     record: JobRecord,
     active_cap: Option<u32>,
+    schedule_drain: bool,
     state: SubmitState,
     output: Option<Result<SubmitJobResult, SubmitJobError>>,
 }
@@ -159,9 +161,21 @@ impl SubmitJobOperation {
         Self {
             record,
             active_cap,
+            schedule_drain: true,
             state: SubmitState::Init,
             output: None,
         }
+    }
+
+    pub(crate) fn reserved(spec: SubmitJobSpec, job_id: JobId) -> Self {
+        let mut operation = Self::new(spec, job_id);
+        operation.active_cap = None;
+        operation.schedule_drain = false;
+        operation
+    }
+
+    pub(crate) fn record(&self) -> &JobRecord {
+        &self.record
     }
 
     fn fail(&mut self, error: SubmitJobError) -> Effects {
@@ -254,6 +268,14 @@ impl SubmitJobOperation {
     fn schedule_drain(&mut self) -> Effects {
         self.state = SubmitState::ScheduleDrain;
         smallvec![schedule_job_drain_effect()]
+    }
+
+    fn after_write(&mut self) -> Effects {
+        if self.schedule_drain {
+            self.schedule_drain()
+        } else {
+            self.finish_created()
+        }
     }
 
     fn finish_existing(&mut self, txn_id: TxnId, job_id: JobId) -> Effects {
@@ -376,13 +398,13 @@ impl Operation for SubmitJobOperation {
                         self.state = SubmitState::CommitTransaction { txn_id };
                         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
                     }
-                    None => self.schedule_drain(),
+                    None => self.after_write(),
                 },
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
             },
             SubmitState::CommitTransaction { .. } => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => self.schedule_drain(),
+                Event::Storage(StorageEvent::TransactionCommitted { .. }) => self.after_write(),
                 Event::Storage(StorageEvent::Error {
                     error: StorageError::TransactionConflict,
                 }) => self.start_transaction(),

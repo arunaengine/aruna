@@ -4,9 +4,10 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    AuthContext, DocumentClass, JobId, JobState, PlacementRef, PlacementScope, RealmId,
+    AuthContext, DocumentClass, JobId, JobRecord, JobState, PlacementRef, PlacementScope, RealmId,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
@@ -25,12 +26,16 @@ use super::runtime::JobsRuntime;
 use super::service::{
     ArtifactLookup, CancelJobOutcome, JobReportLookup, JobReportView, JobStatusView, OwnedArtifact,
     cancel_owned_job, read_artifact_range, read_job_run_crate_status, read_owned_artifact,
-    read_owned_job, read_owned_report,
+    read_owned_job, read_owned_report, submit_local_job,
 };
+use super::store::{
+    UserIndexError, list_jobs_for_user, reserve_user_index, update_user_index, write_passive_record,
+};
+use super::submit::{SubmitJobError, SubmitJobResult, SubmitJobSpec};
 use crate::driver::DriverContext;
 use crate::metadata::api::load_realm_config;
 use crate::metadata::{MetadataAuthToken, MetadataWritePeerError};
-use crate::placement::resolve_shard_holders;
+use crate::placement::{placement_ref_for_target, resolve_shard_holders};
 
 const JOB_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_JOB_FRAME_SIZE: usize = 16 * 1024 * 1024;
@@ -51,6 +56,29 @@ pub enum JobRouteError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum JobRequest {
+    Index {
+        auth_token: MetadataAuthToken,
+        record: JobRecord,
+        config_digest: [u8; 32],
+    },
+    List {
+        auth_token: MetadataAuthToken,
+        user_id: UserId,
+        cursor: Option<Vec<u8>>,
+        limit: u16,
+        config_digest: [u8; 32],
+    },
+    Submit {
+        auth_token: MetadataAuthToken,
+        job_id: JobId,
+        spec: SubmitJobSpec,
+        config_digest: [u8; 32],
+    },
+    Replicate {
+        auth_token: MetadataAuthToken,
+        record: JobRecord,
+        config_digest: [u8; 32],
+    },
     Status {
         auth_token: MetadataAuthToken,
         job_id: JobId,
@@ -80,25 +108,44 @@ pub(crate) enum JobRequest {
 impl JobRequest {
     fn auth_token(&self) -> MetadataAuthToken {
         match self {
-            Self::Status { auth_token, .. }
+            Self::Index { auth_token, .. }
+            | Self::List { auth_token, .. }
+            | Self::Submit { auth_token, .. }
+            | Self::Replicate { auth_token, .. }
+            | Self::Status { auth_token, .. }
             | Self::Report { auth_token, .. }
             | Self::Artifact { auth_token, .. }
             | Self::Cancel { auth_token, .. } => auth_token.clone(),
         }
     }
 
-    fn job_id(&self) -> JobId {
+    fn job_id(&self) -> Option<JobId> {
         match self {
+            Self::Index { .. } | Self::List { .. } => None,
+            Self::Submit { job_id, .. } => Some(*job_id),
+            Self::Replicate { record, .. } => Some(record.job_id),
             Self::Status { job_id, .. }
             | Self::Report { job_id, .. }
             | Self::Artifact { job_id, .. }
-            | Self::Cancel { job_id, .. } => *job_id,
+            | Self::Cancel { job_id, .. } => Some(*job_id),
+        }
+    }
+
+    fn user_id(&self) -> Option<UserId> {
+        match self {
+            Self::Index { record, .. } => Some(record.created_by),
+            Self::List { user_id, .. } => Some(*user_id),
+            _ => None,
         }
     }
 
     fn config_digest(&self) -> [u8; 32] {
         match self {
-            Self::Status { config_digest, .. }
+            Self::Index { config_digest, .. }
+            | Self::List { config_digest, .. }
+            | Self::Submit { config_digest, .. }
+            | Self::Replicate { config_digest, .. }
+            | Self::Status { config_digest, .. }
             | Self::Report { config_digest, .. }
             | Self::Artifact { config_digest, .. }
             | Self::Cancel { config_digest, .. } => *config_digest,
@@ -161,6 +208,15 @@ pub(crate) enum JobResponse {
     Forbidden,
     NotFound,
     Unavailable(String),
+    Indexed(JobId),
+    Listed {
+        records: Vec<JobRecord>,
+        next_cursor: Option<Vec<u8>>,
+    },
+    Submitted(SubmitJobResult),
+    SubmitConflict(JobId),
+    SubmitCap(u32),
+    Replicated,
     Status {
         job: JobStatusView,
         run_crate: Option<String>,
@@ -233,6 +289,42 @@ pub(crate) async fn resolve_job_holders(
     if holders.is_empty() {
         return Err(JobRouteError::Unavailable(
             "job-control bucket has no holders".to_string(),
+        ));
+    }
+    let config_digest = config
+        .digest()
+        .map_err(|error| JobRouteError::Unavailable(error.to_string()))?;
+    Ok(JobRoute {
+        holders,
+        config_digest,
+    })
+}
+
+pub(crate) async fn resolve_user_route(
+    context: &DriverContext,
+    user_id: UserId,
+) -> Result<JobRoute, JobRouteError> {
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or_else(|| JobRouteError::Unavailable("network handle unavailable".to_string()))?;
+    if *net_handle.realm_id() != user_id.realm_id {
+        return Err(JobRouteError::Unavailable(
+            "user does not belong to the serving realm".to_string(),
+        ));
+    }
+    let config = load_realm_config(context, user_id.realm_id)
+        .await
+        .ok_or_else(|| JobRouteError::Unavailable("realm config unavailable".to_string()))?;
+    let placement = placement_ref_for_target(
+        &config,
+        &DocumentSyncTarget::User { user_id },
+        Default::default(),
+    );
+    let holders = resolve_shard_holders(&config, &placement);
+    if holders.is_empty() {
+        return Err(JobRouteError::Unavailable(
+            "user placement has no holders".to_string(),
         ));
     }
     let config_digest = config
@@ -386,9 +478,43 @@ async fn prepare_response(
     if !auth_realm_matches(&auth, local_realm_id) {
         return PreparedResponse::new(JobResponse::Forbidden);
     }
-    let job_id = request.job_id();
     let config_digest = request.config_digest();
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    if let Some(user_id) = request.user_id() {
+        let route = match resolve_user_route(context, user_id).await {
+            Ok(route) => route,
+            Err(error) => {
+                return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
+            }
+        };
+        if route.config_digest != config_digest {
+            return PreparedResponse::new(JobResponse::Unavailable(
+                "user placement config does not match the requester".to_string(),
+            ));
+        }
+        if local_node != route.holders.first().copied() {
+            return PreparedResponse::new(JobResponse::Unavailable(
+                "receiving node is not the authoritative user holder".to_string(),
+            ));
+        }
+        return match request {
+            JobRequest::Index { record, .. } => prepare_index(context, auth.user_id, record).await,
+            JobRequest::List {
+                user_id,
+                cursor,
+                limit,
+                ..
+            } => prepare_list(context, auth.user_id, user_id, cursor, limit).await,
+            _ => PreparedResponse::new(JobResponse::Unavailable(
+                "invalid user-routed job request".to_string(),
+            )),
+        };
+    }
+    let Some(job_id) = request.job_id() else {
+        return PreparedResponse::new(JobResponse::Unavailable(
+            "job-routed request is missing a job id".to_string(),
+        ));
+    };
     let route = match resolve_job_holders(context, job_id).await {
         Ok(route) => route,
         Err(error) => {
@@ -406,6 +532,20 @@ async fn prepare_response(
         ));
     }
     match request {
+        JobRequest::Index { .. } | JobRequest::List { .. } => PreparedResponse::new(
+            JobResponse::Unavailable("user-routed request reached the job dispatcher".to_string()),
+        ),
+        JobRequest::Submit { spec, .. } => {
+            if local_node != route.holders.first().copied() {
+                return PreparedResponse::new(JobResponse::Unavailable(
+                    "receiving node is not the rank-0 job holder".to_string(),
+                ));
+            }
+            prepare_submit(context, auth.user_id, job_id, spec).await
+        }
+        JobRequest::Replicate { record, .. } => {
+            prepare_replicate(context, auth.user_id, record).await
+        }
         JobRequest::Status { .. } => prepare_status(context, auth.user_id, job_id).await,
         JobRequest::Report {
             expected_digest,
@@ -434,6 +574,90 @@ async fn prepare_response(
             .await
         }
         JobRequest::Cancel { .. } => prepare_cancel(context, runtime, auth.user_id, job_id).await,
+    }
+}
+
+async fn prepare_index(
+    context: &DriverContext,
+    user_id: UserId,
+    record: JobRecord,
+) -> PreparedResponse {
+    if record.created_by != user_id || record.payload.is_internal() {
+        return PreparedResponse::new(JobResponse::Forbidden);
+    }
+    if record.state.is_terminal() {
+        return match update_user_index(&context.storage_handle, &record).await {
+            Ok(()) => PreparedResponse::new(JobResponse::Indexed(record.job_id)),
+            Err(error) => PreparedResponse::new(JobResponse::Unavailable(error)),
+        };
+    }
+    match reserve_user_index(&context.storage_handle, &record).await {
+        Ok(job_id) => PreparedResponse::new(JobResponse::Indexed(job_id)),
+        Err(UserIndexError::ActiveLimit { limit }) => {
+            PreparedResponse::new(JobResponse::SubmitCap(limit))
+        }
+        Err(error) => PreparedResponse::new(JobResponse::Unavailable(error.to_string())),
+    }
+}
+
+async fn prepare_list(
+    context: &DriverContext,
+    auth_user: UserId,
+    user_id: UserId,
+    cursor: Option<Vec<u8>>,
+    limit: u16,
+) -> PreparedResponse {
+    if auth_user != user_id {
+        return PreparedResponse::new(JobResponse::Forbidden);
+    }
+    match list_jobs_for_user(
+        &context.storage_handle,
+        user_id,
+        cursor,
+        usize::from(limit),
+        |_| true,
+    )
+    .await
+    {
+        Ok((records, next_cursor)) => PreparedResponse::new(JobResponse::Listed {
+            records,
+            next_cursor,
+        }),
+        Err(error) => PreparedResponse::new(JobResponse::Unavailable(error)),
+    }
+}
+
+async fn prepare_submit(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+    spec: SubmitJobSpec,
+) -> PreparedResponse {
+    if spec.created_by != user_id {
+        return PreparedResponse::new(JobResponse::Forbidden);
+    }
+    let response = match submit_local_job(context, spec, job_id).await {
+        Ok(result) => JobResponse::Submitted(result),
+        Err(SubmitJobError::JobPlanConflict { existing_job_id }) => {
+            JobResponse::SubmitConflict(existing_job_id)
+        }
+        Err(SubmitJobError::ActiveJobLimit { limit }) => JobResponse::SubmitCap(limit),
+        Err(error) => JobResponse::Unavailable(error.to_string()),
+    };
+    PreparedResponse::new(response)
+}
+
+async fn prepare_replicate(
+    context: &DriverContext,
+    user_id: UserId,
+    record: JobRecord,
+) -> PreparedResponse {
+    if record.created_by != user_id {
+        return PreparedResponse::new(JobResponse::Forbidden);
+    }
+    match write_passive_record(&context.storage_handle, &record).await {
+        Ok(()) => PreparedResponse::new(JobResponse::Replicated),
+        Err(error) => PreparedResponse::new(JobResponse::Unavailable(error)),
     }
 }
 
