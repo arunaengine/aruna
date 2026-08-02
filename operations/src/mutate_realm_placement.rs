@@ -23,9 +23,9 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::{
     Actor, BindingError, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DocumentClass,
-    HANDLE_RANGE_SIZE, HANDLE_SPACE_END, HandleRange, MetadataRegistryRecord, NodePlacementEntry,
-    PlacementBinding, PlacementOverride, PlacementRef, PlacementScope, PlacementStrategy,
-    RealmConfigDocument, StrategyBinding,
+    HandleRange, MetadataRegistryRecord, NodePlacementEntry, PlacementBinding, PlacementOverride,
+    PlacementRef, PlacementScope, PlacementStrategy, RealmConfigDocument, StrategyBinding,
+    owner_handle_band,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -57,16 +57,17 @@ pub enum RealmPlacementMutation {
     GrantHandleRange(HandleRange),
 }
 
-/// Builds the next disjoint range after all current grants.
-/// Returns `None` when the handle space is exhausted.
+/// Grants `owner` its deterministic handle band. Returns `None` once the owner
+/// already holds that band, so a coordinator draws one disjoint range that never
+/// races another coordinator's start.
 pub fn next_handle_range(config: &RealmConfigDocument, owner: NodeId) -> Option<HandleRange> {
-    let start = config.handle_range_directory().next_grantable_start();
-    if start >= HANDLE_SPACE_END {
+    let (start, end) = owner_handle_band(&owner);
+    if config
+        .handle_range_directory()
+        .owner_holds_band(&owner, start, end)
+    {
         return None;
     }
-    let end = start
-        .saturating_add(HANDLE_RANGE_SIZE)
-        .min(HANDLE_SPACE_END);
     Some(HandleRange {
         range_id: Ulid::generate(),
         owner,
@@ -959,9 +960,8 @@ mod tests {
     };
     use aruna_core::structs::{
         AffinityEffect, AffinityRule, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT, DocumentClass,
-        FIRST_GRANTABLE_HANDLE, FIRST_HANDLE, HANDLE_SPACE_END, HandleRange, LabelMatch,
-        MetadataRegistryRecord, PlacementBinding, PlacementRef, PlacementScope, RealmId,
-        RealmNodeKind,
+        FIRST_GRANTABLE_HANDLE, HandleRange, LabelMatch, MetadataRegistryRecord, PlacementBinding,
+        PlacementRef, PlacementScope, RealmId, RealmNodeKind, owner_handle_band,
     };
     use aruna_core::structured_id::PlacementHandle;
     use aruna_core::task::{TaskEffect, TaskKey};
@@ -1785,16 +1785,34 @@ mod tests {
     }
 
     #[test]
-    fn realm_exhaustion_none() {
+    fn owner_band_exhausts() {
+        // A coordinator already holding its band draws no second range, while a
+        // different owner still draws its own disjoint band.
         let realm_id = RealmId::from_bytes([52; 32]);
         let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        let owner = node(3);
+        let (start, end) = owner_handle_band(&owner);
         document.placement_handle_ranges.push(HandleRange {
             range_id: Ulid::generate(),
-            owner: node(2),
-            start: FIRST_HANDLE,
-            end: HANDLE_SPACE_END,
+            owner,
+            start,
+            end,
         });
-        assert!(next_handle_range(&document, node(3)).is_none());
+        assert!(next_handle_range(&document, owner).is_none());
+        assert!(next_handle_range(&document, node(4)).is_some());
+    }
+
+    #[test]
+    fn cross_node_grants_disjoint() {
+        // Two coordinators computing from the same replicated snapshot pick
+        // non-overlapping ranges, so both survive the derived directory.
+        let realm_id = RealmId::from_bytes([54; 32]);
+        let document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        let left = next_handle_range(&document, node(2)).unwrap();
+        let right = next_handle_range(&document, node(3)).unwrap();
+        assert!(!left.overlaps(&right));
+        let directory = aruna_core::structs::HandleRangeDirectory::from_ranges(&[left, right]);
+        assert_eq!(directory.conflicts(), 0);
     }
 
     #[tokio::test]
@@ -1812,7 +1830,6 @@ mod tests {
             .await
             .unwrap();
         assert!(!first.overlaps(&second));
-        assert_eq!(second.start, first.end);
 
         let stored = drive(GetRealmConfigOperation::new(realm_id), &context)
             .await
