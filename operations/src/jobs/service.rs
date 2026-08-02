@@ -3,9 +3,12 @@ use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    ArtifactRef, ExecutionSpec, ExportRoCrateSpec, ImportRoCrateSpec, JobId, JobPayload, JobRecord,
-    JobResultPayload, JobState, RunCrateStatus, StagingJobSpec, WorkspaceMode, user_dedup_key,
+    ArtifactRef, DEFAULT_SHARD_COUNT, DocumentClass, ExecutionSpec, ExportRoCrateSpec,
+    ImportRoCrateSpec, JOBCONTROL_HANDLE, JobError, JobId, JobPayload, JobProgress, JobRecord,
+    JobResultPayload, JobState, PlacementScope, RealmId, RunCrateStatus, StagingJobSpec,
+    WorkspaceMode, shard_for_subject, user_dedup_key,
 };
+use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{NodeId, UserId, Value};
 use aruna_core::util::unix_timestamp_millis;
@@ -20,11 +23,65 @@ use super::store::{
     read_artifact_tombstone, read_job_record, read_run_crate_status, set_cancel_requested,
 };
 use super::submit::{
-    SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, schedule_job_drain_effect,
+    SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_job_id,
+    schedule_job_drain_effect,
 };
 use super::workflow::finalize_followups;
 use crate::driver::{DriverContext, drive};
+use crate::metadata::api::load_realm_config;
 use crate::metadata::repository::StorageReadError;
+use crate::placement::choose_origin_bucket;
+
+async fn mint_local_job(
+    context: &DriverContext,
+    realm_id: RealmId,
+    owner_node_id: NodeId,
+) -> Result<JobId, SubmitJobError> {
+    let handle = PlacementHandle::new(JOBCONTROL_HANDLE)
+        .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
+    let entropy = ulid::Ulid::generate().to_bytes();
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        let shard = shard_for_subject(&entropy, DEFAULT_SHARD_COUNT);
+        let bucket = BucketId::new(shard as u16)
+            .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
+        return Ok(mint_job_id(handle, bucket)?);
+    };
+    if net_handle.node_id() != owner_node_id || *net_handle.realm_id() != realm_id {
+        return Err(SubmitJobError::PlacementUnavailable(
+            "job owner does not match the serving node".to_string(),
+        ));
+    }
+    let config = load_realm_config(context, realm_id).await.ok_or_else(|| {
+        SubmitJobError::PlacementUnavailable("realm config unavailable".to_string())
+    })?;
+    let tuple = config
+        .binding_directory()
+        .resolve(handle)
+        .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
+    if tuple.document_class != DocumentClass::JobControl
+        || tuple.scope != PlacementScope::Realm(realm_id)
+    {
+        return Err(SubmitJobError::PlacementUnavailable(
+            "reserved job-control binding does not match this realm".to_string(),
+        ));
+    }
+    let strategy = config.strategy(&tuple.strategy_id).ok_or_else(|| {
+        SubmitJobError::PlacementUnavailable("job-control strategy unavailable".to_string())
+    })?;
+    let placement =
+        choose_origin_bucket(&config, strategy, owner_node_id, &entropy).ok_or_else(|| {
+            SubmitJobError::PlacementUnavailable(
+                "serving node holds no job-control bucket".to_string(),
+            )
+        })?;
+    let bucket = u16::try_from(placement.shard)
+        .ok()
+        .and_then(|shard| BucketId::new(shard).ok())
+        .ok_or_else(|| {
+            SubmitJobError::PlacementUnavailable("job bucket is out of range".to_string())
+        })?;
+    Ok(mint_job_id(handle, bucket)?)
+}
 
 /// Submit a container execution job on behalf of `created_by`. The drain claims it
 /// and drives the fenced external attempt lifecycle. The idempotency key is
@@ -85,17 +142,21 @@ pub async fn submit_execution_job(
         ));
     }
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
+    let job_id = mint_local_job(context, created_by.realm_id, owner_node_id).await?;
     drive(
-        SubmitJobOperation::new(SubmitJobSpec {
-            payload: JobPayload::Execution(spec),
-            created_by,
-            owner_node_id,
-            dedup_key,
-            now_ms: unix_timestamp_millis(),
-            retention_ms,
-            workspace_mode,
-            workspace_bucket,
-        }),
+        SubmitJobOperation::new(
+            SubmitJobSpec {
+                payload: JobPayload::Execution(spec),
+                created_by,
+                owner_node_id,
+                dedup_key,
+                now_ms: unix_timestamp_millis(),
+                retention_ms,
+                workspace_mode,
+                workspace_bucket,
+            },
+            job_id,
+        ),
         context,
     )
     .await
@@ -108,17 +169,21 @@ pub async fn submit_staging_job(
     retention_ms: u64,
 ) -> Result<SubmitJobResult, SubmitJobError> {
     let created_by = spec.auth_context.user_id;
+    let job_id = mint_local_job(context, created_by.realm_id, owner_node_id).await?;
     drive(
-        SubmitJobOperation::new(SubmitJobSpec {
-            payload: JobPayload::Staging(spec),
-            created_by,
-            owner_node_id,
-            dedup_key: None,
-            now_ms: unix_timestamp_millis(),
-            retention_ms,
-            workspace_mode: WorkspaceMode::default(),
-            workspace_bucket: None,
-        }),
+        SubmitJobOperation::new(
+            SubmitJobSpec {
+                payload: JobPayload::Staging(spec),
+                created_by,
+                owner_node_id,
+                dedup_key: None,
+                now_ms: unix_timestamp_millis(),
+                retention_ms,
+                workspace_mode: WorkspaceMode::default(),
+                workspace_bucket: None,
+            },
+            job_id,
+        ),
         context,
     )
     .await
@@ -133,17 +198,21 @@ pub async fn submit_rocrate_import(
     let created_by = spec.auth_context.user_id;
     let retention_ms = spec.limits.artifact_retention_ms;
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
+    let job_id = mint_local_job(context, created_by.realm_id, owner_node_id).await?;
     drive(
-        SubmitJobOperation::new(SubmitJobSpec {
-            payload: JobPayload::ImportRoCrate(spec),
-            created_by,
-            owner_node_id,
-            dedup_key,
-            now_ms: unix_timestamp_millis(),
-            retention_ms,
-            workspace_mode: WorkspaceMode::default(),
-            workspace_bucket: None,
-        }),
+        SubmitJobOperation::new(
+            SubmitJobSpec {
+                payload: JobPayload::ImportRoCrate(spec),
+                created_by,
+                owner_node_id,
+                dedup_key,
+                now_ms: unix_timestamp_millis(),
+                retention_ms,
+                workspace_mode: WorkspaceMode::default(),
+                workspace_bucket: None,
+            },
+            job_id,
+        ),
         context,
     )
     .await
@@ -190,17 +259,21 @@ pub async fn submit_export_job(
     let created_by = spec.auth_context.user_id;
     let retention_ms = spec.limits.artifact_retention_ms;
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
+    let job_id = mint_local_job(context, created_by.realm_id, owner_node_id).await?;
     drive(
-        SubmitJobOperation::new(SubmitJobSpec {
-            payload: JobPayload::ExportRoCrate(spec),
-            created_by,
-            owner_node_id,
-            dedup_key,
-            now_ms: unix_timestamp_millis(),
-            workspace_mode: WorkspaceMode::default(),
-            workspace_bucket: None,
-            retention_ms,
-        }),
+        SubmitJobOperation::new(
+            SubmitJobSpec {
+                payload: JobPayload::ExportRoCrate(spec),
+                created_by,
+                owner_node_id,
+                dedup_key,
+                now_ms: unix_timestamp_millis(),
+                workspace_mode: WorkspaceMode::default(),
+                workspace_bucket: None,
+                retention_ms,
+            },
+            job_id,
+        ),
         context,
     )
     .await

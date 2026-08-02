@@ -13,9 +13,10 @@ use std::time::{Duration, Instant};
 use aruna_compute::executor::docker::DockerBackend;
 use aruna_compute::{DockerConfig, ExecutorBackend, ExecutorRegistry};
 use aruna_core::structs::{
-    ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId, JobPayload,
-    JobRecord, JobState, OutputDestination, OutputSelection, RunCrateStatus,
+    ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JOBCONTROL_HANDLE,
+    JobId, JobPayload, JobRecord, JobState, OutputDestination, OutputSelection, RunCrateStatus,
 };
+use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::reconcile::ExternalReconciler;
 use aruna_operations::jobs::runtime::JobsRuntime;
@@ -23,6 +24,7 @@ use aruna_operations::jobs::store::{
     ClaimOutcome, JobMutation, claim_job, insert_job, mutate_job, read_job_record,
     read_run_crate_status,
 };
+use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::jobs::workflow::reconcile::ComputeReconciler;
 use aruna_operations::jobs::workflow::run_execution_job;
 use aws_sdk_s3::primitives::ByteStream;
@@ -32,6 +34,14 @@ use shared::{
 };
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
+
+fn job_id() -> JobId {
+    mint_job_id(
+        PlacementHandle::new(JOBCONTROL_HANDLE).unwrap(),
+        BucketId::new(0).unwrap(),
+    )
+    .unwrap()
+}
 
 /// A reachable, healthy Docker daemon, or `None` (test skips).
 async fn docker_or_skip() -> Option<DockerBackend> {
@@ -164,7 +174,7 @@ fn execution_spec(
 async fn claim_execution(fixture: &Fixture, spec: ExecutionSpec) -> (JobId, JobRecord) {
     let ctx = fixture.compute_ctx.as_ref();
     let node_id = ctx.net_handle.as_ref().unwrap().node_id();
-    let job_id = JobId::new();
+    let job_id = job_id();
     let record = JobRecord::new(
         job_id,
         JobPayload::Execution(spec),
@@ -239,7 +249,10 @@ async fn wait_run_crate(
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(Some(status)) = read_run_crate_status(&ctx.storage_handle, job_id).await
-            && status != RunCrateStatus::Pending
+            && !matches!(
+                status,
+                RunCrateStatus::Pending | RunCrateStatus::Minted { .. }
+            )
         {
             return Some(status);
         }

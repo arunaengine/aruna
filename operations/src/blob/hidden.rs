@@ -211,11 +211,10 @@ fn is_orphaned(
     if referenced.contains(&entry.key) {
         return false;
     }
-    if entry
-        .key
-        .namespace()
-        .is_ok_and(|namespace| active_rocrate.contains(&JobId(namespace)))
-    {
+    if entry.key.namespace().is_ok_and(|namespace| {
+        JobId::try_from_bytes(namespace.to_bytes())
+            .is_ok_and(|job_id| active_rocrate.contains(&job_id))
+    }) {
         return false;
     }
     entry.modified_at.is_some_and(|modified| modified <= cutoff)
@@ -363,7 +362,7 @@ mod tests {
         assert!(!is_orphaned(
             &entry,
             &HashSet::new(),
-            &HashSet::from([JobId(namespace)]),
+            &HashSet::from([JobId::from_bytes(namespace.to_bytes())]),
             UNIX_EPOCH
         ));
     }

@@ -365,6 +365,12 @@ pub(crate) fn map_submit_error(
             ServerError::Conflict(format!("active RO-Crate job limit of {limit} reached"))
         }
         SubmitJobError::InvalidWorkspace(_) => ServerError::BadRequest,
+        SubmitJobError::ClockHealth(_) => {
+            ServerError::ServiceUnavailableReason("structured_id_clock_unhealthy".to_string())
+        }
+        SubmitJobError::PlacementUnavailable(_) => {
+            ServerError::ServiceUnavailableReason("job_placement_unavailable".to_string())
+        }
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -530,7 +536,9 @@ pub async fn list_jobs(
         (status = 200, description = "Idempotent match of an existing job", body = SubmitJobResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 409, description = "Idempotency key bound to a different plan", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse)
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Realm access forbidden", body = ErrorResponse),
+        (status = 503, description = "Job placement unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1097,9 +1105,11 @@ mod tests {
     use aruna_core::structs::{
         ArtifactRef, BackendLocation, BackendRef, ExportOmissionCounts, ExportRoCrateResult,
         ExportRoCrateSpec, ImportMetadataTarget, ImportReportDetail, ImportRoCrateResult,
-        ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobProgress, JobResultPayload,
-        NodeCapabilities, PathRestriction, Permission, RealmId, ReasonCode, RoCrateLimits,
+        ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JOBCONTROL_HANDLE, JobPayload,
+        JobProgress, JobResultPayload, NodeCapabilities, PathRestriction, Permission, RealmId,
+        ReasonCode, RoCrateLimits,
     };
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::{NodeId, UserId};
     use aruna_operations::driver::DriverContext;
     use aruna_operations::jobs::runtime::JobsRuntime;
@@ -1122,6 +1132,16 @@ mod tests {
 
     fn user(byte: u8) -> UserId {
         UserId::new(Ulid::from_bytes([byte; 16]), realm())
+    }
+
+    fn job_id(timestamp_ms: u64) -> JobId {
+        JobId::from_parts(
+            timestamp_ms,
+            PlacementHandle::new(JOBCONTROL_HANDLE).unwrap(),
+            BucketId::new(0).unwrap(),
+            0,
+        )
+        .unwrap()
     }
 
     fn auth_for(user_id: UserId) -> Option<AuthContext> {
@@ -1361,7 +1381,7 @@ mod tests {
         for seq in 1..=3u64 {
             insert_job(
                 &state.get_ctx().storage_handle,
-                &job_for(JobId(Ulid::from_parts(seq, 0)), owner, seq * 1000),
+                &job_for(job_id(seq), owner, seq * 1000),
             )
             .await
             .unwrap();
@@ -1379,10 +1399,7 @@ mod tests {
         .unwrap();
         assert_eq!(page1.jobs.len(), 2);
         // Newest first: seq 3 then seq 2.
-        assert_eq!(
-            page1.jobs[0].job_id,
-            JobId(Ulid::from_parts(3, 0)).to_string()
-        );
+        assert_eq!(page1.jobs[0].job_id, job_id(3).to_string());
         let cursor = page1.next_cursor.clone().expect("cursor for next page");
 
         let (_, Json(page2)) = list_jobs(
@@ -1397,10 +1414,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(page2.jobs.len(), 1);
-        assert_eq!(
-            page2.jobs[0].job_id,
-            JobId(Ulid::from_parts(1, 0)).to_string()
-        );
+        assert_eq!(page2.jobs[0].job_id, job_id(1).to_string());
         assert!(page2.next_cursor.is_none());
     }
 
@@ -1883,7 +1897,7 @@ mod tests {
             workspace_request(None).unwrap(),
             (WorkspaceMode::Kept, None)
         );
-        let record = job_for(JobId(Ulid::from_parts(1, 0)), user(2), 1);
+        let record = job_for(job_id(1), user(2), 1);
         assert_eq!(job_status_response(&record).workspace_mode, "kept");
         assert!(
             workspace_request(Some(WorkspaceRequest {

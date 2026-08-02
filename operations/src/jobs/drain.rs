@@ -398,8 +398,10 @@ mod tests {
     use crate::jobs::JOB_LEASE_MS;
     use crate::jobs::store::insert_job;
     use aruna_core::structs::{
-        AttemptIntent, JobClaim, JobPayload, JobState, RealmId, job_due_index_key,
+        AttemptIntent, JOBCONTROL_HANDLE, JobClaim, JobPayload, JobState, RealmId,
+        job_due_index_key,
     };
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::UserId;
     use aruna_storage::FjallStorage;
     use std::sync::Mutex;
@@ -422,6 +424,16 @@ mod tests {
         let mut seed_bytes = [0u8; 32];
         seed_bytes[0] = seed;
         iroh::SecretKey::from_bytes(&seed_bytes).public()
+    }
+
+    fn job_id(timestamp_ms: u64) -> JobId {
+        JobId::from_parts(
+            timestamp_ms,
+            PlacementHandle::new(JOBCONTROL_HANDLE).unwrap(),
+            BucketId::new(0).unwrap(),
+            0,
+        )
+        .unwrap()
     }
 
     fn budget_of(slots: usize) -> JobClassBudget {
@@ -454,12 +466,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         for seq in 1..=3u128 {
-            insert_job(
-                &storage,
-                &queued_record(JobId(Ulid::from_parts(seq as u64, 0)), 1),
-            )
-            .await
-            .unwrap();
+            insert_job(&storage, &queued_record(job_id(seq as u64), 1))
+                .await
+                .unwrap();
         }
 
         let budget = JobClassBudget {
@@ -480,11 +489,11 @@ mod tests {
         // index must not claim and release the external row it cannot run.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let external = JobId(Ulid::from_parts(1, 0));
+        let external = job_id(1);
         let mut record = queued_record(external, 1);
         record.execution_class = JobExecutionClass::ExternalAttempt;
         insert_job(&storage, &record).await.unwrap();
-        let internal = JobId(Ulid::from_parts(2, 0));
+        let internal = job_id(2);
         insert_job(&storage, &queued_record(internal, 1))
             .await
             .unwrap();
@@ -527,7 +536,7 @@ mod tests {
         // back off instead of re-arming the drain at zero.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let job_id = JobId(Ulid::from_parts(1, 0));
+        let job_id = job_id(1);
         insert_job(&storage, &queued_record(job_id, 1))
             .await
             .unwrap();

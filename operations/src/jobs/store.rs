@@ -2128,9 +2128,10 @@ mod tests {
     use aruna_core::structs::{
         AuthContext, ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportReportDetail,
         ImportReportRow, ImportRoCrateResult, ImportRoCrateSource, ImportRoCrateSpec,
-        ImportRoCrateTarget, JOB_LEASE_INDEX_PREFIX, JobPayload, RealmId, ReasonCode,
-        RoCrateLimits, parse_job_schedule_index_key,
+        ImportRoCrateTarget, JOB_LEASE_INDEX_PREFIX, JOBCONTROL_HANDLE, JobPayload, RealmId,
+        ReasonCode, RoCrateLimits, parse_job_schedule_index_key,
     };
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::UserId;
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
@@ -2146,6 +2147,16 @@ mod tests {
         let mut seed_bytes = [0u8; 32];
         seed_bytes[0] = seed;
         iroh::SecretKey::from_bytes(&seed_bytes).public()
+    }
+
+    fn job_id(timestamp_ms: u64) -> JobId {
+        JobId::from_parts(
+            timestamp_ms,
+            PlacementHandle::new(JOBCONTROL_HANDLE).unwrap(),
+            BucketId::new(0).unwrap(),
+            0,
+        )
+        .unwrap()
     }
 
     fn queued_record(job_id: JobId) -> JobRecord {
@@ -3015,7 +3026,7 @@ mod tests {
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
         let make = |seq: u64, state: JobState| {
             let mut record = JobRecord::new(
-                JobId(Ulid::from_parts(seq, 0)),
+                job_id(seq),
                 JobPayload::Probe {
                     steps: 1,
                     step_sleep_ms: 0,
@@ -3043,7 +3054,7 @@ mod tests {
             &storage,
             vec![(
                 JOB_OWNER_INDEX_KEYSPACE.to_string(),
-                job_owner_index_key(owner, 2_000, JobId(Ulid::from_parts(2, 0))),
+                job_owner_index_key(owner, 2_000, job_id(2)),
                 empty_value(),
             )],
             None,

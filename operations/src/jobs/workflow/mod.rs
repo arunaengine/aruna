@@ -1666,7 +1666,10 @@ mod tests {
     use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
     use aruna_compute::executor::logs::LogSink;
     use aruna_core::compute::{LogTails, NOBODY, TaskOutput};
-    use aruna_core::structs::{ComputeResources, JobErrorKind, JobState, RealmId};
+    use aruna_core::structs::{
+        ComputeResources, JOBCONTROL_HANDLE, JobErrorKind, JobState, RealmId,
+    };
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
@@ -1675,6 +1678,14 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::Notify;
     use ulid::Ulid;
+
+    fn job_id() -> JobId {
+        crate::jobs::submit::mint_job_id(
+            PlacementHandle::new(JOBCONTROL_HANDLE).unwrap(),
+            BucketId::new(0).unwrap(),
+        )
+        .unwrap()
+    }
 
     enum StubReconcile {
         NotFound,
@@ -1854,7 +1865,7 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let context = context(storage);
         let spec = execution_spec();
-        let job_id = JobId::new();
+        let job_id = job_id();
         let record = JobRecord::new(
             job_id,
             JobPayload::Execution(spec.clone()),
@@ -1909,7 +1920,7 @@ mod tests {
     /// A claimed execution job in `Ready` with its attempt intent written, i.e.
     /// the exact state at the moment `backend.submit()` fails.
     async fn ready_with_intent(storage: &StorageHandle) -> (JobRecord, ulid::Ulid, AttemptRef) {
-        let job_id = JobId::new();
+        let job_id = job_id();
         let record = JobRecord::new(
             job_id,
             JobPayload::Execution(execution_spec()),

@@ -1,3 +1,4 @@
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use aruna_core::effects::{Effect, StorageEffect};
@@ -6,16 +7,17 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{JOB_ACTIVE_USER_KEYSPACE, JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    DEFAULT_SHARD_COUNT, JOBCONTROL_HANDLE, JobId, JobPayload, JobRecord, WorkspaceMode,
-    job_active_prefix, job_record_key, parse_job_dedup_value, shard_for_subject,
+    JobId, JobPayload, JobRecord, WorkspaceMode, job_active_prefix, job_record_key,
+    parse_job_dedup_value,
 };
-use aruna_core::structured_id::{BucketId, JobId as RoutableJobId, PlacementHandle, StructuredId};
+use aruna_core::structured_id::{
+    BucketId, ClockHealthError, JobId as RoutableJobId, PlacementHandle, StructuredIdGenerator,
+};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, NodeId, TxnId, UserId};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
-use ulid::Ulid;
 
 use super::store::{decode_job_record, job_dedup_index_key, job_insert_entries};
 
@@ -27,19 +29,18 @@ pub fn schedule_job_drain_effect() -> Effect {
     })
 }
 
-/// Fresh routable id for a new top-level job: creation-ordered by `now_ms`,
-/// placed in the reserved JobControl band, with a random subject spreading jobs
-/// across shards and a random nonce keeping each id unique.
-fn mint_job_id(now_ms: u64) -> JobId {
-    let handle = PlacementHandle::new(JOBCONTROL_HANDLE).expect("job-control handle is reserved");
-    let entropy = Ulid::generate().to_bytes();
-    let shard = shard_for_subject(&entropy, DEFAULT_SHARD_COUNT) as u16;
-    let bucket = BucketId::new(shard).expect("shard within bucket space");
-    let nonce =
-        u64::from_be_bytes(entropy[8..16].try_into().expect("8 bytes")) & ((1u64 << 48) - 1);
-    let routable =
-        RoutableJobId::from_parts(now_ms, handle, bucket, nonce).expect("structured job id");
-    JobId(routable.as_ulid())
+pub fn mint_job_id(handle: PlacementHandle, bucket: BucketId) -> Result<JobId, ClockHealthError> {
+    let mut generator = job_id_generator()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    generator
+        .mint::<RoutableJobId>(handle, bucket)
+        .map(JobId::from_routable)
+}
+
+fn job_id_generator() -> &'static Mutex<StructuredIdGenerator> {
+    static GENERATOR: OnceLock<Mutex<StructuredIdGenerator>> = OnceLock::new();
+    GENERATOR.get_or_init(|| Mutex::new(StructuredIdGenerator::new()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +68,10 @@ pub enum SubmitJobError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
+    #[error(transparent)]
+    ClockHealth(#[from] ClockHealthError),
+    #[error("job placement unavailable: {0}")]
+    PlacementUnavailable(String),
     #[error("idempotency key already bound to job {existing_job_id} with a different plan")]
     JobPlanConflict { existing_job_id: JobId },
     #[error("invalid workspace: {0}")]
@@ -121,13 +126,13 @@ pub struct SubmitJobOperation {
 }
 
 impl SubmitJobOperation {
-    pub fn new(spec: SubmitJobSpec) -> Self {
+    pub fn new(spec: SubmitJobSpec, job_id: JobId) -> Self {
         let active_cap = spec
             .payload
             .rocrate_limits()
             .map(|limits| limits.max_active_jobs);
         let mut record = JobRecord::new(
-            mint_job_id(spec.now_ms),
+            job_id,
             spec.payload,
             spec.created_by,
             spec.owner_node_id,
@@ -434,8 +439,8 @@ mod tests {
     };
     use aruna_core::structs::{
         AuthContext, ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource,
-        ImportRoCrateSpec, ImportRoCrateTarget, JobState, RealmId, RoCrateLimits,
-        encode_job_dedup_value,
+        ImportRoCrateSpec, ImportRoCrateTarget, JOBCONTROL_HANDLE, JobState, RealmId,
+        RoCrateLimits, encode_job_dedup_value,
     };
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
@@ -458,6 +463,15 @@ mod tests {
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
         }
+    }
+
+    fn operation(spec: SubmitJobSpec) -> SubmitJobOperation {
+        let job_id = mint_job_id(
+            PlacementHandle::new(JOBCONTROL_HANDLE).unwrap(),
+            BucketId::new(0).unwrap(),
+        )
+        .unwrap();
+        SubmitJobOperation::new(spec, job_id)
     }
 
     fn spec(dedup_key: Option<Vec<u8>>) -> SubmitJobSpec {
@@ -567,9 +581,7 @@ mod tests {
             ..spec(None)
         };
 
-        let result = drive(SubmitJobOperation::new(submission), &ctx)
-            .await
-            .unwrap();
+        let result = drive(operation(submission), &ctx).await.unwrap();
         let record = read_job_record(&storage, result.job_id, None)
             .await
             .unwrap()
@@ -587,9 +599,7 @@ mod tests {
         let mut submission = spec(None);
         submission.retention_ms = 42;
 
-        let result = drive(SubmitJobOperation::new(submission), &ctx)
-            .await
-            .unwrap();
+        let result = drive(operation(submission), &ctx).await.unwrap();
         let record = read_job_record(&storage, result.job_id, None)
             .await
             .unwrap()
@@ -611,12 +621,8 @@ mod tests {
             ..spec(None)
         };
 
-        let first = drive(SubmitJobOperation::new(submission.clone()), &ctx)
-            .await
-            .unwrap();
-        let second = drive(SubmitJobOperation::new(submission), &ctx)
-            .await
-            .unwrap();
+        let first = drive(operation(submission.clone()), &ctx).await.unwrap();
+        let second = drive(operation(submission), &ctx).await.unwrap();
 
         assert!(first.created);
         assert!(!second.created);
@@ -644,7 +650,7 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
 
-        let result = drive(SubmitJobOperation::new(spec(None)), &ctx)
+        let result = drive(operation(spec(None)), &ctx)
             .await
             .expect("submit succeeds");
         assert!(result.created);
@@ -668,13 +674,13 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
 
-        let first = drive(SubmitJobOperation::new(spec(Some(b"k".to_vec()))), &ctx)
+        let first = drive(operation(spec(Some(b"k".to_vec()))), &ctx)
             .await
             .unwrap();
         assert!(first.created);
         assert_eq!(count_keyspace(&storage, JOB_DEDUP_INDEX_KEYSPACE).await, 1);
 
-        let second = drive(SubmitJobOperation::new(spec(Some(b"k".to_vec()))), &ctx)
+        let second = drive(operation(spec(Some(b"k".to_vec()))), &ctx)
             .await
             .unwrap();
         assert!(!second.created);
@@ -688,12 +694,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
-        let first = drive(SubmitJobOperation::new(rocrate_spec(1, None)), &ctx)
-            .await
-            .unwrap();
+        let first = drive(operation(rocrate_spec(1, None)), &ctx).await.unwrap();
 
         assert_eq!(
-            drive(SubmitJobOperation::new(rocrate_spec(1, None)), &ctx).await,
+            drive(operation(rocrate_spec(1, None)), &ctx).await,
             Err(SubmitJobError::ActiveJobLimit { limit: 1 })
         );
 
@@ -713,7 +717,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            drive(SubmitJobOperation::new(rocrate_spec(1, None)), &ctx)
+            drive(operation(rocrate_spec(1, None)), &ctx)
                 .await
                 .unwrap()
                 .created
@@ -726,12 +730,8 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
         let submission = rocrate_spec(1, Some(b"import".to_vec()));
-        let first = drive(SubmitJobOperation::new(submission.clone()), &ctx)
-            .await
-            .unwrap();
-        let second = drive(SubmitJobOperation::new(submission.clone()), &ctx)
-            .await
-            .unwrap();
+        let first = drive(operation(submission.clone()), &ctx).await.unwrap();
+        let second = drive(operation(submission.clone()), &ctx).await.unwrap();
 
         assert!(first.created);
         assert!(!second.created);
@@ -752,9 +752,7 @@ mod tests {
             .await
             .unwrap();
 
-        let terminal = drive(SubmitJobOperation::new(submission), &ctx)
-            .await
-            .unwrap();
+        let terminal = drive(operation(submission), &ctx).await.unwrap();
         assert!(!terminal.created);
         assert_eq!(terminal.job_id, first.job_id);
     }
@@ -766,12 +764,12 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
 
-        let first = drive(SubmitJobOperation::new(spec(Some(b"k".to_vec()))), &ctx)
+        let first = drive(operation(spec(Some(b"k".to_vec()))), &ctx)
             .await
             .unwrap();
         let mut other = spec(Some(b"k".to_vec()));
         other.created_by = UserId::new(Ulid::from_bytes([3u8; 16]), RealmId([1u8; 32]));
-        let second = drive(SubmitJobOperation::new(other), &ctx).await.unwrap();
+        let second = drive(operation(other), &ctx).await.unwrap();
 
         assert!(first.created);
         assert!(second.created);
@@ -791,9 +789,7 @@ mod tests {
             unreachable!()
         };
         *steps = 2;
-        let first = drive(SubmitJobOperation::new(first_spec), &ctx)
-            .await
-            .unwrap();
+        let first = drive(operation(first_spec), &ctx).await.unwrap();
         assert!(first.created);
 
         let mut conflicting = spec(Some(b"k".to_vec()));
@@ -801,7 +797,7 @@ mod tests {
             unreachable!()
         };
         *steps = 9;
-        let error = drive(SubmitJobOperation::new(conflicting), &ctx)
+        let error = drive(operation(conflicting), &ctx)
             .await
             .expect_err("differing plan must conflict");
         assert_eq!(
@@ -823,9 +819,7 @@ mod tests {
         let ctx = context(storage.clone());
 
         let before = storage.snapshot_metrics().requests_total;
-        drive(SubmitJobOperation::new(spec(None)), &ctx)
-            .await
-            .unwrap();
+        drive(operation(spec(None)), &ctx).await.unwrap();
         let after = storage.snapshot_metrics().requests_total;
         assert_eq!(
             after - before,
@@ -858,9 +852,7 @@ mod tests {
         )
         .await;
 
-        let result = drive(SubmitJobOperation::new(submission), &ctx)
-            .await
-            .unwrap();
+        let result = drive(operation(submission), &ctx).await.unwrap();
         assert!(result.created);
         assert_ne!(result.job_id, ghost);
         assert_eq!(
@@ -889,7 +881,7 @@ mod tests {
         )
         .await;
 
-        let result = drive(SubmitJobOperation::new(submission), &ctx)
+        let result = drive(operation(submission), &ctx)
             .await
             .expect("ghost row must not conflict");
         assert!(result.created);
@@ -927,9 +919,7 @@ mod tests {
         )
         .await;
 
-        let result = drive(SubmitJobOperation::new(submission), &ctx)
-            .await
-            .unwrap();
+        let result = drive(operation(submission), &ctx).await.unwrap();
         assert!(result.created);
         assert_ne!(result.job_id, ghost);
         assert_eq!(
@@ -946,7 +936,7 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
 
-        let first = drive(SubmitJobOperation::new(spec(Some(b"k".to_vec()))), &ctx)
+        let first = drive(operation(spec(Some(b"k".to_vec()))), &ctx)
             .await
             .unwrap();
         // Take the job through claim + terminal so the dedup entry is cleared.
@@ -965,7 +955,7 @@ mod tests {
             .await
             .unwrap();
 
-        let second = drive(SubmitJobOperation::new(spec(Some(b"k".to_vec()))), &ctx)
+        let second = drive(operation(spec(Some(b"k".to_vec()))), &ctx)
             .await
             .unwrap();
         assert!(second.created);

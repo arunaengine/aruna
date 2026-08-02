@@ -519,7 +519,7 @@ async fn spool_source(
     let blob = cancel_source_stream(blob, ctx.cancel.clone(), ctx.shutdown.clone());
     let event = blob_handle
         .send_blob_effect(BlobEffect::SpoolHidden {
-            namespace: ctx.job_id.0,
+            namespace: ctx.job_id.as_ulid(),
             name: "input".to_string(),
             created_by,
             max_bytes: Some(limit),

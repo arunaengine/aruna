@@ -1769,7 +1769,7 @@ async fn assemble_export(
     )));
     let event = blob_handle
         .send_blob_effect(BlobEffect::SpoolHidden {
-            namespace: ctx.job_id.0,
+            namespace: ctx.job_id.as_ulid(),
             name: "rocrate.zip".to_string(),
             created_by: spec.auth_context.user_id,
             max_bytes: Some(spec.limits.export_artifact_bytes),

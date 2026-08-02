@@ -2133,9 +2133,10 @@ mod tests {
     use aruna_core::metadata::{MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord};
     use aruna_core::storage_entries::notification_outbox_write_entry;
     use aruna_core::structs::{
-        Actor, JobId, JobPayload, JobRecord, JobState, NotificationClass, NotificationKind,
-        NotificationOutboxRecord, RealmConfigDocument, RealmId, RealmNodeKind,
+        Actor, JOBCONTROL_HANDLE, JobId, JobPayload, JobRecord, JobState, NotificationClass,
+        NotificationKind, NotificationOutboxRecord, RealmConfigDocument, RealmId, RealmNodeKind,
     };
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
@@ -2146,6 +2147,14 @@ mod tests {
     use ulid::Ulid;
 
     use crate::notifications::outbox::new_notification_outbox_record;
+
+    fn job_id() -> JobId {
+        crate::jobs::submit::mint_job_id(
+            PlacementHandle::new(JOBCONTROL_HANDLE).unwrap(),
+            BucketId::new(0).unwrap(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn blocked_batch_waits() {
@@ -2234,7 +2243,7 @@ mod tests {
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
         });
-        let job_id = JobId::new();
+        let job_id = job_id();
         let record = JobRecord::new(
             job_id,
             JobPayload::Probe {
