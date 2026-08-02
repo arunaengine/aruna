@@ -308,7 +308,20 @@ pub(crate) async fn handle_job_stream(
         return;
     }
     if let Some(body) = prepared.body.as_mut() {
-        while let Some(chunk) = body.next().await {
+        loop {
+            // Bound the source poll so a stalled artifact reader releases its
+            // blob-read and inbound-handler permits instead of pinning them.
+            let next = match timeout(JOB_IO_TIMEOUT, body.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    warn!(%peer, "Timed out reading job artifact source");
+                    stream.0.reset(1u32.into()).ok();
+                    return;
+                }
+            };
+            let Some(chunk) = next else {
+                break;
+            };
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(error) => {
