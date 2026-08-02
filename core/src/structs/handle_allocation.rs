@@ -15,7 +15,7 @@ use crate::structured_id::PlacementHandle;
 /// and excluded from allocation, mirroring [`crate::structs::BindingDirectory`].
 #[derive(Debug, Default, Clone)]
 pub struct HandleRangeDirectory {
-    by_id: HashMap<Ulid, HandleRange>,
+    by_id: HashMap<Ulid, BTreeSet<HandleRange>>,
     conflicted: BTreeSet<Ulid>,
 }
 
@@ -24,23 +24,31 @@ impl HandleRangeDirectory {
         let mut directory = Self::default();
         // Distinct value re-using a `range_id` is a same-key divergence.
         for range in ranges {
-            match directory.by_id.get(&range.range_id) {
-                Some(existing) if existing == range => {}
-                Some(_) => {
+            match directory.by_id.get_mut(&range.range_id) {
+                Some(existing) if existing.contains(range) => {}
+                Some(existing) => {
+                    existing.insert(*range);
                     directory.conflicted.insert(range.range_id);
                 }
                 None => {
-                    directory.by_id.insert(range.range_id, *range);
+                    directory
+                        .by_id
+                        .insert(range.range_id, BTreeSet::from([*range]));
                 }
             }
         }
         // Any two ranges whose intervals intersect are both fail-closed.
-        let ids: Vec<Ulid> = directory.by_id.keys().copied().collect();
-        for (i, left_id) in ids.iter().enumerate() {
-            for right_id in &ids[i + 1..] {
-                let left = directory.by_id[left_id];
-                let right = directory.by_id[right_id];
-                if left.overlaps(&right) {
+        let ranges: Vec<(Ulid, HandleRange)> = directory
+            .by_id
+            .iter()
+            .flat_map(|(range_id, ranges)| ranges.iter().map(|range| (*range_id, *range)))
+            .collect();
+        for (i, (left_id, left)) in ranges.iter().enumerate() {
+            for (right_id, right) in &ranges[i + 1..] {
+                if left_id == right_id {
+                    continue;
+                }
+                if left.overlaps(right) {
                     directory.conflicted.insert(*left_id);
                     directory.conflicted.insert(*right_id);
                 }
@@ -58,8 +66,10 @@ impl HandleRangeDirectory {
     pub fn granted_to(&self, owner: &NodeId) -> Vec<HandleRange> {
         let mut ranges: Vec<HandleRange> = self
             .by_id
-            .values()
-            .filter(|range| range.owner == *owner && !self.conflicted.contains(&range.range_id))
+            .iter()
+            .filter(|(range_id, _)| !self.conflicted.contains(range_id))
+            .flat_map(|(_, ranges)| ranges)
+            .filter(|range| range.owner == *owner)
             .copied()
             .collect();
         ranges.sort_by_key(|range| (range.start, range.range_id));
@@ -69,14 +79,16 @@ impl HandleRangeDirectory {
     pub fn owned_range(&self, range_id: &Ulid, owner: &NodeId) -> Option<HandleRange> {
         self.by_id
             .get(range_id)
-            .copied()
-            .filter(|range| range.owner == *owner && !self.conflicted.contains(&range.range_id))
+            .filter(|_| !self.conflicted.contains(range_id))
+            .and_then(|ranges| ranges.first().copied())
+            .filter(|range| range.owner == *owner)
     }
 
     /// Next ungranted start, including conflicted ranges in the occupied span.
     pub fn next_grantable_start(&self) -> u32 {
         self.by_id
             .values()
+            .flat_map(|ranges| ranges.iter())
             .map(|range| range.end)
             .max()
             .unwrap_or(FIRST_GRANTABLE_HANDLE)
@@ -164,6 +176,19 @@ mod tests {
         // Order-independent: reversing the input yields the same verdict.
         let reversed = HandleRangeDirectory::from_ranges(&[ranges[1], ranges[0]]);
         assert_eq!(reversed.conflicts(), 2);
+    }
+
+    #[test]
+    fn divergence_occupies_span() {
+        let owner = node(1);
+        let first = range(1, owner, 3, 1027);
+        let divergent = range(1, owner, 1027, 2051);
+        let overlap = range(2, owner, 1500, 2500);
+        let directory = HandleRangeDirectory::from_ranges(&[first, divergent, overlap]);
+
+        assert_eq!(directory.conflicts(), 2);
+        assert!(directory.granted_to(&owner).is_empty());
+        assert_eq!(directory.next_grantable_start(), 2500);
     }
 
     #[test]
