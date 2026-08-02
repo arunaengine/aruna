@@ -6,7 +6,7 @@ use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{JOB_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE};
 use aruna_core::structs::{
-    JOB_DUE_INDEX_PREFIX, JOB_LEASE_INDEX_PREFIX, JOB_RECORD_KEY_PREFIX, JobError,
+    AuthContext, JOB_DUE_INDEX_PREFIX, JOB_LEASE_INDEX_PREFIX, JOB_RECORD_KEY_PREFIX, JobError,
     JobExecutionClass, JobId, JobRecord, JobState, job_lease_index_key,
     parse_job_schedule_index_key,
 };
@@ -18,7 +18,9 @@ use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use tracing::warn;
 
-use super::protocol::resolve_job_holders;
+use super::protocol::{
+    JobRequest, JobResponse, resolve_job_authority, resolve_job_holders, send_job_request,
+};
 use super::reconcile::ExternalReconciler;
 use super::store::{
     ClaimOutcome, JobMutationError, RequeueOutcome, batch_delete, claim_job, decode_job_record,
@@ -26,6 +28,7 @@ use super::store::{
 };
 use super::{JOB_DRAIN_BATCH_SIZE, JOB_RECONCILE_REARM};
 use crate::driver::DriverContext;
+use crate::metadata::MetadataAuthToken;
 
 /// Per-class claim budget. Both classes share one due index, so a saturated class
 /// must be skipped during the scan rather than claimed and released again.
@@ -333,6 +336,22 @@ async fn claim_due_jobs(
                 }
             };
             if let Some(context) = route_context {
+                match deliver_due_job(context, holder_node_id, &record).await {
+                    Ok(true) => {
+                        if let Err(error) = delete_schedule_row(storage, key).await {
+                            warn!(job_id = %job_id, error = %error, "Failed to acknowledge delivered job");
+                            result.retry_after_error = true;
+                            break 'pages;
+                        }
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        warn!(job_id = %job_id, error = %error, "Failed to deliver queued job");
+                        result.retry_after_error = true;
+                        break 'pages;
+                    }
+                }
                 let route = match resolve_job_holders(context, job_id).await {
                     Ok(route) => route,
                     Err(error) => {
@@ -385,6 +404,44 @@ async fn claim_due_jobs(
         }
     }
     Ok(())
+}
+
+async fn deliver_due_job(
+    context: &DriverContext,
+    local_node: NodeId,
+    record: &JobRecord,
+) -> Result<bool, String> {
+    if record.state != JobState::Queued || record.owner_node_id == local_node {
+        return Ok(false);
+    }
+    let route = resolve_job_authority(context, record.created_by.realm_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if route.holders.first().copied() != Some(local_node) {
+        return Ok(false);
+    }
+    let reply = send_job_request(
+        context,
+        record.owner_node_id,
+        JobRequest::Deliver {
+            auth_token: MetadataAuthToken::internal(AuthContext {
+                user_id: record.created_by,
+                realm_id: record.created_by.realm_id,
+                path_restrictions: None,
+            }),
+            record: record.clone(),
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    match reply.response {
+        JobResponse::Delivered(result) if result.job_id == record.job_id => Ok(true),
+        JobResponse::DeliveryConflict => Err("job owner rejected conflicting delivery".to_string()),
+        JobResponse::Unauthorized => Err("job owner rejected delivery authentication".to_string()),
+        JobResponse::Forbidden => Err("job owner rejected delivery authority".to_string()),
+        JobResponse::Unavailable(error) => Err(error),
+        response => Err(format!("unexpected job delivery response: {response:?}")),
+    }
 }
 
 async fn delete_schedule_row(storage: &StorageHandle, key: Key) -> Result<(), String> {

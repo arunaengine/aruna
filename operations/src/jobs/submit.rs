@@ -176,14 +176,6 @@ impl SubmitJobOperation {
         }
     }
 
-    pub(crate) fn reserved(spec: SubmitJobSpec, job_id: JobId) -> Self {
-        let mut operation = Self::new(spec, job_id);
-        operation.active_cap = None;
-        operation.schedule_drain = false;
-        operation.delivery = true;
-        operation
-    }
-
     pub(crate) fn delivered(record: JobRecord) -> Self {
         Self {
             record,
@@ -193,10 +185,6 @@ impl SubmitJobOperation {
             state: SubmitState::Init,
             output: None,
         }
-    }
-
-    pub(crate) fn record(&self) -> &JobRecord {
-        &self.record
     }
 
     fn fail(&mut self, error: SubmitJobError) -> Effects {

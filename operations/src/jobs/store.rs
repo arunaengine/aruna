@@ -12,11 +12,11 @@ use aruna_core::structs::{
     AttemptControl, AttemptIntent, JobClaim, JobError, JobExecutionClass, JobId, JobPayload,
     JobProgress, JobRecord, JobResultPayload, JobState, JobTransitionError, RunCrateStatus,
     UserAccess, attempt_control_key, cleanup_dedup_key, cleanup_job_id, crate_job_id,
-    encode_job_dedup_value, job_active_key, job_active_prefix, job_due_index_key, job_entry_key,
-    job_entry_prefix, job_lease_index_key, job_owner_cursor, job_owner_index_key,
-    job_owner_index_prefix, job_prune_index_key, job_record_key, job_run_crate_key,
-    parse_entry_key, parse_job_dedup_value, parse_job_owner_index_key, rocrate_plan_key,
-    run_crate_dedup_key, validate_transition, workspace_credential_id,
+    encode_job_dedup_value, job_active_key, job_due_index_key, job_entry_key, job_entry_prefix,
+    job_lease_index_key, job_owner_cursor, job_owner_index_key, job_owner_index_prefix,
+    job_prune_index_key, job_record_key, job_run_crate_key, parse_entry_key, parse_job_dedup_value,
+    parse_job_owner_index_key, rocrate_plan_key, run_crate_dedup_key, validate_transition,
+    workspace_credential_id,
 };
 use aruna_core::types::{Key, KeySpace, NodeId, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
@@ -63,16 +63,6 @@ pub enum JobMutationError {
     EpochMismatch,
     #[error(transparent)]
     IllegalTransition(#[from] JobTransitionError),
-    #[error("{0}")]
-    Storage(String),
-}
-
-#[derive(Debug, Error)]
-pub enum UserIndexError {
-    #[error("active RO-Crate job limit reached ({limit})")]
-    ActiveLimit { limit: u32 },
-    #[error(transparent)]
-    Conversion(#[from] ConversionError),
     #[error("{0}")]
     Storage(String),
 }
@@ -750,123 +740,6 @@ pub async fn write_job_schedule(storage: &StorageHandle, record: &JobRecord) -> 
         None,
     )
     .await
-}
-
-pub async fn reserve_user_index(
-    storage: &StorageHandle,
-    record: &JobRecord,
-) -> Result<JobId, UserIndexError> {
-    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
-        let txn_id = start_write_txn(storage)
-            .await
-            .map_err(UserIndexError::Storage)?;
-        match reserve_user_txn(storage, txn_id, record).await {
-            Ok(Some(job_id)) => {
-                abort_txn(storage, txn_id).await;
-                return Ok(job_id);
-            }
-            Ok(None) => match commit_txn(storage, txn_id).await {
-                CommitResult::Committed => return Ok(record.job_id),
-                CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => {
-                    tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
-                }
-                CommitResult::Conflict => {
-                    return Err(UserIndexError::Storage(
-                        "user job index exhausted conflict retries".to_string(),
-                    ));
-                }
-                CommitResult::Failed(error) => return Err(UserIndexError::Storage(error)),
-            },
-            Err(error) => {
-                abort_txn(storage, txn_id).await;
-                return Err(error);
-            }
-        }
-    }
-    Err(UserIndexError::Storage(
-        "user job index exhausted conflict retries".to_string(),
-    ))
-}
-
-async fn reserve_user_txn(
-    storage: &StorageHandle,
-    txn_id: TxnId,
-    record: &JobRecord,
-) -> Result<Option<JobId>, UserIndexError> {
-    let owner_key = job_owner_index_key(record.created_by, record.created_at_ms, record.job_id);
-    if read_raw(
-        storage,
-        JOB_OWNER_INDEX_KEYSPACE,
-        owner_key.clone(),
-        Some(txn_id),
-    )
-    .await
-    .map_err(UserIndexError::Storage)?
-    .is_some()
-    {
-        return Ok(Some(record.job_id));
-    }
-    if let Some(dedup_key) = &record.dedup_key
-        && let Some(value) = read_raw(
-            storage,
-            JOB_DEDUP_INDEX_KEYSPACE,
-            job_dedup_index_key(record.created_by, dedup_key),
-            Some(txn_id),
-        )
-        .await
-        .map_err(UserIndexError::Storage)?
-        && let Ok((job_id, _)) = parse_job_dedup_value(value.as_ref())
-    {
-        return Ok(Some(job_id));
-    }
-    let active_cap = record
-        .payload
-        .rocrate_limits()
-        .map(|limits| limits.max_active_jobs);
-    if let Some(limit) = active_cap {
-        if limit == 0 {
-            return Err(UserIndexError::ActiveLimit { limit });
-        }
-        let (active, _) = iter_prefix_page(
-            storage,
-            JOB_ACTIVE_USER_KEYSPACE,
-            Some(job_active_prefix(record.created_by)),
-            None,
-            limit as usize,
-            Some(txn_id),
-        )
-        .await
-        .map_err(UserIndexError::Storage)?;
-        if active.len() >= limit as usize {
-            return Err(UserIndexError::ActiveLimit { limit });
-        }
-    }
-    let mut writes = vec![(
-        JOB_OWNER_INDEX_KEYSPACE.to_string(),
-        owner_key,
-        ByteView::from(record.to_bytes()?),
-    )];
-    if active_cap.is_some() {
-        writes.push((
-            JOB_ACTIVE_USER_KEYSPACE.to_string(),
-            job_active_key(record.created_by, record.job_id),
-            empty_value(),
-        ));
-    }
-    if let Some(dedup_key) = &record.dedup_key {
-        writes.push((
-            JOB_DEDUP_INDEX_KEYSPACE.to_string(),
-            job_dedup_index_key(record.created_by, dedup_key),
-            ByteView::from(encode_job_dedup_value(
-                record.job_id,
-                record.plan_digest.unwrap_or_default(),
-            )),
-        ));
-    }
-    batch_write(storage, writes, Some(txn_id))
-        .await
-        .map_err(UserIndexError::Storage)?;
-    Ok(None)
 }
 
 pub async fn update_user_index(storage: &StorageHandle, record: &JobRecord) -> Result<(), String> {

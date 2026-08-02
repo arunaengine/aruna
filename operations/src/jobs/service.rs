@@ -21,14 +21,14 @@ use tracing::warn;
 
 use super::JOB_REPORT_MAX_ROWS;
 use super::protocol::{
-    JobRequest, JobResponse, JobRouteError, WireRange, resolve_job_holders, resolve_user_route,
+    JobRequest, JobResponse, JobRouteError, WireRange, resolve_job_authority, resolve_job_holders,
     send_job_request,
 };
 use super::runtime::JobsRuntime;
 use super::store::{
-    CancelRequestOutcome, JobMutationError, UserIndexError, find_dedup_plan, list_job_entries,
-    list_jobs_for_user, read_artifact_tombstone, read_job_record, read_run_crate_status,
-    reserve_user_index, set_cancel_requested, update_user_index,
+    CancelRequestOutcome, JobMutationError, find_dedup_plan, list_job_entries, list_jobs_for_user,
+    read_artifact_tombstone, read_job_record, read_run_crate_status, set_cancel_requested,
+    update_user_index,
 };
 use super::submit::{
     SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_job_id,
@@ -39,14 +39,14 @@ use crate::driver::{DriverContext, drive};
 use crate::metadata::MetadataAuthToken;
 use crate::metadata::api::load_realm_config;
 use crate::metadata::repository::StorageReadError;
-use crate::placement::choose_origin_bucket;
+use crate::placement::resolve_shard_holders;
 
-async fn mint_local_job(
+async fn mint_authority_job(
     context: &DriverContext,
     realm_id: RealmId,
-    owner_node_id: NodeId,
+    fallback_owner: NodeId,
     dedup_key: Option<&[u8]>,
-) -> Result<JobId, SubmitJobError> {
+) -> Result<(JobId, NodeId), SubmitJobError> {
     let handle = PlacementHandle::new(JOBCONTROL_HANDLE)
         .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
     let entropy = ulid::Ulid::generate().to_bytes();
@@ -55,16 +55,21 @@ async fn mint_local_job(
         let shard = shard_for_subject(subject, DEFAULT_SHARD_COUNT);
         let bucket = BucketId::new(shard as u16)
             .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
-        return Ok(mint_job_id(handle, bucket)?);
+        return Ok((mint_job_id(handle, bucket)?, fallback_owner));
     };
-    if net_handle.node_id() != owner_node_id || *net_handle.realm_id() != realm_id {
+    if *net_handle.realm_id() != realm_id {
         return Err(SubmitJobError::PlacementUnavailable(
-            "job owner does not match the serving node".to_string(),
+            "job authority does not match the serving realm".to_string(),
         ));
     }
     let config = load_realm_config(context, realm_id).await.ok_or_else(|| {
         SubmitJobError::PlacementUnavailable("realm config unavailable".to_string())
     })?;
+    if config.handle_allocator_node() != Some(net_handle.node_id()) {
+        return Err(SubmitJobError::PlacementUnavailable(
+            "serving node is not the realm job authority".to_string(),
+        ));
+    }
     let tuple = config
         .binding_directory()
         .resolve(handle)
@@ -79,92 +84,42 @@ async fn mint_local_job(
     let strategy = config.strategy(&tuple.strategy_id).ok_or_else(|| {
         SubmitJobError::PlacementUnavailable("job-control strategy unavailable".to_string())
     })?;
-    let shard = match dedup_key {
-        Some(key) => shard_for_subject(key, strategy.shard_count),
-        None => {
-            choose_origin_bucket(&config, strategy, owner_node_id, &entropy)
-                .ok_or_else(|| {
-                    SubmitJobError::PlacementUnavailable(
-                        "serving node holds no job-control bucket".to_string(),
-                    )
-                })?
-                .shard
-        }
+    let shard = shard_for_subject(subject, strategy.shard_count);
+    let placement = aruna_core::structs::PlacementRef {
+        strategy_id: tuple.strategy_id,
+        epoch: 0,
+        shard,
     };
+    let owner_node_id = resolve_shard_holders(&config, &placement)
+        .first()
+        .copied()
+        .ok_or_else(|| {
+            SubmitJobError::PlacementUnavailable(
+                "job-control bucket has no execution owner".to_string(),
+            )
+        })?;
     let bucket = u16::try_from(shard)
         .ok()
         .and_then(|shard| BucketId::new(shard).ok())
         .ok_or_else(|| {
             SubmitJobError::PlacementUnavailable("job bucket is out of range".to_string())
         })?;
-    Ok(mint_job_id(handle, bucket)?)
+    Ok((mint_job_id(handle, bucket)?, owner_node_id))
 }
 
-async fn reserve_job_index(
-    context: &DriverContext,
-    record: &JobRecord,
-) -> Result<JobId, SubmitJobError> {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return reserve_user_index(&context.storage_handle, record)
-            .await
-            .map_err(|error| match error {
-                UserIndexError::ActiveLimit { limit } => SubmitJobError::ActiveJobLimit { limit },
-                error => SubmitJobError::UnexpectedEvent(error.to_string()),
-            });
-    };
-    let route = resolve_user_route(context, record.created_by)
-        .await
-        .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
-    let holder = route.holders[0];
-    if holder == net_handle.node_id() {
-        return reserve_user_index(&context.storage_handle, record)
-            .await
-            .map_err(|error| match error {
-                UserIndexError::ActiveLimit { limit } => SubmitJobError::ActiveJobLimit { limit },
-                error => SubmitJobError::UnexpectedEvent(error.to_string()),
-            });
-    }
-    let auth_token = MetadataAuthToken::internal(AuthContext {
-        user_id: record.created_by,
-        realm_id: record.created_by.realm_id,
-        path_restrictions: None,
-    });
-    let reply = send_job_request(
-        context,
-        holder,
-        JobRequest::Index {
-            auth_token,
-            record: record.clone(),
-            config_digest: route.config_digest,
-        },
-    )
-    .await
-    .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
-    match reply.response {
-        JobResponse::Indexed(job_id) => Ok(job_id),
-        JobResponse::SubmitCap(limit) => Err(SubmitJobError::ActiveJobLimit { limit }),
-        JobResponse::Unavailable(error) => Err(SubmitJobError::UnexpectedEvent(error)),
-        response => Err(SubmitJobError::UnexpectedEvent(format!(
-            "unexpected user index response: {response:?}"
-        ))),
-    }
-}
-
-pub(crate) async fn submit_local_job(
+pub(crate) async fn submit_authority_job(
     context: &DriverContext,
     mut spec: SubmitJobSpec,
-    job_id: JobId,
 ) -> Result<SubmitJobResult, SubmitJobError> {
-    let operation = if let Some(net_handle) = context.net_handle.as_ref() {
-        spec.owner_node_id = net_handle.node_id();
-        let preview = SubmitJobOperation::reserved(spec.clone(), job_id);
-        let indexed_job_id = reserve_job_index(context, preview.record()).await?;
-        SubmitJobOperation::reserved(spec, indexed_job_id)
-    } else {
-        SubmitJobOperation::new(spec, job_id)
-    };
-    let result = drive(operation, context).await?;
-    replicate_job_record(context, result.job_id).await;
+    let (job_id, owner_node_id) = mint_authority_job(
+        context,
+        spec.created_by.realm_id,
+        spec.owner_node_id,
+        spec.dedup_key.as_deref(),
+    )
+    .await?;
+    spec.owner_node_id = owner_node_id;
+    let result = drive(SubmitJobOperation::new(spec, job_id), context).await?;
     if result.created {
         kick_drain(context).await;
     }
@@ -174,17 +129,16 @@ pub(crate) async fn submit_local_job(
 async fn submit_job_routed(
     context: &DriverContext,
     spec: SubmitJobSpec,
-    job_id: JobId,
 ) -> Result<SubmitJobResult, SubmitJobError> {
     let Some(net_handle) = context.net_handle.as_ref() else {
-        return submit_local_job(context, spec, job_id).await;
+        return submit_authority_job(context, spec).await;
     };
-    let route = resolve_job_holders(context, job_id)
+    let route = resolve_job_authority(context, spec.created_by.realm_id)
         .await
         .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
-    let runner = route.holders[0];
-    if runner == net_handle.node_id() {
-        return submit_local_job(context, spec, job_id).await;
+    let authority = route.holders[0];
+    if authority == net_handle.node_id() {
+        return submit_authority_job(context, spec).await;
     }
     let auth_token = MetadataAuthToken::internal(AuthContext {
         user_id: spec.created_by,
@@ -193,10 +147,9 @@ async fn submit_job_routed(
     });
     let reply = send_job_request(
         context,
-        runner,
+        authority,
         JobRequest::Submit {
             auth_token,
-            job_id,
             spec,
             config_digest: route.config_digest,
         },
@@ -210,10 +163,10 @@ async fn submit_job_routed(
         }
         JobResponse::SubmitCap(limit) => Err(SubmitJobError::ActiveJobLimit { limit }),
         JobResponse::Unauthorized => Err(SubmitJobError::UnexpectedEvent(
-            "rank-0 job holder rejected forwarding authentication".to_string(),
+            "job authority rejected forwarding authentication".to_string(),
         )),
         JobResponse::Forbidden => Err(SubmitJobError::UnexpectedEvent(
-            "rank-0 job holder rejected the forwarded principal".to_string(),
+            "job authority rejected the forwarded principal".to_string(),
         )),
         JobResponse::Unavailable(error) => Err(SubmitJobError::UnexpectedEvent(error)),
         response => Err(SubmitJobError::UnexpectedEvent(format!(
@@ -281,13 +234,6 @@ pub async fn submit_execution_job(
         ));
     }
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
-    let job_id = mint_local_job(
-        context,
-        created_by.realm_id,
-        owner_node_id,
-        dedup_key.as_deref(),
-    )
-    .await?;
     submit_job_routed(
         context,
         SubmitJobSpec {
@@ -300,7 +246,6 @@ pub async fn submit_execution_job(
             workspace_mode,
             workspace_bucket,
         },
-        job_id,
     )
     .await
 }
@@ -312,7 +257,6 @@ pub async fn submit_staging_job(
     retention_ms: u64,
 ) -> Result<SubmitJobResult, SubmitJobError> {
     let created_by = spec.auth_context.user_id;
-    let job_id = mint_local_job(context, created_by.realm_id, owner_node_id, None).await?;
     submit_job_routed(
         context,
         SubmitJobSpec {
@@ -325,7 +269,6 @@ pub async fn submit_staging_job(
             workspace_mode: WorkspaceMode::default(),
             workspace_bucket: None,
         },
-        job_id,
     )
     .await
 }
@@ -339,13 +282,6 @@ pub async fn submit_rocrate_import(
     let created_by = spec.auth_context.user_id;
     let retention_ms = spec.limits.artifact_retention_ms;
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
-    let job_id = mint_local_job(
-        context,
-        created_by.realm_id,
-        owner_node_id,
-        dedup_key.as_deref(),
-    )
-    .await?;
     submit_job_routed(
         context,
         SubmitJobSpec {
@@ -358,20 +294,18 @@ pub async fn submit_rocrate_import(
             workspace_mode: WorkspaceMode::default(),
             workspace_bucket: None,
         },
-        job_id,
     )
     .await
 }
 
-pub async fn lookup_job_dedup(
+pub(crate) async fn lookup_local_dedup(
     context: &DriverContext,
     created_by: UserId,
-    idempotency_key: &str,
+    dedup_key: &[u8],
     plan_digest: [u8; 32],
 ) -> Result<Option<SubmitJobResult>, SubmitJobError> {
-    let dedup_key = user_dedup_key(created_by, idempotency_key);
     let Some((job_id, existing_digest)) =
-        find_dedup_plan(&context.storage_handle, created_by, &dedup_key, None)
+        find_dedup_plan(&context.storage_handle, created_by, dedup_key, None)
             .await
             .map_err(SubmitJobError::UnexpectedEvent)?
     else {
@@ -395,6 +329,58 @@ pub async fn lookup_job_dedup(
     }))
 }
 
+pub async fn lookup_job_dedup(
+    context: &DriverContext,
+    created_by: UserId,
+    idempotency_key: &str,
+    plan_digest: [u8; 32],
+) -> Result<Option<SubmitJobResult>, SubmitJobError> {
+    let dedup_key = user_dedup_key(created_by, idempotency_key);
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return lookup_local_dedup(context, created_by, &dedup_key, plan_digest).await;
+    };
+    let route = resolve_job_authority(context, created_by.realm_id)
+        .await
+        .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
+    let authority = route.holders[0];
+    if authority == net_handle.node_id() {
+        return lookup_local_dedup(context, created_by, &dedup_key, plan_digest).await;
+    }
+    let reply = send_job_request(
+        context,
+        authority,
+        JobRequest::Dedup {
+            auth_token: MetadataAuthToken::internal(AuthContext {
+                user_id: created_by,
+                realm_id: created_by.realm_id,
+                path_restrictions: None,
+            }),
+            user_id: created_by,
+            dedup_key,
+            plan_digest,
+            config_digest: route.config_digest,
+        },
+    )
+    .await
+    .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
+    match reply.response {
+        JobResponse::Dedup(result) => Ok(result),
+        JobResponse::SubmitConflict(existing_job_id) => {
+            Err(SubmitJobError::JobPlanConflict { existing_job_id })
+        }
+        JobResponse::Unauthorized => Err(SubmitJobError::UnexpectedEvent(
+            "job authority rejected dedup authentication".to_string(),
+        )),
+        JobResponse::Forbidden => Err(SubmitJobError::UnexpectedEvent(
+            "job authority rejected the dedup principal".to_string(),
+        )),
+        JobResponse::Unavailable(error) => Err(SubmitJobError::UnexpectedEvent(error)),
+        response => Err(SubmitJobError::UnexpectedEvent(format!(
+            "unexpected job dedup response: {response:?}"
+        ))),
+    }
+}
+
 pub async fn submit_export_job(
     context: &DriverContext,
     spec: ExportRoCrateSpec,
@@ -404,13 +390,6 @@ pub async fn submit_export_job(
     let created_by = spec.auth_context.user_id;
     let retention_ms = spec.limits.artifact_retention_ms;
     let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
-    let job_id = mint_local_job(
-        context,
-        created_by.realm_id,
-        owner_node_id,
-        dedup_key.as_deref(),
-    )
-    .await?;
     submit_job_routed(
         context,
         SubmitJobSpec {
@@ -423,7 +402,6 @@ pub async fn submit_export_job(
             workspace_bucket: None,
             retention_ms,
         },
-        job_id,
     )
     .await
 }
@@ -447,7 +425,7 @@ pub async fn list_owned_jobs(
     if limit == 0 || context.net_handle.is_none() {
         return list_jobs_for_user(&context.storage_handle, user_id, cursor, limit, filter).await;
     }
-    let route = resolve_user_route(context, user_id)
+    let route = resolve_job_authority(context, user_id.realm_id)
         .await
         .map_err(|error| error.to_string())?;
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
@@ -582,7 +560,7 @@ async fn sync_user_record(context: &DriverContext, record: &JobRecord) {
     if record.payload.is_internal() {
         return;
     }
-    let route = match resolve_user_route(context, record.created_by).await {
+    let route = match resolve_job_authority(context, record.created_by.realm_id).await {
         Ok(route) => route,
         Err(error) => {
             warn!(job_id = %record.job_id, error = %error, "Failed to resolve job owner index");
