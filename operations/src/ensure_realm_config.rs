@@ -17,7 +17,7 @@ use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
 };
-use aruna_core::structs::{Actor, RealmConfigDocument, RealmNodeKind};
+use aruna_core::structs::{Actor, HandleRange, RealmConfigDocument, RealmNodeKind};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
@@ -86,6 +86,10 @@ pub enum EnsureRealmConfigError {
     RealmConfigNotFound,
     #[error("realm config node {node_id} already exists with a different kind")]
     NodeKindMismatch { node_id: NodeId },
+    #[error("realm config node {node_id} has a conflicting handle range assignment")]
+    HandleRangeConflict { node_id: NodeId },
+    #[error("realm handle space is fully assigned")]
+    HandleSpaceExhausted,
     #[error("missing active transaction")]
     MissingTransaction,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -194,24 +198,71 @@ impl EnsureRealmConfigOperation {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentReducerState::new(target));
-        if previous_reducer_state.as_ref().is_some_and(|state| {
+        overlay_realm_config_reducer_materialization(&mut document, &reducer_state);
+
+        let node_is_noop = previous_reducer_state.as_ref().is_some_and(|state| {
             realm_config_node_ensure_is_noop(
                 &document,
                 state,
                 &self.config.target_node_id,
                 &self.config.target_node_kind,
             )
-        }) {
+        });
+        let owned_ranges: Vec<_> = document
+            .placement_handle_ranges
+            .iter()
+            .filter(|range| range.owner == self.config.target_node_id)
+            .copied()
+            .collect();
+        let usable_ranges = document
+            .handle_range_directory()
+            .granted_to(&self.config.target_node_id);
+        let assigned_range = match (owned_ranges.as_slice(), usable_ranges.as_slice()) {
+            ([], []) => {
+                let (start, end) = document
+                    .handle_range_directory()
+                    .next_free_band()
+                    .ok_or(EnsureRealmConfigError::HandleSpaceExhausted)?;
+                HandleRange {
+                    range_id: Ulid::generate(),
+                    owner: self.config.target_node_id,
+                    start,
+                    end,
+                }
+            }
+            ([owned], [usable]) if owned == usable => *owned,
+            _ => {
+                return Err(EnsureRealmConfigError::HandleRangeConflict {
+                    node_id: self.config.target_node_id,
+                });
+            }
+        };
+        let range_is_noop = reducer_state
+            .materialized_handle_ranges()
+            .get(&assigned_range.range_id)
+            == Some(&assigned_range);
+        if node_is_noop && range_is_noop {
             self.output = Some(Ok(document.clone()));
             return Ok(self.emit_commit_noop(document));
         }
 
-        let admin_event = apply_realm_config_node_ensure(
-            &mut reducer_state,
-            &self.config.actor,
-            self.config.target_node_id,
-            self.config.target_node_kind.clone(),
-        )?;
+        let mut admin_events = Vec::with_capacity(2);
+        if !node_is_noop {
+            admin_events.push(apply_realm_config_node_ensure(
+                &mut reducer_state,
+                &self.config.actor,
+                self.config.target_node_id,
+                self.config.target_node_kind.clone(),
+            )?);
+        }
+        if !range_is_noop {
+            admin_events.push(reducer_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigHandleRangeGranted {
+                    range: assigned_range,
+                },
+            )?);
+        }
         overlay_realm_config_reducer_materialization(&mut document, &reducer_state);
 
         let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
@@ -228,18 +279,20 @@ impl EnsureRealmConfigOperation {
             ),
             admin_document_reducer_state_write_entry(&reducer_state)?,
         ];
-        let record = new_outbox_record_with_id(
-            admin_event.event_id,
-            self.config.actor.node_id,
-            document_target,
-            Vec::new(),
-            DocumentSyncOutboxEvent::AdminOperation {
-                event: Box::new(admin_event),
-            },
-            placement,
-            false,
-        );
-        writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
+        for admin_event in admin_events {
+            let record = new_outbox_record_with_id(
+                admin_event.event_id,
+                self.config.actor.node_id,
+                document_target.clone(),
+                Vec::new(),
+                DocumentSyncOutboxEvent::AdminOperation {
+                    event: Box::new(admin_event),
+                },
+                placement,
+                false,
+            );
+            writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
+        }
         writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));

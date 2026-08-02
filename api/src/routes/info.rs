@@ -1127,8 +1127,7 @@ fn map_handle_error(error: HandleAllocationError) -> ServerError {
         HandleAllocationError::StrategyNotFound(strategy_id) => ServerError::BadRequestReason(
             format!("placement strategy {strategy_id} does not exist"),
         ),
-        HandleAllocationError::PlacementHandleExhausted { .. }
-        | HandleAllocationError::Append(MutateRealmPlacementError::RealmHandleSpaceExhausted) => {
+        HandleAllocationError::PlacementHandleExhausted { .. } => {
             ServerError::Conflict("placement handle space is exhausted".to_string())
         }
         HandleAllocationError::Append(error) => map_mutate_realm_placement_error(error),
@@ -1740,7 +1739,7 @@ mod tests {
     };
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::driver::{DriverContext, drive};
-    use aruna_operations::mutate_realm_placement::{MutateRealmPlacementError, grant_handle_range};
+    use aruna_operations::mutate_realm_placement::MutateRealmPlacementError;
     use aruna_operations::set_realm_quota::SetRealmQuotaError;
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
@@ -2345,9 +2344,6 @@ mod tests {
     }
 
     async fn provision_strategy(state: &ServerState, actor: Actor, strategy_id: Ulid) {
-        grant_handle_range(actor.clone(), actor.node_id, state.get_ctx().as_ref())
-            .await
-            .unwrap();
         allocate_placement_binding(
             state.get_ctx().as_ref(),
             actor.clone(),

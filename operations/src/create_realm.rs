@@ -10,8 +10,9 @@ use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::admin_document_reducer_state_write_entry;
 use aruna_core::structs::{
-    Actor, NodePlacementEntry, OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument,
-    RealmNodeKind, normalize_node_placement_input,
+    Actor, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange, NodePlacementEntry,
+    OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
+    normalize_node_placement_input,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, Value};
@@ -103,6 +104,12 @@ impl CreateRealmOperation {
             RealmConfigDocument::default_for_realm(realm_id, self.config.oidc_providers.clone());
         config_doc.description = self.config.realm_description.clone();
         config_doc.ensure_node(self.config.actor.node_id, RealmNodeKind::Management);
+        config_doc.placement_handle_ranges.push(HandleRange {
+            range_id: Ulid::generate(),
+            owner: self.config.actor.node_id,
+            start: FIRST_GRANTABLE_HANDLE,
+            end: FIRST_GRANTABLE_HANDLE + HANDLE_RANGE_SIZE,
+        });
         seed_placement_defaults(&mut config_doc);
         config_doc
             .placement_map
@@ -171,6 +178,12 @@ impl CreateRealmOperation {
             },
         )?;
         let mut config_events = vec![config_node_event];
+        for range in &config_doc.placement_handle_ranges {
+            config_events.push(config_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigHandleRangeGranted { range: *range },
+            )?);
+        }
         let mut oidc_providers = self.config.oidc_providers.clone();
         oidc_providers.sort_by(|left, right| left.id.cmp(&right.id));
         for provider in oidc_providers {

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::structs::{FIRST_GRANTABLE_HANDLE, HandleRange};
+use crate::structs::{FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE, HandleRange};
 use crate::structured_id::PlacementHandle;
 
 /// The derived view over the replicated handle-range set. Overlapping grants —
@@ -84,23 +84,18 @@ impl HandleRangeDirectory {
             .filter(|range| range.owner == *owner)
     }
 
-    /// Whether `owner` already holds a range (granted or conflicted) intersecting
-    /// `[start, end)`. Keeps a coordinator's band grant idempotent.
-    pub fn owner_holds_band(&self, owner: &NodeId, start: u32, end: u32) -> bool {
-        self.by_id
-            .values()
-            .flatten()
-            .any(|range| range.owner == *owner && range.start < end && start < range.end)
-    }
-
-    /// Next ungranted start, including conflicted ranges in the occupied span.
-    pub fn next_grantable_start(&self) -> u32 {
-        self.by_id
-            .values()
-            .flat_map(|ranges| ranges.iter())
-            .map(|range| range.end)
-            .max()
-            .unwrap_or(FIRST_GRANTABLE_HANDLE)
+    /// First canonical band that has never intersected a stored grant.
+    pub fn next_free_band(&self) -> Option<(u32, u32)> {
+        (0..HANDLE_BANDS).find_map(|index| {
+            let start = FIRST_GRANTABLE_HANDLE + index * HANDLE_RANGE_SIZE;
+            let end = start + HANDLE_RANGE_SIZE;
+            (!self
+                .by_id
+                .values()
+                .flatten()
+                .any(|range| range.start < end && start < range.end))
+            .then_some((start, end))
+        })
     }
 }
 
@@ -150,28 +145,29 @@ impl HandleAllocationCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structs::{HANDLE_RANGE_SIZE, HANDLE_SPACE_END, owner_handle_band};
+    use crate::structs::{HANDLE_RANGE_SIZE, HANDLE_SPACE_END};
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
     #[test]
-    fn owner_bands_survive() {
-        // Two owners granting from their own bands never overlap, so both survive
-        // replication together with zero conflicts.
+    fn assigned_bands_survive() {
         let left = node(1);
         let right = node(7);
-        let (ls, le) = owner_handle_band(&left);
-        let (rs, re) = owner_handle_band(&right);
-        assert_ne!((ls, le), (rs, re), "distinct owners share a band");
+        let ls = FIRST_GRANTABLE_HANDLE;
+        let le = ls + HANDLE_RANGE_SIZE;
+        let rs = le;
+        let re = rs + HANDLE_RANGE_SIZE;
         let ranges = [range(1, left, ls, le), range(2, right, rs, re)];
         let directory = HandleRangeDirectory::from_ranges(&ranges);
         assert_eq!(directory.conflicts(), 0);
         assert_eq!(directory.granted_to(&left).len(), 1);
         assert_eq!(directory.granted_to(&right).len(), 1);
-        assert!(directory.owner_holds_band(&left, ls, le));
-        assert!(!directory.owner_holds_band(&right, ls, le));
+        assert_eq!(
+            directory.next_free_band(),
+            Some((re, re + HANDLE_RANGE_SIZE))
+        );
     }
 
     fn range(id: u8, owner: NodeId, start: u32, end: u32) -> HandleRange {
@@ -190,7 +186,7 @@ mod tests {
         let directory = HandleRangeDirectory::from_ranges(&ranges);
         assert_eq!(directory.conflicts(), 0);
         assert_eq!(directory.granted_to(&owner).len(), 2);
-        assert_eq!(directory.next_grantable_start(), 2049);
+        assert_eq!(directory.next_free_band(), Some((2051, 3075)));
     }
 
     #[test]
@@ -215,7 +211,7 @@ mod tests {
 
         assert_eq!(directory.conflicts(), 2);
         assert!(directory.granted_to(&owner).is_empty());
-        assert_eq!(directory.next_grantable_start(), 2500);
+        assert_eq!(directory.next_free_band(), Some((2051, 3075)));
     }
 
     #[test]

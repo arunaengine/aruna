@@ -1,5 +1,3 @@
-use std::sync::OnceLock;
-
 use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{
     AdminDocumentReducerError, AdminDocumentReducerState,
@@ -23,9 +21,8 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::{
     Actor, BindingError, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DocumentClass,
-    HandleRange, MetadataRegistryRecord, NodePlacementEntry, PlacementBinding, PlacementOverride,
-    PlacementRef, PlacementScope, PlacementStrategy, RealmConfigDocument, StrategyBinding,
-    owner_handle_band,
+    MetadataRegistryRecord, NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementRef,
+    PlacementScope, PlacementStrategy, RealmConfigDocument, StrategyBinding,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -54,26 +51,6 @@ pub enum RealmPlacementMutation {
     SetOverride(PlacementOverride),
     RemoveOverride(Vec<u8>),
     AppendPlacementBinding(PlacementBinding),
-    GrantHandleRange(HandleRange),
-}
-
-/// Grants `owner` its deterministic handle band. Returns `None` once the owner
-/// already holds that band, so a coordinator draws one disjoint range that never
-/// races another coordinator's start.
-pub fn next_handle_range(config: &RealmConfigDocument, owner: NodeId) -> Option<HandleRange> {
-    let (start, end) = owner_handle_band(&owner);
-    if config
-        .handle_range_directory()
-        .owner_holds_band(&owner, start, end)
-    {
-        return None;
-    }
-    Some(HandleRange {
-        range_id: Ulid::generate(),
-        owner,
-        start,
-        end,
-    })
 }
 
 impl RealmPlacementMutation {
@@ -120,9 +97,6 @@ impl RealmPlacementMutation {
                 AdminDocumentOperation::RealmConfigPlacementBindingAppended {
                     binding: binding.clone(),
                 }
-            }
-            Self::GrantHandleRange(range) => {
-                AdminDocumentOperation::RealmConfigHandleRangeGranted { range: *range }
             }
         }
     }
@@ -211,27 +185,6 @@ impl RealmPlacementMutation {
                     }
                     Ok(_) | Err(_) => Ok(()),
                 }
-            }
-            Self::GrantHandleRange(range) => {
-                if !range.is_well_formed() {
-                    return Err(MutateRealmPlacementError::InvalidInput(format!(
-                        "handle range [{}, {}) is not a valid sub-interval of the handle space",
-                        range.start, range.end
-                    )));
-                }
-                // Cross-id overlap converges to a derived conflict after replication.
-                // A divergent value under the same id is rejected locally.
-                if document
-                    .placement_handle_ranges
-                    .iter()
-                    .any(|existing| existing.range_id == range.range_id && existing != range)
-                {
-                    return Err(MutateRealmPlacementError::InvalidInput(format!(
-                        "handle range id {} is already granted with different bounds",
-                        range.range_id
-                    )));
-                }
-                Ok(())
             }
             Self::SetOverride(record) => match &record.strategy_id {
                 Some(strategy_id) => require_strategy(document, strategy_id, "override"),
@@ -374,8 +327,6 @@ pub enum MutateRealmPlacementError {
     EmptyShardHolders { strategy_id: Ulid, shard: u32 },
     #[error("placement strategy {strategy_id} is currently referenced")]
     StrategyReferenced { strategy_id: Ulid },
-    #[error("realm handle space is fully granted: no disjoint range remains to grant")]
-    RealmHandleSpaceExhausted,
     #[error("missing active transaction")]
     MissingTransaction,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -902,52 +853,6 @@ pub async fn drive_realm_placement_mutation(
     outcome
 }
 
-/// Persists the next disjoint range as a Management-only admin operation.
-pub async fn grant_handle_range(
-    actor: Actor,
-    owner: NodeId,
-    context: &crate::driver::DriverContext,
-) -> Result<HandleRange, MutateRealmPlacementError> {
-    let _guard = grant_lock().lock().await;
-    let config = crate::driver::drive(
-        crate::get_realm_config::GetRealmConfigOperation::new(actor.realm_id),
-        context,
-    )
-    .await
-    .map_err(|error| match error {
-        crate::get_realm_config::GetRealmConfigError::StorageError(error) => error.into(),
-        crate::get_realm_config::GetRealmConfigError::ConversionError(error) => error.into(),
-        crate::get_realm_config::GetRealmConfigError::DocumentNotFound => {
-            MutateRealmPlacementError::RealmConfigNotFound
-        }
-        crate::get_realm_config::GetRealmConfigError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        } => MutateRealmPlacementError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        },
-    })?;
-    let range = next_handle_range(&config, owner)
-        .ok_or(MutateRealmPlacementError::RealmHandleSpaceExhausted)?;
-    crate::driver::drive(
-        MutateRealmPlacementOperation::new(MutateRealmPlacementConfig {
-            actor,
-            mutation: RealmPlacementMutation::GrantHandleRange(range),
-        }),
-        context,
-    )
-    .await?;
-    Ok(range)
-}
-
-fn grant_lock() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -961,7 +866,7 @@ mod tests {
     use aruna_core::structs::{
         AffinityEffect, AffinityRule, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT, DocumentClass,
         FIRST_GRANTABLE_HANDLE, HandleRange, LabelMatch, MetadataRegistryRecord, PlacementBinding,
-        PlacementRef, PlacementScope, RealmId, RealmNodeKind, owner_handle_band,
+        PlacementRef, PlacementScope, RealmId, RealmNodeKind,
     };
     use aruna_core::structured_id::PlacementHandle;
     use aruna_core::task::{TaskEffect, TaskKey};
@@ -998,6 +903,12 @@ mod tests {
     async fn seed_config(context: &DriverContext, actor: &Actor) -> RealmConfigDocument {
         let mut document = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
         document.seed_default_placement();
+        document.placement_handle_ranges.push(HandleRange {
+            range_id: Ulid::from_bytes([9; 16]),
+            owner: actor.node_id,
+            start: FIRST_GRANTABLE_HANDLE,
+            end: FIRST_GRANTABLE_HANDLE + 1024,
+        });
         let target = DocumentSyncTarget::RealmConfig {
             realm_id: actor.realm_id,
         };
@@ -1126,19 +1037,7 @@ mod tests {
             Err(MutateRealmPlacementError::InvalidInput(reason))
                 if reason.contains("has no binding")
         ));
-        let range_id = Ulid::from_bytes([9; 16]);
-        mutate(
-            &context,
-            &actor,
-            RealmPlacementMutation::GrantHandleRange(HandleRange {
-                range_id,
-                owner: actor.node_id,
-                start: FIRST_GRANTABLE_HANDLE,
-                end: FIRST_GRANTABLE_HANDLE + 1024,
-            }),
-        )
-        .await
-        .unwrap();
+        let range_id = initial.placement_handle_ranges[0].range_id;
         mutate(
             &context,
             &actor,
@@ -1782,82 +1681,5 @@ mod tests {
             RealmPlacementMutation::AppendPlacementBinding(foreign).validate(&document),
             Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("does not match")
         ));
-    }
-
-    #[test]
-    fn owner_band_exhausts() {
-        // A coordinator already holding its band draws no second range, while a
-        // different owner still draws its own disjoint band.
-        let realm_id = RealmId::from_bytes([52; 32]);
-        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        let owner = node(3);
-        let (start, end) = owner_handle_band(&owner);
-        document.placement_handle_ranges.push(HandleRange {
-            range_id: Ulid::generate(),
-            owner,
-            start,
-            end,
-        });
-        assert!(next_handle_range(&document, owner).is_none());
-        assert!(next_handle_range(&document, node(4)).is_some());
-    }
-
-    #[test]
-    fn cross_node_grants_disjoint() {
-        // Two coordinators computing from the same replicated snapshot pick
-        // non-overlapping ranges, so both survive the derived directory.
-        let realm_id = RealmId::from_bytes([54; 32]);
-        let document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        let left = next_handle_range(&document, node(2)).unwrap();
-        let right = next_handle_range(&document, node(3)).unwrap();
-        assert!(!left.overlaps(&right));
-        let directory = aruna_core::structs::HandleRangeDirectory::from_ranges(&[left, right]);
-        assert_eq!(directory.conflicts(), 0);
-    }
-
-    #[tokio::test]
-    async fn grant_ranges_disjoint() {
-        let temp = tempdir().unwrap();
-        let context = context(temp.path().to_str().unwrap());
-        let realm_id = RealmId::from_bytes([51; 32]);
-        let actor = actor(realm_id);
-        seed_config(&context, &actor).await;
-
-        let first = grant_handle_range(actor.clone(), node(2), &context)
-            .await
-            .unwrap();
-        let second = grant_handle_range(actor.clone(), node(3), &context)
-            .await
-            .unwrap();
-        assert!(!first.overlaps(&second));
-
-        let stored = drive(GetRealmConfigOperation::new(realm_id), &context)
-            .await
-            .unwrap();
-        assert_eq!(stored.handle_range_directory().conflicts(), 0);
-        assert_eq!(stored.placement_handle_ranges.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn concurrent_grants_disjoint() {
-        let temp = tempdir().unwrap();
-        let context = context(temp.path().to_str().unwrap());
-        let realm_id = RealmId::from_bytes([53; 32]);
-        let actor = actor(realm_id);
-        seed_config(&context, &actor).await;
-
-        let (left, right) = tokio::join!(
-            grant_handle_range(actor.clone(), node(2), &context),
-            grant_handle_range(actor.clone(), node(3), &context),
-        );
-        let left = left.unwrap();
-        let right = right.unwrap();
-        assert!(!left.overlaps(&right));
-
-        let stored = drive(GetRealmConfigOperation::new(realm_id), &context)
-            .await
-            .unwrap();
-        assert_eq!(stored.handle_range_directory().conflicts(), 0);
-        assert_eq!(stored.placement_handle_ranges.len(), 2);
     }
 }

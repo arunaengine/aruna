@@ -1,4 +1,4 @@
-//! Node-local placement-handle allocation from coordinator-granted ranges.
+//! Node-local placement-handle allocation from bootstrap-assigned ranges.
 //! The durable cursor is persisted before returning, so crashes may skip a
 //! handle but cannot reissue one.
 
@@ -262,7 +262,7 @@ pub async fn allocate_placement_binding(
 }
 
 /// Idempotently provisions the immutable metadata binding required before a
-/// placement strategy can become active, granting this node a range if needed.
+/// placement strategy can become active.
 pub async fn provision_metadata_binding(
     context: &DriverContext,
     actor: Actor,
@@ -293,21 +293,6 @@ pub async fn provision_metadata_binding(
                 )
             });
     }
-    match allocate_placement_binding(
-        context,
-        actor.clone(),
-        scope,
-        DocumentClass::Metadata,
-        strategy_id,
-    )
-    .await
-    {
-        Ok(binding) => return Ok(binding),
-        Err(HandleAllocationError::PlacementHandleExhausted { .. }) => {}
-        Err(error) => return Err(error),
-    }
-    crate::mutate_realm_placement::grant_handle_range(actor.clone(), actor.node_id, context)
-        .await?;
     allocate_placement_binding(context, actor, scope, DocumentClass::Metadata, strategy_id).await
 }
 
@@ -322,7 +307,7 @@ mod tests {
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::events::Event;
     use aruna_core::structs::{
-        FIRST_GRANTABLE_HANDLE, HandleRange, RealmConfigDocument, RealmNodeKind, owner_handle_band,
+        FIRST_GRANTABLE_HANDLE, HandleRange, RealmConfigDocument, RealmNodeKind,
     };
     use aruna_core::types::UserId;
     use tempfile::tempdir;
@@ -533,39 +518,5 @@ mod tests {
             allocate_handle(&context, realm_id, actor.node_id).await,
             Err(HandleAllocationError::PlacementHandleExhausted { .. })
         ));
-    }
-
-    #[tokio::test]
-    async fn provision_extends_range() {
-        let temp = tempdir().unwrap();
-        let context = context(temp.path().to_str().unwrap());
-        let realm_id = RealmId::from_bytes([65; 32]);
-        let actor = actor(realm_id);
-        let document = seed_range_config(
-            &context,
-            &actor,
-            range(
-                actor.node_id,
-                FIRST_GRANTABLE_HANDLE,
-                FIRST_GRANTABLE_HANDLE + 1,
-            ),
-        )
-        .await;
-        allocate_handle(&context, realm_id, actor.node_id)
-            .await
-            .unwrap();
-
-        // The seeded range is exhausted, so the extension grants from the owner band.
-        let band_start = owner_handle_band(&actor.node_id).0;
-        let binding = provision_metadata_binding(
-            &context,
-            actor,
-            PlacementScope::Group(Ulid::from_bytes([8; 16])),
-            document.default_strategy_id.unwrap(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(binding.handle.get(), band_start);
     }
 }
