@@ -12,7 +12,10 @@
 mod topology;
 
 use aruna_core::StructuredId;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::MetadataError;
+use aruna_core::storage_entries::metadata_registry_delete_entries;
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_forward_document, mint_local_document,
@@ -22,7 +25,7 @@ use aruna_operations::get_metadata_document::{
     GetMetadataDocumentError, GetMetadataDocumentOperation, load_metadata_record_by_document,
 };
 use aruna_operations::metadata::forward::{
-    create_metadata_document_routed, delete_metadata_document_routed,
+    create_metadata_document_routed, delete_metadata_document_routed, origin_holds_document,
     update_metadata_document_routed,
 };
 use aruna_operations::metadata::projector::replay_metadata_event_log;
@@ -226,11 +229,21 @@ async fn bystander_writes_forward() -> TestResult<()> {
         .map_err(|error| format!("registry read failed: {error:?}"))?
         .ok_or("the non-holder must carry the registry row")?;
     assert_eq!(record.placement, placement);
+    assert!(
+        !origin_holds_document(
+            &bystander.context,
+            realm.realm_id,
+            bystander.node_id(),
+            document_id,
+        )
+        .await?
+    );
 
     update_metadata_document_routed(
         &bystander.context,
         realm.actor(bystander),
-        &record,
+        None,
+        document_id,
         None,
         UpdateMetadataDocumentMutation::UpsertDataEntity {
             jsonld: r#"{"@id":"./off-holder.txt","@type":"File","name":"off-holder.txt"}"#
@@ -263,10 +276,50 @@ async fn bystander_writes_forward() -> TestResult<()> {
         "the forwarder must not have applied the write onto a bucket it does not hold"
     );
 
+    let stale = realm.find(holders[0]);
+    let deleted = stale
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::BatchDelete {
+            deletes: metadata_registry_delete_entries(group_id, document_id),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        deleted,
+        Event::Storage(StorageEvent::BatchDeleteResult { .. })
+    ));
+    assert!(!registry_row_present(stale, document_id).await);
+
+    update_metadata_document_routed(
+        &stale.context,
+        realm.actor(stale),
+        None,
+        document_id,
+        None,
+        UpdateMetadataDocumentMutation::UpsertDataEntity {
+            jsonld: r#"{"@id":"./stale-holder.txt","@type":"File","name":"stale-holder.txt"}"#
+                .to_string(),
+        },
+        Some(realm.bearer_token()),
+    )
+    .await?;
+    let healthy = realm.find(holders[1]);
+    wait_until("stale holder forwards", healthy.node_id(), || async {
+        drive(
+            GetMetadataDocumentOperation::new(group_id, document_id),
+            healthy.context.as_ref(),
+        )
+        .await
+        .is_ok_and(|view| view.jsonld.contains("stale-holder.txt"))
+    })
+    .await?;
+
     delete_metadata_document_routed(
         &bystander.context,
         realm.actor(bystander),
-        &record,
+        None,
+        document_id,
         Some(realm.bearer_token()),
     )
     .await?;

@@ -139,7 +139,8 @@ async fn forwarded_invalid_terminal() -> Result<(), Box<dyn std::error::Error>> 
             user_id: realm.user_id,
             realm_id: realm.realm_id,
         },
-        &record,
+        Some(&record),
+        document_id,
         None,
         UpdateMetadataDocumentMutation::UpsertDataEntity {
             jsonld: "{}".to_string(),

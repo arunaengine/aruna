@@ -5,8 +5,6 @@
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::structs::RealmId;
-use crate::types::GroupId;
 use crate::{MetaResourceId, StructuredId};
 
 /// Domain tag separating the path-claim winner digest from every other hash in
@@ -19,8 +17,6 @@ const PATH_CLAIM_WINNER_DOMAIN: &[u8] = b"aruna-path-claim-v1";
 /// causal event that established the claim.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PathClaimRecord {
-    pub realm_id: RealmId,
-    pub group_id: GroupId,
     /// The claiming Meta Resource id (a structured `MetaResourceId` as a `Ulid`).
     pub document_id: MetaResourceId,
     /// The causal event that established this claim generation.
@@ -59,18 +55,6 @@ pub struct PathResolution {
     pub conflicts: Vec<PathClaimRecord>,
 }
 
-impl PathResolution {
-    /// The id served for the path.
-    pub fn winner_id(&self) -> MetaResourceId {
-        self.winner.document_id
-    }
-
-    /// Whether more than one id claims the path.
-    pub fn is_conflicted(&self) -> bool {
-        !self.conflicts.is_empty()
-    }
-}
-
 /// Resolves a causally closed claim set, retaining the lowest event per document.
 /// Returns `None` for an empty set and is invariant under input order.
 pub fn resolve_path_claim(claims: &[PathClaimRecord]) -> Option<PathResolution> {
@@ -92,8 +76,6 @@ mod tests {
 
     fn claim(doc: u8, event: u8, path: &str) -> PathClaimRecord {
         PathClaimRecord {
-            realm_id: RealmId([1u8; 32]),
-            group_id: Ulid::from_bytes([2u8; 16]),
             document_id: MetaResourceId::from_bytes([doc; 16]).unwrap(),
             establishing_event_id: Ulid::from_bytes([event; 16]),
             requested_path: path.to_string(),
@@ -109,10 +91,10 @@ mod tests {
     fn single_claim_wins() {
         let resolution = resolve_path_claim(&[claim(10, 11, "datasets/x")]).unwrap();
         assert_eq!(
-            resolution.winner_id(),
+            resolution.winner.document_id,
             MetaResourceId::from_bytes([10; 16]).unwrap()
         );
-        assert!(!resolution.is_conflicted());
+        assert!(resolution.conflicts.is_empty());
     }
 
     #[test]
@@ -147,14 +129,14 @@ mod tests {
         let a = claim(10, 40, "datasets/x");
         let b = claim(20, 41, "datasets/x");
         let resolution = resolve_path_claim(&[a.clone(), b.clone()]).unwrap();
-        let mut seen: Vec<MetaResourceId> = std::iter::once(resolution.winner_id())
+        let mut seen: Vec<MetaResourceId> = std::iter::once(resolution.winner.document_id)
             .chain(resolution.conflicts.iter().map(|c| c.document_id))
             .collect();
         seen.sort();
         let mut expected = vec![a.document_id, b.document_id];
         expected.sort();
         assert_eq!(seen, expected);
-        assert!(resolution.is_conflicted());
+        assert!(!resolution.conflicts.is_empty());
     }
 
     #[test]
@@ -162,7 +144,7 @@ mod tests {
         // An idempotent retry / re-delivered event for the same id collapses.
         let a = claim(10, 40, "datasets/x");
         let resolution = resolve_path_claim(&[a.clone(), a.clone(), a]).unwrap();
-        assert!(!resolution.is_conflicted());
+        assert!(resolution.conflicts.is_empty());
     }
 
     #[test]
@@ -177,7 +159,7 @@ mod tests {
             .filter(|claim| claim.document_id != loser)
             .collect();
         let resolved = resolve_path_claim(&remaining).unwrap();
-        assert!(!resolved.is_conflicted());
-        assert_ne!(resolved.winner_id(), loser);
+        assert!(resolved.conflicts.is_empty());
+        assert_ne!(resolved.winner.document_id, loser);
     }
 }

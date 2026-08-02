@@ -598,29 +598,6 @@ pub async fn mint_local_id(
     )
 }
 
-/// Mints a deterministic blind bucket for a forwarded nil-sentinel create.
-/// Already minted retry ids are reused unchanged.
-pub async fn mint_forward_id(
-    context: &DriverContext,
-    config: &CreateMetadataDocumentConfig,
-) -> Result<MetaResourceId, CreateMetadataDocumentError> {
-    if !config.document_id.is_nil() {
-        return MetaResourceId::from_bytes(config.document_id.to_bytes()).map_err(|error| {
-            CreateMetadataDocumentError::PlacementBindingUnavailable(format!(
-                "forwarded document id is not a structured id: {error}"
-            ))
-        });
-    }
-    let realm_config = load_create_config(context, config.actor.realm_id).await?;
-    mint_document_for(
-        &realm_config,
-        &config.actor,
-        config.group_id,
-        &config.document_path,
-        true,
-    )
-}
-
 /// Mints a job-produced metadata document id with the blind placement.
 pub async fn mint_job_document(
     context: &DriverContext,

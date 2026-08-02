@@ -25,19 +25,21 @@ use aruna_operations::jobs::service::submit_export_job;
 use aruna_operations::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
     ListVisibleMetadataDocumentsRequest, MetadataApiError, MetadataApiQueryMode,
-    MetadataDocumentQueryRequest, MetadataFanoutStats, MetadataListOrder, MetadataQueryRequest,
-    MetadataReferenceEntry, MetadataReferencesExecution, MetadataReferencesRequest,
+    MetadataDocumentQueryRequest, MetadataFanoutStats, MetadataListOrder,
+    MetadataPathLookupRequest, MetadataQueryRequest, MetadataReferenceEntry,
+    MetadataReferencesExecution, MetadataReferencesRequest,
     MetadataRoCrateExportView as OperationMetadataRoCrateExportView, MetadataSearchRequest,
-    export_metadata_rocrate as run_export_metadata_rocrate,
+    export_metadata_rocrate as run_export_metadata_rocrate, forwarded_bearer,
     list_visible_metadata_documents as run_list_visible_metadata_documents,
-    metadata_auth_token_from_bearer, query_metadata as run_query_metadata,
+    lookup_metadata_path as run_lookup_metadata_path, query_metadata as run_query_metadata,
     query_metadata_document as run_query_metadata_document,
     references_metadata as run_references_metadata, search_metadata as run_search_metadata,
 };
 use aruna_operations::metadata::forward::{
     MetadataWriteError, create_metadata_document_routed as run_create_metadata_document,
     delete_metadata_document_routed as run_delete_metadata_document,
-    get_metadata_routed as run_get_visible_metadata_document,
+    get_metadata_routed as run_get_visible_metadata_document, is_user_origin,
+    origin_holds_document as run_origin_holds_document,
     update_metadata_document_routed as run_update_metadata_document,
 };
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
@@ -62,6 +64,7 @@ use super::jobs::{job_urls, map_submit_error};
 
 #[cfg(test)]
 use aruna_operations::metadata::MetadataAuthToken;
+use aruna_operations::metadata::MetadataPathWinner;
 #[cfg(test)]
 use aruna_operations::metadata::api::{
     MetadataQueryForm as QueryForm, aggregate_query_results, deduplicate_fanout_nodes,
@@ -78,6 +81,7 @@ use std::time::Duration;
         create_metadata_document,
         list_all_metadata_documents,
         list_metadata_documents,
+        get_metadata_path,
         get_metadata_document,
         delete_metadata_document,
         search_metadata,
@@ -103,6 +107,7 @@ pub fn router() -> Router<Arc<ServerState>> {
         .route("/metadata/references", get(metadata_references))
         .route("/metadata/sparql/query", post(query_all_metadata))
         .route("/groups/{group_id}/metadata", get(list_metadata_documents))
+        .route("/groups/{group_id}/metadata/path", get(get_metadata_path))
         .route(
             "/metadata/{document_id}",
             get(get_metadata_document).delete(delete_metadata_document),
@@ -208,13 +213,23 @@ pub struct MetadataDocumentListItem {
     pub document_path: String,
     pub graph_iri: String,
     pub public: bool,
-    pub path_conflicted: bool,
     pub replicas: usize,
     pub created_at: String,
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<Object>)]
     pub rocrate_summary: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataPathResponse {
+    pub winner: MetadataDocumentSummary,
+    pub conflicts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct MetadataPathQuery {
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
@@ -484,19 +499,29 @@ impl From<&MetadataRegistryRecord> for MetadataDocumentSummary {
     }
 }
 
+impl From<&MetadataPathWinner> for MetadataDocumentSummary {
+    fn from(winner: &MetadataPathWinner) -> Self {
+        Self {
+            document_id: winner.document_id.to_string(),
+            group_id: winner.group_id.to_string(),
+            document_path: winner.document_path.clone(),
+            graph_iri: winner.graph_iri.clone(),
+            public: winner.public,
+            replicas: winner.replicas,
+            created_at: format_timestamp_ms(winner.created_at_ms),
+            updated_at: format_timestamp_ms(winner.updated_at_ms),
+        }
+    }
+}
+
 impl MetadataDocumentListItem {
-    fn from_record(
-        record: &MetadataRegistryRecord,
-        path_conflicted: bool,
-        rocrate_summary: Option<Value>,
-    ) -> Self {
+    fn from_record(record: &MetadataRegistryRecord, rocrate_summary: Option<Value>) -> Self {
         Self {
             document_id: record.document_id.to_string(),
             group_id: record.group_id.to_string(),
             document_path: record.document_path.clone(),
             graph_iri: record.graph_iri.clone(),
             public: record.public,
-            path_conflicted,
             replicas: record.holder_node_ids.len(),
             created_at: format_timestamp_ms(record.created_at_ms),
             updated_at: format_timestamp_ms(record.updated_at_ms),
@@ -620,9 +645,13 @@ pub async fn create_metadata_document(
     if MetadataRegistryRecord::normalize_document_path(&path).is_empty() {
         return Err(ServerError::BadRequest);
     }
-    ensure_metadata_write_scope(&state, &auth, group_id).await?;
-
     let ctx = state.get_ctx();
+    if !is_user_origin(&ctx, state.get_realm_id(), state.get_node_id())
+        .await
+        .map_err(map_metadata_api_error)?
+    {
+        ensure_metadata_write_scope(&state, &auth, group_id).await?;
+    }
     let created = run_create_metadata_document(
         CreateMetadataDocumentOperation::new_for_generated_document_id(
             CreateMetadataDocumentConfig {
@@ -639,7 +668,7 @@ pub async fn create_metadata_document(
             },
         ),
         ctx.clone(),
-        forwarded_auth_token(bearer_token),
+        forwarded_auth_token(bearer_token)?,
     )
     .await
     .map_err(map_metadata_write_error)?;
@@ -737,13 +766,61 @@ pub async fn list_metadata_documents(
 
 #[utoipa::path(
     get,
+    path = "/groups/{group_id}/metadata/path",
+    tag = "metadata",
+    description = "Returns the deterministic visible winner and authorized conflicts reported consistently by every current replica for one normalized metadata path. An unavailable or divergent current-replica view fails closed.",
+    params(
+        ("group_id" = String, Path, description = "Group id"),
+        ("path" = String, Query, description = "Exact normalized metadata path")
+    ),
+    responses(
+        (status = 200, description = "Path winner and authorized conflicts", body = MetadataPathResponse),
+        (status = 400, description = "Invalid group id, empty path, or bearer forwarding carrier", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "No visible winner", body = ErrorResponse),
+        (status = 503, description = "Current-replica path view unavailable or divergent", body = ErrorResponse)
+    ),
+    security((), ("bearer_auth" = []))
+)]
+pub async fn get_metadata_path(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Path(group_id): Path<String>,
+    Query(query): Query<MetadataPathQuery>,
+) -> ServerResult<(StatusCode, Json<MetadataPathResponse>)> {
+    let group_id = parse_group_id(&group_id)?;
+    let result = run_lookup_metadata_path(
+        state.get_ctx().as_ref(),
+        state.get_realm_id(),
+        MetadataPathLookupRequest {
+            group_id,
+            document_path: query.path,
+            auth,
+        },
+        forwarded_auth_token(bearer_token)?,
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
+    Ok((
+        StatusCode::OK,
+        Json(MetadataPathResponse {
+            winner: MetadataDocumentSummary::from(&result.winner),
+            conflicts: result.conflicts.iter().map(ToString::to_string).collect(),
+        }),
+    ))
+}
+
+#[utoipa::path(
+    get,
     path = "/metadata/{document_id}",
     tag = "metadata",
     description = "Authentication is optional and changes the result: a document that is not public is only returned to a caller whose identity may read it.",
     params(("document_id" = String, Path, description = "Metadata document id")),
     responses(
         (status = 200, description = "Metadata document summary", body = MetadataDocumentSummary),
-        (status = 400, description = "Invalid id", body = ErrorResponse),
+        (status = 400, description = "Invalid id or bearer forwarding carrier", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
@@ -754,6 +831,7 @@ pub async fn list_metadata_documents(
 pub async fn get_metadata_document(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(document_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
     let document_id = parse_document_id(&document_id)?;
@@ -762,6 +840,7 @@ pub async fn get_metadata_document(
         &ctx,
         state.get_realm_id(),
         GetVisibleMetadataDocumentRequest { document_id, auth },
+        forwarded_auth_token(bearer_token)?,
     )
     .await
     .map_err(map_metadata_api_error)?;
@@ -775,10 +854,11 @@ pub async fn get_metadata_document(
     params(("document_id" = String, Path, description = "Metadata document id")),
     responses(
         (status = 204, description = "Metadata document deleted"),
-        (status = 400, description = "Invalid id", body = ErrorResponse),
+        (status = 400, description = "Invalid id or bearer forwarding carrier", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Not found", body = ErrorResponse)
+        (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 503, description = "Placement or holders unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -790,10 +870,8 @@ pub async fn delete_metadata_document(
 ) -> ServerResult<StatusCode> {
     let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
-    let record = load_metadata_record_by_document(&state, document_id).await?;
-    ensure_record_writable(&state, &auth, &record).await?;
-
     let ctx = state.get_ctx();
+    let record = local_write_record(&state, &auth, document_id).await?;
     run_delete_metadata_document(
         &ctx,
         Actor {
@@ -801,8 +879,9 @@ pub async fn delete_metadata_document(
             user_id: auth.user_id,
             realm_id: state.get_realm_id(),
         },
-        &record,
-        forwarded_auth_token(bearer_token),
+        record.as_ref(),
+        document_id,
+        forwarded_auth_token(bearer_token)?,
     )
     .await
     .map_err(map_metadata_write_error)?;
@@ -1023,7 +1102,8 @@ pub async fn submit_rocrate_export(
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Not found", body = ErrorResponse)
+        (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 503, description = "Placement or holders unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1036,10 +1116,8 @@ pub async fn replace_metadata_rocrate(
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
     let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
-    let record = load_metadata_record_by_document(&state, document_id).await?;
-    ensure_record_writable(&state, &auth, &record).await?;
-
     let ctx = state.get_ctx();
+    let record = local_write_record(&state, &auth, document_id).await?;
     let updated = run_update_metadata_document(
         &ctx,
         Actor {
@@ -1047,12 +1125,13 @@ pub async fn replace_metadata_rocrate(
             user_id: auth.user_id,
             realm_id: state.get_realm_id(),
         },
-        &record,
+        record.as_ref(),
+        document_id,
         request.public,
         UpdateMetadataDocumentMutation::ReplaceRoCrate {
             jsonld: serialize_jsonld_object(&request.rocrate)?,
         },
-        forwarded_auth_token(bearer_token),
+        forwarded_auth_token(bearer_token)?,
     )
     .await
     .map_err(map_metadata_write_error)?;
@@ -1115,7 +1194,8 @@ pub async fn replace_metadata_rocrate(
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Not found", body = ErrorResponse)
+        (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 503, description = "Placement or holders unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1128,10 +1208,8 @@ pub async fn add_metadata_data_entity(
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
     let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
-    let record = load_metadata_record_by_document(&state, document_id).await?;
-    ensure_record_writable(&state, &auth, &record).await?;
-
     let ctx = state.get_ctx();
+    let record = local_write_record(&state, &auth, document_id).await?;
     let updated = run_update_metadata_document(
         &ctx,
         Actor {
@@ -1139,12 +1217,13 @@ pub async fn add_metadata_data_entity(
             user_id: auth.user_id,
             realm_id: state.get_realm_id(),
         },
-        &record,
+        record.as_ref(),
+        document_id,
         None,
         UpdateMetadataDocumentMutation::UpsertDataEntity {
             jsonld: serialize_jsonld_entity(&entity)?,
         },
-        forwarded_auth_token(bearer_token),
+        forwarded_auth_token(bearer_token)?,
     )
     .await
     .map_err(map_metadata_write_error)?;
@@ -1203,7 +1282,8 @@ pub async fn add_metadata_data_entity(
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Not found", body = ErrorResponse)
+        (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 503, description = "Placement or holders unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1216,10 +1296,8 @@ pub async fn add_metadata_contextual_entity(
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
     let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
-    let record = load_metadata_record_by_document(&state, document_id).await?;
-    ensure_record_writable(&state, &auth, &record).await?;
-
     let ctx = state.get_ctx();
+    let record = local_write_record(&state, &auth, document_id).await?;
     let updated = run_update_metadata_document(
         &ctx,
         Actor {
@@ -1227,12 +1305,13 @@ pub async fn add_metadata_contextual_entity(
             user_id: auth.user_id,
             realm_id: state.get_realm_id(),
         },
-        &record,
+        record.as_ref(),
+        document_id,
         None,
         UpdateMetadataDocumentMutation::UpsertContextualEntity {
             jsonld: serialize_jsonld_entity(&entity)?,
         },
-        forwarded_auth_token(bearer_token),
+        forwarded_auth_token(bearer_token)?,
     )
     .await
     .map_err(map_metadata_write_error)?;
@@ -1537,7 +1616,6 @@ async fn run_list_metadata_documents(
             .transpose()?;
         documents.push(MetadataDocumentListItem::from_record(
             &document.record,
-            document.path_conflicted,
             rocrate_summary,
         ));
     }
@@ -1607,6 +1685,9 @@ fn serialize_jsonld_entity(value: &Value) -> ServerResult<String> {
 /// answered `201` for a record that can never replicate.
 fn map_metadata_write_error(error: MetadataWriteError) -> ServerError {
     match error {
+        MetadataWriteError::Unauthorized => ServerError::Unauthorized,
+        MetadataWriteError::Forbidden => ServerError::Forbidden,
+        MetadataWriteError::NotFound => ServerError::NotFound,
         MetadataWriteError::Create(error) => map_create_error(error),
         MetadataWriteError::Update(error) => map_update_metadata_error(error),
         MetadataWriteError::Delete(error) => ServerError::InternalError(error.to_string()),
@@ -1652,8 +1733,9 @@ fn map_update_metadata_error(error: UpdateMetadataDocumentError) -> ServerError 
 /// so it re-runs the same permission checks under the same authority.
 fn forwarded_auth_token(
     bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
-) -> Option<aruna_operations::metadata::MetadataAuthToken> {
-    metadata_auth_token_from_bearer(bearer_token_to_string(bearer_token).as_deref())
+) -> ServerResult<Option<aruna_operations::metadata::MetadataAuthToken>> {
+    forwarded_bearer(bearer_token_to_string(bearer_token).as_deref())
+        .map_err(map_metadata_api_error)
 }
 
 fn map_metadata_error(error: MetadataError) -> ServerError {
@@ -1711,6 +1793,39 @@ async fn ensure_record_writable(
         Permission::WRITE,
     )
     .await
+}
+
+async fn local_write_record(
+    state: &ServerState,
+    auth: &AuthContext,
+    document_id: Ulid,
+) -> ServerResult<Option<MetadataRegistryRecord>> {
+    let context = state.get_ctx();
+    if !run_origin_holds_document(
+        &context,
+        state.get_realm_id(),
+        state.get_node_id(),
+        document_id,
+    )
+    .await
+    .map_err(map_metadata_api_error)?
+    {
+        return Ok(None);
+    }
+    let record =
+        match load_metadata_record_by_document_from_operations(context.as_ref(), document_id).await
+        {
+            Ok(Some(record)) => record,
+            Ok(None) => return Ok(None),
+            Err(crate::routes::metadata::ReadError::Storage(error)) => {
+                return Err(ServerError::InternalError(error.to_string()));
+            }
+            Err(crate::routes::metadata::ReadError::Conversion(error)) => {
+                return Err(ServerError::InternalError(error.to_string()));
+            }
+        };
+    ensure_record_writable(state, auth, &record).await?;
+    Ok(Some(record))
 }
 
 async fn ensure_permission(
@@ -1986,9 +2101,10 @@ mod tests {
         metadata_materialization_status_write_entry, metadata_registry_delete_entries,
     };
     use aruna_core::structs::{
-        Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
+        Group, GroupAuthorizationDocument, METADATA_HANDLE, NodeCapabilities,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
     };
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::task::{PersistedTaskTimer, TaskKey};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::announce_realm_presence::{
@@ -2130,6 +2246,7 @@ mod tests {
 
         let fetched = get_metadata_document(
             State(test.state.clone()),
+            Extension(None),
             Extension(None),
             Path(document_id.clone()),
         )
@@ -2784,6 +2901,7 @@ mod tests {
         let fetched = get_metadata_document(
             State(test.state.clone()),
             Extension(None),
+            Extension(None),
             Path(created.summary.document_id),
         )
         .await;
@@ -2892,7 +3010,7 @@ mod tests {
             .net
             .add_peer_addr(coordinator.net.endpoint_addr())
             .await;
-        install_distributed_realm_config(&[&coordinator, &remote], realm_id).await;
+        install_distributed_realm_config(&[&coordinator, &remote], realm_id, None).await;
 
         let initial = load_realm_nodes(coordinator.state.as_ref()).await.unwrap();
         assert_eq!(initial, vec![coordinator.net.node_id()]);
@@ -2931,14 +3049,19 @@ mod tests {
     }
 
     #[test]
-    fn metadata_auth_token_helper_uses_validated_carrier_only() {
-        let carrier = ValidatedArunaBearerTokenCarrier::new_for_test("raw-aruna-token");
+    fn bearer_limits() {
+        let limit = ValidatedArunaBearerTokenCarrier::new_for_test("x".repeat(4096));
+        let oversized = ValidatedArunaBearerTokenCarrier::new_for_test("x".repeat(4097));
 
-        assert_eq!(
-            metadata_auth_token_from_bearer(Some(carrier.as_str())),
-            Some(MetadataAuthToken::bearer("raw-aruna-token").unwrap())
-        );
-        assert_eq!(metadata_auth_token_from_bearer(None), None);
+        assert!(matches!(
+            forwarded_auth_token(Some(limit)),
+            Ok(Some(MetadataAuthToken::Bearer(_)))
+        ));
+        assert!(matches!(
+            forwarded_auth_token(Some(oversized)),
+            Err(ServerError::BadRequest)
+        ));
+        assert!(matches!(forwarded_auth_token(None), Ok(None)));
     }
 
     #[tokio::test]
@@ -3608,6 +3731,188 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn private_get_forwards() {
+        let test = setup_distributed_metadata_access_state().await;
+        let (_, Json(listed)) = list_metadata_documents(
+            State(test.remote.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Path(test.group_id.to_string()),
+            Query(ListMetadataQuery::default()),
+        )
+        .await
+        .unwrap();
+        let private = listed
+            .documents
+            .into_iter()
+            .find(|document| document.document_path == "datasets/remote-private")
+            .expect("private document exists on its holder");
+        let (_, Json(path)) = get_metadata_path(
+            State(test.coordinator.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+                test.valid_bearer_token.clone(),
+            ))),
+            Path(test.group_id.to_string()),
+            Query(MetadataPathQuery {
+                path: "datasets/remote-private".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(path.winner.document_id, private.document_id);
+        assert!(path.conflicts.is_empty());
+
+        let (_, Json(fetched)) = get_metadata_document(
+            State(test.coordinator.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+                test.valid_bearer_token.clone(),
+            ))),
+            Path(private.document_id),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fetched.document_path, "datasets/remote-private");
+        test.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn user_writes_forward() {
+        let test = setup_distributed_metadata_access_state().await;
+        let denied = create_metadata_document(
+            State(test.coordinator.state.clone()),
+            Extension(Some(test.denied_auth.clone())),
+            Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+                test.denied_bearer_token.clone(),
+            ))),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/user-denied".to_string(),
+                    name: "User Denied".to_string(),
+                    description: "Forwarded write without group permission".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: None,
+                    public: false,
+                },
+            )),
+        )
+        .await;
+        assert!(matches!(denied, Err(ServerError::Forbidden)));
+
+        let bearer = || {
+            Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+                test.valid_bearer_token.clone(),
+            )))
+        };
+        let missing = MetaResourceId::from_parts(
+            1,
+            PlacementHandle::new(METADATA_HANDLE).unwrap(),
+            BucketId::new(0).unwrap(),
+            1,
+        )
+        .unwrap();
+        let missing_result = delete_metadata_document(
+            State(test.coordinator.state.clone()),
+            Extension(Some(test.auth.clone())),
+            bearer(),
+            Path(missing.to_string()),
+        )
+        .await;
+        assert!(matches!(missing_result, Err(ServerError::NotFound)));
+
+        let (_, Json(created)) = create_metadata_document(
+            State(test.coordinator.state.clone()),
+            Extension(Some(test.auth.clone())),
+            bearer(),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/user-forward".to_string(),
+                    name: "User Forward".to_string(),
+                    description: "Forwarded from a User node".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: None,
+                    public: false,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        let document_id = created.summary.document_id;
+        drain_metadata_background(test.remote.state.as_ref()).await;
+
+        let _ = add_metadata_data_entity(
+            State(test.coordinator.state.clone()),
+            Extension(Some(test.auth.clone())),
+            bearer(),
+            Path(document_id.clone()),
+            Json(json!({
+                "@id": "./forwarded.txt",
+                "@type": "File",
+                "name": "forwarded.txt"
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            delete_metadata_document(
+                State(test.coordinator.state.clone()),
+                Extension(Some(test.auth.clone())),
+                bearer(),
+                Path(document_id),
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+
+        test.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn missing_config_fails() {
+        let test = setup_distributed_metadata_access_state().await;
+        let context = test.coordinator.state.get_ctx();
+        let deleted = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: (*test.coordinator.state.get_realm_id().as_bytes()).into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            deleted,
+            Event::Storage(StorageEvent::DeleteResult { .. })
+        ));
+
+        let result = create_metadata_document(
+            State(test.coordinator.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+                test.valid_bearer_token.clone(),
+            ))),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/missing-config".to_string(),
+                    name: "Missing Config".to_string(),
+                    description: "Origin must fail closed".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: None,
+                    public: false,
+                },
+            )),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::ServiceUnavailable)));
+
+        test.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn distributed_search_without_forwarded_token_reads_remote_public_metadata_only() {
         let test = setup_distributed_metadata_access_state().await;
         let ctx = test.remote.state.get_ctx();
@@ -3695,7 +4000,7 @@ mod tests {
             }
         }
         let node_refs: Vec<&DistributedMetadataNode> = nodes.iter().collect();
-        install_distributed_realm_config(&node_refs, realm_id).await;
+        install_distributed_realm_config(&node_refs, realm_id, None).await;
         for node in &nodes {
             install_metadata_auth_documents(node, realm_id, user_id, group_id).await;
         }
@@ -4484,7 +4789,10 @@ mod tests {
 
     struct DistributedMetadataAccessState {
         auth: AuthContext,
+        denied_auth: AuthContext,
+        group_id: Ulid,
         valid_bearer_token: String,
+        denied_bearer_token: String,
         coordinator: DistributedMetadataNode,
         remote: DistributedMetadataNode,
     }
@@ -4519,6 +4827,7 @@ mod tests {
         let realm_signing_key = test_realm_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let denied_user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
         let group_id = Ulid::generate();
         let coordinator = spawn_distributed_metadata_node(realm_id).await;
         let remote = spawn_distributed_metadata_node(realm_id).await;
@@ -4532,13 +4841,16 @@ mod tests {
             .net
             .add_peer_addr(coordinator.net.endpoint_addr())
             .await;
-        install_distributed_realm_config(&nodes, realm_id).await;
-        for node in nodes {
-            install_metadata_auth_documents(node, realm_id, user_id, group_id).await;
-        }
+        install_distributed_realm_config(&nodes, realm_id, Some(coordinator.net.node_id())).await;
+        install_metadata_auth_documents(&remote, realm_id, user_id, group_id).await;
 
         let auth = AuthContext {
             user_id,
+            realm_id,
+            path_restrictions: None,
+        };
+        let denied_auth = AuthContext {
+            user_id: denied_user_id,
             realm_id,
             path_restrictions: None,
         };
@@ -4564,10 +4876,17 @@ mod tests {
 
         let valid_bearer_token =
             sign_test_token(&realm_signing_key, &test_token_claims(realm_id, user_id));
+        let denied_bearer_token = sign_test_token(
+            &realm_signing_key,
+            &test_token_claims(realm_id, denied_user_id),
+        );
 
         DistributedMetadataAccessState {
             auth,
+            denied_auth,
+            group_id,
             valid_bearer_token,
+            denied_bearer_token,
             coordinator,
             remote,
         }
@@ -4630,11 +4949,17 @@ mod tests {
     async fn install_distributed_realm_config(
         nodes: &[&DistributedMetadataNode],
         realm_id: RealmId,
+        user_node: Option<aruna_core::NodeId>,
     ) {
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.seed_default_placement();
         for node in nodes {
-            config.ensure_node(node.net.node_id(), RealmNodeKind::Server);
+            let kind = if Some(node.net.node_id()) == user_node {
+                RealmNodeKind::User
+            } else {
+                RealmNodeKind::Server
+            };
+            config.ensure_node(node.net.node_id(), kind);
         }
 
         for node in nodes {

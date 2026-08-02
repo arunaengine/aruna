@@ -21,8 +21,9 @@ use tracing::warn;
 
 use crate::driver::DriverContext;
 
+pub(crate) use handle::MetadataWritePeerError;
 pub use handle::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
-pub use protocol::{MetadataAuthToken, MetadataAuthTokenError};
+pub use protocol::{MetadataAuthToken, MetadataAuthTokenError, MetadataPathWinner};
 
 /// Primes the metadata caches off the boot path so the first user query
 /// finds them warm. Never blocks startup.
