@@ -6,21 +6,23 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aruna_core::NodeId;
-use aruna_core::document::DocumentSyncTarget;
-use aruna_core::effects::StorageEffect;
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
+use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    Actor, DocumentClass, HandleAllocationCursor, PlacementBinding, PlacementScope,
-    RealmConfigDocument, RealmId,
+    Actor, DocumentClass, HandleAllocationCursor, HandleRange, PlacementBinding, PlacementScope,
+    RealmId,
 };
 use aruna_core::structured_id::PlacementHandle;
-use aruna_core::types::Key;
+use aruna_core::types::{Effects, Key};
+use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
+use crate::get_realm_config::GetRealmConfigError;
 use crate::mutate_realm_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementError, MutateRealmPlacementOperation,
     RealmPlacementMutation,
@@ -51,96 +53,151 @@ pub struct AllocatedHandle {
     pub allocated_at_ms: u64,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum HandleAllocationError {
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error("realm config document missing")]
-    RealmConfigNotFound,
     #[error("unexpected storage event: {0}")]
     UnexpectedStorageEvent(String),
     #[error("placement_handle_exhausted: node {node} has spent every handle in its granted ranges")]
     PlacementHandleExhausted { node: NodeId },
     #[error(transparent)]
     Append(#[from] MutateRealmPlacementError),
+    #[error(transparent)]
+    ReadConfig(#[from] GetRealmConfigError),
 }
 
-async fn read_realm_config(
-    context: &DriverContext,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandleAllocationState {
+    Init,
+    ReadCursor,
+    WriteCursor,
+    Finish,
+    Error,
+}
+
+#[derive(Debug, PartialEq)]
+struct AllocateHandleOperation {
     realm_id: RealmId,
-) -> Result<RealmConfigDocument, HandleAllocationError> {
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: target.storage_keyspace().to_string(),
-            key: target.storage_key(),
-            txn_id: None,
-        })
-        .await;
-    match event {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => Ok(RealmConfigDocument::from_bytes(&bytes)?),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            Err(HandleAllocationError::RealmConfigNotFound)
+    node_id: NodeId,
+    ranges: Vec<HandleRange>,
+    allocated_at_ms: u64,
+    state: HandleAllocationState,
+    output: Option<Result<AllocatedHandle, HandleAllocationError>>,
+}
+
+impl AllocateHandleOperation {
+    fn new(
+        realm_id: RealmId,
+        node_id: NodeId,
+        ranges: Vec<HandleRange>,
+        allocated_at_ms: u64,
+    ) -> Self {
+        Self {
+            realm_id,
+            node_id,
+            ranges,
+            allocated_at_ms,
+            state: HandleAllocationState::Init,
+            output: None,
         }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(HandleAllocationError::UnexpectedStorageEvent(format!(
-            "{other:?}"
-        ))),
+    }
+
+    fn fail(&mut self, error: HandleAllocationError) -> Effects {
+        self.state = HandleAllocationState::Error;
+        self.output = Some(Err(error));
+        smallvec![]
+    }
+
+    fn unexpected(&mut self, event: Event) -> Effects {
+        self.fail(HandleAllocationError::UnexpectedStorageEvent(format!(
+            "{event:?}"
+        )))
     }
 }
 
-async fn read_cursor(
-    context: &DriverContext,
-    realm_id: RealmId,
-) -> Result<HandleAllocationCursor, HandleAllocationError> {
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: NODE_STATE_KEYSPACE.to_string(),
-            key: allocation_cursor_key(&realm_id),
-            txn_id: None,
-        })
-        .await;
-    match event {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => Ok(postcard::from_bytes(&bytes).map_err(ConversionError::from)?),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            Ok(HandleAllocationCursor::new())
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(HandleAllocationError::UnexpectedStorageEvent(format!(
-            "{other:?}"
-        ))),
-    }
-}
+impl Operation for AllocateHandleOperation {
+    type Output = AllocatedHandle;
+    type Error = HandleAllocationError;
 
-async fn persist_cursor(
-    context: &DriverContext,
-    realm_id: RealmId,
-    cursor: &HandleAllocationCursor,
-) -> Result<(), HandleAllocationError> {
-    let value = postcard::to_allocvec(cursor).map_err(ConversionError::from)?;
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
+    fn start(&mut self) -> Effects {
+        self.state = HandleAllocationState::ReadCursor;
+        smallvec![Effect::Storage(StorageEffect::Read {
             key_space: NODE_STATE_KEYSPACE.to_string(),
-            key: allocation_cursor_key(&realm_id),
-            value: value.into(),
+            key: allocation_cursor_key(&self.realm_id),
             txn_id: None,
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match self.state {
+            HandleAllocationState::ReadCursor => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    let mut cursor = match value {
+                        Some(bytes) => match postcard::from_bytes(&bytes) {
+                            Ok(cursor) => cursor,
+                            Err(error) => return self.fail(ConversionError::from(error).into()),
+                        },
+                        None => HandleAllocationCursor::new(),
+                    };
+                    let Some((handle, allocator_range_id)) = cursor.allocate(&self.ranges) else {
+                        return self.fail(HandleAllocationError::PlacementHandleExhausted {
+                            node: self.node_id,
+                        });
+                    };
+                    let value = match postcard::to_allocvec(&cursor) {
+                        Ok(value) => value,
+                        Err(error) => return self.fail(ConversionError::from(error).into()),
+                    };
+                    self.output = Some(Ok(AllocatedHandle {
+                        handle,
+                        allocator_range_id,
+                        allocated_by: self.node_id,
+                        allocated_at_ms: self.allocated_at_ms,
+                    }));
+                    self.state = HandleAllocationState::WriteCursor;
+                    smallvec![Effect::Storage(StorageEffect::Write {
+                        key_space: NODE_STATE_KEYSPACE.to_string(),
+                        key: allocation_cursor_key(&self.realm_id),
+                        value: value.into(),
+                        txn_id: None,
+                    })]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected(other),
+            },
+            HandleAllocationState::WriteCursor => match event {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {
+                    self.state = HandleAllocationState::Finish;
+                    smallvec![]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected(other),
+            },
+            HandleAllocationState::Init => self.unexpected(event),
+            HandleAllocationState::Finish | HandleAllocationState::Error => self.unexpected(event),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(
+            self.state,
+            HandleAllocationState::Finish | HandleAllocationState::Error
+        )
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or_else(|| {
+            Err(HandleAllocationError::UnexpectedStorageEvent(
+                "handle allocation finalized before completion".to_string(),
+            ))
         })
-        .await;
-    match event {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(HandleAllocationError::UnexpectedStorageEvent(format!(
-            "{other:?}"
-        ))),
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
     }
 }
 
@@ -153,21 +210,17 @@ pub async fn allocate_handle(
     node_id: NodeId,
 ) -> Result<AllocatedHandle, HandleAllocationError> {
     let _guard = allocation_lock().lock().await;
-    let config = read_realm_config(context, realm_id).await?;
+    let config = crate::driver::drive(
+        crate::get_realm_config::GetRealmConfigOperation::new(realm_id),
+        context,
+    )
+    .await?;
     let ranges = config.handle_range_directory().granted_to(&node_id);
-    let mut cursor = read_cursor(context, realm_id).await?;
-    let (handle, allocator_range_id) = cursor
-        .allocate(&ranges)
-        .ok_or(HandleAllocationError::PlacementHandleExhausted { node: node_id })?;
-    // Persist the advanced cursor before acknowledging: a crash after this point
-    // wastes the drawn handle at worst, it is never re-issued.
-    persist_cursor(context, realm_id, &cursor).await?;
-    Ok(AllocatedHandle {
-        handle,
-        allocator_range_id,
-        allocated_by: node_id,
-        allocated_at_ms: now_ms(),
-    })
+    crate::driver::drive(
+        AllocateHandleOperation::new(realm_id, node_id, ranges, now_ms()),
+        context,
+    )
+    .await
 }
 
 fn allocation_lock() -> &'static tokio::sync::Mutex<()> {
@@ -209,8 +262,11 @@ pub async fn allocate_placement_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::document::DocumentSyncTarget;
     use aruna_core::events::Event;
-    use aruna_core::structs::{FIRST_GRANTABLE_HANDLE, HandleRange, RealmNodeKind};
+    use aruna_core::structs::{
+        FIRST_GRANTABLE_HANDLE, HandleRange, RealmConfigDocument, RealmNodeKind,
+    };
     use aruna_core::types::UserId;
     use tempfile::tempdir;
 

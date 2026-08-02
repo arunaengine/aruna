@@ -908,24 +908,27 @@ pub async fn grant_handle_range(
     context: &crate::driver::DriverContext,
 ) -> Result<HandleRange, MutateRealmPlacementError> {
     let _guard = grant_lock().lock().await;
-    let document_target = DocumentSyncTarget::RealmConfig {
-        realm_id: actor.realm_id,
-    };
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: document_target.storage_keyspace().to_string(),
-            key: document_target.storage_key(),
-            txn_id: None,
-        })
-        .await;
-    let config = match event {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => RealmConfigDocument::from_bytes(&bytes)?,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        _ => return Err(MutateRealmPlacementError::RealmConfigNotFound),
-    };
+    let config = crate::driver::drive(
+        crate::get_realm_config::GetRealmConfigOperation::new(actor.realm_id),
+        context,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::get_realm_config::GetRealmConfigError::StorageError(error) => error.into(),
+        crate::get_realm_config::GetRealmConfigError::ConversionError(error) => error.into(),
+        crate::get_realm_config::GetRealmConfigError::DocumentNotFound => {
+            MutateRealmPlacementError::RealmConfigNotFound
+        }
+        crate::get_realm_config::GetRealmConfigError::UnexpectedEvent {
+            state,
+            expected,
+            got,
+        } => MutateRealmPlacementError::UnexpectedEvent {
+            state,
+            expected,
+            got,
+        },
+    })?;
     let range = next_handle_range(&config, owner)
         .ok_or(MutateRealmPlacementError::RealmHandleSpaceExhausted)?;
     crate::driver::drive(
