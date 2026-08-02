@@ -1663,13 +1663,16 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::errors::StorageError;
     use aruna_core::keys::generate_signing_key;
-    use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, QuotaConfig, RealmId};
+    use aruna_core::structs::{
+        Actor, AuthContext, DocumentClass, NodeCapabilities, PlacementScope, QuotaConfig, RealmId,
+    };
+    use aruna_operations::allocate_handle::allocate_placement_binding;
     use aruna_operations::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::driver::{DriverContext, drive};
-    use aruna_operations::mutate_realm_placement::MutateRealmPlacementError;
+    use aruna_operations::mutate_realm_placement::{MutateRealmPlacementError, grant_handle_range};
     use aruna_operations::set_realm_quota::SetRealmQuotaError;
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
@@ -2273,6 +2276,21 @@ mod tests {
         }
     }
 
+    async fn provision_strategy(state: &ServerState, actor: Actor, strategy_id: Ulid) {
+        grant_handle_range(actor.clone(), actor.node_id, state.get_ctx().as_ref())
+            .await
+            .unwrap();
+        allocate_placement_binding(
+            state.get_ctx().as_ref(),
+            actor.clone(),
+            PlacementScope::Realm(actor.realm_id),
+            DocumentClass::Metadata,
+            strategy_id,
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn realm_placement_admin_endpoints_require_auth_and_management_node() {
         let (state, realm_id, _admin, _tempdir) = setup_management_state().await;
@@ -2324,10 +2342,27 @@ mod tests {
         let scope = RealmPlacementBindingScope::Realm;
         let node_id = state.get_node_id().to_string();
 
-        for request in [
-            RealmPlacementMutationRequest::UpsertStrategy {
+        let (_status, _body) = mutate_realm_placement(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Ok(Json(RealmPlacementMutationRequest::UpsertStrategy {
                 strategy: placement_strategy(strategy_id),
+            })),
+        )
+        .await
+        .unwrap();
+        provision_strategy(
+            state.as_ref(),
+            Actor {
+                node_id: state.get_node_id(),
+                user_id: admin,
+                realm_id,
             },
+            strategy_id,
+        )
+        .await;
+
+        for request in [
             RealmPlacementMutationRequest::SetDefaultStrategy {
                 strategy_id: strategy_id.to_string(),
             },
@@ -2392,9 +2427,6 @@ mod tests {
             RealmPlacementMutationRequest::SetDefaultStrategy {
                 strategy_id: initial_default,
             },
-            RealmPlacementMutationRequest::RemoveStrategy {
-                strategy_id: strategy_id.to_string(),
-            },
         ] {
             let (_status, _body) = mutate_realm_placement(
                 State(state.clone()),
@@ -2405,11 +2437,22 @@ mod tests {
             .unwrap();
         }
 
+        let error = mutate_realm_placement(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Ok(Json(RealmPlacementMutationRequest::RemoveStrategy {
+                strategy_id: strategy_id.to_string(),
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ServerError::Conflict(message) if message.contains("referenced")));
+
         let (_, Json(stored)) = get_realm_placement(State(state), Extension(Some(auth)))
             .await
             .unwrap();
         assert!(
-            !stored
+            stored
                 .strategies
                 .iter()
                 .any(|strategy| strategy.strategy_id == strategy_id.to_string())
@@ -2429,22 +2472,34 @@ mod tests {
         let auth = admin_auth(realm_id, admin);
         let strategy_id = Ulid::from_bytes([24; 16]);
 
-        for request in [
-            RealmPlacementMutationRequest::UpsertStrategy {
+        let (_status, _body) = mutate_realm_placement(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Ok(Json(RealmPlacementMutationRequest::UpsertStrategy {
                 strategy: placement_strategy(strategy_id),
+            })),
+        )
+        .await
+        .unwrap();
+        provision_strategy(
+            state.as_ref(),
+            Actor {
+                node_id: state.get_node_id(),
+                user_id: admin,
+                realm_id,
             },
-            RealmPlacementMutationRequest::SetDefaultStrategy {
+            strategy_id,
+        )
+        .await;
+        let (_status, _body) = mutate_realm_placement(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Ok(Json(RealmPlacementMutationRequest::SetDefaultStrategy {
                 strategy_id: strategy_id.to_string(),
-            },
-        ] {
-            let _ = mutate_realm_placement(
-                State(state.clone()),
-                Extension(Some(auth.clone())),
-                Ok(Json(request)),
-            )
-            .await
-            .unwrap();
-        }
+            })),
+        )
+        .await
+        .unwrap();
 
         let (_, Json(info)) = get_realm_info(State(state.clone()), Extension(Some(auth.clone())))
             .await
