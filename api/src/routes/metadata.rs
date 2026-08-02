@@ -37,7 +37,7 @@ use aruna_operations::metadata::api::{
 use aruna_operations::metadata::forward::{
     MetadataWriteError, create_metadata_document_routed as run_create_metadata_document,
     delete_metadata_document_routed as run_delete_metadata_document,
-    export_metadata_rocrate_routed as run_export_metadata_rocrate_routed,
+    export_rocrate_routed as run_export_rocrate,
     get_metadata_routed as run_get_visible_metadata_document, is_user_origin,
     origin_holds_document as run_origin_holds_document,
     update_metadata_document_routed as run_update_metadata_document,
@@ -963,7 +963,7 @@ pub async fn export_metadata_rocrate(
     let document_id = parse_document_id(&document_id)?;
     let view = params.view.clone().unwrap_or(MetadataRoCrateView::Full);
     let ctx = state.get_ctx();
-    let export = run_export_metadata_rocrate_routed(
+    let export = run_export_rocrate(
         &ctx,
         state.get_realm_id(),
         ExportMetadataRoCrateRequest {
@@ -975,6 +975,7 @@ pub async fn export_metadata_rocrate(
             after: params.after.clone(),
         },
         forwarded_auth_token(bearer_token)?,
+        state.rocrate_limits().metadata_bytes,
     )
     .await
     .map_err(map_metadata_api_error)?;

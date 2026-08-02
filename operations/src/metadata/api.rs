@@ -1041,43 +1041,99 @@ pub async fn query_metadata_document(
     ensure_supported_query_form(&request.query)?;
     let record = load_record_by_document(context, request.document_id).await?;
     ensure_record_readable(context, realm_id, request.auth.as_ref(), &record).await?;
-    let config = load_realm_config(context, realm_id).await;
-    let holders = document_replica_query_nodes(config.as_ref(), &record, local_node_id);
-    // A non-holder routes the read to the document's holders instead of
-    // materializing a graph it does not carry.
-    let mode = if holders.contains(&local_node_id) {
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
+    if request.mode == Some(MetadataApiQueryMode::Local) {
         ensure_record_materialized_for_graph_read(context, &record).await?;
-        request.mode
-    } else {
-        Some(MetadataApiQueryMode::Distributed)
-    };
-    let discovery_failed = context.net_handle.is_some()
-        && mode.unwrap_or(MetadataApiQueryMode::Distributed) == MetadataApiQueryMode::Distributed
-        && config.is_none();
-    if discovery_failed && !request.allow_partial {
-        return Err(MetadataApiError::ServiceUnavailable);
+        let results = metadata
+            .query_authorized_local(request.auth, Some(vec![record.graph_iri]), request.query)
+            .await
+            .map_err(map_metadata_query_error)?;
+        return Ok(MetadataQueryExecution {
+            results,
+            fanout_stats: MetadataFanoutStats {
+                nodes_queried: 1,
+                ..MetadataFanoutStats::default()
+            },
+        });
     }
 
-    let mut execution = query_metadata(
-        context,
-        realm_id,
-        local_node_id,
-        MetadataQueryRequest {
-            auth: request.auth,
-            bearer_token: request.bearer_token,
-            graph_iris: Some(vec![record.graph_iri.clone()]),
-            query: request.query,
-            mode,
-            target_nodes: Some(holders),
-            allow_partial: request.allow_partial,
-        },
-    )
-    .await?;
-    if discovery_failed {
-        execution.fanout_stats.nodes_failed += 1;
-        execution.fanout_stats.discovery_failed = true;
+    let Some(config) = load_realm_config(context, realm_id).await else {
+        if !request.allow_partial {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
+        ensure_record_materialized_for_graph_read(context, &record).await?;
+        let results = metadata
+            .query_authorized_local(request.auth, Some(vec![record.graph_iri]), request.query)
+            .await
+            .map_err(map_metadata_query_error)?;
+        return Ok(MetadataQueryExecution {
+            results,
+            fanout_stats: MetadataFanoutStats {
+                nodes_queried: 1,
+                nodes_failed: 1,
+                discovery_failed: true,
+                ..MetadataFanoutStats::default()
+            },
+        });
+    };
+    let config_digest = config
+        .digest()
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let mut holders = document_replica_query_nodes(Some(&config), &record, local_node_id);
+    if let Some(index) = holders.iter().position(|holder| *holder == local_node_id) {
+        holders.swap(0, index);
     }
-    Ok(execution)
+    let remote_auth = match request.bearer_token.as_deref() {
+        Some(token) => {
+            Some(MetadataAuthToken::bearer(token).map_err(|_| MetadataApiError::BadRequest)?)
+        }
+        None => request.auth.clone().map(MetadataAuthToken::internal),
+    };
+    let mut fanout_stats = MetadataFanoutStats::default();
+    for holder in holders {
+        fanout_stats.nodes_queried += 1;
+        let result = if holder == local_node_id {
+            match ensure_record_materialized_for_graph_read(context, &record).await {
+                Ok(()) => {
+                    metadata
+                        .query_authorized_local(
+                            request.auth.clone(),
+                            Some(vec![record.graph_iri.clone()]),
+                            request.query.clone(),
+                        )
+                        .await
+                }
+                Err(error) => Err(MetadataError::Backend(error.to_string())),
+            }
+        } else {
+            metadata
+                .request_document_query(
+                    holder,
+                    remote_auth.clone(),
+                    config_digest,
+                    request.document_id,
+                    request.query.clone(),
+                )
+                .await
+        };
+        match result {
+            Ok(results) => {
+                return Ok(MetadataQueryExecution {
+                    results,
+                    fanout_stats,
+                });
+            }
+            Err(error) => {
+                fanout_stats.nodes_failed += 1;
+                fanout_stats.failed_partitions.push(holder);
+                warn!(%holder, %error, "Document query holder failed; trying the next replica");
+            }
+        }
+    }
+    Err(MetadataApiError::ServiceUnavailable)
 }
 
 pub async fn query_metadata(

@@ -80,6 +80,8 @@ use crate::sync_relationship::{
 };
 
 const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
+const METADATA_CHUNK_SIZE: usize = 64 * 1024;
+const METADATA_ENVELOPE_BYTES: u64 = 16 * 1024 * 1024;
 const SYNC_MIRROR_REQUEST_TIMEOUT: Duration =
     RECONCILE_GRACE.saturating_sub(Duration::from_secs(10));
 const METADATA_GRAPH_SYNC_ATTEMPTS: usize = 3;
@@ -1157,6 +1159,7 @@ impl MetadataHandle {
         context: &Arc<DriverContext>,
         mut stream: BiStream,
         peer: NodeId,
+        metadata_bytes: u64,
     ) -> Result<(), MetadataError> {
         let total_started = Instant::now();
         let read_started = Instant::now();
@@ -1166,6 +1169,7 @@ impl MetadataHandle {
         span.record("request", transport_message_kind(&message));
 
         let process_started = Instant::now();
+        let mut response_body = None;
         let response = match message {
             MetadataTransportMessage::QueryGraphs {
                 auth_token,
@@ -1314,6 +1318,10 @@ impl MetadataHandle {
                 self.apply_sync_mirror(context, peer, auth_token, *relationship, None, true)
                     .await
             }
+            query @ MetadataTransportMessage::QueryDocument { .. } => {
+                let result = super::forward::apply_document_query(context, peer, query).await;
+                MetadataTransportMessage::DocumentQueryResults { result }
+            }
             MetadataTransportMessage::ForwardPathLookup {
                 auth_token,
                 group_id,
@@ -1409,11 +1417,33 @@ impl MetadataHandle {
                 };
                 MetadataTransportMessage::ForwardedPathResolution { result }
             }
+            forward @ MetadataTransportMessage::ForwardExportDocument { .. } => {
+                match super::forward::apply_forwarded_export(context, peer, forward, metadata_bytes)
+                    .await
+                {
+                    Ok((export, metadata_bytes)) => match postcard::to_allocvec(&export) {
+                        Ok(bytes) => {
+                            let length = bytes.len() as u64;
+                            if length > metadata_body_limit(metadata_bytes) {
+                                MetadataTransportMessage::ForwardedExport {
+                                    result: Err(MetadataReadError::Unavailable),
+                                }
+                            } else {
+                                response_body = Some(bytes);
+                                MetadataTransportMessage::ForwardedExport { result: Ok(length) }
+                            }
+                        }
+                        Err(_) => MetadataTransportMessage::ForwardedExport {
+                            result: Err(MetadataReadError::Unavailable),
+                        },
+                    },
+                    Err(error) => MetadataTransportMessage::ForwardedExport { result: Err(error) },
+                }
+            }
             forward @ (MetadataTransportMessage::ForwardCreateDocument { .. }
             | MetadataTransportMessage::ForwardUpdateDocument { .. }
             | MetadataTransportMessage::ForwardDeleteDocument { .. }
-            | MetadataTransportMessage::ForwardReadDocument { .. }
-            | MetadataTransportMessage::ForwardExportDocument { .. }) => {
+            | MetadataTransportMessage::ForwardReadDocument { .. }) => {
                 super::forward::apply_forwarded_write(context, peer, forward).await
             }
             MetadataTransportMessage::QueryResults { .. }
@@ -1431,6 +1461,7 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardedDelete
             | MetadataTransportMessage::ForwardedUpdateInvalidInput { .. }
             | MetadataTransportMessage::ForwardedExport { .. }
+            | MetadataTransportMessage::DocumentQueryResults { .. }
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -1442,7 +1473,13 @@ impl MetadataHandle {
         record_elapsed_ms(&span, "drain_ms", drain_started);
 
         let write_started = Instant::now();
-        let _ = write_transport_message(&mut stream, &response).await;
+        if write_transport_message(&mut stream, &response)
+            .await
+            .is_ok()
+            && let Some(body) = response_body
+        {
+            let _ = write_stream_body(&mut stream, &body).await;
+        }
         record_elapsed_ms(&span, "write_ms", write_started);
         close_stream(&mut stream).await;
         record_elapsed_ms(&span, "elapsed_ms", total_started);
@@ -1731,6 +1768,17 @@ impl MetadataHandle {
         result
     }
 
+    pub(crate) async fn request_export(
+        &self,
+        node_id: NodeId,
+        message: MetadataTransportMessage,
+    ) -> Result<
+        Result<super::api::ExportMetadataRoCrateResult, MetadataReadError>,
+        MetadataRequestError,
+    > {
+        send_export_request(&self.inner, node_id, message).await
+    }
+
     #[tracing::instrument(
         name = "metadata.query.local_authorized",
         level = "debug",
@@ -1921,6 +1969,41 @@ impl MetadataHandle {
             Err(error) => record_error(&span, &error.to_string()),
         }
         result
+    }
+
+    pub(crate) async fn request_document_query(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        config_digest: [u8; 32],
+        document_id: Ulid,
+        sparql: String,
+    ) -> Result<MetadataQueryResults, MetadataError> {
+        match send_remote_metadata_request(
+            &self.inner,
+            &Span::current(),
+            node_id,
+            MetadataTransportMessage::QueryDocument {
+                auth_token,
+                config_digest,
+                document_id,
+                sparql,
+            },
+        )
+        .await
+        .map_err(MetadataRequestError::into_metadata_error)?
+        {
+            MetadataTransportMessage::DocumentQueryResults {
+                result: Ok(results),
+            } => Ok(results),
+            MetadataTransportMessage::DocumentQueryResults { result: Err(error) } => Err(
+                MetadataError::Backend(format!("document query failed: {error:?}")),
+            ),
+            response => Err(MetadataError::Backend(format!(
+                "unexpected document query response: {}",
+                transport_message_kind(&response)
+            ))),
+        }
     }
 
     #[tracing::instrument(
@@ -4010,6 +4093,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedDelete => "forwarded_delete",
         MetadataTransportMessage::ForwardExportDocument { .. } => "forward_export_document",
         MetadataTransportMessage::ForwardedExport { .. } => "forwarded_export",
+        MetadataTransportMessage::QueryDocument { .. } => "query_document",
+        MetadataTransportMessage::DocumentQueryResults { .. } => "document_query_results",
         MetadataTransportMessage::Reject(_) => "reject",
         MetadataTransportMessage::ForwardedUpdateInvalidInput { .. } => {
             "forwarded_update_invalid_input"
@@ -5929,6 +6014,72 @@ async fn send_request(
     Ok(response)
 }
 
+async fn send_export_request(
+    inner: &MetadataInner,
+    node_id: NodeId,
+    message: MetadataTransportMessage,
+) -> Result<Result<super::api::ExportMetadataRoCrateResult, MetadataReadError>, MetadataRequestError>
+{
+    let metadata_bytes = match &message {
+        MetadataTransportMessage::ForwardExportDocument { metadata_bytes, .. } => *metadata_bytes,
+        _ => {
+            return Err(MetadataRequestError::definitely_not_sent(
+                MetadataError::InvalidInput("expected a metadata export request".to_string()),
+            ));
+        }
+    };
+    let bytes = encode_message(&message)
+        .map_err(MetadataError::Backend)
+        .map_err(MetadataRequestError::definitely_not_sent)?;
+    let net_handle = inner
+        .net_handle
+        .clone()
+        .ok_or_else(|| MetadataRequestError::definitely_not_sent(MetadataError::HandleMissing))?;
+    let mut stream = net_handle
+        .open_stream(node_id, Alpn::Metadata)
+        .await
+        .map_err(|error| MetadataError::Backend(error.to_string()))
+        .map_err(MetadataRequestError::definitely_not_sent)?;
+    write_encoded_transport_message(&mut stream, &bytes)
+        .await
+        .map_err(MetadataRequestError::possibly_sent)?;
+    stream
+        .0
+        .finish()
+        .map_err(|error| MetadataError::Backend(error.to_string()))
+        .map_err(MetadataRequestError::possibly_sent)?;
+    let response = read_transport_message(&mut stream)
+        .await
+        .map_err(MetadataRequestError::possibly_sent)?;
+    let result = match response {
+        MetadataTransportMessage::ForwardedExport { result: Err(error) } => Err(error),
+        MetadataTransportMessage::ForwardedExport { result: Ok(length) } => {
+            if length > metadata_body_limit(metadata_bytes) {
+                return Err(MetadataRequestError::possibly_sent(MetadataError::Backend(
+                    "metadata export body exceeds the protocol limit".to_string(),
+                )));
+            }
+            let bytes = read_stream_body(&mut stream, length)
+                .await
+                .map_err(MetadataRequestError::possibly_sent)?;
+            postcard::from_bytes(&bytes)
+                .map_err(|error| MetadataError::Backend(error.to_string()))
+                .map_err(MetadataRequestError::possibly_sent)
+                .map(Ok)?
+        }
+        response => {
+            return Err(MetadataRequestError::possibly_sent(MetadataError::Backend(
+                format!(
+                    "unexpected metadata export response: {}",
+                    transport_message_kind(&response)
+                ),
+            )));
+        }
+    };
+    close_stream(&mut stream).await;
+    Ok(result)
+}
+
 async fn write_transport_message(
     stream: &mut BiStream,
     message: &MetadataTransportMessage,
@@ -5959,6 +6110,37 @@ async fn read_transport_message(
     result
         .map_err(|_| MetadataError::Backend("timed out waiting for metadata message".to_string()))?
         .map_err(MetadataError::Backend)
+}
+
+async fn write_stream_body(stream: &mut BiStream, bytes: &[u8]) -> Result<(), MetadataError> {
+    for chunk in bytes.chunks(METADATA_CHUNK_SIZE) {
+        timeout(METADATA_IO_TIMEOUT, stream.0.write_all(chunk))
+            .await
+            .map_err(|_| MetadataError::Backend("timed out writing metadata body".to_string()))?
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn metadata_body_limit(metadata_bytes: u64) -> u64 {
+    metadata_bytes.saturating_add(METADATA_ENVELOPE_BYTES)
+}
+
+async fn read_stream_body(stream: &mut BiStream, length: u64) -> Result<Vec<u8>, MetadataError> {
+    let length = usize::try_from(length)
+        .map_err(|_| MetadataError::Backend("metadata body length is unsupported".to_string()))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| MetadataError::Backend("metadata body allocation failed".to_string()))?;
+    bytes.resize(length, 0);
+    for chunk in bytes.chunks_mut(METADATA_CHUNK_SIZE) {
+        timeout(METADATA_IO_TIMEOUT, stream.1.read_exact(chunk))
+            .await
+            .map_err(|_| MetadataError::Backend("timed out reading metadata body".to_string()))?
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    }
+    Ok(bytes)
 }
 
 async fn close_stream(stream: &mut BiStream) {

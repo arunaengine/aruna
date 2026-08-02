@@ -47,7 +47,7 @@ use crate::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, MetadataApiError,
     MetadataRoCrateExportView,
 };
-use crate::metadata::forward::export_metadata_rocrate_routed;
+use crate::metadata::forward::export_rocrate_routed;
 use crate::replication::bao_read::{BaoReadError, BaoReadOperation, BaoReadOutput};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 
@@ -335,7 +335,7 @@ async fn snapshot_export(
     // Route the raw revision from a document holder; a job placed on a
     // job-control bucket rarely also holds the document's bucket. The holder
     // re-checks the job principal's READ, attested by this authenticated peer.
-    let export = export_metadata_rocrate_routed(
+    let export = export_rocrate_routed(
         &ctx.driver,
         spec.auth_context.realm_id,
         ExportMetadataRoCrateRequest {
@@ -347,6 +347,7 @@ async fn snapshot_export(
             after: None,
         },
         Some(MetadataAuthToken::internal(spec.auth_context.clone())),
+        spec.limits.metadata_bytes,
     )
     .await
     .map_err(snapshot_read_failure)?;

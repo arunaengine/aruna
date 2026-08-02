@@ -474,7 +474,12 @@ impl InboundEventHandler for OperationsInboundHandler {
                         return;
                     };
                     if let Err(err) = metadata_handle
-                        .handle_inbound_stream(&self.context, stream, node_id)
+                        .handle_inbound_stream(
+                            &self.context,
+                            stream,
+                            node_id,
+                            self.rocrate_limits.metadata_bytes,
+                        )
                         .await
                     {
                         error!(error = ?err, "Failed to process inbound metadata stream");

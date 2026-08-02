@@ -37,8 +37,8 @@ use aruna_operations::metadata::api::{
     MetadataDocumentQueryRequest, MetadataRoCrateExportView, query_metadata_document,
 };
 use aruna_operations::metadata::forward::{
-    create_metadata_document_routed, delete_metadata_document_routed,
-    export_metadata_rocrate_routed, origin_holds_document, update_metadata_document_routed,
+    create_metadata_document_routed, delete_metadata_document_routed, export_rocrate_routed,
+    origin_holds_document, update_metadata_document_routed,
 };
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::sync_placement::sort_node_ids;
@@ -625,11 +625,12 @@ async fn document_export_routes() -> TestResult<()> {
         offset: None,
         after: None,
     };
-    let bearer = export_metadata_rocrate_routed(
+    let bearer = export_rocrate_routed(
         &bystander.context,
         realm.realm_id,
         request(None),
         Some(realm.bearer_token()),
+        aruna_core::structs::RoCrateLimits::default().metadata_bytes,
     )
     .await?;
     assert!(matches!(bearer, ExportMetadataRoCrateResult::Full { .. }));
@@ -639,11 +640,12 @@ async fn document_export_routes() -> TestResult<()> {
         realm_id: realm.realm_id,
         path_restrictions: None,
     };
-    let internal = export_metadata_rocrate_routed(
+    let internal = export_rocrate_routed(
         &bystander.context,
         realm.realm_id,
         request(Some(principal.clone())),
         Some(MetadataAuthToken::internal(principal)),
+        aruna_core::structs::RoCrateLimits::default().metadata_bytes,
     )
     .await?;
     assert!(matches!(internal, ExportMetadataRoCrateResult::Full { .. }));
