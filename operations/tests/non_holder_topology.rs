@@ -18,8 +18,8 @@ use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::storage_entries::metadata_registry_delete_entries;
 use aruna_core::structs::{
-    AuthContext, ComputeResources, DocumentClass, ExecutionSpec, JOBCONTROL_HANDLE, PlacementRef,
-    PlacementScope, WorkspaceMode,
+    AuthContext, ComputeResources, DocumentClass, ExecutionSpec, JOBCONTROL_HANDLE, JobState,
+    PlacementRef, PlacementScope, WorkspaceMode,
 };
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
@@ -29,10 +29,8 @@ use aruna_operations::driver::drive;
 use aruna_operations::get_metadata_document::{
     GetMetadataDocumentError, GetMetadataDocumentOperation, load_metadata_record_by_document,
 };
-use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::jobs::service::{
-    RoutedCancelOutcome, cancel_job_routed, read_job_routed, read_owned_job, submit_execution_job,
-};
+use aruna_operations::jobs::drain::{JobClassBudget, process_routed_queue};
+use aruna_operations::jobs::service::{read_job_routed, read_owned_job, submit_execution_job};
 use aruna_operations::metadata::MetadataAuthToken;
 use aruna_operations::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, MetadataApiQueryMode,
@@ -53,31 +51,35 @@ const MANAGEMENT_NODES: usize = 5;
 const USER_NODES: usize = 1;
 const REPLICATION_FACTOR: u32 = 3;
 
+fn execution_spec(seed: u8) -> ExecutionSpec {
+    ExecutionSpec {
+        group_id: Ulid::from_bytes([seed; 16]),
+        name: None,
+        description: None,
+        tags: Default::default(),
+        image: "alpine:3".to_string(),
+        entrypoint: None,
+        command: Vec::new(),
+        workdir: None,
+        env: Default::default(),
+        resources: ComputeResources::default(),
+        executor_constraint: None,
+        inputs: Vec::new(),
+        file_outputs: Vec::new(),
+        workspace_outputs: Vec::new(),
+        output_prefixes: Vec::new(),
+    }
+}
+
 #[tokio::test]
-async fn job_read_routes() -> TestResult<()> {
+async fn replica_read_routes() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
-    let owner = realm.node(0);
+    let ingress = realm.node(0);
     let submitted = submit_execution_job(
-        owner.context.as_ref(),
-        ExecutionSpec {
-            group_id: Ulid::from_bytes([41; 16]),
-            name: None,
-            description: None,
-            tags: Default::default(),
-            image: "alpine:3".to_string(),
-            entrypoint: None,
-            command: Vec::new(),
-            workdir: None,
-            env: Default::default(),
-            resources: ComputeResources::default(),
-            executor_constraint: None,
-            inputs: Vec::new(),
-            file_outputs: Vec::new(),
-            workspace_outputs: Vec::new(),
-            output_prefixes: Vec::new(),
-        },
+        ingress.context.as_ref(),
+        execution_spec(41),
         realm.user_id,
-        owner.node_id(),
+        ingress.node_id(),
         None,
         WorkspaceMode::None,
         None,
@@ -98,13 +100,24 @@ async fn job_read_routes() -> TestResult<()> {
         epoch: 0,
         shard: u32::from(routable.bucket().get()),
     };
-    realm.assert_holder(owner.node_id(), &placement);
-    let reader = realm.user_node();
-    realm.assert_not_holder(reader.node_id(), &placement);
-    let stored = read_owned_job(owner.context.as_ref(), realm.user_id, submitted.job_id)
+    let holders = realm.assert_holder(ingress.node_id(), &placement);
+    let runner = realm.find(holders[0]);
+    let reader = holders
+        .iter()
+        .copied()
+        .find(|holder| *holder != runner.node_id() && *holder != ingress.node_id())
+        .map(|holder| realm.find(holder))
+        .expect("replication factor three provides a non-ingress passive holder");
+    let stored = read_owned_job(runner.context.as_ref(), realm.user_id, submitted.job_id)
         .await?
-        .expect("holder stores the submitted job");
-    assert_eq!(stored.owner_node_id, owner.node_id());
+        .expect("rank-0 holder stores the active job");
+    assert_eq!(stored.owner_node_id, runner.node_id());
+    let passive = read_owned_job(reader.context.as_ref(), realm.user_id, submitted.job_id)
+        .await?
+        .expect("non-runner holder stores a passive replica");
+    assert_eq!(passive.job_id, submitted.job_id);
+    assert_eq!(passive.state, JobState::Queued);
+    assert!(passive.claim.is_none());
 
     let routed = read_job_routed(
         reader.context.as_ref(),
@@ -115,20 +128,105 @@ async fn job_read_routes() -> TestResult<()> {
     .await?;
     assert_eq!(routed.job.job_id, submitted.job_id);
 
-    let caller_runtime = JobsRuntime::new_paused();
-    let cancelled = cancel_job_routed(
-        reader.context.as_ref(),
-        caller_runtime.as_ref(),
+    realm.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn retry_dedups_remote() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let first_ingress = realm.node(0);
+    let second_ingress = realm.node(1);
+    let key = Some("cross-node-retry".to_string());
+    let first = submit_execution_job(
+        first_ingress.context.as_ref(),
+        execution_spec(42),
         realm.user_id,
-        submitted.job_id,
-        Some(realm.bearer_token()),
+        first_ingress.node_id(),
+        key.clone(),
+        WorkspaceMode::None,
+        None,
+        aruna_operations::jobs::JOB_RETENTION_MS,
     )
     .await?;
-    assert!(matches!(cancelled, RoutedCancelOutcome::Requested(_)));
-    let stored = read_owned_job(owner.context.as_ref(), realm.user_id, submitted.job_id)
+    let second = submit_execution_job(
+        second_ingress.context.as_ref(),
+        execution_spec(42),
+        realm.user_id,
+        second_ingress.node_id(),
+        key,
+        WorkspaceMode::None,
+        None,
+        aruna_operations::jobs::JOB_RETENTION_MS,
+    )
+    .await?;
+
+    assert!(first.created);
+    assert!(!second.created);
+    assert_eq!(second.job_id, first.job_id);
+
+    realm.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rank_zero_claims() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let ingress = realm.node(0);
+    let submitted = submit_execution_job(
+        ingress.context.as_ref(),
+        execution_spec(43),
+        realm.user_id,
+        ingress.node_id(),
+        None,
+        WorkspaceMode::None,
+        None,
+        aruna_operations::jobs::JOB_RETENTION_MS,
+    )
+    .await?;
+    let routable = submitted.job_id.as_routable()?;
+    let binding = realm
+        .config
+        .binding_directory()
+        .resolve(routable.placement_handle())?;
+    let placement = PlacementRef {
+        strategy_id: binding.strategy_id,
+        epoch: 0,
+        shard: u32::from(routable.bucket().get()),
+    };
+    let holders = realm.holders(&placement);
+    let runner = realm.find(holders[0]);
+    let passive = realm.find(holders[1]);
+    let budget = JobClassBudget {
+        in_process: 1,
+        external: 1,
+    };
+
+    let passive_result = process_routed_queue(passive.context.as_ref(), budget, None).await?;
+    assert!(passive_result.claimed.is_empty());
+    let passive_record = read_owned_job(passive.context.as_ref(), realm.user_id, submitted.job_id)
         .await?
-        .expect("holder retains the submitted job");
-    assert!(stored.cancel_requested);
+        .expect("second holder retains its passive record");
+    assert!(passive_record.claim.is_none());
+
+    let runner_result = process_routed_queue(runner.context.as_ref(), budget, None).await?;
+    assert_eq!(runner_result.claimed.len(), 1);
+    assert_eq!(runner_result.claimed[0].job_id, submitted.job_id);
+    assert_eq!(
+        runner_result.claimed[0]
+            .claim
+            .as_ref()
+            .map(|claim| claim.holder_node_id),
+        Some(runner.node_id())
+    );
+
+    let passive_result = process_routed_queue(passive.context.as_ref(), budget, None).await?;
+    assert!(passive_result.claimed.is_empty());
+    let passive_record = read_owned_job(passive.context.as_ref(), realm.user_id, submitted.job_id)
+        .await?
+        .expect("second holder remains passive");
+    assert_eq!(passive_record.state, JobState::Queued);
+    assert!(passive_record.claim.is_none());
 
     realm.shutdown().await;
     Ok(())
