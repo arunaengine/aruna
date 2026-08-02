@@ -5105,7 +5105,6 @@ mod tests {
         let directory = config.handle_range_directory();
         assert_eq!(directory.conflicts(), 0);
         assert_eq!(directory.granted_to(&owner).len(), 2);
-        assert_eq!(directory.next_grantable_start(), 2051);
     }
 
     #[test]

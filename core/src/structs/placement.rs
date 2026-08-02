@@ -248,23 +248,6 @@ pub const HANDLE_SPACE_END: u32 = crate::structured_id::MAX_PLACEMENT_HANDLE + 1
 /// Handles per coordinator grant, supporting about one thousand grants.
 pub const HANDLE_RANGE_SIZE: u32 = 1024;
 
-/// Disjoint owner bands the grantable handle space divides into, one grant each.
-pub const HANDLE_BANDS: u32 = (HANDLE_SPACE_END - FIRST_GRANTABLE_HANDLE) / HANDLE_RANGE_SIZE;
-
-/// The single handle band a coordinator may grant from, derived from its node id
-/// so two coordinators computing concurrently never target the same start and
-/// cannot mint overlapping ranges. The fail-closed range directory stays the
-/// backstop for the rare band collision between two distinct node ids.
-pub fn owner_handle_band(owner: &NodeId) -> (u32, u32) {
-    let mut input = b"aruna-handle-band-v1".to_vec();
-    input.extend_from_slice(owner.as_bytes());
-    let mut head = [0u8; 4];
-    head.copy_from_slice(&blake3::hash(&input).as_bytes()[..4]);
-    let lane = u32::from_be_bytes(head) % HANDLE_BANDS;
-    let start = FIRST_GRANTABLE_HANDLE + lane * HANDLE_RANGE_SIZE;
-    (start, start + HANDLE_RANGE_SIZE)
-}
-
 /// Durable `[start, end)` handle slice granted to one node.
 /// Intersecting grants fail closed in the derived range directory.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

@@ -1,4 +1,5 @@
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{
@@ -23,12 +24,14 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::{
     Actor, BindingError, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DocumentClass,
-    HandleRange, MetadataRegistryRecord, NodePlacementEntry, PlacementBinding, PlacementOverride,
-    PlacementRef, PlacementScope, PlacementStrategy, RealmConfigDocument, StrategyBinding,
-    owner_handle_band,
+    FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HANDLE_SPACE_END, HandleRange,
+    MetadataRegistryRecord, NodePlacementEntry, Permission, PlacementBinding, PlacementOverride,
+    PlacementRef, PlacementScope, PlacementStrategy, RealmConfigDocument, RealmNodeKind,
+    StrategyBinding,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
+use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
@@ -41,6 +44,26 @@ use crate::placement::placement_ref_for_target;
 use crate::sync_placement::schedule_placement_revalidation_effect;
 
 const STRATEGY_REFERENCE_SCAN_PAGE_SIZE: usize = 8_192;
+const HANDLE_GRANT_TIMEOUT: Duration = Duration::from_secs(30);
+const HANDLE_GRANT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+const HANDLE_GRANT_POLL: Duration = Duration::from_millis(100);
+const HANDLE_GRANT_ATTEMPTS: usize = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
+pub enum HandleGrantError {
+    #[error("handle grant authentication failed")]
+    Unauthorized,
+    #[error("handle grant is forbidden")]
+    Forbidden,
+    #[error("handle grant request conflicts with stored state")]
+    Conflict,
+    #[error("realm handle space is exhausted")]
+    Exhausted,
+    #[error("handle grant timed out")]
+    Timeout,
+    #[error("handle grant is unavailable: {0}")]
+    Unavailable(String),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RealmPlacementMutation {
@@ -57,19 +80,50 @@ pub enum RealmPlacementMutation {
     GrantHandleRange(HandleRange),
 }
 
-/// Grants `owner` its deterministic handle band. Returns `None` once the owner
-/// already holds that band, so a coordinator draws one disjoint range that never
-/// races another coordinator's start.
-pub fn next_handle_range(config: &RealmConfigDocument, owner: NodeId) -> Option<HandleRange> {
-    let (start, end) = owner_handle_band(&owner);
+fn next_handle_range(
+    config: &RealmConfigDocument,
+    owner: NodeId,
+    request_id: Ulid,
+) -> Result<HandleRange, HandleGrantError> {
     if config
-        .handle_range_directory()
-        .owner_holds_band(&owner, start, end)
+        .placement_handle_ranges
+        .iter()
+        .any(|range| range.range_id == request_id)
     {
-        return None;
+        return config
+            .handle_range_directory()
+            .owned_range(&request_id, &owner)
+            .ok_or(HandleGrantError::Conflict);
     }
-    Some(HandleRange {
-        range_id: Ulid::generate(),
+
+    let mut occupied = config.placement_handle_ranges.clone();
+    occupied.sort_by_key(|range| (range.start, range.end, range.range_id));
+    let mut start = FIRST_GRANTABLE_HANDLE;
+    for range in occupied {
+        let Some(end) = start
+            .checked_add(HANDLE_RANGE_SIZE)
+            .filter(|end| *end <= HANDLE_SPACE_END)
+        else {
+            return Err(HandleGrantError::Exhausted);
+        };
+        if end <= range.start {
+            return Ok(HandleRange {
+                range_id: request_id,
+                owner,
+                start,
+                end,
+            });
+        }
+        if range.end > start {
+            start = range.end;
+        }
+    }
+    let end = start
+        .checked_add(HANDLE_RANGE_SIZE)
+        .filter(|end| *end <= HANDLE_SPACE_END)
+        .ok_or(HandleGrantError::Exhausted)?;
+    Ok(HandleRange {
+        range_id: request_id,
         owner,
         start,
         end,
@@ -218,6 +272,25 @@ impl RealmPlacementMutation {
                         "handle range [{}, {}) is not a valid sub-interval of the handle space",
                         range.start, range.end
                     )));
+                }
+                if !configured_management(document, range.owner) {
+                    return Err(MutateRealmPlacementError::InvalidInput(
+                        "handle ranges may only be granted to Management nodes".to_string(),
+                    ));
+                }
+                let expected =
+                    next_handle_range(document, range.owner, range.range_id).map_err(|error| {
+                        match error {
+                            HandleGrantError::Exhausted => {
+                                MutateRealmPlacementError::RealmHandleSpaceExhausted
+                            }
+                            error => MutateRealmPlacementError::InvalidInput(error.to_string()),
+                        }
+                    })?;
+                if expected != *range {
+                    return Err(MutateRealmPlacementError::InvalidInput(
+                        "handle range is not the allocator's first free interval".to_string(),
+                    ));
                 }
                 // Cross-id overlap converges to a derived conflict after replication.
                 // A divergent value under the same id is rejected locally.
@@ -376,6 +449,8 @@ pub enum MutateRealmPlacementError {
     StrategyReferenced { strategy_id: Ulid },
     #[error("realm handle space is fully granted: no disjoint range remains to grant")]
     RealmHandleSpaceExhausted,
+    #[error(transparent)]
+    HandleGrant(#[from] HandleGrantError),
     #[error("missing active transaction")]
     MissingTransaction,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -440,6 +515,15 @@ impl MutateRealmPlacementOperation {
             return Err(MutateRealmPlacementError::RealmConfigNotFound);
         };
         let mut document = RealmConfigDocument::from_bytes(&document_value)?;
+        if matches!(
+            self.config.mutation,
+            RealmPlacementMutation::GrantHandleRange(_)
+        ) && document.handle_allocator_node() != Some(self.config.actor.node_id)
+        {
+            return Err(MutateRealmPlacementError::InvalidInput(
+                "only the configured handle allocator may grant ranges".to_string(),
+            ));
+        }
         self.config.mutation.validate(&document)?;
 
         let target = self.admin_target();
@@ -902,36 +986,50 @@ pub async fn drive_realm_placement_mutation(
     outcome
 }
 
-/// Persists the next disjoint range as a Management-only admin operation.
-pub async fn grant_handle_range(
-    actor: Actor,
-    owner: NodeId,
+async fn load_realm_config(
+    realm_id: aruna_core::structs::RealmId,
     context: &crate::driver::DriverContext,
-) -> Result<HandleRange, MutateRealmPlacementError> {
-    let _guard = grant_lock().lock().await;
-    let config = crate::driver::drive(
-        crate::get_realm_config::GetRealmConfigOperation::new(actor.realm_id),
+) -> Result<RealmConfigDocument, HandleGrantError> {
+    crate::driver::drive(
+        crate::get_realm_config::GetRealmConfigOperation::new(realm_id),
         context,
     )
     .await
-    .map_err(|error| match error {
-        crate::get_realm_config::GetRealmConfigError::StorageError(error) => error.into(),
-        crate::get_realm_config::GetRealmConfigError::ConversionError(error) => error.into(),
-        crate::get_realm_config::GetRealmConfigError::DocumentNotFound => {
-            MutateRealmPlacementError::RealmConfigNotFound
-        }
-        crate::get_realm_config::GetRealmConfigError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        } => MutateRealmPlacementError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        },
-    })?;
-    let range = next_handle_range(&config, owner)
-        .ok_or(MutateRealmPlacementError::RealmHandleSpaceExhausted)?;
+    .map_err(|error| HandleGrantError::Unavailable(error.to_string()))
+}
+
+fn configured_management(config: &RealmConfigDocument, node_id: NodeId) -> bool {
+    let node_id = node_id.to_string();
+    config
+        .nodes
+        .iter()
+        .any(|node| node.node_id == node_id && matches!(node.kind, RealmNodeKind::Management))
+}
+
+async fn persist_handle_grant(
+    actor: Actor,
+    owner: NodeId,
+    request_id: Ulid,
+    context: &crate::driver::DriverContext,
+) -> Result<HandleRange, HandleGrantError> {
+    let _guard = grant_lock().lock().await;
+    let config = load_realm_config(actor.realm_id, context).await?;
+    if config.handle_allocator_node() != Some(actor.node_id) {
+        return Err(HandleGrantError::Unavailable(
+            "local node is not the configured handle allocator".to_string(),
+        ));
+    }
+    if !configured_management(&config, owner) {
+        return Err(HandleGrantError::Forbidden);
+    }
+    let replay = config
+        .placement_handle_ranges
+        .iter()
+        .any(|range| range.range_id == request_id);
+    let range = next_handle_range(&config, owner, request_id)?;
+    if replay {
+        return Ok(range);
+    }
     crate::driver::drive(
         MutateRealmPlacementOperation::new(MutateRealmPlacementConfig {
             actor,
@@ -939,7 +1037,195 @@ pub async fn grant_handle_range(
         }),
         context,
     )
-    .await?;
+    .await
+    .map_err(|error| match error {
+        MutateRealmPlacementError::RealmHandleSpaceExhausted => HandleGrantError::Exhausted,
+        MutateRealmPlacementError::InvalidInput(_) => HandleGrantError::Conflict,
+        error => HandleGrantError::Unavailable(error.to_string()),
+    })?;
+    Ok(range)
+}
+
+pub(crate) async fn apply_handle_grant(
+    context: &crate::driver::DriverContext,
+    peer: NodeId,
+    auth_token: crate::metadata::MetadataAuthToken,
+    realm_id: aruna_core::structs::RealmId,
+    request_id: Ulid,
+    owner: NodeId,
+) -> Result<HandleRange, HandleGrantError> {
+    let net = context
+        .metadata_handle
+        .as_ref()
+        .and(context.net_handle.as_ref());
+    let Some(net) = net else {
+        return Err(HandleGrantError::Unavailable(
+            "handle grant requires metadata and network handles".to_string(),
+        ));
+    };
+    let local_node_id = net.node_id();
+    if *net.realm_id() != realm_id || peer != owner || request_id.is_nil() {
+        return Err(HandleGrantError::Forbidden);
+    }
+    let config = load_realm_config(realm_id, context).await?;
+    if config.handle_allocator_node() != Some(local_node_id) {
+        return Err(HandleGrantError::Unavailable(
+            "request reached a node other than the configured handle allocator".to_string(),
+        ));
+    }
+    if !configured_management(&config, peer) {
+        return Err(HandleGrantError::Forbidden);
+    }
+    if peer != local_node_id && !matches!(auth_token, crate::metadata::MetadataAuthToken::Bearer(_))
+    {
+        return Err(HandleGrantError::Unauthorized);
+    }
+    let metadata = context.metadata_handle.as_ref().ok_or_else(|| {
+        HandleGrantError::Unavailable("handle grant metadata handle is missing".to_string())
+    })?;
+    let auth = metadata
+        .authorize_write_peer(peer, Some(auth_token))
+        .await
+        .map_err(|error| match error {
+            crate::metadata::MetadataWritePeerError::Unauthorized => HandleGrantError::Unauthorized,
+            crate::metadata::MetadataWritePeerError::Unavailable(error) => {
+                HandleGrantError::Unavailable(error.to_string())
+            }
+        })?;
+    if auth.realm_id != realm_id || auth.user_id.realm_id != realm_id {
+        return Err(HandleGrantError::Forbidden);
+    }
+    let permitted = crate::driver::drive(
+        crate::check_permissions::CheckPermissionsOperation::new(
+            crate::check_permissions::CheckPermissionsConfig {
+                auth_context: auth.clone(),
+                path: format!("/{realm_id}/admin/config"),
+                required_permission: Permission::WRITE,
+            },
+        ),
+        context,
+    )
+    .await
+    .map_err(|error| HandleGrantError::Unavailable(error.to_string()))?;
+    if !permitted {
+        return Err(HandleGrantError::Forbidden);
+    }
+
+    persist_handle_grant(
+        Actor {
+            node_id: local_node_id,
+            user_id: auth.user_id,
+            realm_id,
+        },
+        owner,
+        request_id,
+        context,
+    )
+    .await
+}
+
+async fn wait_handle_grant(
+    context: &crate::driver::DriverContext,
+    realm_id: aruna_core::structs::RealmId,
+    range: HandleRange,
+) -> Result<(), HandleGrantError> {
+    let deadline = tokio::time::Instant::now() + HANDLE_GRANT_TIMEOUT;
+    loop {
+        let config = tokio::time::timeout_at(deadline, load_realm_config(realm_id, context))
+            .await
+            .map_err(|_| HandleGrantError::Timeout)??;
+        if config
+            .handle_range_directory()
+            .owned_range(&range.range_id, &range.owner)
+            == Some(range)
+        {
+            return Ok(());
+        }
+        if config
+            .placement_handle_ranges
+            .iter()
+            .any(|stored| stored.range_id == range.range_id)
+        {
+            return Err(HandleGrantError::Conflict);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(HandleGrantError::Timeout);
+        }
+        tokio::time::sleep_until(std::cmp::min(
+            deadline,
+            tokio::time::Instant::now() + HANDLE_GRANT_POLL,
+        ))
+        .await;
+    }
+}
+
+/// Routes one stable request to the configured allocator and waits for its exact grant.
+pub async fn grant_handle_range(
+    actor: Actor,
+    auth_token: crate::metadata::MetadataAuthToken,
+    context: &crate::driver::DriverContext,
+) -> Result<HandleRange, MutateRealmPlacementError> {
+    let request_id = Ulid::generate();
+    let config = load_realm_config(actor.realm_id, context).await?;
+    let Some(net) = context.net_handle.as_ref() else {
+        if config.handle_allocator_node() != Some(actor.node_id) {
+            return Err(HandleGrantError::Forbidden.into());
+        }
+        let range = persist_handle_grant(actor.clone(), actor.node_id, request_id, context).await?;
+        wait_handle_grant(context, actor.realm_id, range).await?;
+        return Ok(range);
+    };
+    let local_node_id = net.node_id();
+    if actor.node_id != local_node_id || !configured_management(&config, local_node_id) {
+        return Err(HandleGrantError::Forbidden.into());
+    }
+    let allocator = config.handle_allocator_node().ok_or_else(|| {
+        HandleGrantError::Unavailable("realm handle allocator is missing or invalid".to_string())
+    })?;
+    let range = if allocator == local_node_id {
+        apply_handle_grant(
+            context,
+            local_node_id,
+            auth_token,
+            actor.realm_id,
+            request_id,
+            local_node_id,
+        )
+        .await?
+    } else {
+        if !matches!(auth_token, crate::metadata::MetadataAuthToken::Bearer(_)) {
+            return Err(HandleGrantError::Unauthorized.into());
+        }
+        let metadata = context.metadata_handle.as_ref().ok_or_else(|| {
+            HandleGrantError::Unavailable("handle grant metadata handle is missing".to_string())
+        })?;
+        let mut result = Err(HandleGrantError::Timeout);
+        for _ in 0..HANDLE_GRANT_ATTEMPTS {
+            result = tokio::time::timeout(
+                HANDLE_GRANT_ATTEMPT_TIMEOUT,
+                metadata.request_handle_grant(
+                    allocator,
+                    auth_token.clone(),
+                    actor.realm_id,
+                    request_id,
+                    local_node_id,
+                ),
+            )
+            .await
+            .unwrap_or(Err(HandleGrantError::Timeout));
+            if !matches!(
+                &result,
+                Err(HandleGrantError::Timeout | HandleGrantError::Unavailable(_))
+            ) {
+                break;
+            }
+        }
+        result?
+    };
+    if range.range_id != request_id || range.owner != local_node_id || !range.is_well_formed() {
+        return Err(HandleGrantError::Conflict.into());
+    }
+    wait_handle_grant(context, actor.realm_id, range).await?;
     Ok(range)
 }
 
@@ -959,9 +1245,9 @@ mod tests {
         metadata_create_event_and_pending_projection_write_entries, metadata_registry_write_entries,
     };
     use aruna_core::structs::{
-        AffinityEffect, AffinityRule, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT, DocumentClass,
-        FIRST_GRANTABLE_HANDLE, HandleRange, LabelMatch, MetadataRegistryRecord, PlacementBinding,
-        PlacementRef, PlacementScope, RealmId, RealmNodeKind, owner_handle_band,
+        AffinityEffect, AffinityRule, AuthContext, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT,
+        DocumentClass, FIRST_GRANTABLE_HANDLE, HandleRange, LabelMatch, MetadataRegistryRecord,
+        PlacementBinding, PlacementRef, PlacementScope, RealmId, RealmNodeKind,
     };
     use aruna_core::structured_id::PlacementHandle;
     use aruna_core::task::{TaskEffect, TaskKey};
@@ -984,6 +1270,14 @@ mod tests {
         }
     }
 
+    fn grant_auth(actor: &Actor) -> crate::metadata::MetadataAuthToken {
+        crate::metadata::MetadataAuthToken::internal(AuthContext {
+            user_id: actor.user_id,
+            realm_id: actor.realm_id,
+            path_restrictions: None,
+        })
+    }
+
     fn context(root: &str) -> DriverContext {
         DriverContext {
             storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
@@ -998,6 +1292,8 @@ mod tests {
     async fn seed_config(context: &DriverContext, actor: &Actor) -> RealmConfigDocument {
         let mut document = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
         document.seed_default_placement();
+        document.ensure_node(actor.node_id, RealmNodeKind::Management);
+        document.handle_allocator_node_id = Some(actor.node_id);
         let target = DocumentSyncTarget::RealmConfig {
             realm_id: actor.realm_id,
         };
@@ -1784,37 +2080,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn owner_band_exhausts() {
-        // A coordinator already holding its band draws no second range, while a
-        // different owner still draws its own disjoint band.
-        let realm_id = RealmId::from_bytes([52; 32]);
-        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        let owner = node(3);
-        let (start, end) = owner_handle_band(&owner);
-        document.placement_handle_ranges.push(HandleRange {
-            range_id: Ulid::generate(),
-            owner,
-            start,
-            end,
-        });
-        assert!(next_handle_range(&document, owner).is_none());
-        assert!(next_handle_range(&document, node(4)).is_some());
-    }
-
-    #[test]
-    fn cross_node_grants_disjoint() {
-        // Two coordinators computing from the same replicated snapshot pick
-        // non-overlapping ranges, so both survive the derived directory.
-        let realm_id = RealmId::from_bytes([54; 32]);
-        let document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        let left = next_handle_range(&document, node(2)).unwrap();
-        let right = next_handle_range(&document, node(3)).unwrap();
-        assert!(!left.overlaps(&right));
-        let directory = aruna_core::structs::HandleRangeDirectory::from_ranges(&[left, right]);
-        assert_eq!(directory.conflicts(), 0);
-    }
-
     #[tokio::test]
     async fn grant_ranges_disjoint() {
         let temp = tempdir().unwrap();
@@ -1823,10 +2088,10 @@ mod tests {
         let actor = actor(realm_id);
         seed_config(&context, &actor).await;
 
-        let first = grant_handle_range(actor.clone(), node(2), &context)
+        let first = grant_handle_range(actor.clone(), grant_auth(&actor), &context)
             .await
             .unwrap();
-        let second = grant_handle_range(actor.clone(), node(3), &context)
+        let second = grant_handle_range(actor.clone(), grant_auth(&actor), &context)
             .await
             .unwrap();
         assert!(!first.overlaps(&second));
@@ -1847,8 +2112,8 @@ mod tests {
         seed_config(&context, &actor).await;
 
         let (left, right) = tokio::join!(
-            grant_handle_range(actor.clone(), node(2), &context),
-            grant_handle_range(actor.clone(), node(3), &context),
+            grant_handle_range(actor.clone(), grant_auth(&actor), &context),
+            grant_handle_range(actor.clone(), grant_auth(&actor), &context),
         );
         let left = left.unwrap();
         let right = right.unwrap();

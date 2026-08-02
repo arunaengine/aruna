@@ -23,6 +23,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::get_realm_config::GetRealmConfigError;
+use crate::metadata::MetadataAuthToken;
 use crate::mutate_realm_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementError, MutateRealmPlacementOperation,
     RealmPlacementMutation,
@@ -266,6 +267,7 @@ pub async fn allocate_placement_binding(
 pub async fn provision_metadata_binding(
     context: &DriverContext,
     actor: Actor,
+    auth_token: MetadataAuthToken,
     scope: PlacementScope,
     strategy_id: Ulid,
 ) -> Result<PlacementBinding, HandleAllocationError> {
@@ -306,8 +308,7 @@ pub async fn provision_metadata_binding(
         Err(HandleAllocationError::PlacementHandleExhausted { .. }) => {}
         Err(error) => return Err(error),
     }
-    crate::mutate_realm_placement::grant_handle_range(actor.clone(), actor.node_id, context)
-        .await?;
+    crate::mutate_realm_placement::grant_handle_range(actor.clone(), auth_token, context).await?;
     allocate_placement_binding(context, actor, scope, DocumentClass::Metadata, strategy_id).await
 }
 
@@ -322,7 +323,7 @@ mod tests {
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::events::Event;
     use aruna_core::structs::{
-        FIRST_GRANTABLE_HANDLE, HandleRange, RealmConfigDocument, RealmNodeKind, owner_handle_band,
+        AuthContext, FIRST_GRANTABLE_HANDLE, HandleRange, RealmConfigDocument, RealmNodeKind,
     };
     use aruna_core::types::UserId;
     use tempfile::tempdir;
@@ -358,6 +359,7 @@ mod tests {
         let mut document = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
         document.seed_default_placement();
         document.ensure_node(actor.node_id, RealmNodeKind::Management);
+        document.handle_allocator_node_id = Some(actor.node_id);
         document.placement_handle_ranges.push(range);
         let target = DocumentSyncTarget::RealmConfig {
             realm_id: actor.realm_id,
@@ -555,17 +557,23 @@ mod tests {
             .await
             .unwrap();
 
-        // The seeded range is exhausted, so the extension grants from the owner band.
-        let band_start = owner_handle_band(&actor.node_id).0;
+        // The seeded range is exhausted, so the extension takes the first free interval.
+        let next_handle = FIRST_GRANTABLE_HANDLE + 1;
+        let auth_token = MetadataAuthToken::internal(AuthContext {
+            user_id: actor.user_id,
+            realm_id: actor.realm_id,
+            path_restrictions: None,
+        });
         let binding = provision_metadata_binding(
             &context,
             actor,
+            auth_token,
             PlacementScope::Group(Ulid::from_bytes([8; 16])),
             document.default_strategy_id.unwrap(),
         )
         .await
         .unwrap();
 
-        assert_eq!(binding.handle.get(), band_start);
+        assert_eq!(binding.handle.get(), next_handle);
     }
 }

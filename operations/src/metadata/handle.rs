@@ -22,8 +22,8 @@ use aruna_core::metadata::{
 };
 use aruna_core::storage_entries::metadata_graph_lifecycle_key;
 use aruna_core::structs::{
-    AuthContext, BucketInfo, MetadataRegistryRecord, Permission, RealmConfigDocument, RealmId,
-    SyncRelationship, blob_bucket_permission_path,
+    AuthContext, BucketInfo, HandleRange, MetadataRegistryRecord, Permission, RealmConfigDocument,
+    RealmId, SyncRelationship, blob_bucket_permission_path,
 };
 use aruna_core::telemetry::{duration_ms, record_duration_ms, record_elapsed_ms};
 use aruna_core::types::{GroupId, UserId};
@@ -68,6 +68,7 @@ use crate::auth::{
 };
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
+use crate::mutate_realm_placement::HandleGrantError;
 use crate::permission_rules::GroupPermissionRules;
 use crate::realm_peer::{RealmPeerError, ensure_realm_peer};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
@@ -1322,6 +1323,22 @@ impl MetadataHandle {
                 let result = super::forward::apply_document_query(context, peer, query).await;
                 MetadataTransportMessage::DocumentQueryResults { result }
             }
+            MetadataTransportMessage::GrantHandleRange {
+                auth_token,
+                realm_id,
+                request_id,
+                owner,
+            } => MetadataTransportMessage::HandleRangeGranted {
+                result: crate::mutate_realm_placement::apply_handle_grant(
+                    context.as_ref(),
+                    peer,
+                    auth_token,
+                    realm_id,
+                    request_id,
+                    owner,
+                )
+                .await,
+            },
             MetadataTransportMessage::ForwardPathLookup {
                 auth_token,
                 group_id,
@@ -1462,6 +1479,7 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardedUpdateInvalidInput { .. }
             | MetadataTransportMessage::ForwardedExport { .. }
             | MetadataTransportMessage::DocumentQueryResults { .. }
+            | MetadataTransportMessage::HandleRangeGranted { .. }
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -1766,6 +1784,30 @@ impl MetadataHandle {
             record_error(&span, &error.to_string());
         }
         result
+    }
+
+    pub(crate) async fn request_handle_grant(
+        &self,
+        node_id: NodeId,
+        auth_token: MetadataAuthToken,
+        realm_id: RealmId,
+        request_id: Ulid,
+        owner: NodeId,
+    ) -> Result<HandleRange, HandleGrantError> {
+        let message = MetadataTransportMessage::GrantHandleRange {
+            auth_token,
+            realm_id,
+            request_id,
+            owner,
+        };
+        match send_remote_metadata_request(&self.inner, &Span::current(), node_id, message).await {
+            Ok(MetadataTransportMessage::HandleRangeGranted { result }) => result,
+            Ok(response) => Err(HandleGrantError::Unavailable(format!(
+                "unexpected handle grant response: {}",
+                transport_message_kind(&response)
+            ))),
+            Err(error) => Err(HandleGrantError::Unavailable(error.to_string())),
+        }
     }
 
     pub(crate) async fn request_export(
@@ -4095,6 +4137,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedExport { .. } => "forwarded_export",
         MetadataTransportMessage::QueryDocument { .. } => "query_document",
         MetadataTransportMessage::DocumentQueryResults { .. } => "document_query_results",
+        MetadataTransportMessage::GrantHandleRange { .. } => "grant_handle_range",
+        MetadataTransportMessage::HandleRangeGranted { .. } => "handle_range_granted",
         MetadataTransportMessage::Reject(_) => "reject",
         MetadataTransportMessage::ForwardedUpdateInvalidInput { .. } => {
             "forwarded_update_invalid_input"
