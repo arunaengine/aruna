@@ -56,7 +56,7 @@ impl RawEventPlan {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataRawView {
     pub revision: MetadataRawRevision,
     pub projection_state: MetadataMaterializationState,

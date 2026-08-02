@@ -8,6 +8,7 @@ use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
 use crate::create_metadata_document::CreateMetadataDocumentPayload;
+use crate::metadata::api::{ExportMetadataRoCrateResult, MetadataRoCrateExportView};
 use crate::s3::search_buckets::BucketSearchHit;
 use crate::update_metadata_document::UpdateMetadataDocumentMutation;
 
@@ -217,6 +218,22 @@ pub enum MetadataTransportMessage {
     },
     ForwardedWriteNotFound,
     ForwardedWriteUnavailable,
+    /// An RO-Crate export that arrived at a node holding none of the document's
+    /// bucket, forwarded to a holder. `auth_token` carries a bearer token (sync
+    /// callers) or an `Internal` principal attested by the forwarding peer (a
+    /// queued job), which the holder re-checks for READ.
+    ForwardExportDocument {
+        auth_token: Option<MetadataAuthToken>,
+        config_digest: [u8; 32],
+        document_id: Ulid,
+        view: MetadataRoCrateExportView,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        after: Option<String>,
+    },
+    ForwardedExport {
+        result: Result<Box<ExportMetadataRoCrateResult>, MetadataReadError>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -354,6 +371,15 @@ mod tests {
             auth_token: Some(MetadataAuthToken::bearer("delete-token").unwrap()),
             config_digest: [0; 32],
             document_id: Ulid::nil(),
+        });
+        assert_has_auth_token_field(MetadataTransportMessage::ForwardExportDocument {
+            auth_token: Some(MetadataAuthToken::bearer("export-token").unwrap()),
+            config_digest: [0; 32],
+            document_id: Ulid::nil(),
+            view: MetadataRoCrateExportView::Raw,
+            limit: None,
+            offset: None,
+            after: None,
         });
     }
 

@@ -159,7 +159,7 @@ pub struct GetVisibleMetadataDocumentRequest {
     pub auth: Option<AuthContext>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetadataRoCrateExportView {
     Full,
     Summary,
@@ -177,7 +177,7 @@ pub struct ExportMetadataRoCrateRequest {
     pub after: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ExportMetadataRoCrateResult {
     Full {
         record: MetadataRegistryRecord,

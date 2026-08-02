@@ -18,7 +18,7 @@ use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::storage_entries::metadata_registry_delete_entries;
 use aruna_core::structs::{
-    ComputeResources, DocumentClass, ExecutionSpec, JOBCONTROL_HANDLE, PlacementRef,
+    AuthContext, ComputeResources, DocumentClass, ExecutionSpec, JOBCONTROL_HANDLE, PlacementRef,
     PlacementScope, WorkspaceMode,
 };
 use aruna_operations::create_metadata_document::{
@@ -33,12 +33,14 @@ use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, read_job_routed, read_owned_job, submit_execution_job,
 };
+use aruna_operations::metadata::MetadataAuthToken;
 use aruna_operations::metadata::api::{
-    MetadataApiQueryMode, MetadataDocumentQueryRequest, query_metadata_document,
+    ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, MetadataApiQueryMode,
+    MetadataDocumentQueryRequest, MetadataRoCrateExportView, query_metadata_document,
 };
 use aruna_operations::metadata::forward::{
-    create_metadata_document_routed, delete_metadata_document_routed, origin_holds_document,
-    update_metadata_document_routed,
+    create_metadata_document_routed, delete_metadata_document_routed,
+    export_metadata_rocrate_routed, origin_holds_document, update_metadata_document_routed,
 };
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::sync_placement::sort_node_ids;
@@ -483,6 +485,70 @@ async fn document_sparql_routes() -> TestResult<()> {
         matches!(execution.results, MetadataQueryResults::Boolean(true)),
         "non-holder query did not route to a holder graph"
     );
+
+    realm.shutdown().await;
+    Ok(())
+}
+
+// An RO-Crate export arriving at a non-holder must route to a document holder,
+// under either a bearer token (sync) or a peer-attested principal (queued job).
+#[tokio::test]
+async fn document_export_routes() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+
+    let group_id = Ulid::from_bytes([71; 16]);
+    let path = "datasets/export-routes";
+    let origin = realm.node(0);
+    let document_id =
+        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    let placement = create_document(&realm, origin, group_id, document_id, path).await?;
+    let holders = realm.assert_holder(origin.node_id(), &placement);
+    for holder in &holders {
+        let node = realm.find(*holder);
+        wait_until("document reaches holder", node.node_id(), || {
+            document_present(node, group_id, document_id)
+        })
+        .await?;
+    }
+
+    let bystander = realm.non_holder(&placement);
+    wait_until(
+        "registry row reaches non-holder",
+        bystander.node_id(),
+        || registry_row_present(bystander, document_id),
+    )
+    .await?;
+
+    let request = |auth| ExportMetadataRoCrateRequest {
+        document_id,
+        auth,
+        view: MetadataRoCrateExportView::Full,
+        limit: None,
+        offset: None,
+        after: None,
+    };
+    let bearer = export_metadata_rocrate_routed(
+        &bystander.context,
+        realm.realm_id,
+        request(None),
+        Some(realm.bearer_token()),
+    )
+    .await?;
+    assert!(matches!(bearer, ExportMetadataRoCrateResult::Full { .. }));
+
+    let principal = AuthContext {
+        user_id: realm.user_id,
+        realm_id: realm.realm_id,
+        path_restrictions: None,
+    };
+    let internal = export_metadata_rocrate_routed(
+        &bystander.context,
+        realm.realm_id,
+        request(Some(principal.clone())),
+        Some(MetadataAuthToken::internal(principal)),
+    )
+    .await?;
+    assert!(matches!(internal, ExportMetadataRoCrateResult::Full { .. }));
 
     realm.shutdown().await;
     Ok(())

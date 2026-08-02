@@ -29,8 +29,7 @@ use aruna_operations::metadata::api::{
     MetadataPathLookupRequest, MetadataQueryRequest, MetadataReferenceEntry,
     MetadataReferencesExecution, MetadataReferencesRequest,
     MetadataRoCrateExportView as OperationMetadataRoCrateExportView, MetadataSearchRequest,
-    export_metadata_rocrate as run_export_metadata_rocrate, forwarded_bearer,
-    list_visible_metadata_documents as run_list_visible_metadata_documents,
+    forwarded_bearer, list_visible_metadata_documents as run_list_visible_metadata_documents,
     lookup_metadata_path as run_lookup_metadata_path, query_metadata as run_query_metadata,
     query_metadata_document as run_query_metadata_document,
     references_metadata as run_references_metadata, search_metadata as run_search_metadata,
@@ -38,6 +37,7 @@ use aruna_operations::metadata::api::{
 use aruna_operations::metadata::forward::{
     MetadataWriteError, create_metadata_document_routed as run_create_metadata_document,
     delete_metadata_document_routed as run_delete_metadata_document,
+    export_metadata_rocrate_routed as run_export_metadata_rocrate_routed,
     get_metadata_routed as run_get_visible_metadata_document, is_user_origin,
     origin_holds_document as run_origin_holds_document,
     update_metadata_document_routed as run_update_metadata_document,
@@ -956,14 +956,15 @@ pub async fn delete_metadata_document(
 pub async fn export_metadata_rocrate(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(document_id): Path<String>,
     Query(params): Query<MetadataRoCrateExportParams>,
 ) -> ServerResult<(StatusCode, Json<MetadataRoCrateResponse>)> {
     let document_id = parse_document_id(&document_id)?;
     let view = params.view.clone().unwrap_or(MetadataRoCrateView::Full);
     let ctx = state.get_ctx();
-    let export = run_export_metadata_rocrate(
-        ctx.as_ref(),
+    let export = run_export_metadata_rocrate_routed(
+        &ctx,
         state.get_realm_id(),
         ExportMetadataRoCrateRequest {
             document_id,
@@ -973,6 +974,7 @@ pub async fn export_metadata_rocrate(
             offset: params.offset,
             after: params.after.clone(),
         },
+        forwarded_auth_token(bearer_token)?,
     )
     .await
     .map_err(map_metadata_api_error)?;

@@ -1412,7 +1412,8 @@ impl MetadataHandle {
             forward @ (MetadataTransportMessage::ForwardCreateDocument { .. }
             | MetadataTransportMessage::ForwardUpdateDocument { .. }
             | MetadataTransportMessage::ForwardDeleteDocument { .. }
-            | MetadataTransportMessage::ForwardReadDocument { .. }) => {
+            | MetadataTransportMessage::ForwardReadDocument { .. }
+            | MetadataTransportMessage::ForwardExportDocument { .. }) => {
                 super::forward::apply_forwarded_write(context, peer, forward).await
             }
             MetadataTransportMessage::QueryResults { .. }
@@ -1429,6 +1430,7 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardedWriteUnavailable
             | MetadataTransportMessage::ForwardedDelete
             | MetadataTransportMessage::ForwardedUpdateInvalidInput { .. }
+            | MetadataTransportMessage::ForwardedExport { .. }
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -4006,6 +4008,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedWriteNotFound => "forwarded_write_not_found",
         MetadataTransportMessage::ForwardedWriteUnavailable => "forwarded_write_unavailable",
         MetadataTransportMessage::ForwardedDelete => "forwarded_delete",
+        MetadataTransportMessage::ForwardExportDocument { .. } => "forward_export_document",
+        MetadataTransportMessage::ForwardedExport { .. } => "forwarded_export",
         MetadataTransportMessage::Reject(_) => "reject",
         MetadataTransportMessage::ForwardedUpdateInvalidInput { .. } => {
             "forwarded_update_invalid_input"

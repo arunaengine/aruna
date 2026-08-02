@@ -28,7 +28,8 @@ use crate::delete_metadata_document::{
 use crate::driver::{DriverContext, drive};
 use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::metadata::api::{
-    GetVisibleMetadataDocumentRequest, MetadataApiError, get_visible_metadata_document,
+    ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
+    MetadataApiError, export_metadata_rocrate, get_visible_metadata_document,
 };
 use crate::metadata::handle::{MetadataRequestDelivery, MetadataWritePeerError};
 use crate::metadata::protocol::{
@@ -224,6 +225,92 @@ pub async fn get_metadata_routed(
                 result: Err(MetadataReadError::NotFound),
             }) => not_found += 1,
             Ok(MetadataTransportMessage::ForwardedRead {
+                result: Err(MetadataReadError::Unavailable),
+            })
+            | Ok(MetadataTransportMessage::Reject(_))
+            | Err(_) => {}
+            Ok(_) => {}
+        }
+    }
+    if holder_count > 0 && not_found == holder_count {
+        Err(MetadataApiError::NotFound)
+    } else {
+        Err(MetadataApiError::ServiceUnavailable)
+    }
+}
+
+/// Exports an RO-Crate, running locally when this node holds the document's
+/// bucket and otherwise forwarding to a holder. `forward_token` carries the
+/// caller's bearer token or a queued job's `Internal` principal for the holder
+/// to re-check.
+pub async fn export_metadata_rocrate_routed(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    request: ExportMetadataRoCrateRequest,
+    forward_token: Option<MetadataAuthToken>,
+) -> Result<ExportMetadataRoCrateResult, MetadataApiError> {
+    if context.net_handle.is_none() {
+        return export_metadata_rocrate(context.as_ref(), realm_id, request).await;
+    }
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let config_digest = config
+        .digest()
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let placement = resolve_metadata_id(&config, realm_id, None, request.document_id)
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let holders = resolve_shard_holders(&config, &placement);
+    let holder_count = holders.len();
+    let mut not_found = 0usize;
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    if local_node.is_some_and(|node| holders.contains(&node)) {
+        match export_metadata_rocrate(context.as_ref(), realm_id, request.clone()).await {
+            Ok(result) => return Ok(result),
+            Err(MetadataApiError::NotFound) => not_found += 1,
+            Err(MetadataApiError::ServiceUnavailable) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if holder_count > 0 && not_found == holder_count {
+        return Err(MetadataApiError::NotFound);
+    }
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    for holder in holders
+        .into_iter()
+        .filter(|holder| Some(*holder) != local_node)
+    {
+        let response = metadata
+            .request_forwarded_write(
+                holder,
+                MetadataTransportMessage::ForwardExportDocument {
+                    auth_token: forward_token.clone(),
+                    config_digest,
+                    document_id: request.document_id,
+                    view: request.view,
+                    limit: request.limit,
+                    offset: request.offset,
+                    after: request.after.clone(),
+                },
+            )
+            .await;
+        match response {
+            Ok(MetadataTransportMessage::ForwardedExport { result: Ok(export) }) => {
+                return Ok(*export);
+            }
+            Ok(MetadataTransportMessage::ForwardedExport {
+                result: Err(MetadataReadError::Unauthorized),
+            }) => return Err(MetadataApiError::Unauthorized),
+            Ok(MetadataTransportMessage::ForwardedExport {
+                result: Err(MetadataReadError::Forbidden),
+            }) => return Err(MetadataApiError::Forbidden),
+            Ok(MetadataTransportMessage::ForwardedExport {
+                result: Err(MetadataReadError::NotFound),
+            }) => not_found += 1,
+            Ok(MetadataTransportMessage::ForwardedExport {
                 result: Err(MetadataReadError::Unavailable),
             })
             | Ok(MetadataTransportMessage::Reject(_))
@@ -490,7 +577,8 @@ pub(crate) async fn apply_forwarded_write(
         MetadataTransportMessage::ForwardCreateDocument { config_digest, .. }
         | MetadataTransportMessage::ForwardUpdateDocument { config_digest, .. }
         | MetadataTransportMessage::ForwardDeleteDocument { config_digest, .. }
-        | MetadataTransportMessage::ForwardReadDocument { config_digest, .. } => *config_digest,
+        | MetadataTransportMessage::ForwardReadDocument { config_digest, .. }
+        | MetadataTransportMessage::ForwardExportDocument { config_digest, .. } => *config_digest,
         _ => return reject("unexpected forwarded metadata message"),
     };
     if config.digest().ok() != Some(expected_digest) {
@@ -529,6 +617,48 @@ pub(crate) async fn apply_forwarded_write(
             Err(error) => Err(error),
         };
         return MetadataTransportMessage::ForwardedRead { result };
+    }
+
+    if let MetadataTransportMessage::ForwardExportDocument {
+        auth_token,
+        document_id,
+        view,
+        limit,
+        offset,
+        after,
+        ..
+    } = &message
+    {
+        let Some(metadata) = context.metadata_handle.as_ref() else {
+            return reject("forwarded metadata export needs a metadata handle");
+        };
+        let result = match metadata
+            .authorize_read_peer(peer, auth_token.clone(), false)
+            .await
+        {
+            Ok(auth)
+                if holds_metadata_id(&config, realm_id, net_handle.node_id(), *document_id) =>
+            {
+                export_metadata_rocrate(
+                    context.as_ref(),
+                    realm_id,
+                    ExportMetadataRoCrateRequest {
+                        document_id: *document_id,
+                        auth,
+                        view: *view,
+                        limit: *limit,
+                        offset: *offset,
+                        after: after.clone(),
+                    },
+                )
+                .await
+                .map(Box::new)
+                .map_err(read_error)
+            }
+            Ok(_) => Err(MetadataReadError::Unavailable),
+            Err(error) => Err(error),
+        };
+        return MetadataTransportMessage::ForwardedExport { result };
     }
 
     let auth = match authorize_forwarded_caller(context, peer, realm_id, &message).await {
