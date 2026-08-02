@@ -67,6 +67,8 @@ pub enum HandleAllocationError {
     Append(#[from] MutateRealmPlacementError),
     #[error(transparent)]
     ReadConfig(#[from] GetRealmConfigError),
+    #[error("placement strategy {0} does not exist")]
+    StrategyNotFound(Ulid),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +259,61 @@ pub async fn allocate_placement_binding(
     )
     .await?;
     Ok(binding)
+}
+
+/// Idempotently provisions the immutable metadata binding required before a
+/// placement strategy can become active, granting this node a range if needed.
+pub async fn provision_metadata_binding(
+    context: &DriverContext,
+    actor: Actor,
+    scope: PlacementScope,
+    strategy_id: Ulid,
+) -> Result<PlacementBinding, HandleAllocationError> {
+    let _guard = provision_lock().lock().await;
+    let config = crate::driver::drive(
+        crate::get_realm_config::GetRealmConfigOperation::new(actor.realm_id),
+        context,
+    )
+    .await?;
+    if config.strategy(&strategy_id).is_none() {
+        return Err(HandleAllocationError::StrategyNotFound(strategy_id));
+    }
+    if let Some(handle) =
+        config
+            .binding_directory()
+            .handle_for(scope, DocumentClass::Metadata, strategy_id)
+    {
+        return config
+            .placement_bindings
+            .into_iter()
+            .find(|binding| binding.handle == handle)
+            .ok_or_else(|| {
+                HandleAllocationError::UnexpectedStorageEvent(
+                    "binding directory returned a missing placement binding".to_string(),
+                )
+            });
+    }
+    match allocate_placement_binding(
+        context,
+        actor.clone(),
+        scope,
+        DocumentClass::Metadata,
+        strategy_id,
+    )
+    .await
+    {
+        Ok(binding) => return Ok(binding),
+        Err(HandleAllocationError::PlacementHandleExhausted { .. }) => {}
+        Err(error) => return Err(error),
+    }
+    crate::mutate_realm_placement::grant_handle_range(actor.clone(), actor.node_id, context)
+        .await?;
+    allocate_placement_binding(context, actor, scope, DocumentClass::Metadata, strategy_id).await
+}
+
+fn provision_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 #[cfg(test)]
@@ -476,5 +533,37 @@ mod tests {
             allocate_handle(&context, realm_id, actor.node_id).await,
             Err(HandleAllocationError::PlacementHandleExhausted { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn provision_extends_range() {
+        let temp = tempdir().unwrap();
+        let context = context(temp.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([65; 32]);
+        let actor = actor(realm_id);
+        let document = seed_range_config(
+            &context,
+            &actor,
+            range(
+                actor.node_id,
+                FIRST_GRANTABLE_HANDLE,
+                FIRST_GRANTABLE_HANDLE + 1,
+            ),
+        )
+        .await;
+        allocate_handle(&context, realm_id, actor.node_id)
+            .await
+            .unwrap();
+
+        let binding = provision_metadata_binding(
+            &context,
+            actor,
+            PlacementScope::Group(Ulid::from_bytes([8; 16])),
+            document.default_strategy_id.unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(binding.handle.get(), FIRST_GRANTABLE_HANDLE + 1);
     }
 }
