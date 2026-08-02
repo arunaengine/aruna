@@ -272,7 +272,8 @@ pub async fn run_accept_loop(
                             | Alpn::Metadata
                             | Alpn::NativeReference
                             | Alpn::Notification
-                            | Alpn::Shard),
+                            | Alpn::Shard
+                            | Alpn::JobControl),
                         ) => {
                             if alpn == Alpn::DocumentSync {
                                 document_sync.register_inbound_connection(&conn);

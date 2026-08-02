@@ -13,10 +13,16 @@ use aruna_core::task::TaskEvent;
 use aruna_core::types::{NodeId, UserId, Value};
 use aruna_core::util::unix_timestamp_millis;
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use std::ops::Range;
 use std::path::Path;
 use tracing::warn;
 
+use super::JOB_REPORT_MAX_ROWS;
+use super::protocol::{
+    JobRequest, JobResponse, JobRouteError, WireRange, resolve_job_holders, send_job_request,
+};
 use super::runtime::JobsRuntime;
 use super::store::{
     CancelRequestOutcome, JobMutationError, find_dedup_plan, list_job_entries, list_jobs_for_user,
@@ -313,15 +319,212 @@ pub async fn read_owned_job(
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JobKind {
+    Probe,
+    Execution,
+    WriteRunCrate,
+    TerminalCleanup,
+    Staging,
+    ImportRoCrate,
+    ExportRoCrate,
+}
+
+impl JobKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Probe => "probe",
+            Self::Execution => "execution",
+            Self::WriteRunCrate => "write_run_crate",
+            Self::TerminalCleanup => "terminal_cleanup",
+            Self::Staging => "staging",
+            Self::ImportRoCrate => "import_rocrate",
+            Self::ExportRoCrate => "export_rocrate",
+        }
+    }
+
+    fn is_internal(self) -> bool {
+        matches!(self, Self::WriteRunCrate | Self::TerminalCleanup)
+    }
+
+    fn is_report(self) -> bool {
+        matches!(self, Self::ImportRoCrate | Self::ExportRoCrate)
+    }
+}
+
+impl From<&JobPayload> for JobKind {
+    fn from(payload: &JobPayload) -> Self {
+        match payload {
+            JobPayload::Probe { .. } => Self::Probe,
+            JobPayload::Execution(_) => Self::Execution,
+            JobPayload::WriteRunCrate { .. } => Self::WriteRunCrate,
+            JobPayload::TerminalCleanup { .. } => Self::TerminalCleanup,
+            JobPayload::Staging(_) => Self::Staging,
+            JobPayload::ImportRoCrate(_) => Self::ImportRoCrate,
+            JobPayload::ExportRoCrate(_) => Self::ExportRoCrate,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct JobStatusView {
+    pub job_id: JobId,
+    pub created_by: UserId,
+    pub kind: JobKind,
+    pub state: JobState,
+    pub attempts: u32,
+    pub cancel_requested: bool,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub finished_at_ms: Option<u64>,
+    pub progress: JobProgress,
+    pub last_error: Option<JobError>,
+    #[serde(with = "json_value")]
+    pub result: Option<JsonValue>,
+    pub workspace_bucket: Option<String>,
+    pub workspace_mode: WorkspaceMode,
+}
+
+mod json_value {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde_json::Value;
+
+    pub fn serialize<S>(value: &Option<Value>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        value.as_ref().map(Value::to_string).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer)?
+            .map(|value| serde_json::from_str(&value).map_err(serde::de::Error::custom))
+            .transpose()
+    }
+}
+
+impl From<&JobRecord> for JobStatusView {
+    fn from(record: &JobRecord) -> Self {
+        Self {
+            job_id: record.job_id,
+            created_by: record.created_by,
+            kind: JobKind::from(&record.payload),
+            state: record.state,
+            attempts: record.attempts,
+            cancel_requested: record.cancel_requested,
+            created_at_ms: record.created_at_ms,
+            updated_at_ms: record.updated_at_ms,
+            finished_at_ms: record.finished_at_ms,
+            progress: record.progress.clone(),
+            last_error: record.last_error.clone(),
+            result: record.result.as_ref().map(JobResultPayload::to_public_json),
+            workspace_bucket: record.workspace_bucket.clone(),
+            workspace_mode: record.workspace_mode,
+        }
+    }
+}
+
+pub struct RoutedJobStatus {
+    pub job: JobStatusView,
+    pub run_crate: Option<JsonValue>,
+}
+
+pub async fn read_job_routed(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+    auth_token: Option<crate::metadata::MetadataAuthToken>,
+) -> Result<RoutedJobStatus, JobRouteError> {
+    if context.net_handle.is_none() {
+        let record = read_owned_job(context, user_id, job_id)
+            .await
+            .map_err(JobRouteError::Internal)?
+            .ok_or(JobRouteError::NotFound)?;
+        let run_crate = read_job_run_crate_status(context, job_id)
+            .await
+            .map_err(JobRouteError::Internal)?
+            .map(|status| status.to_public_json());
+        return Ok(RoutedJobStatus {
+            job: JobStatusView::from(&record),
+            run_crate,
+        });
+    }
+    let route = resolve_job_holders(context, job_id).await?;
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let mut not_found = 0usize;
+    for holder in &route.holders {
+        if Some(*holder) == local_node {
+            let record = match read_owned_job(context, user_id, job_id).await {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    not_found += 1;
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            let run_crate = match read_job_run_crate_status(context, job_id).await {
+                Ok(status) => status.map(|status| status.to_public_json()),
+                Err(_) => continue,
+            };
+            return Ok(RoutedJobStatus {
+                job: JobStatusView::from(&record),
+                run_crate,
+            });
+        }
+        let token = auth_token.clone().ok_or(JobRouteError::Unauthorized)?;
+        let reply = match send_job_request(
+            context,
+            *holder,
+            JobRequest::Status {
+                auth_token: token,
+                job_id,
+                config_digest: route.config_digest,
+            },
+        )
+        .await
+        {
+            Ok(reply) => reply,
+            Err(_) => continue,
+        };
+        match reply.response {
+            JobResponse::Status { job, run_crate } if routed_job_matches(&job, user_id, job_id) => {
+                let Ok(run_crate) = run_crate
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()
+                else {
+                    continue;
+                };
+                return Ok(RoutedJobStatus { job, run_crate });
+            }
+            JobResponse::Unauthorized => return Err(JobRouteError::Unauthorized),
+            JobResponse::Forbidden => return Err(JobRouteError::Forbidden),
+            JobResponse::NotFound => not_found += 1,
+            _ => {}
+        }
+    }
+    route_miss(not_found, route.holders.len())
+}
+
 pub enum JobReportLookup {
     NotFound,
     Pending(JobState),
     CursorConflict,
     Ready {
-        record: JobRecord,
+        job: JobReportView,
         rows: Vec<(Vec<u8>, Value)>,
         next_key: Option<Vec<u8>>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobReportView {
+    pub job_id: JobId,
+    pub created_by: UserId,
+    pub kind: JobKind,
+    pub report_digest: [u8; 32],
 }
 
 pub async fn read_owned_report(
@@ -335,8 +538,16 @@ pub async fn read_owned_report(
     let Some(record) = read_owned_job(context, user_id, job_id).await? else {
         return Ok(JobReportLookup::NotFound);
     };
-    if !record.payload.is_rocrate() {
-        return Ok(JobReportLookup::NotFound);
+    let key_limit = match &record.payload {
+        JobPayload::ImportRoCrate(spec) => spec.limits.key_bytes,
+        JobPayload::ExportRoCrate(spec) => spec.limits.key_bytes,
+        _ => return Ok(JobReportLookup::NotFound),
+    };
+    if last_key
+        .as_ref()
+        .is_some_and(|key| u64::try_from(key.len()).unwrap_or(u64::MAX) > key_limit)
+    {
+        return Ok(JobReportLookup::CursorConflict);
     }
     if !record.state.is_terminal() {
         return Ok(JobReportLookup::Pending(record.state));
@@ -351,18 +562,121 @@ pub async fn read_owned_report(
     if expected_digest.is_some_and(|expected| expected != report_digest) {
         return Ok(JobReportLookup::CursorConflict);
     }
+    let limit = limit.clamp(1, usize::from(JOB_REPORT_MAX_ROWS));
     let (rows, next_key) =
         list_job_entries(&context.storage_handle, job_id, last_key, limit).await?;
     Ok(JobReportLookup::Ready {
-        record,
+        job: JobReportView {
+            job_id: record.job_id,
+            created_by: record.created_by,
+            kind: JobKind::from(&record.payload),
+            report_digest,
+        },
         rows,
         next_key,
     })
 }
 
+pub async fn read_report_routed(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+    expected_digest: Option<[u8; 32]>,
+    last_key: Option<Vec<u8>>,
+    limit: usize,
+    auth_token: Option<crate::metadata::MetadataAuthToken>,
+) -> Result<JobReportLookup, JobRouteError> {
+    if context.net_handle.is_none() {
+        return read_owned_report(context, user_id, job_id, expected_digest, last_key, limit)
+            .await
+            .map_err(JobRouteError::Internal);
+    }
+    let route = resolve_job_holders(context, job_id).await?;
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let mut not_found = 0usize;
+    for holder in &route.holders {
+        if Some(*holder) == local_node {
+            match read_owned_report(
+                context,
+                user_id,
+                job_id,
+                expected_digest,
+                last_key.clone(),
+                limit,
+            )
+            .await
+            {
+                Ok(JobReportLookup::NotFound) => {
+                    not_found += 1;
+                    continue;
+                }
+                Ok(lookup) => return Ok(lookup),
+                Err(_) => continue,
+            }
+        }
+        let token = auth_token.clone().ok_or(JobRouteError::Unauthorized)?;
+        let wire_limit = u16::try_from(limit.min(usize::from(JOB_REPORT_MAX_ROWS)))
+            .map_err(|error| JobRouteError::Internal(error.to_string()))?;
+        let reply = match send_job_request(
+            context,
+            *holder,
+            JobRequest::Report {
+                auth_token: token,
+                job_id,
+                expected_digest,
+                last_key: last_key.clone(),
+                limit: wire_limit,
+                config_digest: route.config_digest,
+            },
+        )
+        .await
+        {
+            Ok(reply) => reply,
+            Err(_) => continue,
+        };
+        match reply.response {
+            JobResponse::ReportPending(state) => return Ok(JobReportLookup::Pending(state)),
+            JobResponse::ReportConflict => return Ok(JobReportLookup::CursorConflict),
+            JobResponse::ReportReady {
+                job,
+                rows,
+                next_key,
+            } if report_job_matches(&job, user_id, job_id, expected_digest) => {
+                return Ok(JobReportLookup::Ready {
+                    job,
+                    rows: rows
+                        .into_iter()
+                        .map(|(key, value)| (key, Value::from(value)))
+                        .collect(),
+                    next_key,
+                });
+            }
+            JobResponse::Unauthorized => return Err(JobRouteError::Unauthorized),
+            JobResponse::Forbidden => return Err(JobRouteError::Forbidden),
+            JobResponse::NotFound => not_found += 1,
+            _ => {}
+        }
+    }
+    route_miss(not_found, route.holders.len())
+}
+
 pub struct OwnedArtifact {
-    pub artifact: ArtifactRef,
+    pub job_id: JobId,
+    pub created_by: UserId,
+    pub blake3: [u8; 32],
+    pub size: u64,
     pub filename: String,
+    pub(crate) artifact: Option<ArtifactRef>,
+}
+
+impl OwnedArtifact {
+    pub(crate) fn source(&self) -> Option<&ArtifactRef> {
+        self.artifact.as_ref()
+    }
+
+    pub fn same_content(&self, other: &Self) -> bool {
+        self.blake3 == other.blake3 && self.size == other.size
+    }
 }
 
 pub enum ArtifactLookup {
@@ -411,6 +725,15 @@ pub async fn read_owned_artifact(
     if artifact.expires_at_ms <= now_ms {
         return Ok(ArtifactLookup::Gone);
     }
+    let location_hash: [u8; 32] = artifact
+        .location
+        .get_blake3()
+        .ok_or_else(|| "artifact location is missing its BLAKE3 hash".to_string())?
+        .try_into()
+        .map_err(|_| "artifact location has an invalid BLAKE3 hash".to_string())?;
+    if location_hash != artifact.blake3 {
+        return Err("artifact record does not match its blob location".to_string());
+    }
     let document_path =
         crate::get_metadata_document::load_metadata_record_by_document(context, spec.document_id)
             .await
@@ -420,9 +743,128 @@ pub async fn read_owned_artifact(
             })?
             .map(|record| record.document_path);
     Ok(ArtifactLookup::Ready(OwnedArtifact {
-        artifact,
+        job_id: record.job_id,
+        created_by: record.created_by,
+        blake3: artifact.blake3,
+        size: artifact.size,
+        artifact: Some(artifact),
         filename: artifact_filename(document_path.as_deref(), spec.document_id),
     }))
+}
+
+pub async fn read_artifact_routed(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+    now_ms: u64,
+    range: Option<Range<u64>>,
+    auth_token: Option<crate::metadata::MetadataAuthToken>,
+) -> Result<(ArtifactLookup, Option<ArtifactRead>), JobRouteError> {
+    if context.net_handle.is_none() {
+        let lookup = read_owned_artifact(context, user_id, job_id, now_ms)
+            .await
+            .map_err(JobRouteError::Internal)?;
+        let read = match (&lookup, range) {
+            (ArtifactLookup::Ready(owned), Some(range)) => {
+                let artifact = owned.source().ok_or_else(|| {
+                    JobRouteError::Internal("local artifact source is unavailable".to_string())
+                })?;
+                let read = read_artifact_range(context, artifact, range.clone())
+                    .await
+                    .map_err(JobRouteError::Internal)?;
+                if !artifact_size_matches(Some(&range), read.stream_size) {
+                    return Err(JobRouteError::Internal(
+                        "artifact reader returned an unexpected range size".to_string(),
+                    ));
+                }
+                Some(read)
+            }
+            _ => None,
+        };
+        return Ok((lookup, read));
+    }
+    let route = resolve_job_holders(context, job_id).await?;
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let mut not_found = 0usize;
+    for holder in &route.holders {
+        if Some(*holder) == local_node {
+            let lookup = match read_owned_artifact(context, user_id, job_id, now_ms).await {
+                Ok(lookup) => lookup,
+                Err(_) => continue,
+            };
+            if matches!(lookup, ArtifactLookup::NotFound) {
+                not_found += 1;
+                continue;
+            }
+            let read = match (&lookup, range.clone()) {
+                (ArtifactLookup::Ready(owned), Some(range)) => {
+                    let Some(artifact) = owned.source() else {
+                        continue;
+                    };
+                    let Ok(read) = read_artifact_range(context, artifact, range.clone()).await
+                    else {
+                        continue;
+                    };
+                    if !artifact_size_matches(Some(&range), read.stream_size) {
+                        continue;
+                    }
+                    Some(read)
+                }
+                _ => None,
+            };
+            return Ok((lookup, read));
+        }
+        let token = auth_token.clone().ok_or(JobRouteError::Unauthorized)?;
+        let reply = match send_job_request(
+            context,
+            *holder,
+            JobRequest::Artifact {
+                auth_token: token,
+                job_id,
+                range: range.clone().map(WireRange::from),
+                config_digest: route.config_digest,
+            },
+        )
+        .await
+        {
+            Ok(reply) => reply,
+            Err(_) => continue,
+        };
+        match reply.response {
+            JobResponse::ArtifactPending(state) => {
+                return Ok((ArtifactLookup::Pending(state), None));
+            }
+            JobResponse::ArtifactGone => return Ok((ArtifactLookup::Gone, None)),
+            JobResponse::ArtifactReady { owned, stream_size } => {
+                let owned = OwnedArtifact::from(owned);
+                if !artifact_job_matches(&owned, user_id, job_id) {
+                    continue;
+                }
+                let read = match (range.as_ref(), reply.body) {
+                    (Some(range), Some(blob))
+                        if artifact_size_matches(Some(range), stream_size) =>
+                    {
+                        Some(ArtifactRead { blob, stream_size })
+                    }
+                    (None, None) if artifact_size_matches(None, stream_size) => None,
+                    _ => continue,
+                };
+                return Ok((ArtifactLookup::Ready(owned), read));
+            }
+            JobResponse::Unauthorized => return Err(JobRouteError::Unauthorized),
+            JobResponse::Forbidden => return Err(JobRouteError::Forbidden),
+            JobResponse::NotFound => not_found += 1,
+            _ => {}
+        }
+    }
+    route_miss(not_found, route.holders.len())
+}
+
+fn artifact_size_matches(range: Option<&Range<u64>>, stream_size: u64) -> bool {
+    match range {
+        Some(range) => range.end.checked_sub(range.start) == Some(stream_size),
+        None => stream_size == 0,
+    }
 }
 
 pub struct ArtifactRead {
@@ -458,6 +900,12 @@ pub enum CancelJobOutcome {
     NotFound,
     AlreadyTerminal(JobRecord),
     Requested(JobRecord),
+}
+
+pub enum RoutedCancelOutcome {
+    NotFound,
+    AlreadyTerminal(JobStatusView),
+    Requested(JobStatusView),
 }
 
 pub async fn cancel_owned_job(
@@ -499,6 +947,112 @@ pub async fn cancel_owned_job(
     })
 }
 
+pub async fn cancel_job_routed(
+    context: &DriverContext,
+    runtime: &JobsRuntime,
+    user_id: UserId,
+    job_id: JobId,
+    auth_token: Option<crate::metadata::MetadataAuthToken>,
+) -> Result<RoutedCancelOutcome, JobRouteError> {
+    if context.net_handle.is_none() {
+        return cancel_owned_job(context, runtime, user_id, job_id)
+            .await
+            .map(|outcome| match outcome {
+                CancelJobOutcome::NotFound => RoutedCancelOutcome::NotFound,
+                CancelJobOutcome::AlreadyTerminal(record) => {
+                    RoutedCancelOutcome::AlreadyTerminal(JobStatusView::from(&record))
+                }
+                CancelJobOutcome::Requested(record) => {
+                    RoutedCancelOutcome::Requested(JobStatusView::from(&record))
+                }
+            })
+            .map_err(JobRouteError::Internal);
+    }
+    let route = resolve_job_holders(context, job_id).await?;
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let mut not_found = 0usize;
+    for holder in &route.holders {
+        if Some(*holder) == local_node {
+            match cancel_owned_job(context, runtime, user_id, job_id).await {
+                Ok(CancelJobOutcome::NotFound) => {
+                    not_found += 1;
+                    continue;
+                }
+                Ok(CancelJobOutcome::AlreadyTerminal(record)) => {
+                    return Ok(RoutedCancelOutcome::AlreadyTerminal(JobStatusView::from(
+                        &record,
+                    )));
+                }
+                Ok(CancelJobOutcome::Requested(record)) => {
+                    return Ok(RoutedCancelOutcome::Requested(JobStatusView::from(&record)));
+                }
+                Err(_) => continue,
+            }
+        }
+        let token = auth_token.clone().ok_or(JobRouteError::Unauthorized)?;
+        let reply = match send_job_request(
+            context,
+            *holder,
+            JobRequest::Cancel {
+                auth_token: token,
+                job_id,
+                config_digest: route.config_digest,
+            },
+        )
+        .await
+        {
+            Ok(reply) => reply,
+            Err(_) => continue,
+        };
+        match reply.response {
+            JobResponse::Cancelled { job, terminal }
+                if routed_job_matches(&job, user_id, job_id) =>
+            {
+                return Ok(if terminal {
+                    RoutedCancelOutcome::AlreadyTerminal(job)
+                } else {
+                    RoutedCancelOutcome::Requested(job)
+                });
+            }
+            JobResponse::Unauthorized => return Err(JobRouteError::Unauthorized),
+            JobResponse::Forbidden => return Err(JobRouteError::Forbidden),
+            JobResponse::NotFound => not_found += 1,
+            _ => {}
+        }
+    }
+    route_miss(not_found, route.holders.len())
+}
+
+fn routed_job_matches(job: &JobStatusView, user_id: UserId, job_id: JobId) -> bool {
+    job.job_id == job_id && job.created_by == user_id && !job.kind.is_internal()
+}
+
+fn report_job_matches(
+    job: &JobReportView,
+    user_id: UserId,
+    job_id: JobId,
+    expected_digest: Option<[u8; 32]>,
+) -> bool {
+    job.job_id == job_id
+        && job.created_by == user_id
+        && job.kind.is_report()
+        && expected_digest.is_none_or(|digest| digest == job.report_digest)
+}
+
+fn artifact_job_matches(artifact: &OwnedArtifact, user_id: UserId, job_id: JobId) -> bool {
+    artifact.job_id == job_id && artifact.created_by == user_id
+}
+
+fn route_miss<T>(not_found: usize, holder_count: usize) -> Result<T, JobRouteError> {
+    if holder_count > 0 && not_found == holder_count {
+        Err(JobRouteError::NotFound)
+    } else {
+        Err(JobRouteError::Unavailable(
+            "no job-control holder returned an authoritative response".to_string(),
+        ))
+    }
+}
+
 async fn kick_drain(context: &DriverContext) {
     if let Some(task_handle) = context.task_handle.as_ref()
         && let Event::Task(TaskEvent::Error { message, .. }) =
@@ -523,6 +1077,102 @@ mod tests {
 
     fn node_id() -> NodeId {
         iroh::SecretKey::from_bytes(&[7u8; 32]).public()
+    }
+
+    #[test]
+    fn miss_requires_all() {
+        assert!(matches!(
+            route_miss::<()>(3, 3),
+            Err(JobRouteError::NotFound)
+        ));
+        assert!(matches!(
+            route_miss::<()>(2, 3),
+            Err(JobRouteError::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn validates_artifact_size() {
+        assert!(artifact_size_matches(None, 0));
+        assert!(!artifact_size_matches(None, 1));
+        assert!(artifact_size_matches(Some(&(2..5)), 3));
+        assert!(!artifact_size_matches(Some(&(2..5)), 2));
+        let malformed = Range { start: 5, end: 2 };
+        assert!(!artifact_size_matches(Some(&malformed), 0));
+    }
+
+    #[test]
+    fn rejects_wrong_records() {
+        let realm_id = RealmId([1u8; 32]);
+        let owner = UserId::new(Ulid::from_bytes([2u8; 16]), realm_id);
+        let job_id = JobId::from_bytes([3u8; 16]);
+        let record = JobRecord::new(
+            job_id,
+            JobPayload::Probe {
+                steps: 1,
+                step_sleep_ms: 0,
+                fail_at: None,
+                panic_at: None,
+                cleanup_marker: None,
+            },
+            owner,
+            node_id(),
+            1,
+            1,
+            None,
+        );
+        let mut view = JobStatusView::from(&record);
+        assert!(routed_job_matches(&view, owner, job_id));
+        assert!(!routed_job_matches(
+            &view,
+            UserId::new(Ulid::from_bytes([4u8; 16]), realm_id),
+            job_id
+        ));
+        assert!(!routed_job_matches(
+            &view,
+            owner,
+            JobId::from_bytes([5u8; 16])
+        ));
+        view.kind = JobKind::WriteRunCrate;
+        assert!(!routed_job_matches(&view, owner, job_id));
+
+        let report = JobReportView {
+            job_id,
+            created_by: owner,
+            kind: JobKind::ImportRoCrate,
+            report_digest: [6u8; 32],
+        };
+        assert!(report_job_matches(&report, owner, job_id, Some([6u8; 32])));
+        assert!(!report_job_matches(&report, owner, job_id, Some([7u8; 32])));
+
+        let artifact = OwnedArtifact {
+            job_id,
+            created_by: owner,
+            blake3: [8u8; 32],
+            size: 1,
+            filename: "artifact.zip".to_string(),
+            artifact: None,
+        };
+        assert!(artifact_job_matches(&artifact, owner, job_id));
+        assert!(!artifact_job_matches(
+            &artifact,
+            owner,
+            JobId::from_bytes([9u8; 16])
+        ));
+        let matching = OwnedArtifact {
+            job_id,
+            created_by: owner,
+            blake3: artifact.blake3,
+            size: artifact.size,
+            filename: "renamed.zip".to_string(),
+            artifact: None,
+        };
+        assert!(artifact.same_content(&matching));
+        let changed = OwnedArtifact {
+            size: artifact.size + 1,
+            ..matching
+        };
+        assert!(!artifact.same_content(&changed));
     }
 
     #[tokio::test]

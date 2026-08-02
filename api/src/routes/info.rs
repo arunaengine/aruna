@@ -1696,6 +1696,7 @@ fn protocol_name(alpn: Option<Alpn>) -> Option<String> {
         Alpn::NativeReference => "native_reference".to_string(),
         Alpn::Notification => "notification".to_string(),
         Alpn::Shard => "shard".to_string(),
+        Alpn::JobControl => "job_control".to_string(),
     })
 }
 

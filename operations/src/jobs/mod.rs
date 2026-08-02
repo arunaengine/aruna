@@ -4,6 +4,7 @@ pub mod drain;
 pub mod executor;
 pub mod export;
 pub mod import;
+pub(crate) mod protocol;
 pub mod prune;
 pub mod reconcile;
 mod rocrate_jsonld;
@@ -13,6 +14,8 @@ pub mod staging;
 pub mod store;
 pub mod submit;
 pub mod workflow;
+
+pub use protocol::JobRouteError;
 
 /// Claim lease; fenced by `claim_token` so a lapsed holder's writes are rejected.
 pub const JOB_LEASE_MS: u64 = 60_000;
@@ -31,6 +34,7 @@ pub const JOB_RETENTION_MS: u64 = aruna_core::structs::DEFAULT_JOB_RETENTION_MS;
 pub const JOB_PROGRESS_FLUSH_INTERVAL_MS: u64 = 500;
 /// Bounded OCC retries when a job mutation transaction conflicts.
 pub const JOB_MUTATE_MAX_ATTEMPTS: u32 = 8;
+pub const JOB_REPORT_MAX_ROWS: u16 = 1000;
 /// How long a shutdown lets in-flight jobs wind down before handing their leases back.
 pub const JOB_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 

@@ -455,6 +455,7 @@ impl NetHandle {
             Alpn::NativeReference.as_bytes().to_vec(),
             Alpn::Notification.as_bytes().to_vec(),
             Alpn::Shard.as_bytes().to_vec(),
+            Alpn::JobControl.as_bytes().to_vec(),
         ];
 
         let mut endpoint_builder = Endpoint::builder(presets::Minimal)

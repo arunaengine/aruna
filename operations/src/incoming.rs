@@ -7,6 +7,7 @@ use crate::document_sync_outbox::{
     new_outbox_record_with_id, schedule_outbox_drain_effect, write_outbox_effect,
 };
 use crate::driver::{DriverContext, drive, node_routing, quota_marked_routing};
+use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
 use crate::metadata::projector::{
     METADATA_PROJECTION_RETRY_AFTER, project_metadata_create_events,
@@ -53,16 +54,22 @@ struct OperationsInboundHandler {
     context: Arc<DriverContext>,
     document_sync_reconcile: Arc<DocumentSyncReconcileCoalescer>,
     rocrate_limits: RoCrateLimits,
+    jobs_runtime: Arc<JobsRuntime>,
 }
 
 impl OperationsInboundHandler {
-    fn new(context: Arc<DriverContext>, rocrate_limits: RoCrateLimits) -> Self {
+    fn new(
+        context: Arc<DriverContext>,
+        rocrate_limits: RoCrateLimits,
+        jobs_runtime: Arc<JobsRuntime>,
+    ) -> Self {
         let document_sync_reconcile = Arc::new(DocumentSyncReconcileCoalescer::default());
         spawn_reconcile_queue_gauge(Arc::downgrade(&document_sync_reconcile));
         Self {
             context,
             document_sync_reconcile,
             rocrate_limits,
+            jobs_runtime,
         }
     }
 }
@@ -269,10 +276,14 @@ async fn reconcile_inbound_document_sync_topics(
 }
 
 pub fn initialize_net_incoming(context: Arc<DriverContext>) {
-    initialize_net_holder(context, RoCrateLimits::default());
+    initialize_net_holder(context, RoCrateLimits::default(), JobsRuntime::new());
 }
 
-pub fn initialize_net_holder(context: Arc<DriverContext>, rocrate_limits: RoCrateLimits) {
+pub fn initialize_net_holder(
+    context: Arc<DriverContext>,
+    rocrate_limits: RoCrateLimits,
+    jobs_runtime: Arc<JobsRuntime>,
+) {
     let Some(net_handle) = context.net_handle.clone() else {
         warn!("Cannot initialize inbound handling without net handle");
         return;
@@ -281,6 +292,7 @@ pub fn initialize_net_holder(context: Arc<DriverContext>, rocrate_limits: RoCrat
     let inbound_handler = Arc::new(OperationsInboundHandler::new(
         context.clone(),
         rocrate_limits,
+        jobs_runtime,
     ));
 
     net_handle.set_inbound_handler(inbound_handler.clone());
@@ -487,6 +499,15 @@ impl InboundEventHandler for OperationsInboundHandler {
                 Alpn::Shard => {
                     crate::shard::incoming::handle_shard_stream(
                         self.context.as_ref(),
+                        stream,
+                        node_id,
+                    )
+                    .await;
+                }
+                Alpn::JobControl => {
+                    crate::jobs::protocol::handle_job_stream(
+                        self.context.as_ref(),
+                        &self.jobs_runtime,
                         stream,
                         node_id,
                     )
@@ -761,6 +782,7 @@ mod tests {
                 compute_handle: None,
             }),
             RoCrateLimits::default(),
+            JobsRuntime::new(),
         );
 
         let mut outbound = net_a.open_stream(net_b.node_id(), Alpn::Bao).await.unwrap();

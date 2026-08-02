@@ -145,7 +145,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Task initialization binds the compute reconciler before startup recovery.
     let jobs_runtime = JobsRuntime::new_paused();
-    initialize_net_holder(driver_ctx.clone(), config.rocrate_limits.clone());
+    initialize_net_holder(
+        driver_ctx.clone(),
+        config.rocrate_limits.clone(),
+        jobs_runtime.clone(),
+    );
     initialize_task_holder(
         driver_ctx.clone(),
         task_handle.clone(),

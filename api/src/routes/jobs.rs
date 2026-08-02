@@ -6,15 +6,15 @@ use std::sync::Arc;
 use aruna_core::compute::normalize_container_path;
 use aruna_core::structs::{
     AuthContext, ComputeResources, ExecutionSpec, ExportReportRow, ImportReportRow, InputMode,
-    InputSelection, InputSource, JOB_SYSTEM_ENTRY_PREFIX, JobId, JobPayload, JobRecord, JobState,
-    Permission, WorkspaceMode, WorkspaceOutput, blob_bucket_permission_path,
-    blob_group_permission_path,
+    InputSelection, InputSource, JOB_SYSTEM_ENTRY_PREFIX, JobId, JobRecord, JobState, Permission,
+    WorkspaceMode, WorkspaceOutput, blob_bucket_permission_path, blob_group_permission_path,
 };
 use aruna_operations::jobs::service::{
-    ArtifactLookup, CancelJobOutcome, JobReportLookup, OwnedArtifact, cancel_owned_job,
-    list_owned_jobs, read_artifact_range, read_job_run_crate_status, read_owned_artifact,
-    read_owned_job, read_owned_report, submit_execution_job,
+    ArtifactLookup, JobKind, JobReportLookup, JobStatusView, OwnedArtifact, RoutedCancelOutcome,
+    cancel_job_routed, list_owned_jobs, read_artifact_routed, read_job_routed, read_report_routed,
+    submit_execution_job,
 };
+use aruna_operations::jobs::{JOB_REPORT_MAX_ROWS, JobRouteError};
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::get_object::ObjectRangeRequest;
 use axum::body::Body;
@@ -33,7 +33,9 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 
-use crate::auth::{ensure_permission, require_unrestricted_realm_auth};
+use crate::auth::{
+    ValidatedArunaBearerTokenCarrier, ensure_permission, require_unrestricted_realm_auth,
+};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_operations::driver::drive;
@@ -41,7 +43,6 @@ use aruna_operations::driver::drive;
 const DEFAULT_LIST_LIMIT: usize = 50;
 const MAX_LIST_LIMIT: usize = 200;
 const DEFAULT_REPORT_LIMIT: usize = 200;
-const MAX_REPORT_LIMIT: usize = 1000;
 const MAX_OUTPUT_PREFIXES: usize = 32;
 /// Bounds the quadratic duplicate-input validation.
 const MAX_INPUTS: usize = 512;
@@ -260,27 +261,31 @@ fn rfc3339(ms: u64) -> String {
 }
 
 fn job_status_response(record: &JobRecord) -> JobStatusResponse {
+    job_view_response(&JobStatusView::from(record))
+}
+
+fn job_view_response(job: &JobStatusView) -> JobStatusResponse {
     JobStatusResponse {
-        job_id: record.job_id.to_string(),
-        kind: record.payload.kind().to_string(),
-        state: record.state.name().to_string(),
-        attempts: record.attempts,
-        cancel_requested: record.cancel_requested,
-        created_at: rfc3339(record.created_at_ms),
-        updated_at: rfc3339(record.updated_at_ms),
-        finished_at: record.finished_at_ms.map(rfc3339),
+        job_id: job.job_id.to_string(),
+        kind: job.kind.name().to_string(),
+        state: job.state.name().to_string(),
+        attempts: job.attempts,
+        cancel_requested: job.cancel_requested,
+        created_at: rfc3339(job.created_at_ms),
+        updated_at: rfc3339(job.updated_at_ms),
+        finished_at: job.finished_at_ms.map(rfc3339),
         progress: JobProgressResponse {
-            current: record.progress.current,
-            total: record.progress.total,
-            unit: record.progress.unit.clone(),
+            current: job.progress.current,
+            total: job.progress.total,
+            unit: job.progress.unit.clone(),
         },
-        error: record.last_error.as_ref().map(|error| JobErrorResponse {
+        error: job.last_error.as_ref().map(|error| JobErrorResponse {
             message: error.message.clone(),
             kind: error.kind.name().to_string(),
         }),
-        result: record.result.as_ref().map(|result| result.to_public_json()),
-        workspace_bucket: record.workspace_bucket.clone(),
-        workspace_mode: record.workspace_mode.name().to_string(),
+        result: job.result.clone(),
+        workspace_bucket: job.workspace_bucket.clone(),
+        workspace_mode: job.workspace_mode.name().to_string(),
         run_crate: None,
     }
 }
@@ -351,6 +356,29 @@ fn encode_report_cursor(
 
 fn parse_job_id(raw: &str) -> ServerResult<JobId> {
     JobId::from_str(raw).map_err(|_| ServerError::NotFound)
+}
+
+fn forwarded_job_auth(
+    bearer: Option<ValidatedArunaBearerTokenCarrier>,
+) -> ServerResult<Option<aruna_operations::metadata::MetadataAuthToken>> {
+    aruna_operations::metadata::api::forwarded_bearer(
+        bearer
+            .as_ref()
+            .map(ValidatedArunaBearerTokenCarrier::as_str),
+    )
+    .map_err(super::metadata::map_metadata_api_error)
+}
+
+fn map_job_route(error: JobRouteError) -> ServerError {
+    match error {
+        JobRouteError::Unauthorized => ServerError::Unauthorized,
+        JobRouteError::Forbidden => ServerError::Forbidden,
+        JobRouteError::NotFound => ServerError::NotFound,
+        JobRouteError::Unavailable(_) => {
+            ServerError::ServiceUnavailableReason("job_holder_unavailable".to_string())
+        }
+        JobRouteError::Internal(error) => ServerError::InternalError(error),
+    }
 }
 
 pub(crate) fn map_submit_error(
@@ -657,26 +685,32 @@ pub async fn submit_job(
     params(("job_id" = String, Path, description = "Job identifier")),
     responses(
         (status = 200, description = "Job status", body = JobStatusResponse),
-        (status = 404, description = "Job not found", body = ErrorResponse)
+        (status = 400, description = "Invalid bearer forwarding carrier", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Realm access forbidden", body = ErrorResponse),
+        (status = 404, description = "Job not found", body = ErrorResponse),
+        (status = 503, description = "Job holder unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn get_job(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(job_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<JobStatusResponse>)> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let job_id = parse_job_id(&job_id)?;
-    let record = read_owned_job(&state.get_ctx(), auth.user_id, job_id)
-        .await
-        .map_err(ServerError::InternalError)?
-        .ok_or(ServerError::NotFound)?;
-    let mut response = job_status_response(&record);
-    response.run_crate = read_job_run_crate_status(&state.get_ctx(), job_id)
-        .await
-        .map_err(ServerError::InternalError)?
-        .map(|status| status.to_public_json());
+    let routed = read_job_routed(
+        &state.get_ctx(),
+        auth.user_id,
+        job_id,
+        forwarded_job_auth(bearer)?,
+    )
+    .await
+    .map_err(map_job_route)?;
+    let mut response = job_view_response(&routed.job);
+    response.run_crate = routed.run_crate;
     Ok((StatusCode::OK, Json(response)))
 }
 
@@ -689,12 +723,12 @@ fn coded_response(status: StatusCode, error: &str, code: &str) -> Response {
 }
 
 fn decode_report_row(
-    payload: &JobPayload,
+    kind: JobKind,
     entry_key: &[u8],
     value: &[u8],
 ) -> ServerResult<serde_json::Value> {
-    let row = match payload {
-        JobPayload::ImportRoCrate(_) => {
+    let row = match kind {
+        JobKind::ImportRoCrate => {
             let row: ImportReportRow = postcard::from_bytes(value)
                 .map_err(|error| ServerError::InternalError(error.to_string()))?;
             let visible_key = entry_key
@@ -707,7 +741,7 @@ fn decode_report_row(
             }
             serde_json::to_value(row)
         }
-        JobPayload::ExportRoCrate(_) => {
+        JobKind::ExportRoCrate => {
             let row: ExportReportRow = postcard::from_bytes(value)
                 .map_err(|error| ServerError::InternalError(error.to_string()))?;
             if row.entry_key.as_bytes() != entry_key {
@@ -733,15 +767,19 @@ fn decode_report_row(
     ),
     responses(
         (status = 200, description = "Immutable terminal report page", body = JobReportResponse),
-        (status = 400, description = "Invalid cursor", body = ErrorResponse),
+        (status = 400, description = "Invalid cursor or bearer forwarding carrier", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Realm access forbidden", body = ErrorResponse),
         (status = 404, description = "Job not found or report pending", body = ReportUnavailableResponse),
-        (status = 409, description = "Cursor does not match this frozen report", body = ErrorResponse)
+        (status = 409, description = "Cursor does not match this frozen report", body = ErrorResponse),
+        (status = 503, description = "Job holder unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn get_job_report(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(job_id): Path<String>,
     Query(query): Query<ReportQuery>,
 ) -> ServerResult<Response> {
@@ -762,19 +800,20 @@ pub async fn get_job_report(
         .limit
         .filter(|limit| *limit > 0)
         .unwrap_or(DEFAULT_REPORT_LIMIT)
-        .min(MAX_REPORT_LIMIT);
+        .min(usize::from(JOB_REPORT_MAX_ROWS));
     let expected_digest = cursor.as_ref().map(|cursor| cursor.report_digest);
     let last_key = cursor.map(|cursor| cursor.last_key);
-    match read_owned_report(
+    match read_report_routed(
         &state.get_ctx(),
         auth.user_id,
         job_id,
         expected_digest,
         last_key,
         limit,
+        forwarded_job_auth(bearer)?,
     )
     .await
-    .map_err(ServerError::InternalError)?
+    .map_err(map_job_route)?
     {
         JobReportLookup::NotFound => Err(ServerError::NotFound),
         JobReportLookup::Pending(state) => Ok((
@@ -791,20 +830,14 @@ pub async fn get_job_report(
             "report_cursor_conflict",
         )),
         JobReportLookup::Ready {
-            record,
+            job,
             rows,
             next_key,
         } => {
-            let report_digest = record.report_digest.ok_or_else(|| {
-                ServerError::InternalError(
-                    "terminal RO-Crate job is missing its report digest".to_string(),
-                )
-            })?;
+            let report_digest = job.report_digest;
             let rows = rows
                 .into_iter()
-                .map(|(entry_key, value)| {
-                    decode_report_row(&record.payload, &entry_key, value.as_ref())
-                })
+                .map(|(entry_key, value)| decode_report_row(job.kind, &entry_key, value.as_ref()))
                 .collect::<ServerResult<Vec<_>>>()?;
             Ok((
                 StatusCode::OK,
@@ -861,28 +894,12 @@ fn ascii_filename(filename: &str) -> String {
 }
 
 fn artifact_headers(owned: &OwnedArtifact) -> ServerResult<HeaderMap> {
-    let location_hash: [u8; 32] = owned
-        .artifact
-        .location
-        .get_blake3()
-        .ok_or_else(|| {
-            ServerError::InternalError("artifact location is missing its BLAKE3 hash".to_string())
-        })?
-        .try_into()
-        .map_err(|_| {
-            ServerError::InternalError("artifact location has an invalid BLAKE3 hash".to_string())
-        })?;
-    if location_hash != owned.artifact.blake3 {
-        return Err(ServerError::InternalError(
-            "artifact record does not match its blob location".to_string(),
-        ));
-    }
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/zip"));
     headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     headers.insert(
         ETAG,
-        HeaderValue::from_str(&format!("\"{}\"", hex::encode(location_hash)))
+        HeaderValue::from_str(&format!("\"{}\"", hex::encode(owned.blake3)))
             .map_err(|error| ServerError::InternalError(error.to_string()))?,
     );
     let encoded = utf8_percent_encode(&owned.filename, NON_ALPHANUMERIC);
@@ -915,20 +932,26 @@ fn range_error(size: u64) -> Response {
 async fn artifact_response(
     state: Arc<ServerState>,
     auth: Option<AuthContext>,
+    bearer: Option<ValidatedArunaBearerTokenCarrier>,
     job_id: String,
     headers: HeaderMap,
     download: bool,
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let job_id = parse_job_id(&job_id)?;
-    let owned = match read_owned_artifact(
+    let auth_token = forwarded_job_auth(bearer)?;
+    let now_ms = aruna_core::util::unix_timestamp_millis();
+    let owned = match read_artifact_routed(
         &state.get_ctx(),
         auth.user_id,
         job_id,
-        aruna_core::util::unix_timestamp_millis(),
+        now_ms,
+        None,
+        auth_token.clone(),
     )
     .await
-    .map_err(ServerError::InternalError)?
+    .map_err(map_job_route)?
+    .0
     {
         ArtifactLookup::NotFound => return Err(ServerError::NotFound),
         ArtifactLookup::Pending(state) => {
@@ -953,22 +976,22 @@ async fn artifact_response(
     };
     let range_request = match range_request(&headers) {
         Ok(range) => range,
-        Err(()) => return Ok(range_error(owned.artifact.size)),
+        Err(()) => return Ok(range_error(owned.size)),
     };
     let (status, range, content_range) = match range_request {
-        Some(request) => match request.resolve(owned.artifact.size) {
+        Some(request) => match request.resolve(owned.size) {
             Ok(resolved) => (
                 StatusCode::PARTIAL_CONTENT,
                 resolved.range,
                 Some(resolved.content_range),
             ),
-            Err(_) => return Ok(range_error(owned.artifact.size)),
+            Err(_) => return Ok(range_error(owned.size)),
         },
         None => (
             StatusCode::OK,
             Range {
                 start: 0,
-                end: owned.artifact.size,
+                end: owned.size,
             },
             None,
         ),
@@ -987,10 +1010,50 @@ async fn artifact_response(
                 .map_err(|error| ServerError::InternalError(error.to_string()))?,
         );
     }
-    let body = if download {
-        let read = read_artifact_range(&state.get_ctx(), &owned.artifact, range)
-            .await
-            .map_err(ServerError::InternalError)?;
+    let body = if download && content_length > 0 {
+        let (lookup, read) = read_artifact_routed(
+            &state.get_ctx(),
+            auth.user_id,
+            job_id,
+            now_ms,
+            Some(range),
+            auth_token,
+        )
+        .await
+        .map_err(map_job_route)?;
+        let read = match lookup {
+            ArtifactLookup::Ready(current) if owned.same_content(&current) => {
+                read.ok_or_else(|| {
+                    ServerError::InternalError(
+                        "artifact holder omitted the response body".to_string(),
+                    )
+                })?
+            }
+            ArtifactLookup::Ready(_) => {
+                return Err(ServerError::ServiceUnavailableReason(
+                    "job_holder_unavailable".to_string(),
+                ));
+            }
+            ArtifactLookup::NotFound => return Err(ServerError::NotFound),
+            ArtifactLookup::Pending(state) => {
+                return Ok((
+                    StatusCode::NOT_FOUND,
+                    Json(
+                        ErrorResponse::new("RO-Crate artifact is not ready")
+                            .with_code("artifact_pending")
+                            .with_details(state.name()),
+                    ),
+                )
+                    .into_response());
+            }
+            ArtifactLookup::Gone => {
+                return Ok(coded_response(
+                    StatusCode::GONE,
+                    "RO-Crate artifact has expired",
+                    "artifact_expired",
+                ));
+            }
+        };
         if read.stream_size != content_length {
             return Err(ServerError::InternalError(
                 "artifact reader returned an unexpected range size".to_string(),
@@ -1017,19 +1080,24 @@ async fn artifact_response(
     responses(
         (status = 200, description = "Complete RO-Crate ZIP"),
         (status = 206, description = "Requested artifact byte range"),
+        (status = 400, description = "Invalid bearer forwarding carrier", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Realm access forbidden", body = ErrorResponse),
         (status = 404, description = "Artifact not found or pending", body = ErrorResponse),
         (status = 410, description = "Artifact expired", body = ErrorResponse),
-        (status = 416, description = "Range not satisfiable", body = ErrorResponse)
+        (status = 416, description = "Range not satisfiable", body = ErrorResponse),
+        (status = 503, description = "Job holder unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn get_job_artifact(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(job_id): Path<String>,
     headers: HeaderMap,
 ) -> ServerResult<Response> {
-    artifact_response(state, auth, job_id, headers, true).await
+    artifact_response(state, auth, bearer, job_id, headers, true).await
 }
 
 #[utoipa::path(
@@ -1043,19 +1111,24 @@ pub async fn get_job_artifact(
     responses(
         (status = 200, description = "RO-Crate artifact headers"),
         (status = 206, description = "Requested artifact range headers"),
+        (status = 400, description = "Invalid bearer forwarding carrier", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Realm access forbidden", body = ErrorResponse),
         (status = 404, description = "Artifact not found or pending", body = ErrorResponse),
         (status = 410, description = "Artifact expired", body = ErrorResponse),
-        (status = 416, description = "Range not satisfiable", body = ErrorResponse)
+        (status = 416, description = "Range not satisfiable", body = ErrorResponse),
+        (status = 503, description = "Job holder unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn head_job_artifact(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(job_id): Path<String>,
     headers: HeaderMap,
 ) -> ServerResult<Response> {
-    artifact_response(state, auth, job_id, headers, false).await
+    artifact_response(state, auth, bearer, job_id, headers, false).await
 }
 
 #[utoipa::path(
@@ -1066,34 +1139,40 @@ pub async fn head_job_artifact(
     responses(
         (status = 202, description = "Cancellation requested", body = JobStatusResponse),
         (status = 200, description = "Job already terminal", body = JobStatusResponse),
-        (status = 404, description = "Job not found", body = ErrorResponse)
+        (status = 400, description = "Invalid bearer forwarding carrier", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Realm access forbidden", body = ErrorResponse),
+        (status = 404, description = "Job not found", body = ErrorResponse),
+        (status = 503, description = "Job holder unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn cancel_job(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(job_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<JobStatusResponse>)> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let job_id = parse_job_id(&job_id)?;
 
-    let outcome = cancel_owned_job(
+    let outcome = cancel_job_routed(
         &state.get_ctx(),
         &state.jobs_runtime(),
         auth.user_id,
         job_id,
+        forwarded_job_auth(bearer)?,
     )
     .await
-    .map_err(ServerError::InternalError)?;
+    .map_err(map_job_route)?;
 
     match outcome {
-        CancelJobOutcome::NotFound => Err(ServerError::NotFound),
-        CancelJobOutcome::AlreadyTerminal(record) => {
-            Ok((StatusCode::OK, Json(job_status_response(&record))))
+        RoutedCancelOutcome::NotFound => Err(ServerError::NotFound),
+        RoutedCancelOutcome::AlreadyTerminal(job) => {
+            Ok((StatusCode::OK, Json(job_view_response(&job))))
         }
-        CancelJobOutcome::Requested(record) => {
-            Ok((StatusCode::ACCEPTED, Json(job_status_response(&record))))
+        RoutedCancelOutcome::Requested(job) => {
+            Ok((StatusCode::ACCEPTED, Json(job_view_response(&job))))
         }
     }
 }
@@ -1264,7 +1343,7 @@ mod tests {
             let value = postcard::to_allocvec(&row).unwrap();
             let mut stored_key = vec![JOB_SYSTEM_ENTRY_PREFIX];
             stored_key.extend_from_slice(entry_key.as_bytes());
-            let decoded = decode_report_row(&payload, &stored_key, &value).unwrap();
+            let decoded = decode_report_row(JobKind::from(&payload), &stored_key, &value).unwrap();
             assert_eq!(decoded["entry_key"], entry_key);
         }
     }
@@ -1428,6 +1507,7 @@ mod tests {
         let first = get_job_report(
             State(state.clone()),
             Extension(auth_for(owner)),
+            Extension(None),
             Path(job_id.to_string()),
             Query(ReportQuery {
                 limit: Some(1),
@@ -1444,6 +1524,7 @@ mod tests {
         let second = get_job_report(
             State(state.clone()),
             Extension(auth_for(owner)),
+            Extension(None),
             Path(job_id.to_string()),
             Query(ReportQuery {
                 limit: Some(1),
@@ -1465,6 +1546,7 @@ mod tests {
         let response = get_job_report(
             State(state.clone()),
             Extension(auth_for(owner)),
+            Extension(None),
             Path(job_id.to_string()),
             Query(ReportQuery {
                 limit: None,
@@ -1478,6 +1560,7 @@ mod tests {
         let foreign = get_job_report(
             State(state),
             Extension(auth_for(user(3))),
+            Extension(None),
             Path(job_id.to_string()),
             Query(ReportQuery::default()),
         )
@@ -1497,6 +1580,7 @@ mod tests {
         let response = get_job_report(
             State(state),
             Extension(auth_for(owner)),
+            Extension(None),
             Path(job_id.to_string()),
             Query(ReportQuery::default()),
         )
@@ -1564,6 +1648,7 @@ mod tests {
         let response = head_job_artifact(
             State(state.clone()),
             Extension(auth_for(owner)),
+            Extension(None),
             Path(job_id.to_string()),
             HeaderMap::new(),
         )
@@ -1584,6 +1669,7 @@ mod tests {
         let foreign = head_job_artifact(
             State(state),
             Extension(auth_for(user(3))),
+            Extension(None),
             Path(job_id.to_string()),
             HeaderMap::new(),
         )
@@ -1606,6 +1692,7 @@ mod tests {
         let response = head_job_artifact(
             State(state),
             Extension(auth_for(owner)),
+            Extension(None),
             Path(job_id.to_string()),
             HeaderMap::new(),
         )
@@ -1629,6 +1716,18 @@ mod tests {
         );
         headers.insert(RANGE, HeaderValue::from_static("bytes=2-3,5-6"));
         assert_eq!(range_request(&headers), Err(()));
+    }
+
+    #[test]
+    fn forwarded_auth_bounds() {
+        assert!(forwarded_job_auth(None).unwrap().is_none());
+        let accepted = ValidatedArunaBearerTokenCarrier::new_for_test("a".repeat(4_096));
+        assert!(forwarded_job_auth(Some(accepted)).unwrap().is_some());
+        let rejected = ValidatedArunaBearerTokenCarrier::new_for_test("a".repeat(4_097));
+        assert!(matches!(
+            forwarded_job_auth(Some(rejected)),
+            Err(ServerError::BadRequest)
+        ));
     }
 
     #[tokio::test]
@@ -1671,6 +1770,7 @@ mod tests {
         let result = get_job(
             State(state.clone()),
             Extension(auth_for(user(3))),
+            Extension(None),
             Path(job_id.to_string()),
         )
         .await;
@@ -1694,6 +1794,7 @@ mod tests {
         let (status, _) = cancel_job(
             State(state.clone()),
             Extension(auth_for(owner)),
+            Extension(None),
             Path(job_id.to_string()),
         )
         .await
@@ -1704,6 +1805,7 @@ mod tests {
         let (status, Json(body)) = cancel_job(
             State(state.clone()),
             Extension(auth_for(owner)),
+            Extension(None),
             Path(job_id.to_string()),
         )
         .await
@@ -1727,6 +1829,7 @@ mod tests {
         let (status, _) = cancel_job(
             State(state.clone()),
             Extension(auth_for(owner)),
+            Extension(None),
             Path(job_id.to_string()),
         )
         .await
@@ -1773,6 +1876,7 @@ mod tests {
         let get = get_job(
             State(state.clone()),
             Extension(restricted_auth_for(owner)),
+            Extension(None),
             Path(job_id.to_string()),
         )
         .await;
@@ -1781,6 +1885,7 @@ mod tests {
         let cancel = cancel_job(
             State(state.clone()),
             Extension(restricted_auth_for(owner)),
+            Extension(None),
             Path(job_id.to_string()),
         )
         .await;
