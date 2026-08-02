@@ -616,7 +616,7 @@ async fn mark_crate_failed(
         && !matches!(
             RunCrateStatus::from_bytes(value.as_ref())
                 .map_err(|error| JobMutationError::Storage(error.to_string()))?,
-            RunCrateStatus::Pending
+            RunCrateStatus::Pending | RunCrateStatus::Minted { .. }
         )
     {
         return Ok(());

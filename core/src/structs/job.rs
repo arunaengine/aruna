@@ -815,6 +815,7 @@ impl JobResultPayload {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunCrateStatus {
     Pending,
+    Minted { document_id: Ulid },
     Written { resource: String },
     Denied { message: String },
     Failed { message: String },
@@ -824,6 +825,7 @@ impl RunCrateStatus {
     pub fn name(&self) -> &'static str {
         match self {
             RunCrateStatus::Pending => "pending",
+            RunCrateStatus::Minted { .. } => "pending",
             RunCrateStatus::Written { .. } => "written",
             RunCrateStatus::Denied { .. } => "denied",
             RunCrateStatus::Failed { .. } => "failed",
@@ -841,6 +843,7 @@ impl RunCrateStatus {
     pub fn to_public_json(&self) -> serde_json::Value {
         match self {
             RunCrateStatus::Pending => serde_json::json!({ "status": "pending" }),
+            RunCrateStatus::Minted { .. } => serde_json::json!({ "status": "pending" }),
             RunCrateStatus::Written { resource } => {
                 serde_json::json!({ "status": "written", "resource": resource })
             }

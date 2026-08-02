@@ -65,7 +65,6 @@ use crate::create_metadata_document::{
 };
 use crate::driver::{bucket_snapshot, drive};
 use crate::get_realm_config::GetRealmConfigOperation;
-use crate::list_metadata_documents::ListMetadataDocumentsOperation;
 use crate::metadata::MetadataAuthToken;
 use crate::metadata::forward::{MetadataWriteError, create_metadata_document_routed};
 use crate::replication::queue::{
@@ -646,7 +645,7 @@ async fn validate_source(
     checkpoint: &mut ImportCheckpoint,
 ) -> Result<ImportPlan, ImportFailure> {
     ensure_targets(ctx, spec).await?;
-    ensure_path_free(ctx, spec).await?;
+    ensure_valid_path(spec)?;
     let inspection = checkpoint
         .inspection
         .as_ref()
@@ -993,7 +992,7 @@ async fn create_document(
     checkpoint: &mut ImportCheckpoint,
 ) -> Result<(), ImportFailure> {
     ensure_metadata_permission(ctx, spec).await?;
-    ensure_path_free(ctx, spec).await?;
+    ensure_valid_path(spec)?;
     let jsonld = checkpoint
         .rewritten_json
         .clone()
@@ -1015,10 +1014,7 @@ async fn create_document(
             },
         ),
         ctx.driver.clone(),
-        Some(MetadataAuthToken::internal(
-            spec.auth_context.user_id,
-            spec.auth_context.realm_id,
-        )),
+        Some(MetadataAuthToken::internal(spec.auth_context.clone())),
     )
     .await
     {
@@ -1195,26 +1191,12 @@ async fn ensure_metadata_permission(
     ensure_permission(ctx, &spec.auth_context, path, Permission::WRITE).await
 }
 
-async fn ensure_path_free(ctx: &JobContext, spec: &ImportRoCrateSpec) -> Result<(), ImportFailure> {
+fn ensure_valid_path(spec: &ImportRoCrateSpec) -> Result<(), ImportFailure> {
     let normalized = MetadataRegistryRecord::normalize_document_path(&spec.metadata.path);
     if normalized.is_empty() {
         return Err(ImportFailure::Permanent(
             "metadata path must not be empty".to_string(),
         ));
-    }
-    let documents = drive(
-        ListMetadataDocumentsOperation::new(spec.metadata.group_id),
-        &ctx.driver,
-    )
-    .await
-    .map_err(|error| ImportFailure::Retryable(error.to_string()))?;
-    if documents
-        .iter()
-        .any(|record| record.document_path == normalized && record.document_id != spec.document_id)
-    {
-        return Err(ImportFailure::Permanent(format!(
-            "metadata path `{normalized}` already exists"
-        )));
     }
     Ok(())
 }

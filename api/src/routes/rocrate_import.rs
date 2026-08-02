@@ -9,14 +9,13 @@ use aruna_core::structs::{
     ImportRoCrateTarget, JobPayload, MetadataRegistryRecord, Permission, RoCrateMediaType,
     blob_bucket_permission_path, blob_object_permission_path, user_dedup_key,
 };
-use aruna_operations::create_metadata_document::mint_job_create_id;
+use aruna_operations::create_metadata_document::mint_job_document;
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::import::{
     CreateRoCrateUploadConfig, CreateRoCrateUploadError, CreateRoCrateUploadOperation,
     load_rocrate_upload,
 };
 use aruna_operations::jobs::service::{lookup_job_dedup, read_owned_job, submit_rocrate_import};
-use aruna_operations::list_metadata_documents::ListMetadataDocumentsOperation;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::staging::head_source::{
@@ -199,7 +198,8 @@ pub async fn upload_rocrate(
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Source or target not found", body = ErrorResponse),
-        (status = 409, description = "Idempotency conflict or active-job cap", body = ErrorResponse)
+        (status = 409, description = "Idempotency conflict or active-job cap", body = ErrorResponse),
+        (status = 503, description = "Placement binding unavailable or conflicted", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -212,31 +212,13 @@ pub async fn submit_import(
     let source = parse_import_source(request.source)?;
     let target = parse_import_target(request.target, state.rocrate_limits().key_bytes)?;
     let metadata = parse_import_metadata(request.metadata, state.rocrate_limits().key_bytes)?;
-    // Mint the imported document's structured id at submission (seeded fresh, then
-    // stored in the spec), so the import job's create routes by a real handle and
-    // bucket instead of an unstructured ULID.
-    let actor = Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: state.get_realm_id(),
-    };
-    let document_id = mint_job_create_id(
-        state.get_ctx().as_ref(),
-        &actor,
-        metadata.group_id,
-        &metadata.path,
-        Ulid::generate(),
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?
-    .as_ulid();
-    let spec = ImportRoCrateSpec {
+    let mut spec = ImportRoCrateSpec {
         auth_context: auth,
         source,
         target,
         metadata,
         limits: state.rocrate_limits().clone(),
-        document_id,
+        document_id: Ulid::nil(),
     };
     let replay = if let Some(idempotency_key) = request.idempotency_key.as_deref() {
         lookup_job_dedup(
@@ -253,6 +235,21 @@ pub async fn submit_import(
     let result = if let Some(result) = replay {
         result
     } else {
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: spec.auth_context.user_id,
+            realm_id: state.get_realm_id(),
+        };
+        let document_id = mint_job_document(
+            state.get_ctx().as_ref(),
+            &actor,
+            spec.metadata.group_id,
+            &spec.metadata.path,
+        )
+        .await
+        .map_err(super::metadata::map_create_error)?
+        .as_ulid();
+        spec.document_id = document_id;
         fast_source_check(
             &state,
             &spec.auth_context,
@@ -523,21 +520,6 @@ async fn fast_metadata_check(
         Permission::WRITE,
     )
     .await?;
-    let records = drive(
-        ListMetadataDocumentsOperation::new(metadata.group_id),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
-    if records
-        .iter()
-        .any(|record| record.document_path == metadata.path && record.document_id != document_id)
-    {
-        return Err(ServerError::Conflict(format!(
-            "metadata path `{}` already exists",
-            metadata.path
-        )));
-    }
     Ok(())
 }
 

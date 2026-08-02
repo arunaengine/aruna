@@ -19,7 +19,7 @@ use super::super::store::{put_run_crate_status, read_job_record, read_run_crate_
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload, mint_job_create_id,
+    CreateMetadataDocumentPayload, mint_job_document,
 };
 use crate::driver::drive;
 use crate::metadata::MetadataAuthToken;
@@ -33,11 +33,12 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
     let storage = &context.storage_handle;
 
     // A re-driven crate job returns a previously recorded outcome without recreating it.
-    match read_run_crate_status(storage, for_job).await {
+    let saved_id = match read_run_crate_status(storage, for_job).await {
         Ok(Some(RunCrateStatus::Written { resource })) => {
             return JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource });
         }
-        Ok(Some(RunCrateStatus::Pending)) | Ok(None) => {}
+        Ok(Some(RunCrateStatus::Pending)) | Ok(None) => None,
+        Ok(Some(RunCrateStatus::Minted { document_id })) => Some(document_id),
         Ok(Some(status)) => {
             return JobRunOutcome::Succeeded(JobResultPayload::RunCrate {
                 resource: status.name().to_string(),
@@ -48,7 +49,7 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
                 "run crate read status failed: {error}"
             )));
         }
-    }
+    };
 
     let parent = match read_job_record(storage, for_job, None).await {
         Ok(Some(record)) => record,
@@ -81,24 +82,26 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
         user_id: parent.created_by,
         realm_id: parent.created_by.realm_id,
     };
-    // Deterministic structured id keyed on the job id, minted before the RO-Crate
-    // content embeds it, so a restart re-derives the identical id (idempotent).
-    let document_id = match mint_job_create_id(
-        context,
-        &actor,
-        spec.group_id,
-        &document_path,
-        Ulid::from_bytes(for_job.to_bytes()),
-    )
-    .await
-    {
-        Ok(id) => id.as_ulid(),
-        Err(error) => {
-            return JobRunOutcome::Failed(JobError::retryable(format!(
-                "run crate mint document id failed: {error}"
-            )));
-        }
+    // Persist the first minted id before create so retries survive policy changes.
+    let document_id = match saved_id {
+        Some(document_id) => document_id,
+        None => match mint_job_document(context, &actor, spec.group_id, &document_path).await {
+            Ok(id) => id.as_ulid(),
+            Err(error) => {
+                return JobRunOutcome::Failed(JobError::retryable(format!(
+                    "run crate mint document id failed: {error}"
+                )));
+            }
+        },
     };
+    if saved_id.is_none()
+        && let Err(error) =
+            put_run_crate_status(storage, for_job, &RunCrateStatus::Minted { document_id }).await
+    {
+        return JobRunOutcome::Failed(JobError::retryable(format!(
+            "run crate status write failed: {error}"
+        )));
+    }
     let denied = match drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: AuthContext {
@@ -159,10 +162,11 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
             },
         ),
         ctx.driver.clone(),
-        Some(MetadataAuthToken::internal(
-            parent.created_by,
-            parent.created_by.realm_id,
-        )),
+        Some(MetadataAuthToken::internal(AuthContext {
+            user_id: parent.created_by,
+            realm_id: parent.created_by.realm_id,
+            path_restrictions: None,
+        })),
     )
     .await
     {
