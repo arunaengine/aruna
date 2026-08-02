@@ -431,18 +431,13 @@ struct MetadataIncludeFlags {
 pub struct SparqlQueryRequest {
     /// SPARQL query string. Only `SELECT` and `ASK` queries are supported.
     pub query: String,
-    /// Query execution scope. Omit to use `distributed`.
-    ///
-    /// `local` runs only against metadata indexed on the current node.
-    /// `distributed` fans out to all known realm nodes for all-metadata queries,
-    /// or to the document's registry replica nodes for document-scoped queries,
-    /// and returns one complete replica result.
-    /// Distributed mode is best-effort and may return partial results if realm
-    /// node discovery or remote requests fail.
+    /// Query scope; omitted means distributed. `local` uses only this node.
+    /// `distributed` fans out all-metadata queries, but document queries try
+    /// replicas sequentially until one complete result succeeds.
     #[serde(default)]
     pub mode: Option<MetadataQueryMode>,
-    /// Keep successful partitions when distributed execution is incomplete.
-    /// Defaults to `true` for compatibility with the existing best-effort API.
+    /// Keeps successful all-metadata partitions, and permits document-local fallback
+    /// only when holder discovery fails. Replica failover never returns partial data.
     #[serde(default = "default_allow_partial")]
     pub allow_partial: bool,
 }
@@ -456,9 +451,8 @@ fn default_allow_partial() -> bool {
 pub enum MetadataQueryMode {
     /// Run the query only on the current node.
     Local,
-    /// Run the query across the selected metadata partitions.
-    /// This is best-effort and may return partial results if discovery or
-    /// remote requests fail.
+    /// Fan out all-metadata queries or try document replicas sequentially.
+    /// Only fanout and document discovery fallback may return partial data.
     Distributed,
 }
 
@@ -466,10 +460,10 @@ pub enum MetadataQueryMode {
 pub struct MetadataQueryResponse {
     #[serde(flatten)]
     pub result: MetadataQueryResult,
-    /// Number of node partitions this query was executed against.
+    /// Number of node attempts made while producing this result.
     pub nodes_queried: usize,
-    /// Number of node partitions that failed or timed out; a non-zero value
-    /// means the result is partial.
+    /// Number of selected partitions absent from the result; non-zero means partial.
+    /// Failed document replica attempts followed by success are not partitions.
     pub nodes_failed: usize,
     /// Whether every selected partition completed successfully.
     pub complete: bool,
@@ -1333,7 +1327,7 @@ pub async fn add_metadata_contextual_entity(
     params(("document_id" = String, Path, description = "Metadata document id")),
     request_body(
         content = SparqlQueryRequest,
-        description = "Run a SPARQL `SELECT` or `ASK` query against one metadata document. `mode=local` only queries the current node, while `mode=distributed` queries the document's registry replicas and returns the first successful complete result. Distributed mode is best-effort by default; set `allow_partial=false` to fail if any selected replica fails.",
+        description = "Run a SPARQL `SELECT` or `ASK` query against one metadata document. `mode=local` only queries the current node, while `mode=distributed` tries the document's registry replicas until one returns a complete result. Failed replica attempts do not make a successful result partial; `allow_partial` only permits local fallback when holder discovery is unavailable.",
         examples(
             (
                 "DocumentAsk" = (
@@ -1359,7 +1353,8 @@ pub async fn add_metadata_contextual_entity(
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 404, description = "Not found", body = ErrorResponse)
+        (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 503, description = "Holder discovery or every document replica unavailable", body = ErrorResponse)
     ),
     security((), ("bearer_auth" = []))
 )]

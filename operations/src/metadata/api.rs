@@ -1121,6 +1121,8 @@ pub async fn query_metadata_document(
         };
         match result {
             Ok(results) => {
+                fanout_stats.nodes_failed = 0;
+                fanout_stats.failed_partitions.clear();
                 return Ok(MetadataQueryExecution {
                     results,
                     fanout_stats,
