@@ -22,6 +22,7 @@ use tracing::warn;
 
 use super::store::{
     decode_job_record, job_dedup_index_key, job_delivery_entries, job_insert_entries,
+    same_submission,
 };
 
 /// Kick the drain so a submitted job is claimed promptly; this timer is never persisted.
@@ -341,20 +342,6 @@ fn delivery_record_valid(record: &JobRecord) -> bool {
         && record.report_digest.is_none()
 }
 
-fn same_job_submission(existing: &JobRecord, delivered: &JobRecord) -> bool {
-    existing.job_id == delivered.job_id
-        && existing.payload == delivered.payload
-        && existing.created_by == delivered.created_by
-        && existing.owner_node_id == delivered.owner_node_id
-        && existing.created_at_ms == delivered.created_at_ms
-        && existing.dedup_key == delivered.dedup_key
-        && existing.execution_class == delivered.execution_class
-        && existing.plan_digest == delivered.plan_digest
-        && existing.workspace_bucket == delivered.workspace_bucket
-        && existing.workspace_mode == delivered.workspace_mode
-        && existing.retention_ms == delivered.retention_ms
-}
-
 fn workspace_plan_digest(
     payload: &JobPayload,
     mode: WorkspaceMode,
@@ -446,7 +433,7 @@ impl Operation for SubmitJobOperation {
                 Event::Storage(StorageEvent::ReadResult {
                     value: Some(value), ..
                 }) => match decode_job_record(&value) {
-                    Ok(existing) if same_job_submission(&existing, &self.record) => {
+                    Ok(existing) if same_submission(&existing, &self.record) => {
                         self.finish_existing(txn_id, existing.job_id)
                     }
                     Ok(_) | Err(_) => self.fail(SubmitJobError::JobDeliveryConflict {

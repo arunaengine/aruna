@@ -24,10 +24,12 @@ use tracing::warn;
 use super::runtime::JobsRuntime;
 use super::service::{
     ArtifactLookup, CancelJobOutcome, JobReportLookup, JobReportView, JobStatusView, OwnedArtifact,
-    cancel_owned_job, lookup_local_dedup, read_artifact_range, read_job_run_crate_status,
-    read_owned_artifact, read_owned_job, read_owned_report, submit_authority_job,
+    RoutedCancelOutcome, cancel_job_routed, cancel_owned_job, lookup_local_dedup,
+    read_artifact_range, read_artifact_routed, read_job_routed, read_job_run_crate_status,
+    read_owned_artifact, read_owned_job, read_owned_report, read_report_routed,
+    submit_authority_job,
 };
-use super::store::{list_jobs_for_user, update_user_index, write_passive_record};
+use super::store::{JobSyncError, apply_terminal, list_jobs_for_user, write_passive_record};
 use super::submit::{SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::api::load_realm_config;
@@ -53,11 +55,6 @@ pub enum JobRouteError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum JobRequest {
-    Index {
-        auth_token: MetadataAuthToken,
-        record: JobRecord,
-        config_digest: [u8; 32],
-    },
     List {
         auth_token: MetadataAuthToken,
         user_id: UserId,
@@ -110,13 +107,16 @@ pub(crate) enum JobRequest {
         plan_digest: [u8; 32],
         config_digest: [u8; 32],
     },
+    Sync {
+        auth_token: MetadataAuthToken,
+        record: JobRecord,
+    },
 }
 
 impl JobRequest {
     fn auth_token(&self) -> MetadataAuthToken {
         match self {
-            Self::Index { auth_token, .. }
-            | Self::List { auth_token, .. }
+            Self::List { auth_token, .. }
             | Self::Submit { auth_token, .. }
             | Self::Replicate { auth_token, .. }
             | Self::Status { auth_token, .. }
@@ -124,17 +124,17 @@ impl JobRequest {
             | Self::Artifact { auth_token, .. }
             | Self::Cancel { auth_token, .. }
             | Self::Deliver { auth_token, .. }
-            | Self::Dedup { auth_token, .. } => auth_token.clone(),
+            | Self::Dedup { auth_token, .. }
+            | Self::Sync { auth_token, .. } => auth_token.clone(),
         }
     }
 
     fn job_id(&self) -> Option<JobId> {
         match self {
-            Self::Index { .. } | Self::List { .. } | Self::Submit { .. } | Self::Dedup { .. } => {
-                None
-            }
+            Self::List { .. } | Self::Submit { .. } | Self::Dedup { .. } => None,
             Self::Replicate { record, .. } => Some(record.job_id),
             Self::Deliver { record, .. } => Some(record.job_id),
+            Self::Sync { record, .. } => Some(record.job_id),
             Self::Status { job_id, .. }
             | Self::Report { job_id, .. }
             | Self::Artifact { job_id, .. }
@@ -144,7 +144,6 @@ impl JobRequest {
 
     fn user_id(&self) -> Option<UserId> {
         match self {
-            Self::Index { record, .. } => Some(record.created_by),
             Self::List { user_id, .. } => Some(*user_id),
             Self::Submit { spec, .. } => Some(spec.created_by),
             Self::Dedup { user_id, .. } => Some(*user_id),
@@ -154,8 +153,7 @@ impl JobRequest {
 
     fn config_digest(&self) -> Option<[u8; 32]> {
         match self {
-            Self::Index { config_digest, .. }
-            | Self::List { config_digest, .. }
+            Self::List { config_digest, .. }
             | Self::Submit { config_digest, .. }
             | Self::Replicate { config_digest, .. }
             | Self::Status { config_digest, .. }
@@ -163,7 +161,7 @@ impl JobRequest {
             | Self::Artifact { config_digest, .. }
             | Self::Cancel { config_digest, .. }
             | Self::Dedup { config_digest, .. } => Some(*config_digest),
-            Self::Deliver { .. } => None,
+            Self::Deliver { .. } | Self::Sync { .. } => None,
         }
     }
 }
@@ -223,7 +221,6 @@ pub(crate) enum JobResponse {
     Forbidden,
     NotFound,
     Unavailable(String),
-    Indexed(JobId),
     Listed {
         records: Vec<JobRecord>,
         next_cursor: Option<Vec<u8>>,
@@ -256,6 +253,8 @@ pub(crate) enum JobResponse {
     Delivered(SubmitJobResult),
     DeliveryConflict,
     Dedup(Option<SubmitJobResult>),
+    Synced(JobId),
+    SyncConflict,
 }
 
 pub(crate) struct RemoteJobReply {
@@ -492,6 +491,9 @@ async fn prepare_response(
         JobRequest::Deliver { record, .. } => {
             return prepare_delivery(context, peer, auth.user_id, record).await;
         }
+        JobRequest::Sync { record, .. } => {
+            return prepare_sync(context, peer, auth.user_id, record).await;
+        }
         request => request,
     };
     let Some(config_digest) = request.config_digest() else {
@@ -518,7 +520,6 @@ async fn prepare_response(
             ));
         }
         return match request {
-            JobRequest::Index { record, .. } => prepare_index(context, auth.user_id, record).await,
             JobRequest::List {
                 user_id,
                 cursor,
@@ -536,6 +537,16 @@ async fn prepare_response(
                 "invalid authority-routed job request".to_string(),
             )),
         };
+    }
+    if matches!(
+        request,
+        JobRequest::Status { .. }
+            | JobRequest::Report { .. }
+            | JobRequest::Artifact { .. }
+            | JobRequest::Cancel { .. }
+    ) {
+        return prepare_external(context, runtime, peer, auth.user_id, config_digest, request)
+            .await;
     }
     let Some(job_id) = request.job_id() else {
         return PreparedResponse::new(JobResponse::Unavailable(
@@ -559,46 +570,23 @@ async fn prepare_response(
         ));
     }
     match request {
-        JobRequest::Index { .. }
-        | JobRequest::List { .. }
-        | JobRequest::Submit { .. }
-        | JobRequest::Dedup { .. } => PreparedResponse::new(JobResponse::Unavailable(
-            "authority-routed request reached the job dispatcher".to_string(),
-        )),
+        JobRequest::List { .. } | JobRequest::Submit { .. } | JobRequest::Dedup { .. } => {
+            PreparedResponse::new(JobResponse::Unavailable(
+                "authority-routed request reached the job dispatcher".to_string(),
+            ))
+        }
         JobRequest::Replicate { record, .. } => {
-            prepare_replicate(context, auth.user_id, record).await
+            prepare_replicate(context, peer, auth.user_id, record).await
         }
-        JobRequest::Status { .. } => prepare_status(context, auth.user_id, job_id).await,
-        JobRequest::Report {
-            expected_digest,
-            last_key,
-            limit,
-            ..
-        } => {
-            prepare_report(
-                context,
-                auth.user_id,
-                job_id,
-                expected_digest,
-                last_key,
-                usize::from(limit),
-            )
-            .await
-        }
-        JobRequest::Artifact { range, .. } => {
-            prepare_artifact(
-                context,
-                auth.user_id,
-                job_id,
-                unix_timestamp_millis(),
-                range,
-            )
-            .await
-        }
-        JobRequest::Cancel { .. } => prepare_cancel(context, runtime, auth.user_id, job_id).await,
-        JobRequest::Deliver { .. } => PreparedResponse::new(JobResponse::Unavailable(
-            "delivery reached the job dispatcher".to_string(),
+        JobRequest::Status { .. }
+        | JobRequest::Report { .. }
+        | JobRequest::Artifact { .. }
+        | JobRequest::Cancel { .. } => PreparedResponse::new(JobResponse::Unavailable(
+            "owner-routed request reached the replica dispatcher".to_string(),
         )),
+        JobRequest::Deliver { .. } | JobRequest::Sync { .. } => PreparedResponse::new(
+            JobResponse::Unavailable("direct job obligation reached the dispatcher".to_string()),
+        ),
     }
 }
 
@@ -634,20 +622,131 @@ async fn prepare_delivery(
     }
 }
 
-async fn prepare_index(
+async fn prepare_sync(
     context: &DriverContext,
+    peer: NodeId,
     user_id: UserId,
     record: JobRecord,
 ) -> PreparedResponse {
-    if record.created_by != user_id || record.payload.is_internal() {
+    let Some(local_node) = context.net_handle.as_ref().map(|net| net.node_id()) else {
+        return PreparedResponse::new(JobResponse::Unavailable(
+            "job-control network handle unavailable".to_string(),
+        ));
+    };
+    let Some(config) = load_realm_config(context, user_id.realm_id).await else {
+        return PreparedResponse::new(JobResponse::Unavailable(
+            "realm config unavailable".to_string(),
+        ));
+    };
+    if record.created_by != user_id
+        || record.payload.is_internal()
+        || config.handle_allocator_node() != Some(local_node)
+    {
         return PreparedResponse::new(JobResponse::Forbidden);
     }
-    if !record.state.is_terminal() {
+    match apply_terminal(&context.storage_handle, peer, &record).await {
+        Ok(record) => PreparedResponse::new(JobResponse::Synced(record.job_id)),
+        Err(JobSyncError::NotFound) => PreparedResponse::new(JobResponse::NotFound),
+        Err(JobSyncError::Forbidden) => PreparedResponse::new(JobResponse::Forbidden),
+        Err(JobSyncError::Conflict) => PreparedResponse::new(JobResponse::SyncConflict),
+        Err(JobSyncError::Storage(error)) => PreparedResponse::new(JobResponse::Unavailable(error)),
+    }
+}
+
+async fn prepare_external(
+    context: &DriverContext,
+    runtime: &Arc<JobsRuntime>,
+    peer: NodeId,
+    user_id: UserId,
+    config_digest: [u8; 32],
+    request: JobRequest,
+) -> PreparedResponse {
+    let route = match resolve_job_authority(context, user_id.realm_id).await {
+        Ok(route) => route,
+        Err(error) => return PreparedResponse::new(route_error_response(error)),
+    };
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let authority = route.holders[0];
+    if local_node == Some(authority) {
+        if route.config_digest != config_digest {
+            return PreparedResponse::new(JobResponse::Unavailable(
+                "job authority config does not match the requester".to_string(),
+            ));
+        }
+        return match request {
+            JobRequest::Status {
+                auth_token, job_id, ..
+            } => prepare_routed_status(context, user_id, job_id, auth_token).await,
+            JobRequest::Report {
+                auth_token,
+                job_id,
+                expected_digest,
+                last_key,
+                limit,
+                ..
+            } => {
+                prepare_routed_report(
+                    context,
+                    user_id,
+                    job_id,
+                    expected_digest,
+                    last_key,
+                    usize::from(limit),
+                    auth_token,
+                )
+                .await
+            }
+            JobRequest::Artifact {
+                auth_token,
+                job_id,
+                range,
+                ..
+            } => prepare_routed_artifact(context, user_id, job_id, range, auth_token).await,
+            JobRequest::Cancel {
+                auth_token, job_id, ..
+            } => prepare_routed_cancel(context, runtime, user_id, job_id, auth_token).await,
+            _ => PreparedResponse::new(JobResponse::Unavailable(
+                "invalid owner-routed job request".to_string(),
+            )),
+        };
+    }
+    if peer != authority {
         return PreparedResponse::new(JobResponse::Forbidden);
     }
-    match update_user_index(&context.storage_handle, &record).await {
-        Ok(()) => PreparedResponse::new(JobResponse::Indexed(record.job_id)),
-        Err(error) => PreparedResponse::new(JobResponse::Unavailable(error)),
+    let Some(job_id) = request.job_id() else {
+        return PreparedResponse::new(JobResponse::Forbidden);
+    };
+    let record = match read_owned_job(context, user_id, job_id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return PreparedResponse::new(JobResponse::NotFound),
+        Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error)),
+    };
+    if local_node != Some(record.owner_node_id) {
+        return PreparedResponse::new(JobResponse::Forbidden);
+    }
+    match request {
+        JobRequest::Status { .. } => prepare_status(context, user_id, job_id).await,
+        JobRequest::Report {
+            expected_digest,
+            last_key,
+            limit,
+            ..
+        } => {
+            prepare_report(
+                context,
+                user_id,
+                job_id,
+                expected_digest,
+                last_key,
+                usize::from(limit),
+            )
+            .await
+        }
+        JobRequest::Artifact { range, .. } => {
+            prepare_artifact(context, user_id, job_id, unix_timestamp_millis(), range).await
+        }
+        JobRequest::Cancel { .. } => prepare_cancel(context, runtime, user_id, job_id).await,
+        _ => PreparedResponse::new(JobResponse::Forbidden),
     }
 }
 
@@ -718,11 +817,30 @@ async fn prepare_dedup(
 
 async fn prepare_replicate(
     context: &DriverContext,
+    peer: NodeId,
     user_id: UserId,
     record: JobRecord,
 ) -> PreparedResponse {
-    if record.created_by != user_id {
+    if record.created_by != user_id
+        || !record.payload.is_internal()
+            && (record.owner_node_id != peer || !record.state.is_terminal())
+    {
         return PreparedResponse::new(JobResponse::Forbidden);
+    }
+    if !record.payload.is_internal() {
+        let route = match resolve_job_authority(context, user_id.realm_id).await {
+            Ok(route) => route,
+            Err(error) => {
+                return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
+            }
+        };
+        if context
+            .net_handle
+            .as_ref()
+            .is_some_and(|net| net.node_id() == route.holders[0])
+        {
+            return PreparedResponse::new(JobResponse::Replicated);
+        }
     }
     match write_passive_record(&context.storage_handle, &record).await {
         Ok(()) => PreparedResponse::new(JobResponse::Replicated),
@@ -732,6 +850,136 @@ async fn prepare_replicate(
 
 fn auth_realm_matches(auth: &AuthContext, realm_id: RealmId) -> bool {
     auth.realm_id == realm_id && auth.user_id.realm_id == realm_id
+}
+
+fn route_error_response(error: JobRouteError) -> JobResponse {
+    match error {
+        JobRouteError::Unauthorized => JobResponse::Unauthorized,
+        JobRouteError::Forbidden => JobResponse::Forbidden,
+        JobRouteError::NotFound => JobResponse::NotFound,
+        JobRouteError::Unavailable(error) | JobRouteError::Internal(error) => {
+            JobResponse::Unavailable(error)
+        }
+    }
+}
+
+async fn prepare_routed_status(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+    auth_token: MetadataAuthToken,
+) -> PreparedResponse {
+    match read_job_routed(context, user_id, job_id, Some(auth_token)).await {
+        Ok(status) => PreparedResponse::new(JobResponse::Status {
+            job: status.job,
+            run_crate: status.run_crate.map(|status| status.to_string()),
+        }),
+        Err(error) => PreparedResponse::new(route_error_response(error)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_routed_report(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+    expected_digest: Option<[u8; 32]>,
+    last_key: Option<Vec<u8>>,
+    limit: usize,
+    auth_token: MetadataAuthToken,
+) -> PreparedResponse {
+    let response = match read_report_routed(
+        context,
+        user_id,
+        job_id,
+        expected_digest,
+        last_key,
+        limit,
+        Some(auth_token),
+    )
+    .await
+    {
+        Ok(JobReportLookup::NotFound) => JobResponse::NotFound,
+        Ok(JobReportLookup::Pending(state)) => JobResponse::ReportPending(state),
+        Ok(JobReportLookup::CursorConflict) => JobResponse::ReportConflict,
+        Ok(JobReportLookup::Ready {
+            job,
+            rows,
+            next_key,
+        }) => JobResponse::ReportReady {
+            job,
+            rows: rows
+                .into_iter()
+                .map(|(key, value)| (key, value.as_ref().to_vec()))
+                .collect(),
+            next_key,
+        },
+        Err(error) => route_error_response(error),
+    };
+    PreparedResponse::new(response)
+}
+
+async fn prepare_routed_artifact(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+    range: Option<WireRange>,
+    auth_token: MetadataAuthToken,
+) -> PreparedResponse {
+    let range = range.map(|range| range.start..range.end);
+    let (lookup, read) = match read_artifact_routed(
+        context,
+        user_id,
+        job_id,
+        unix_timestamp_millis(),
+        range,
+        Some(auth_token),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => return PreparedResponse::new(route_error_response(error)),
+    };
+    match lookup {
+        ArtifactLookup::NotFound => PreparedResponse::new(JobResponse::NotFound),
+        ArtifactLookup::Pending(state) => {
+            PreparedResponse::new(JobResponse::ArtifactPending(state))
+        }
+        ArtifactLookup::Gone => PreparedResponse::new(JobResponse::ArtifactGone),
+        ArtifactLookup::Ready(owned) => {
+            let stream_size = read.as_ref().map_or(0, |read| read.stream_size);
+            PreparedResponse {
+                response: JobResponse::ArtifactReady {
+                    owned: WireArtifact::from(&owned),
+                    stream_size,
+                },
+                body: read.map(|read| read.blob),
+            }
+        }
+    }
+}
+
+async fn prepare_routed_cancel(
+    context: &DriverContext,
+    runtime: &Arc<JobsRuntime>,
+    user_id: UserId,
+    job_id: JobId,
+    auth_token: MetadataAuthToken,
+) -> PreparedResponse {
+    let response =
+        match cancel_job_routed(context, runtime, user_id, job_id, Some(auth_token)).await {
+            Ok(RoutedCancelOutcome::NotFound) => JobResponse::NotFound,
+            Ok(RoutedCancelOutcome::AlreadyTerminal(job)) => JobResponse::Cancelled {
+                job,
+                terminal: true,
+            },
+            Ok(RoutedCancelOutcome::Requested(job)) => JobResponse::Cancelled {
+                job,
+                terminal: false,
+            },
+            Err(error) => route_error_response(error),
+        };
+    PreparedResponse::new(response)
 }
 
 async fn prepare_status(
