@@ -233,8 +233,7 @@ impl PlacementBinding {
     }
 }
 
-/// First allocatable handle: handle zero is reserved by the id codec, so every
-/// grant starts at one.
+/// First nonzero handle; the reserved class bindings start here.
 pub const FIRST_HANDLE: u32 = 1;
 /// Realm-scoped default class binding for metadata documents.
 pub const METADATA_HANDLE: u32 = FIRST_HANDLE;
