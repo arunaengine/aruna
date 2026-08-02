@@ -349,6 +349,24 @@ pub struct OidcProviderConfig {
 }
 
 impl RealmConfigDocument {
+    /// Hashes the canonical realm configuration used to bind routed requests.
+    pub fn digest(&self) -> Result<[u8; 32], ConversionError> {
+        let mut canonical = self.clone();
+        sort_canonical(&mut canonical.oidc_providers)?;
+        sort_canonical(&mut canonical.nodes)?;
+        sort_canonical(&mut canonical.placement_map)?;
+        sort_canonical(&mut canonical.strategies)?;
+        sort_canonical(&mut canonical.strategy_bindings)?;
+        sort_canonical(&mut canonical.placement_overrides)?;
+        sort_canonical(&mut canonical.placement_bindings)?;
+        sort_canonical(&mut canonical.placement_handle_ranges)?;
+        let encoded = postcard::to_allocvec(&canonical)?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"aruna-realm-config-v1");
+        hasher.update(&encoded);
+        Ok(*hasher.finalize().as_bytes())
+    }
+
     pub fn new(
         realm_id: RealmId,
         oidc_providers: Vec<OidcProviderConfig>,
@@ -540,6 +558,16 @@ impl RealmConfigDocument {
     }
 }
 
+fn sort_canonical<T: Serialize>(values: &mut Vec<T>) -> Result<(), ConversionError> {
+    let mut keyed = std::mem::take(values)
+        .into_iter()
+        .map(|value| Ok((postcard::to_allocvec(&value)?, value)))
+        .collect::<Result<Vec<_>, ConversionError>>()?;
+    keyed.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    *values = keyed.into_iter().map(|(_, value)| value).collect();
+    Ok(())
+}
+
 pub fn default_realm_discovery_config() -> RealmDiscoveryConfig {
     RealmDiscoveryConfig::Dynamic {
         methods: vec![
@@ -689,6 +717,55 @@ mod test {
         let restored = RealmConfigDocument::from_bytes(&bytes).expect("from bytes");
 
         assert_eq!(document, restored);
+    }
+
+    #[test]
+    fn config_digest_changes() {
+        let config = RealmConfigDocument::new(RealmId([4u8; 32]), Vec::new(), 3);
+        let mut changed = config.clone();
+        changed.description = "changed".to_string();
+
+        assert_eq!(config.digest().unwrap(), config.clone().digest().unwrap());
+        assert_ne!(config.digest().unwrap(), changed.digest().unwrap());
+    }
+
+    #[test]
+    fn digest_ignores_order() {
+        let mut config = RealmConfigDocument::new(
+            RealmId([4u8; 32]),
+            vec![
+                OidcProviderConfig {
+                    id: "z".to_string(),
+                    issuer: "z".to_string(),
+                    audience: "z".to_string(),
+                    discovery_url: "z".to_string(),
+                },
+                OidcProviderConfig {
+                    id: "a".to_string(),
+                    issuer: "a".to_string(),
+                    audience: "a".to_string(),
+                    discovery_url: "a".to_string(),
+                },
+            ],
+            3,
+        );
+        config.seed_default_placement();
+        config.ensure_node(
+            iroh::SecretKey::from_bytes(&[1; 32]).public(),
+            RealmNodeKind::Management,
+        );
+        config.ensure_node(
+            iroh::SecretKey::from_bytes(&[2; 32]).public(),
+            RealmNodeKind::Server,
+        );
+        let mut reordered = config.clone();
+        reordered.oidc_providers.reverse();
+        reordered.nodes.reverse();
+        reordered.strategies.reverse();
+        reordered.strategy_bindings.reverse();
+        reordered.placement_bindings.reverse();
+
+        assert_eq!(config.digest().unwrap(), reordered.digest().unwrap());
     }
 
     #[test]
