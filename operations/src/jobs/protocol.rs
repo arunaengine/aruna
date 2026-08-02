@@ -576,7 +576,7 @@ async fn prepare_response(
             ))
         }
         JobRequest::Replicate { record, .. } => {
-            prepare_replicate(context, peer, auth.user_id, record).await
+            prepare_replicate(context, auth.user_id, record).await
         }
         JobRequest::Status { .. }
         | JobRequest::Report { .. }
@@ -817,30 +817,11 @@ async fn prepare_dedup(
 
 async fn prepare_replicate(
     context: &DriverContext,
-    peer: NodeId,
     user_id: UserId,
     record: JobRecord,
 ) -> PreparedResponse {
-    if record.created_by != user_id
-        || !record.payload.is_internal()
-            && (record.owner_node_id != peer || !record.state.is_terminal())
-    {
+    if record.created_by != user_id || !record.payload.is_internal() {
         return PreparedResponse::new(JobResponse::Forbidden);
-    }
-    if !record.payload.is_internal() {
-        let route = match resolve_job_authority(context, user_id.realm_id).await {
-            Ok(route) => route,
-            Err(error) => {
-                return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
-            }
-        };
-        if context
-            .net_handle
-            .as_ref()
-            .is_some_and(|net| net.node_id() == route.holders[0])
-        {
-            return PreparedResponse::new(JobResponse::Replicated);
-        }
     }
     match write_passive_record(&context.storage_handle, &record).await {
         Ok(()) => PreparedResponse::new(JobResponse::Replicated),

@@ -865,52 +865,29 @@ pub async fn apply_terminal(
     ))
 }
 
-/// Stores a readable replica without making it visible to the local drain.
-pub async fn write_passive_record(
+pub async fn ack_job_delivery(
     storage: &StorageHandle,
-    record: &JobRecord,
-) -> Result<(), String> {
-    let value = ByteView::from(record.to_bytes().map_err(|error| error.to_string())?);
-    if record.payload.is_internal() {
-        return batch_write(
-            storage,
-            vec![(
-                JOB_KEYSPACE.to_string(),
-                job_record_key(record.job_id),
-                value,
-            )],
-            None,
-        )
-        .await;
-    }
-    if !record.state.is_terminal() {
-        return Err("only terminal external jobs may be replicated".to_string());
-    }
+    delivered: &JobRecord,
+    schedule_key: Key,
+) -> Result<bool, String> {
     for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
         let txn_id = start_write_txn(storage).await?;
-        let existing = match read_job_record(storage, record.job_id, Some(txn_id)).await {
-            Ok(existing) => existing,
+        let current = match read_job_record(storage, delivered.job_id, Some(txn_id)).await {
+            Ok(current) => current,
             Err(error) => {
                 abort_txn(storage, txn_id).await;
                 return Err(error);
             }
         };
-        if existing.as_ref().is_some_and(|existing| {
-            !same_submission(existing, record) || existing.state.is_terminal() && existing != record
-        }) {
+        if current.as_ref() != Some(delivered) {
             abort_txn(storage, txn_id).await;
-            return Err("job replica conflicts with the local record".to_string());
+            return Ok(false);
         }
-        if existing.as_ref() == Some(record) {
-            abort_txn(storage, txn_id).await;
-            return Ok(());
-        }
-        if let Err(error) = batch_write(
+        if let Err(error) = batch_delete(
             storage,
             vec![(
-                JOB_KEYSPACE.to_string(),
-                job_record_key(record.job_id),
-                value.clone(),
+                JOB_SCHEDULE_INDEX_KEYSPACE.to_string(),
+                schedule_key.clone(),
             )],
             Some(txn_id),
         )
@@ -920,15 +897,35 @@ pub async fn write_passive_record(
             return Err(error);
         }
         match commit_txn(storage, txn_id).await {
-            CommitResult::Committed => return Ok(()),
+            CommitResult::Committed => return Ok(true),
             CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => continue,
             CommitResult::Conflict => {
-                return Err("job replication exhausted conflict retries".to_string());
+                return Err("job delivery acknowledgement exhausted conflict retries".to_string());
             }
             CommitResult::Failed(error) => return Err(error),
         }
     }
-    Err("job replication exhausted conflict retries".to_string())
+    Err("job delivery acknowledgement exhausted conflict retries".to_string())
+}
+
+/// Stores a readable replica without making it visible to the local drain.
+pub async fn write_passive_record(
+    storage: &StorageHandle,
+    record: &JobRecord,
+) -> Result<(), String> {
+    if !record.payload.is_internal() {
+        return Err("external jobs are not passively replicated".to_string());
+    }
+    batch_write(
+        storage,
+        vec![(
+            JOB_KEYSPACE.to_string(),
+            job_record_key(record.job_id),
+            ByteView::from(record.to_bytes().map_err(|error| error.to_string())?),
+        )],
+        None,
+    )
+    .await
 }
 
 pub async fn write_job_schedule(storage: &StorageHandle, record: &JobRecord) -> Result<(), String> {

@@ -513,11 +513,9 @@ pub(crate) async fn replicate_job_record(context: &DriverContext, job_id: JobId)
             return;
         }
     };
-    if record.payload.is_internal() {
-        if record.state != JobState::Queued && !record.state.is_terminal() {
-            return;
-        }
-    } else if !record.state.is_terminal() {
+    if !record.payload.is_internal()
+        || record.state != JobState::Queued && !record.state.is_terminal()
+    {
         return;
     }
     let route = match resolve_job_holders(context, job_id).await {

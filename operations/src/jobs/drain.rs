@@ -23,9 +23,9 @@ use super::protocol::{
 };
 use super::reconcile::ExternalReconciler;
 use super::store::{
-    ClaimOutcome, JobMutationError, RequeueOutcome, apply_terminal, batch_delete, claim_job,
-    decode_job_record, first_schedule_entry, iter_prefix_page, read_job_record, requeue_job,
-    write_job_schedule,
+    ClaimOutcome, JobMutationError, RequeueOutcome, ack_job_delivery, apply_terminal, batch_delete,
+    claim_job, decode_job_record, first_schedule_entry, iter_prefix_page, read_job_record,
+    requeue_job, write_job_schedule,
 };
 use super::{JOB_DRAIN_BATCH_SIZE, JOB_RECONCILE_REARM};
 use crate::driver::DriverContext;
@@ -443,7 +443,9 @@ async fn claim_due_jobs(
                 if !record.payload.is_internal() && record.owner_node_id != holder_node_id {
                     match deliver_due_job(context, holder_node_id, &record).await {
                         Ok(true) => {
-                            if let Err(error) = delete_schedule_row(storage, key).await {
+                            if let Err(error) =
+                                ack_job_delivery(storage, &record, key.clone()).await
+                            {
                                 warn!(job_id = %job_id, error = %error, "Failed to acknowledge delivered job");
                                 result.retry_after_error = true;
                                 break 'pages;
