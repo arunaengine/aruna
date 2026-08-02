@@ -15,6 +15,7 @@ use aruna_core::StructuredId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::MetadataError;
+use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::storage_entries::metadata_registry_delete_entries;
 use aruna_core::structs::{
     ComputeResources, DocumentClass, ExecutionSpec, JOBCONTROL_HANDLE, PlacementRef,
@@ -32,7 +33,6 @@ use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, read_job_routed, read_owned_job, submit_execution_job,
 };
-use aruna_core::metadata::MetadataQueryResults;
 use aruna_operations::metadata::api::{
     MetadataApiQueryMode, MetadataDocumentQueryRequest, query_metadata_document,
 };
