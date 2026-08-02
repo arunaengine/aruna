@@ -167,27 +167,11 @@ pub fn shard_for_subject(subject: &[u8], shard_count: u32) -> u32 {
     u32::from_be_bytes(head) & (shard_count - 1)
 }
 
-/// Discriminant of a placement binding's scope (spec 6.3.4).
-#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum PlacementScopeKind {
-    Realm,
-    Group,
-}
-
 /// Type-safe `scope_kind`/`scope_id` pair for a binding (spec 6.3.4).
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PlacementScope {
     Realm(RealmId),
     Group(GroupId),
-}
-
-impl PlacementScope {
-    pub fn kind(&self) -> PlacementScopeKind {
-        match self {
-            PlacementScope::Realm(_) => PlacementScopeKind::Realm,
-            PlacementScope::Group(_) => PlacementScopeKind::Group,
-        }
-    }
 }
 
 /// Immutable handle identity used for conflict and alias detection.
@@ -532,8 +516,8 @@ mod tests {
         };
         assert_ne!(realm.scope, binding.scope);
         assert_eq!(realm.tuple().document_class, DocumentClass::Metadata);
-        assert_eq!(binding.scope.kind(), PlacementScopeKind::Group);
-        assert_eq!(realm.scope.kind(), PlacementScopeKind::Realm);
+        assert!(matches!(binding.scope, PlacementScope::Group(_)));
+        assert!(matches!(realm.scope, PlacementScope::Realm(_)));
     }
 
     #[test]

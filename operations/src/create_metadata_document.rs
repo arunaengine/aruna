@@ -632,18 +632,6 @@ pub async fn mint_job_document(
     mint_document_for(&realm_config, actor, group_id, document_path, true)
 }
 
-/// Resolves the blind bucket that forwarding and the stamped id share.
-pub fn forward_bucket_placement(
-    config: &RealmConfigDocument,
-    actor: &Actor,
-    group_id: GroupId,
-    document_path: &str,
-) -> Result<PlacementRef, CreateMetadataDocumentError> {
-    let normalized = MetadataRegistryRecord::normalize_document_path(document_path);
-    resolve_create_placement(config, actor, group_id, &normalized, true)
-        .map(|(_, placement)| placement)
-}
-
 /// Mints a local held-bucket id from an already-loaded config.
 pub fn mint_local_document(
     config: &RealmConfigDocument,

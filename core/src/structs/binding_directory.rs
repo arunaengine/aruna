@@ -9,9 +9,7 @@ use ulid::Ulid;
 use crate::structs::{
     BindingTuple, DocumentClass, HandleRangeDirectory, PlacementBinding, PlacementScope,
 };
-use crate::structured_id::{
-    ALLOCATABLE_HANDLES, BucketId, BucketNotInRange, PlacementHandle, StructuredId,
-};
+use crate::structured_id::{BucketId, BucketNotInRange, PlacementHandle, StructuredId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum BindingError {
@@ -205,12 +203,6 @@ impl BindingDirectory {
             .values()
             .filter(|state| matches!(state, HandleState::Conflicted(_)))
             .count()
-    }
-
-    /// Remaining allocatable handles in the 20-bit namespace.
-    pub fn remaining(&self) -> u32 {
-        let used = u32::try_from(self.by_handle.len()).unwrap_or(u32::MAX);
-        ALLOCATABLE_HANDLES.saturating_sub(used)
     }
 }
 

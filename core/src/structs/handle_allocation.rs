@@ -49,10 +49,6 @@ impl HandleRangeDirectory {
         directory
     }
 
-    pub fn is_conflicted(&self, range_id: &Ulid) -> bool {
-        self.conflicted.contains(range_id)
-    }
-
     pub fn conflicts(&self) -> usize {
         self.conflicted.len()
     }
