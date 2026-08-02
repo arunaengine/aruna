@@ -86,8 +86,6 @@ pub enum EnsureRealmConfigError {
     RealmConfigNotFound,
     #[error("realm config node {node_id} already exists with a different kind")]
     NodeKindMismatch { node_id: NodeId },
-    #[error("realm config bootstrap allocator must be the creating management node")]
-    InvalidHandleAllocator,
     #[error("missing active transaction")]
     MissingTransaction,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -148,7 +146,6 @@ impl EnsureRealmConfigOperation {
         let Some(txn_id) = self.txn_id else {
             return Err(EnsureRealmConfigError::MissingTransaction);
         };
-        let creating_document = document_value.is_none();
         let mut document = match document_value.as_deref() {
             Some(value) => RealmConfigDocument::from_bytes(value)?,
             None if self.config.create_if_missing => {
@@ -193,24 +190,6 @@ impl EnsureRealmConfigOperation {
         {
             return Err(AdminDocumentReducerError::TargetMismatch.into());
         }
-        let seeds_allocator = creating_document && previous_reducer_state.is_none();
-        let reducer_allocator = previous_reducer_state
-            .as_ref()
-            .and_then(AdminDocumentReducerState::materialized_handle_allocator);
-        if seeds_allocator
-            && (self.config.target_node_id != self.config.actor.node_id
-                || !matches!(self.config.target_node_kind, RealmNodeKind::Management))
-        {
-            return Err(EnsureRealmConfigError::InvalidHandleAllocator);
-        }
-        if (document.handle_allocator_node_id == Some(self.config.target_node_id)
-            || reducer_allocator == Some(self.config.target_node_id))
-            && !matches!(self.config.target_node_kind, RealmNodeKind::Management)
-        {
-            return Err(EnsureRealmConfigError::NodeKindMismatch {
-                node_id: self.config.target_node_id,
-            });
-        }
 
         let mut reducer_state = previous_reducer_state
             .clone()
@@ -233,16 +212,6 @@ impl EnsureRealmConfigOperation {
             self.config.target_node_id,
             self.config.target_node_kind.clone(),
         )?;
-        let mut admin_events = vec![admin_event];
-        if seeds_allocator {
-            document.handle_allocator_node_id = Some(self.config.actor.node_id);
-            admin_events.push(reducer_state.apply_operation(
-                &self.config.actor,
-                AdminDocumentOperation::RealmConfigHandleAllocatorSet {
-                    node_id: self.config.actor.node_id,
-                },
-            )?);
-        }
         overlay_realm_config_reducer_materialization(&mut document, &reducer_state);
 
         let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
@@ -259,20 +228,18 @@ impl EnsureRealmConfigOperation {
             ),
             admin_document_reducer_state_write_entry(&reducer_state)?,
         ];
-        for admin_event in admin_events {
-            let record = new_outbox_record_with_id(
-                admin_event.event_id,
-                self.config.actor.node_id,
-                document_target.clone(),
-                Vec::new(),
-                DocumentSyncOutboxEvent::AdminOperation {
-                    event: Box::new(admin_event),
-                },
-                placement,
-                false,
-            );
-            writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
-        }
+        let record = new_outbox_record_with_id(
+            admin_event.event_id,
+            self.config.actor.node_id,
+            document_target,
+            Vec::new(),
+            DocumentSyncOutboxEvent::AdminOperation {
+                event: Box::new(admin_event),
+            },
+            placement,
+            false,
+        );
+        writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));

@@ -1,7 +1,5 @@
-use aruna_core::NodeId;
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
 use aruna_core::structs::{AuthContext, MetadataRegistryRecord, PathClaimRecord, SyncRelationship};
-use aruna_core::structs::{HandleRange, RealmId};
 use aruna_core::types::GroupId;
 use aruna_net::streams::BiStream;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -11,7 +9,6 @@ use ulid::Ulid;
 
 use crate::create_metadata_document::CreateMetadataDocumentPayload;
 use crate::metadata::api::MetadataRoCrateExportView;
-use crate::mutate_realm_placement::HandleGrantError;
 use crate::s3::search_buckets::BucketSearchHit;
 use crate::update_metadata_document::UpdateMetadataDocumentMutation;
 
@@ -244,15 +241,6 @@ pub enum MetadataTransportMessage {
     },
     DocumentQueryResults {
         result: Result<MetadataQueryResults, MetadataReadError>,
-    },
-    GrantHandleRange {
-        auth_token: MetadataAuthToken,
-        realm_id: RealmId,
-        request_id: Ulid,
-        owner: NodeId,
-    },
-    HandleRangeGranted {
-        result: Result<HandleRange, HandleGrantError>,
     },
 }
 

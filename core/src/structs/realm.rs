@@ -164,8 +164,6 @@ pub struct RealmConfigDocument {
     pub placement_bindings: Vec<PlacementBinding>,
     /// Append-only grants retained for fail-closed overlap detection.
     pub placement_handle_ranges: Vec<HandleRange>,
-    /// Immutable Management node that serializes realm handle grants.
-    pub handle_allocator_node_id: Option<NodeId>,
 }
 
 /// Realm-wide quota policy. Lives in the realm config (Class-1, replicated
@@ -389,7 +387,6 @@ impl RealmConfigDocument {
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),
             placement_handle_ranges: Vec::new(),
-            handle_allocator_node_id: None,
         }
     }
 
@@ -496,15 +493,6 @@ impl RealmConfigDocument {
     pub fn has_node(&self, node_id: NodeId) -> bool {
         let node_id = node_id.to_string();
         self.nodes.iter().any(|node| node.node_id == node_id)
-    }
-
-    pub fn handle_allocator_node(&self) -> Option<NodeId> {
-        self.handle_allocator_node_id.filter(|node_id| {
-            let node_id = node_id.to_string();
-            self.nodes.iter().any(|node| {
-                node.node_id == node_id && matches!(node.kind, RealmNodeKind::Management)
-            })
-        })
     }
 
     pub fn node_ids(&self) -> Result<Vec<NodeId>, ConversionError> {
@@ -718,7 +706,6 @@ mod test {
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),
             placement_handle_ranges: Vec::new(),
-            handle_allocator_node_id: None,
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -878,7 +865,6 @@ mod test {
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),
             placement_handle_ranges: Vec::new(),
-            handle_allocator_node_id: None,
         };
 
         assert_eq!(

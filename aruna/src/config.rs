@@ -143,8 +143,6 @@ pub enum PersistedNodeIdentity {
     Local,
 }
 
-/// A persisted node identity has one active process and storage lineage.
-/// Concurrent clones invalidate signed admin-event sequencing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedNodeState {
     pub boot_origin: BootOrigin,

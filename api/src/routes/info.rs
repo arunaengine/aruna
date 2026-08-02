@@ -1,4 +1,4 @@
-use crate::auth::{ValidatedArunaBearerTokenCarrier, require_realm_auth};
+use crate::auth::require_realm_auth;
 use crate::error::{ServerError, ServerResult};
 pub use crate::server_state::PortalStatus;
 use crate::server_state::ServerState;
@@ -17,11 +17,10 @@ use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissio
 use aruna_operations::driver::{backend_used_bytes, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::get_realm_nodes::{GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT};
-use aruna_operations::metadata::MetadataAuthToken;
 use aruna_operations::metadata::stats::count_realm_documents;
 use aruna_operations::mutate_realm_placement::{
-    HandleGrantError, MutateRealmPlacementConfig, MutateRealmPlacementError,
-    RealmPlacementMutation, drive_realm_placement_mutation,
+    MutateRealmPlacementConfig, MutateRealmPlacementError, RealmPlacementMutation,
+    drive_realm_placement_mutation,
 };
 use aruna_operations::set_realm_quota::{
     SetRealmQuotaConfig, SetRealmQuotaError, SetRealmQuotaOperation,
@@ -1071,8 +1070,7 @@ pub async fn get_realm_placement(
         (status = 401, description = "Authentication required", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin or this is not a management node", body = crate::error::ErrorResponse),
         (status = 404, description = "Realm config not found", body = crate::error::ErrorResponse),
-        (status = 409, description = "Referenced strategy, handle grant, or concurrent transaction conflict", body = crate::error::ErrorResponse),
-        (status = 503, description = "Handle allocator unavailable", body = crate::error::ErrorResponse),
+        (status = 409, description = "Referenced strategy or concurrent transaction conflict", body = crate::error::ErrorResponse),
         (status = 500, description = "Unexpected server error", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1080,7 +1078,6 @@ pub async fn get_realm_placement(
 pub async fn mutate_realm_placement(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     request: Result<Json<RealmPlacementMutationRequest>, JsonRejection>,
 ) -> ServerResult<(StatusCode, Json<RealmPlacementConfigResponse>)> {
     let auth = authorize_realm_config_admin(&state, auth).await?;
@@ -1106,18 +1103,9 @@ pub async fn mutate_realm_placement(
             let scope = group_id
                 .map(PlacementScope::Group)
                 .unwrap_or(PlacementScope::Realm(actor.realm_id));
-            let bearer_token = bearer_token.ok_or(ServerError::Unauthorized)?;
-            let auth_token = MetadataAuthToken::bearer(bearer_token.as_str())
-                .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
-            provision_metadata_binding(
-                context.as_ref(),
-                actor.clone(),
-                auth_token,
-                scope,
-                strategy_id,
-            )
-            .await
-            .map_err(map_handle_error)?;
+            provision_metadata_binding(context.as_ref(), actor.clone(), scope, strategy_id)
+                .await
+                .map_err(map_handle_error)?;
             drive(GetRealmConfigOperation::new(actor.realm_id), &context)
                 .await
                 .map_err(|error| match error {
@@ -1169,20 +1157,6 @@ fn map_mutate_realm_placement_error(error: MutateRealmPlacementError) -> ServerE
         MutateRealmPlacementError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent realm placement update conflict; retry".to_string())
         }
-        MutateRealmPlacementError::HandleGrant(HandleGrantError::Unauthorized) => {
-            ServerError::Unauthorized
-        }
-        MutateRealmPlacementError::HandleGrant(HandleGrantError::Forbidden) => {
-            ServerError::Forbidden
-        }
-        MutateRealmPlacementError::HandleGrant(
-            HandleGrantError::Conflict | HandleGrantError::Exhausted,
-        ) => ServerError::Conflict(
-            "handle space is exhausted or grant conflicts with realm state".to_string(),
-        ),
-        MutateRealmPlacementError::HandleGrant(
-            HandleGrantError::Timeout | HandleGrantError::Unavailable(_),
-        ) => ServerError::ServiceUnavailable,
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -2359,12 +2333,6 @@ mod tests {
         }
     }
 
-    fn bearer_ext() -> Extension<Option<ValidatedArunaBearerTokenCarrier>> {
-        Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
-            "test-token",
-        )))
-    }
-
     fn placement_strategy(strategy_id: Ulid) -> RealmPlacementStrategy {
         RealmPlacementStrategy {
             strategy_id: strategy_id.to_string(),
@@ -2377,12 +2345,7 @@ mod tests {
     }
 
     async fn provision_strategy(state: &ServerState, actor: Actor, strategy_id: Ulid) {
-        let auth_token = MetadataAuthToken::internal(AuthContext {
-            user_id: actor.user_id,
-            realm_id: actor.realm_id,
-            path_restrictions: None,
-        });
-        grant_handle_range(actor.clone(), auth_token, state.get_ctx().as_ref())
+        grant_handle_range(actor.clone(), actor.node_id, state.get_ctx().as_ref())
             .await
             .unwrap();
         allocate_placement_binding(
@@ -2419,13 +2382,7 @@ mod tests {
             subject: "00".to_string(),
         };
         assert!(matches!(
-            mutate_realm_placement(
-                State(state.clone()),
-                Extension(None),
-                bearer_ext(),
-                Ok(Json(request))
-            )
-            .await,
+            mutate_realm_placement(State(state.clone()), Extension(None), Ok(Json(request))).await,
             Err(ServerError::Unauthorized)
         ));
 
@@ -2456,7 +2413,6 @@ mod tests {
         let (_status, _body) = mutate_realm_placement(
             State(state.clone()),
             Extension(Some(auth.clone())),
-            bearer_ext(),
             Ok(Json(RealmPlacementMutationRequest::UpsertStrategy {
                 strategy: placement_strategy(strategy_id),
             })),
@@ -2466,7 +2422,6 @@ mod tests {
         let _ = mutate_realm_placement(
             State(state.clone()),
             Extension(Some(auth.clone())),
-            bearer_ext(),
             Ok(Json(
                 RealmPlacementMutationRequest::ProvisionMetadataBinding {
                     strategy_id: strategy_id.to_string(),
@@ -2499,7 +2454,6 @@ mod tests {
             let (status, _) = mutate_realm_placement(
                 State(state.clone()),
                 Extension(Some(auth.clone())),
-                bearer_ext(),
                 Ok(Json(request)),
             )
             .await
@@ -2525,7 +2479,6 @@ mod tests {
         let error = mutate_realm_placement(
             State(state.clone()),
             Extension(Some(auth.clone())),
-            bearer_ext(),
             Ok(Json(RealmPlacementMutationRequest::RemoveStrategy {
                 strategy_id: strategy_id.to_string(),
             })),
@@ -2548,7 +2501,6 @@ mod tests {
             let (_status, _body) = mutate_realm_placement(
                 State(state.clone()),
                 Extension(Some(auth.clone())),
-                bearer_ext(),
                 Ok(Json(request)),
             )
             .await
@@ -2558,7 +2510,6 @@ mod tests {
         let error = mutate_realm_placement(
             State(state.clone()),
             Extension(Some(auth.clone())),
-            bearer_ext(),
             Ok(Json(RealmPlacementMutationRequest::RemoveStrategy {
                 strategy_id: strategy_id.to_string(),
             })),
@@ -2594,7 +2545,6 @@ mod tests {
         let (_status, _body) = mutate_realm_placement(
             State(state.clone()),
             Extension(Some(auth.clone())),
-            bearer_ext(),
             Ok(Json(RealmPlacementMutationRequest::UpsertStrategy {
                 strategy: placement_strategy(strategy_id),
             })),
@@ -2614,7 +2564,6 @@ mod tests {
         let (_status, _body) = mutate_realm_placement(
             State(state.clone()),
             Extension(Some(auth.clone())),
-            bearer_ext(),
             Ok(Json(RealmPlacementMutationRequest::SetDefaultStrategy {
                 strategy_id: strategy_id.to_string(),
             })),
@@ -2635,7 +2584,6 @@ mod tests {
         let _ = mutate_realm_placement(
             State(state.clone()),
             Extension(Some(auth.clone())),
-            bearer_ext(),
             Ok(Json(RealmPlacementMutationRequest::UpsertStrategy {
                 strategy: unbounded,
             })),
@@ -2701,7 +2649,6 @@ mod tests {
                 mutate_realm_placement(
                     State(state.clone()),
                     Extension(Some(auth.clone())),
-                    bearer_ext(),
                     Ok(Json(request))
                 )
                 .await,
@@ -2729,7 +2676,6 @@ mod tests {
                 mutate_realm_placement(
                     State(state.clone()),
                     Extension(Some(auth.clone())),
-                    bearer_ext(),
                     Ok(Json(request))
                 )
                 .await,
@@ -2747,13 +2693,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(
-            mutate_realm_placement(
-                State(state),
-                Extension(Some(auth)),
-                bearer_ext(),
-                Err(rejection)
-            )
-            .await,
+            mutate_realm_placement(State(state), Extension(Some(auth)), Err(rejection)).await,
             Err(ServerError::BadRequestReason(_))
         ));
     }

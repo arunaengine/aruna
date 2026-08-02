@@ -454,17 +454,10 @@ impl Serialize for JsonRealmConfigDocument {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("RealmConfigDocument", 4)?;
+        let mut state = serializer.serialize_struct("RealmConfigDocument", 3)?;
         state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
         state.serialize_field("description", &self.0.description)?;
         state.serialize_field("metadata_replication", &self.0.metadata_replication)?;
-        state.serialize_field(
-            "handle_allocator_node_id",
-            &self
-                .0
-                .handle_allocator_node_id
-                .map(|node_id| node_id.to_string()),
-        )?;
         state.end()
     }
 }

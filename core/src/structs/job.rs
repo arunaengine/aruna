@@ -22,7 +22,6 @@ pub const JOB_RECORD_KEY_PREFIX: &[u8] = b"jobs-v1/";
 pub const JOB_DUE_INDEX_PREFIX: &[u8] = b"due/";
 pub const JOB_LEASE_INDEX_PREFIX: &[u8] = b"lease/";
 pub const JOB_PRUNE_INDEX_PREFIX: &[u8] = b"prune/";
-pub const JOB_SYNC_INDEX_PREFIX: &[u8] = b"sync/";
 /// Invalid UTF-8 byte separating generated report rows from user paths.
 pub const JOB_SYSTEM_ENTRY_PREFIX: u8 = u8::MAX;
 pub const DEFAULT_JOB_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -1241,21 +1240,6 @@ pub fn job_lease_index_key(lease_expires_at_ms: u64, job_id: JobId) -> Key {
 
 pub fn job_prune_index_key(retention_expiry_ms: u64, job_id: JobId) -> Key {
     schedule_index_key(JOB_PRUNE_INDEX_PREFIX, retention_expiry_ms, job_id)
-}
-
-pub fn job_sync_key(job_id: JobId) -> Key {
-    let mut bytes = Vec::with_capacity(JOB_SYNC_INDEX_PREFIX.len() + 16);
-    bytes.extend_from_slice(JOB_SYNC_INDEX_PREFIX);
-    bytes.extend_from_slice(&job_id.to_bytes());
-    ByteView::from(bytes)
-}
-
-pub fn decode_sync_key(key: &[u8]) -> Result<JobId, ConversionError> {
-    let bytes = key
-        .strip_prefix(JOB_SYNC_INDEX_PREFIX)
-        .ok_or_else(|| ConversionError::InvalidLength("invalid job sync prefix".to_string()))?;
-    let bytes: [u8; 16] = bytes.try_into()?;
-    JobId::try_from_bytes(bytes).map_err(|error| ConversionError::FromStrError(error.to_string()))
 }
 
 /// Extract `(timestamp_ms, job_id)` from a `due/`, `lease/`, or `prune/` schedule

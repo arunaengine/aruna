@@ -8,13 +8,13 @@ use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{
     AdminDocumentApplyStatus, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
     GROUP_REALM_ID_PATH, REALM_CONFIG_DESCRIPTION_PATH, REALM_CONFIG_DISCOVERY_PATH,
-    REALM_CONFIG_HANDLE_ALLOCATOR_PATH, REALM_CONFIG_METADATA_REPLICATION_PATH,
-    REALM_CONFIG_QUOTA_PATH, USER_NAME_PATH, decode_admin_document_reducer_state,
-    group_role_id_from_path, group_role_path, group_role_user_assignment_from_path,
-    group_role_user_assignment_path, overlay_realm_config_placement_reducer_materialization,
-    realm_config_node_id_from_path, realm_config_node_path,
-    realm_config_oidc_provider_id_from_path, realm_role_path, realm_role_user_assignment_from_path,
-    realm_role_user_assignment_path, user_attribute_path, user_subject_id_path,
+    REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_QUOTA_PATH, USER_NAME_PATH,
+    decode_admin_document_reducer_state, group_role_id_from_path, group_role_path,
+    group_role_user_assignment_from_path, group_role_user_assignment_path,
+    overlay_realm_config_placement_reducer_materialization, realm_config_node_id_from_path,
+    realm_config_node_path, realm_config_oidc_provider_id_from_path, realm_role_path,
+    realm_role_user_assignment_from_path, realm_role_user_assignment_path, user_attribute_path,
+    user_subject_id_path,
 };
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
@@ -3324,7 +3324,6 @@ fn realm_config_from_reducer_materialization(
         placement_overrides: Vec::new(),
         placement_bindings: Vec::new(),
         placement_handle_ranges: Vec::new(),
-        handle_allocator_node_id: None,
     };
     overlay_realm_config_reducer_materialization(&mut config, reducer_state);
     Some(config)
@@ -4132,7 +4131,6 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
             | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
             | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
-            | AdminDocumentOperation::RealmConfigHandleAllocatorSet { .. }
     ) {
         return Err(NetError::Bootstrap(
             "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, description updates, quota updates, and placement updates"
@@ -5202,8 +5200,7 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
-        | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
-        | AdminDocumentOperation::RealmConfigHandleAllocatorSet { .. } => {
+        | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. } => {
             AdminOperationFamily::RealmConfig
         }
     };
@@ -5306,8 +5303,7 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
-        | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
-        | AdminDocumentOperation::RealmConfigHandleAllocatorSet { .. } => {}
+        | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. } => {}
         AdminDocumentOperation::RealmConfigHandleRangeGranted { .. } => {}
         AdminDocumentOperation::RealmConfigNodePlacementSet { entry } => {
             if let Some(label) = reserved_label(&entry.labels) {
@@ -5417,28 +5413,6 @@ fn configured_node_kind<'a>(
         .map(|node| &node.kind)
 }
 
-fn valid_bootstrap_allocator(
-    state: &AdminDocumentReducerState,
-    event: &AdminDocumentEvent,
-    node_id: &NodeId,
-) -> bool {
-    let allocator_unset = !state
-        .user_subject_ids
-        .contains_key(REALM_CONFIG_HANDLE_ALLOCATOR_PATH)
-        && !state
-            .conflicts
-            .contains_key(REALM_CONFIG_HANDLE_ALLOCATOR_PATH);
-    let nodes = state.materialized_realm_config_nodes();
-    allocator_unset
-        && event.origin_node_id == *node_id
-        && nodes
-            .get(node_id)
-            .is_some_and(|kind| matches!(kind, RealmNodeKind::Management))
-        && nodes.iter().all(|(existing_id, kind)| {
-            !matches!(kind, RealmNodeKind::Management) || existing_id == node_id
-        })
-}
-
 async fn validate_realm_config_admin_authority(
     storage: &StorageHandle,
     event: &AdminDocumentEvent,
@@ -5454,39 +5428,6 @@ async fn validate_realm_config_admin_authority(
         if config.realm_id != realm_id {
             return Ok(AdminEventValidation::Rejected(
                 "stored realm config has the wrong realm".to_string(),
-            ));
-        }
-        if let AdminDocumentOperation::RealmConfigHandleAllocatorSet { node_id } = &event.op {
-            let existing = config.handle_allocator_node() == Some(*node_id)
-                && event.origin_node_id == *node_id;
-            let bootstrap = config.handle_allocator_node_id.is_none()
-                && previous_state
-                    .is_some_and(|state| valid_bootstrap_allocator(state, event, node_id));
-            return Ok(if existing || bootstrap {
-                AdminEventValidation::Accepted
-            } else {
-                AdminEventValidation::Rejected("realm handle allocator is immutable".to_string())
-            });
-        }
-        if matches!(
-            &event.op,
-            AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
-        ) && config.handle_allocator_node() != Some(event.origin_node_id)
-        {
-            return Ok(AdminEventValidation::Rejected(
-                "handle range grant origin is not the realm allocator".to_string(),
-            ));
-        }
-        if matches!(
-            &event.op,
-            AdminDocumentOperation::RealmConfigNodeEnsured {
-                node_id,
-                kind,
-            } if config.handle_allocator_node_id == Some(*node_id)
-                && !matches!(kind, RealmNodeKind::Management)
-        ) {
-            return Ok(AdminEventValidation::Rejected(
-                "realm handle allocator must remain a management node".to_string(),
             ));
         }
         let server_binding = match (
@@ -5527,52 +5468,6 @@ async fn validate_realm_config_admin_authority(
                 )
             },
         );
-    }
-
-    if let Some(state) = previous_state {
-        let nodes = state.materialized_realm_config_nodes();
-        let origin_is_management = nodes
-            .get(&event.origin_node_id)
-            .is_some_and(|kind| matches!(kind, RealmNodeKind::Management));
-        match &event.op {
-            AdminDocumentOperation::RealmConfigHandleAllocatorSet { node_id } => {
-                let same = state.materialized_handle_allocator() == Some(*node_id);
-                return Ok(
-                    if (event.origin_node_id == *node_id && origin_is_management && same)
-                        || valid_bootstrap_allocator(state, event, node_id)
-                    {
-                        AdminEventValidation::Accepted
-                    } else {
-                        AdminEventValidation::Rejected(
-                            "realm handle allocator must be the bootstrap management node"
-                                .to_string(),
-                        )
-                    },
-                );
-            }
-            AdminDocumentOperation::RealmConfigHandleRangeGranted { .. } => {
-                return Ok(
-                    if origin_is_management
-                        && state.materialized_handle_allocator() == Some(event.origin_node_id)
-                    {
-                        AdminEventValidation::Accepted
-                    } else {
-                        AdminEventValidation::Rejected(
-                            "handle range grant origin is not the realm allocator".to_string(),
-                        )
-                    },
-                );
-            }
-            AdminDocumentOperation::RealmConfigNodeEnsured { node_id, kind }
-                if state.materialized_handle_allocator() == Some(*node_id)
-                    && !matches!(kind, RealmNodeKind::Management) =>
-            {
-                return Ok(AdminEventValidation::Rejected(
-                    "realm handle allocator must remain a management node".to_string(),
-                ));
-            }
-            _ => {}
-        }
     }
 
     let bootstrap = previous_state.is_none()

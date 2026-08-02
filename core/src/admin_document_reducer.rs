@@ -50,8 +50,6 @@ pub enum AdminDocumentReducerError {
     PlacementShardCountChanged,
     #[error("placement handle range is malformed")]
     InvalidHandleRange,
-    #[error("realm handle allocator cannot be changed")]
-    HandleAllocatorChanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,16 +103,6 @@ pub fn overlay_realm_config_placement_reducer_materialization(
     config: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
 ) {
-    if reducer_state
-        .user_subject_ids
-        .contains_key(REALM_CONFIG_HANDLE_ALLOCATOR_PATH)
-        || reducer_state
-            .conflicts
-            .contains_key(REALM_CONFIG_HANDLE_ALLOCATOR_PATH)
-    {
-        config.handle_allocator_node_id = reducer_state.materialized_handle_allocator();
-    }
-
     if reducer_state
         .user_subject_ids
         .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
@@ -653,12 +641,6 @@ impl AdminDocumentReducerState {
                 }
                 self.apply_handle_range(event, range);
             }
-            (
-                AdminDocumentTarget::RealmConfig { .. },
-                AdminDocumentOperation::RealmConfigHandleAllocatorSet { node_id },
-            ) => {
-                self.apply_handle_allocator(event, node_id)?;
-            }
             _ => return Err(AdminDocumentReducerError::UnsupportedTarget),
         }
 
@@ -840,21 +822,6 @@ impl AdminDocumentReducerState {
                 Some((node_id, kind))
             })
             .collect()
-    }
-
-    pub fn materialized_handle_allocator(&self) -> Option<NodeId> {
-        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. })
-            || self
-                .conflicts
-                .contains_key(REALM_CONFIG_HANDLE_ALLOCATOR_PATH)
-        {
-            return None;
-        }
-
-        self.user_subject_ids
-            .get(REALM_CONFIG_HANDLE_ALLOCATOR_PATH)
-            .and_then(|version| version.value.as_deref())
-            .and_then(|value| NodeId::from_str(value).ok())
     }
 
     pub fn materialized_realm_config_oidc_providers(&self) -> BTreeMap<String, OidcProviderConfig> {
@@ -1280,35 +1247,6 @@ impl AdminDocumentReducerState {
         }
     }
 
-    fn apply_handle_allocator(
-        &mut self,
-        event: &AdminDocumentEvent,
-        node_id: &NodeId,
-    ) -> Result<(), AdminDocumentReducerError> {
-        let path = REALM_CONFIG_HANDLE_ALLOCATOR_PATH;
-        if self.event_is_stale_for_path(event, path) {
-            return Ok(());
-        }
-        if self.conflicts.contains_key(path) {
-            return Err(AdminDocumentReducerError::HandleAllocatorChanged);
-        }
-
-        let value = Some(node_id.to_string());
-        if let Some(current) = self.user_subject_ids.get(path)
-            && current.value != value
-        {
-            let observed = std::iter::once(&current.dot)
-                .chain(self.equivalent_value_dots.get(path).into_iter().flatten())
-                .all(|dot| event_observes_dot(event, dot));
-            if observed {
-                return Err(AdminDocumentReducerError::HandleAllocatorChanged);
-            }
-        }
-
-        self.apply_realm_config_setting(event, path, node_id.to_string());
-        Ok(())
-    }
-
     fn apply_realm_config_placement_field(
         &mut self,
         event: &AdminDocumentEvent,
@@ -1546,7 +1484,6 @@ pub const REALM_CONFIG_DISCOVERY_PATH: &str = "realm_config.settings.discovery";
 pub const REALM_CONFIG_DESCRIPTION_PATH: &str = "realm_config.description";
 pub const REALM_CONFIG_QUOTA_PATH: &str = "realm_config.quota";
 pub const REALM_CONFIG_DEFAULT_STRATEGY_PATH: &str = "realm_config.placement.default_strategy";
-pub const REALM_CONFIG_HANDLE_ALLOCATOR_PATH: &str = "realm_config.handle_allocator_node_id";
 
 fn event_observes_dot(event: &AdminDocumentEvent, dot: &AdminDocumentDot) -> bool {
     event.observed.observes(dot)
@@ -1635,9 +1572,6 @@ fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         }
         AdminDocumentOperation::RealmConfigHandleRangeGranted { range } => {
             vec![handle_range_path(range.range_id)]
-        }
-        AdminDocumentOperation::RealmConfigHandleAllocatorSet { .. } => {
-            vec![REALM_CONFIG_HANDLE_ALLOCATOR_PATH.to_string()]
         }
     }
 }
@@ -5105,6 +5039,7 @@ mod tests {
         let directory = config.handle_range_directory();
         assert_eq!(directory.conflicts(), 0);
         assert_eq!(directory.granted_to(&owner).len(), 2);
+        assert_eq!(directory.next_grantable_start(), 2051);
     }
 
     #[test]

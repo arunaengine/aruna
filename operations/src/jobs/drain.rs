@@ -6,9 +6,9 @@ use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{JOB_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE};
 use aruna_core::structs::{
-    AuthContext, JOB_DUE_INDEX_PREFIX, JOB_LEASE_INDEX_PREFIX, JOB_RECORD_KEY_PREFIX,
-    JOB_SYNC_INDEX_PREFIX, JobError, JobExecutionClass, JobId, JobRecord, JobState,
-    decode_sync_key, job_lease_index_key, parse_job_schedule_index_key,
+    JOB_DUE_INDEX_PREFIX, JOB_LEASE_INDEX_PREFIX, JOB_RECORD_KEY_PREFIX, JobError,
+    JobExecutionClass, JobId, JobRecord, JobState, job_lease_index_key,
+    parse_job_schedule_index_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, NodeId};
@@ -18,18 +18,14 @@ use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use tracing::warn;
 
-use super::protocol::{
-    JobRequest, JobResponse, resolve_job_authority, resolve_job_holders, send_job_request,
-};
+use super::protocol::resolve_job_holders;
 use super::reconcile::ExternalReconciler;
 use super::store::{
-    ClaimOutcome, JobMutationError, RequeueOutcome, ack_job_delivery, apply_terminal, batch_delete,
-    claim_job, decode_job_record, first_schedule_entry, iter_prefix_page, read_job_record,
-    requeue_job, write_job_schedule,
+    ClaimOutcome, JobMutationError, RequeueOutcome, batch_delete, claim_job, decode_job_record,
+    first_schedule_entry, iter_prefix_page, read_job_record, requeue_job, write_job_schedule,
 };
 use super::{JOB_DRAIN_BATCH_SIZE, JOB_RECONCILE_REARM};
 use crate::driver::DriverContext;
-use crate::metadata::MetadataAuthToken;
 
 /// Per-class claim budget. Both classes share one due index, so a saturated class
 /// must be skipped during the scan rather than claimed and released again.
@@ -119,10 +115,6 @@ async fn process_job_batch(
     let now_ms = unix_timestamp_millis();
     let mut result = JobDrainResult::default();
 
-    if let Some(context) = route_context {
-        result.retry_after_error = sync_terminal_jobs(context, holder_node_id).await?;
-    }
-
     claim_due_jobs(
         storage,
         holder_node_id,
@@ -149,24 +141,6 @@ async fn process_job_batch(
                     let expired_count = expired_leases.len();
                     let reconciled_before = result.reconciled;
                     for (ts, job_id) in expired_leases {
-                        if route_context.is_some() {
-                            match read_job_record(storage, job_id, None).await {
-                                Ok(Some(record))
-                                    if !record.payload.is_internal()
-                                        && record.owner_node_id != holder_node_id =>
-                                {
-                                    delete_schedule_row(storage, job_lease_index_key(ts, job_id))
-                                        .await?;
-                                    continue;
-                                }
-                                Ok(_) => {}
-                                Err(error) => {
-                                    warn!(job_id = %job_id, error = %error, "Failed to read expired job owner");
-                                    result.retry_after_error = true;
-                                    break;
-                                }
-                            }
-                        }
                         match requeue_job(
                             storage,
                             job_id,
@@ -259,7 +233,7 @@ async fn promote_passive_jobs(
             let Ok(record) = decode_job_record(value.as_ref()) else {
                 continue;
             };
-            if record.state != JobState::Queued || !record.payload.is_internal() {
+            if record.state != JobState::Queued {
                 continue;
             }
             let route = resolve_job_holders(context, record.job_id)
@@ -284,87 +258,6 @@ async fn promote_passive_jobs(
     }
 }
 
-async fn sync_terminal_jobs(context: &DriverContext, local_node: NodeId) -> Result<bool, String> {
-    let (values, _) = iter_prefix_page(
-        &context.storage_handle,
-        JOB_SCHEDULE_INDEX_KEYSPACE,
-        Some(ByteView::from(JOB_SYNC_INDEX_PREFIX.to_vec())),
-        None,
-        JOB_DRAIN_BATCH_SIZE,
-        None,
-    )
-    .await?;
-    let mut retry_after_error = false;
-    for (key, _) in values {
-        let job_id = match decode_sync_key(key.as_ref()) {
-            Ok(job_id) => job_id,
-            Err(error) => {
-                warn!(error = %error, "Deleting malformed job sync row");
-                delete_schedule_row(&context.storage_handle, key).await?;
-                continue;
-            }
-        };
-        let Some(record) = read_job_record(&context.storage_handle, job_id, None).await? else {
-            delete_schedule_row(&context.storage_handle, key).await?;
-            continue;
-        };
-        if !record.state.is_terminal()
-            || record.payload.is_internal()
-            || record.owner_node_id != local_node
-        {
-            delete_schedule_row(&context.storage_handle, key).await?;
-            continue;
-        }
-        let route = resolve_job_authority(context, record.created_by.realm_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let authority = route.holders[0];
-        let synced = if authority == local_node {
-            match apply_terminal(&context.storage_handle, local_node, &record).await {
-                Ok(_) => true,
-                Err(error) => {
-                    warn!(job_id = %job_id, error = %error, "Failed to apply local terminal sync");
-                    retry_after_error = true;
-                    false
-                }
-            }
-        } else {
-            let reply = match send_job_request(
-                context,
-                authority,
-                JobRequest::Sync {
-                    auth_token: MetadataAuthToken::internal(AuthContext {
-                        user_id: record.created_by,
-                        realm_id: record.created_by.realm_id,
-                        path_restrictions: None,
-                    }),
-                    record: record.clone(),
-                },
-            )
-            .await
-            {
-                Ok(reply) => reply,
-                Err(error) => {
-                    warn!(job_id = %job_id, error = %error, "Failed to send terminal sync");
-                    retry_after_error = true;
-                    continue;
-                }
-            };
-            if matches!(reply.response, JobResponse::Synced(id) if id == record.job_id) {
-                true
-            } else {
-                warn!(job_id = %job_id, response = ?reply.response, "Job authority rejected terminal sync");
-                retry_after_error = true;
-                false
-            }
-        };
-        if synced {
-            delete_schedule_row(&context.storage_handle, key).await?;
-        }
-    }
-    Ok(retry_after_error)
-}
-
 /// Walk the due head, claiming each job against its own class budget. A job whose
 /// class is saturated is skipped without a write: claiming it would only release it
 /// again, churning storage while the drain re-arms at zero.
@@ -376,7 +269,7 @@ async fn claim_due_jobs(
     result: &mut JobDrainResult,
     route_context: Option<&DriverContext>,
 ) -> Result<(), String> {
-    if route_context.is_none() && budget.is_empty() {
+    if budget.is_empty() {
         result.deferred_saturated = true;
         return Ok(());
     }
@@ -440,52 +333,16 @@ async fn claim_due_jobs(
                 }
             };
             if let Some(context) = route_context {
-                if !record.payload.is_internal() && record.owner_node_id != holder_node_id {
-                    match deliver_due_job(context, holder_node_id, &record).await {
-                        Ok(true) => {
-                            if let Err(error) =
-                                ack_job_delivery(storage, &record, key.clone()).await
-                            {
-                                warn!(job_id = %job_id, error = %error, "Failed to acknowledge delivered job");
-                                result.retry_after_error = true;
-                                break 'pages;
-                            }
-                        }
-                        Ok(false) => {
-                            if let Err(error) = delete_schedule_row(storage, key).await {
-                                warn!(job_id = %job_id, error = %error, "Failed to drop stale job schedule");
-                                result.retry_after_error = true;
-                                break 'pages;
-                            }
-                        }
-                        Err(error) => {
-                            warn!(job_id = %job_id, error = %error, "Failed to deliver queued job");
-                            result.retry_after_error = true;
-                            continue;
-                        }
-                    }
-                    continue;
-                }
-                if !record.payload.is_internal() && record.state != JobState::Queued {
-                    if let Err(error) = delete_schedule_row(storage, key).await {
-                        warn!(job_id = %job_id, error = %error, "Failed to drop stale owner schedule");
+                let route = match resolve_job_holders(context, job_id).await {
+                    Ok(route) => route,
+                    Err(error) => {
+                        warn!(job_id = %job_id, error = %error, "Failed to resolve job runner");
                         result.retry_after_error = true;
                         break 'pages;
                     }
+                };
+                if route.holders.first().copied() != Some(holder_node_id) {
                     continue;
-                }
-                if record.payload.is_internal() {
-                    let route = match resolve_job_holders(context, job_id).await {
-                        Ok(route) => route,
-                        Err(error) => {
-                            warn!(job_id = %job_id, error = %error, "Failed to resolve job runner");
-                            result.retry_after_error = true;
-                            break 'pages;
-                        }
-                    };
-                    if route.holders.first().copied() != Some(holder_node_id) {
-                        continue;
-                    }
                 }
             }
             let class = record.execution_class;
@@ -497,6 +354,9 @@ async fn claim_due_jobs(
                 Ok(ClaimOutcome::Claimed(record)) => {
                     budget.take(record.execution_class);
                     result.claimed.push(record);
+                    if budget.is_empty() {
+                        break 'pages;
+                    }
                 }
                 Ok(ClaimOutcome::CancelledFresh(record)) => {
                     result.cancelled_fresh = result.cancelled_fresh.saturating_add(1);
@@ -527,69 +387,6 @@ async fn claim_due_jobs(
     Ok(())
 }
 
-async fn deliver_due_job(
-    context: &DriverContext,
-    local_node: NodeId,
-    record: &JobRecord,
-) -> Result<bool, String> {
-    if record.state != JobState::Queued || record.owner_node_id == local_node {
-        return Ok(false);
-    }
-    let route = resolve_job_authority(context, record.created_by.realm_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    if route.holders.first().copied() != Some(local_node) {
-        return Ok(false);
-    }
-    let auth_token = MetadataAuthToken::internal(AuthContext {
-        user_id: record.created_by,
-        realm_id: record.created_by.realm_id,
-        path_restrictions: None,
-    });
-    let reply = send_job_request(
-        context,
-        record.owner_node_id,
-        JobRequest::Deliver {
-            auth_token: auth_token.clone(),
-            record: record.clone(),
-        },
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    match reply.response {
-        JobResponse::Delivered(result) if result.job_id == record.job_id => Ok(()),
-        JobResponse::DeliveryConflict => Err("job owner rejected conflicting delivery".to_string()),
-        JobResponse::Unauthorized => Err("job owner rejected delivery authentication".to_string()),
-        JobResponse::Forbidden => Err("job owner rejected delivery authority".to_string()),
-        JobResponse::Unavailable(error) => Err(error),
-        response => Err(format!("unexpected job delivery response: {response:?}")),
-    }?;
-    if !record.cancel_requested {
-        return Ok(true);
-    }
-    let reply = send_job_request(
-        context,
-        record.owner_node_id,
-        JobRequest::Cancel {
-            auth_token,
-            job_id: record.job_id,
-            config_digest: route.config_digest,
-        },
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    match reply.response {
-        JobResponse::Cancelled { job, .. } if job.job_id == record.job_id => Ok(true),
-        JobResponse::Unauthorized => Err("job owner rejected cancel authentication".to_string()),
-        JobResponse::Forbidden => Err("job owner rejected cancel authority".to_string()),
-        JobResponse::NotFound => Err("delivered job vanished before cancellation".to_string()),
-        JobResponse::Unavailable(error) => Err(error),
-        response => Err(format!(
-            "unexpected delivered cancel response: {response:?}"
-        )),
-    }
-}
-
 async fn delete_schedule_row(storage: &StorageHandle, key: Key) -> Result<(), String> {
     batch_delete(
         storage,
@@ -608,24 +405,11 @@ async fn next_drain_delays(
     let delay = |ts: u64| Duration::from_millis(ts.saturating_sub(now_ms));
     let due = first_schedule_entry(storage, JOB_DUE_INDEX_PREFIX).await?;
     let lease = first_schedule_entry(storage, JOB_LEASE_INDEX_PREFIX).await?;
-    let (sync, _) = iter_prefix_page(
-        storage,
-        JOB_SCHEDULE_INDEX_KEYSPACE,
-        Some(ByteView::from(JOB_SYNC_INDEX_PREFIX.to_vec())),
-        None,
-        1,
-        None,
-    )
-    .await?;
     // A reconciled attempt keeps its expired lease row in place by design, which
     // would otherwise pin the lease head at zero and busy-loop the drain; only an
     // already-due head needs the floor, a still-future one must still fire on time.
     Ok((
-        if sync.is_empty() {
-            due.map(|(ts, _)| delay(ts))
-        } else {
-            Some(Duration::ZERO)
-        },
+        due.map(|(ts, _)| delay(ts)),
         lease.map(|(ts, _)| {
             let raw = delay(ts);
             if raw.is_zero() {

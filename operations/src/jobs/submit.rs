@@ -20,10 +20,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
-use super::store::{
-    decode_job_record, job_dedup_index_key, job_delivery_entries, job_insert_entries,
-    same_submission,
-};
+use super::store::{decode_job_record, job_dedup_index_key, job_insert_entries};
 
 /// Kick the drain so a submitted job is claimed promptly; this timer is never persisted.
 pub fn schedule_job_drain_effect() -> Effect {
@@ -78,8 +75,6 @@ pub enum SubmitJobError {
     PlacementUnavailable(String),
     #[error("idempotency key already bound to job {existing_job_id} with a different plan")]
     JobPlanConflict { existing_job_id: JobId },
-    #[error("job delivery conflicts with existing job {job_id}")]
-    JobDeliveryConflict { job_id: JobId },
     #[error("invalid workspace: {0}")]
     InvalidWorkspace(String),
     #[error("active RO-Crate job limit reached ({limit})")]
@@ -99,9 +94,6 @@ enum SubmitState {
         txn_id: TxnId,
         job_id: JobId,
         digest_matches: bool,
-    },
-    ReadDelivery {
-        txn_id: TxnId,
     },
     CheckActive {
         txn_id: TxnId,
@@ -131,7 +123,6 @@ pub struct SubmitJobOperation {
     record: JobRecord,
     active_cap: Option<u32>,
     schedule_drain: bool,
-    delivery: bool,
     state: SubmitState,
     output: Option<Result<SubmitJobResult, SubmitJobError>>,
 }
@@ -171,28 +162,26 @@ impl SubmitJobOperation {
             record,
             active_cap,
             schedule_drain: true,
-            delivery: false,
             state: SubmitState::Init,
             output: None,
         }
     }
 
-    pub(crate) fn delivered(record: JobRecord) -> Self {
-        Self {
-            record,
-            active_cap: None,
-            schedule_drain: true,
-            delivery: true,
-            state: SubmitState::Init,
-            output: None,
-        }
+    pub(crate) fn reserved(spec: SubmitJobSpec, job_id: JobId) -> Self {
+        let mut operation = Self::new(spec, job_id);
+        operation.active_cap = None;
+        operation.schedule_drain = false;
+        operation
+    }
+
+    pub(crate) fn record(&self) -> &JobRecord {
+        &self.record
     }
 
     fn fail(&mut self, error: SubmitJobError) -> Effects {
         let txn_id = match self.state {
             SubmitState::ReadDedup { txn_id }
             | SubmitState::VerifyDedup { txn_id, .. }
-            | SubmitState::ReadDelivery { txn_id }
             | SubmitState::CheckActive { txn_id }
             | SubmitState::CommitTransaction { txn_id } => Some(txn_id),
             SubmitState::WriteJob { txn_id } => txn_id,
@@ -213,27 +202,11 @@ impl SubmitJobOperation {
     }
 
     fn begin(&mut self) -> Effects {
-        if self.delivery {
-            if !delivery_record_valid(&self.record) {
-                return self.fail(SubmitJobError::JobDeliveryConflict {
-                    job_id: self.record.job_id,
-                });
-            }
-            self.start_transaction()
-        } else if self.record.dedup_key.is_some() || self.active_cap.is_some() {
+        if self.record.dedup_key.is_some() || self.active_cap.is_some() {
             self.start_transaction()
         } else {
             self.write_job(None)
         }
-    }
-
-    fn read_delivery(&mut self, txn_id: TxnId) -> Effects {
-        self.state = SubmitState::ReadDelivery { txn_id };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: JOB_KEYSPACE.to_string(),
-            key: job_record_key(self.record.job_id),
-            txn_id: Some(txn_id),
-        })]
     }
 
     fn read_dedup(&mut self, txn_id: TxnId) -> Effects {
@@ -281,11 +254,7 @@ impl SubmitJobOperation {
     }
 
     fn write_job(&mut self, txn_id: Option<TxnId>) -> Effects {
-        let writes = match if self.delivery {
-            job_delivery_entries(&self.record)
-        } else {
-            job_insert_entries(&self.record)
-        } {
+        let writes = match job_insert_entries(&self.record) {
             Ok(writes) => writes,
             Err(error) => return self.fail(error.into()),
         };
@@ -328,20 +297,6 @@ impl SubmitJobOperation {
     }
 }
 
-fn delivery_record_valid(record: &JobRecord) -> bool {
-    record.state == aruna_core::structs::JobState::Queued
-        && record.started_at_ms.is_none()
-        && record.finished_at_ms.is_none()
-        && record.attempts == 0
-        && record.next_attempt_epoch == 1
-        && !record.has_run
-        && record.last_error.is_none()
-        && record.claim.is_none()
-        && record.result.is_none()
-        && record.attempt_intent.is_none()
-        && record.report_digest.is_none()
-}
-
 fn workspace_plan_digest(
     payload: &JobPayload,
     mode: WorkspaceMode,
@@ -376,11 +331,7 @@ impl Operation for SubmitJobOperation {
             SubmitState::Init => self.begin(),
             SubmitState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    if self.delivery {
-                        self.read_delivery(txn_id)
-                    } else {
-                        self.read_dedup(txn_id)
-                    }
+                    self.read_dedup(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
@@ -425,23 +376,6 @@ impl Operation for SubmitJobOperation {
                 Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
                     warn!(job_id = %job_id, "Dedup entry points at a missing job; creating fresh");
                     self.check_active(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
-            },
-            SubmitState::ReadDelivery { txn_id } => match event {
-                Event::Storage(StorageEvent::ReadResult {
-                    value: Some(value), ..
-                }) => match decode_job_record(&value) {
-                    Ok(existing) if same_submission(&existing, &self.record) => {
-                        self.finish_existing(txn_id, existing.job_id)
-                    }
-                    Ok(_) | Err(_) => self.fail(SubmitJobError::JobDeliveryConflict {
-                        job_id: self.record.job_id,
-                    }),
-                },
-                Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-                    self.write_job(Some(txn_id))
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
@@ -506,7 +440,6 @@ impl Operation for SubmitJobOperation {
         let txn_id = match self.state {
             SubmitState::ReadDedup { txn_id }
             | SubmitState::VerifyDedup { txn_id, .. }
-            | SubmitState::ReadDelivery { txn_id }
             | SubmitState::CheckActive { txn_id }
             | SubmitState::CommitTransaction { txn_id } => Some(txn_id),
             SubmitState::WriteJob { txn_id } => txn_id,

@@ -20,7 +20,6 @@ use super::JOB_PRUNE_SCAN_PAGE_SIZE;
 use super::store::{
     artifact_tombstone_key, batch_delete, first_schedule_entry, iter_prefix_page,
     job_entry_deletes, job_prune_delete_entries, preserve_artifact_tombstone, read_job_record,
-    sync_pending,
 };
 use crate::driver::DriverContext;
 
@@ -81,9 +80,6 @@ pub(crate) async fn process_job_prune_batch_with_page_size(
             }
             match read_job_record(storage, job_id, None).await? {
                 Some(record) => {
-                    if sync_pending(storage, record.job_id).await? {
-                        continue;
-                    }
                     // The fence state a queued cleanup still needs outlives retention:
                     // deleting it now would fail that cleanup permanently and strand
                     // the backend attempt.
@@ -109,13 +105,7 @@ pub(crate) async fn process_job_prune_batch_with_page_size(
                         )
                         .await?;
                     }
-                    if context
-                        .net_handle
-                        .as_ref()
-                        .is_none_or(|net| net.node_id() == record.owner_node_id)
-                    {
-                        delete_job_artifact(context, &record).await?;
-                    }
+                    delete_job_artifact(context, &record).await?;
                     deletes.extend(job_prune_delete_entries(&record));
                 }
                 None => {

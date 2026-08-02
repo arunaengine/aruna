@@ -12,11 +12,11 @@ use aruna_core::structs::{
     AttemptControl, AttemptIntent, JobClaim, JobError, JobExecutionClass, JobId, JobPayload,
     JobProgress, JobRecord, JobResultPayload, JobState, JobTransitionError, RunCrateStatus,
     UserAccess, attempt_control_key, cleanup_dedup_key, cleanup_job_id, crate_job_id,
-    encode_job_dedup_value, job_active_key, job_due_index_key, job_entry_key, job_entry_prefix,
-    job_lease_index_key, job_owner_cursor, job_owner_index_key, job_owner_index_prefix,
-    job_prune_index_key, job_record_key, job_run_crate_key, job_sync_key, parse_entry_key,
-    parse_job_dedup_value, parse_job_owner_index_key, rocrate_plan_key, run_crate_dedup_key,
-    validate_transition, workspace_credential_id,
+    encode_job_dedup_value, job_active_key, job_active_prefix, job_due_index_key, job_entry_key,
+    job_entry_prefix, job_lease_index_key, job_owner_cursor, job_owner_index_key,
+    job_owner_index_prefix, job_prune_index_key, job_record_key, job_run_crate_key,
+    parse_entry_key, parse_job_dedup_value, parse_job_owner_index_key, rocrate_plan_key,
+    run_crate_dedup_key, validate_transition, workspace_credential_id,
 };
 use aruna_core::types::{Key, KeySpace, NodeId, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
@@ -68,13 +68,11 @@ pub enum JobMutationError {
 }
 
 #[derive(Debug, Error)]
-pub enum JobSyncError {
-    #[error("job not found")]
-    NotFound,
-    #[error("terminal job sender is not its immutable owner")]
-    Forbidden,
-    #[error("terminal job conflicts with the authoritative record")]
-    Conflict,
+pub enum UserIndexError {
+    #[error("active RO-Crate job limit reached ({limit})")]
+    ActiveLimit { limit: u32 },
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
     #[error("{0}")]
     Storage(String),
 }
@@ -154,36 +152,6 @@ pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionErr
     Ok(writes)
 }
 
-/// Writes accepted by an execution owner; realm-wide indexes stay authoritative elsewhere.
-pub(super) fn job_delivery_entries(record: &JobRecord) -> Result<JobWrites, ConversionError> {
-    Ok(vec![
-        (
-            JOB_KEYSPACE.to_string(),
-            job_record_key(record.job_id),
-            ByteView::from(record.to_bytes()?),
-        ),
-        (
-            JOB_SCHEDULE_INDEX_KEYSPACE.to_string(),
-            job_schedule_key(record),
-            empty_value(),
-        ),
-    ])
-}
-
-pub(super) fn same_submission(existing: &JobRecord, incoming: &JobRecord) -> bool {
-    existing.job_id == incoming.job_id
-        && existing.payload == incoming.payload
-        && existing.created_by == incoming.created_by
-        && existing.owner_node_id == incoming.owner_node_id
-        && existing.created_at_ms == incoming.created_at_ms
-        && existing.dedup_key == incoming.dedup_key
-        && existing.execution_class == incoming.execution_class
-        && existing.plan_digest == incoming.plan_digest
-        && existing.workspace_bucket == incoming.workspace_bucket
-        && existing.workspace_mode == incoming.workspace_mode
-        && existing.retention_ms == incoming.retention_ms
-}
-
 /// Deletes for a pruned terminal job.
 pub fn job_prune_delete_entries(record: &JobRecord) -> JobDeletes {
     let mut deletes = vec![
@@ -199,10 +167,6 @@ pub fn job_prune_delete_entries(record: &JobRecord) -> JobDeletes {
         (
             JOB_SCHEDULE_INDEX_KEYSPACE.to_string(),
             job_schedule_key(record),
-        ),
-        (
-            JOB_SCHEDULE_INDEX_KEYSPACE.to_string(),
-            job_sync_key(record.job_id),
         ),
         (
             STAGING_JOB_STATE_KEYSPACE.to_string(),
@@ -264,13 +228,6 @@ fn index_deltas(
         deletes.push((
             JOB_ACTIVE_USER_KEYSPACE.to_string(),
             job_active_key(new.created_by, new.job_id),
-        ));
-    }
-    if !new.payload.is_internal() && !old.state.is_terminal() && new.state.is_terminal() {
-        writes.push((
-            JOB_SCHEDULE_INDEX_KEYSPACE.to_string(),
-            job_sync_key(new.job_id),
-            empty_value(),
         ));
     }
 
@@ -709,31 +666,20 @@ async fn cleanup_dedup_entry(
     old: &JobRecord,
     new: &JobRecord,
 ) -> Result<(), JobMutationError> {
-    if old.dedup_key.is_none() {
+    let Some(dedup_key) = &old.dedup_key else {
         return Ok(());
-    }
+    };
     if old.payload.is_rocrate() || old.state.is_terminal() || !new.state.is_terminal() {
         return Ok(());
     }
-    remove_job_dedup(storage, txn_id, old).await
-}
-
-async fn remove_job_dedup(
-    storage: &StorageHandle,
-    txn_id: TxnId,
-    record: &JobRecord,
-) -> Result<(), JobMutationError> {
-    let Some(dedup_key) = &record.dedup_key else {
-        return Ok(());
-    };
-    let key = job_dedup_index_key(record.created_by, dedup_key);
+    let key = job_dedup_index_key(old.created_by, dedup_key);
     let current = read_raw(storage, JOB_DEDUP_INDEX_KEYSPACE, key.clone(), Some(txn_id))
         .await
         .map_err(JobMutationError::Storage)?;
     let still_ours = current
         .as_deref()
         .and_then(|bytes| parse_job_dedup_value(bytes).ok())
-        .is_some_and(|(job_id, _)| job_id == record.job_id);
+        .is_some_and(|(job_id, _)| job_id == old.job_id);
     if still_ours {
         delete_raw(storage, JOB_DEDUP_INDEX_KEYSPACE, key, Some(txn_id))
             .await
@@ -760,162 +706,11 @@ pub async fn read_job_record(
     }
 }
 
-pub async fn apply_terminal(
-    storage: &StorageHandle,
-    peer: NodeId,
-    incoming: &JobRecord,
-) -> Result<JobRecord, JobSyncError> {
-    if !incoming.state.is_terminal()
-        || incoming.payload.is_internal()
-        || incoming.owner_node_id != peer
-    {
-        return Err(JobSyncError::Forbidden);
-    }
-    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
-        let txn_id = start_write_txn(storage)
-            .await
-            .map_err(JobSyncError::Storage)?;
-        let result = async {
-            let existing = read_job_record(storage, incoming.job_id, Some(txn_id))
-                .await
-                .map_err(JobSyncError::Storage)?
-                .ok_or(JobSyncError::NotFound)?;
-            if existing.owner_node_id != peer {
-                return Err(JobSyncError::Forbidden);
-            }
-            if !same_submission(&existing, incoming)
-                || existing.state.is_terminal() && existing != *incoming
-            {
-                return Err(JobSyncError::Conflict);
-            }
-            let record = if existing.state.is_terminal() {
-                existing.clone()
-            } else {
-                incoming.clone()
-            };
-            let value = ByteView::from(
-                record
-                    .to_bytes()
-                    .map_err(|error| JobSyncError::Storage(error.to_string()))?,
-            );
-            batch_write(
-                storage,
-                vec![
-                    (
-                        JOB_KEYSPACE.to_string(),
-                        job_record_key(record.job_id),
-                        value.clone(),
-                    ),
-                    (
-                        JOB_OWNER_INDEX_KEYSPACE.to_string(),
-                        job_owner_index_key(record.created_by, record.created_at_ms, record.job_id),
-                        value,
-                    ),
-                    (
-                        JOB_SCHEDULE_INDEX_KEYSPACE.to_string(),
-                        job_schedule_key(&record),
-                        empty_value(),
-                    ),
-                ],
-                Some(txn_id),
-            )
-            .await
-            .map_err(JobSyncError::Storage)?;
-            let mut deletes = Vec::new();
-            let old_schedule = job_schedule_key(&existing);
-            if old_schedule != job_schedule_key(&record) {
-                deletes.push((JOB_SCHEDULE_INDEX_KEYSPACE.to_string(), old_schedule));
-            }
-            if record.payload.is_rocrate() {
-                deletes.push((
-                    JOB_ACTIVE_USER_KEYSPACE.to_string(),
-                    job_active_key(record.created_by, record.job_id),
-                ));
-            }
-            batch_delete(storage, deletes, Some(txn_id))
-                .await
-                .map_err(JobSyncError::Storage)?;
-            if !record.payload.is_rocrate() {
-                remove_job_dedup(storage, txn_id, &record)
-                    .await
-                    .map_err(|error| JobSyncError::Storage(error.to_string()))?;
-            }
-            Ok(record)
-        }
-        .await;
-        match result {
-            Ok(record) => match commit_txn(storage, txn_id).await {
-                CommitResult::Committed => return Ok(record),
-                CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => continue,
-                CommitResult::Conflict => {
-                    return Err(JobSyncError::Storage(
-                        "terminal sync exhausted conflict retries".to_string(),
-                    ));
-                }
-                CommitResult::Failed(error) => return Err(JobSyncError::Storage(error)),
-            },
-            Err(error) => {
-                abort_txn(storage, txn_id).await;
-                return Err(error);
-            }
-        }
-    }
-    Err(JobSyncError::Storage(
-        "terminal sync exhausted conflict retries".to_string(),
-    ))
-}
-
-pub async fn ack_job_delivery(
-    storage: &StorageHandle,
-    delivered: &JobRecord,
-    schedule_key: Key,
-) -> Result<bool, String> {
-    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
-        let txn_id = start_write_txn(storage).await?;
-        let current = match read_job_record(storage, delivered.job_id, Some(txn_id)).await {
-            Ok(current) => current,
-            Err(error) => {
-                abort_txn(storage, txn_id).await;
-                return Err(error);
-            }
-        };
-        if current.as_ref() != Some(delivered) {
-            abort_txn(storage, txn_id).await;
-            return Ok(false);
-        }
-        if let Err(error) = batch_delete(
-            storage,
-            vec![(
-                JOB_SCHEDULE_INDEX_KEYSPACE.to_string(),
-                schedule_key.clone(),
-            )],
-            Some(txn_id),
-        )
-        .await
-        {
-            abort_txn(storage, txn_id).await;
-            return Err(error);
-        }
-        match commit_txn(storage, txn_id).await {
-            CommitResult::Committed => return Ok(true),
-            CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => continue,
-            CommitResult::Conflict => {
-                return Err("job delivery acknowledgement exhausted conflict retries".to_string());
-            }
-            CommitResult::Failed(error) => return Err(error),
-        }
-    }
-    Err("job delivery acknowledgement exhausted conflict retries".to_string())
-}
-
 /// Stores a readable replica without making it visible to the local drain.
 pub async fn write_passive_record(
     storage: &StorageHandle,
     record: &JobRecord,
 ) -> Result<(), String> {
-    if !record.payload.is_internal() {
-        return Err("external jobs are not passively replicated".to_string());
-    }
     batch_write(
         storage,
         vec![(
@@ -941,15 +736,121 @@ pub async fn write_job_schedule(storage: &StorageHandle, record: &JobRecord) -> 
     .await
 }
 
-pub async fn sync_pending(storage: &StorageHandle, job_id: JobId) -> Result<bool, String> {
-    read_raw(
+pub async fn reserve_user_index(
+    storage: &StorageHandle,
+    record: &JobRecord,
+) -> Result<JobId, UserIndexError> {
+    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
+        let txn_id = start_write_txn(storage)
+            .await
+            .map_err(UserIndexError::Storage)?;
+        match reserve_user_txn(storage, txn_id, record).await {
+            Ok(Some(job_id)) => {
+                abort_txn(storage, txn_id).await;
+                return Ok(job_id);
+            }
+            Ok(None) => match commit_txn(storage, txn_id).await {
+                CommitResult::Committed => return Ok(record.job_id),
+                CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => {
+                    tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
+                }
+                CommitResult::Conflict => {
+                    return Err(UserIndexError::Storage(
+                        "user job index exhausted conflict retries".to_string(),
+                    ));
+                }
+                CommitResult::Failed(error) => return Err(UserIndexError::Storage(error)),
+            },
+            Err(error) => {
+                abort_txn(storage, txn_id).await;
+                return Err(error);
+            }
+        }
+    }
+    Err(UserIndexError::Storage(
+        "user job index exhausted conflict retries".to_string(),
+    ))
+}
+
+async fn reserve_user_txn(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    record: &JobRecord,
+) -> Result<Option<JobId>, UserIndexError> {
+    let owner_key = job_owner_index_key(record.created_by, record.created_at_ms, record.job_id);
+    if read_raw(
         storage,
-        JOB_SCHEDULE_INDEX_KEYSPACE,
-        job_sync_key(job_id),
-        None,
+        JOB_OWNER_INDEX_KEYSPACE,
+        owner_key.clone(),
+        Some(txn_id),
     )
     .await
-    .map(|value| value.is_some())
+    .map_err(UserIndexError::Storage)?
+    .is_some()
+    {
+        return Ok(Some(record.job_id));
+    }
+    if let Some(dedup_key) = &record.dedup_key
+        && let Some(value) = read_raw(
+            storage,
+            JOB_DEDUP_INDEX_KEYSPACE,
+            job_dedup_index_key(record.created_by, dedup_key),
+            Some(txn_id),
+        )
+        .await
+        .map_err(UserIndexError::Storage)?
+        && let Ok((job_id, _)) = parse_job_dedup_value(value.as_ref())
+    {
+        return Ok(Some(job_id));
+    }
+    let active_cap = record
+        .payload
+        .rocrate_limits()
+        .map(|limits| limits.max_active_jobs);
+    if let Some(limit) = active_cap {
+        if limit == 0 {
+            return Err(UserIndexError::ActiveLimit { limit });
+        }
+        let (active, _) = iter_prefix_page(
+            storage,
+            JOB_ACTIVE_USER_KEYSPACE,
+            Some(job_active_prefix(record.created_by)),
+            None,
+            limit as usize,
+            Some(txn_id),
+        )
+        .await
+        .map_err(UserIndexError::Storage)?;
+        if active.len() >= limit as usize {
+            return Err(UserIndexError::ActiveLimit { limit });
+        }
+    }
+    let mut writes = vec![(
+        JOB_OWNER_INDEX_KEYSPACE.to_string(),
+        owner_key,
+        ByteView::from(record.to_bytes()?),
+    )];
+    if active_cap.is_some() {
+        writes.push((
+            JOB_ACTIVE_USER_KEYSPACE.to_string(),
+            job_active_key(record.created_by, record.job_id),
+            empty_value(),
+        ));
+    }
+    if let Some(dedup_key) = &record.dedup_key {
+        writes.push((
+            JOB_DEDUP_INDEX_KEYSPACE.to_string(),
+            job_dedup_index_key(record.created_by, dedup_key),
+            ByteView::from(encode_job_dedup_value(
+                record.job_id,
+                record.plan_digest.unwrap_or_default(),
+            )),
+        ));
+    }
+    batch_write(storage, writes, Some(txn_id))
+        .await
+        .map_err(UserIndexError::Storage)?;
+    Ok(None)
 }
 
 pub async fn update_user_index(storage: &StorageHandle, record: &JobRecord) -> Result<(), String> {
@@ -2054,22 +1955,6 @@ pub enum CancelRequestOutcome {
     Cancelled(JobRecord),
     Flagged(JobRecord),
     AlreadyTerminal(JobRecord),
-}
-
-pub async fn flag_job_cancel(
-    storage: &StorageHandle,
-    job_id: JobId,
-    now_ms: u64,
-) -> Result<JobRecord, JobMutationError> {
-    mutate_job(storage, job_id, |record| {
-        if record.state.is_terminal() || record.cancel_requested {
-            return Ok(JobMutation::Skip);
-        }
-        record.cancel_requested = true;
-        record.updated_at_ms = now_ms;
-        Ok(JobMutation::Persist)
-    })
-    .await
 }
 
 /// Idempotently set `cancel_requested`; a terminal job is a no-op. A queued job that never

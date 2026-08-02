@@ -193,10 +193,6 @@ pub enum AdminDocumentOperation {
     RealmConfigHandleRangeGranted {
         range: HandleRange,
     },
-    /// Sets the immutable Management node that serializes handle grants.
-    RealmConfigHandleAllocatorSet {
-        node_id: NodeId,
-    },
 }
 
 #[cfg(test)]
