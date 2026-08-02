@@ -16,6 +16,10 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::MetadataError;
 use aruna_core::storage_entries::metadata_registry_delete_entries;
+use aruna_core::structs::{
+    ComputeResources, DocumentClass, ExecutionSpec, JOBCONTROL_HANDLE, PlacementRef,
+    PlacementScope, WorkspaceMode,
+};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_forward_document, mint_local_document,
@@ -23,6 +27,10 @@ use aruna_operations::create_metadata_document::{
 use aruna_operations::driver::drive;
 use aruna_operations::get_metadata_document::{
     GetMetadataDocumentError, GetMetadataDocumentOperation, load_metadata_record_by_document,
+};
+use aruna_operations::jobs::runtime::JobsRuntime;
+use aruna_operations::jobs::service::{
+    RoutedCancelOutcome, cancel_job_routed, read_job_routed, read_owned_job, submit_execution_job,
 };
 use aruna_operations::metadata::forward::{
     create_metadata_document_routed, delete_metadata_document_routed, origin_holds_document,
@@ -38,6 +46,87 @@ use topology::{TestNode, TestResult, Topology, wait_until};
 const MANAGEMENT_NODES: usize = 5;
 const USER_NODES: usize = 1;
 const REPLICATION_FACTOR: u32 = 3;
+
+#[tokio::test]
+async fn job_read_routes() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let owner = realm.node(0);
+    let submitted = submit_execution_job(
+        owner.context.as_ref(),
+        ExecutionSpec {
+            group_id: Ulid::from_bytes([41; 16]),
+            name: None,
+            description: None,
+            tags: Default::default(),
+            image: "alpine:3".to_string(),
+            entrypoint: None,
+            command: Vec::new(),
+            workdir: None,
+            env: Default::default(),
+            resources: ComputeResources::default(),
+            executor_constraint: None,
+            inputs: Vec::new(),
+            file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+        },
+        realm.user_id,
+        owner.node_id(),
+        None,
+        WorkspaceMode::None,
+        None,
+        aruna_operations::jobs::JOB_RETENTION_MS,
+    )
+    .await?;
+
+    let binding = realm
+        .config
+        .binding_directory()
+        .resolve(submitted.job_id.as_routable()?.placement_handle())?;
+    let routable = submitted.job_id.as_routable()?;
+    assert_eq!(routable.placement_handle().get(), JOBCONTROL_HANDLE);
+    assert_eq!(binding.document_class, DocumentClass::JobControl);
+    assert_eq!(binding.scope, PlacementScope::Realm(realm.realm_id));
+    let placement = PlacementRef {
+        strategy_id: binding.strategy_id,
+        epoch: 0,
+        shard: u32::from(routable.bucket().get()),
+    };
+    realm.assert_holder(owner.node_id(), &placement);
+    let reader = realm.user_node();
+    realm.assert_not_holder(reader.node_id(), &placement);
+    let stored = read_owned_job(owner.context.as_ref(), realm.user_id, submitted.job_id)
+        .await?
+        .expect("holder stores the submitted job");
+    assert_eq!(stored.owner_node_id, owner.node_id());
+
+    let routed = read_job_routed(
+        reader.context.as_ref(),
+        realm.user_id,
+        submitted.job_id,
+        Some(realm.bearer_token()),
+    )
+    .await?;
+    assert_eq!(routed.job.job_id, submitted.job_id);
+
+    let caller_runtime = JobsRuntime::new_paused();
+    let cancelled = cancel_job_routed(
+        reader.context.as_ref(),
+        caller_runtime.as_ref(),
+        realm.user_id,
+        submitted.job_id,
+        Some(realm.bearer_token()),
+    )
+    .await?;
+    assert!(matches!(cancelled, RoutedCancelOutcome::Requested(_)));
+    let stored = read_owned_job(owner.context.as_ref(), realm.user_id, submitted.job_id)
+        .await?
+        .expect("holder retains the submitted job");
+    assert!(stored.cancel_requested);
+
+    realm.shutdown().await;
+    Ok(())
+}
 
 // The fixture itself is the deliverable: without this proof every test below
 // degrades silently into the all-nodes-hold-everything case.

@@ -409,7 +409,7 @@ async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<TestNo
     initialize_task_incoming(
         context.clone(),
         task_handle,
-        aruna_operations::jobs::runtime::JobsRuntime::new(),
+        aruna_operations::jobs::runtime::JobsRuntime::new_paused(),
     )
     .await;
 
