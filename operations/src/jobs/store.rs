@@ -152,6 +152,22 @@ pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionErr
     Ok(writes)
 }
 
+/// Writes accepted by an execution owner; realm-wide indexes stay authoritative elsewhere.
+pub(super) fn job_delivery_entries(record: &JobRecord) -> Result<JobWrites, ConversionError> {
+    Ok(vec![
+        (
+            JOB_KEYSPACE.to_string(),
+            job_record_key(record.job_id),
+            ByteView::from(record.to_bytes()?),
+        ),
+        (
+            JOB_SCHEDULE_INDEX_KEYSPACE.to_string(),
+            job_schedule_key(record),
+            empty_value(),
+        ),
+    ])
+}
+
 /// Deletes for a pruned terminal job.
 pub fn job_prune_delete_entries(record: &JobRecord) -> JobDeletes {
     let mut deletes = vec![

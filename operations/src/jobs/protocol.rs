@@ -31,8 +31,8 @@ use super::service::{
 use super::store::{
     UserIndexError, list_jobs_for_user, reserve_user_index, update_user_index, write_passive_record,
 };
-use super::submit::{SubmitJobError, SubmitJobResult, SubmitJobSpec};
-use crate::driver::DriverContext;
+use super::submit::{SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec};
+use crate::driver::{DriverContext, drive};
 use crate::metadata::api::load_realm_config;
 use crate::metadata::{MetadataAuthToken, MetadataWritePeerError};
 use crate::placement::{placement_ref_for_target, resolve_shard_holders};
@@ -103,6 +103,10 @@ pub(crate) enum JobRequest {
         job_id: JobId,
         config_digest: [u8; 32],
     },
+    Deliver {
+        auth_token: MetadataAuthToken,
+        record: JobRecord,
+    },
 }
 
 impl JobRequest {
@@ -115,7 +119,8 @@ impl JobRequest {
             | Self::Status { auth_token, .. }
             | Self::Report { auth_token, .. }
             | Self::Artifact { auth_token, .. }
-            | Self::Cancel { auth_token, .. } => auth_token.clone(),
+            | Self::Cancel { auth_token, .. }
+            | Self::Deliver { auth_token, .. } => auth_token.clone(),
         }
     }
 
@@ -124,6 +129,7 @@ impl JobRequest {
             Self::Index { .. } | Self::List { .. } => None,
             Self::Submit { job_id, .. } => Some(*job_id),
             Self::Replicate { record, .. } => Some(record.job_id),
+            Self::Deliver { record, .. } => Some(record.job_id),
             Self::Status { job_id, .. }
             | Self::Report { job_id, .. }
             | Self::Artifact { job_id, .. }
@@ -139,7 +145,7 @@ impl JobRequest {
         }
     }
 
-    fn config_digest(&self) -> [u8; 32] {
+    fn config_digest(&self) -> Option<[u8; 32]> {
         match self {
             Self::Index { config_digest, .. }
             | Self::List { config_digest, .. }
@@ -148,7 +154,8 @@ impl JobRequest {
             | Self::Status { config_digest, .. }
             | Self::Report { config_digest, .. }
             | Self::Artifact { config_digest, .. }
-            | Self::Cancel { config_digest, .. } => *config_digest,
+            | Self::Cancel { config_digest, .. } => Some(*config_digest),
+            Self::Deliver { .. } => None,
         }
     }
 }
@@ -238,6 +245,8 @@ pub(crate) enum JobResponse {
         job: JobStatusView,
         terminal: bool,
     },
+    Delivered(SubmitJobResult),
+    DeliveryConflict,
 }
 
 pub(crate) struct RemoteJobReply {
@@ -478,7 +487,17 @@ async fn prepare_response(
     if !auth_realm_matches(&auth, local_realm_id) {
         return PreparedResponse::new(JobResponse::Forbidden);
     }
-    let config_digest = request.config_digest();
+    let request = match request {
+        JobRequest::Deliver { record, .. } => {
+            return prepare_delivery(context, peer, auth.user_id, record).await;
+        }
+        request => request,
+    };
+    let Some(config_digest) = request.config_digest() else {
+        return PreparedResponse::new(JobResponse::Unavailable(
+            "job request is missing its placement digest".to_string(),
+        ));
+    };
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     if let Some(user_id) = request.user_id() {
         let route = match resolve_user_route(context, user_id).await {
@@ -574,6 +593,41 @@ async fn prepare_response(
             .await
         }
         JobRequest::Cancel { .. } => prepare_cancel(context, runtime, auth.user_id, job_id).await,
+        JobRequest::Deliver { .. } => PreparedResponse::new(JobResponse::Unavailable(
+            "delivery reached the job dispatcher".to_string(),
+        )),
+    }
+}
+
+async fn prepare_delivery(
+    context: &DriverContext,
+    peer: NodeId,
+    user_id: UserId,
+    record: JobRecord,
+) -> PreparedResponse {
+    let Some(local_node) = context.net_handle.as_ref().map(|net| net.node_id()) else {
+        return PreparedResponse::new(JobResponse::Unavailable(
+            "job-control network handle unavailable".to_string(),
+        ));
+    };
+    let Some(config) = load_realm_config(context, user_id.realm_id).await else {
+        return PreparedResponse::new(JobResponse::Unavailable(
+            "realm config unavailable".to_string(),
+        ));
+    };
+    if record.created_by != user_id
+        || record.payload.is_internal()
+        || record.owner_node_id != local_node
+        || config.handle_allocator_node() != Some(peer)
+    {
+        return PreparedResponse::new(JobResponse::Forbidden);
+    }
+    match drive(SubmitJobOperation::delivered(record), context).await {
+        Ok(result) => PreparedResponse::new(JobResponse::Delivered(result)),
+        Err(SubmitJobError::JobDeliveryConflict { .. }) => {
+            PreparedResponse::new(JobResponse::DeliveryConflict)
+        }
+        Err(error) => PreparedResponse::new(JobResponse::Unavailable(error.to_string())),
     }
 }
 
