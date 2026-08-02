@@ -322,7 +322,7 @@ mod tests {
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::events::Event;
     use aruna_core::structs::{
-        FIRST_GRANTABLE_HANDLE, HandleRange, RealmConfigDocument, RealmNodeKind,
+        FIRST_GRANTABLE_HANDLE, HandleRange, RealmConfigDocument, RealmNodeKind, owner_handle_band,
     };
     use aruna_core::types::UserId;
     use tempfile::tempdir;
@@ -555,6 +555,8 @@ mod tests {
             .await
             .unwrap();
 
+        // The seeded range is exhausted, so the extension grants from the owner band.
+        let band_start = owner_handle_band(&actor.node_id).0;
         let binding = provision_metadata_binding(
             &context,
             actor,
@@ -564,6 +566,6 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(binding.handle.get(), FIRST_GRANTABLE_HANDLE + 1);
+        assert_eq!(binding.handle.get(), band_start);
     }
 }
