@@ -3371,7 +3371,7 @@ mod tests {
             document_query_request["description"]
                 .as_str()
                 .unwrap()
-                .contains("best-effort")
+                .contains("complete result")
         );
 
         let query_all_request = &openapi["paths"]["/metadata/sparql/query"]["post"]["requestBody"];
