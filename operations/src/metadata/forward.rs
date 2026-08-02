@@ -109,6 +109,9 @@ pub async fn get_metadata_routed(
     realm_id: RealmId,
     request: GetVisibleMetadataDocumentRequest,
 ) -> Result<MetadataRegistryRecord, MetadataApiError> {
+    if context.net_handle.is_none() {
+        return get_visible_metadata_document(context.as_ref(), realm_id, request).await;
+    }
     let config = load_realm_config(context, realm_id)
         .await
         .ok_or(MetadataApiError::ServiceUnavailable)?;
