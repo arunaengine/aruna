@@ -35,8 +35,8 @@ use aruna_operations::jobs::JobRouteError;
 use aruna_operations::jobs::drain::{JobClassBudget, process_job_queue_batch};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::service::{
-    RoutedCancelOutcome, cancel_job_routed, read_job_routed, read_owned_job, submit_execution_job,
-    submit_rocrate_import,
+    RoutedCancelOutcome, cancel_job_routed, read_job_routed, read_owned_job, read_record_routed,
+    submit_execution_job, submit_rocrate_import,
 };
 use aruna_operations::jobs::store::find_dedup_job;
 use aruna_operations::jobs::submit::{SubmitJobError, mint_job_id};
@@ -140,6 +140,54 @@ async fn owner_read_routes() -> TestResult<()> {
     )
     .await?;
     assert_eq!(routed.job.job_id, submitted.job_id);
+
+    realm.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn record_routes_owner() -> TestResult<()> {
+    // TES/staging fetch the full owner record off-owner: a non-owner routes to
+    // the owner and, when the owner is down, reports 503 not a false 404.
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let ingress = realm.node(0);
+    let owner_id = ingress.node_id();
+    let submitted = submit_execution_job(
+        ingress.context.as_ref(),
+        execution_spec(47),
+        realm.user_id,
+        owner_id,
+        None,
+        WorkspaceMode::None,
+        None,
+        aruna_operations::jobs::JOB_RETENTION_MS,
+    )
+    .await?;
+    let probe = realm.node(1);
+
+    let routed = read_record_routed(
+        probe.context.as_ref(),
+        realm.user_id,
+        submitted.job_id,
+        Some(realm.bearer_token()),
+    )
+    .await?
+    .expect("the owner returns the full record");
+    assert_eq!(routed.job_id, submitted.job_id);
+    assert_eq!(routed.owner_node_id, owner_id);
+
+    realm.find(owner_id).net.shutdown().await;
+    let down = read_record_routed(
+        probe.context.as_ref(),
+        realm.user_id,
+        submitted.job_id,
+        Some(realm.bearer_token()),
+    )
+    .await;
+    assert!(
+        matches!(down, Err(JobRouteError::Unavailable(_))),
+        "owner-down record fetch must be unavailable, never a false 404: {down:?}"
+    );
 
     realm.shutdown().await;
     Ok(())

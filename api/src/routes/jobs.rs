@@ -358,7 +358,7 @@ fn parse_job_id(raw: &str) -> ServerResult<JobId> {
     JobId::from_str(raw).map_err(|_| ServerError::NotFound)
 }
 
-fn forwarded_job_auth(
+pub(crate) fn forwarded_job_auth(
     bearer: Option<ValidatedArunaBearerTokenCarrier>,
 ) -> ServerResult<Option<aruna_operations::metadata::MetadataAuthToken>> {
     aruna_operations::metadata::api::forwarded_bearer(
@@ -369,7 +369,7 @@ fn forwarded_job_auth(
     .map_err(super::metadata::map_metadata_api_error)
 }
 
-fn map_job_route(error: JobRouteError) -> ServerError {
+pub(crate) fn map_job_route(error: JobRouteError) -> ServerError {
     match error {
         JobRouteError::Unauthorized => ServerError::Unauthorized,
         JobRouteError::Forbidden => ServerError::Forbidden,

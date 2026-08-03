@@ -5,7 +5,7 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{AuthContext, JobId, JobState, RealmId};
+use aruna_core::structs::{AuthContext, JobId, JobRecord, JobState, RealmId};
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_net::streams::{BiStream, RecvStream, SendStream};
@@ -69,6 +69,12 @@ pub(crate) enum JobRequest {
         auth_token: MetadataAuthToken,
         job_id: JobId,
     },
+    /// Full owner record for API projections (TES, staging) the status view
+    /// cannot reconstruct off-owner.
+    Record {
+        auth_token: MetadataAuthToken,
+        job_id: JobId,
+    },
 }
 
 impl JobRequest {
@@ -77,7 +83,8 @@ impl JobRequest {
             Self::Status { auth_token, .. }
             | Self::Report { auth_token, .. }
             | Self::Artifact { auth_token, .. }
-            | Self::Cancel { auth_token, .. } => auth_token.clone(),
+            | Self::Cancel { auth_token, .. }
+            | Self::Record { auth_token, .. } => auth_token.clone(),
         }
     }
 }
@@ -158,6 +165,7 @@ pub(crate) enum JobResponse {
         job: JobStatusView,
         terminal: bool,
     },
+    Record(Box<JobRecord>),
 }
 
 pub(crate) struct RemoteJobReply {
@@ -355,13 +363,30 @@ async fn prepare_response(
             }
             prepare_cancel(context, runtime, auth.user_id, job_id).await
         }
+        JobRequest::Record { job_id, .. } => {
+            if let Some(rejected) = owner_gate(context, job_id, local_node).await {
+                return rejected;
+            }
+            prepare_record(context, auth.user_id, job_id).await
+        }
     }
 }
 
-/// Owner-directed requests are answered only by the derived owner. A node
-/// that is not the owner, or cannot resolve one, answers `Unavailable`; a
-/// provably invalid id is `NotFound`. The gate makes the resolved owner the
-/// sole authority for absence.
+async fn prepare_record(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+) -> PreparedResponse {
+    match read_owned_job(context, user_id, job_id).await {
+        Ok(Some(record)) => PreparedResponse::new(JobResponse::Record(Box::new(record))),
+        Ok(None) => PreparedResponse::new(JobResponse::NotFound),
+        Err(error) => PreparedResponse::new(JobResponse::Unavailable(error)),
+    }
+}
+
+/// Owner-directed requests are answered only by the derived owner, the sole
+/// absence authority: a non-owner or unresolved owner answers `Unavailable`,
+/// and only a provably invalid id is `NotFound`.
 async fn owner_gate(
     context: &DriverContext,
     job_id: JobId,

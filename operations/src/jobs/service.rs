@@ -312,12 +312,9 @@ pub async fn read_job_run_crate_status(
     read_run_crate_status(&context.storage_handle, job_id).await
 }
 
-/// API-facing helpers so REST handlers never orchestrate storage/task effects directly.
-///
-/// Listings are per-origin by contract: the serving node lists the jobs it
-/// owns, which covers every job the user submitted through it. A realm-wide
-/// view is an owner-partitioned aggregate and stays incomplete for jobs owned
-/// by disconnected nodes; clients submit through a stable origin.
+/// Node-local listing: returns only jobs owned by the serving node (every job
+/// the user submitted through it). There is no realm-wide aggregation, so jobs
+/// owned by other nodes are omitted; listings are per-origin by contract.
 pub async fn list_owned_jobs(
     context: &DriverContext,
     user_id: UserId,
@@ -341,6 +338,57 @@ pub async fn read_owned_job(
             _ => None,
         },
     )
+}
+
+/// Full owner record for API projections that the status view cannot rebuild
+/// off-owner. Routes to the derived owner like `read_job_routed`; an unreachable
+/// owner is `Unavailable` (503), only the owner answers absence (`Ok(None)`).
+pub async fn read_record_routed(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+    auth_token: Option<crate::metadata::MetadataAuthToken>,
+) -> Result<Option<JobRecord>, JobRouteError> {
+    if context.net_handle.is_none() {
+        return read_owned_job(context, user_id, job_id)
+            .await
+            .map_err(JobRouteError::Internal);
+    }
+    let owner = resolve_job_owner(context, job_id).await?;
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    if Some(owner) == local_node {
+        return read_owned_job(context, user_id, job_id)
+            .await
+            .map_err(JobRouteError::Internal);
+    }
+    let token = auth_token.ok_or(JobRouteError::Unauthorized)?;
+    let reply = send_job_request(
+        context,
+        owner,
+        JobRequest::Record {
+            auth_token: token,
+            job_id,
+        },
+    )
+    .await
+    .map_err(owner_unreachable)?;
+    match reply.response {
+        JobResponse::Record(record)
+            if record.job_id == job_id
+                && record.created_by == user_id
+                && !record.payload.is_internal() =>
+        {
+            Ok(Some(*record))
+        }
+        JobResponse::Record(_) => Err(JobRouteError::NotFound),
+        JobResponse::Unauthorized => Err(JobRouteError::Unauthorized),
+        JobResponse::Forbidden => Err(JobRouteError::Forbidden),
+        JobResponse::NotFound => Ok(None),
+        JobResponse::Unavailable(error) => Err(JobRouteError::Unavailable(error)),
+        response => Err(JobRouteError::Unavailable(format!(
+            "unexpected record response from the job owner: {response:?}"
+        ))),
+    }
 }
 
 /// Derives the immutable owner from the JobId alone: replicated placement
