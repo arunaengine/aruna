@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::ops::Range;
 use std::path::Path;
-use std::str::FromStr;
 use tracing::warn;
 
 use super::JOB_REPORT_MAX_ROWS;
@@ -27,9 +26,9 @@ use super::protocol::{
 };
 use super::runtime::JobsRuntime;
 use super::store::{
-    CancelRequestOutcome, JobMutationError, UserIndexError, UserIndexReservation, find_dedup_plan,
-    find_user_job, list_job_entries, list_jobs_for_user, read_artifact_tombstone, read_job_record,
-    read_run_crate_status, reserve_user_index, set_cancel_requested, update_user_index,
+    CancelRequestOutcome, JobMutationError, UserIndexError, find_dedup_plan, list_job_entries,
+    list_jobs_for_user, read_artifact_tombstone, read_job_record, read_run_crate_status,
+    reserve_user_index, set_cancel_requested, update_user_index,
 };
 use super::submit::{
     SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_job_id,
@@ -104,7 +103,7 @@ async fn mint_local_job(
 async fn reserve_job_index(
     context: &DriverContext,
     record: &JobRecord,
-) -> Result<UserIndexReservation, SubmitJobError> {
+) -> Result<JobId, SubmitJobError> {
     let Some(net_handle) = context.net_handle.as_ref() else {
         return reserve_user_index(&context.storage_handle, record)
             .await
@@ -142,7 +141,7 @@ async fn reserve_job_index(
     .await
     .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
     match reply.response {
-        JobResponse::Indexed { job_id, created } => Ok(UserIndexReservation { job_id, created }),
+        JobResponse::Indexed(job_id) => Ok(job_id),
         JobResponse::SubmitCap(limit) => Err(SubmitJobError::ActiveJobLimit { limit }),
         JobResponse::Unavailable(error) => Err(SubmitJobError::UnexpectedEvent(error)),
         response => Err(SubmitJobError::UnexpectedEvent(format!(
@@ -159,46 +158,13 @@ pub(crate) async fn submit_local_job(
     let operation = if let Some(net_handle) = context.net_handle.as_ref() {
         spec.owner_node_id = net_handle.node_id();
         let preview = SubmitJobOperation::reserved(spec.clone(), job_id);
-        let reservation = reserve_job_index(context, preview.record()).await?;
-        if !reservation.created {
-            let auth_token = MetadataAuthToken::internal(AuthContext {
-                user_id: spec.created_by,
-                realm_id: spec.created_by.realm_id,
-                path_restrictions: None,
-            });
-            let owner = resolve_job_owner(
-                context,
-                spec.created_by,
-                reservation.job_id,
-                Some(auth_token.clone()),
-            )
-            .await
-            .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
-            let owner = verify_job_owner(
-                context,
-                spec.created_by,
-                reservation.job_id,
-                owner.node_id,
-                auth_token,
-            )
-            .await
-            .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
-            if owner.plan_digest != preview.record().plan_digest {
-                return Err(SubmitJobError::JobPlanConflict {
-                    existing_job_id: reservation.job_id,
-                });
-            }
-            return Ok(SubmitJobResult {
-                job_id: reservation.job_id,
-                created: false,
-            });
-        }
-        SubmitJobOperation::reserved(spec, reservation.job_id)
+        let indexed_job_id = reserve_job_index(context, preview.record()).await?;
+        SubmitJobOperation::reserved(spec, indexed_job_id)
     } else {
         SubmitJobOperation::new(spec, job_id)
     };
     let result = drive(operation, context).await?;
-    sync_job_record(context, result.job_id).await;
+    replicate_job_record(context, result.job_id).await;
     if result.created {
         kick_drain(context).await;
     }
@@ -557,199 +523,15 @@ pub async fn read_owned_job(
     )
 }
 
-#[derive(Clone, Copy)]
-struct JobOwner {
-    node_id: NodeId,
-    plan_digest: Option<[u8; 32]>,
-}
-
-async fn resolve_job_owner(
-    context: &DriverContext,
-    user_id: UserId,
-    job_id: JobId,
-    auth_token: Option<MetadataAuthToken>,
-) -> Result<JobOwner, JobRouteError> {
-    if let Some(record) = read_owned_job(context, user_id, job_id)
-        .await
-        .map_err(JobRouteError::Internal)?
-    {
-        return Ok(JobOwner {
-            node_id: record.owner_node_id,
-            plan_digest: record.plan_digest,
-        });
-    }
-    let net_handle = context
-        .net_handle
-        .as_ref()
-        .ok_or_else(|| JobRouteError::Unavailable("network handle unavailable".to_string()))?;
-    let mut unavailable = false;
-    let indexed = match resolve_user_route(context, user_id).await {
-        Ok(user_route) => {
-            let user_holder = user_route.holders[0];
-            if user_holder == net_handle.node_id() {
-                match find_user_job(&context.storage_handle, user_id, job_id).await {
-                    Ok(record) => record.map(|record| JobOwner {
-                        node_id: record.owner_node_id,
-                        plan_digest: record.plan_digest,
-                    }),
-                    Err(_) => {
-                        unavailable = true;
-                        None
-                    }
-                }
-            } else {
-                match send_job_request(
-                    context,
-                    user_holder,
-                    JobRequest::Lookup {
-                        auth_token: MetadataAuthToken::internal(AuthContext {
-                            user_id,
-                            realm_id: user_id.realm_id,
-                            path_restrictions: None,
-                        }),
-                        user_id,
-                        job_id,
-                        config_digest: user_route.config_digest,
-                    },
-                )
-                .await
-                {
-                    Ok(reply) => match reply.response {
-                        JobResponse::Located {
-                            owner_node_id,
-                            plan_digest,
-                        } => Some(JobOwner {
-                            node_id: owner_node_id,
-                            plan_digest,
-                        }),
-                        JobResponse::NotFound => None,
-                        _ => {
-                            unavailable = true;
-                            None
-                        }
-                    },
-                    Err(_) => {
-                        unavailable = true;
-                        None
-                    }
-                }
-            }
-        }
-        Err(_) => {
-            unavailable = true;
-            None
-        }
-    };
-    if let Some(owner) = indexed {
-        return Ok(owner);
-    }
-    let config = load_realm_config(context, user_id.realm_id)
-        .await
-        .ok_or_else(|| JobRouteError::Unavailable("realm config unavailable".to_string()))?;
-    let token = auth_token.ok_or(JobRouteError::Unauthorized)?;
-    for realm_node in config
-        .nodes
-        .iter()
-        .filter(|realm_node| realm_node.kind.is_sync_eligible())
-    {
-        let Ok(node_id) = NodeId::from_str(&realm_node.node_id) else {
-            unavailable = true;
-            continue;
-        };
-        if node_id == net_handle.node_id() {
-            continue;
-        }
-        match send_job_request(
-            context,
-            node_id,
-            JobRequest::Locate {
-                auth_token: token.clone(),
-                job_id,
-            },
-        )
-        .await
-        {
-            Ok(reply) => match reply.response {
-                JobResponse::Located {
-                    owner_node_id,
-                    plan_digest,
-                } if owner_node_id == node_id => {
-                    return Ok(JobOwner {
-                        node_id: owner_node_id,
-                        plan_digest,
-                    });
-                }
-                JobResponse::Unauthorized => return Err(JobRouteError::Unauthorized),
-                JobResponse::Forbidden => return Err(JobRouteError::Forbidden),
-                JobResponse::NotFound => {}
-                _ => unavailable = true,
-            },
-            Err(_) => unavailable = true,
-        }
-    }
-    if unavailable {
-        Err(JobRouteError::Unavailable(
-            "job owner could not be resolved".to_string(),
-        ))
-    } else {
-        Err(JobRouteError::NotFound)
-    }
-}
-
-async fn verify_job_owner(
-    context: &DriverContext,
-    user_id: UserId,
-    job_id: JobId,
-    owner_node_id: NodeId,
-    auth_token: MetadataAuthToken,
-) -> Result<JobOwner, JobRouteError> {
-    if context
-        .net_handle
-        .as_ref()
-        .is_some_and(|net| net.node_id() == owner_node_id)
-    {
-        let record = read_owned_job(context, user_id, job_id)
-            .await
-            .map_err(JobRouteError::Internal)?
-            .filter(|record| record.owner_node_id == owner_node_id)
-            .ok_or(JobRouteError::NotFound)?;
-        return Ok(JobOwner {
-            node_id: owner_node_id,
-            plan_digest: record.plan_digest,
-        });
-    }
-    let reply = send_job_request(
-        context,
-        owner_node_id,
-        JobRequest::Locate { auth_token, job_id },
-    )
-    .await?;
-    match reply.response {
-        JobResponse::Located {
-            owner_node_id: located_node,
-            plan_digest,
-        } if located_node == owner_node_id => Ok(JobOwner {
-            node_id: located_node,
-            plan_digest,
-        }),
-        JobResponse::Unauthorized => Err(JobRouteError::Unauthorized),
-        JobResponse::Forbidden => Err(JobRouteError::Forbidden),
-        JobResponse::NotFound => Err(JobRouteError::NotFound),
-        response => Err(JobRouteError::Unavailable(format!(
-            "job owner returned an unexpected locator response: {response:?}"
-        ))),
-    }
-}
-
-pub(crate) async fn sync_job_record(context: &DriverContext, job_id: JobId) {
+pub(crate) async fn replicate_job_record(context: &DriverContext, job_id: JobId) {
     let record = match read_job_record(&context.storage_handle, job_id, None).await {
         Ok(Some(record)) => record,
         Ok(None) => {
-            warn!(job_id = %job_id, "Cannot sync a missing job record");
+            warn!(job_id = %job_id, "Cannot replicate a missing job record");
             return;
         }
         Err(error) => {
-            warn!(job_id = %job_id, error = %error, "Failed to read job for index sync");
+            warn!(job_id = %job_id, error = %error, "Failed to read job for replication");
             return;
         }
     };
@@ -757,6 +539,43 @@ pub(crate) async fn sync_job_record(context: &DriverContext, job_id: JobId) {
         return;
     }
     sync_user_record(context, &record).await;
+    let route = match resolve_job_holders(context, job_id).await {
+        Ok(route) => route,
+        Err(error) => {
+            warn!(job_id = %job_id, error = %error, "Failed to resolve job replicas");
+            return;
+        }
+    };
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let auth_token = MetadataAuthToken::internal(AuthContext {
+        user_id: record.created_by,
+        realm_id: record.created_by.realm_id,
+        path_restrictions: None,
+    });
+    for holder in route.holders {
+        if Some(holder) == local_node {
+            continue;
+        }
+        match send_job_request(
+            context,
+            holder,
+            JobRequest::Replicate {
+                auth_token: auth_token.clone(),
+                record: record.clone(),
+                config_digest: route.config_digest,
+            },
+        )
+        .await
+        {
+            Ok(reply) if matches!(reply.response, JobResponse::Replicated) => {}
+            Ok(reply) => {
+                warn!(job_id = %job_id, %holder, response = ?reply.response, "Job replica was rejected")
+            }
+            Err(error) => {
+                warn!(job_id = %job_id, %holder, error = %error, "Failed to replicate job record")
+            }
+        }
+    }
 }
 
 async fn sync_user_record(context: &DriverContext, record: &JobRecord) {
@@ -797,7 +616,7 @@ async fn sync_user_record(context: &DriverContext, record: &JobRecord) {
     )
     .await
     {
-        Ok(reply) if matches!(reply.response, JobResponse::Indexed { .. }) => {}
+        Ok(reply) if matches!(reply.response, JobResponse::Indexed(_)) => {}
         Ok(reply) => {
             warn!(job_id = %record.job_id, response = ?reply.response, "Job owner index was rejected")
         }
@@ -940,46 +759,75 @@ pub async fn read_job_routed(
             run_crate,
         });
     }
-    let owner = resolve_job_owner(context, user_id, job_id, auth_token.clone()).await?;
+    let route = resolve_job_holders(context, job_id).await?;
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    if Some(owner.node_id) == local_node {
-        let record = read_owned_job(context, user_id, job_id)
-            .await
-            .map_err(JobRouteError::Internal)?
-            .ok_or(JobRouteError::NotFound)?;
-        let run_crate = read_job_run_crate_status(context, job_id)
-            .await
-            .map_err(JobRouteError::Internal)?
-            .map(|status| status.to_public_json());
-        return Ok(RoutedJobStatus {
-            job: JobStatusView::from(&record),
-            run_crate,
-        });
-    }
-    let reply = send_job_request(
-        context,
-        owner.node_id,
-        JobRequest::Status {
-            auth_token: auth_token.ok_or(JobRouteError::Unauthorized)?,
-            job_id,
-        },
-    )
-    .await?;
-    match reply.response {
-        JobResponse::Status { job, run_crate } if routed_job_matches(&job, user_id, job_id) => {
-            let run_crate = run_crate
-                .map(|value| serde_json::from_str(&value))
-                .transpose()
-                .map_err(|error| JobRouteError::Internal(error.to_string()))?;
-            Ok(RoutedJobStatus { job, run_crate })
+    let mut not_found = 0usize;
+    let mut freshest = None;
+    for holder in &route.holders {
+        if Some(*holder) == local_node {
+            let record = match read_owned_job(context, user_id, job_id).await {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    not_found += 1;
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            let run_crate = match read_job_run_crate_status(context, job_id).await {
+                Ok(status) => status.map(|status| status.to_public_json()),
+                Err(_) => continue,
+            };
+            let candidate = RoutedJobStatus {
+                job: JobStatusView::from(&record),
+                run_crate,
+            };
+            if freshest.as_ref().is_none_or(|current: &RoutedJobStatus| {
+                candidate.job.updated_at_ms > current.job.updated_at_ms
+            }) {
+                freshest = Some(candidate);
+            }
+            continue;
         }
-        JobResponse::Unauthorized => Err(JobRouteError::Unauthorized),
-        JobResponse::Forbidden => Err(JobRouteError::Forbidden),
-        JobResponse::NotFound => Err(JobRouteError::NotFound),
-        response => Err(JobRouteError::Unavailable(format!(
-            "job owner returned an unexpected status response: {response:?}"
-        ))),
+        let token = auth_token.clone().ok_or(JobRouteError::Unauthorized)?;
+        let reply = match send_job_request(
+            context,
+            *holder,
+            JobRequest::Status {
+                auth_token: token,
+                job_id,
+                config_digest: route.config_digest,
+            },
+        )
+        .await
+        {
+            Ok(reply) => reply,
+            Err(_) => continue,
+        };
+        match reply.response {
+            JobResponse::Status { job, run_crate } if routed_job_matches(&job, user_id, job_id) => {
+                let Ok(run_crate) = run_crate
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()
+                else {
+                    continue;
+                };
+                let candidate = RoutedJobStatus { job, run_crate };
+                if freshest.as_ref().is_none_or(|current: &RoutedJobStatus| {
+                    candidate.job.updated_at_ms > current.job.updated_at_ms
+                }) {
+                    freshest = Some(candidate);
+                }
+            }
+            JobResponse::Unauthorized => return Err(JobRouteError::Unauthorized),
+            JobResponse::Forbidden => return Err(JobRouteError::Forbidden),
+            JobResponse::NotFound => not_found += 1,
+            _ => {}
+        }
     }
+    if let Some(freshest) = freshest {
+        return Ok(freshest);
+    }
+    route_miss(not_found, route.holders.len())
 }
 
 pub enum JobReportLookup {
@@ -1065,51 +913,73 @@ pub async fn read_report_routed(
             .await
             .map_err(JobRouteError::Internal);
     }
-    let owner = resolve_job_owner(context, user_id, job_id, auth_token.clone()).await?;
+    let route = resolve_job_holders(context, job_id).await?;
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    if Some(owner.node_id) == local_node {
-        return read_owned_report(context, user_id, job_id, expected_digest, last_key, limit)
+    let mut not_found = 0usize;
+    for holder in &route.holders {
+        if Some(*holder) == local_node {
+            match read_owned_report(
+                context,
+                user_id,
+                job_id,
+                expected_digest,
+                last_key.clone(),
+                limit,
+            )
             .await
-            .map_err(JobRouteError::Internal);
-    }
-    let wire_limit = u16::try_from(limit.min(usize::from(JOB_REPORT_MAX_ROWS)))
-        .map_err(|error| JobRouteError::Internal(error.to_string()))?;
-    let reply = send_job_request(
-        context,
-        owner.node_id,
-        JobRequest::Report {
-            auth_token: auth_token.ok_or(JobRouteError::Unauthorized)?,
-            job_id,
-            expected_digest,
-            last_key,
-            limit: wire_limit,
-        },
-    )
-    .await?;
-    match reply.response {
-        JobResponse::ReportPending(state) => Ok(JobReportLookup::Pending(state)),
-        JobResponse::ReportConflict => Ok(JobReportLookup::CursorConflict),
-        JobResponse::ReportReady {
-            job,
-            rows,
-            next_key,
-        } if report_job_matches(&job, user_id, job_id, expected_digest) => {
-            Ok(JobReportLookup::Ready {
-                job,
-                rows: rows
-                    .into_iter()
-                    .map(|(key, value)| (key, Value::from(value)))
-                    .collect(),
-                next_key,
-            })
+            {
+                Ok(JobReportLookup::NotFound) => {
+                    not_found += 1;
+                    continue;
+                }
+                Ok(lookup) => return Ok(lookup),
+                Err(_) => continue,
+            }
         }
-        JobResponse::Unauthorized => Err(JobRouteError::Unauthorized),
-        JobResponse::Forbidden => Err(JobRouteError::Forbidden),
-        JobResponse::NotFound => Ok(JobReportLookup::NotFound),
-        response => Err(JobRouteError::Unavailable(format!(
-            "job owner returned an unexpected report response: {response:?}"
-        ))),
+        let token = auth_token.clone().ok_or(JobRouteError::Unauthorized)?;
+        let wire_limit = u16::try_from(limit.min(usize::from(JOB_REPORT_MAX_ROWS)))
+            .map_err(|error| JobRouteError::Internal(error.to_string()))?;
+        let reply = match send_job_request(
+            context,
+            *holder,
+            JobRequest::Report {
+                auth_token: token,
+                job_id,
+                expected_digest,
+                last_key: last_key.clone(),
+                limit: wire_limit,
+                config_digest: route.config_digest,
+            },
+        )
+        .await
+        {
+            Ok(reply) => reply,
+            Err(_) => continue,
+        };
+        match reply.response {
+            JobResponse::ReportPending(state) => return Ok(JobReportLookup::Pending(state)),
+            JobResponse::ReportConflict => return Ok(JobReportLookup::CursorConflict),
+            JobResponse::ReportReady {
+                job,
+                rows,
+                next_key,
+            } if report_job_matches(&job, user_id, job_id, expected_digest) => {
+                return Ok(JobReportLookup::Ready {
+                    job,
+                    rows: rows
+                        .into_iter()
+                        .map(|(key, value)| (key, Value::from(value)))
+                        .collect(),
+                    next_key,
+                });
+            }
+            JobResponse::Unauthorized => return Err(JobRouteError::Unauthorized),
+            JobResponse::Forbidden => return Err(JobRouteError::Forbidden),
+            JobResponse::NotFound => not_found += 1,
+            _ => {}
+        }
     }
+    route_miss(not_found, route.holders.len())
 }
 
 pub struct OwnedArtifact {
@@ -1235,71 +1105,81 @@ pub async fn read_artifact_routed(
         };
         return Ok((lookup, read));
     }
-    let owner = resolve_job_owner(context, user_id, job_id, auth_token.clone()).await?;
+    let route = resolve_job_holders(context, job_id).await?;
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    if Some(owner.node_id) == local_node {
-        let lookup = read_owned_artifact(context, user_id, job_id, now_ms)
-            .await
-            .map_err(JobRouteError::Internal)?;
-        let read = match (&lookup, range) {
-            (ArtifactLookup::Ready(owned), Some(range)) => {
-                let artifact = owned.source().ok_or_else(|| {
-                    JobRouteError::Internal("local artifact source is unavailable".to_string())
-                })?;
-                let read = read_artifact_range(context, artifact, range.clone())
-                    .await
-                    .map_err(JobRouteError::Internal)?;
-                if !artifact_size_matches(Some(&range), read.stream_size) {
-                    return Err(JobRouteError::Internal(
-                        "artifact reader returned an unexpected range size".to_string(),
-                    ));
-                }
-                Some(read)
-            }
-            _ => None,
-        };
-        return Ok((lookup, read));
-    }
-    let reply = send_job_request(
-        context,
-        owner.node_id,
-        JobRequest::Artifact {
-            auth_token: auth_token.ok_or(JobRouteError::Unauthorized)?,
-            job_id,
-            range: range.clone().map(WireRange::from),
-        },
-    )
-    .await?;
-    match reply.response {
-        JobResponse::ArtifactPending(state) => Ok((ArtifactLookup::Pending(state), None)),
-        JobResponse::ArtifactGone => Ok((ArtifactLookup::Gone, None)),
-        JobResponse::ArtifactReady { owned, stream_size } => {
-            let owned = OwnedArtifact::from(owned);
-            if !artifact_job_matches(&owned, user_id, job_id) {
-                return Err(JobRouteError::Unavailable(
-                    "job owner returned an artifact for another job".to_string(),
-                ));
-            }
-            let read = match (range.as_ref(), reply.body) {
-                (Some(range), Some(blob)) if artifact_size_matches(Some(range), stream_size) => {
-                    Some(ArtifactRead { blob, stream_size })
-                }
-                (None, None) if artifact_size_matches(None, stream_size) => None,
-                _ => {
-                    return Err(JobRouteError::Unavailable(
-                        "job owner returned an invalid artifact stream".to_string(),
-                    ));
-                }
+    let mut not_found = 0usize;
+    for holder in &route.holders {
+        if Some(*holder) == local_node {
+            let lookup = match read_owned_artifact(context, user_id, job_id, now_ms).await {
+                Ok(lookup) => lookup,
+                Err(_) => continue,
             };
-            Ok((ArtifactLookup::Ready(owned), read))
+            if matches!(lookup, ArtifactLookup::NotFound) {
+                not_found += 1;
+                continue;
+            }
+            let read = match (&lookup, range.clone()) {
+                (ArtifactLookup::Ready(owned), Some(range)) => {
+                    let Some(artifact) = owned.source() else {
+                        continue;
+                    };
+                    let Ok(read) = read_artifact_range(context, artifact, range.clone()).await
+                    else {
+                        continue;
+                    };
+                    if !artifact_size_matches(Some(&range), read.stream_size) {
+                        continue;
+                    }
+                    Some(read)
+                }
+                _ => None,
+            };
+            return Ok((lookup, read));
         }
-        JobResponse::Unauthorized => Err(JobRouteError::Unauthorized),
-        JobResponse::Forbidden => Err(JobRouteError::Forbidden),
-        JobResponse::NotFound => Ok((ArtifactLookup::NotFound, None)),
-        response => Err(JobRouteError::Unavailable(format!(
-            "job owner returned an unexpected artifact response: {response:?}"
-        ))),
+        let token = auth_token.clone().ok_or(JobRouteError::Unauthorized)?;
+        let reply = match send_job_request(
+            context,
+            *holder,
+            JobRequest::Artifact {
+                auth_token: token,
+                job_id,
+                range: range.clone().map(WireRange::from),
+                config_digest: route.config_digest,
+            },
+        )
+        .await
+        {
+            Ok(reply) => reply,
+            Err(_) => continue,
+        };
+        match reply.response {
+            JobResponse::ArtifactPending(state) => {
+                return Ok((ArtifactLookup::Pending(state), None));
+            }
+            JobResponse::ArtifactGone => return Ok((ArtifactLookup::Gone, None)),
+            JobResponse::ArtifactReady { owned, stream_size } => {
+                let owned = OwnedArtifact::from(owned);
+                if !artifact_job_matches(&owned, user_id, job_id) {
+                    continue;
+                }
+                let read = match (range.as_ref(), reply.body) {
+                    (Some(range), Some(blob))
+                        if artifact_size_matches(Some(range), stream_size) =>
+                    {
+                        Some(ArtifactRead { blob, stream_size })
+                    }
+                    (None, None) if artifact_size_matches(None, stream_size) => None,
+                    _ => continue,
+                };
+                return Ok((ArtifactLookup::Ready(owned), read));
+            }
+            JobResponse::Unauthorized => return Err(JobRouteError::Unauthorized),
+            JobResponse::Forbidden => return Err(JobRouteError::Forbidden),
+            JobResponse::NotFound => not_found += 1,
+            _ => {}
+        }
     }
+    route_miss(not_found, route.holders.len())
 }
 
 fn artifact_size_matches(range: Option<&Range<u64>>, stream_size: u64) -> bool {
@@ -1379,7 +1259,9 @@ pub async fn cancel_owned_job(
             if matches!(&record.payload, JobPayload::Execution(_)) {
                 finalize_followups(context, job_id).await;
             }
-            sync_job_record(context, job_id).await;
+            if can_replicate_terminal(context, &record).await {
+                replicate_job_record(context, job_id).await;
+            }
             CancelJobOutcome::Requested(record)
         }
         CancelRequestOutcome::Flagged(record) => {
@@ -1388,6 +1270,24 @@ pub async fn cancel_owned_job(
             CancelJobOutcome::Requested(record)
         }
     })
+}
+
+async fn can_replicate_terminal(context: &DriverContext, record: &JobRecord) -> bool {
+    let Some(local_node) = context.net_handle.as_ref().map(|net| net.node_id()) else {
+        return false;
+    };
+    let runner = record
+        .claim
+        .as_ref()
+        .map_or(record.owner_node_id, |claim| claim.holder_node_id);
+    if runner == local_node {
+        return true;
+    }
+    resolve_job_holders(context, record.job_id)
+        .await
+        .is_ok_and(|route| {
+            route.holders.first().copied() == Some(local_node) && !route.holders.contains(&runner)
+        })
 }
 
 pub async fn cancel_job_routed(
@@ -1411,46 +1311,86 @@ pub async fn cancel_job_routed(
             })
             .map_err(JobRouteError::Internal);
     }
-    let owner = resolve_job_owner(context, user_id, job_id, auth_token.clone()).await?;
+    let route = resolve_job_holders(context, job_id).await?;
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    if Some(owner.node_id) == local_node {
-        return cancel_owned_job(context, runtime, user_id, job_id)
-            .await
-            .map(|outcome| match outcome {
-                CancelJobOutcome::NotFound => RoutedCancelOutcome::NotFound,
-                CancelJobOutcome::AlreadyTerminal(record) => {
-                    RoutedCancelOutcome::AlreadyTerminal(JobStatusView::from(&record))
+    let mut not_found = 0usize;
+    let mut freshest = None;
+    for holder in &route.holders {
+        if Some(*holder) == local_node {
+            match cancel_owned_job(context, runtime, user_id, job_id).await {
+                Ok(CancelJobOutcome::NotFound) => {
+                    not_found += 1;
+                    continue;
                 }
-                CancelJobOutcome::Requested(record) => {
-                    RoutedCancelOutcome::Requested(JobStatusView::from(&record))
+                Ok(CancelJobOutcome::AlreadyTerminal(record)) => {
+                    let job = JobStatusView::from(&record);
+                    if freshest
+                        .as_ref()
+                        .is_none_or(|(current, _): &(JobStatusView, bool)| {
+                            job.updated_at_ms > current.updated_at_ms
+                        })
+                    {
+                        freshest = Some((job, true));
+                    }
+                    continue;
                 }
-            })
-            .map_err(JobRouteError::Internal);
-    }
-    let reply = send_job_request(
-        context,
-        owner.node_id,
-        JobRequest::Cancel {
-            auth_token: auth_token.ok_or(JobRouteError::Unauthorized)?,
-            job_id,
-        },
-    )
-    .await?;
-    match reply.response {
-        JobResponse::Cancelled { job, terminal } if routed_job_matches(&job, user_id, job_id) => {
-            Ok(if terminal {
-                RoutedCancelOutcome::AlreadyTerminal(job)
-            } else {
-                RoutedCancelOutcome::Requested(job)
-            })
+                Ok(CancelJobOutcome::Requested(record)) => {
+                    let job = JobStatusView::from(&record);
+                    if freshest
+                        .as_ref()
+                        .is_none_or(|(current, _): &(JobStatusView, bool)| {
+                            job.updated_at_ms > current.updated_at_ms
+                        })
+                    {
+                        freshest = Some((job, false));
+                    }
+                    continue;
+                }
+                Err(_) => continue,
+            }
         }
-        JobResponse::Unauthorized => Err(JobRouteError::Unauthorized),
-        JobResponse::Forbidden => Err(JobRouteError::Forbidden),
-        JobResponse::NotFound => Ok(RoutedCancelOutcome::NotFound),
-        response => Err(JobRouteError::Unavailable(format!(
-            "job owner returned an unexpected cancel response: {response:?}"
-        ))),
+        let token = auth_token.clone().ok_or(JobRouteError::Unauthorized)?;
+        let reply = match send_job_request(
+            context,
+            *holder,
+            JobRequest::Cancel {
+                auth_token: token,
+                job_id,
+                config_digest: route.config_digest,
+            },
+        )
+        .await
+        {
+            Ok(reply) => reply,
+            Err(_) => continue,
+        };
+        match reply.response {
+            JobResponse::Cancelled { job, terminal }
+                if routed_job_matches(&job, user_id, job_id) =>
+            {
+                if freshest
+                    .as_ref()
+                    .is_none_or(|(current, _): &(JobStatusView, bool)| {
+                        job.updated_at_ms > current.updated_at_ms
+                    })
+                {
+                    freshest = Some((job, terminal));
+                }
+            }
+            JobResponse::Unauthorized => return Err(JobRouteError::Unauthorized),
+            JobResponse::Forbidden => return Err(JobRouteError::Forbidden),
+            JobResponse::NotFound => not_found += 1,
+            _ => {}
+        }
     }
+    if let Some((job, terminal)) = freshest {
+        return Ok(if terminal {
+            RoutedCancelOutcome::AlreadyTerminal(job)
+        } else {
+            RoutedCancelOutcome::Requested(job)
+        });
+    }
+    route_miss(not_found, route.holders.len())
 }
 
 fn routed_job_matches(job: &JobStatusView, user_id: UserId, job_id: JobId) -> bool {
@@ -1471,6 +1411,16 @@ fn report_job_matches(
 
 fn artifact_job_matches(artifact: &OwnedArtifact, user_id: UserId, job_id: JobId) -> bool {
     artifact.job_id == job_id && artifact.created_by == user_id
+}
+
+fn route_miss<T>(not_found: usize, holder_count: usize) -> Result<T, JobRouteError> {
+    if holder_count > 0 && not_found == holder_count {
+        Err(JobRouteError::NotFound)
+    } else {
+        Err(JobRouteError::Unavailable(
+            "no job-control holder returned an authoritative response".to_string(),
+        ))
+    }
 }
 
 async fn kick_drain(context: &DriverContext) {
@@ -1497,6 +1447,18 @@ mod tests {
 
     fn node_id() -> NodeId {
         iroh::SecretKey::from_bytes(&[7u8; 32]).public()
+    }
+
+    #[test]
+    fn miss_requires_all() {
+        assert!(matches!(
+            route_miss::<()>(3, 3),
+            Err(JobRouteError::NotFound)
+        ));
+        assert!(matches!(
+            route_miss::<()>(2, 3),
+            Err(JobRouteError::Unavailable(_))
+        ));
     }
 
     #[test]
