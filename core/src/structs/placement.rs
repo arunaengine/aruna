@@ -250,11 +250,9 @@ pub fn band_start(band: u32) -> u32 {
     FIRST_GRANTABLE_HANDLE + band * HANDLE_RANGE_SIZE
 }
 
-/// A coordinator's delegated slice of the band space. Pools form a causal
-/// delegation tree: the realm-creation root has no parent, and every other pool
-/// is carved by its `issuer` from a `parent` the issuer owns. Precedence is by
-/// lineage, never by `pool_id` wall-clock order, so replication reordering and
-/// clock skew cannot move a band's owner.
+/// A coordinator's delegated slice of the band space, forming a causal
+/// delegation tree (root has no parent; every child is carved by its `issuer`
+/// from a `parent` it owns). Precedence is by lineage, never `pool_id` order.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BandPool {
     pub pool_id: Ulid,
