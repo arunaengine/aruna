@@ -77,6 +77,12 @@ pub enum UserIndexError {
     Storage(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserIndexReservation {
+    pub job_id: JobId,
+    pub created: bool,
+}
+
 /// Schedule-index key by state: queued -> due/, claimed/running -> lease/, terminal -> prune/.
 fn job_schedule_key(record: &JobRecord) -> Key {
     match record.state {
@@ -739,7 +745,7 @@ pub async fn write_job_schedule(storage: &StorageHandle, record: &JobRecord) -> 
 pub async fn reserve_user_index(
     storage: &StorageHandle,
     record: &JobRecord,
-) -> Result<JobId, UserIndexError> {
+) -> Result<UserIndexReservation, UserIndexError> {
     for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
         let txn_id = start_write_txn(storage)
             .await
@@ -747,10 +753,18 @@ pub async fn reserve_user_index(
         match reserve_user_txn(storage, txn_id, record).await {
             Ok(Some(job_id)) => {
                 abort_txn(storage, txn_id).await;
-                return Ok(job_id);
+                return Ok(UserIndexReservation {
+                    job_id,
+                    created: false,
+                });
             }
             Ok(None) => match commit_txn(storage, txn_id).await {
-                CommitResult::Committed => return Ok(record.job_id),
+                CommitResult::Committed => {
+                    return Ok(UserIndexReservation {
+                        job_id: record.job_id,
+                        created: true,
+                    });
+                }
                 CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => {
                     tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
                 }
@@ -854,6 +868,12 @@ async fn reserve_user_txn(
 }
 
 pub async fn update_user_index(storage: &StorageHandle, record: &JobRecord) -> Result<(), String> {
+    if let Some(existing) = find_user_job(storage, record.created_by, record.job_id).await?
+        && (existing.owner_node_id != record.owner_node_id
+            || existing.created_at_ms != record.created_at_ms)
+    {
+        return Err("job owner index identity is immutable".to_string());
+    }
     let value = ByteView::from(record.to_bytes().map_err(|error| error.to_string())?);
     for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
         let txn_id = start_write_txn(storage).await?;
@@ -2063,6 +2083,16 @@ pub async fn list_jobs_for_user(
         }
         start_after = resume;
     }
+}
+
+pub(crate) async fn find_user_job(
+    storage: &StorageHandle,
+    user_id: UserId,
+    job_id: JobId,
+) -> Result<Option<JobRecord>, String> {
+    let (records, _) =
+        list_jobs_for_user(storage, user_id, None, 1, |record| record.job_id == job_id).await?;
+    Ok(records.into_iter().next())
 }
 
 pub async fn list_job_entries(
