@@ -4,11 +4,10 @@ use std::time::Duration;
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{JOB_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE};
+use aruna_core::keyspaces::JOB_SCHEDULE_INDEX_KEYSPACE;
 use aruna_core::structs::{
-    JOB_DUE_INDEX_PREFIX, JOB_LEASE_INDEX_PREFIX, JOB_RECORD_KEY_PREFIX, JobError,
-    JobExecutionClass, JobId, JobRecord, JobState, job_lease_index_key,
-    parse_job_schedule_index_key,
+    JOB_DUE_INDEX_PREFIX, JOB_LEASE_INDEX_PREFIX, JobError, JobExecutionClass, JobId, JobRecord,
+    job_lease_index_key, parse_job_schedule_index_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, NodeId};
@@ -18,11 +17,10 @@ use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use tracing::warn;
 
-use super::protocol::resolve_job_holders;
 use super::reconcile::ExternalReconciler;
 use super::store::{
-    ClaimOutcome, JobMutationError, RequeueOutcome, batch_delete, claim_job, decode_job_record,
-    first_schedule_entry, iter_prefix_page, read_job_record, requeue_job, write_job_schedule,
+    ClaimOutcome, JobMutationError, RequeueOutcome, batch_delete, claim_job, first_schedule_entry,
+    iter_prefix_page, read_job_record, requeue_job,
 };
 use super::{JOB_DRAIN_BATCH_SIZE, JOB_RECONCILE_REARM};
 use crate::driver::DriverContext;
@@ -81,7 +79,7 @@ pub async fn process_job_queue_batch(
     budget: JobClassBudget,
     reconciler: Option<&Arc<dyn ExternalReconciler>>,
 ) -> Result<JobDrainResult, String> {
-    process_job_batch(storage, holder_node_id, budget, reconciler, None).await
+    process_job_batch(storage, holder_node_id, budget, reconciler).await
 }
 
 pub async fn process_routed_queue(
@@ -94,15 +92,7 @@ pub async fn process_routed_queue(
         .as_ref()
         .map(|net| net.node_id())
         .ok_or_else(|| "job drain requires a network handle".to_string())?;
-    promote_passive_jobs(context, holder_node_id).await?;
-    process_job_batch(
-        &context.storage_handle,
-        holder_node_id,
-        budget,
-        reconciler,
-        Some(context),
-    )
-    .await
+    process_job_batch(&context.storage_handle, holder_node_id, budget, reconciler).await
 }
 
 async fn process_job_batch(
@@ -110,20 +100,11 @@ async fn process_job_batch(
     holder_node_id: NodeId,
     budget: JobClassBudget,
     reconciler: Option<&Arc<dyn ExternalReconciler>>,
-    route_context: Option<&DriverContext>,
 ) -> Result<JobDrainResult, String> {
     let now_ms = unix_timestamp_millis();
     let mut result = JobDrainResult::default();
 
-    claim_due_jobs(
-        storage,
-        holder_node_id,
-        now_ms,
-        budget,
-        &mut result,
-        route_context,
-    )
-    .await?;
+    claim_due_jobs(storage, holder_node_id, now_ms, budget, &mut result).await?;
 
     if !result.retry_after_error {
         let mut start_after = None;
@@ -141,6 +122,25 @@ async fn process_job_batch(
                     let expired_count = expired_leases.len();
                     let reconciled_before = result.reconciled;
                     for (ts, job_id) in expired_leases {
+                        match read_job_record(storage, job_id, None).await {
+                            Ok(Some(record)) if record.owner_node_id != holder_node_id => {
+                                if let Err(error) =
+                                    delete_schedule_row(storage, job_lease_index_key(ts, job_id))
+                                        .await
+                                {
+                                    warn!(job_id = %job_id, error = %error, "Failed to drop non-owner job lease row");
+                                    result.retry_after_error = true;
+                                    break;
+                                }
+                                continue;
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                warn!(job_id = %job_id, error = %error, "Failed to read leased job owner");
+                                result.retry_after_error = true;
+                                break;
+                            }
+                        }
                         match requeue_job(
                             storage,
                             job_id,
@@ -214,50 +214,6 @@ async fn process_job_batch(
     Ok(result)
 }
 
-async fn promote_passive_jobs(
-    context: &DriverContext,
-    holder_node_id: NodeId,
-) -> Result<(), String> {
-    let mut start_after = None;
-    loop {
-        let (values, next) = iter_prefix_page(
-            &context.storage_handle,
-            JOB_KEYSPACE,
-            Some(ByteView::from(JOB_RECORD_KEY_PREFIX.to_vec())),
-            start_after,
-            JOB_DRAIN_BATCH_SIZE,
-            None,
-        )
-        .await?;
-        for (_, value) in values {
-            let Ok(record) = decode_job_record(value.as_ref()) else {
-                continue;
-            };
-            if record.state != JobState::Queued {
-                continue;
-            }
-            let route = resolve_job_holders(context, record.job_id)
-                .await
-                .map_err(|error| error.to_string())?;
-            if route.holders.first().copied() != Some(holder_node_id) {
-                continue;
-            }
-            let runner = record
-                .claim
-                .as_ref()
-                .map_or(record.owner_node_id, |claim| claim.holder_node_id);
-            if route.holders.contains(&runner) {
-                continue;
-            }
-            write_job_schedule(&context.storage_handle, &record).await?;
-        }
-        match next {
-            Some(next) => start_after = Some(next),
-            None => return Ok(()),
-        }
-    }
-}
-
 /// Walk the due head, claiming each job against its own class budget. A job whose
 /// class is saturated is skipped without a write: claiming it would only release it
 /// again, churning storage while the drain re-arms at zero.
@@ -267,7 +223,6 @@ async fn claim_due_jobs(
     now_ms: u64,
     mut budget: JobClassBudget,
     result: &mut JobDrainResult,
-    route_context: Option<&DriverContext>,
 ) -> Result<(), String> {
     if budget.is_empty() {
         result.deferred_saturated = true;
@@ -332,18 +287,13 @@ async fn claim_due_jobs(
                     break 'pages;
                 }
             };
-            if let Some(context) = route_context {
-                let route = match resolve_job_holders(context, job_id).await {
-                    Ok(route) => route,
-                    Err(error) => {
-                        warn!(job_id = %job_id, error = %error, "Failed to resolve job runner");
-                        result.retry_after_error = true;
-                        break 'pages;
-                    }
-                };
-                if route.holders.first().copied() != Some(holder_node_id) {
-                    continue;
+            if record.owner_node_id != holder_node_id {
+                if let Err(error) = delete_schedule_row(storage, key).await {
+                    warn!(job_id = %job_id, error = %error, "Failed to drop non-owner job schedule row");
+                    result.retry_after_error = true;
+                    break 'pages;
                 }
+                continue;
             }
             let class = record.execution_class;
             if budget.remaining(class) == 0 {

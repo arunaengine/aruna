@@ -712,23 +712,6 @@ pub async fn read_job_record(
     }
 }
 
-/// Stores a readable replica without making it visible to the local drain.
-pub async fn write_passive_record(
-    storage: &StorageHandle,
-    record: &JobRecord,
-) -> Result<(), String> {
-    batch_write(
-        storage,
-        vec![(
-            JOB_KEYSPACE.to_string(),
-            job_record_key(record.job_id),
-            ByteView::from(record.to_bytes().map_err(|error| error.to_string())?),
-        )],
-        None,
-    )
-    .await
-}
-
 pub async fn write_job_schedule(storage: &StorageHandle, record: &JobRecord) -> Result<(), String> {
     batch_write(
         storage,

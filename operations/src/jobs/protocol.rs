@@ -28,9 +28,7 @@ use super::service::{
     cancel_owned_job, read_artifact_range, read_job_run_crate_status, read_owned_artifact,
     read_owned_job, read_owned_report, submit_local_job,
 };
-use super::store::{
-    UserIndexError, list_jobs_for_user, reserve_user_index, update_user_index, write_passive_record,
-};
+use super::store::{UserIndexError, list_jobs_for_user, reserve_user_index, update_user_index};
 use super::submit::{SubmitJobError, SubmitJobResult, SubmitJobSpec};
 use crate::driver::DriverContext;
 use crate::metadata::api::load_realm_config;
@@ -74,11 +72,6 @@ pub(crate) enum JobRequest {
         spec: SubmitJobSpec,
         config_digest: [u8; 32],
     },
-    Replicate {
-        auth_token: MetadataAuthToken,
-        record: JobRecord,
-        config_digest: [u8; 32],
-    },
     Locate {
         auth_token: MetadataAuthToken,
         job_id: JobId,
@@ -111,7 +104,6 @@ impl JobRequest {
             Self::Index { auth_token, .. }
             | Self::List { auth_token, .. }
             | Self::Submit { auth_token, .. }
-            | Self::Replicate { auth_token, .. }
             | Self::Locate { auth_token, .. }
             | Self::Status { auth_token, .. }
             | Self::Report { auth_token, .. }
@@ -124,7 +116,6 @@ impl JobRequest {
         match self {
             Self::Index { .. } | Self::List { .. } => None,
             Self::Submit { job_id, .. } => Some(*job_id),
-            Self::Replicate { record, .. } => Some(record.job_id),
             Self::Locate { job_id, .. }
             | Self::Status { job_id, .. }
             | Self::Report { job_id, .. }
@@ -145,8 +136,7 @@ impl JobRequest {
         match self {
             Self::Index { config_digest, .. }
             | Self::List { config_digest, .. }
-            | Self::Submit { config_digest, .. }
-            | Self::Replicate { config_digest, .. } => Some(*config_digest),
+            | Self::Submit { config_digest, .. } => Some(*config_digest),
             Self::Locate { .. }
             | Self::Status { .. }
             | Self::Report { .. }
@@ -226,7 +216,6 @@ pub(crate) enum JobResponse {
     Submitted(SubmitJobResult),
     SubmitConflict(JobId),
     SubmitCap(u32),
-    Replicated,
     Status {
         job: JobStatusView,
         run_crate: Option<String>,
@@ -617,9 +606,6 @@ async fn prepare_response(
             }
             prepare_submit(context, auth.user_id, job_id, spec).await
         }
-        JobRequest::Replicate { record, .. } => {
-            prepare_replicate(context, auth.user_id, record).await
-        }
         JobRequest::Locate { .. }
         | JobRequest::Status { .. }
         | JobRequest::Report { .. }
@@ -735,20 +721,6 @@ async fn prepare_submit(
         Err(error) => JobResponse::Unavailable(error.to_string()),
     };
     PreparedResponse::new(response)
-}
-
-async fn prepare_replicate(
-    context: &DriverContext,
-    user_id: UserId,
-    record: JobRecord,
-) -> PreparedResponse {
-    if record.created_by != user_id {
-        return PreparedResponse::new(JobResponse::Forbidden);
-    }
-    match write_passive_record(&context.storage_handle, &record).await {
-        Ok(()) => PreparedResponse::new(JobResponse::Replicated),
-        Err(error) => PreparedResponse::new(JobResponse::Unavailable(error)),
-    }
 }
 
 fn auth_realm_matches(auth: &AuthContext, realm_id: RealmId) -> bool {

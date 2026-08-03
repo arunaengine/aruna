@@ -43,7 +43,7 @@ use crate::group_backends::remove::remove_drained_backends;
 use crate::jobs::drain::{JobClassBudget, process_routed_queue, restore_job_queue_timer};
 use crate::jobs::prune::{process_job_prune_batch, restore_job_prune_timer};
 use crate::jobs::runtime::JobsRuntime;
-use crate::jobs::service::replicate_job_record;
+use crate::jobs::service::sync_job_record;
 use crate::jobs::store::release_job;
 use crate::jobs::{JOB_DRAIN_RETRY_AFTER, JOB_PRUNE_POLL_AFTER, JOB_PRUNE_RETRY_AFTER};
 use crate::metadata::materialization_queue::{
@@ -1721,7 +1721,7 @@ impl OperationsTaskHandler {
         };
 
         for record in &result.terminal {
-            replicate_job_record(&self.context, record.job_id).await;
+            sync_job_record(&self.context, record.job_id).await;
         }
 
         for record in result.claimed {

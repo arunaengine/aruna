@@ -198,7 +198,7 @@ pub(crate) async fn submit_local_job(
         SubmitJobOperation::new(spec, job_id)
     };
     let result = drive(operation, context).await?;
-    replicate_job_record(context, result.job_id).await;
+    sync_job_record(context, result.job_id).await;
     if result.created {
         kick_drain(context).await;
     }
@@ -692,15 +692,15 @@ async fn verify_job_owner(
     }
 }
 
-pub(crate) async fn replicate_job_record(context: &DriverContext, job_id: JobId) {
+pub(crate) async fn sync_job_record(context: &DriverContext, job_id: JobId) {
     let record = match read_job_record(&context.storage_handle, job_id, None).await {
         Ok(Some(record)) => record,
         Ok(None) => {
-            warn!(job_id = %job_id, "Cannot replicate a missing job record");
+            warn!(job_id = %job_id, "Cannot sync a missing job record");
             return;
         }
         Err(error) => {
-            warn!(job_id = %job_id, error = %error, "Failed to read job for replication");
+            warn!(job_id = %job_id, error = %error, "Failed to read job for index sync");
             return;
         }
     };
@@ -708,43 +708,6 @@ pub(crate) async fn replicate_job_record(context: &DriverContext, job_id: JobId)
         return;
     }
     sync_user_record(context, &record).await;
-    let route = match resolve_job_holders(context, job_id).await {
-        Ok(route) => route,
-        Err(error) => {
-            warn!(job_id = %job_id, error = %error, "Failed to resolve job replicas");
-            return;
-        }
-    };
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    let auth_token = MetadataAuthToken::internal(AuthContext {
-        user_id: record.created_by,
-        realm_id: record.created_by.realm_id,
-        path_restrictions: None,
-    });
-    for holder in route.holders {
-        if Some(holder) == local_node {
-            continue;
-        }
-        match send_job_request(
-            context,
-            holder,
-            JobRequest::Replicate {
-                auth_token: auth_token.clone(),
-                record: record.clone(),
-                config_digest: route.config_digest,
-            },
-        )
-        .await
-        {
-            Ok(reply) if matches!(reply.response, JobResponse::Replicated) => {}
-            Ok(reply) => {
-                warn!(job_id = %job_id, %holder, response = ?reply.response, "Job replica was rejected")
-            }
-            Err(error) => {
-                warn!(job_id = %job_id, %holder, error = %error, "Failed to replicate job record")
-            }
-        }
-    }
 }
 
 async fn sync_user_record(context: &DriverContext, record: &JobRecord) {
@@ -1367,9 +1330,7 @@ pub async fn cancel_owned_job(
             if matches!(&record.payload, JobPayload::Execution(_)) {
                 finalize_followups(context, job_id).await;
             }
-            if can_replicate_terminal(context, &record).await {
-                replicate_job_record(context, job_id).await;
-            }
+            sync_job_record(context, job_id).await;
             CancelJobOutcome::Requested(record)
         }
         CancelRequestOutcome::Flagged(record) => {
@@ -1378,24 +1339,6 @@ pub async fn cancel_owned_job(
             CancelJobOutcome::Requested(record)
         }
     })
-}
-
-async fn can_replicate_terminal(context: &DriverContext, record: &JobRecord) -> bool {
-    let Some(local_node) = context.net_handle.as_ref().map(|net| net.node_id()) else {
-        return false;
-    };
-    let runner = record
-        .claim
-        .as_ref()
-        .map_or(record.owner_node_id, |claim| claim.holder_node_id);
-    if runner == local_node {
-        return true;
-    }
-    resolve_job_holders(context, record.job_id)
-        .await
-        .is_ok_and(|route| {
-            route.holders.first().copied() == Some(local_node) && !route.holders.contains(&runner)
-        })
 }
 
 pub async fn cancel_job_routed(
