@@ -36,7 +36,6 @@ use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, read_job_routed, read_owned_job, submit_execution_job,
 };
 use aruna_operations::jobs::store::read_job_pointer;
-use aruna_operations::placement::shard_subject_bytes;
 use aruna_operations::metadata::MetadataAuthToken;
 use aruna_operations::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, MetadataApiQueryMode,
@@ -47,6 +46,7 @@ use aruna_operations::metadata::forward::{
     origin_holds_document, update_metadata_document_routed,
 };
 use aruna_operations::metadata::projector::replay_metadata_event_log;
+use aruna_operations::placement::shard_subject_bytes;
 use aruna_operations::sync_placement::sort_node_ids;
 use aruna_operations::update_metadata_document::UpdateMetadataDocumentMutation;
 use ulid::Ulid;
@@ -79,10 +79,7 @@ fn execution_spec(seed: u8) -> ExecutionSpec {
 
 /// The stamped placement of a job-control id, verified against the reserved
 /// binding, so holder assertions run against what the submit actually used.
-fn job_placement(
-    realm: &Topology,
-    job_id: aruna_core::structs::JobId,
-) -> TestResult<PlacementRef> {
+fn job_placement(realm: &Topology, job_id: aruna_core::structs::JobId) -> TestResult<PlacementRef> {
     let routable = job_id.as_routable()?;
     assert_eq!(routable.placement_handle().get(), JOBCONTROL_HANDLE);
     let binding = realm
@@ -297,7 +294,10 @@ async fn swap_keeps_owner() -> TestResult<()> {
         });
     realm.apply_config(config).await?;
     let swapped = realm.holders(&placement);
-    assert!(!swapped.contains(&owner_id), "the owner left the holder set");
+    assert!(
+        !swapped.contains(&owner_id),
+        "the owner left the holder set"
+    );
 
     let new_rank0 = realm.find(swapped[0]);
     let result = process_job_queue_batch(
@@ -316,14 +316,13 @@ async fn swap_keeps_owner() -> TestResult<()> {
     );
 
     let owner = realm.find(owner_id);
-    let result = process_job_queue_batch(
-        &owner.context.storage_handle,
-        owner_id,
-        JOB_BUDGET,
-        None,
-    )
-    .await?;
-    assert_eq!(result.claimed.len(), 1, "the swap must not strand the owner");
+    let result =
+        process_job_queue_batch(&owner.context.storage_handle, owner_id, JOB_BUDGET, None).await?;
+    assert_eq!(
+        result.claimed.len(),
+        1,
+        "the swap must not strand the owner"
+    );
     assert_eq!(result.claimed[0].job_id, submitted.job_id);
 
     // Cancellation from the new rank-0 reaches only the owner.
@@ -406,9 +405,11 @@ async fn owner_down_unavailable() -> TestResult<()> {
         "owner-down cancel must be unavailable, not a passive terminalization"
     );
 
-    for node in realm.nodes.iter().filter(|node| {
-        node.is_sync_eligible() && node.node_id() != owner_id
-    }) {
+    for node in realm
+        .nodes
+        .iter()
+        .filter(|node| node.is_sync_eligible() && node.node_id() != owner_id)
+    {
         let result = process_job_queue_batch(
             &node.context.storage_handle,
             node.node_id(),

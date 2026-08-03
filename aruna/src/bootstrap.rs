@@ -246,7 +246,10 @@ fn node_is_ready(config: &aruna_core::structs::RealmConfigDocument, node_id: Nod
     // range behind, and the re-probed replacement is what makes the node ready.
     config.has_node(node_id)
         && config.placement_entry(node_id).is_some()
-        && !config.handle_range_directory().granted_to(&node_id).is_empty()
+        && !config
+            .handle_range_directory()
+            .granted_to(&node_id)
+            .is_empty()
 }
 
 async fn load_realm_config(
