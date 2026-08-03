@@ -5040,7 +5040,7 @@ mod tests {
         assert_eq!(directory.conflicts(), 0);
         assert_eq!(directory.granted_to(&owner).len(), 2);
         assert_eq!(
-            directory.first_free_band_from(FIRST_GRANTABLE_HANDLE),
+            directory.free_band_from(FIRST_GRANTABLE_HANDLE),
             Some((2051, 3075))
         );
     }

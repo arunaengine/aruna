@@ -223,7 +223,7 @@ impl EnsureRealmConfigOperation {
             ([], []) => {
                 let (start, end) = document
                     .handle_range_directory()
-                    .first_free_band_from(owner_handle_band(&self.config.target_node_id).0)
+                    .free_band_from(owner_handle_band(&self.config.target_node_id).0)
                     .ok_or(EnsureRealmConfigError::HandleSpaceExhausted)?;
                 HandleRange {
                     range_id: Ulid::generate(),
