@@ -92,8 +92,7 @@ async fn scan_jobs(
     let mut referenced = HashSet::new();
     let mut start_after = None;
     loop {
-        // Records only: the keyspace also holds owner pointers under their own
-        // prefix, which do not decode as job records.
+        // Scan the versioned record prefix only.
         let (values, next) = iter_prefix_page(
             storage,
             JOB_KEYSPACE,
