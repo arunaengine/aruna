@@ -375,7 +375,7 @@ pub(crate) fn map_job_route(error: JobRouteError) -> ServerError {
         JobRouteError::Forbidden => ServerError::Forbidden,
         JobRouteError::NotFound => ServerError::NotFound,
         JobRouteError::Unavailable(_) => {
-            ServerError::ServiceUnavailableReason("job_holder_unavailable".to_string())
+            ServerError::ServiceUnavailableReason("job_owner_unavailable".to_string())
         }
         JobRouteError::Internal(error) => ServerError::InternalError(error),
     }
@@ -514,7 +514,7 @@ fn validate_output_prefixes(prefixes: Vec<String>) -> ServerResult<Vec<String>> 
         ("state" = Option<String>, Query, description = "Optional state filter")
     ),
     responses(
-        (status = 200, description = "Jobs page", body = JobListResponse),
+        (status = 200, description = "Node-local jobs page; jobs owned by other nodes are omitted", body = JobListResponse),
         (status = 400, description = "Invalid cursor or state", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse)
     ),
@@ -689,7 +689,7 @@ pub async fn submit_job(
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Realm access forbidden", body = ErrorResponse),
         (status = 404, description = "Job not found", body = ErrorResponse),
-        (status = 503, description = "Job holder unavailable", body = ErrorResponse)
+        (status = 503, description = "Job owner unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -772,7 +772,7 @@ fn decode_report_row(
         (status = 403, description = "Realm access forbidden", body = ErrorResponse),
         (status = 404, description = "Job not found or report pending", body = ReportUnavailableResponse),
         (status = 409, description = "Cursor does not match this frozen report", body = ErrorResponse),
-        (status = 503, description = "Job holder unavailable", body = ErrorResponse)
+        (status = 503, description = "Job owner unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1025,13 +1025,13 @@ async fn artifact_response(
             ArtifactLookup::Ready(current) if owned.same_content(&current) => {
                 read.ok_or_else(|| {
                     ServerError::InternalError(
-                        "artifact holder omitted the response body".to_string(),
+                        "artifact owner omitted the response body".to_string(),
                     )
                 })?
             }
             ArtifactLookup::Ready(_) => {
                 return Err(ServerError::ServiceUnavailableReason(
-                    "job_holder_unavailable".to_string(),
+                    "job_owner_unavailable".to_string(),
                 ));
             }
             ArtifactLookup::NotFound => return Err(ServerError::NotFound),
@@ -1086,7 +1086,7 @@ async fn artifact_response(
         (status = 404, description = "Artifact not found or pending", body = ErrorResponse),
         (status = 410, description = "Artifact expired", body = ErrorResponse),
         (status = 416, description = "Range not satisfiable", body = ErrorResponse),
-        (status = 503, description = "Job holder unavailable", body = ErrorResponse)
+        (status = 503, description = "Job owner unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1117,7 +1117,7 @@ pub async fn get_job_artifact(
         (status = 404, description = "Artifact not found or pending", body = ErrorResponse),
         (status = 410, description = "Artifact expired", body = ErrorResponse),
         (status = 416, description = "Range not satisfiable", body = ErrorResponse),
-        (status = 503, description = "Job holder unavailable", body = ErrorResponse)
+        (status = 503, description = "Job owner unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1143,7 +1143,7 @@ pub async fn head_job_artifact(
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Realm access forbidden", body = ErrorResponse),
         (status = 404, description = "Job not found", body = ErrorResponse),
-        (status = 503, description = "Job holder unavailable", body = ErrorResponse)
+        (status = 503, description = "Job owner unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

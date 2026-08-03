@@ -517,7 +517,8 @@ pub async fn create_task(
         (status = 200, body = TesTask),
         (status = 400, body = TesErrorPayload),
         (status = 401, body = TesErrorPayload),
-        (status = 404, body = TesErrorPayload)
+        (status = 404, body = TesErrorPayload),
+        (status = 503, body = TesErrorPayload)
     ),
     security(("bearer_auth" = []), ("basic_auth" = []))
 )]
@@ -576,7 +577,7 @@ pub async fn get_task(
         ("tag_value" = Vec<String>, Query, description = "Repeated tag values")
     ),
     responses(
-        (status = 200, body = TesListTasksResponse),
+        (status = 200, description = "Node-local tasks page; tasks owned by other nodes are omitted", body = TesListTasksResponse),
         (status = 400, body = TesErrorPayload),
         (status = 401, body = TesErrorPayload)
     ),
@@ -647,7 +648,8 @@ pub async fn list_tasks(
     responses(
         (status = 200, description = "Cancellation requested"),
         (status = 401, body = TesErrorPayload),
-        (status = 404, body = TesErrorPayload)
+        (status = 404, body = TesErrorPayload),
+        (status = 503, body = TesErrorPayload)
     ),
     security(("bearer_auth" = []), ("basic_auth" = []))
 )]

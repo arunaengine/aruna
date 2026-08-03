@@ -41,7 +41,7 @@ pub use aruna_core::jobs::{JobKind, JobReportView, JobStatusView};
 
 /// Mints a JobId whose handle is the serving node's JobControl handle, so the
 /// owner is encoded in the id itself. The bucket is a local queue shard only;
-/// it never selects a remote holder.
+/// it never selects a remote owner.
 async fn mint_local_job(
     context: &DriverContext,
     realm_id: RealmId,
@@ -422,7 +422,7 @@ async fn route_record(
 
 /// Derives the immutable owner from the JobId alone: replicated placement
 /// state is the only input, so resolution never asks another node and can
-/// never be stranded by a holder rebalance. A missing or unsynced binding is
+/// never be stranded by a placement rebalance. A missing or unsynced binding is
 /// `Unavailable` (503); only a provably invalid id maps to `NotFound`.
 pub(crate) async fn resolve_job_owner(
     context: &DriverContext,

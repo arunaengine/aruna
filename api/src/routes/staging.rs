@@ -535,7 +535,7 @@ pub async fn submit_staging(
         ("cursor" = Option<String>, Query, description = "Opaque pagination cursor from a previous page")
     ),
     responses(
-        (status = 200, description = "Staging jobs", body = StagingJobListResponse),
+        (status = 200, description = "Node-local staging jobs; jobs owned by other nodes are omitted", body = StagingJobListResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -582,7 +582,8 @@ pub async fn list_staging_jobs(
     responses(
         (status = 200, description = "Staging job", body = StagingJobResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 404, description = "Not found", body = ErrorResponse)
+        (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 503, description = "Job owner unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

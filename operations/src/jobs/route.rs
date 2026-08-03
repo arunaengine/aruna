@@ -26,10 +26,8 @@ enum RouteState {
     Done,
 }
 
-/// Sans-I/O job-control routing: load the realm config, derive the immutable
-/// owner from the JobId (pure), then resolve locally or round-trip the request
-/// to the owner. `request` is `None` when the caller sent no token; a remote
-/// owner then answers `Unauthorized`, a local owner needs none.
+/// Loads the realm config, derives the immutable owner from the JobId, then
+/// resolves locally or emits a request. A remote request requires a token.
 #[derive(Debug, PartialEq)]
 pub(crate) struct JobRouteOperation {
     realm_id: RealmId,
@@ -75,10 +73,7 @@ impl JobRouteOperation {
                 Some(request) => {
                     self.state = RouteState::AwaitResponse;
                     smallvec![Effect::Net(NetEffect::JobControl(Box::new(
-                        JobControlEffect {
-                            holder: owner,
-                            request,
-                        }
+                        JobControlEffect { owner, request }
                     )))]
                 }
                 None => self.finish(Err(JobRouteError::Unauthorized)),
@@ -243,7 +238,7 @@ mod tests {
     // The remote path emits exactly one JobControl effect, then the response
     // becomes the operation output; no I/O runs inside start/step.
     #[test]
-    fn remote_routes_via_effect() {
+    fn remote_routes_effect() {
         let realm_id = RealmId([1u8; 32]);
         let (config, job_id) = owned_job(realm_id, node(7));
         let request = JobRequest::Status {
@@ -261,7 +256,7 @@ mod tests {
         let [Effect::Net(NetEffect::JobControl(job_control))] = effects.as_slice() else {
             panic!("remote owner must emit one job-control effect");
         };
-        assert_eq!(job_control.holder, node(7));
+        assert_eq!(job_control.owner, node(7));
 
         let response = JobResponse::Status {
             job: status_view(job_id, user(realm_id)),

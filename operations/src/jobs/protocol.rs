@@ -43,7 +43,7 @@ pub enum JobRouteError {
     Forbidden,
     #[error("job not found")]
     NotFound,
-    #[error("job holder unavailable: {0}")]
+    #[error("job owner unavailable: {0}")]
     Unavailable(String),
     #[error("job operation failed: {0}")]
     Internal(String),
@@ -81,7 +81,7 @@ pub(crate) struct RemoteJobReply {
 
 pub(crate) async fn send_job_request(
     context: &DriverContext,
-    holder: NodeId,
+    owner: NodeId,
     request: JobRequest,
 ) -> Result<RemoteJobReply, JobRouteError> {
     let net_handle = context
@@ -90,7 +90,7 @@ pub(crate) async fn send_job_request(
         .ok_or_else(|| JobRouteError::Unavailable("network handle unavailable".to_string()))?;
     let expects_body = matches!(request, JobRequest::Artifact { range: Some(_), .. });
     let mut stream = net_handle
-        .open_stream(holder, Alpn::JobControl)
+        .open_stream(owner, Alpn::JobControl)
         .await
         .map_err(|error| JobRouteError::Unavailable(error.to_string()))?;
     timeout(JOB_IO_TIMEOUT, write_frame(&mut stream.0, &request))

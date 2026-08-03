@@ -417,8 +417,8 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
 /// owner's reply; an unreachable owner is reported so the routing operation can
 /// map it to `Unavailable` (503). The artifact body path stays out of band.
 async fn dispatch_job_control(effect: JobControlEffect, context: &DriverContext) -> Event {
-    let JobControlEffect { holder, request } = effect;
-    let event = match crate::jobs::protocol::send_job_request(context, holder, request).await {
+    let JobControlEffect { owner, request } = effect;
+    let event = match crate::jobs::protocol::send_job_request(context, owner, request).await {
         Ok(reply) => JobControlEvent::Response(Box::new(reply.response)),
         Err(error) => JobControlEvent::Unavailable(error.to_string()),
     };

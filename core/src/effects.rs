@@ -247,7 +247,7 @@ pub enum NetEffect {
 /// the frame round-trip; the routing operation only emits this.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JobControlEffect {
-    pub holder: NodeId,
+    pub owner: NodeId,
     pub request: JobRequest,
 }
 
