@@ -6,9 +6,10 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{JOB_KEYSPACE, ROCRATE_JOB_STATE_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE};
 use aruna_core::structs::{
-    BackendLocation, HiddenBlobEntry, HiddenBlobKey, JobId, JobRecord, JobResultPayload,
-    RoCrateCheckpointRefs, RoCrateUploadRecord,
+    BackendLocation, HiddenBlobEntry, HiddenBlobKey, JOB_RECORD_KEY_PREFIX, JobId, JobRecord,
+    JobResultPayload, RoCrateCheckpointRefs, RoCrateUploadRecord,
 };
+use byteview::ByteView;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Key;
 use aruna_core::util::unix_timestamp_millis;
@@ -91,10 +92,12 @@ async fn scan_jobs(
     let mut referenced = HashSet::new();
     let mut start_after = None;
     loop {
+        // Records only: the keyspace also holds owner pointers under their own
+        // prefix, which do not decode as job records.
         let (values, next) = iter_prefix_page(
             storage,
             JOB_KEYSPACE,
-            None,
+            Some(ByteView::from(JOB_RECORD_KEY_PREFIX.to_vec())),
             start_after.take(),
             SWEEP_PAGE_SIZE,
             None,
