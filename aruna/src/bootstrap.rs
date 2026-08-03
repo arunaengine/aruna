@@ -433,7 +433,7 @@ mod tests {
         config
             .placement_handle_ranges
             .push(aruna_core::structs::HandleRange {
-                range_id: Ulid::from_bytes([3; 16]),
+                range_id: ulid::Ulid::from_bytes([3; 16]),
                 owner: node_id,
                 start: aruna_core::structs::FIRST_GRANTABLE_HANDLE,
                 end: aruna_core::structs::FIRST_GRANTABLE_HANDLE

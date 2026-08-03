@@ -17,7 +17,9 @@ use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
 };
-use aruna_core::structs::{Actor, HandleRange, RealmConfigDocument, RealmNodeKind};
+use aruna_core::structs::{
+    Actor, HandleRange, RealmConfigDocument, RealmNodeKind, owner_handle_band,
+};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
@@ -221,7 +223,7 @@ impl EnsureRealmConfigOperation {
             ([], []) => {
                 let (start, end) = document
                     .handle_range_directory()
-                    .next_free_band()
+                    .first_free_band_from(owner_handle_band(&self.config.target_node_id).0)
                     .ok_or(EnsureRealmConfigError::HandleSpaceExhausted)?;
                 HandleRange {
                     range_id: Ulid::generate(),
@@ -570,8 +572,9 @@ mod tests {
     use aruna_core::operation::Operation;
     use aruna_core::storage_entries::admin_document_reducer_conflict_key;
     use aruna_core::structs::{
-        Actor, BindingScope, DocumentClass, NodePlacementEntry, PlacementOverride,
-        PlacementStrategy, RealmConfigDocument, RealmId, RealmNodeKind, StrategyBinding,
+        Actor, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange,
+        NodePlacementEntry, PlacementOverride, PlacementStrategy, RealmConfigDocument, RealmId,
+        RealmNodeKind, StrategyBinding,
     };
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::{Effects, Key, KeySpace, TxnId, UserId, Value};
@@ -753,8 +756,26 @@ mod tests {
                 },
             })
             .unwrap();
+        let range = HandleRange {
+            range_id: Ulid::from_bytes([11; 16]),
+            owner: actor.node_id,
+            start: FIRST_GRANTABLE_HANDLE,
+            end: FIRST_GRANTABLE_HANDLE + HANDLE_RANGE_SIZE,
+        };
+        previous_state
+            .apply(&AdminDocumentEvent {
+                event_id: Ulid::from_bytes([11; 16]),
+                target: AdminDocumentTarget::RealmConfig { realm_id },
+                origin_node_id: actor.node_id,
+                origin_seq: 2,
+                observed: AdminDocumentClock::default(),
+                actor: actor.clone(),
+                op: AdminDocumentOperation::RealmConfigHandleRangeGranted { range },
+            })
+            .unwrap();
         let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         document.ensure_node(actor.node_id, RealmNodeKind::Management);
+        document.placement_handle_ranges.push(range);
 
         let mut operation = EnsureRealmConfigOperation::new(config(actor.clone(), 3));
         let txn_id = TxnId::generate();

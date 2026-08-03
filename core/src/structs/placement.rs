@@ -251,6 +251,19 @@ pub const HANDLE_RANGE_SIZE: u32 = 1024;
 /// Disjoint node bands in the assignable handle space.
 pub const HANDLE_BANDS: u32 = (HANDLE_SPACE_END - FIRST_GRANTABLE_HANDLE) / HANDLE_RANGE_SIZE;
 
+/// The hash-derived band a node prefers. Onboarding probes on from here to the
+/// first free band, so two nodes collide only on a rare hash clash, which the
+/// fail-closed range directory then backstops.
+pub fn owner_handle_band(owner: &NodeId) -> (u32, u32) {
+    let mut input = b"aruna-handle-band-v1".to_vec();
+    input.extend_from_slice(owner.as_bytes());
+    let mut head = [0u8; 4];
+    head.copy_from_slice(&blake3::hash(&input).as_bytes()[..4]);
+    let lane = u32::from_be_bytes(head) % HANDLE_BANDS;
+    let start = FIRST_GRANTABLE_HANDLE + lane * HANDLE_RANGE_SIZE;
+    (start, start + HANDLE_RANGE_SIZE)
+}
+
 /// Durable `[start, end)` handle slice granted to one node.
 /// Intersecting grants fail closed in the derived range directory.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

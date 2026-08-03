@@ -84,9 +84,13 @@ impl HandleRangeDirectory {
             .filter(|range| range.owner == *owner)
     }
 
-    /// First canonical band that has never intersected a stored grant.
-    pub fn next_free_band(&self) -> Option<(u32, u32)> {
-        (0..HANDLE_BANDS).find_map(|index| {
+    /// First free band at or after the band holding `preferred_start`, wrapping.
+    /// A band is free when it intersects no stored grant; `None` means the whole
+    /// assignable space is occupied.
+    pub fn first_free_band_from(&self, preferred_start: u32) -> Option<(u32, u32)> {
+        let preferred = preferred_start.saturating_sub(FIRST_GRANTABLE_HANDLE) / HANDLE_RANGE_SIZE;
+        (0..HANDLE_BANDS).find_map(|offset| {
+            let index = (preferred + offset) % HANDLE_BANDS;
             let start = FIRST_GRANTABLE_HANDLE + index * HANDLE_RANGE_SIZE;
             let end = start + HANDLE_RANGE_SIZE;
             (!self
@@ -165,7 +169,7 @@ mod tests {
         assert_eq!(directory.granted_to(&left).len(), 1);
         assert_eq!(directory.granted_to(&right).len(), 1);
         assert_eq!(
-            directory.next_free_band(),
+            directory.first_free_band_from(FIRST_GRANTABLE_HANDLE),
             Some((re, re + HANDLE_RANGE_SIZE))
         );
     }
@@ -186,7 +190,10 @@ mod tests {
         let directory = HandleRangeDirectory::from_ranges(&ranges);
         assert_eq!(directory.conflicts(), 0);
         assert_eq!(directory.granted_to(&owner).len(), 2);
-        assert_eq!(directory.next_free_band(), Some((2051, 3075)));
+        assert_eq!(
+            directory.first_free_band_from(FIRST_GRANTABLE_HANDLE),
+            Some((2051, 3075))
+        );
     }
 
     #[test]
@@ -211,7 +218,10 @@ mod tests {
 
         assert_eq!(directory.conflicts(), 2);
         assert!(directory.granted_to(&owner).is_empty());
-        assert_eq!(directory.next_free_band(), Some((2051, 3075)));
+        assert_eq!(
+            directory.first_free_band_from(FIRST_GRANTABLE_HANDLE),
+            Some((3075, 4099))
+        );
     }
 
     #[test]
