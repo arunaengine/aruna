@@ -88,8 +88,6 @@ pub enum EnsureRealmConfigError {
     RealmConfigNotFound,
     #[error("realm config node {node_id} already exists with a different kind")]
     NodeKindMismatch { node_id: NodeId },
-    #[error("realm config node {node_id} has a conflicting handle range assignment")]
-    HandleRangeConflict { node_id: NodeId },
     #[error("realm handle space is fully assigned")]
     HandleSpaceExhausted,
     #[error("missing active transaction")]
@@ -210,20 +208,24 @@ impl EnsureRealmConfigOperation {
                 &self.config.target_node_kind,
             )
         });
-        let owned_ranges: Vec<_> = document
+        let owned_ranges = document
             .placement_handle_ranges
             .iter()
             .filter(|range| range.owner == self.config.target_node_id)
-            .copied()
-            .collect();
+            .count();
         let usable_ranges = document
             .handle_range_directory()
             .granted_to(&self.config.target_node_id);
-        let assigned_range = match (owned_ranges.as_slice(), usable_ranges.as_slice()) {
-            ([], []) => {
+        // A usable grant wins; otherwise re-probe from a band salted by the count of
+        // this node's fail-closed grants, so two nodes that collided on one hash band
+        // deterministically diverge instead of conflicting forever.
+        let assigned_range = match usable_ranges.first() {
+            Some(usable) => *usable,
+            None => {
+                let salt = u32::try_from(owned_ranges).unwrap_or(u32::MAX);
                 let (start, end) = document
                     .handle_range_directory()
-                    .free_band_from(owner_handle_band(&self.config.target_node_id).0)
+                    .free_band_from(owner_handle_band(&self.config.target_node_id, salt).0)
                     .ok_or(EnsureRealmConfigError::HandleSpaceExhausted)?;
                 HandleRange {
                     range_id: Ulid::generate(),
@@ -231,12 +233,6 @@ impl EnsureRealmConfigOperation {
                     start,
                     end,
                 }
-            }
-            ([owned], [usable]) if owned == usable => *owned,
-            _ => {
-                return Err(EnsureRealmConfigError::HandleRangeConflict {
-                    node_id: self.config.target_node_id,
-                });
             }
         };
         let range_is_noop = reducer_state
@@ -574,7 +570,7 @@ mod tests {
     use aruna_core::structs::{
         Actor, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange,
         NodePlacementEntry, PlacementOverride, PlacementStrategy, RealmConfigDocument, RealmId,
-        RealmNodeKind, StrategyBinding,
+        RealmNodeKind, StrategyBinding, owner_handle_band,
     };
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::{Effects, Key, KeySpace, TxnId, UserId, Value};
@@ -708,6 +704,94 @@ mod tests {
                     admin_document_reducer_conflict_key(&target, &path),
                 )],
                 txn_id: Some(txn_id),
+            }))
+        );
+    }
+
+    #[test]
+    fn conflicted_bands_reprobe() {
+        // Two onboarding nodes fail-closed on one band must each re-probe to a
+        // fresh disjoint band instead of erroring forever, and re-running the
+        // ensure once a usable grant exists must be a pure noop commit.
+        let realm_id = RealmId::from_bytes([31; 32]);
+        let actor_a = actor(31, realm_id);
+        let actor_b = actor(32, realm_id);
+        let band = owner_handle_band(&actor_a.node_id, 0);
+        let clash = |seed: u8, owner| HandleRange {
+            range_id: Ulid::from_bytes([seed; 16]),
+            owner,
+            start: band.0,
+            end: band.1,
+        };
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        document
+            .placement_handle_ranges
+            .push(clash(1, actor_a.node_id));
+        document
+            .placement_handle_ranges
+            .push(clash(2, actor_b.node_id));
+        let directory = document.handle_range_directory();
+        assert!(directory.granted_to(&actor_a.node_id).is_empty());
+        assert!(directory.granted_to(&actor_b.node_id).is_empty());
+
+        let run = |target: &Actor, document: &RealmConfigDocument| {
+            let mut operation = EnsureRealmConfigOperation::new(config(target.clone(), 3));
+            let txn_id = TxnId::generate();
+            operation.txn_id = Some(txn_id);
+            let writes = batch_write(
+                operation
+                    .emit_write_document_and_admin_state(
+                        Some(document.to_bytes(target).unwrap().into()),
+                        None,
+                    )
+                    .unwrap(),
+                txn_id,
+            );
+            let stored =
+                RealmConfigDocument::from_bytes(write_value(&writes, REALM_CONFIG_KEYSPACE))
+                    .unwrap();
+            let state = write_value(&writes, ADMIN_DOCUMENT_STATE_KEYSPACE).to_vec();
+            (stored, state)
+        };
+
+        // Concurrent round: both re-probe from the shared merged document without
+        // seeing each other's fresh grant; the salted probe must diverge.
+        let (after_a, state_a) = run(&actor_a, &document);
+        let (after_b, _) = run(&actor_b, &document);
+        let fresh = |after: &RealmConfigDocument, owner| {
+            let granted = after.handle_range_directory().granted_to(owner);
+            assert_eq!(granted.len(), 1, "re-probe must yield one usable grant");
+            granted[0]
+        };
+        let granted_a = fresh(&after_a, &actor_a.node_id);
+        let granted_b = fresh(&after_b, &actor_b.node_id);
+        assert!(!granted_a.overlaps(&clash(1, actor_a.node_id)));
+        assert!(!granted_b.overlaps(&clash(2, actor_b.node_id)));
+        assert!(
+            !granted_a.overlaps(&granted_b),
+            "salted re-probes must diverge for distinct nodes"
+        );
+
+        // CRDT union of both rounds keeps both fresh grants usable.
+        let mut merged = after_a.clone();
+        merged.placement_handle_ranges.push(granted_b);
+        let directory = merged.handle_range_directory();
+        assert_eq!(directory.granted_to(&actor_a.node_id), vec![granted_a]);
+        assert_eq!(directory.granted_to(&actor_b.node_id), vec![granted_b]);
+
+        let mut operation = EnsureRealmConfigOperation::new(config(actor_a, 3));
+        let txn_id = TxnId::generate();
+        operation.txn_id = Some(txn_id);
+        let effects = operation
+            .emit_write_document_and_admin_state(
+                Some(merged.to_bytes(&actor_b).unwrap().into()),
+                Some(state_a.into()),
+            )
+            .unwrap();
+        assert_eq!(
+            effects.first(),
+            Some(&Effect::Storage(StorageEffect::CommitTransaction {
+                txn_id
             }))
         );
     }

@@ -479,9 +479,6 @@ fn map_finalize_error(error: BootstrapOnboardingFinalizeError) -> ServerError {
             EnsureRealmConfigError::NodeKindMismatch { .. },
         ) => ServerError::BadRequest,
         BootstrapOnboardingFinalizeError::EnsureRealmConfig(
-            EnsureRealmConfigError::HandleRangeConflict { .. },
-        ) => ServerError::Conflict("node handle range assignment is conflicted".to_string()),
-        BootstrapOnboardingFinalizeError::EnsureRealmConfig(
             EnsureRealmConfigError::HandleSpaceExhausted,
         ) => ServerError::Conflict("realm handle space is exhausted".to_string()),
         BootstrapOnboardingFinalizeError::ReservedNodeLabel(_)

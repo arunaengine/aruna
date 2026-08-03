@@ -242,15 +242,11 @@ pub async fn wait_for_onboarding_placement(
 }
 
 fn node_is_ready(config: &aruna_core::structs::RealmConfigDocument, node_id: NodeId) -> bool {
-    let owned_ranges = config
-        .placement_handle_ranges
-        .iter()
-        .filter(|range| range.owner == node_id)
-        .count();
+    // At least one usable grant: a fail-closed collision leaves a conflicted
+    // range behind, and the re-probed replacement is what makes the node ready.
     config.has_node(node_id)
         && config.placement_entry(node_id).is_some()
-        && owned_ranges == 1
-        && config.handle_range_directory().granted_to(&node_id).len() == 1
+        && !config.handle_range_directory().granted_to(&node_id).is_empty()
 }
 
 async fn load_realm_config(

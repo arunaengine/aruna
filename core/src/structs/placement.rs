@@ -252,11 +252,12 @@ pub const HANDLE_RANGE_SIZE: u32 = 1024;
 pub const HANDLE_BANDS: u32 = (HANDLE_SPACE_END - FIRST_GRANTABLE_HANDLE) / HANDLE_RANGE_SIZE;
 
 /// The hash-derived band a node prefers. Onboarding probes on from here to the
-/// first free band, so two nodes collide only on a rare hash clash, which the
-/// fail-closed range directory then backstops.
-pub fn owner_handle_band(owner: &NodeId) -> (u32, u32) {
+/// first free band; `salt` re-seeds the probe after a fail-closed collision so
+/// two nodes that hashed onto one band diverge on their next grant.
+pub fn owner_handle_band(owner: &NodeId, salt: u32) -> (u32, u32) {
     let mut input = b"aruna-handle-band-v1".to_vec();
     input.extend_from_slice(owner.as_bytes());
+    input.extend_from_slice(&salt.to_be_bytes());
     let mut head = [0u8; 4];
     head.copy_from_slice(&blake3::hash(&input).as_bytes()[..4]);
     let lane = u32::from_be_bytes(head) % HANDLE_BANDS;
