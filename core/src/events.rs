@@ -9,6 +9,7 @@ use crate::{
     document::DocumentSyncNetEvent,
     errors::{AuthorizationError, DhtError, StorageError, StreamError},
     id::{DhtKeyId, NodeId},
+    jobs::JobResponse,
     task::TaskEvent,
     types::{Key, KeySpace, TxnId, Value},
 };
@@ -178,7 +179,16 @@ pub enum NetEvent {
     Dht(DhtEvent),
     DocumentSync(DocumentSyncNetEvent),
     Stream(StreamEvent),
+    JobControl(JobControlEvent),
     Error(NetError),
+}
+
+/// Reply to a [`crate::effects::JobControlEffect`]: the owner's response, or an
+/// unreachable-owner failure the routing operation maps to `Unavailable` (503).
+#[derive(Debug, PartialEq)]
+pub enum JobControlEvent {
+    Response(Box<JobResponse>),
+    Unavailable(String),
 }
 
 #[derive(Debug, PartialEq)]

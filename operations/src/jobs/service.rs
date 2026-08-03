@@ -4,16 +4,14 @@ use aruna_core::handle::Handle;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     ArtifactRef, DEFAULT_SHARD_COUNT, ExecutionSpec, ExportRoCrateSpec, FIRST_GRANTABLE_HANDLE,
-    ImportRoCrateSpec, JobError, JobId, JobOwnerError, JobPayload, JobProgress, JobRecord,
-    JobResultPayload, JobState, RealmId, RunCrateStatus, StagingJobSpec, WorkspaceMode,
-    shard_for_subject, user_dedup_key,
+    ImportRoCrateSpec, JobId, JobOwnerError, JobPayload, JobRecord, JobResultPayload, JobState,
+    RealmId, RunCrateStatus, StagingJobSpec, WorkspaceMode, shard_for_subject, user_dedup_key,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{NodeId, UserId, Value};
 use aruna_core::util::unix_timestamp_millis;
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::ops::Range;
 use std::path::Path;
@@ -34,6 +32,10 @@ use super::workflow::finalize_followups;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::api::load_realm_config;
 use crate::metadata::repository::StorageReadError;
+
+use super::route::{JobRouteOperation, JobRouteOutcome};
+
+pub use aruna_core::jobs::{JobKind, JobReportView, JobStatusView};
 
 /// Mints a JobId whose handle is the serving node's JobControl handle, so the
 /// owner is encoded in the id itself. The bucket is a local queue shard only;
@@ -349,45 +351,34 @@ pub async fn read_record_routed(
     job_id: JobId,
     auth_token: Option<crate::metadata::MetadataAuthToken>,
 ) -> Result<Option<JobRecord>, JobRouteError> {
-    if context.net_handle.is_none() {
+    let Some(net) = context.net_handle.as_ref() else {
         return read_owned_job(context, user_id, job_id)
             .await
             .map_err(JobRouteError::Internal);
-    }
-    let owner = resolve_job_owner(context, job_id).await?;
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    if Some(owner) == local_node {
-        return read_owned_job(context, user_id, job_id)
+    };
+    let request = auth_token.map(|auth_token| JobRequest::Record { auth_token, job_id });
+    let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request);
+    match drive(operation, context).await? {
+        JobRouteOutcome::Local => read_owned_job(context, user_id, job_id)
             .await
-            .map_err(JobRouteError::Internal);
-    }
-    let token = auth_token.ok_or(JobRouteError::Unauthorized)?;
-    let reply = send_job_request(
-        context,
-        owner,
-        JobRequest::Record {
-            auth_token: token,
-            job_id,
+            .map_err(JobRouteError::Internal),
+        JobRouteOutcome::Remote(response) => match response {
+            JobResponse::Record(record)
+                if record.job_id == job_id
+                    && record.created_by == user_id
+                    && !record.payload.is_internal() =>
+            {
+                Ok(Some(*record))
+            }
+            JobResponse::Record(_) => Err(JobRouteError::NotFound),
+            JobResponse::Unauthorized => Err(JobRouteError::Unauthorized),
+            JobResponse::Forbidden => Err(JobRouteError::Forbidden),
+            JobResponse::NotFound => Ok(None),
+            JobResponse::Unavailable(error) => Err(JobRouteError::Unavailable(error)),
+            response => Err(JobRouteError::Unavailable(format!(
+                "unexpected record response from the job owner: {response:?}"
+            ))),
         },
-    )
-    .await
-    .map_err(owner_unreachable)?;
-    match reply.response {
-        JobResponse::Record(record)
-            if record.job_id == job_id
-                && record.created_by == user_id
-                && !record.payload.is_internal() =>
-        {
-            Ok(Some(*record))
-        }
-        JobResponse::Record(_) => Err(JobRouteError::NotFound),
-        JobResponse::Unauthorized => Err(JobRouteError::Unauthorized),
-        JobResponse::Forbidden => Err(JobRouteError::Forbidden),
-        JobResponse::NotFound => Ok(None),
-        JobResponse::Unavailable(error) => Err(JobRouteError::Unavailable(error)),
-        response => Err(JobRouteError::Unavailable(format!(
-            "unexpected record response from the job owner: {response:?}"
-        ))),
     }
 }
 
@@ -422,118 +413,29 @@ fn owner_unreachable(error: JobRouteError) -> JobRouteError {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum JobKind {
-    Probe,
-    Execution,
-    WriteRunCrate,
-    TerminalCleanup,
-    Staging,
-    ImportRoCrate,
-    ExportRoCrate,
-}
-
-impl JobKind {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Probe => "probe",
-            Self::Execution => "execution",
-            Self::WriteRunCrate => "write_run_crate",
-            Self::TerminalCleanup => "terminal_cleanup",
-            Self::Staging => "staging",
-            Self::ImportRoCrate => "import_rocrate",
-            Self::ExportRoCrate => "export_rocrate",
-        }
-    }
-
-    fn is_internal(self) -> bool {
-        matches!(self, Self::WriteRunCrate | Self::TerminalCleanup)
-    }
-
-    fn is_report(self) -> bool {
-        matches!(self, Self::ImportRoCrate | Self::ExportRoCrate)
-    }
-}
-
-impl From<&JobPayload> for JobKind {
-    fn from(payload: &JobPayload) -> Self {
-        match payload {
-            JobPayload::Probe { .. } => Self::Probe,
-            JobPayload::Execution(_) => Self::Execution,
-            JobPayload::WriteRunCrate { .. } => Self::WriteRunCrate,
-            JobPayload::TerminalCleanup { .. } => Self::TerminalCleanup,
-            JobPayload::Staging(_) => Self::Staging,
-            JobPayload::ImportRoCrate(_) => Self::ImportRoCrate,
-            JobPayload::ExportRoCrate(_) => Self::ExportRoCrate,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct JobStatusView {
-    pub job_id: JobId,
-    pub created_by: UserId,
-    pub kind: JobKind,
-    pub state: JobState,
-    pub attempts: u32,
-    pub cancel_requested: bool,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-    pub finished_at_ms: Option<u64>,
-    pub progress: JobProgress,
-    pub last_error: Option<JobError>,
-    #[serde(with = "json_value")]
-    pub result: Option<JsonValue>,
-    pub workspace_bucket: Option<String>,
-    pub workspace_mode: WorkspaceMode,
-}
-
-mod json_value {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use serde_json::Value;
-
-    pub fn serialize<S>(value: &Option<Value>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        value.as_ref().map(Value::to_string).serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Option::<String>::deserialize(deserializer)?
-            .map(|value| serde_json::from_str(&value).map_err(serde::de::Error::custom))
-            .transpose()
-    }
-}
-
-impl From<&JobRecord> for JobStatusView {
-    fn from(record: &JobRecord) -> Self {
-        Self {
-            job_id: record.job_id,
-            created_by: record.created_by,
-            kind: JobKind::from(&record.payload),
-            state: record.state,
-            attempts: record.attempts,
-            cancel_requested: record.cancel_requested,
-            created_at_ms: record.created_at_ms,
-            updated_at_ms: record.updated_at_ms,
-            finished_at_ms: record.finished_at_ms,
-            progress: record.progress.clone(),
-            last_error: record.last_error.clone(),
-            result: record.result.as_ref().map(JobResultPayload::to_public_json),
-            workspace_bucket: record.workspace_bucket.clone(),
-            workspace_mode: record.workspace_mode,
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct RoutedJobStatus {
     pub job: JobStatusView,
     pub run_crate: Option<JsonValue>,
+}
+
+async fn local_status(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+) -> Result<RoutedJobStatus, JobRouteError> {
+    let record = read_owned_job(context, user_id, job_id)
+        .await
+        .map_err(JobRouteError::Internal)?
+        .ok_or(JobRouteError::NotFound)?;
+    let run_crate = read_job_run_crate_status(context, job_id)
+        .await
+        .map_err(JobRouteError::Internal)?
+        .map(|status| status.to_public_json());
+    Ok(RoutedJobStatus {
+        job: JobStatusView::from(&record),
+        run_crate,
+    })
 }
 
 pub async fn read_job_routed(
@@ -542,62 +444,29 @@ pub async fn read_job_routed(
     job_id: JobId,
     auth_token: Option<crate::metadata::MetadataAuthToken>,
 ) -> Result<RoutedJobStatus, JobRouteError> {
-    if context.net_handle.is_none() {
-        let record = read_owned_job(context, user_id, job_id)
-            .await
-            .map_err(JobRouteError::Internal)?
-            .ok_or(JobRouteError::NotFound)?;
-        let run_crate = read_job_run_crate_status(context, job_id)
-            .await
-            .map_err(JobRouteError::Internal)?
-            .map(|status| status.to_public_json());
-        return Ok(RoutedJobStatus {
-            job: JobStatusView::from(&record),
-            run_crate,
-        });
-    }
-    let owner = resolve_job_owner(context, job_id).await?;
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    if Some(owner) == local_node {
-        let record = read_owned_job(context, user_id, job_id)
-            .await
-            .map_err(JobRouteError::Internal)?
-            .ok_or(JobRouteError::NotFound)?;
-        let run_crate = read_job_run_crate_status(context, job_id)
-            .await
-            .map_err(JobRouteError::Internal)?
-            .map(|status| status.to_public_json());
-        return Ok(RoutedJobStatus {
-            job: JobStatusView::from(&record),
-            run_crate,
-        });
-    }
-    let token = auth_token.ok_or(JobRouteError::Unauthorized)?;
-    let reply = send_job_request(
-        context,
-        owner,
-        JobRequest::Status {
-            auth_token: token,
-            job_id,
+    let Some(net) = context.net_handle.as_ref() else {
+        return local_status(context, user_id, job_id).await;
+    };
+    let request = auth_token.map(|auth_token| JobRequest::Status { auth_token, job_id });
+    let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request);
+    match drive(operation, context).await? {
+        JobRouteOutcome::Local => local_status(context, user_id, job_id).await,
+        JobRouteOutcome::Remote(response) => match response {
+            JobResponse::Status { job, run_crate } if routed_job_matches(&job, user_id, job_id) => {
+                let run_crate = run_crate
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()
+                    .map_err(|error| JobRouteError::Internal(error.to_string()))?;
+                Ok(RoutedJobStatus { job, run_crate })
+            }
+            JobResponse::Unauthorized => Err(JobRouteError::Unauthorized),
+            JobResponse::Forbidden => Err(JobRouteError::Forbidden),
+            JobResponse::NotFound => Err(JobRouteError::NotFound),
+            JobResponse::Unavailable(error) => Err(JobRouteError::Unavailable(error)),
+            response => Err(JobRouteError::Unavailable(format!(
+                "unexpected status response from the job owner: {response:?}"
+            ))),
         },
-    )
-    .await
-    .map_err(owner_unreachable)?;
-    match reply.response {
-        JobResponse::Status { job, run_crate } if routed_job_matches(&job, user_id, job_id) => {
-            let run_crate = run_crate
-                .map(|value| serde_json::from_str(&value))
-                .transpose()
-                .map_err(|error| JobRouteError::Internal(error.to_string()))?;
-            Ok(RoutedJobStatus { job, run_crate })
-        }
-        JobResponse::Unauthorized => Err(JobRouteError::Unauthorized),
-        JobResponse::Forbidden => Err(JobRouteError::Forbidden),
-        JobResponse::NotFound => Err(JobRouteError::NotFound),
-        JobResponse::Unavailable(error) => Err(JobRouteError::Unavailable(error)),
-        response => Err(JobRouteError::Unavailable(format!(
-            "unexpected status response from the job owner: {response:?}"
-        ))),
     }
 }
 
@@ -610,14 +479,6 @@ pub enum JobReportLookup {
         rows: Vec<(Vec<u8>, Value)>,
         next_key: Option<Vec<u8>>,
     },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JobReportView {
-    pub job_id: JobId,
-    pub created_by: UserId,
-    pub kind: JobKind,
-    pub report_digest: [u8; 32],
 }
 
 pub async fn read_owned_report(
@@ -679,58 +540,52 @@ pub async fn read_report_routed(
     limit: usize,
     auth_token: Option<crate::metadata::MetadataAuthToken>,
 ) -> Result<JobReportLookup, JobRouteError> {
-    if context.net_handle.is_none() {
+    let Some(net) = context.net_handle.as_ref() else {
         return read_owned_report(context, user_id, job_id, expected_digest, last_key, limit)
             .await
             .map_err(JobRouteError::Internal);
-    }
-    let owner = resolve_job_owner(context, job_id).await?;
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    if Some(owner) == local_node {
-        return read_owned_report(context, user_id, job_id, expected_digest, last_key, limit)
-            .await
-            .map_err(JobRouteError::Internal);
-    }
-    let token = auth_token.ok_or(JobRouteError::Unauthorized)?;
+    };
     let wire_limit = u16::try_from(limit.min(usize::from(JOB_REPORT_MAX_ROWS)))
         .map_err(|error| JobRouteError::Internal(error.to_string()))?;
-    let reply = send_job_request(
-        context,
-        owner,
-        JobRequest::Report {
-            auth_token: token,
-            job_id,
-            expected_digest,
-            last_key,
-            limit: wire_limit,
-        },
-    )
-    .await
-    .map_err(owner_unreachable)?;
-    match reply.response {
-        JobResponse::ReportPending(state) => Ok(JobReportLookup::Pending(state)),
-        JobResponse::ReportConflict => Ok(JobReportLookup::CursorConflict),
-        JobResponse::ReportReady {
-            job,
-            rows,
-            next_key,
-        } if report_job_matches(&job, user_id, job_id, expected_digest) => {
-            Ok(JobReportLookup::Ready {
-                job,
-                rows: rows
-                    .into_iter()
-                    .map(|(key, value)| (key, Value::from(value)))
-                    .collect(),
-                next_key,
-            })
+    let request = auth_token.map(|auth_token| JobRequest::Report {
+        auth_token,
+        job_id,
+        expected_digest,
+        last_key: last_key.clone(),
+        limit: wire_limit,
+    });
+    let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request);
+    match drive(operation, context).await? {
+        JobRouteOutcome::Local => {
+            read_owned_report(context, user_id, job_id, expected_digest, last_key, limit)
+                .await
+                .map_err(JobRouteError::Internal)
         }
-        JobResponse::Unauthorized => Err(JobRouteError::Unauthorized),
-        JobResponse::Forbidden => Err(JobRouteError::Forbidden),
-        JobResponse::NotFound => Ok(JobReportLookup::NotFound),
-        JobResponse::Unavailable(error) => Err(JobRouteError::Unavailable(error)),
-        response => Err(JobRouteError::Unavailable(format!(
-            "unexpected report response from the job owner: {response:?}"
-        ))),
+        JobRouteOutcome::Remote(response) => match response {
+            JobResponse::ReportPending(state) => Ok(JobReportLookup::Pending(state)),
+            JobResponse::ReportConflict => Ok(JobReportLookup::CursorConflict),
+            JobResponse::ReportReady {
+                job,
+                rows,
+                next_key,
+            } if report_job_matches(&job, user_id, job_id, expected_digest) => {
+                Ok(JobReportLookup::Ready {
+                    job,
+                    rows: rows
+                        .into_iter()
+                        .map(|(key, value)| (key, Value::from(value)))
+                        .collect(),
+                    next_key,
+                })
+            }
+            JobResponse::Unauthorized => Err(JobRouteError::Unauthorized),
+            JobResponse::Forbidden => Err(JobRouteError::Forbidden),
+            JobResponse::NotFound => Ok(JobReportLookup::NotFound),
+            JobResponse::Unavailable(error) => Err(JobRouteError::Unavailable(error)),
+            response => Err(JobRouteError::Unavailable(format!(
+                "unexpected report response from the job owner: {response:?}"
+            ))),
+        },
     }
 }
 
@@ -1035,46 +890,37 @@ pub async fn cancel_job_routed(
     job_id: JobId,
     auth_token: Option<crate::metadata::MetadataAuthToken>,
 ) -> Result<RoutedCancelOutcome, JobRouteError> {
-    if context.net_handle.is_none() {
+    let Some(net) = context.net_handle.as_ref() else {
         return cancel_owned_job(context, runtime, user_id, job_id)
             .await
             .map(cancel_outcome)
             .map_err(JobRouteError::Internal);
-    }
-    let owner = resolve_job_owner(context, job_id).await?;
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    if Some(owner) == local_node {
-        return cancel_owned_job(context, runtime, user_id, job_id)
+    };
+    let request = auth_token.map(|auth_token| JobRequest::Cancel { auth_token, job_id });
+    let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request);
+    match drive(operation, context).await? {
+        JobRouteOutcome::Local => cancel_owned_job(context, runtime, user_id, job_id)
             .await
             .map(cancel_outcome)
-            .map_err(JobRouteError::Internal);
-    }
-    let token = auth_token.ok_or(JobRouteError::Unauthorized)?;
-    let reply = send_job_request(
-        context,
-        owner,
-        JobRequest::Cancel {
-            auth_token: token,
-            job_id,
+            .map_err(JobRouteError::Internal),
+        JobRouteOutcome::Remote(response) => match response {
+            JobResponse::Cancelled { job, terminal }
+                if routed_job_matches(&job, user_id, job_id) =>
+            {
+                Ok(if terminal {
+                    RoutedCancelOutcome::AlreadyTerminal(job)
+                } else {
+                    RoutedCancelOutcome::Requested(job)
+                })
+            }
+            JobResponse::Unauthorized => Err(JobRouteError::Unauthorized),
+            JobResponse::Forbidden => Err(JobRouteError::Forbidden),
+            JobResponse::NotFound => Err(JobRouteError::NotFound),
+            JobResponse::Unavailable(error) => Err(JobRouteError::Unavailable(error)),
+            response => Err(JobRouteError::Unavailable(format!(
+                "unexpected cancel response from the job owner: {response:?}"
+            ))),
         },
-    )
-    .await
-    .map_err(owner_unreachable)?;
-    match reply.response {
-        JobResponse::Cancelled { job, terminal } if routed_job_matches(&job, user_id, job_id) => {
-            Ok(if terminal {
-                RoutedCancelOutcome::AlreadyTerminal(job)
-            } else {
-                RoutedCancelOutcome::Requested(job)
-            })
-        }
-        JobResponse::Unauthorized => Err(JobRouteError::Unauthorized),
-        JobResponse::Forbidden => Err(JobRouteError::Forbidden),
-        JobResponse::NotFound => Err(JobRouteError::NotFound),
-        JobResponse::Unavailable(error) => Err(JobRouteError::Unavailable(error)),
-        response => Err(JobRouteError::Unavailable(format!(
-            "unexpected cancel response from the job owner: {response:?}"
-        ))),
     }
 }
 

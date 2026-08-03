@@ -8,6 +8,7 @@ pub(crate) mod protocol;
 pub mod prune;
 pub mod reconcile;
 mod rocrate_jsonld;
+mod route;
 pub mod runtime;
 pub mod service;
 pub mod staging;

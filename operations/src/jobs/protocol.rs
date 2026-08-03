@@ -1,18 +1,17 @@
-use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{AuthContext, JobId, JobRecord, JobState, RealmId};
+use aruna_core::structs::{AuthContext, JobId, RealmId};
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_net::streams::{BiStream, RecvStream, SendStream};
 use bytes::Bytes;
 use futures_util::StreamExt;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
@@ -21,17 +20,21 @@ use tracing::warn;
 
 use super::runtime::JobsRuntime;
 use super::service::{
-    ArtifactLookup, CancelJobOutcome, JobReportLookup, JobReportView, JobStatusView, OwnedArtifact,
-    cancel_owned_job, read_artifact_range, read_job_run_crate_status, read_owned_artifact,
-    read_owned_job, read_owned_report, resolve_job_owner,
+    ArtifactLookup, CancelJobOutcome, JobReportLookup, OwnedArtifact, cancel_owned_job,
+    read_artifact_range, read_job_run_crate_status, read_owned_artifact, read_owned_job,
+    read_owned_report, resolve_job_owner,
 };
 use crate::driver::DriverContext;
-use crate::metadata::{MetadataAuthToken, MetadataWritePeerError};
+use crate::metadata::MetadataWritePeerError;
+
+pub(crate) use aruna_core::jobs::{
+    JobRequest, JobResponse, JobStatusView, WireArtifact, WireRange,
+};
 
 const JOB_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_JOB_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum JobRouteError {
     #[error("job request is unauthorized")]
     Unauthorized,
@@ -43,74 +46,6 @@ pub enum JobRouteError {
     Unavailable(String),
     #[error("job operation failed: {0}")]
     Internal(String),
-}
-
-/// Owner-directed requests only: every operation on a job is answered by its
-/// immutable owner, derived from the JobId on both ends.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum JobRequest {
-    Status {
-        auth_token: MetadataAuthToken,
-        job_id: JobId,
-    },
-    Report {
-        auth_token: MetadataAuthToken,
-        job_id: JobId,
-        expected_digest: Option<[u8; 32]>,
-        last_key: Option<Vec<u8>>,
-        limit: u16,
-    },
-    Artifact {
-        auth_token: MetadataAuthToken,
-        job_id: JobId,
-        range: Option<WireRange>,
-    },
-    Cancel {
-        auth_token: MetadataAuthToken,
-        job_id: JobId,
-    },
-    /// Full owner record for API projections (TES, staging) the status view
-    /// cannot reconstruct off-owner.
-    Record {
-        auth_token: MetadataAuthToken,
-        job_id: JobId,
-    },
-}
-
-impl JobRequest {
-    fn auth_token(&self) -> MetadataAuthToken {
-        match self {
-            Self::Status { auth_token, .. }
-            | Self::Report { auth_token, .. }
-            | Self::Artifact { auth_token, .. }
-            | Self::Cancel { auth_token, .. }
-            | Self::Record { auth_token, .. } => auth_token.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub(crate) struct WireRange {
-    pub start: u64,
-    pub end: u64,
-}
-
-impl From<Range<u64>> for WireRange {
-    fn from(range: Range<u64>) -> Self {
-        Self {
-            start: range.start,
-            end: range.end,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct WireArtifact {
-    pub job_id: JobId,
-    pub created_by: UserId,
-    pub blake3: [u8; 32],
-    pub size: u64,
-    pub filename: String,
 }
 
 impl From<&OwnedArtifact> for WireArtifact {
@@ -136,36 +71,6 @@ impl From<WireArtifact> for OwnedArtifact {
             artifact: None,
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum JobResponse {
-    Unauthorized,
-    Forbidden,
-    NotFound,
-    Unavailable(String),
-    Status {
-        job: JobStatusView,
-        run_crate: Option<String>,
-    },
-    ReportPending(JobState),
-    ReportConflict,
-    ReportReady {
-        job: JobReportView,
-        rows: Vec<(Vec<u8>, Vec<u8>)>,
-        next_key: Option<Vec<u8>>,
-    },
-    ArtifactPending(JobState),
-    ArtifactGone,
-    ArtifactReady {
-        owned: WireArtifact,
-        stream_size: u64,
-    },
-    Cancelled {
-        job: JobStatusView,
-        terminal: bool,
-    },
-    Record(Box<JobRecord>),
 }
 
 pub(crate) struct RemoteJobReply {
@@ -566,7 +471,7 @@ async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T, Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{JobProgress, WorkspaceMode};
+    use aruna_core::structs::{JobProgress, JobState, WorkspaceMode};
     use ulid::Ulid;
 
     use crate::jobs::service::JobKind;

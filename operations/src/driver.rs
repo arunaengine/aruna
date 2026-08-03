@@ -1,8 +1,10 @@
 use aruna_blob::blob::{BlobHandle, GroupHold};
 use aruna_compute::ExecutorRegistry;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, JobControlEffect, NetEffect, StorageEffect};
 use aruna_core::errors::BlobError;
-use aruna_core::events::{BlobEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
+use aruna_core::events::{
+    BlobEvent, Event, JobControlEvent, NetEvent, StorageEvent, SubOperationEvent,
+};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::operation::{Operation, SubOperation};
@@ -311,6 +313,11 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
             }
             event
         }
+        // Job-control routing runs its frame I/O here, where the runner holds
+        // the context; the net crate never sees this effect.
+        Effect::Net(NetEffect::JobControl(job_control)) => {
+            Box::pin(dispatch_job_control(*job_control, context)).await
+        }
         Effect::Net(net_effect) => {
             if let Some(net_handle) = &context.net_handle {
                 Box::pin(net_handle.send_effect(Effect::Net(net_effect))).await
@@ -404,6 +411,18 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
     }
 
     event
+}
+
+/// Executes a job-control request by opening the frame stream and reading the
+/// owner's reply; an unreachable owner is reported so the routing operation can
+/// map it to `Unavailable` (503). The artifact body path stays out of band.
+async fn dispatch_job_control(effect: JobControlEffect, context: &DriverContext) -> Event {
+    let JobControlEffect { holder, request } = effect;
+    let event = match crate::jobs::protocol::send_job_request(context, holder, request).await {
+        Ok(reply) => JobControlEvent::Response(Box::new(reply.response)),
+        Err(error) => JobControlEvent::Unavailable(error.to_string()),
+    };
+    Event::Net(NetEvent::JobControl(event))
 }
 
 /// Reserves every tenant backend an effect names for the rest of the operation.

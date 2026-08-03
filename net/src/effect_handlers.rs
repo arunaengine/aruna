@@ -1,6 +1,6 @@
 use aruna_core::effects::{DhtEffect, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
-use aruna_core::events::{DhtEvent, NetEvent, StreamEvent};
+use aruna_core::events::{DhtEvent, JobControlEvent, NetEvent, StreamEvent};
 use aruna_core::id::hex_prefix;
 use tracing::{trace, warn};
 
@@ -31,6 +31,11 @@ pub async fn handle_net_effect(
             }
         },
         NetEffect::Stream(stream_effect) => handle_stream_effect(stream_effect).await,
+        // Job-control effects are executed by the operations runner, which holds
+        // the driver context; they never reach this handler.
+        NetEffect::JobControl(_) => NetEvent::JobControl(JobControlEvent::Unavailable(
+            "job-control effect must be dispatched by the operations runner".to_string(),
+        )),
     }
 }
 
@@ -118,6 +123,7 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::Dht(_) => "dht",
         NetEffect::DocumentSync(_) => "document_sync",
         NetEffect::Stream(_) => "stream",
+        NetEffect::JobControl(_) => "job_control",
     }
 }
 
