@@ -71,10 +71,20 @@ pub enum JobMutationError {
 pub enum UserIndexError {
     #[error("active RO-Crate job limit reached ({limit})")]
     ActiveLimit { limit: u32 },
+    #[error("idempotency key already bound to job {existing_job_id} with a different plan")]
+    PlanConflict { existing_job_id: JobId },
     #[error(transparent)]
     Conversion(#[from] ConversionError),
     #[error("{0}")]
     Storage(String),
+}
+
+/// Outcome of a user-index reservation: `created` is false when an equivalent
+/// job already exists and the caller must reuse `job_id` instead of creating.
+#[derive(Debug, Clone, Copy)]
+pub struct UserIndexReservation {
+    pub job_id: JobId,
+    pub created: bool,
 }
 
 /// Schedule-index key by state: queued -> due/, claimed/running -> lease/, terminal -> prune/.
@@ -736,21 +746,42 @@ pub async fn write_job_schedule(storage: &StorageHandle, record: &JobRecord) -> 
     .await
 }
 
+enum UserTxnOutcome {
+    Reserved,
+    Replayed,
+    Existing(JobId),
+}
+
 pub async fn reserve_user_index(
     storage: &StorageHandle,
     record: &JobRecord,
-) -> Result<JobId, UserIndexError> {
+) -> Result<UserIndexReservation, UserIndexError> {
     for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
         let txn_id = start_write_txn(storage)
             .await
             .map_err(UserIndexError::Storage)?;
         match reserve_user_txn(storage, txn_id, record).await {
-            Ok(Some(job_id)) => {
+            Ok(UserTxnOutcome::Existing(job_id)) => {
                 abort_txn(storage, txn_id).await;
-                return Ok(job_id);
+                return Ok(UserIndexReservation {
+                    job_id,
+                    created: false,
+                });
             }
-            Ok(None) => match commit_txn(storage, txn_id).await {
-                CommitResult::Committed => return Ok(record.job_id),
+            Ok(UserTxnOutcome::Replayed) => {
+                abort_txn(storage, txn_id).await;
+                return Ok(UserIndexReservation {
+                    job_id: record.job_id,
+                    created: true,
+                });
+            }
+            Ok(UserTxnOutcome::Reserved) => match commit_txn(storage, txn_id).await {
+                CommitResult::Committed => {
+                    return Ok(UserIndexReservation {
+                        job_id: record.job_id,
+                        created: true,
+                    });
+                }
                 CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => {
                     tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
                 }
@@ -776,8 +807,11 @@ async fn reserve_user_txn(
     storage: &StorageHandle,
     txn_id: TxnId,
     record: &JobRecord,
-) -> Result<Option<JobId>, UserIndexError> {
+) -> Result<UserTxnOutcome, UserIndexError> {
     let owner_key = job_owner_index_key(record.created_by, record.created_at_ms, record.job_id);
+    // A row under this exact identity is a replayed reservation of the same job:
+    // proceed with creation, but never rewrite the row (a terminal update may
+    // already have landed and must not be regressed).
     if read_raw(
         storage,
         JOB_OWNER_INDEX_KEYSPACE,
@@ -788,7 +822,7 @@ async fn reserve_user_txn(
     .map_err(UserIndexError::Storage)?
     .is_some()
     {
-        return Ok(Some(record.job_id));
+        return Ok(UserTxnOutcome::Replayed);
     }
     if let Some(dedup_key) = &record.dedup_key
         && let Some(value) = read_raw(
@@ -799,9 +833,15 @@ async fn reserve_user_txn(
         )
         .await
         .map_err(UserIndexError::Storage)?
-        && let Ok((job_id, _)) = parse_job_dedup_value(value.as_ref())
+        && let Ok((job_id, digest)) = parse_job_dedup_value(value.as_ref())
+        && job_id != record.job_id
     {
-        return Ok(Some(job_id));
+        if digest != record.plan_digest.unwrap_or_default() {
+            return Err(UserIndexError::PlanConflict {
+                existing_job_id: job_id,
+            });
+        }
+        return Ok(UserTxnOutcome::Existing(job_id));
     }
     let active_cap = record
         .payload
@@ -850,10 +890,55 @@ async fn reserve_user_txn(
     batch_write(storage, writes, Some(txn_id))
         .await
         .map_err(UserIndexError::Storage)?;
-    Ok(None)
+    Ok(UserTxnOutcome::Reserved)
+}
+
+/// The indexed record for `job_id` under `user_id`'s owner index, if present.
+/// An empty row (written by the owner's local create) falls back to the record.
+pub(crate) async fn find_user_job(
+    storage: &StorageHandle,
+    user_id: UserId,
+    job_id: JobId,
+) -> Result<Option<JobRecord>, String> {
+    let prefix = job_owner_index_prefix(user_id);
+    let mut start_after = None;
+    loop {
+        let (values, next) = iter_prefix_page(
+            storage,
+            JOB_OWNER_INDEX_KEYSPACE,
+            Some(prefix.clone()),
+            start_after,
+            128,
+            None,
+        )
+        .await?;
+        for (key, value) in values {
+            let (_, _, indexed) =
+                parse_job_owner_index_key(key.as_ref()).map_err(|error| error.to_string())?;
+            if indexed != job_id {
+                continue;
+            }
+            if value.is_empty() {
+                return read_job_record(storage, job_id, None).await;
+            }
+            return Ok(decode_job_record(value.as_ref()).ok());
+        }
+        match next {
+            Some(next) => start_after = Some(next),
+            None => return Ok(None),
+        }
+    }
 }
 
 pub async fn update_user_index(storage: &StorageHandle, record: &JobRecord) -> Result<(), String> {
+    // The indexed identity is immutable: an update may refresh state but never
+    // re-parent the job onto another owner node or creation identity.
+    if let Some(existing) = find_user_job(storage, record.created_by, record.job_id).await?
+        && (existing.owner_node_id != record.owner_node_id
+            || existing.created_at_ms != record.created_at_ms)
+    {
+        return Err("job owner index identity is immutable".to_string());
+    }
     let value = ByteView::from(record.to_bytes().map_err(|error| error.to_string())?);
     for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
         let txn_id = start_write_txn(storage).await?;

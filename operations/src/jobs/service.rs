@@ -26,9 +26,9 @@ use super::protocol::{
 };
 use super::runtime::JobsRuntime;
 use super::store::{
-    CancelRequestOutcome, JobMutationError, UserIndexError, find_dedup_plan, list_job_entries,
-    list_jobs_for_user, read_artifact_tombstone, read_job_record, read_run_crate_status,
-    reserve_user_index, set_cancel_requested, update_user_index,
+    CancelRequestOutcome, JobMutationError, UserIndexError, UserIndexReservation, find_dedup_plan,
+    list_job_entries, list_jobs_for_user, read_artifact_tombstone, read_job_record,
+    read_run_crate_status, reserve_user_index, set_cancel_requested, update_user_index,
 };
 use super::submit::{
     SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_job_id,
@@ -100,17 +100,24 @@ async fn mint_local_job(
     Ok(mint_job_id(handle, bucket)?)
 }
 
+fn map_index_error(error: UserIndexError) -> SubmitJobError {
+    match error {
+        UserIndexError::ActiveLimit { limit } => SubmitJobError::ActiveJobLimit { limit },
+        UserIndexError::PlanConflict { existing_job_id } => {
+            SubmitJobError::JobPlanConflict { existing_job_id }
+        }
+        error => SubmitJobError::UnexpectedEvent(error.to_string()),
+    }
+}
+
 async fn reserve_job_index(
     context: &DriverContext,
     record: &JobRecord,
-) -> Result<JobId, SubmitJobError> {
+) -> Result<UserIndexReservation, SubmitJobError> {
     let Some(net_handle) = context.net_handle.as_ref() else {
         return reserve_user_index(&context.storage_handle, record)
             .await
-            .map_err(|error| match error {
-                UserIndexError::ActiveLimit { limit } => SubmitJobError::ActiveJobLimit { limit },
-                error => SubmitJobError::UnexpectedEvent(error.to_string()),
-            });
+            .map_err(map_index_error);
     };
     let route = resolve_user_route(context, record.created_by)
         .await
@@ -119,10 +126,7 @@ async fn reserve_job_index(
     if holder == net_handle.node_id() {
         return reserve_user_index(&context.storage_handle, record)
             .await
-            .map_err(|error| match error {
-                UserIndexError::ActiveLimit { limit } => SubmitJobError::ActiveJobLimit { limit },
-                error => SubmitJobError::UnexpectedEvent(error.to_string()),
-            });
+            .map_err(map_index_error);
     }
     let auth_token = MetadataAuthToken::internal(AuthContext {
         user_id: record.created_by,
@@ -141,7 +145,10 @@ async fn reserve_job_index(
     .await
     .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
     match reply.response {
-        JobResponse::Indexed(job_id) => Ok(job_id),
+        JobResponse::Indexed { job_id, created } => Ok(UserIndexReservation { job_id, created }),
+        JobResponse::SubmitConflict(existing_job_id) => {
+            Err(SubmitJobError::JobPlanConflict { existing_job_id })
+        }
         JobResponse::SubmitCap(limit) => Err(SubmitJobError::ActiveJobLimit { limit }),
         JobResponse::Unavailable(error) => Err(SubmitJobError::UnexpectedEvent(error)),
         response => Err(SubmitJobError::UnexpectedEvent(format!(
@@ -158,8 +165,16 @@ pub(crate) async fn submit_local_job(
     let operation = if let Some(net_handle) = context.net_handle.as_ref() {
         spec.owner_node_id = net_handle.node_id();
         let preview = SubmitJobOperation::reserved(spec.clone(), job_id);
-        let indexed_job_id = reserve_job_index(context, preview.record()).await?;
-        SubmitJobOperation::reserved(spec, indexed_job_id)
+        let reservation = reserve_job_index(context, preview.record()).await?;
+        // An equivalent job already exists on its immutable owner: reuse it and
+        // never materialize a second record for the same JobId on this node.
+        if !reservation.created {
+            return Ok(SubmitJobResult {
+                job_id: reservation.job_id,
+                created: false,
+            });
+        }
+        SubmitJobOperation::reserved(spec, reservation.job_id)
     } else {
         SubmitJobOperation::new(spec, job_id)
     };
@@ -616,7 +631,7 @@ async fn sync_user_record(context: &DriverContext, record: &JobRecord) {
     )
     .await
     {
-        Ok(reply) if matches!(reply.response, JobResponse::Indexed(_)) => {}
+        Ok(reply) if matches!(reply.response, JobResponse::Indexed { .. }) => {}
         Ok(reply) => {
             warn!(job_id = %record.job_id, response = ?reply.response, "Job owner index was rejected")
         }

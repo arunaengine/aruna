@@ -208,7 +208,10 @@ pub(crate) enum JobResponse {
     Forbidden,
     NotFound,
     Unavailable(String),
-    Indexed(JobId),
+    Indexed {
+        job_id: JobId,
+        created: bool,
+    },
     Listed {
         records: Vec<JobRecord>,
         next_cursor: Option<Vec<u8>>,
@@ -587,14 +590,23 @@ async fn prepare_index(
     }
     if record.state.is_terminal() {
         return match update_user_index(&context.storage_handle, &record).await {
-            Ok(()) => PreparedResponse::new(JobResponse::Indexed(record.job_id)),
+            Ok(()) => PreparedResponse::new(JobResponse::Indexed {
+                job_id: record.job_id,
+                created: false,
+            }),
             Err(error) => PreparedResponse::new(JobResponse::Unavailable(error)),
         };
     }
     match reserve_user_index(&context.storage_handle, &record).await {
-        Ok(job_id) => PreparedResponse::new(JobResponse::Indexed(job_id)),
+        Ok(reservation) => PreparedResponse::new(JobResponse::Indexed {
+            job_id: reservation.job_id,
+            created: reservation.created,
+        }),
         Err(UserIndexError::ActiveLimit { limit }) => {
             PreparedResponse::new(JobResponse::SubmitCap(limit))
+        }
+        Err(UserIndexError::PlanConflict { existing_job_id }) => {
+            PreparedResponse::new(JobResponse::SubmitConflict(existing_job_id))
         }
         Err(error) => PreparedResponse::new(JobResponse::Unavailable(error.to_string())),
     }
