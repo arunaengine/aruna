@@ -10,6 +10,71 @@ use crate::errors::StorageError;
 use crate::structs::{AuthContext, MetadataAuditOperation, MetadataRegistryRecord, RealmId};
 use crate::types::{GroupId, UserId};
 
+pub const MAX_METADATA_BEARER_TOKEN_LEN: usize = 4096;
+
+/// Credential a forwarded metadata or job-control request carries to the holder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataAuthToken {
+    Bearer(MetadataBearerToken),
+    Internal(AuthContext),
+}
+
+impl MetadataAuthToken {
+    pub fn bearer(token: impl Into<String>) -> Result<Self, MetadataAuthTokenError> {
+        MetadataBearerToken::new(token).map(Self::Bearer)
+    }
+
+    pub fn internal(auth: AuthContext) -> Self {
+        Self::Internal(auth)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MetadataBearerToken(String);
+
+impl MetadataBearerToken {
+    pub fn new(token: impl Into<String>) -> Result<Self, MetadataAuthTokenError> {
+        let token = token.into();
+        if token.len() > MAX_METADATA_BEARER_TOKEN_LEN {
+            return Err(MetadataAuthTokenError {
+                length: token.len(),
+            });
+        }
+        Ok(Self(token))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for MetadataBearerToken {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let token = String::deserialize(deserializer)?;
+        Self::new(token).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataAuthTokenError {
+    length: usize,
+}
+
+impl std::fmt::Display for MetadataAuthTokenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "metadata bearer token length {} exceeds maximum {}",
+            self.length, MAX_METADATA_BEARER_TOKEN_LEN
+        )
+    }
+}
+
+impl std::error::Error for MetadataAuthTokenError {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataGraphPolicy {
     pub public: bool,

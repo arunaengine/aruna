@@ -1,9 +1,8 @@
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
-use aruna_core::structs::{AuthContext, MetadataRegistryRecord, PathClaimRecord, SyncRelationship};
+use aruna_core::structs::{MetadataRegistryRecord, PathClaimRecord, SyncRelationship};
 use aruna_core::types::GroupId;
 use aruna_net::streams::BiStream;
-use serde::{Deserialize, Deserializer, Serialize};
-use std::fmt;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
@@ -12,70 +11,9 @@ use crate::metadata::api::MetadataRoCrateExportView;
 use crate::s3::search_buckets::BucketSearchHit;
 use crate::update_metadata_document::UpdateMetadataDocumentMutation;
 
+pub use aruna_core::metadata::{MetadataAuthToken, MetadataAuthTokenError};
+
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
-pub const MAX_METADATA_BEARER_TOKEN_LEN: usize = 4096;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MetadataAuthToken {
-    Bearer(MetadataBearerToken),
-    Internal(AuthContext),
-}
-
-impl MetadataAuthToken {
-    pub fn bearer(token: impl Into<String>) -> Result<Self, MetadataAuthTokenError> {
-        MetadataBearerToken::new(token).map(Self::Bearer)
-    }
-
-    pub fn internal(auth: AuthContext) -> Self {
-        Self::Internal(auth)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct MetadataBearerToken(String);
-
-impl MetadataBearerToken {
-    pub fn new(token: impl Into<String>) -> Result<Self, MetadataAuthTokenError> {
-        let token = token.into();
-        if token.len() > MAX_METADATA_BEARER_TOKEN_LEN {
-            return Err(MetadataAuthTokenError {
-                length: token.len(),
-            });
-        }
-        Ok(Self(token))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for MetadataBearerToken {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let token = String::deserialize(deserializer)?;
-        Self::new(token).map_err(serde::de::Error::custom)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MetadataAuthTokenError {
-    length: usize,
-}
-
-impl fmt::Display for MetadataAuthTokenError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "metadata bearer token length {} exceeds maximum {}",
-            self.length, MAX_METADATA_BEARER_TOKEN_LEN
-        )
-    }
-}
-
-impl std::error::Error for MetadataAuthTokenError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataPathCandidate {
@@ -317,7 +255,8 @@ pub async fn read_message(stream: &mut BiStream) -> Result<MetadataTransportMess
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{PathRestriction, Permission, RealmId};
+    use aruna_core::metadata::MAX_METADATA_BEARER_TOKEN_LEN;
+    use aruna_core::structs::{AuthContext, PathRestriction, Permission, RealmId};
     use aruna_core::types::UserId;
 
     #[test]
