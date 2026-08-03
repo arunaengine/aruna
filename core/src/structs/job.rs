@@ -18,6 +18,8 @@ use crate::types::{GroupId, Key, UserId};
 
 /// Version prefix keeping the record wrappable in a version envelope later (#286).
 pub const JOB_RECORD_KEY_PREFIX: &[u8] = b"jobs-v1/";
+/// Immutable owner-lookup pointers held by job-control bucket holders.
+pub const JOB_POINTER_KEY_PREFIX: &[u8] = b"jobptr-v1/";
 
 pub const JOB_DUE_INDEX_PREFIX: &[u8] = b"due/";
 pub const JOB_LEASE_INDEX_PREFIX: &[u8] = b"lease/";
@@ -1155,6 +1157,13 @@ fn external_attempt_transition(from: JobState, to: JobState) -> bool {
 pub fn job_record_key(job_id: JobId) -> Key {
     let mut bytes = Vec::with_capacity(JOB_RECORD_KEY_PREFIX.len() + 16);
     bytes.extend_from_slice(JOB_RECORD_KEY_PREFIX);
+    bytes.extend_from_slice(&job_id.to_bytes());
+    ByteView::from(bytes)
+}
+
+pub fn job_pointer_key(job_id: JobId) -> Key {
+    let mut bytes = Vec::with_capacity(JOB_POINTER_KEY_PREFIX.len() + 16);
+    bytes.extend_from_slice(JOB_POINTER_KEY_PREFIX);
     bytes.extend_from_slice(&job_id.to_bytes());
     ByteView::from(bytes)
 }

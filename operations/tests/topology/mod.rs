@@ -370,6 +370,26 @@ impl Topology {
             .count()
     }
 
+    /// Reinstalls a mutated realm config on every node, as an admin change would.
+    pub async fn apply_config(&mut self, config: RealmConfigDocument) -> TestResult<()> {
+        for node in &self.nodes {
+            let actor = Actor {
+                node_id: node.node_id(),
+                user_id: self.user_id,
+                realm_id: self.realm_id,
+            };
+            write(
+                node,
+                REALM_CONFIG_KEYSPACE,
+                self.realm_id.as_bytes().to_vec(),
+                config.to_bytes(&actor)?,
+            )
+            .await?;
+        }
+        self.config = config;
+        Ok(())
+    }
+
     pub async fn shutdown(self) {
         for node in self.nodes {
             node.net.shutdown().await;

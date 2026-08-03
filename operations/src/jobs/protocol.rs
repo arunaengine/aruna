@@ -29,7 +29,8 @@ use super::service::{
     read_owned_job, read_owned_report, submit_local_job,
 };
 use super::store::{
-    UserIndexError, list_jobs_for_user, reserve_user_index, update_user_index, write_passive_record,
+    JobPointer, UserIndexError, find_user_job, list_jobs_for_user, read_job_pointer,
+    read_job_record, reserve_user_index, update_user_index, write_job_pointer,
 };
 use super::submit::{SubmitJobError, SubmitJobResult, SubmitJobSpec};
 use crate::driver::DriverContext;
@@ -68,21 +69,33 @@ pub(crate) enum JobRequest {
         limit: u16,
         config_digest: [u8; 32],
     },
+    /// JobId -> owner resolution against the user rank-0 owner index.
+    Lookup {
+        auth_token: MetadataAuthToken,
+        user_id: UserId,
+        job_id: JobId,
+        config_digest: [u8; 32],
+    },
     Submit {
         auth_token: MetadataAuthToken,
         job_id: JobId,
         spec: SubmitJobSpec,
         config_digest: [u8; 32],
     },
-    Replicate {
+    /// Store an immutable owner pointer on a job-control bucket holder.
+    Point {
         auth_token: MetadataAuthToken,
-        record: JobRecord,
+        pointer: JobPointer,
         config_digest: [u8; 32],
+    },
+    /// JobId -> owner resolution against a local record or pointer.
+    Locate {
+        auth_token: MetadataAuthToken,
+        job_id: JobId,
     },
     Status {
         auth_token: MetadataAuthToken,
         job_id: JobId,
-        config_digest: [u8; 32],
     },
     Report {
         auth_token: MetadataAuthToken,
@@ -90,18 +103,15 @@ pub(crate) enum JobRequest {
         expected_digest: Option<[u8; 32]>,
         last_key: Option<Vec<u8>>,
         limit: u16,
-        config_digest: [u8; 32],
     },
     Artifact {
         auth_token: MetadataAuthToken,
         job_id: JobId,
         range: Option<WireRange>,
-        config_digest: [u8; 32],
     },
     Cancel {
         auth_token: MetadataAuthToken,
         job_id: JobId,
-        config_digest: [u8; 32],
     },
 }
 
@@ -110,45 +120,14 @@ impl JobRequest {
         match self {
             Self::Index { auth_token, .. }
             | Self::List { auth_token, .. }
+            | Self::Lookup { auth_token, .. }
             | Self::Submit { auth_token, .. }
-            | Self::Replicate { auth_token, .. }
+            | Self::Point { auth_token, .. }
+            | Self::Locate { auth_token, .. }
             | Self::Status { auth_token, .. }
             | Self::Report { auth_token, .. }
             | Self::Artifact { auth_token, .. }
             | Self::Cancel { auth_token, .. } => auth_token.clone(),
-        }
-    }
-
-    fn job_id(&self) -> Option<JobId> {
-        match self {
-            Self::Index { .. } | Self::List { .. } => None,
-            Self::Submit { job_id, .. } => Some(*job_id),
-            Self::Replicate { record, .. } => Some(record.job_id),
-            Self::Status { job_id, .. }
-            | Self::Report { job_id, .. }
-            | Self::Artifact { job_id, .. }
-            | Self::Cancel { job_id, .. } => Some(*job_id),
-        }
-    }
-
-    fn user_id(&self) -> Option<UserId> {
-        match self {
-            Self::Index { record, .. } => Some(record.created_by),
-            Self::List { user_id, .. } => Some(*user_id),
-            _ => None,
-        }
-    }
-
-    fn config_digest(&self) -> [u8; 32] {
-        match self {
-            Self::Index { config_digest, .. }
-            | Self::List { config_digest, .. }
-            | Self::Submit { config_digest, .. }
-            | Self::Replicate { config_digest, .. }
-            | Self::Status { config_digest, .. }
-            | Self::Report { config_digest, .. }
-            | Self::Artifact { config_digest, .. }
-            | Self::Cancel { config_digest, .. } => *config_digest,
         }
     }
 }
@@ -219,7 +198,10 @@ pub(crate) enum JobResponse {
     Submitted(SubmitJobResult),
     SubmitConflict(JobId),
     SubmitCap(u32),
-    Replicated,
+    Pointed,
+    Located {
+        owner_node_id: NodeId,
+    },
     Status {
         job: JobStatusView,
         run_crate: Option<String>,
@@ -481,81 +463,86 @@ async fn prepare_response(
     if !auth_realm_matches(&auth, local_realm_id) {
         return PreparedResponse::new(JobResponse::Forbidden);
     }
-    let config_digest = request.config_digest();
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    if let Some(user_id) = request.user_id() {
-        let route = match resolve_user_route(context, user_id).await {
-            Ok(route) => route,
-            Err(error) => {
-                return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
-            }
-        };
-        if route.config_digest != config_digest {
-            return PreparedResponse::new(JobResponse::Unavailable(
-                "user placement config does not match the requester".to_string(),
-            ));
-        }
-        if local_node != route.holders.first().copied() {
-            return PreparedResponse::new(JobResponse::Unavailable(
-                "receiving node is not the authoritative user holder".to_string(),
-            ));
-        }
-        return match request {
-            JobRequest::Index { record, .. } => prepare_index(context, auth.user_id, record).await,
-            JobRequest::List {
-                user_id,
-                cursor,
-                limit,
-                ..
-            } => prepare_list(context, auth.user_id, user_id, cursor, limit).await,
-            _ => PreparedResponse::new(JobResponse::Unavailable(
-                "invalid user-routed job request".to_string(),
-            )),
-        };
-    }
-    let Some(job_id) = request.job_id() else {
-        return PreparedResponse::new(JobResponse::Unavailable(
-            "job-routed request is missing a job id".to_string(),
-        ));
-    };
-    let route = match resolve_job_holders(context, job_id).await {
-        Ok(route) => route,
-        Err(error) => {
-            return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
-        }
-    };
-    if route.config_digest != config_digest {
-        return PreparedResponse::new(JobResponse::Unavailable(
-            "job-control realm config does not match the requester".to_string(),
-        ));
-    }
-    if local_node.is_none_or(|node| !route.holders.contains(&node)) {
-        return PreparedResponse::new(JobResponse::Unavailable(
-            "receiving node does not hold this job-control bucket".to_string(),
-        ));
-    }
     match request {
-        JobRequest::Index { .. } | JobRequest::List { .. } => PreparedResponse::new(
-            JobResponse::Unavailable("user-routed request reached the job dispatcher".to_string()),
-        ),
-        JobRequest::Submit { spec, .. } => {
-            if local_node != route.holders.first().copied() {
-                return PreparedResponse::new(JobResponse::Unavailable(
-                    "receiving node is not the rank-0 job holder".to_string(),
-                ));
+        JobRequest::Index {
+            record,
+            config_digest,
+            ..
+        } => {
+            if let Some(rejected) =
+                user_gate(context, record.created_by, config_digest, local_node).await
+            {
+                return rejected;
+            }
+            prepare_index(context, auth.user_id, record).await
+        }
+        JobRequest::List {
+            user_id,
+            cursor,
+            limit,
+            config_digest,
+            ..
+        } => {
+            if let Some(rejected) = user_gate(context, user_id, config_digest, local_node).await {
+                return rejected;
+            }
+            prepare_list(context, auth.user_id, user_id, cursor, limit).await
+        }
+        JobRequest::Lookup {
+            user_id,
+            job_id,
+            config_digest,
+            ..
+        } => {
+            if let Some(rejected) = user_gate(context, user_id, config_digest, local_node).await {
+                return rejected;
+            }
+            prepare_lookup(context, auth.user_id, user_id, job_id).await
+        }
+        JobRequest::Submit {
+            job_id,
+            spec,
+            config_digest,
+            ..
+        } => {
+            if let Some(rejected) =
+                bucket_gate(context, job_id, config_digest, local_node, true).await
+            {
+                return rejected;
             }
             prepare_submit(context, auth.user_id, job_id, spec).await
         }
-        JobRequest::Replicate { record, .. } => {
-            prepare_replicate(context, auth.user_id, record).await
+        JobRequest::Point {
+            pointer,
+            config_digest,
+            ..
+        } => {
+            if let Some(rejected) =
+                bucket_gate(context, pointer.job_id, config_digest, local_node, false).await
+            {
+                return rejected;
+            }
+            prepare_point(context, auth.user_id, pointer).await
         }
-        JobRequest::Status { .. } => prepare_status(context, auth.user_id, job_id).await,
+        JobRequest::Locate { job_id, .. } => prepare_locate(context, auth.user_id, job_id).await,
+        // Owner-directed operations: only the immutable owner may answer them.
+        JobRequest::Status { job_id, .. } => {
+            if let Some(rejected) = owner_gate(context, job_id, local_node).await {
+                return rejected;
+            }
+            prepare_status(context, auth.user_id, job_id).await
+        }
         JobRequest::Report {
+            job_id,
             expected_digest,
             last_key,
             limit,
             ..
         } => {
+            if let Some(rejected) = owner_gate(context, job_id, local_node).await {
+                return rejected;
+            }
             prepare_report(
                 context,
                 auth.user_id,
@@ -566,7 +553,10 @@ async fn prepare_response(
             )
             .await
         }
-        JobRequest::Artifact { range, .. } => {
+        JobRequest::Artifact { job_id, range, .. } => {
+            if let Some(rejected) = owner_gate(context, job_id, local_node).await {
+                return rejected;
+            }
             prepare_artifact(
                 context,
                 auth.user_id,
@@ -576,7 +566,100 @@ async fn prepare_response(
             )
             .await
         }
-        JobRequest::Cancel { .. } => prepare_cancel(context, runtime, auth.user_id, job_id).await,
+        JobRequest::Cancel { job_id, .. } => {
+            if let Some(rejected) = owner_gate(context, job_id, local_node).await {
+                return rejected;
+            }
+            prepare_cancel(context, runtime, auth.user_id, job_id).await
+        }
+    }
+}
+
+/// Rejects a user-routed request unless this node is the authoritative user
+/// rank-0 holder under the requester's config.
+async fn user_gate(
+    context: &DriverContext,
+    user_id: UserId,
+    config_digest: [u8; 32],
+    local_node: Option<NodeId>,
+) -> Option<PreparedResponse> {
+    let route = match resolve_user_route(context, user_id).await {
+        Ok(route) => route,
+        Err(error) => {
+            return Some(PreparedResponse::new(JobResponse::Unavailable(
+                error.to_string(),
+            )));
+        }
+    };
+    if route.config_digest != config_digest {
+        return Some(PreparedResponse::new(JobResponse::Unavailable(
+            "user placement config does not match the requester".to_string(),
+        )));
+    }
+    if local_node != route.holders.first().copied() {
+        return Some(PreparedResponse::new(JobResponse::Unavailable(
+            "receiving node is not the authoritative user holder".to_string(),
+        )));
+    }
+    None
+}
+
+/// Rejects a bucket-routed request unless this node holds the job's bucket
+/// (rank-0 when `require_rank0`) under the requester's config.
+async fn bucket_gate(
+    context: &DriverContext,
+    job_id: JobId,
+    config_digest: [u8; 32],
+    local_node: Option<NodeId>,
+    require_rank0: bool,
+) -> Option<PreparedResponse> {
+    let route = match resolve_job_holders(context, job_id).await {
+        Ok(route) => route,
+        Err(error) => {
+            return Some(PreparedResponse::new(JobResponse::Unavailable(
+                error.to_string(),
+            )));
+        }
+    };
+    if route.config_digest != config_digest {
+        return Some(PreparedResponse::new(JobResponse::Unavailable(
+            "job-control realm config does not match the requester".to_string(),
+        )));
+    }
+    if require_rank0 {
+        if local_node != route.holders.first().copied() {
+            return Some(PreparedResponse::new(JobResponse::Unavailable(
+                "receiving node is not the rank-0 job holder".to_string(),
+            )));
+        }
+    } else if local_node.is_none_or(|node| !route.holders.contains(&node)) {
+        return Some(PreparedResponse::new(JobResponse::Unavailable(
+            "receiving node does not hold this job-control bucket".to_string(),
+        )));
+    }
+    None
+}
+
+/// Rejects an owner-directed request when a local record proves another node
+/// owns the job. A missing record falls through so handlers answer NotFound or
+/// Gone themselves.
+async fn owner_gate(
+    context: &DriverContext,
+    job_id: JobId,
+    local_node: Option<NodeId>,
+) -> Option<PreparedResponse> {
+    match read_job_record(&context.storage_handle, job_id, None).await {
+        Ok(Some(record)) => {
+            if local_node.is_some_and(|node| record.owner_node_id == node) {
+                None
+            } else {
+                Some(PreparedResponse::new(JobResponse::Unavailable(
+                    "receiving node does not own this job".to_string(),
+                )))
+            }
+        }
+        Ok(None) => None,
+        Err(error) => Some(PreparedResponse::new(JobResponse::Unavailable(error))),
     }
 }
 
@@ -659,16 +742,59 @@ async fn prepare_submit(
     PreparedResponse::new(response)
 }
 
-async fn prepare_replicate(
+async fn prepare_lookup(
     context: &DriverContext,
+    auth_user: UserId,
     user_id: UserId,
-    record: JobRecord,
+    job_id: JobId,
 ) -> PreparedResponse {
-    if record.created_by != user_id {
+    if auth_user != user_id {
         return PreparedResponse::new(JobResponse::Forbidden);
     }
-    match write_passive_record(&context.storage_handle, &record).await {
-        Ok(()) => PreparedResponse::new(JobResponse::Replicated),
+    match find_user_job(&context.storage_handle, user_id, job_id).await {
+        Ok(Some(record)) => PreparedResponse::new(JobResponse::Located {
+            owner_node_id: record.owner_node_id,
+        }),
+        Ok(None) => PreparedResponse::new(JobResponse::NotFound),
+        Err(error) => PreparedResponse::new(JobResponse::Unavailable(error)),
+    }
+}
+
+async fn prepare_locate(
+    context: &DriverContext,
+    auth_user: UserId,
+    job_id: JobId,
+) -> PreparedResponse {
+    match read_owned_job(context, auth_user, job_id).await {
+        Ok(Some(record)) => {
+            return PreparedResponse::new(JobResponse::Located {
+                owner_node_id: record.owner_node_id,
+            });
+        }
+        Ok(None) => {}
+        Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error)),
+    }
+    match read_job_pointer(&context.storage_handle, job_id).await {
+        Ok(Some(pointer)) if pointer.created_by == auth_user => {
+            PreparedResponse::new(JobResponse::Located {
+                owner_node_id: pointer.owner_node_id,
+            })
+        }
+        Ok(_) => PreparedResponse::new(JobResponse::NotFound),
+        Err(error) => PreparedResponse::new(JobResponse::Unavailable(error)),
+    }
+}
+
+async fn prepare_point(
+    context: &DriverContext,
+    user_id: UserId,
+    pointer: JobPointer,
+) -> PreparedResponse {
+    if pointer.created_by != user_id {
+        return PreparedResponse::new(JobResponse::Forbidden);
+    }
+    match write_job_pointer(&context.storage_handle, &pointer).await {
+        Ok(()) => PreparedResponse::new(JobResponse::Pointed),
         Err(error) => PreparedResponse::new(JobResponse::Unavailable(error)),
     }
 }

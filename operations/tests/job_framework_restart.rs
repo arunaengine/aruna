@@ -124,7 +124,7 @@ async fn drive_until_terminal(
     loop {
         let batch = process_job_queue_batch(
             &context.storage_handle,
-            node_id(9),
+            node_id(1),
             JobClassBudget {
                 in_process: 8,
                 external: 8,

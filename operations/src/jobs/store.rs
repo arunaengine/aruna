@@ -14,7 +14,7 @@ use aruna_core::structs::{
     UserAccess, attempt_control_key, cleanup_dedup_key, cleanup_job_id, crate_job_id,
     encode_job_dedup_value, job_active_key, job_active_prefix, job_due_index_key, job_entry_key,
     job_entry_prefix, job_lease_index_key, job_owner_cursor, job_owner_index_key,
-    job_owner_index_prefix, job_prune_index_key, job_record_key, job_run_crate_key,
+    job_owner_index_prefix, job_pointer_key, job_prune_index_key, job_record_key, job_run_crate_key,
     parse_entry_key, parse_job_dedup_value, parse_job_owner_index_key, rocrate_plan_key,
     run_crate_dedup_key, validate_transition, workspace_credential_id,
 };
@@ -716,34 +716,47 @@ pub async fn read_job_record(
     }
 }
 
-/// Stores a readable replica without making it visible to the local drain.
-pub async fn write_passive_record(
+/// Immutable JobId -> owner lookup pointer. Never a runnable record: it carries
+/// no state, schedule row, or claim, and no code path ever promotes it to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobPointer {
+    pub job_id: JobId,
+    pub owner_node_id: NodeId,
+    pub created_by: UserId,
+}
+
+/// Persist an owner pointer, refusing to repoint an existing one elsewhere.
+pub async fn write_job_pointer(
     storage: &StorageHandle,
-    record: &JobRecord,
+    pointer: &JobPointer,
 ) -> Result<(), String> {
+    if let Some(existing) = read_job_pointer(storage, pointer.job_id).await?
+        && existing != *pointer
+    {
+        return Err("job owner pointer is immutable".to_string());
+    }
     batch_write(
         storage,
         vec![(
             JOB_KEYSPACE.to_string(),
-            job_record_key(record.job_id),
-            ByteView::from(record.to_bytes().map_err(|error| error.to_string())?),
+            job_pointer_key(pointer.job_id),
+            ByteView::from(postcard::to_allocvec(pointer).map_err(|error| error.to_string())?),
         )],
         None,
     )
     .await
 }
 
-pub async fn write_job_schedule(storage: &StorageHandle, record: &JobRecord) -> Result<(), String> {
-    batch_write(
-        storage,
-        vec![(
-            JOB_SCHEDULE_INDEX_KEYSPACE.to_string(),
-            job_schedule_key(record),
-            empty_value(),
-        )],
-        None,
-    )
-    .await
+pub async fn read_job_pointer(
+    storage: &StorageHandle,
+    job_id: JobId,
+) -> Result<Option<JobPointer>, String> {
+    match read_raw(storage, JOB_KEYSPACE, job_pointer_key(job_id), None).await? {
+        Some(value) => postcard::from_bytes(value.as_ref())
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        None => Ok(None),
+    }
 }
 
 enum UserTxnOutcome {

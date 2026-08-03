@@ -40,10 +40,10 @@ use crate::document_sync_outbox::{
 };
 use crate::driver::{DriverContext, drive};
 use crate::group_backends::remove::remove_drained_backends;
-use crate::jobs::drain::{JobClassBudget, process_routed_queue, restore_job_queue_timer};
+use crate::jobs::drain::{JobClassBudget, process_job_queue_batch, restore_job_queue_timer};
 use crate::jobs::prune::{process_job_prune_batch, restore_job_prune_timer};
 use crate::jobs::runtime::JobsRuntime;
-use crate::jobs::service::replicate_job_record;
+use crate::jobs::service::sync_job_record;
 use crate::jobs::store::release_job;
 use crate::jobs::{JOB_DRAIN_RETRY_AFTER, JOB_PRUNE_POLL_AFTER, JOB_PRUNE_RETRY_AFTER};
 use crate::metadata::materialization_queue::{
@@ -1689,12 +1689,12 @@ impl OperationsTaskHandler {
         if !self.jobs_runtime.is_started() {
             return;
         }
-        if self.context.net_handle.is_none() {
+        let Some(owner_node_id) = self.context.net_handle.as_ref().map(|net| net.node_id()) else {
             warn!(task_id = ?TaskKey::DrainJobQueue, "Cannot drain job queue without net handle");
             self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
                 .await;
             return;
-        }
+        };
         let Some(claim_producer) = self.jobs_runtime.claim_producer().await else {
             return;
         };
@@ -1710,7 +1710,14 @@ impl OperationsTaskHandler {
         };
 
         let reconciler = self.jobs_runtime.reconciler();
-        let result = match process_routed_queue(&self.context, budget, reconciler.as_ref()).await {
+        let result = match process_job_queue_batch(
+            &self.context.storage_handle,
+            owner_node_id,
+            budget,
+            reconciler.as_ref(),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(error) => {
                 warn!(task_id = ?TaskKey::DrainJobQueue, error = %error, "Failed to drain job queue");
@@ -1721,7 +1728,7 @@ impl OperationsTaskHandler {
         };
 
         for record in &result.terminal {
-            replicate_job_record(&self.context, record.job_id).await;
+            sync_job_record(&self.context, record.job_id).await;
         }
 
         for record in result.claimed {
