@@ -287,12 +287,22 @@ impl BandPool {
 }
 
 fn pool_by_id(pools: &[BandPool], id: Ulid) -> Option<&BandPool> {
-    pools.iter().find(|pool| pool.pool_id == id)
+    let mut matches = pools.iter().filter(|pool| pool.pool_id == id);
+    let pool = matches.next()?;
+    matches.next().is_none().then_some(pool)
 }
 
 /// Lineage validity: a root is self-issued; a child's issuer must own its valid
 /// parent and its span must be a subset. Cycles and malformed pools are invalid.
 pub fn pool_is_valid(pools: &[BandPool], pool: &BandPool) -> bool {
+    if pools
+        .iter()
+        .filter(|candidate| candidate.pool_id == pool.pool_id)
+        .count()
+        != 1
+    {
+        return false;
+    }
     valid_with_guard(pools, pool, &mut Vec::new())
 }
 

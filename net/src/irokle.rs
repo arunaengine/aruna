@@ -51,12 +51,13 @@ use aruna_core::storage_entries::{
     stale_admin_document_conflict_delete_entries, subject_index_key, subject_index_value,
 };
 use aruna_core::structs::{
-    BindingError, DocumentClass, Group, GroupAuthorizationDocument, MetadataRegistryRecord,
-    NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument, NodeUsageSnapshot, PlacementRef,
-    PlacementScope, PoolAdmission, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-    RealmNodeKind, Role, User, WatchEventMask, WatchInterestDigest, WatchSubscription,
-    admit_band_pool, group_owner_index_key, node_usage_key_node_id, reserved_label,
-    watch_interest_dirty_key, watch_interest_key_node_id, watch_interest_key_realm_id,
+    BindingError, DocumentClass, FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument,
+    HANDLE_RANGE_SIZE, MetadataRegistryRecord, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument,
+    NodeUsageSnapshot, PlacementRef, PlacementScope, PoolAdmission, RealmAuthorizationDocument,
+    RealmConfigDocument, RealmId, RealmNodeKind, Role, User, WatchEventMask, WatchInterestDigest,
+    WatchSubscription, admit_band_pool, coordinator_spans, group_owner_index_key,
+    node_usage_key_node_id, reserved_label, watch_interest_dirty_key, watch_interest_key_node_id,
+    watch_interest_key_realm_id,
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::{RoleId, TxnId, UserId, Value};
@@ -5450,6 +5451,34 @@ async fn validate_realm_config_admin_authority(
                     });
                 }
                 PoolAdmission::Accept => {}
+            }
+        }
+        if let AdminDocumentOperation::RealmConfigHandleRangeGranted { range } = &event.op {
+            let canonical = range.len() == HANDLE_RANGE_SIZE
+                && range
+                    .start
+                    .checked_sub(FIRST_GRANTABLE_HANDLE)
+                    .is_some_and(|offset| offset % HANDLE_RANGE_SIZE == 0)
+                && range.start.checked_add(HANDLE_RANGE_SIZE) == Some(range.end);
+            if !canonical {
+                return Ok(AdminEventValidation::Rejected(
+                    "handle grant is not one canonical band".to_string(),
+                ));
+            }
+            let spans = coordinator_spans(&config.band_pools, &event.origin_node_id);
+            if spans.is_empty() {
+                return Ok(AdminEventValidation::Deferred {
+                    dependency: None,
+                    reason: "coordinator band pool is not yet replicated".to_string(),
+                });
+            }
+            if !spans
+                .iter()
+                .any(|(start, end)| *start <= range.start && range.end <= *end)
+            {
+                return Ok(AdminEventValidation::Rejected(
+                    "handle grant lies outside the coordinator band pool".to_string(),
+                ));
             }
         }
         let server_binding = match (
