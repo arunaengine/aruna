@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::structs::{FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE, HandleRange};
+use crate::structs::{FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange};
 use crate::structured_id::PlacementHandle;
 
 /// The derived view over the replicated handle-range set. Overlapping grants —
@@ -84,22 +84,26 @@ impl HandleRangeDirectory {
             .filter(|range| range.owner == *owner)
     }
 
-    /// First free band at or after the band holding `preferred_start`, wrapping.
-    /// A band is free when it intersects no stored grant; `None` means the whole
-    /// assignable space is occupied.
-    pub fn free_band_from(&self, preferred_start: u32) -> Option<(u32, u32)> {
-        let preferred = preferred_start.saturating_sub(FIRST_GRANTABLE_HANDLE) / HANDLE_RANGE_SIZE;
-        (0..HANDLE_BANDS).find_map(|offset| {
-            let index = (preferred + offset) % HANDLE_BANDS;
-            let start = FIRST_GRANTABLE_HANDLE + index * HANDLE_RANGE_SIZE;
-            let end = start + HANDLE_RANGE_SIZE;
-            (!self
-                .by_id
-                .values()
-                .flatten()
-                .any(|range| range.start < end && start < range.end))
-            .then_some((start, end))
-        })
+    /// Lowest free band inside the pool `spans`: a band intersecting no stored
+    /// grant, conflicted grants included conservatively. `None` means the spans
+    /// are fully consumed.
+    pub fn free_band_in(&self, spans: &[(u32, u32)]) -> Option<(u32, u32)> {
+        spans
+            .iter()
+            .flat_map(|(span_start, span_end)| {
+                let bands = span_end.saturating_sub(*span_start) / HANDLE_RANGE_SIZE;
+                (0..bands).map(move |band| {
+                    let start = span_start + band * HANDLE_RANGE_SIZE;
+                    (start, start + HANDLE_RANGE_SIZE)
+                })
+            })
+            .find(|(start, end)| {
+                !self
+                    .by_id
+                    .values()
+                    .flatten()
+                    .any(|range| range.start < *end && *start < range.end)
+            })
     }
 }
 
@@ -127,16 +131,17 @@ impl HandleAllocationCursor {
 
     /// Draws the lowest unused handle at or after `next` that falls inside one of
     /// `ranges` (this node's disjoint granted slices, any order), advancing the
-    /// cursor past it. `None` ⇒ every granted handle is spent.
+    /// cursor past it. The first handle of every range is the owner's reserved
+    /// JobControl handle and is never drawn. `None` ⇒ every granted handle is spent.
     pub fn allocate(&mut self, ranges: &[HandleRange]) -> Option<(PlacementHandle, Ulid)> {
         let mut sorted: Vec<&HandleRange> =
             ranges.iter().filter(|range| !range.is_empty()).collect();
         sorted.sort_by_key(|range| (range.start, range.range_id));
         for range in sorted {
-            if range.end <= self.next {
+            let candidate = self.next.max(range.start + 1);
+            if candidate >= range.end {
                 continue;
             }
-            let candidate = self.next.max(range.start);
             if let Ok(handle) = PlacementHandle::new(candidate) {
                 self.next = candidate + 1;
                 return Some((handle, range.range_id));
@@ -149,10 +154,14 @@ impl HandleAllocationCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structs::{HANDLE_RANGE_SIZE, HANDLE_SPACE_END};
+    use crate::structs::{HANDLE_BANDS, HANDLE_RANGE_SIZE, HANDLE_SPACE_END, band_start};
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn full_span() -> Vec<(u32, u32)> {
+        vec![(FIRST_GRANTABLE_HANDLE, band_start(HANDLE_BANDS))]
     }
 
     #[test]
@@ -169,7 +178,7 @@ mod tests {
         assert_eq!(directory.granted_to(&left).len(), 1);
         assert_eq!(directory.granted_to(&right).len(), 1);
         assert_eq!(
-            directory.free_band_from(FIRST_GRANTABLE_HANDLE),
+            directory.free_band_in(&full_span()),
             Some((re, re + HANDLE_RANGE_SIZE))
         );
     }
@@ -190,10 +199,9 @@ mod tests {
         let directory = HandleRangeDirectory::from_ranges(&ranges);
         assert_eq!(directory.conflicts(), 0);
         assert_eq!(directory.granted_to(&owner).len(), 2);
-        assert_eq!(
-            directory.free_band_from(FIRST_GRANTABLE_HANDLE),
-            Some((2051, 3075))
-        );
+        assert_eq!(directory.free_band_in(&full_span()), Some((2051, 3075)));
+        // A pool span not covering the free band yields nothing.
+        assert_eq!(directory.free_band_in(&[(3, 2051)]), None);
     }
 
     #[test]
@@ -218,17 +226,15 @@ mod tests {
 
         assert_eq!(directory.conflicts(), 2);
         assert!(directory.granted_to(&owner).is_empty());
-        assert_eq!(
-            directory.free_band_from(FIRST_GRANTABLE_HANDLE),
-            Some((3075, 4099))
-        );
+        assert_eq!(directory.free_band_in(&full_span()), Some((3075, 4099)));
     }
 
     #[test]
     fn cursor_skips_gaps() {
+        // The first handle of each range is the reserved JobControl handle.
         let owner = node(1);
-        let low = range(1, owner, 3, 5);
-        let high = range(2, owner, 2049, 2051);
+        let low = range(1, owner, 3, 6);
+        let high = range(2, owner, 2049, 2052);
         let mut cursor = HandleAllocationCursor::new();
         let drawn: Vec<u32> = std::iter::from_fn(|| {
             cursor
@@ -236,7 +242,7 @@ mod tests {
                 .map(|(handle, _)| handle.get())
         })
         .collect();
-        assert_eq!(drawn, vec![3, 4, 2049, 2050]);
+        assert_eq!(drawn, vec![4, 5, 2050, 2051]);
         assert!(cursor.allocate(&[low, high]).is_none());
     }
 
@@ -256,10 +262,14 @@ mod tests {
     #[test]
     fn last_range_bounded() {
         let owner = node(1);
-        let last = range(1, owner, HANDLE_SPACE_END - 1, HANDLE_SPACE_END);
+        let last = range(1, owner, HANDLE_SPACE_END - 2, HANDLE_SPACE_END);
         let mut cursor = HandleAllocationCursor { next: last.start };
         let (handle, _) = cursor.allocate(&[last]).unwrap();
         assert_eq!(handle.get(), HANDLE_SPACE_END - 1);
         assert!(cursor.allocate(&[last]).is_none());
+        // A single-handle range holds only the reserved handle: nothing to draw.
+        let reserved_only = range(2, owner, 3, 4);
+        let mut cursor = HandleAllocationCursor::new();
+        assert!(cursor.allocate(&[reserved_only]).is_none());
     }
 }

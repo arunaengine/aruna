@@ -213,10 +213,6 @@ impl PlacementBinding {
                 METADATA_HANDLE,
                 DocumentClass::Metadata,
                 PlacementScope::Realm(_)
-            ) | (
-                JOBCONTROL_HANDLE,
-                DocumentClass::JobControl,
-                PlacementScope::Realm(_)
             )
         ) && self.allocator_range_id.is_none()
             && self.allocated_by.is_none()
@@ -237,8 +233,6 @@ impl PlacementBinding {
 pub const FIRST_HANDLE: u32 = 1;
 /// Realm-scoped default class binding for metadata documents.
 pub const METADATA_HANDLE: u32 = FIRST_HANDLE;
-/// Realm-scoped default class binding for job-control records.
-pub const JOBCONTROL_HANDLE: u32 = 2;
 /// First handle a bootstrap assignment may use; the low band below it is reserved for
 /// the realm-scoped default class bindings above.
 pub const FIRST_GRANTABLE_HANDLE: u32 = 3;
@@ -251,18 +245,39 @@ pub const HANDLE_RANGE_SIZE: u32 = 1024;
 /// Disjoint node bands in the assignable handle space.
 pub const HANDLE_BANDS: u32 = (HANDLE_SPACE_END - FIRST_GRANTABLE_HANDLE) / HANDLE_RANGE_SIZE;
 
-/// The hash-derived band a node prefers. Onboarding probes on from here to the
-/// first free band; `salt` re-seeds the probe after a fail-closed collision so
-/// two nodes that hashed onto one band diverge on their next grant.
-pub fn owner_handle_band(owner: &NodeId, salt: u32) -> (u32, u32) {
-    let mut input = b"aruna-handle-band-v1".to_vec();
-    input.extend_from_slice(owner.as_bytes());
-    input.extend_from_slice(&salt.to_be_bytes());
-    let mut head = [0u8; 4];
-    head.copy_from_slice(&blake3::hash(&input).as_bytes()[..4]);
-    let lane = u32::from_be_bytes(head) % HANDLE_BANDS;
-    let start = FIRST_GRANTABLE_HANDLE + lane * HANDLE_RANGE_SIZE;
-    (start, start + HANDLE_RANGE_SIZE)
+/// First handle of the band with index `band`.
+pub fn band_start(band: u32) -> u32 {
+    FIRST_GRANTABLE_HANDLE + band * HANDLE_RANGE_SIZE
+}
+
+/// Handle spans `owner` may grant bands from: every pool slice assigned to it,
+/// minus any slice a later pool re-assigned (a transfer to a new coordinator).
+/// Later pools win per band, ordered by `range_id`, so carving is deterministic.
+pub fn coordinator_spans(pools: &[HandleRange], owner: &NodeId) -> Vec<(u32, u32)> {
+    let mut sorted: Vec<&HandleRange> = pools.iter().collect();
+    sorted.sort_by_key(|pool| (pool.range_id, pool.owner, pool.start, pool.end));
+    let mut owners: Vec<Option<NodeId>> = vec![None; HANDLE_BANDS as usize];
+    for pool in sorted {
+        for band in 0..HANDLE_BANDS {
+            let start = band_start(band);
+            if pool.start <= start && start + HANDLE_RANGE_SIZE <= pool.end {
+                owners[band as usize] = Some(pool.owner);
+            }
+        }
+    }
+    let mut spans: Vec<(u32, u32)> = Vec::new();
+    for band in 0..HANDLE_BANDS {
+        if owners[band as usize].as_ref() != Some(owner) {
+            continue;
+        }
+        let start = band_start(band);
+        let end = start + HANDLE_RANGE_SIZE;
+        match spans.last_mut() {
+            Some(span) if span.1 == start => span.1 = end,
+            _ => spans.push((start, end)),
+        }
+    }
+    spans
 }
 
 /// Durable `[start, end)` handle slice granted to one node.
@@ -587,6 +602,61 @@ mod tests {
             ..a
         };
         assert!(!past_end.is_well_formed());
+    }
+
+    #[test]
+    fn spans_follow_transfers() {
+        // A later pool re-assigns its slice; the elder owner keeps the rest.
+        let elder = node(1);
+        let newer = node(2);
+        let full = HandleRange {
+            range_id: Ulid::from_bytes([1; 16]),
+            owner: elder,
+            start: FIRST_GRANTABLE_HANDLE,
+            end: band_start(HANDLE_BANDS),
+        };
+        assert_eq!(
+            coordinator_spans(&[full], &elder),
+            vec![(FIRST_GRANTABLE_HANDLE, band_start(HANDLE_BANDS))]
+        );
+        assert!(coordinator_spans(&[full], &newer).is_empty());
+
+        let transferred = HandleRange {
+            range_id: Ulid::from_bytes([2; 16]),
+            owner: newer,
+            start: band_start(HANDLE_BANDS / 2),
+            end: band_start(HANDLE_BANDS),
+        };
+        let pools = [full, transferred];
+        assert_eq!(
+            coordinator_spans(&pools, &elder),
+            vec![(FIRST_GRANTABLE_HANDLE, band_start(HANDLE_BANDS / 2))]
+        );
+        assert_eq!(
+            coordinator_spans(&pools, &newer),
+            vec![(band_start(HANDLE_BANDS / 2), band_start(HANDLE_BANDS))]
+        );
+        // Order-independent: the reversed input carves identically.
+        assert_eq!(
+            coordinator_spans(&[transferred, full], &elder),
+            coordinator_spans(&pools, &elder)
+        );
+    }
+
+    #[test]
+    fn partial_bands_ignored() {
+        // A pool covering only part of a band never makes that band grantable.
+        let owner = node(3);
+        let partial = HandleRange {
+            range_id: Ulid::from_bytes([3; 16]),
+            owner,
+            start: FIRST_GRANTABLE_HANDLE + 1,
+            end: band_start(2) + 5,
+        };
+        assert_eq!(
+            coordinator_spans(&[partial], &owner),
+            vec![(band_start(1), band_start(2))]
+        );
     }
 
     #[test]

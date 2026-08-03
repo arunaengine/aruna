@@ -242,14 +242,15 @@ pub async fn wait_for_onboarding_placement(
 }
 
 fn node_is_ready(config: &aruna_core::structs::RealmConfigDocument, node_id: NodeId) -> bool {
-    // At least one usable grant: a fail-closed collision leaves a conflicted
-    // range behind, and the re-probed replacement is what makes the node ready.
+    // A usable band grant plus its JobControl binding: the node must be able
+    // to mint owner-encoded JobIds before it starts serving.
     config.has_node(node_id)
         && config.placement_entry(node_id).is_some()
         && !config
             .handle_range_directory()
             .granted_to(&node_id)
             .is_empty()
+        && config.job_control_handle(&node_id).is_some()
 }
 
 async fn load_realm_config(
@@ -429,6 +430,7 @@ mod tests {
             draining: false,
             labels: Default::default(),
         });
+        config.seed_default_placement();
         config
             .placement_handle_ranges
             .push(aruna_core::structs::HandleRange {
@@ -437,6 +439,22 @@ mod tests {
                 start: aruna_core::structs::FIRST_GRANTABLE_HANDLE,
                 end: aruna_core::structs::FIRST_GRANTABLE_HANDLE
                     + aruna_core::structs::HANDLE_RANGE_SIZE,
+            });
+        // A grant without its JobControl binding is not ready yet.
+        assert!(!node_is_ready(&config, node_id));
+        config
+            .placement_bindings
+            .push(aruna_core::structs::PlacementBinding {
+                handle: aruna_core::structured_id::PlacementHandle::new(
+                    aruna_core::structs::FIRST_GRANTABLE_HANDLE,
+                )
+                .unwrap(),
+                scope: aruna_core::structs::PlacementScope::Realm(realm_id),
+                document_class: aruna_core::structs::DocumentClass::JobControl,
+                strategy_id: config.default_strategy_id.unwrap(),
+                allocator_range_id: Some(ulid::Ulid::from_bytes([3; 16])),
+                allocated_by: Some(node_id),
+                allocated_at_ms: Some(1),
             });
         assert!(node_is_ready(&config, node_id));
     }

@@ -193,6 +193,11 @@ pub enum AdminDocumentOperation {
     RealmConfigHandleRangeGranted {
         range: HandleRange,
     },
+    /// Assigns an append-only coordinator band pool. A later pool re-assigns
+    /// its slice (a transfer to a new coordinator); carving is deterministic.
+    RealmConfigBandPoolAssigned {
+        pool: HandleRange,
+    },
 }
 
 #[cfg(test)]
@@ -370,6 +375,14 @@ mod tests {
                     owner: node(1),
                     start: 1,
                     end: 1025,
+                },
+            },
+            AdminDocumentOperation::RealmConfigBandPoolAssigned {
+                pool: HandleRange {
+                    range_id: Ulid::from_bytes([7; 16]),
+                    owner: node(1),
+                    start: 3,
+                    end: 1027,
                 },
             },
         ];

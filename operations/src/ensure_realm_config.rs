@@ -18,8 +18,12 @@ use aruna_core::storage_entries::{
     admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
 };
 use aruna_core::structs::{
-    Actor, HandleRange, RealmConfigDocument, RealmNodeKind, owner_handle_band,
+    Actor, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE, HandleRange,
+    PlacementBinding, PlacementScope, RealmConfigDocument, RealmNodeKind, band_start,
+    coordinator_spans,
 };
+use aruna_core::structured_id::PlacementHandle;
+use aruna_core::util::unix_timestamp_millis;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
@@ -90,6 +94,12 @@ pub enum EnsureRealmConfigError {
     NodeKindMismatch { node_id: NodeId },
     #[error("realm handle space is fully assigned")]
     HandleSpaceExhausted,
+    #[error("onboarding coordinator {node_id} has no band pool")]
+    CoordinatorPoolMissing { node_id: NodeId },
+    #[error("realm config has no placement strategy for the job-control binding")]
+    DefaultStrategyMissing,
+    #[error("granted band start is not a valid placement handle")]
+    InvalidBandStart,
     #[error("missing active transaction")]
     MissingTransaction,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -150,6 +160,7 @@ impl EnsureRealmConfigOperation {
         let Some(txn_id) = self.txn_id else {
             return Err(EnsureRealmConfigError::MissingTransaction);
         };
+        let fresh = document_value.is_none();
         let mut document = match document_value.as_deref() {
             Some(value) => RealmConfigDocument::from_bytes(value)?,
             None if self.config.create_if_missing => {
@@ -208,24 +219,32 @@ impl EnsureRealmConfigOperation {
                 &self.config.target_node_kind,
             )
         });
-        let owned_ranges = document
-            .placement_handle_ranges
-            .iter()
-            .filter(|range| range.owner == self.config.target_node_id)
-            .count();
-        let usable_ranges = document
-            .handle_range_directory()
-            .granted_to(&self.config.target_node_id);
-        // A usable grant wins; otherwise re-probe from a band salted by the count of
-        // this node's fail-closed grants, so two nodes that collided on one hash band
-        // deterministically diverge instead of conflicting forever.
+        // A fresh document seeds the creating coordinator with every band.
+        let seed_pool = (fresh && document.band_pools.is_empty()).then(|| HandleRange {
+            range_id: Ulid::generate(),
+            owner: self.config.actor.node_id,
+            start: FIRST_GRANTABLE_HANDLE,
+            end: band_start(HANDLE_BANDS),
+        });
+        let mut pools = document.band_pools.clone();
+        pools.extend(seed_pool);
+
+        let directory = document.handle_range_directory();
+        let usable_ranges = directory.granted_to(&self.config.target_node_id);
+        // A usable grant is reused; otherwise the acting coordinator consumes
+        // the lowest free band of its own disjoint pool, so two disconnected
+        // coordinators can never mint colliding grants.
         let assigned_range = match usable_ranges.first() {
             Some(usable) => *usable,
             None => {
-                let salt = u32::try_from(owned_ranges).unwrap_or(u32::MAX);
-                let (start, end) = document
-                    .handle_range_directory()
-                    .free_band_from(owner_handle_band(&self.config.target_node_id, salt).0)
+                let spans = coordinator_spans(&pools, &self.config.actor.node_id);
+                if spans.is_empty() {
+                    return Err(EnsureRealmConfigError::CoordinatorPoolMissing {
+                        node_id: self.config.actor.node_id,
+                    });
+                }
+                let (start, end) = directory
+                    .free_band_in(&spans)
                     .ok_or(EnsureRealmConfigError::HandleSpaceExhausted)?;
                 HandleRange {
                     range_id: Ulid::generate(),
@@ -239,12 +258,67 @@ impl EnsureRealmConfigOperation {
             .materialized_handle_ranges()
             .get(&assigned_range.range_id)
             == Some(&assigned_range);
-        if node_is_noop && range_is_noop {
+        // The band's first handle is the target's JobControl handle; the
+        // immutable binding is appended at most once per handle.
+        let job_handle = PlacementHandle::new(assigned_range.start)
+            .map_err(|_| EnsureRealmConfigError::InvalidBandStart)?;
+        let job_binding = if document
+            .placement_bindings
+            .iter()
+            .any(|binding| binding.handle == job_handle)
+        {
+            None
+        } else {
+            let strategy_id = document
+                .default_strategy_id
+                .or_else(|| document.strategies.first().map(|s| s.strategy_id))
+                .ok_or(EnsureRealmConfigError::DefaultStrategyMissing)?;
+            Some(PlacementBinding {
+                handle: job_handle,
+                scope: PlacementScope::Realm(self.config.actor.realm_id),
+                document_class: DocumentClass::JobControl,
+                strategy_id,
+                allocator_range_id: Some(assigned_range.range_id),
+                allocated_by: Some(self.config.target_node_id),
+                allocated_at_ms: Some(unix_timestamp_millis()),
+            })
+        };
+        // A new management coordinator receives an unused tail slice of the
+        // acting coordinator's pool so it can onboard nodes on its own.
+        let transfer_pool = if self.config.target_node_kind == RealmNodeKind::Management
+            && self.config.target_node_id != self.config.actor.node_id
+            && coordinator_spans(&pools, &self.config.target_node_id).is_empty()
+        {
+            let spans = coordinator_spans(&pools, &self.config.actor.node_id);
+            let mut consumed = document.placement_handle_ranges.clone();
+            consumed.push(assigned_range);
+            let slice = pool_transfer_slice(&spans, &consumed);
+            if slice.is_none() {
+                warn!(
+                    target_node = %self.config.target_node_id,
+                    "New coordinator gets no band pool: the acting pool cannot be split"
+                );
+            }
+            slice.map(|(start, end)| HandleRange {
+                range_id: Ulid::generate(),
+                owner: self.config.target_node_id,
+                start,
+                end,
+            })
+        } else {
+            None
+        };
+        if node_is_noop
+            && range_is_noop
+            && job_binding.is_none()
+            && seed_pool.is_none()
+            && transfer_pool.is_none()
+        {
             self.output = Some(Ok(document.clone()));
             return Ok(self.emit_commit_noop(document));
         }
 
-        let mut admin_events = Vec::with_capacity(2);
+        let mut admin_events = Vec::with_capacity(5);
         if !node_is_noop {
             admin_events.push(apply_realm_config_node_ensure(
                 &mut reducer_state,
@@ -253,12 +327,30 @@ impl EnsureRealmConfigOperation {
                 self.config.target_node_kind.clone(),
             )?);
         }
+        if let Some(pool) = seed_pool {
+            admin_events.push(reducer_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigBandPoolAssigned { pool },
+            )?);
+        }
         if !range_is_noop {
             admin_events.push(reducer_state.apply_operation(
                 &self.config.actor,
                 AdminDocumentOperation::RealmConfigHandleRangeGranted {
                     range: assigned_range,
                 },
+            )?);
+        }
+        if let Some(binding) = job_binding {
+            admin_events.push(reducer_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding },
+            )?);
+        }
+        if let Some(pool) = transfer_pool {
+            admin_events.push(reducer_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigBandPoolAssigned { pool },
             )?);
         }
         overlay_realm_config_reducer_materialization(&mut document, &reducer_state);
@@ -474,6 +566,37 @@ impl Operation for EnsureRealmConfigOperation {
     }
 }
 
+/// Upper half of the largest free band run of `spans`; `None` when fewer than
+/// two free bands remain (the new coordinator then starts without a pool).
+fn pool_transfer_slice(spans: &[(u32, u32)], consumed: &[HandleRange]) -> Option<(u32, u32)> {
+    let mut best: Option<(u32, u32)> = None;
+    for (span_start, span_end) in spans {
+        let mut run_start = None;
+        let bands = span_end.saturating_sub(*span_start) / HANDLE_RANGE_SIZE;
+        for band in 0..=bands {
+            let start = span_start + band * HANDLE_RANGE_SIZE;
+            let free = band < bands
+                && !consumed
+                    .iter()
+                    .any(|range| range.start < start + HANDLE_RANGE_SIZE && start < range.end);
+            match (free, run_start) {
+                (true, None) => run_start = Some(start),
+                (false, Some(from)) => {
+                    if best.is_none_or(|(best_start, best_end)| start - from > best_end - best_start)
+                    {
+                        best = Some((from, start));
+                    }
+                    run_start = None;
+                }
+                _ => {}
+            }
+        }
+    }
+    let (start, end) = best?;
+    let bands = (end - start) / HANDLE_RANGE_SIZE;
+    (bands >= 2).then(|| (start + bands.div_ceil(2) * HANDLE_RANGE_SIZE, end))
+}
+
 fn apply_realm_config_node_ensure(
     state: &mut AdminDocumentReducerState,
     actor: &Actor,
@@ -568,9 +691,10 @@ mod tests {
     use aruna_core::operation::Operation;
     use aruna_core::storage_entries::admin_document_reducer_conflict_key;
     use aruna_core::structs::{
-        Actor, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange,
-        NodePlacementEntry, PlacementOverride, PlacementStrategy, RealmConfigDocument, RealmId,
-        RealmNodeKind, StrategyBinding, owner_handle_band,
+        Actor, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS,
+        HANDLE_RANGE_SIZE, HandleRange, NodePlacementEntry, PlacementOverride, PlacementStrategy,
+        RealmConfigDocument, RealmId, RealmNodeKind, StrategyBinding, band_start,
+        coordinator_spans,
     };
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::{Effects, Key, KeySpace, TxnId, UserId, Value};
@@ -708,83 +832,113 @@ mod tests {
         );
     }
 
+    fn pooled_document(realm_id: RealmId, pools: &[(u8, Actor, u32, u32)]) -> RealmConfigDocument {
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        document.seed_default_placement();
+        for (seed, owner, start_band, end_band) in pools {
+            document.band_pools.push(HandleRange {
+                range_id: Ulid::from_bytes([*seed; 16]),
+                owner: owner.node_id,
+                start: band_start(*start_band),
+                end: band_start(*end_band),
+            });
+        }
+        document
+    }
+
+    fn run_ensure(
+        actor: &Actor,
+        target: aruna_core::NodeId,
+        kind: RealmNodeKind,
+        document: &RealmConfigDocument,
+    ) -> (RealmConfigDocument, Vec<u8>) {
+        let mut operation = EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
+            target_node_id: target,
+            target_node_kind: kind,
+            ..config(actor.clone(), 3)
+        });
+        let txn_id = TxnId::generate();
+        operation.txn_id = Some(txn_id);
+        let writes = batch_write(
+            operation
+                .emit_write_document_and_admin_state(
+                    Some(document.to_bytes(actor).unwrap().into()),
+                    None,
+                )
+                .unwrap(),
+            txn_id,
+        );
+        let stored =
+            RealmConfigDocument::from_bytes(write_value(&writes, REALM_CONFIG_KEYSPACE)).unwrap();
+        let state = write_value(&writes, ADMIN_DOCUMENT_STATE_KEYSPACE).to_vec();
+        (stored, state)
+    }
+
     #[test]
-    fn conflicted_bands_reprobe() {
-        // Two onboarding nodes fail-closed on one band must each re-probe to a
-        // fresh disjoint band instead of erroring forever, and re-running the
-        // ensure once a usable grant exists must be a pure noop commit.
+    fn pools_stay_disjoint() {
+        // Two disconnected coordinators onboard concurrently from the same base
+        // document; disjoint pools make colliding grants impossible.
         let realm_id = RealmId::from_bytes([31; 32]);
         let actor_a = actor(31, realm_id);
         let actor_b = actor(32, realm_id);
-        let band = owner_handle_band(&actor_a.node_id, 0);
-        let clash = |seed: u8, owner| HandleRange {
-            range_id: Ulid::from_bytes([seed; 16]),
-            owner,
-            start: band.0,
-            end: band.1,
-        };
-        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        document
-            .placement_handle_ranges
-            .push(clash(1, actor_a.node_id));
-        document
-            .placement_handle_ranges
-            .push(clash(2, actor_b.node_id));
-        let directory = document.handle_range_directory();
-        assert!(directory.granted_to(&actor_a.node_id).is_empty());
-        assert!(directory.granted_to(&actor_b.node_id).is_empty());
-
-        let run = |target: &Actor, document: &RealmConfigDocument| {
-            let mut operation = EnsureRealmConfigOperation::new(config(target.clone(), 3));
-            let txn_id = TxnId::generate();
-            operation.txn_id = Some(txn_id);
-            let writes = batch_write(
-                operation
-                    .emit_write_document_and_admin_state(
-                        Some(document.to_bytes(target).unwrap().into()),
-                        None,
-                    )
-                    .unwrap(),
-                txn_id,
-            );
-            let stored =
-                RealmConfigDocument::from_bytes(write_value(&writes, REALM_CONFIG_KEYSPACE))
-                    .unwrap();
-            let state = write_value(&writes, ADMIN_DOCUMENT_STATE_KEYSPACE).to_vec();
-            (stored, state)
-        };
-
-        // Concurrent round: both re-probe from the shared merged document without
-        // seeing each other's fresh grant; the salted probe must diverge.
-        let (after_a, state_a) = run(&actor_a, &document);
-        let (after_b, _) = run(&actor_b, &document);
-        let fresh = |after: &RealmConfigDocument, owner| {
-            let granted = after.handle_range_directory().granted_to(owner);
-            assert_eq!(granted.len(), 1, "re-probe must yield one usable grant");
-            granted[0]
-        };
-        let granted_a = fresh(&after_a, &actor_a.node_id);
-        let granted_b = fresh(&after_b, &actor_b.node_id);
-        assert!(!granted_a.overlaps(&clash(1, actor_a.node_id)));
-        assert!(!granted_b.overlaps(&clash(2, actor_b.node_id)));
-        assert!(
-            !granted_a.overlaps(&granted_b),
-            "salted re-probes must diverge for distinct nodes"
+        let joiner_a = node(41);
+        let joiner_b = node(42);
+        let mid = HANDLE_BANDS / 2;
+        let document = pooled_document(
+            realm_id,
+            &[(1, actor_a.clone(), 0, mid), (2, actor_b.clone(), mid, HANDLE_BANDS)],
         );
 
-        // CRDT union of both rounds keeps both fresh grants usable.
+        let (after_a, state_a) = run_ensure(&actor_a, joiner_a, RealmNodeKind::Server, &document);
+        let (after_b, _) = run_ensure(&actor_b, joiner_b, RealmNodeKind::Server, &document);
+        let granted = |after: &RealmConfigDocument, owner: &aruna_core::NodeId| {
+            let granted = after.handle_range_directory().granted_to(owner);
+            assert_eq!(granted.len(), 1, "one usable grant per joiner");
+            granted[0]
+        };
+        let granted_a = granted(&after_a, &joiner_a);
+        let granted_b = granted(&after_b, &joiner_b);
+        assert!(!granted_a.overlaps(&granted_b), "pool grants must be disjoint");
+        assert!(granted_a.start < band_start(mid), "A grants from A's pool");
+        assert!(granted_b.start >= band_start(mid), "B grants from B's pool");
+
+        // Each joiner's JobControl binding names the band's first handle.
+        for (after, joiner, grant) in [
+            (&after_a, joiner_a, granted_a),
+            (&after_b, joiner_b, granted_b),
+        ] {
+            let handle = after.job_control_handle(&joiner).expect("binding appended");
+            assert_eq!(handle.get(), grant.start);
+        }
+
+        // CRDT union of both rounds keeps both grants and bindings usable.
         let mut merged = after_a.clone();
         merged.placement_handle_ranges.push(granted_b);
+        merged.placement_bindings.extend(
+            after_b
+                .placement_bindings
+                .iter()
+                .filter(|binding| binding.allocated_by == Some(joiner_b))
+                .cloned(),
+        );
         let directory = merged.handle_range_directory();
-        assert_eq!(directory.granted_to(&actor_a.node_id), vec![granted_a]);
-        assert_eq!(directory.granted_to(&actor_b.node_id), vec![granted_b]);
+        assert_eq!(directory.conflicts(), 0);
+        assert_eq!(directory.granted_to(&joiner_a), vec![granted_a]);
+        assert_eq!(directory.granted_to(&joiner_b), vec![granted_b]);
+        assert!(merged.job_control_handle(&joiner_a).is_some());
+        assert!(merged.job_control_handle(&joiner_b).is_some());
 
-        let mut operation = EnsureRealmConfigOperation::new(config(actor_a, 3));
+        // Retrying the same joiner over converged state is a pure noop commit.
+        let mut operation = EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
+            target_node_id: joiner_a,
+            target_node_kind: RealmNodeKind::Server,
+            ..config(actor_a.clone(), 3)
+        });
         let txn_id = TxnId::generate();
         operation.txn_id = Some(txn_id);
         let effects = operation
             .emit_write_document_and_admin_state(
-                Some(merged.to_bytes(&actor_b).unwrap().into()),
+                Some(merged.to_bytes(&actor_a).unwrap().into()),
                 Some(state_a.into()),
             )
             .unwrap();
@@ -797,10 +951,66 @@ mod tests {
     }
 
     #[test]
+    fn transfer_splits_pool() {
+        // A new management coordinator receives the tail half of the acting
+        // coordinator's free pool and can grant on its own afterwards.
+        let realm_id = RealmId::from_bytes([33; 32]);
+        let actor_a = actor(33, realm_id);
+        let coordinator = node(43);
+        let document = pooled_document(realm_id, &[(1, actor_a.clone(), 0, HANDLE_BANDS)]);
+
+        let (after, _) = run_ensure(&actor_a, coordinator, RealmNodeKind::Management, &document);
+        let actor_spans = coordinator_spans(&after.band_pools, &actor_a.node_id);
+        let joiner_spans = coordinator_spans(&after.band_pools, &coordinator);
+        assert!(!joiner_spans.is_empty(), "new coordinator received a pool");
+        for (start, end) in &joiner_spans {
+            for (actor_start, actor_end) in &actor_spans {
+                assert!(end <= actor_start || actor_end <= start, "pools overlap");
+            }
+        }
+        // The joiner's node band was consumed from the actor's kept slice.
+        let granted = after.handle_range_directory().granted_to(&coordinator);
+        assert_eq!(granted.len(), 1);
+        assert!(granted[0].start < joiner_spans[0].0);
+
+        // The new coordinator can now grant a band from its own pool.
+        let (after_second, _) =
+            run_ensure(&Actor { node_id: coordinator, ..actor_a.clone() }, node(44), RealmNodeKind::Server, &after);
+        let second = after_second.handle_range_directory().granted_to(&node(44));
+        assert_eq!(second.len(), 1);
+        assert!(second[0].start >= joiner_spans[0].0, "grant from own pool");
+    }
+
+    #[test]
+    fn missing_pool_fails() {
+        // A coordinator without a pool must fail closed, never self-admit.
+        let realm_id = RealmId::from_bytes([34; 32]);
+        let actor_a = actor(34, realm_id);
+        let document = pooled_document(realm_id, &[]);
+        let mut operation = EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
+            create_if_missing: false,
+            ..config(actor_a.clone(), 3)
+        });
+        operation.txn_id = Some(TxnId::generate());
+        let error = operation
+            .emit_write_document_and_admin_state(
+                Some(document.to_bytes(&actor_a).unwrap().into()),
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            EnsureRealmConfigError::CoordinatorPoolMissing {
+                node_id: actor_a.node_id
+            }
+        );
+    }
+
+    #[test]
     fn idempotent_same_node_ensure_does_not_duplicate_config_node() {
         let realm_id = RealmId::from_bytes([9; 32]);
         let actor = actor(9, realm_id);
-        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        let mut document = pooled_document(realm_id, &[(1, actor.clone(), 0, HANDLE_BANDS)]);
         document.ensure_node(actor.node_id, RealmNodeKind::Management);
         let mut operation = EnsureRealmConfigOperation::new(config(actor.clone(), 3));
         let txn_id = TxnId::generate();
@@ -860,6 +1070,18 @@ mod tests {
         let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         document.ensure_node(actor.node_id, RealmNodeKind::Management);
         document.placement_handle_ranges.push(range);
+        // The reserved JobControl binding already exists: nothing to append.
+        document
+            .placement_bindings
+            .push(aruna_core::structs::PlacementBinding {
+                handle: aruna_core::structured_id::PlacementHandle::new(range.start).unwrap(),
+                scope: aruna_core::structs::PlacementScope::Realm(realm_id),
+                document_class: DocumentClass::JobControl,
+                strategy_id: Ulid::from_bytes([12; 16]),
+                allocator_range_id: Some(range.range_id),
+                allocated_by: Some(actor.node_id),
+                allocated_at_ms: Some(1),
+            });
 
         let mut operation = EnsureRealmConfigOperation::new(config(actor.clone(), 3));
         let txn_id = TxnId::generate();

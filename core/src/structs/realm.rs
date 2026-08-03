@@ -2,12 +2,14 @@ use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::structs::{Permission, Role};
 use crate::structs::{
-    Actor, BindingDirectory, BindingScope, DEFAULT_SHARD_COUNT, DocumentClass, HandleRange,
-    HandleRangeDirectory, JOBCONTROL_HANDLE, METADATA_HANDLE, NodePlacementEntry, PlacementBinding,
-    PlacementOverride, PlacementScope, PlacementStrategy, StrategyBinding,
+    Actor, BindingDirectory, BindingError, BindingScope, DEFAULT_SHARD_COUNT, DocumentClass,
+    HandleRange, HandleRangeDirectory, JobId, METADATA_HANDLE, NodePlacementEntry,
+    PlacementBinding, PlacementOverride, PlacementScope, PlacementStrategy, StrategyBinding,
+    coordinator_spans,
 };
-use crate::structured_id::PlacementHandle;
+use crate::structured_id::{PlacementHandle, StructuredId};
 use crate::types::{GroupId, RoleId, UserId};
+use thiserror::Error;
 use core::fmt;
 use ed25519_dalek::VerifyingKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
@@ -164,6 +166,9 @@ pub struct RealmConfigDocument {
     pub placement_bindings: Vec<PlacementBinding>,
     /// Append-only grants retained for fail-closed overlap detection.
     pub placement_handle_ranges: Vec<HandleRange>,
+    /// Append-only coordinator band pools. Each management coordinator grants
+    /// node bands only from its own pool; a later pool re-assigns its slice.
+    pub band_pools: Vec<HandleRange>,
 }
 
 /// Realm-wide quota policy. Lives in the realm config (Class-1, replicated
@@ -360,6 +365,7 @@ impl RealmConfigDocument {
         sort_canonical(&mut canonical.placement_overrides)?;
         sort_canonical(&mut canonical.placement_bindings)?;
         sort_canonical(&mut canonical.placement_handle_ranges)?;
+        sort_canonical(&mut canonical.band_pools)?;
         let encoded = postcard::to_allocvec(&canonical)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"aruna-realm-config-v1");
@@ -387,6 +393,7 @@ impl RealmConfigDocument {
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),
             placement_handle_ranges: Vec::new(),
+            band_pools: Vec::new(),
         }
     }
 
@@ -442,27 +449,17 @@ impl RealmConfigDocument {
             strategy_id: everywhere_strategy.strategy_id,
         })
         .collect();
-        // Reserve low-band Metadata and JobControl bindings before grants begin.
-        self.placement_bindings = vec![
-            PlacementBinding {
-                handle: PlacementHandle::new(METADATA_HANDLE).expect("handle is allocatable"),
-                scope: PlacementScope::Realm(self.realm_id),
-                document_class: DocumentClass::Metadata,
-                strategy_id: default_strategy.strategy_id,
-                allocator_range_id: None,
-                allocated_by: None,
-                allocated_at_ms: None,
-            },
-            PlacementBinding {
-                handle: PlacementHandle::new(JOBCONTROL_HANDLE).expect("handle is allocatable"),
-                scope: PlacementScope::Realm(self.realm_id),
-                document_class: DocumentClass::JobControl,
-                strategy_id: default_strategy.strategy_id,
-                allocator_range_id: None,
-                allocated_by: None,
-                allocated_at_ms: None,
-            },
-        ];
+        // Reserve the low-band Metadata binding before grants begin. JobControl
+        // bindings are per node band and appended at onboarding, never seeded.
+        self.placement_bindings = vec![PlacementBinding {
+            handle: PlacementHandle::new(METADATA_HANDLE).expect("handle is allocatable"),
+            scope: PlacementScope::Realm(self.realm_id),
+            document_class: DocumentClass::Metadata,
+            strategy_id: default_strategy.strategy_id,
+            allocator_range_id: None,
+            allocated_by: None,
+            allocated_at_ms: None,
+        }];
         self.strategies = vec![default_strategy, everywhere_strategy];
     }
 
@@ -540,6 +537,63 @@ impl RealmConfigDocument {
         HandleRangeDirectory::from_ranges(&self.placement_handle_ranges)
     }
 
+    /// Handle spans `node` may grant bands from (see [`coordinator_spans`]).
+    pub fn coordinator_pool(&self, node: &NodeId) -> Vec<(u32, u32)> {
+        coordinator_spans(&self.band_pools, node)
+    }
+
+    /// `node`'s JobControl handle: the reserved first handle of its lowest
+    /// granted band, valid only while its binding resolves non-conflicted.
+    pub fn job_control_handle(&self, node: &NodeId) -> Option<PlacementHandle> {
+        let directory = self.binding_directory();
+        self.placement_bindings
+            .iter()
+            .filter(|binding| {
+                binding.document_class == DocumentClass::JobControl
+                    && binding.scope == PlacementScope::Realm(self.realm_id)
+                    && binding.allocated_by.as_ref() == Some(node)
+                    && directory.resolve(binding.handle).is_ok()
+            })
+            .map(|binding| binding.handle)
+            .min()
+    }
+
+    /// Immutable owner of `job_id`, derived purely from replicated state:
+    /// `handle -> JobControl binding -> granting band -> owner`. Fail-closed:
+    /// a missing or conflicted link is `Unavailable` (503), never absence.
+    pub fn job_owner(&self, job_id: JobId) -> Result<NodeId, JobOwnerError> {
+        let routable = job_id
+            .as_routable()
+            .map_err(|_| JobOwnerError::NotJobControl)?;
+        let resolved = self
+            .binding_directory()
+            .resolve_id(&routable, |strategy_id| {
+                self.strategy(&strategy_id)
+                    .and_then(|strategy| u16::try_from(strategy.shard_count).ok())
+            })
+            .map_err(|error| match error {
+                // A bucket beyond the strategy's immutable capacity is proof of
+                // an invalid id, not of unsynced state.
+                BindingError::BucketOutOfRange(_) => JobOwnerError::NotJobControl,
+                error => JobOwnerError::Unavailable(error.to_string()),
+            })?;
+        if resolved.document_class != DocumentClass::JobControl
+            || resolved.scope != PlacementScope::Realm(self.realm_id)
+        {
+            return Err(JobOwnerError::NotJobControl);
+        }
+        let handle = routable.placement_handle();
+        self.placement_bindings
+            .iter()
+            .find(|binding| {
+                binding.handle == handle && binding.document_class == DocumentClass::JobControl
+            })
+            .and_then(|binding| binding.allocated_by)
+            .ok_or_else(|| {
+                JobOwnerError::Unavailable("job-control binding lacks an owner".to_string())
+            })
+    }
+
     pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {
         self.reconcile_bytes(None, actor)
     }
@@ -556,6 +610,18 @@ impl RealmConfigDocument {
         let _ = (current, actor);
         Ok(postcard::to_allocvec(self)?)
     }
+}
+
+/// Failure of the pure `JobId -> owner` derivation.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum JobOwnerError {
+    /// The id provably names something other than this realm's job control,
+    /// so it can belong to no job; any node may answer absence.
+    #[error("job id does not name a job-control binding")]
+    NotJobControl,
+    /// Fail-closed: binding or range state is missing, conflicted, or unsynced.
+    #[error("job-control placement unavailable: {0}")]
+    Unavailable(String),
 }
 
 fn sort_canonical<T: Serialize>(values: &mut Vec<T>) -> Result<(), ConversionError> {
@@ -706,6 +772,7 @@ mod test {
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),
             placement_handle_ranges: Vec::new(),
+            band_pools: Vec::new(),
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -865,6 +932,7 @@ mod test {
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),
             placement_handle_ranges: Vec::new(),
+            band_pools: Vec::new(),
         };
 
         assert_eq!(
@@ -972,6 +1040,95 @@ mod test {
 
         assert_eq!(document.node_ids().unwrap(), vec![server, user_device]);
         assert_eq!(document.sync_eligible_node_ids().unwrap(), vec![server]);
+    }
+
+    #[test]
+    fn owner_survives_rebalance() {
+        // The derived owner is a pure function of band + binding; arbitrary
+        // placement-map, strategy, and override changes never move it.
+        use crate::structs::{
+            DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange, JobId,
+            JobOwnerError, NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementScope,
+        };
+        use crate::structured_id::{BucketId, PlacementHandle};
+
+        fn node_id(seed: u8) -> NodeId {
+            iroh::SecretKey::from_bytes(&[seed; 32]).public()
+        }
+        let realm_id = RealmId([7u8; 32]);
+        let owner = node_id(1);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.seed_default_placement();
+        let range_id = Ulid::from_bytes([9; 16]);
+        config.placement_handle_ranges.push(HandleRange {
+            range_id,
+            owner,
+            start: FIRST_GRANTABLE_HANDLE,
+            end: FIRST_GRANTABLE_HANDLE + HANDLE_RANGE_SIZE,
+        });
+        let handle = PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap();
+        config.placement_bindings.push(PlacementBinding {
+            handle,
+            scope: PlacementScope::Realm(realm_id),
+            document_class: DocumentClass::JobControl,
+            strategy_id: config.default_strategy_id.unwrap(),
+            allocator_range_id: Some(range_id),
+            allocated_by: Some(owner),
+            allocated_at_ms: Some(1),
+        });
+        assert_eq!(config.job_control_handle(&owner), Some(handle));
+        assert_eq!(config.job_control_handle(&node_id(2)), None);
+
+        let job_id = JobId::from_parts(1, handle, BucketId::new(5).unwrap(), 9).unwrap();
+        assert_eq!(config.job_owner(job_id), Ok(owner));
+
+        // Holders move: nodes join, the owner is excluded everywhere, weights
+        // shift, the default strategy is replaced. The owner does not.
+        for seed in 2..6u8 {
+            config.ensure_node(node_id(seed), RealmNodeKind::Management);
+            config.placement_map.push(NodePlacementEntry {
+                node_id: node_id(seed),
+                location: String::new(),
+                weight: 500,
+                full: false,
+                draining: false,
+                labels: Default::default(),
+            });
+        }
+        config.placement_overrides.push(PlacementOverride {
+            subject: b"any-subject".to_vec(),
+            pinned: vec![node_id(2)],
+            excluded: vec![owner],
+            strategy_id: None,
+        });
+        assert_eq!(config.job_owner(job_id), Ok(owner));
+
+        // An unknown handle is fail-closed 503 material, never absence.
+        let unsynced = PlacementHandle::new(FIRST_GRANTABLE_HANDLE + HANDLE_RANGE_SIZE).unwrap();
+        let foreign = JobId::from_parts(1, unsynced, BucketId::new(0).unwrap(), 9).unwrap();
+        assert!(matches!(
+            config.job_owner(foreign),
+            Err(JobOwnerError::Unavailable(_))
+        ));
+
+        // A non-JobControl handle proves the id is no job of this realm.
+        let metadata = PlacementHandle::new(super::METADATA_HANDLE).unwrap();
+        let invalid = JobId::from_parts(1, metadata, BucketId::new(0).unwrap(), 9).unwrap();
+        assert_eq!(config.job_owner(invalid), Err(JobOwnerError::NotJobControl));
+
+        // A bucket past the strategy capacity is proof too.
+        let wide = JobId::from_parts(1, handle, BucketId::new(64).unwrap(), 9).unwrap();
+        assert_eq!(config.job_owner(wide), Err(JobOwnerError::NotJobControl));
+
+        // A conflicted binding fails closed as unavailable.
+        let mut divergent = config.placement_bindings.last().unwrap().clone();
+        divergent.allocated_at_ms = Some(2);
+        config.placement_bindings.push(divergent);
+        assert!(matches!(
+            config.job_owner(job_id),
+            Err(JobOwnerError::Unavailable(_))
+        ));
+        assert_eq!(config.job_control_handle(&owner), None);
     }
 
     #[test]

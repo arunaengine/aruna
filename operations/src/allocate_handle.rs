@@ -395,8 +395,9 @@ mod tests {
         let second = allocate_handle(&context, realm_id, actor.node_id)
             .await
             .unwrap();
-        assert_eq!(first.handle.get(), FIRST_GRANTABLE_HANDLE);
-        assert_eq!(second.handle.get(), FIRST_GRANTABLE_HANDLE + 1);
+        // The range's first handle is the reserved JobControl handle.
+        assert_eq!(first.handle.get(), FIRST_GRANTABLE_HANDLE + 1);
+        assert_eq!(second.handle.get(), FIRST_GRANTABLE_HANDLE + 2);
         assert_eq!(first.allocator_range_id, Ulid::from_bytes([9; 16]));
 
         // "Restart": a fresh allocation reads the persisted cursor and does not
@@ -404,7 +405,7 @@ mod tests {
         let third = allocate_handle(&context, realm_id, actor.node_id)
             .await
             .unwrap();
-        assert_eq!(third.handle.get(), FIRST_GRANTABLE_HANDLE + 2);
+        assert_eq!(third.handle.get(), FIRST_GRANTABLE_HANDLE + 3);
     }
 
     #[tokio::test]
@@ -435,7 +436,7 @@ mod tests {
         handles.sort_unstable();
         assert_eq!(
             handles,
-            [FIRST_GRANTABLE_HANDLE, FIRST_GRANTABLE_HANDLE + 1]
+            [FIRST_GRANTABLE_HANDLE + 1, FIRST_GRANTABLE_HANDLE + 2]
         );
     }
 
@@ -470,7 +471,7 @@ mod tests {
         assert_eq!(binding.allocator_range_id, Some(Ulid::from_bytes([9; 16])));
         assert_eq!(binding.allocated_by, Some(actor.node_id));
         assert!(binding.allocated_at_ms.is_some());
-        assert_eq!(binding.handle.get(), FIRST_GRANTABLE_HANDLE);
+        assert_eq!(binding.handle.get(), FIRST_GRANTABLE_HANDLE + 1);
     }
 
     #[tokio::test]
@@ -479,14 +480,15 @@ mod tests {
         let context = context(temp.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([62; 32]);
         let actor = actor(realm_id);
-        // A single-handle range: one allocation succeeds, the next is exhausted.
+        // Beyond the reserved first handle the range has one allocatable
+        // handle: one allocation succeeds, the next is exhausted.
         seed_range_config(
             &context,
             &actor,
             range(
                 actor.node_id,
                 FIRST_GRANTABLE_HANDLE,
-                FIRST_GRANTABLE_HANDLE + 1,
+                FIRST_GRANTABLE_HANDLE + 2,
             ),
         )
         .await;
@@ -497,7 +499,7 @@ mod tests {
                 .unwrap()
                 .handle
                 .get(),
-            FIRST_GRANTABLE_HANDLE
+            FIRST_GRANTABLE_HANDLE + 1
         );
         assert!(matches!(
             allocate_handle(&context, realm_id, actor.node_id).await,

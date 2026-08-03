@@ -268,6 +268,32 @@ pub fn overlay_realm_config_placement_reducer_materialization(
         }
     }
 
+    // Band pools mirror handle ranges: same-id divergence retains every value.
+    let materialized_pools = reducer_state.materialized_band_pools();
+    for (path, conflict) in &reducer_state.conflicts {
+        let Some(pool_id) = band_pool_id(path) else {
+            continue;
+        };
+        config.band_pools.retain(|pool| pool.range_id != pool_id);
+        for value in &conflict.values {
+            if let Some(pool) = value.value.as_deref().and_then(parse_handle_range) {
+                config.band_pools.push(pool);
+            }
+        }
+    }
+    for path in reducer_state.user_subject_ids.keys() {
+        let Some(pool_id) = band_pool_id(path) else {
+            continue;
+        };
+        config.band_pools.retain(|pool| pool.range_id != pool_id);
+        if reducer_state.conflicts.contains_key(path) {
+            continue;
+        }
+        if let Some(pool) = materialized_pools.get(&pool_id) {
+            config.band_pools.push(*pool);
+        }
+    }
+
     repair_realm_config_placement_references(config);
 }
 
@@ -359,6 +385,7 @@ impl AdminDocumentReducerState {
             &event.op,
             AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
                 | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
+                | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
         ) && operation_paths(&event.op)
             .iter()
             .all(|path| self.event_is_stale_for_path(event, path));
@@ -640,6 +667,15 @@ impl AdminDocumentReducerState {
                     return Err(AdminDocumentReducerError::InvalidHandleRange);
                 }
                 self.apply_handle_range(event, range);
+            }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigBandPoolAssigned { pool },
+            ) => {
+                if !pool.is_well_formed() {
+                    return Err(AdminDocumentReducerError::InvalidHandleRange);
+                }
+                self.apply_band_pool(event, pool);
             }
             _ => return Err(AdminDocumentReducerError::UnsupportedTarget),
         }
@@ -1014,6 +1050,22 @@ impl AdminDocumentReducerState {
             .collect()
     }
 
+    pub fn materialized_band_pools(&self) -> BTreeMap<Ulid, HandleRange> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let pool_id = band_pool_id(path)?;
+                let pool = version.value.as_deref().and_then(parse_handle_range)?;
+
+                (pool.range_id == pool_id).then_some((pool_id, pool))
+            })
+            .collect()
+    }
+
     fn apply_user_name(&mut self, event: &AdminDocumentEvent, name: &str) {
         self.user_name = self.reduce_value(
             event,
@@ -1266,38 +1318,36 @@ impl AdminDocumentReducerState {
     }
 
     fn apply_placement_binding(&mut self, event: &AdminDocumentEvent, binding: &PlacementBinding) {
-        let path = placement_binding_path(binding.handle);
-        let value = Some(placement_binding_value(binding));
-        if self.conflicts.contains_key(&path) {
-            self.record_conflict_value(&path, value, event.dot());
-            return;
-        }
-
-        let Some(current) = self.user_subject_ids.get(&path).cloned() else {
-            let version = self.version_with_dots(&path, value, BTreeSet::from([event.dot()]));
-            self.user_subject_ids.insert(path, version);
-            return;
-        };
-        let mut dots = self.take_version_dots(&path, &current);
-        if current.value != value {
-            for dot in dots {
-                self.record_conflict_value(&path, current.value.clone(), dot);
-            }
-            self.record_conflict_value(&path, value, event.dot());
-            self.user_subject_ids.remove(&path);
-            return;
-        }
-
-        dots.insert(event.dot());
-        let version = self.version_with_dots(&path, value, dots);
-        self.user_subject_ids.insert(path, version);
+        self.apply_immutable_value(
+            event,
+            placement_binding_path(binding.handle),
+            placement_binding_value(binding),
+        );
     }
 
     fn apply_handle_range(&mut self, event: &AdminDocumentEvent, range: &HandleRange) {
         // Like bindings, divergent values for one id fail closed. Distinct-id
         // overlap is derived later by `HandleRangeDirectory::from_ranges`.
-        let path = handle_range_path(range.range_id);
-        let value = Some(handle_range_value(range));
+        self.apply_handle_range_path(event, handle_range_path(range.range_id), range);
+    }
+
+    fn apply_band_pool(&mut self, event: &AdminDocumentEvent, pool: &HandleRange) {
+        self.apply_handle_range_path(event, band_pool_path(pool.range_id), pool);
+    }
+
+    fn apply_handle_range_path(
+        &mut self,
+        event: &AdminDocumentEvent,
+        path: String,
+        range: &HandleRange,
+    ) {
+        self.apply_immutable_value(event, path, handle_range_value(range));
+    }
+
+    /// Append-only path: a divergent value for an existing path fails closed as
+    /// a conflict instead of selecting a winner.
+    fn apply_immutable_value(&mut self, event: &AdminDocumentEvent, path: String, value: String) {
+        let value = Some(value);
         if self.conflicts.contains_key(&path) {
             self.record_conflict_value(&path, value, event.dot());
             return;
@@ -1573,6 +1623,9 @@ fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         AdminDocumentOperation::RealmConfigHandleRangeGranted { range } => {
             vec![handle_range_path(range.range_id)]
         }
+        AdminDocumentOperation::RealmConfigBandPoolAssigned { pool } => {
+            vec![band_pool_path(pool.range_id)]
+        }
     }
 }
 
@@ -1637,6 +1690,10 @@ pub fn placement_binding_path(handle: PlacementHandle) -> String {
 
 pub fn handle_range_path(range_id: Ulid) -> String {
     format!("realm_config.placement.handle_ranges.{range_id}")
+}
+
+pub fn band_pool_path(pool_id: Ulid) -> String {
+    format!("realm_config.placement.band_pools.{pool_id}")
 }
 
 pub fn binding_scope_key(scope: &BindingScope) -> String {
@@ -1819,6 +1876,11 @@ pub fn realm_config_placement_override_subject_key_from_path(path: &str) -> Opti
 pub fn placement_binding_handle(path: &str) -> Option<PlacementHandle> {
     let handle = path.strip_prefix("realm_config.placement.placement_bindings.")?;
     PlacementHandle::new(handle.parse().ok()?).ok()
+}
+
+pub fn band_pool_id(path: &str) -> Option<Ulid> {
+    let pool_id = path.strip_prefix("realm_config.placement.band_pools.")?;
+    Ulid::from_string(pool_id).ok()
 }
 
 pub fn handle_range_id(path: &str) -> Option<Ulid> {
@@ -5040,7 +5102,10 @@ mod tests {
         assert_eq!(directory.conflicts(), 0);
         assert_eq!(directory.granted_to(&owner).len(), 2);
         assert_eq!(
-            directory.free_band_from(FIRST_GRANTABLE_HANDLE),
+            directory.free_band_in(&[(
+                FIRST_GRANTABLE_HANDLE,
+                crate::structs::band_start(crate::structs::HANDLE_BANDS)
+            )]),
             Some((2051, 3075))
         );
     }

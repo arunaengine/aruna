@@ -3324,6 +3324,7 @@ fn realm_config_from_reducer_materialization(
         placement_overrides: Vec::new(),
         placement_bindings: Vec::new(),
         placement_handle_ranges: Vec::new(),
+        band_pools: Vec::new(),
     };
     overlay_realm_config_reducer_materialization(&mut config, reducer_state);
     Some(config)
@@ -4131,6 +4132,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
             | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
             | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
+            | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
     ) {
         return Err(NetError::Bootstrap(
             "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, description updates, quota updates, and placement updates"
@@ -5200,7 +5202,8 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
-        | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. } => {
+        | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
+        | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. } => {
             AdminOperationFamily::RealmConfig
         }
     };
@@ -5304,7 +5307,8 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. } => {}
-        AdminDocumentOperation::RealmConfigHandleRangeGranted { .. } => {}
+        AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
+        | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. } => {}
         AdminDocumentOperation::RealmConfigNodePlacementSet { entry } => {
             if let Some(label) = reserved_label(&entry.labels) {
                 return reject(&format!(
@@ -5451,9 +5455,12 @@ async fn validate_realm_config_admin_authority(
             AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding }
                 if !binding.has_valid_provenance(&config.handle_range_directory())
         ) {
-            return Ok(AdminEventValidation::Rejected(
-                "placement binding provenance is invalid".to_string(),
-            ));
+            // The granting range event may still be in flight in the same batch
+            // (onboarding writes grant + JobControl binding back to back).
+            return Ok(AdminEventValidation::Deferred {
+                dependency: None,
+                reason: "placement binding provenance is not yet valid".to_string(),
+            });
         }
         return Ok(
             if matches!(
