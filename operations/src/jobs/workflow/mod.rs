@@ -1667,7 +1667,7 @@ mod tests {
     use aruna_compute::executor::logs::LogSink;
     use aruna_core::compute::{LogTails, NOBODY, TaskOutput};
     use aruna_core::structs::{
-        ComputeResources, JOBCONTROL_HANDLE, JobErrorKind, JobState, RealmId,
+        ComputeResources, FIRST_GRANTABLE_HANDLE, JobErrorKind, JobState, RealmId,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::UserId;
@@ -1681,7 +1681,7 @@ mod tests {
 
     fn job_id() -> JobId {
         crate::jobs::submit::mint_job_id(
-            PlacementHandle::new(JOBCONTROL_HANDLE).unwrap(),
+            PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
             BucketId::new(0).unwrap(),
         )
         .unwrap()

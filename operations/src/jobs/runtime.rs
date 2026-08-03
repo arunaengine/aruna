@@ -24,7 +24,6 @@ use tracing::{info, warn};
 
 use super::executor::{JobContext, JobRunOutcome, ProgressReporter, dispatch_payload, run_cleanup};
 use super::reconcile::ExternalReconciler;
-use super::service::sync_job_record;
 use super::store::{
     JobMutationError, ReleaseOutcome, RequeueOutcome, cancel_running_job, complete_job, fail_job,
     flush_progress, handoff_external_attempt, iter_prefix_page, read_job_record, release_job,
@@ -419,14 +418,6 @@ impl JobsRuntime {
         };
         if let Some(job) = removed {
             let _ = job.completion.send(true);
-        }
-        if read_job_record(&context.storage_handle, job_id, None)
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|record| record.state.is_terminal())
-        {
-            sync_job_record(context, job_id).await;
         }
         if let Some(task_handle) = context.task_handle.as_ref()
             && let Event::Task(TaskEvent::Error { message, .. }) =

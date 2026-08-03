@@ -533,7 +533,7 @@ mod tests {
     use crate::jobs::store::{insert_job, record_attempt_intent};
     use crate::jobs::workflow::tests::{execution_spec, node_id};
     use aruna_compute::ExecutorRegistry;
-    use aruna_core::structs::{AttemptIntent, JOBCONTROL_HANDLE, JobClaim, JobId, RealmId};
+    use aruna_core::structs::{AttemptIntent, FIRST_GRANTABLE_HANDLE, JobClaim, JobId, RealmId};
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::UserId;
     use aruna_storage::FjallStorage;
@@ -543,7 +543,7 @@ mod tests {
 
     fn job_id() -> JobId {
         crate::jobs::submit::mint_job_id(
-            PlacementHandle::new(JOBCONTROL_HANDLE).unwrap(),
+            PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
             BucketId::new(0).unwrap(),
         )
         .unwrap()

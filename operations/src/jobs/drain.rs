@@ -418,7 +418,7 @@ mod tests {
     use crate::jobs::JOB_LEASE_MS;
     use crate::jobs::store::insert_job;
     use aruna_core::structs::{
-        AttemptIntent, JOBCONTROL_HANDLE, JobClaim, JobPayload, JobState, RealmId,
+        AttemptIntent, FIRST_GRANTABLE_HANDLE, JobClaim, JobPayload, JobState, RealmId,
         job_due_index_key,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
@@ -449,7 +449,7 @@ mod tests {
     fn job_id(timestamp_ms: u64) -> JobId {
         JobId::from_parts(
             timestamp_ms,
-            PlacementHandle::new(JOBCONTROL_HANDLE).unwrap(),
+            PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
             BucketId::new(0).unwrap(),
             0,
         )

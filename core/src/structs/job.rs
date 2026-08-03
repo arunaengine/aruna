@@ -18,8 +18,6 @@ use crate::types::{GroupId, Key, UserId};
 
 /// Version prefix keeping the record wrappable in a version envelope later (#286).
 pub const JOB_RECORD_KEY_PREFIX: &[u8] = b"jobs-v1/";
-/// Immutable owner-lookup pointers held by job-control bucket holders.
-pub const JOB_POINTER_KEY_PREFIX: &[u8] = b"jobptr-v1/";
 
 pub const JOB_DUE_INDEX_PREFIX: &[u8] = b"due/";
 pub const JOB_LEASE_INDEX_PREFIX: &[u8] = b"lease/";
@@ -1161,13 +1159,6 @@ pub fn job_record_key(job_id: JobId) -> Key {
     ByteView::from(bytes)
 }
 
-pub fn job_pointer_key(job_id: JobId) -> Key {
-    let mut bytes = Vec::with_capacity(JOB_POINTER_KEY_PREFIX.len() + 16);
-    bytes.extend_from_slice(JOB_POINTER_KEY_PREFIX);
-    bytes.extend_from_slice(&job_id.to_bytes());
-    ByteView::from(bytes)
-}
-
 /// Side-row key holding the run-crate obligation status for an execution job.
 pub fn job_run_crate_key(job_id: JobId) -> Key {
     ByteView::from(job_id.to_bytes().to_vec())
@@ -1602,7 +1593,7 @@ mod tests {
         // Child obligations remain on a non-default, high parent bucket.
         let parent = JobId::from_parts(
             1,
-            PlacementHandle::new(crate::structs::JOBCONTROL_HANDLE).unwrap(),
+            PlacementHandle::new(crate::structs::FIRST_GRANTABLE_HANDLE).unwrap(),
             BucketId::new(3_000).unwrap(),
             4,
         )

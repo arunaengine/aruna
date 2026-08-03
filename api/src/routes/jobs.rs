@@ -1184,7 +1184,7 @@ mod tests {
     use aruna_core::structs::{
         ArtifactRef, BackendLocation, BackendRef, ExportOmissionCounts, ExportRoCrateResult,
         ExportRoCrateSpec, ImportMetadataTarget, ImportReportDetail, ImportRoCrateResult,
-        ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JOBCONTROL_HANDLE, JobPayload,
+        ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, FIRST_GRANTABLE_HANDLE, JobPayload,
         JobProgress, JobResultPayload, NodeCapabilities, PathRestriction, Permission, RealmId,
         ReasonCode, RoCrateLimits,
     };
@@ -1216,7 +1216,7 @@ mod tests {
     fn job_id(timestamp_ms: u64) -> JobId {
         JobId::from_parts(
             timestamp_ms,
-            PlacementHandle::new(JOBCONTROL_HANDLE).unwrap(),
+            PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
             BucketId::new(0).unwrap(),
             0,
         )

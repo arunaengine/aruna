@@ -122,7 +122,6 @@ enum SubmitState {
 pub struct SubmitJobOperation {
     record: JobRecord,
     active_cap: Option<u32>,
-    schedule_drain: bool,
     state: SubmitState,
     output: Option<Result<SubmitJobResult, SubmitJobError>>,
 }
@@ -161,21 +160,9 @@ impl SubmitJobOperation {
         Self {
             record,
             active_cap,
-            schedule_drain: true,
             state: SubmitState::Init,
             output: None,
         }
-    }
-
-    pub(crate) fn reserved(spec: SubmitJobSpec, job_id: JobId) -> Self {
-        let mut operation = Self::new(spec, job_id);
-        operation.active_cap = None;
-        operation.schedule_drain = false;
-        operation
-    }
-
-    pub(crate) fn record(&self) -> &JobRecord {
-        &self.record
     }
 
     fn fail(&mut self, error: SubmitJobError) -> Effects {
@@ -271,11 +258,7 @@ impl SubmitJobOperation {
     }
 
     fn after_write(&mut self) -> Effects {
-        if self.schedule_drain {
-            self.schedule_drain()
-        } else {
-            self.finish_created()
-        }
+        self.schedule_drain()
     }
 
     fn finish_existing(&mut self, txn_id: TxnId, job_id: JobId) -> Effects {
@@ -461,7 +444,7 @@ mod tests {
     };
     use aruna_core::structs::{
         AuthContext, ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource,
-        ImportRoCrateSpec, ImportRoCrateTarget, JOBCONTROL_HANDLE, JobState, RealmId,
+        ImportRoCrateSpec, ImportRoCrateTarget, FIRST_GRANTABLE_HANDLE, JobState, RealmId,
         RoCrateLimits, encode_job_dedup_value,
     };
     use aruna_storage::{FjallStorage, StorageHandle};
@@ -489,7 +472,7 @@ mod tests {
 
     fn operation(spec: SubmitJobSpec) -> SubmitJobOperation {
         let job_id = mint_job_id(
-            PlacementHandle::new(JOBCONTROL_HANDLE).unwrap(),
+            PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
             BucketId::new(0).unwrap(),
         )
         .unwrap();
