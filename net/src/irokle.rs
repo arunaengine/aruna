@@ -5429,58 +5429,68 @@ async fn validate_realm_config_admin_authority(
         ));
     };
     let current_config = read_admin_realm_config(storage, realm_id).await?;
-    if let Some(config) = current_config.as_ref() {
-        if config.realm_id != realm_id {
-            return Ok(AdminEventValidation::Rejected(
-                "stored realm config has the wrong realm".to_string(),
-            ));
-        }
-        // Band pools form a causal delegation tree; reject a forged or
-        // non-owning issuer, and defer a child until its parent replicates.
-        if let AdminDocumentOperation::RealmConfigBandPoolAssigned { pool } = &event.op {
-            match admit_band_pool(&config.band_pools, pool, &event.origin_node_id) {
-                PoolAdmission::Reject => {
-                    return Ok(AdminEventValidation::Rejected(
-                        "band pool lineage is invalid".to_string(),
-                    ));
-                }
-                PoolAdmission::MissingParent => {
-                    return Ok(AdminEventValidation::Deferred {
-                        dependency: None,
-                        reason: "band pool parent is not yet replicated".to_string(),
-                    });
-                }
-                PoolAdmission::Accept => {}
-            }
-        }
-        if let AdminDocumentOperation::RealmConfigHandleRangeGranted { range } = &event.op {
-            let canonical = range.len() == HANDLE_RANGE_SIZE
-                && range
-                    .start
-                    .checked_sub(FIRST_GRANTABLE_HANDLE)
-                    .is_some_and(|offset| offset % HANDLE_RANGE_SIZE == 0)
-                && range.start.checked_add(HANDLE_RANGE_SIZE) == Some(range.end);
-            if !canonical {
+    if current_config
+        .as_ref()
+        .is_some_and(|config| config.realm_id != realm_id)
+    {
+        return Ok(AdminEventValidation::Rejected(
+            "stored realm config has the wrong realm".to_string(),
+        ));
+    }
+    // Placement reducer state precedes full config materialization at bootstrap.
+    let mut placement_config = current_config
+        .clone()
+        .unwrap_or_else(|| RealmConfigDocument::default_for_realm(realm_id, Vec::new()));
+    if let Some(state) = previous_state {
+        overlay_realm_config_placement_reducer_materialization(&mut placement_config, state);
+    }
+    // Band pools form a causal delegation tree; reject a forged or
+    // non-owning issuer, and defer a child until its parent replicates.
+    if let AdminDocumentOperation::RealmConfigBandPoolAssigned { pool } = &event.op {
+        match admit_band_pool(&placement_config.band_pools, pool, &event.origin_node_id) {
+            PoolAdmission::Reject => {
                 return Ok(AdminEventValidation::Rejected(
-                    "handle grant is not one canonical band".to_string(),
+                    "band pool lineage is invalid".to_string(),
                 ));
             }
-            let spans = coordinator_spans(&config.band_pools, &event.origin_node_id);
-            if spans.is_empty() {
+            PoolAdmission::MissingParent => {
                 return Ok(AdminEventValidation::Deferred {
                     dependency: None,
-                    reason: "coordinator band pool is not yet replicated".to_string(),
+                    reason: "band pool parent is not yet replicated".to_string(),
                 });
             }
-            if !spans
-                .iter()
-                .any(|(start, end)| *start <= range.start && range.end <= *end)
-            {
-                return Ok(AdminEventValidation::Rejected(
-                    "handle grant lies outside the coordinator band pool".to_string(),
-                ));
-            }
+            PoolAdmission::Accept => {}
         }
+    }
+    if let AdminDocumentOperation::RealmConfigHandleRangeGranted { range } = &event.op {
+        let canonical = range.len() == HANDLE_RANGE_SIZE
+            && range
+                .start
+                .checked_sub(FIRST_GRANTABLE_HANDLE)
+                .is_some_and(|offset| offset % HANDLE_RANGE_SIZE == 0)
+            && range.start.checked_add(HANDLE_RANGE_SIZE) == Some(range.end);
+        if !canonical {
+            return Ok(AdminEventValidation::Rejected(
+                "handle grant is not one canonical band".to_string(),
+            ));
+        }
+        let spans = coordinator_spans(&placement_config.band_pools, &event.origin_node_id);
+        if spans.is_empty() {
+            return Ok(AdminEventValidation::Deferred {
+                dependency: None,
+                reason: "coordinator band pool is not yet replicated".to_string(),
+            });
+        }
+        if !spans
+            .iter()
+            .any(|(start, end)| *start <= range.start && range.end <= *end)
+        {
+            return Ok(AdminEventValidation::Rejected(
+                "handle grant lies outside the coordinator band pool".to_string(),
+            ));
+        }
+    }
+    if let Some(config) = current_config.as_ref() {
         let server_binding = match (
             configured_node_kind(config, &event.origin_node_id),
             &event.op,
