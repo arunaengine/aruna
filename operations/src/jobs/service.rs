@@ -28,7 +28,7 @@ use super::protocol::{
 use super::runtime::JobsRuntime;
 use super::store::{
     CancelRequestOutcome, JobMutationError, UserIndexError, UserIndexReservation, find_dedup_plan,
-    list_job_entries, list_jobs_for_user, read_artifact_tombstone, read_job_record,
+    find_user_job, list_job_entries, list_jobs_for_user, read_artifact_tombstone, read_job_record,
     read_run_crate_status, reserve_user_index, set_cancel_requested, update_user_index,
 };
 use super::submit::{
@@ -578,22 +578,71 @@ async fn resolve_job_owner(
             plan_digest: record.plan_digest,
         });
     }
-    let mut unavailable = false;
-    match list_owned_jobs(context, user_id, None, 1, |record| record.job_id == job_id).await {
-        Ok((records, _)) => {
-            if let Some(record) = records.into_iter().next() {
-                return Ok(JobOwner {
-                    node_id: record.owner_node_id,
-                    plan_digest: record.plan_digest,
-                });
-            }
-        }
-        Err(_) => unavailable = true,
-    }
     let net_handle = context
         .net_handle
         .as_ref()
         .ok_or_else(|| JobRouteError::Unavailable("network handle unavailable".to_string()))?;
+    let mut unavailable = false;
+    let indexed = match resolve_user_route(context, user_id).await {
+        Ok(user_route) => {
+            let user_holder = user_route.holders[0];
+            if user_holder == net_handle.node_id() {
+                match find_user_job(&context.storage_handle, user_id, job_id).await {
+                    Ok(record) => record.map(|record| JobOwner {
+                        node_id: record.owner_node_id,
+                        plan_digest: record.plan_digest,
+                    }),
+                    Err(_) => {
+                        unavailable = true;
+                        None
+                    }
+                }
+            } else {
+                match send_job_request(
+                    context,
+                    user_holder,
+                    JobRequest::Lookup {
+                        auth_token: MetadataAuthToken::internal(AuthContext {
+                            user_id,
+                            realm_id: user_id.realm_id,
+                            path_restrictions: None,
+                        }),
+                        user_id,
+                        job_id,
+                        config_digest: user_route.config_digest,
+                    },
+                )
+                .await
+                {
+                    Ok(reply) => match reply.response {
+                        JobResponse::Located {
+                            owner_node_id,
+                            plan_digest,
+                        } => Some(JobOwner {
+                            node_id: owner_node_id,
+                            plan_digest,
+                        }),
+                        JobResponse::NotFound => None,
+                        _ => {
+                            unavailable = true;
+                            None
+                        }
+                    },
+                    Err(_) => {
+                        unavailable = true;
+                        None
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            unavailable = true;
+            None
+        }
+    };
+    if let Some(owner) = indexed {
+        return Ok(owner);
+    }
     let config = load_realm_config(context, user_id.realm_id)
         .await
         .ok_or_else(|| JobRouteError::Unavailable("realm config unavailable".to_string()))?;

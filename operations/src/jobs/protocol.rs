@@ -28,7 +28,9 @@ use super::service::{
     cancel_owned_job, read_artifact_range, read_job_run_crate_status, read_owned_artifact,
     read_owned_job, read_owned_report, submit_local_job,
 };
-use super::store::{UserIndexError, list_jobs_for_user, reserve_user_index, update_user_index};
+use super::store::{
+    UserIndexError, find_user_job, list_jobs_for_user, reserve_user_index, update_user_index,
+};
 use super::submit::{SubmitJobError, SubmitJobResult, SubmitJobSpec};
 use crate::driver::DriverContext;
 use crate::metadata::api::load_realm_config;
@@ -64,6 +66,12 @@ pub(crate) enum JobRequest {
         user_id: UserId,
         cursor: Option<Vec<u8>>,
         limit: u16,
+        config_digest: [u8; 32],
+    },
+    Lookup {
+        auth_token: MetadataAuthToken,
+        user_id: UserId,
+        job_id: JobId,
         config_digest: [u8; 32],
     },
     Submit {
@@ -103,6 +111,7 @@ impl JobRequest {
         match self {
             Self::Index { auth_token, .. }
             | Self::List { auth_token, .. }
+            | Self::Lookup { auth_token, .. }
             | Self::Submit { auth_token, .. }
             | Self::Locate { auth_token, .. }
             | Self::Status { auth_token, .. }
@@ -114,7 +123,7 @@ impl JobRequest {
 
     fn job_id(&self) -> Option<JobId> {
         match self {
-            Self::Index { .. } | Self::List { .. } => None,
+            Self::Index { .. } | Self::List { .. } | Self::Lookup { .. } => None,
             Self::Submit { job_id, .. } => Some(*job_id),
             Self::Locate { job_id, .. }
             | Self::Status { job_id, .. }
@@ -127,7 +136,7 @@ impl JobRequest {
     fn user_id(&self) -> Option<UserId> {
         match self {
             Self::Index { record, .. } => Some(record.created_by),
-            Self::List { user_id, .. } => Some(*user_id),
+            Self::List { user_id, .. } | Self::Lookup { user_id, .. } => Some(*user_id),
             _ => None,
         }
     }
@@ -136,6 +145,7 @@ impl JobRequest {
         match self {
             Self::Index { config_digest, .. }
             | Self::List { config_digest, .. }
+            | Self::Lookup { config_digest, .. }
             | Self::Submit { config_digest, .. } => Some(*config_digest),
             Self::Locate { .. }
             | Self::Status { .. }
@@ -568,6 +578,9 @@ async fn prepare_response(
                 limit,
                 ..
             } => prepare_list(context, auth.user_id, user_id, cursor, limit).await,
+            JobRequest::Lookup {
+                user_id, job_id, ..
+            } => prepare_lookup(context, auth.user_id, user_id, job_id).await,
             _ => PreparedResponse::new(JobResponse::Unavailable(
                 "invalid user-routed job request".to_string(),
             )),
@@ -595,9 +608,11 @@ async fn prepare_response(
         ));
     }
     match request {
-        JobRequest::Index { .. } | JobRequest::List { .. } => PreparedResponse::new(
-            JobResponse::Unavailable("user-routed request reached the job dispatcher".to_string()),
-        ),
+        JobRequest::Index { .. } | JobRequest::List { .. } | JobRequest::Lookup { .. } => {
+            PreparedResponse::new(JobResponse::Unavailable(
+                "user-routed request reached the job dispatcher".to_string(),
+            ))
+        }
         JobRequest::Submit { spec, .. } => {
             if Some(local_node) != route.holders.first().copied() {
                 return PreparedResponse::new(JobResponse::Unavailable(
@@ -699,6 +714,25 @@ async fn prepare_list(
             records,
             next_cursor,
         }),
+        Err(error) => PreparedResponse::new(JobResponse::Unavailable(error)),
+    }
+}
+
+async fn prepare_lookup(
+    context: &DriverContext,
+    auth_user: UserId,
+    user_id: UserId,
+    job_id: JobId,
+) -> PreparedResponse {
+    if auth_user != user_id {
+        return PreparedResponse::new(JobResponse::Forbidden);
+    }
+    match find_user_job(&context.storage_handle, user_id, job_id).await {
+        Ok(Some(record)) => PreparedResponse::new(JobResponse::Located {
+            owner_node_id: record.owner_node_id,
+            plan_digest: record.plan_digest,
+        }),
+        Ok(None) => PreparedResponse::new(JobResponse::NotFound),
         Err(error) => PreparedResponse::new(JobResponse::Unavailable(error)),
     }
 }
