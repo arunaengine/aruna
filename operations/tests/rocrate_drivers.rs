@@ -20,7 +20,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     Actor, AuthContext, Backend, BackendConfig, BucketInfo, ExportRoCrateSpec,
     GroupAuthorizationDocument, ImportMetadataTarget, ImportReportRow, ImportRoCrateSource,
-    ImportRoCrateSpec, ImportRoCrateTarget, JOBCONTROL_HANDLE, JobId, JobPayload, JobRecord,
+    ImportRoCrateSpec, ImportRoCrateTarget, FIRST_GRANTABLE_HANDLE, JobId, JobPayload, JobRecord,
     JobResultPayload, MetadataRegistryRecord, PathRestriction, Permission,
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, ReasonCode,
     RoCrateLimits, RoCrateMediaType, RoCrateUploadRecord, RoutingSnapshot, SourceConnectorKind,
@@ -77,7 +77,7 @@ fn doc_id(seed: u64) -> Ulid {
 
 fn job_id() -> JobId {
     mint_job_id(
-        PlacementHandle::new(JOBCONTROL_HANDLE).unwrap(),
+        PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
         BucketId::new(0).unwrap(),
     )
     .unwrap()

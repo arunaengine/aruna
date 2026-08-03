@@ -29,9 +29,11 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::{
-    Actor, MetadataRegistryRecord, NodePlacementEntry, PlacementRef, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
+    Actor, DocumentClass, HandleRange, MetadataRegistryRecord, NodePlacementEntry,
+    PlacementBinding, PlacementRef, PlacementScope, RealmAuthorizationDocument,
+    RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims, band_start,
 };
+use aruna_core::structured_id::PlacementHandle;
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::announce_realm_presence::{
@@ -469,6 +471,7 @@ async fn install_realm_config(
 ) -> TestResult<RealmConfigDocument> {
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), replication_factor);
     config.seed_default_placement();
+    let mut band = 0u32;
     for (index, node) in nodes.iter().enumerate() {
         let node_id = node.node_id();
         config.ensure_node(node_id, node.kind.clone());
@@ -483,6 +486,27 @@ async fn install_realm_config(
             draining: false,
             labels: BTreeMap::new(),
         });
+        // Every sync-eligible node gets its onboarding band; the band's first
+        // handle carries its immutable JobControl binding.
+        let range = HandleRange {
+            range_id: Ulid::from_bytes([band as u8 + 1; 16]),
+            owner: node_id,
+            start: band_start(band),
+            end: band_start(band + 1),
+        };
+        config.placement_handle_ranges.push(range);
+        config.placement_bindings.push(PlacementBinding {
+            handle: PlacementHandle::new(range.start).expect("band start is a valid handle"),
+            scope: PlacementScope::Realm(realm_id),
+            document_class: DocumentClass::JobControl,
+            strategy_id: config
+                .default_strategy_id
+                .expect("seeded config has a default strategy"),
+            allocator_range_id: Some(range.range_id),
+            allocated_by: Some(node_id),
+            allocated_at_ms: Some(1),
+        });
+        band += 1;
     }
 
     let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);

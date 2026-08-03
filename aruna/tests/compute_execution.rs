@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use aruna_compute::executor::docker::DockerBackend;
 use aruna_compute::{DockerConfig, ExecutorBackend, ExecutorRegistry};
 use aruna_core::structs::{
-    ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JOBCONTROL_HANDLE,
+    ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, FIRST_GRANTABLE_HANDLE,
     JobId, JobPayload, JobRecord, JobState, OutputDestination, OutputSelection, RunCrateStatus,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
@@ -37,7 +37,7 @@ use ulid::Ulid;
 
 fn job_id() -> JobId {
     mint_job_id(
-        PlacementHandle::new(JOBCONTROL_HANDLE).unwrap(),
+        PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
         BucketId::new(0).unwrap(),
     )
     .unwrap()

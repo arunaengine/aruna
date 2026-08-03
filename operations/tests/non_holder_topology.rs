@@ -18,9 +18,11 @@ use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::storage_entries::metadata_registry_delete_entries;
 use aruna_core::structs::{
-    AuthContext, ComputeResources, DocumentClass, ExecutionSpec, JOBCONTROL_HANDLE, JobState,
-    PlacementRef, PlacementScope, WorkspaceMode,
+    AuthContext, ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource,
+    ImportRoCrateSpec, ImportRoCrateTarget, JobState, RoCrateLimits, WorkspaceMode, band_start,
+    user_dedup_key,
 };
+use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_forward_document, mint_local_document,
@@ -34,8 +36,10 @@ use aruna_operations::jobs::drain::{JobClassBudget, process_job_queue_batch};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, read_job_routed, read_owned_job, submit_execution_job,
+    submit_rocrate_import,
 };
-use aruna_operations::jobs::store::read_job_pointer;
+use aruna_operations::jobs::store::find_dedup_job;
+use aruna_operations::jobs::submit::{SubmitJobError, mint_job_id};
 use aruna_operations::metadata::MetadataAuthToken;
 use aruna_operations::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, MetadataApiQueryMode,
@@ -46,7 +50,6 @@ use aruna_operations::metadata::forward::{
     origin_holds_document, update_metadata_document_routed,
 };
 use aruna_operations::metadata::projector::replay_metadata_event_log;
-use aruna_operations::placement::shard_subject_bytes;
 use aruna_operations::sync_placement::sort_node_ids;
 use aruna_operations::update_metadata_document::UpdateMetadataDocumentMutation;
 use ulid::Ulid;
@@ -77,33 +80,23 @@ fn execution_spec(seed: u8) -> ExecutionSpec {
     }
 }
 
-/// The stamped placement of a job-control id, verified against the reserved
-/// binding, so holder assertions run against what the submit actually used.
-fn job_placement(realm: &Topology, job_id: aruna_core::structs::JobId) -> TestResult<PlacementRef> {
-    let routable = job_id.as_routable()?;
-    assert_eq!(routable.placement_handle().get(), JOBCONTROL_HANDLE);
-    let binding = realm
-        .config
-        .binding_directory()
-        .resolve(routable.placement_handle())?;
-    assert_eq!(binding.document_class, DocumentClass::JobControl);
-    assert_eq!(binding.scope, PlacementScope::Realm(realm.realm_id));
-    Ok(PlacementRef {
-        strategy_id: binding.strategy_id,
-        epoch: 0,
-        shard: u32::from(routable.bucket().get()),
-    })
-}
-
 const JOB_BUDGET: JobClassBudget = JobClassBudget {
     in_process: 1,
     external: 1,
 };
 
+/// Owner derivation as every node performs it: pure, from the replicated config.
+fn derived_owner(
+    realm: &Topology,
+    job_id: aruna_core::structs::JobId,
+) -> TestResult<aruna_core::NodeId> {
+    Ok(realm.config.job_owner(job_id)?)
+}
+
 #[tokio::test]
 async fn owner_read_routes() -> TestResult<()> {
-    // The owner keeps the only record; other holders keep an immutable pointer;
-    // a non-holder bystander resolves the owner and reads through it.
+    // The accepting node is the immutable owner and keeps the only record;
+    // every other node derives the owner from the JobId and reads through it.
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let ingress = realm.node(0);
     let submitted = submit_execution_job(
@@ -118,31 +111,27 @@ async fn owner_read_routes() -> TestResult<()> {
     )
     .await?;
 
-    let placement = job_placement(&realm, submitted.job_id)?;
-    let holders = realm.assert_holder(ingress.node_id(), &placement);
-    let owner = realm.find(holders[0]);
-    let stored = read_owned_job(owner.context.as_ref(), realm.user_id, submitted.job_id)
+    assert_eq!(derived_owner(&realm, submitted.job_id)?, ingress.node_id());
+    let stored = read_owned_job(ingress.context.as_ref(), realm.user_id, submitted.job_id)
         .await?
-        .expect("the owner stores the record");
-    assert_eq!(stored.owner_node_id, owner.node_id());
+        .expect("the accepting node owns the record");
+    assert_eq!(stored.owner_node_id, ingress.node_id());
     assert_eq!(stored.state, JobState::Queued);
 
-    for holder in holders.iter().filter(|node| **node != owner.node_id()) {
-        let node = realm.find(*holder);
+    for node in realm
+        .nodes
+        .iter()
+        .filter(|node| node.node_id() != ingress.node_id())
+    {
         assert!(
             read_owned_job(node.context.as_ref(), realm.user_id, submitted.job_id)
                 .await?
                 .is_none(),
-            "a non-owner holder must not carry a runnable record"
+            "no other node may carry any record"
         );
-        let pointer = read_job_pointer(&node.context.storage_handle, submitted.job_id)
-            .await?
-            .expect("holders carry the owner pointer");
-        assert_eq!(pointer.owner_node_id, owner.node_id());
-        assert_eq!(pointer.created_by, realm.user_id);
     }
 
-    let bystander = realm.non_holder(&placement);
+    let bystander = realm.node(1);
     let routed = read_job_routed(
         bystander.context.as_ref(),
         realm.user_id,
@@ -157,11 +146,13 @@ async fn owner_read_routes() -> TestResult<()> {
 }
 
 #[tokio::test]
-async fn retry_dedups_remote() -> TestResult<()> {
+async fn origin_scoped_dedup() -> TestResult<()> {
+    // Idempotency is per-origin by contract: a retry through the same origin
+    // dedups in its local transaction; a different origin creates its own job.
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let first_ingress = realm.node(0);
     let second_ingress = realm.node(1);
-    let key = Some("cross-node-retry".to_string());
+    let key = Some("origin-scoped-retry".to_string());
     let first = submit_execution_job(
         first_ingress.context.as_ref(),
         execution_spec(42),
@@ -173,7 +164,22 @@ async fn retry_dedups_remote() -> TestResult<()> {
         aruna_operations::jobs::JOB_RETENTION_MS,
     )
     .await?;
-    let second = submit_execution_job(
+    let retried = submit_execution_job(
+        first_ingress.context.as_ref(),
+        execution_spec(42),
+        realm.user_id,
+        first_ingress.node_id(),
+        key.clone(),
+        WorkspaceMode::None,
+        None,
+        aruna_operations::jobs::JOB_RETENTION_MS,
+    )
+    .await?;
+    assert!(first.created);
+    assert!(!retried.created);
+    assert_eq!(retried.job_id, first.job_id);
+
+    let elsewhere = submit_execution_job(
         second_ingress.context.as_ref(),
         execution_spec(42),
         realm.user_id,
@@ -184,22 +190,78 @@ async fn retry_dedups_remote() -> TestResult<()> {
         aruna_operations::jobs::JOB_RETENTION_MS,
     )
     .await?;
+    assert!(elsewhere.created, "another origin owns its own job");
+    assert_ne!(elsewhere.job_id, first.job_id);
+    assert_eq!(
+        derived_owner(&realm, elsewhere.job_id)?,
+        second_ingress.node_id()
+    );
 
-    assert!(first.created);
-    assert!(!second.created);
-    assert_eq!(second.job_id, first.job_id);
-
-    // The dedup replay must not have materialized a second record anywhere.
-    let mut stored = 0;
-    for node in &realm.nodes {
-        if read_owned_job(node.context.as_ref(), realm.user_id, first.job_id)
-            .await?
-            .is_some()
-        {
-            stored += 1;
+    // Submission is one local transaction: dedup rows and records exist only
+    // on their origin, nothing was reserved on any other node.
+    let dedup_key = user_dedup_key(realm.user_id, "origin-scoped-retry");
+    for (index, node) in realm.nodes.iter().enumerate() {
+        let row = find_dedup_job(&node.context.storage_handle, realm.user_id, &dedup_key, None)
+            .await?;
+        match index {
+            0 => assert_eq!(row, Some(first.job_id)),
+            1 => assert_eq!(row, Some(elsewhere.job_id)),
+            _ => assert_eq!(row, None, "no cross-node reservation may exist"),
         }
     }
-    assert_eq!(stored, 1, "exactly one node owns the deduplicated job");
+
+    realm.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cap_stays_local() -> TestResult<()> {
+    // Active-job caps are per-origin: a full origin rejects while another
+    // origin still accepts, and cap rows never leave their origin.
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let import_spec = |seed: u8| {
+        ImportRoCrateSpec {
+            auth_context: AuthContext {
+                user_id: realm.user_id,
+                realm_id: realm.realm_id,
+                path_restrictions: None,
+            },
+            source: ImportRoCrateSource::Upload {
+                upload_id: Ulid::from_bytes([seed; 16]),
+            },
+            target: ImportRoCrateTarget {
+                bucket: "target".to_string(),
+                prefix: String::new(),
+            },
+            metadata: ImportMetadataTarget {
+                group_id: Ulid::from_bytes([90; 16]),
+                path: format!("crate-{seed}"),
+                public: false,
+            },
+            limits: RoCrateLimits {
+                max_active_jobs: 1,
+                ..RoCrateLimits::default()
+            },
+            document_id: Ulid::from_bytes([seed; 16]),
+        }
+    };
+    let ingress = realm.node(0);
+    let first = submit_rocrate_import(ingress.context.as_ref(), import_spec(1), ingress.node_id(), None)
+        .await?;
+    assert!(first.created);
+    let capped =
+        submit_rocrate_import(ingress.context.as_ref(), import_spec(2), ingress.node_id(), None)
+            .await;
+    assert!(matches!(
+        capped,
+        Err(SubmitJobError::ActiveJobLimit { limit: 1 })
+    ));
+
+    let other = realm.node(1);
+    let accepted =
+        submit_rocrate_import(other.context.as_ref(), import_spec(3), other.node_id(), None)
+            .await?;
+    assert!(accepted.created, "another origin counts its own cap");
 
     realm.shutdown().await;
     Ok(())
@@ -221,10 +283,7 @@ async fn owner_claims() -> TestResult<()> {
         aruna_operations::jobs::JOB_RETENTION_MS,
     )
     .await?;
-    let placement = job_placement(&realm, submitted.job_id)?;
-    let holders = realm.holders(&placement);
-    let owner = realm.find(holders[0]);
-    let passive = realm.find(holders[1]);
+    let passive = realm.node(1);
 
     let passive_result = process_job_queue_batch(
         &passive.context.storage_handle,
@@ -238,25 +297,25 @@ async fn owner_claims() -> TestResult<()> {
         read_owned_job(passive.context.as_ref(), realm.user_id, submitted.job_id)
             .await?
             .is_none(),
-        "a non-owner holder has nothing to claim"
+        "a non-owner has nothing to claim"
     );
 
     let owner_result = process_job_queue_batch(
-        &owner.context.storage_handle,
-        owner.node_id(),
+        &ingress.context.storage_handle,
+        ingress.node_id(),
         JOB_BUDGET,
         None,
     )
     .await?;
     assert_eq!(owner_result.claimed.len(), 1);
     assert_eq!(owner_result.claimed[0].job_id, submitted.job_id);
-    assert_eq!(owner_result.claimed[0].owner_node_id, owner.node_id());
+    assert_eq!(owner_result.claimed[0].owner_node_id, ingress.node_id());
     assert_eq!(
         owner_result.claimed[0]
             .claim
             .as_ref()
             .map(|claim| claim.holder_node_id),
-        Some(owner.node_id())
+        Some(ingress.node_id())
     );
 
     realm.shutdown().await;
@@ -265,55 +324,68 @@ async fn owner_claims() -> TestResult<()> {
 
 #[tokio::test]
 async fn swap_keeps_owner() -> TestResult<()> {
-    // A holder-set change never re-homes a job: the immutable owner keeps
-    // running it, the new rank-0 claims nothing, and control ops still route.
+    // An arbitrary placement rebalance never re-homes a job: the owner is
+    // derived from the JobId, so it keeps executing and control ops still
+    // route to it even after it stops being selectable for any placement.
     let mut realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
-    let ingress = realm.node(0);
+    let owner_id = realm.node(0).node_id();
     let submitted = submit_execution_job(
-        ingress.context.as_ref(),
+        realm.node(0).context.as_ref(),
         execution_spec(44),
         realm.user_id,
-        ingress.node_id(),
+        owner_id,
         None,
         WorkspaceMode::None,
         None,
         aruna_operations::jobs::JOB_RETENTION_MS,
     )
     .await?;
-    let placement = job_placement(&realm, submitted.job_id)?;
-    let owner_id = realm.holders(&placement)[0];
+    assert_eq!(derived_owner(&realm, submitted.job_id)?, owner_id);
 
+    // Data holders move: the owner becomes unselectable everywhere and an
+    // override excludes it explicitly. The derived owner does not move.
     let mut config = realm.config.clone();
+    for entry in config.placement_map.iter_mut() {
+        if entry.node_id == owner_id {
+            entry.weight = 0;
+            entry.draining = true;
+        }
+    }
     config
         .placement_overrides
         .push(aruna_core::structs::PlacementOverride {
-            subject: shard_subject_bytes(&placement),
+            subject: b"any-shard-subject".to_vec(),
             pinned: Vec::new(),
             excluded: vec![owner_id],
             strategy_id: None,
         });
     realm.apply_config(config).await?;
-    let swapped = realm.holders(&placement);
-    assert!(
-        !swapped.contains(&owner_id),
-        "the owner left the holder set"
+    assert_eq!(
+        derived_owner(&realm, submitted.job_id)?,
+        owner_id,
+        "the derived owner survives an arbitrary placement change"
     );
 
-    let new_rank0 = realm.find(swapped[0]);
-    let result = process_job_queue_batch(
-        &new_rank0.context.storage_handle,
-        new_rank0.node_id(),
-        JOB_BUDGET,
-        None,
-    )
-    .await?;
-    assert!(result.claimed.is_empty(), "a non-owner must never claim");
-    assert!(
-        read_owned_job(new_rank0.context.as_ref(), realm.user_id, submitted.job_id)
-            .await?
-            .is_none(),
-        "no runnable copy may appear on the new rank-0"
-    );
+    for node in realm
+        .nodes
+        .iter()
+        .filter(|node| node.is_sync_eligible() && node.node_id() != owner_id)
+    {
+        let result = process_job_queue_batch(
+            &node.context.storage_handle,
+            node.node_id(),
+            JOB_BUDGET,
+            None,
+        )
+        .await?;
+        assert!(result.claimed.is_empty(), "a non-owner must never claim");
+        assert!(
+            read_owned_job(node.context.as_ref(), realm.user_id, submitted.job_id)
+                .await?
+                .is_none(),
+            "no runnable copy may appear anywhere else"
+        );
+    }
 
     let owner = realm.find(owner_id);
     let result =
@@ -321,14 +393,15 @@ async fn swap_keeps_owner() -> TestResult<()> {
     assert_eq!(
         result.claimed.len(),
         1,
-        "the swap must not strand the owner"
+        "the rebalance must not strand the owner"
     );
     assert_eq!(result.claimed[0].job_id, submitted.job_id);
 
-    // Cancellation from the new rank-0 reaches only the owner.
+    // Cancellation from a bystander reaches only the owner.
+    let bystander = realm.node(1);
     let runtime = JobsRuntime::new_paused();
     let outcome = cancel_job_routed(
-        new_rank0.context.as_ref(),
+        bystander.context.as_ref(),
         &runtime,
         realm.user_id,
         submitted.job_id,
@@ -347,36 +420,23 @@ async fn swap_keeps_owner() -> TestResult<()> {
 
 #[tokio::test]
 async fn owner_down_unavailable() -> TestResult<()> {
-    // An unreachable owner yields Unavailable, never a takeover: no surviving
-    // node claims the job or fabricates an answer for it.
+    // An unreachable owner yields Unavailable, never a false 404 and never a
+    // takeover: no surviving node claims the job or fabricates an answer.
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     let ingress = realm.node(0);
+    let owner_id = ingress.node_id();
     let submitted = submit_execution_job(
         ingress.context.as_ref(),
         execution_spec(45),
         realm.user_id,
-        ingress.node_id(),
+        owner_id,
         None,
         WorkspaceMode::None,
         None,
         aruna_operations::jobs::JOB_RETENTION_MS,
     )
     .await?;
-    let placement = job_placement(&realm, submitted.job_id)?;
-    let holders = realm.holders(&placement);
-    let owner_id = holders[0];
-    let probe = realm.find(
-        *holders
-            .iter()
-            .find(|holder| **holder != owner_id)
-            .expect("replication factor three provides another holder"),
-    );
-    assert!(
-        read_job_pointer(&probe.context.storage_handle, submitted.job_id)
-            .await?
-            .is_some(),
-        "the probe holder resolves the owner from its local pointer"
-    );
+    let probe = realm.node(1);
 
     realm.find(owner_id).net.shutdown().await;
 
@@ -389,7 +449,7 @@ async fn owner_down_unavailable() -> TestResult<()> {
     .await;
     assert!(
         matches!(status, Err(JobRouteError::Unavailable(_))),
-        "owner-down status must be unavailable, not a passive answer"
+        "owner-down status must be unavailable, never absence: {status:?}"
     );
     let runtime = JobsRuntime::new_paused();
     let cancel = cancel_job_routed(
@@ -425,6 +485,49 @@ async fn owner_down_unavailable() -> TestResult<()> {
             "no survivor may hold a runnable copy"
         );
     }
+
+    realm.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn owner_answers_absence() -> TestResult<()> {
+    // Only the resolved owner returns an authoritative 404; a handle without
+    // a synced binding degrades to Unavailable, never a false absence.
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let ingress = realm.node(0);
+    let bystander = realm.node(1);
+    let handle = realm
+        .config
+        .job_control_handle(&ingress.node_id())
+        .expect("fixture binds every node");
+    let missing = mint_job_id(handle, BucketId::new(0)?)?;
+
+    let routed = read_job_routed(
+        bystander.context.as_ref(),
+        realm.user_id,
+        missing,
+        Some(realm.bearer_token()),
+    )
+    .await;
+    assert!(
+        matches!(routed, Err(JobRouteError::NotFound)),
+        "the owner is the sole 404 authority: {routed:?}"
+    );
+
+    let unbound = PlacementHandle::new(band_start(500))?;
+    let unresolved = mint_job_id(unbound, BucketId::new(0)?)?;
+    let routed = read_job_routed(
+        bystander.context.as_ref(),
+        realm.user_id,
+        unresolved,
+        Some(realm.bearer_token()),
+    )
+    .await;
+    assert!(
+        matches!(routed, Err(JobRouteError::Unavailable(_))),
+        "an unsynced binding must degrade to 503, never 404: {routed:?}"
+    );
 
     realm.shutdown().await;
     Ok(())
