@@ -53,10 +53,10 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::{
     BindingError, DocumentClass, Group, GroupAuthorizationDocument, MetadataRegistryRecord,
     NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument, NodeUsageSnapshot, PlacementRef,
-    PlacementScope, RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, Role,
-    User, WatchEventMask, WatchInterestDigest, WatchSubscription, group_owner_index_key,
-    node_usage_key_node_id, reserved_label, watch_interest_dirty_key, watch_interest_key_node_id,
-    watch_interest_key_realm_id,
+    PlacementScope, PoolAdmission, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+    RealmNodeKind, Role, User, WatchEventMask, WatchInterestDigest, WatchSubscription,
+    admit_band_pool, group_owner_index_key, node_usage_key_node_id, reserved_label,
+    watch_interest_dirty_key, watch_interest_key_node_id, watch_interest_key_realm_id,
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::{RoleId, TxnId, UserId, Value};
@@ -5434,6 +5434,24 @@ async fn validate_realm_config_admin_authority(
                 "stored realm config has the wrong realm".to_string(),
             ));
         }
+        // Band pools form a causal delegation tree; reject a forged or
+        // non-owning issuer, and defer a child until its parent replicates.
+        if let AdminDocumentOperation::RealmConfigBandPoolAssigned { pool } = &event.op {
+            match admit_band_pool(&config.band_pools, pool, &event.origin_node_id) {
+                PoolAdmission::Reject => {
+                    return Ok(AdminEventValidation::Rejected(
+                        "band pool lineage is invalid".to_string(),
+                    ));
+                }
+                PoolAdmission::MissingParent => {
+                    return Ok(AdminEventValidation::Deferred {
+                        dependency: None,
+                        reason: "band pool parent is not yet replicated".to_string(),
+                    });
+                }
+                PoolAdmission::Accept => {}
+            }
+        }
         let server_binding = match (
             configured_node_kind(config, &event.origin_node_id),
             &event.op,
@@ -6384,11 +6402,13 @@ mod tests {
         metadata_registry_key, subject_index_key, subject_index_value,
     };
     use aruna_core::structs::{
-        Actor, BindingScope, DocumentClass, Group, GroupAuthorizationDocument, GroupQuotaOverride,
-        METADATA_HANDLE, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig,
-        Permission, PlacementBinding, PlacementOverride, PlacementRef, PlacementStrategy,
-        QuotaConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig,
-        RealmId, RealmNodeKind, Role, StaticRealmEndpoint, StrategyBinding, UserGroupCapOverride,
+        Actor, BandPool, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, Group,
+        GroupAuthorizationDocument, GroupQuotaOverride, HANDLE_BANDS, METADATA_HANDLE,
+        MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
+        PlacementBinding, PlacementOverride, PlacementRef, PlacementStrategy, QuotaConfig,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
+        RealmNodeKind, Role, StaticRealmEndpoint, StrategyBinding, UserGroupCapOverride,
+        band_start,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::{MetaResourceId, StructuredId, UserId};
@@ -12012,6 +12032,106 @@ mod tests {
                 AdminEventValidation::Rejected(_)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn inbound_rejects_pool() {
+        // A child band pool whose issuer does not own its parent is rejected;
+        // one whose parent has not replicated yet is deferred.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([73; 32]);
+        let coordinator = test_actor(73, UserId::local(Ulid::generate(), realm_id), realm_id);
+        let attacker = test_actor(74, UserId::local(Ulid::generate(), realm_id), realm_id);
+        let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let admin_target = AdminDocumentTarget::RealmConfig { realm_id };
+        let topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
+
+        let root = BandPool {
+            pool_id: Ulid::from_bytes([90; 16]),
+            parent: None,
+            issuer: coordinator.node_id,
+            owner: coordinator.node_id,
+            start: FIRST_GRANTABLE_HANDLE,
+            end: band_start(HANDLE_BANDS),
+        };
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(coordinator.node_id, RealmNodeKind::Management);
+        config.band_pools.push(root);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                config_target.clone(),
+                config
+                    .to_bytes(&coordinator)
+                    .expect("config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("config writes");
+
+        let forged = BandPool {
+            pool_id: Ulid::from_bytes([91; 16]),
+            parent: Some(root.pool_id),
+            issuer: attacker.node_id,
+            owner: attacker.node_id,
+            start: band_start(1),
+            end: band_start(2),
+        };
+        let forged_event = test_admin_event(
+            Ulid::from_parts(1_702, 1),
+            admin_target.clone(),
+            &attacker,
+            1,
+            AdminDocumentOperation::RealmConfigBandPoolAssigned { pool: forged },
+        );
+        let forged_publisher =
+            irokle_crate::actor_id_for(topic, node_id_to_peer_id(&attacker.node_id));
+        assert!(matches!(
+            validate_replicated_admin_event(
+                &storage,
+                topic,
+                forged_publisher,
+                &config_target,
+                &forged_event,
+                realm_id,
+                &PlacementRef::NIL,
+            )
+            .await
+            .expect("storage succeeds"),
+            AdminEventValidation::Rejected(_)
+        ));
+
+        let orphan = BandPool {
+            pool_id: Ulid::from_bytes([92; 16]),
+            parent: Some(Ulid::from_bytes([99; 16])),
+            issuer: coordinator.node_id,
+            owner: coordinator.node_id,
+            start: band_start(1),
+            end: band_start(2),
+        };
+        let orphan_event = test_admin_event(
+            Ulid::from_parts(1_703, 1),
+            admin_target,
+            &coordinator,
+            1,
+            AdminDocumentOperation::RealmConfigBandPoolAssigned { pool: orphan },
+        );
+        let publisher = irokle_crate::actor_id_for(topic, node_id_to_peer_id(&coordinator.node_id));
+        assert!(matches!(
+            validate_replicated_admin_event(
+                &storage,
+                topic,
+                publisher,
+                &config_target,
+                &orphan_event,
+                realm_id,
+                &PlacementRef::NIL,
+            )
+            .await
+            .expect("storage succeeds"),
+            AdminEventValidation::Deferred { .. }
+        ));
     }
 
     #[tokio::test]

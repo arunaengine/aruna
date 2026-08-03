@@ -11,7 +11,7 @@ use crate::admin_documents::{
     AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use crate::structs::{
-    Actor, BindingScope, DocumentClass, HandleRange, MAX_PLACEMENT_SHARD_COUNT,
+    Actor, BandPool, BindingScope, DocumentClass, HandleRange, MAX_PLACEMENT_SHARD_COUNT,
     MetadataRegistryRecord, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig,
     PlacementBinding, PlacementOverride, PlacementStrategy, QuotaConfig, RealmConfigDocument,
     RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding, reserved_label,
@@ -274,9 +274,9 @@ pub fn overlay_realm_config_placement_reducer_materialization(
         let Some(pool_id) = band_pool_id(path) else {
             continue;
         };
-        config.band_pools.retain(|pool| pool.range_id != pool_id);
+        config.band_pools.retain(|pool| pool.pool_id != pool_id);
         for value in &conflict.values {
-            if let Some(pool) = value.value.as_deref().and_then(parse_handle_range) {
+            if let Some(pool) = value.value.as_deref().and_then(parse_band_pool) {
                 config.band_pools.push(pool);
             }
         }
@@ -285,7 +285,7 @@ pub fn overlay_realm_config_placement_reducer_materialization(
         let Some(pool_id) = band_pool_id(path) else {
             continue;
         };
-        config.band_pools.retain(|pool| pool.range_id != pool_id);
+        config.band_pools.retain(|pool| pool.pool_id != pool_id);
         if reducer_state.conflicts.contains_key(path) {
             continue;
         }
@@ -1050,7 +1050,7 @@ impl AdminDocumentReducerState {
             .collect()
     }
 
-    pub fn materialized_band_pools(&self) -> BTreeMap<Ulid, HandleRange> {
+    pub fn materialized_band_pools(&self) -> BTreeMap<Ulid, BandPool> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return BTreeMap::new();
         }
@@ -1059,9 +1059,9 @@ impl AdminDocumentReducerState {
             .iter()
             .filter_map(|(path, version)| {
                 let pool_id = band_pool_id(path)?;
-                let pool = version.value.as_deref().and_then(parse_handle_range)?;
+                let pool = version.value.as_deref().and_then(parse_band_pool)?;
 
-                (pool.range_id == pool_id).then_some((pool_id, pool))
+                (pool.pool_id == pool_id).then_some((pool_id, pool))
             })
             .collect()
     }
@@ -1328,20 +1328,15 @@ impl AdminDocumentReducerState {
     fn apply_handle_range(&mut self, event: &AdminDocumentEvent, range: &HandleRange) {
         // Like bindings, divergent values for one id fail closed. Distinct-id
         // overlap is derived later by `HandleRangeDirectory::from_ranges`.
-        self.apply_handle_range_path(event, handle_range_path(range.range_id), range);
+        self.apply_immutable_value(
+            event,
+            handle_range_path(range.range_id),
+            handle_range_value(range),
+        );
     }
 
-    fn apply_band_pool(&mut self, event: &AdminDocumentEvent, pool: &HandleRange) {
-        self.apply_handle_range_path(event, band_pool_path(pool.range_id), pool);
-    }
-
-    fn apply_handle_range_path(
-        &mut self,
-        event: &AdminDocumentEvent,
-        path: String,
-        range: &HandleRange,
-    ) {
-        self.apply_immutable_value(event, path, handle_range_value(range));
+    fn apply_band_pool(&mut self, event: &AdminDocumentEvent, pool: &BandPool) {
+        self.apply_immutable_value(event, band_pool_path(pool.pool_id), band_pool_value(pool));
     }
 
     /// Append-only path: a divergent value for an existing path fails closed as
@@ -1624,7 +1619,7 @@ fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
             vec![handle_range_path(range.range_id)]
         }
         AdminDocumentOperation::RealmConfigBandPoolAssigned { pool } => {
-            vec![band_pool_path(pool.range_id)]
+            vec![band_pool_path(pool.pool_id)]
         }
     }
 }
@@ -1784,6 +1779,12 @@ fn handle_range_value(range: &HandleRange) -> String {
     serde_json::to_string(range).expect("admin document handle range serializes")
 }
 
+fn band_pool_value(pool: &BandPool) -> String {
+    // The whole record (id, lineage, owner, bounds) is the identity compared
+    // for same-key divergence.
+    serde_json::to_string(pool).expect("admin document band pool serializes")
+}
+
 fn oidc_provider_value(provider: &OidcProviderConfig) -> String {
     serde_json::to_string(provider).expect("admin document OIDC provider config serializes")
 }
@@ -1927,6 +1928,10 @@ fn parse_placement_binding(value: &str) -> Option<PlacementBinding> {
 }
 
 fn parse_handle_range(value: &str) -> Option<HandleRange> {
+    serde_json::from_str(value).ok()
+}
+
+fn parse_band_pool(value: &str) -> Option<BandPool> {
     serde_json::from_str(value).ok()
 }
 

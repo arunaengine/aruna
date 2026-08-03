@@ -18,9 +18,9 @@ use aruna_core::storage_entries::{
     admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
 };
 use aruna_core::structs::{
-    Actor, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE, HandleRange,
-    PlacementBinding, PlacementScope, RealmConfigDocument, RealmNodeKind, band_start,
-    coordinator_spans,
+    Actor, BandPool, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE,
+    HandleRange, PlacementBinding, PlacementScope, RealmConfigDocument, RealmNodeKind, band_start,
+    coordinator_spans, owned_pools,
 };
 use aruna_core::structured_id::PlacementHandle;
 use aruna_core::task::TaskEvent;
@@ -219,9 +219,12 @@ impl EnsureRealmConfigOperation {
                 &self.config.target_node_kind,
             )
         });
-        // A fresh document seeds the creating coordinator with every band.
-        let seed_pool = (fresh && document.band_pools.is_empty()).then(|| HandleRange {
-            range_id: Ulid::generate(),
+        // A fresh document seeds the creating coordinator with the whole space
+        // as a self-issued root pool.
+        let seed_pool = (fresh && document.band_pools.is_empty()).then(|| BandPool {
+            pool_id: Ulid::generate(),
+            parent: None,
+            issuer: self.config.actor.node_id,
             owner: self.config.actor.node_id,
             start: FIRST_GRANTABLE_HANDLE,
             end: band_start(HANDLE_BANDS),
@@ -292,19 +295,27 @@ impl EnsureRealmConfigOperation {
             let spans = coordinator_spans(&pools, &self.config.actor.node_id);
             let mut consumed = document.placement_handle_ranges.clone();
             consumed.push(assigned_range);
-            let slice = pool_transfer_slice(&spans, &consumed);
-            if slice.is_none() {
+            // The slice must sit inside one owned parent pool so lineage holds.
+            let child = pool_transfer_slice(&spans, &consumed).and_then(|(start, end)| {
+                owned_pools(&pools, &self.config.actor.node_id)
+                    .into_iter()
+                    .find(|pool| pool.start <= start && end <= pool.end)
+                    .map(|parent| BandPool {
+                        pool_id: Ulid::generate(),
+                        parent: Some(parent.pool_id),
+                        issuer: self.config.actor.node_id,
+                        owner: self.config.target_node_id,
+                        start,
+                        end,
+                    })
+            });
+            if child.is_none() {
                 warn!(
                     target_node = %self.config.target_node_id,
                     "New coordinator gets no band pool: the acting pool cannot be split"
                 );
             }
-            slice.map(|(start, end)| HandleRange {
-                range_id: Ulid::generate(),
-                owner: self.config.target_node_id,
-                start,
-                end,
-            })
+            child
         } else {
             None
         };
@@ -692,7 +703,7 @@ mod tests {
     use aruna_core::operation::Operation;
     use aruna_core::storage_entries::admin_document_reducer_conflict_key;
     use aruna_core::structs::{
-        Actor, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS,
+        Actor, BandPool, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS,
         HANDLE_RANGE_SIZE, HandleRange, NodePlacementEntry, PlacementOverride, PlacementStrategy,
         RealmConfigDocument, RealmId, RealmNodeKind, StrategyBinding, band_start,
         coordinator_spans,
@@ -837,8 +848,10 @@ mod tests {
         let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         document.seed_default_placement();
         for (seed, owner, start_band, end_band) in pools {
-            document.band_pools.push(HandleRange {
-                range_id: Ulid::from_bytes([*seed; 16]),
+            document.band_pools.push(BandPool {
+                pool_id: Ulid::from_bytes([*seed; 16]),
+                parent: None,
+                issuer: owner.node_id,
                 owner: owner.node_id,
                 start: band_start(*start_band),
                 end: band_start(*end_band),

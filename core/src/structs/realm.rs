@@ -2,8 +2,8 @@ use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::structs::{Permission, Role};
 use crate::structs::{
-    Actor, BindingDirectory, BindingError, BindingScope, DEFAULT_SHARD_COUNT, DocumentClass,
-    HandleRange, HandleRangeDirectory, JobId, METADATA_HANDLE, NodePlacementEntry,
+    Actor, BandPool, BindingDirectory, BindingError, BindingScope, DEFAULT_SHARD_COUNT,
+    DocumentClass, HandleRange, HandleRangeDirectory, JobId, METADATA_HANDLE, NodePlacementEntry,
     PlacementBinding, PlacementOverride, PlacementScope, PlacementStrategy, StrategyBinding,
     coordinator_spans,
 };
@@ -166,9 +166,10 @@ pub struct RealmConfigDocument {
     pub placement_bindings: Vec<PlacementBinding>,
     /// Append-only grants retained for fail-closed overlap detection.
     pub placement_handle_ranges: Vec<HandleRange>,
-    /// Append-only coordinator band pools. Each management coordinator grants
-    /// node bands only from its own pool; a later pool re-assigns its slice.
-    pub band_pools: Vec<HandleRange>,
+    /// Append-only coordinator band pools forming a causal delegation tree.
+    /// Each coordinator grants node bands only from pools it owns; precedence
+    /// is by lineage (see [`coordinator_spans`]).
+    pub band_pools: Vec<BandPool>,
 }
 
 /// Realm-wide quota policy. Lives in the realm config (Class-1, replicated

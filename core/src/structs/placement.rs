@@ -250,27 +250,135 @@ pub fn band_start(band: u32) -> u32 {
     FIRST_GRANTABLE_HANDLE + band * HANDLE_RANGE_SIZE
 }
 
-/// Handle spans `owner` may grant bands from: every pool slice assigned to it,
-/// minus any slice a later pool re-assigned (a transfer to a new coordinator).
-/// Later pools win per band, ordered by `range_id`, so carving is deterministic.
-pub fn coordinator_spans(pools: &[HandleRange], owner: &NodeId) -> Vec<(u32, u32)> {
-    let mut sorted: Vec<&HandleRange> = pools.iter().collect();
-    sorted.sort_by_key(|pool| (pool.range_id, pool.owner, pool.start, pool.end));
-    let mut owners: Vec<Option<NodeId>> = vec![None; HANDLE_BANDS as usize];
-    for pool in sorted {
-        for band in 0..HANDLE_BANDS {
-            let start = band_start(band);
-            if pool.start <= start && start + HANDLE_RANGE_SIZE <= pool.end {
-                owners[band as usize] = Some(pool.owner);
+/// A coordinator's delegated slice of the band space. Pools form a causal
+/// delegation tree: the realm-creation root has no parent, and every other pool
+/// is carved by its `issuer` from a `parent` the issuer owns. Precedence is by
+/// lineage, never by `pool_id` wall-clock order, so replication reordering and
+/// clock skew cannot move a band's owner.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BandPool {
+    pub pool_id: Ulid,
+    /// The pool this slice was carved from; `None` for the realm-creation root.
+    pub parent: Option<Ulid>,
+    /// The coordinator that carved this pool (must own `parent`).
+    pub issuer: NodeId,
+    /// The coordinator that may grant node bands from this pool.
+    pub owner: NodeId,
+    /// Inclusive lower bound.
+    pub start: u32,
+    /// Exclusive upper bound.
+    pub end: u32,
+}
+
+impl BandPool {
+    /// A pool is well-formed when it excludes reserved handles.
+    pub fn is_well_formed(&self) -> bool {
+        self.start >= FIRST_GRANTABLE_HANDLE
+            && self.start < self.end
+            && self.end <= HANDLE_SPACE_END
+    }
+
+    /// True when `[other.start, other.end)` lies within this pool's span.
+    pub fn contains_span(&self, other: &BandPool) -> bool {
+        self.start <= other.start && other.end <= self.end
+    }
+
+    fn covers_band(&self, band_start: u32) -> bool {
+        self.start <= band_start && band_start + HANDLE_RANGE_SIZE <= self.end
+    }
+}
+
+fn pool_by_id(pools: &[BandPool], id: Ulid) -> Option<&BandPool> {
+    pools.iter().find(|pool| pool.pool_id == id)
+}
+
+/// Lineage validity: a root is self-issued; a child's issuer must own its valid
+/// parent and its span must be a subset. Cycles and malformed pools are invalid.
+pub fn pool_is_valid(pools: &[BandPool], pool: &BandPool) -> bool {
+    valid_with_guard(pools, pool, &mut Vec::new())
+}
+
+fn valid_with_guard(pools: &[BandPool], pool: &BandPool, seen: &mut Vec<Ulid>) -> bool {
+    if !pool.is_well_formed() {
+        return false;
+    }
+    match pool.parent {
+        None => pool.issuer == pool.owner,
+        Some(parent_id) => {
+            if seen.contains(&parent_id) {
+                return false;
             }
+            let Some(parent) = pool_by_id(pools, parent_id) else {
+                return false;
+            };
+            if parent.owner != pool.issuer || !parent.contains_span(pool) {
+                return false;
+            }
+            seen.push(parent_id);
+            let ok = valid_with_guard(pools, parent, seen);
+            seen.pop();
+            ok
         }
     }
+}
+
+/// Parent pool ids from `pool` up to its root.
+fn ancestor_ids(pools: &[BandPool], pool: &BandPool) -> Vec<Ulid> {
+    let mut ids = Vec::new();
+    let mut current = pool.parent;
+    while let Some(id) = current {
+        if ids.contains(&id) {
+            break;
+        }
+        ids.push(id);
+        match pool_by_id(pools, id) {
+            Some(parent) => current = parent.parent,
+            None => break,
+        }
+    }
+    ids
+}
+
+/// Owner of a band: the unique valid pool that descends from every other valid
+/// pool covering it. Incomparable coverage (siblings, forgeries, same-id
+/// divergence) fails closed, leaving the band unusable.
+fn band_owner(valid: &[(BandPool, Vec<Ulid>)], band_start: u32) -> Option<NodeId> {
+    let covering: Vec<&(BandPool, Vec<Ulid>)> = valid
+        .iter()
+        .filter(|(pool, _)| pool.covers_band(band_start))
+        .collect();
+    if covering.is_empty() {
+        return None;
+    }
+    let mut winner: Option<NodeId> = None;
+    for (cand, cand_ancestors) in &covering {
+        let dominates = covering.iter().all(|(other, _)| {
+            other.pool_id == cand.pool_id || cand_ancestors.contains(&other.pool_id)
+        });
+        if dominates {
+            if winner.is_some() {
+                return None;
+            }
+            winner = Some(cand.owner);
+        }
+    }
+    winner
+}
+
+/// Handle spans `owner` may grant bands from, resolved by lineage. A band
+/// belongs to the deepest valid pool covering it; unrelated overlap fails closed.
+pub fn coordinator_spans(pools: &[BandPool], owner: &NodeId) -> Vec<(u32, u32)> {
+    let valid: Vec<(BandPool, Vec<Ulid>)> = pools
+        .iter()
+        .filter(|pool| pool_is_valid(pools, pool))
+        .map(|pool| (*pool, ancestor_ids(pools, pool)))
+        .collect();
     let mut spans: Vec<(u32, u32)> = Vec::new();
     for band in 0..HANDLE_BANDS {
-        if owners[band as usize].as_ref() != Some(owner) {
+        let start = band_start(band);
+        if band_owner(&valid, start) != Some(*owner) {
             continue;
         }
-        let start = band_start(band);
         let end = start + HANDLE_RANGE_SIZE;
         match spans.last_mut() {
             Some(span) if span.1 == start => span.1 = end,
@@ -278,6 +386,55 @@ pub fn coordinator_spans(pools: &[HandleRange], owner: &NodeId) -> Vec<(u32, u32
         }
     }
     spans
+}
+
+/// Valid pools whose owner is `owner`; a transfer names one as the child parent.
+pub fn owned_pools(pools: &[BandPool], owner: &NodeId) -> Vec<BandPool> {
+    pools
+        .iter()
+        .filter(|pool| pool.owner == *owner && pool_is_valid(pools, pool))
+        .copied()
+        .collect()
+}
+
+/// Inbound admission decision for a replicated band pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolAdmission {
+    Accept,
+    Reject,
+    /// The named parent is not yet present; retry once it replicates.
+    MissingParent,
+}
+
+/// Validates an inbound band pool against the known pools: the issuer must be
+/// the emitting node, a root must be self-issued, and a child's parent must
+/// exist, be valid, be owned by the issuer, and contain the child's span.
+pub fn admit_band_pool(pools: &[BandPool], pool: &BandPool, origin: &NodeId) -> PoolAdmission {
+    if !pool.is_well_formed() || pool.issuer != *origin {
+        return PoolAdmission::Reject;
+    }
+    match pool.parent {
+        None => {
+            if pool.issuer == pool.owner {
+                PoolAdmission::Accept
+            } else {
+                PoolAdmission::Reject
+            }
+        }
+        Some(parent_id) => match pool_by_id(pools, parent_id) {
+            None => PoolAdmission::MissingParent,
+            Some(parent) => {
+                if pool_is_valid(pools, parent)
+                    && parent.owner == pool.issuer
+                    && parent.contains_span(pool)
+                {
+                    PoolAdmission::Accept
+                } else {
+                    PoolAdmission::Reject
+                }
+            }
+        },
+    }
 }
 
 /// Durable `[start, end)` handle slice granted to one node.
@@ -604,29 +761,41 @@ mod tests {
         assert!(!past_end.is_well_formed());
     }
 
+    fn root(id: u8, owner: NodeId, start_band: u32, end_band: u32) -> BandPool {
+        BandPool {
+            pool_id: Ulid::from_bytes([id; 16]),
+            parent: None,
+            issuer: owner,
+            owner,
+            start: band_start(start_band),
+            end: band_start(end_band),
+        }
+    }
+
+    fn child(id: u8, parent: &BandPool, owner: NodeId, start_band: u32, end_band: u32) -> BandPool {
+        BandPool {
+            pool_id: Ulid::from_bytes([id; 16]),
+            parent: Some(parent.pool_id),
+            issuer: parent.owner,
+            owner,
+            start: band_start(start_band),
+            end: band_start(end_band),
+        }
+    }
+
     #[test]
     fn spans_follow_transfers() {
-        // A later pool re-assigns its slice; the elder owner keeps the rest.
+        // A child transfer overrides its span; the elder owner keeps the rest.
         let elder = node(1);
         let newer = node(2);
-        let full = HandleRange {
-            range_id: Ulid::from_bytes([1; 16]),
-            owner: elder,
-            start: FIRST_GRANTABLE_HANDLE,
-            end: band_start(HANDLE_BANDS),
-        };
+        let full = root(1, elder, 0, HANDLE_BANDS);
         assert_eq!(
             coordinator_spans(&[full], &elder),
             vec![(FIRST_GRANTABLE_HANDLE, band_start(HANDLE_BANDS))]
         );
         assert!(coordinator_spans(&[full], &newer).is_empty());
 
-        let transferred = HandleRange {
-            range_id: Ulid::from_bytes([2; 16]),
-            owner: newer,
-            start: band_start(HANDLE_BANDS / 2),
-            end: band_start(HANDLE_BANDS),
-        };
+        let transferred = child(2, &full, newer, HANDLE_BANDS / 2, HANDLE_BANDS);
         let pools = [full, transferred];
         assert_eq!(
             coordinator_spans(&pools, &elder),
@@ -644,11 +813,110 @@ mod tests {
     }
 
     #[test]
+    fn lineage_beats_skew() {
+        // A child whose pool_id sorts before its parent still resolves by
+        // lineage: no wall-clock/ULID order can move the band owner.
+        let elder = node(1);
+        let newer = node(2);
+        let full = root(9, elder, 0, HANDLE_BANDS);
+        // Child id (2) sorts before the parent id (9).
+        let transferred = child(2, &full, newer, HANDLE_BANDS / 2, HANDLE_BANDS);
+        let pools = [full, transferred];
+        assert_eq!(
+            coordinator_spans(&pools, &newer),
+            vec![(band_start(HANDLE_BANDS / 2), band_start(HANDLE_BANDS))]
+        );
+        assert_eq!(
+            coordinator_spans(&pools, &elder),
+            vec![(FIRST_GRANTABLE_HANDLE, band_start(HANDLE_BANDS / 2))]
+        );
+        assert_eq!(
+            coordinator_spans(&[transferred, full], &newer),
+            coordinator_spans(&pools, &newer)
+        );
+    }
+
+    #[test]
+    fn sibling_overlap_fails() {
+        // Two children of the same root overlap without an ancestor relation;
+        // the shared bands become unusable for both owners.
+        let elder = node(1);
+        let left = node(2);
+        let right = node(3);
+        let full = root(1, elder, 0, HANDLE_BANDS);
+        let a = child(2, &full, left, 1, 3);
+        let b = child(3, &full, right, 2, 4);
+        let pools = [full, a, b];
+        assert_eq!(
+            coordinator_spans(&pools, &left),
+            vec![(band_start(1), band_start(2))]
+        );
+        assert_eq!(
+            coordinator_spans(&pools, &right),
+            vec![(band_start(3), band_start(4))]
+        );
+        // The elder keeps everything except the two children's disjoint parts;
+        // the overlapping band (2) belongs to nobody.
+        for (start, end) in coordinator_spans(&pools, &elder) {
+            for band in (start..end).step_by(HANDLE_RANGE_SIZE as usize) {
+                assert_ne!(band, band_start(2), "conflicted band must not be grantable");
+            }
+        }
+    }
+
+    #[test]
+    fn forged_issuer_invalid() {
+        // A pool whose issuer does not own its parent is invalid and grants
+        // nothing, and inbound admission rejects it.
+        let elder = node(1);
+        let attacker = node(2);
+        let victim = node(3);
+        let full = root(1, elder, 0, HANDLE_BANDS);
+        let forged = BandPool {
+            pool_id: Ulid::from_bytes([5; 16]),
+            parent: Some(full.pool_id),
+            issuer: attacker,
+            owner: victim,
+            start: band_start(1),
+            end: band_start(2),
+        };
+        let pools = [full, forged];
+        assert!(coordinator_spans(&pools, &victim).is_empty());
+        assert!(coordinator_spans(&pools, &attacker).is_empty());
+        assert_eq!(
+            admit_band_pool(&[full], &forged, &attacker),
+            PoolAdmission::Reject
+        );
+    }
+
+    #[test]
+    fn admit_defers_missing() {
+        // A structurally valid child whose parent has not replicated defers.
+        let elder = node(1);
+        let newer = node(2);
+        let full = root(1, elder, 0, HANDLE_BANDS);
+        let transfer = child(2, &full, newer, HANDLE_BANDS / 2, HANDLE_BANDS);
+        assert_eq!(
+            admit_band_pool(&[], &transfer, &elder),
+            PoolAdmission::MissingParent
+        );
+        assert_eq!(
+            admit_band_pool(&[full], &transfer, &elder),
+            PoolAdmission::Accept
+        );
+        // A root must be self-issued and emitted by its owner.
+        assert_eq!(admit_band_pool(&[], &full, &elder), PoolAdmission::Accept);
+        assert_eq!(admit_band_pool(&[], &full, &newer), PoolAdmission::Reject);
+    }
+
+    #[test]
     fn partial_bands_ignored() {
         // A pool covering only part of a band never makes that band grantable.
         let owner = node(3);
-        let partial = HandleRange {
-            range_id: Ulid::from_bytes([3; 16]),
+        let partial = BandPool {
+            pool_id: Ulid::from_bytes([3; 16]),
+            parent: None,
+            issuer: owner,
             owner,
             start: FIRST_GRANTABLE_HANDLE + 1,
             end: band_start(2) + 5,

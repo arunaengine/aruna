@@ -10,8 +10,8 @@ use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::admin_document_reducer_state_write_entry;
 use aruna_core::structs::{
-    Actor, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE, HandleRange,
-    NodePlacementEntry, OidcProviderConfig, PlacementBinding, PlacementScope,
+    Actor, BandPool, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE,
+    HandleRange, NodePlacementEntry, OidcProviderConfig, PlacementBinding, PlacementScope,
     RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind, band_start,
     normalize_node_placement_input,
 };
@@ -107,10 +107,13 @@ impl CreateRealmOperation {
             RealmConfigDocument::default_for_realm(realm_id, self.config.oidc_providers.clone());
         config_doc.description = self.config.realm_description.clone();
         config_doc.ensure_node(self.config.actor.node_id, RealmNodeKind::Management);
-        // The creating coordinator owns the whole assignable band space and
-        // consumes its own first band before any other node can onboard.
-        config_doc.band_pools.push(HandleRange {
-            range_id: Ulid::generate(),
+        // The creating coordinator owns the whole assignable band space as a
+        // self-issued root pool and consumes its own first band before any
+        // other node can onboard.
+        config_doc.band_pools.push(BandPool {
+            pool_id: Ulid::generate(),
+            parent: None,
+            issuer: self.config.actor.node_id,
             owner: self.config.actor.node_id,
             start: FIRST_GRANTABLE_HANDLE,
             end: band_start(HANDLE_BANDS),

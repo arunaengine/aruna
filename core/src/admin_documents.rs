@@ -5,7 +5,7 @@ use ulid::Ulid;
 
 use crate::NodeId;
 use crate::structs::{
-    Actor, BindingScope, HandleRange, MetadataReplicationConfig, NodePlacementEntry,
+    Actor, BandPool, BindingScope, HandleRange, MetadataReplicationConfig, NodePlacementEntry,
     OidcProviderConfig, Permission, PlacementBinding, PlacementOverride, PlacementStrategy,
     QuotaConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind, Role, StrategyBinding,
 };
@@ -193,10 +193,10 @@ pub enum AdminDocumentOperation {
     RealmConfigHandleRangeGranted {
         range: HandleRange,
     },
-    /// Assigns an append-only coordinator band pool. A later pool re-assigns
-    /// its slice (a transfer to a new coordinator); carving is deterministic.
+    /// Assigns an append-only coordinator band pool. Pools form a causal
+    /// delegation tree resolved by lineage, not by assignment order.
     RealmConfigBandPoolAssigned {
-        pool: HandleRange,
+        pool: BandPool,
     },
 }
 
@@ -205,8 +205,8 @@ mod tests {
     use super::{AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget};
     use crate::NodeId;
     use crate::structs::{
-        AffinityEffect, AffinityRule, BindingScope, DocumentClass, HandleRange, LabelMatch,
-        MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
+        AffinityEffect, AffinityRule, BandPool, BindingScope, DocumentClass, HandleRange,
+        LabelMatch, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
         PlacementBinding, PlacementOverride, PlacementScope, PlacementStrategy, QuotaConfig,
         RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding,
     };
@@ -378,8 +378,10 @@ mod tests {
                 },
             },
             AdminDocumentOperation::RealmConfigBandPoolAssigned {
-                pool: HandleRange {
-                    range_id: Ulid::from_bytes([7; 16]),
+                pool: BandPool {
+                    pool_id: Ulid::from_bytes([7; 16]),
+                    parent: None,
+                    issuer: node(1),
                     owner: node(1),
                     start: 3,
                     end: 1027,
