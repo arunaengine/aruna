@@ -16,9 +16,9 @@ use aruna_core::structs::{
     normalize_node_placement_input,
 };
 use aruna_core::structured_id::PlacementHandle;
-use aruna_core::util::unix_timestamp_millis;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, Value};
+use aruna_core::util::unix_timestamp_millis;
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;

@@ -9,7 +9,6 @@ use crate::structs::{
 };
 use crate::structured_id::{PlacementHandle, StructuredId};
 use crate::types::{GroupId, RoleId, UserId};
-use thiserror::Error;
 use core::fmt;
 use ed25519_dalek::VerifyingKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
@@ -17,6 +16,7 @@ use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
+use thiserror::Error;
 use ulid::Ulid;
 
 pub const REALM_ENDPOINT_ANNOUNCEMENT_DOMAIN: &str = "aruna-realm-endpoint-v1";

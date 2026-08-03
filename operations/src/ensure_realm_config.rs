@@ -23,9 +23,9 @@ use aruna_core::structs::{
     coordinator_spans,
 };
 use aruna_core::structured_id::PlacementHandle;
-use aruna_core::util::unix_timestamp_millis;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
+use aruna_core::util::unix_timestamp_millis;
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
@@ -582,7 +582,8 @@ fn pool_transfer_slice(spans: &[(u32, u32)], consumed: &[HandleRange]) -> Option
             match (free, run_start) {
                 (true, None) => run_start = Some(start),
                 (false, Some(from)) => {
-                    if best.is_none_or(|(best_start, best_end)| start - from > best_end - best_start)
+                    if best
+                        .is_none_or(|(best_start, best_end)| start - from > best_end - best_start)
                     {
                         best = Some((from, start));
                     }
@@ -886,7 +887,10 @@ mod tests {
         let mid = HANDLE_BANDS / 2;
         let document = pooled_document(
             realm_id,
-            &[(1, actor_a.clone(), 0, mid), (2, actor_b.clone(), mid, HANDLE_BANDS)],
+            &[
+                (1, actor_a.clone(), 0, mid),
+                (2, actor_b.clone(), mid, HANDLE_BANDS),
+            ],
         );
 
         let (after_a, state_a) = run_ensure(&actor_a, joiner_a, RealmNodeKind::Server, &document);
@@ -898,7 +902,10 @@ mod tests {
         };
         let granted_a = granted(&after_a, &joiner_a);
         let granted_b = granted(&after_b, &joiner_b);
-        assert!(!granted_a.overlaps(&granted_b), "pool grants must be disjoint");
+        assert!(
+            !granted_a.overlaps(&granted_b),
+            "pool grants must be disjoint"
+        );
         assert!(granted_a.start < band_start(mid), "A grants from A's pool");
         assert!(granted_b.start >= band_start(mid), "B grants from B's pool");
 
@@ -974,8 +981,15 @@ mod tests {
         assert!(granted[0].start < joiner_spans[0].0);
 
         // The new coordinator can now grant a band from its own pool.
-        let (after_second, _) =
-            run_ensure(&Actor { node_id: coordinator, ..actor_a.clone() }, node(44), RealmNodeKind::Server, &after);
+        let (after_second, _) = run_ensure(
+            &Actor {
+                node_id: coordinator,
+                ..actor_a.clone()
+            },
+            node(44),
+            RealmNodeKind::Server,
+            &after,
+        );
         let second = after_second.handle_range_directory().granted_to(&node(44));
         assert_eq!(second.len(), 1);
         assert!(second[0].start >= joiner_spans[0].0, "grant from own pool");

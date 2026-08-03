@@ -443,8 +443,8 @@ mod tests {
         JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
     };
     use aruna_core::structs::{
-        AuthContext, ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource,
-        ImportRoCrateSpec, ImportRoCrateTarget, FIRST_GRANTABLE_HANDLE, JobState, RealmId,
+        AuthContext, ComputeResources, ExecutionSpec, FIRST_GRANTABLE_HANDLE, ImportMetadataTarget,
+        ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobState, RealmId,
         RoCrateLimits, encode_job_dedup_value,
     };
     use aruna_storage::{FjallStorage, StorageHandle};

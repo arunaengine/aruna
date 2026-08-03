@@ -201,8 +201,13 @@ async fn origin_scoped_dedup() -> TestResult<()> {
     // on their origin, nothing was reserved on any other node.
     let dedup_key = user_dedup_key(realm.user_id, "origin-scoped-retry");
     for (index, node) in realm.nodes.iter().enumerate() {
-        let row = find_dedup_job(&node.context.storage_handle, realm.user_id, &dedup_key, None)
-            .await?;
+        let row = find_dedup_job(
+            &node.context.storage_handle,
+            realm.user_id,
+            &dedup_key,
+            None,
+        )
+        .await?;
         match index {
             0 => assert_eq!(row, Some(first.job_id)),
             1 => assert_eq!(row, Some(elsewhere.job_id)),
@@ -219,48 +224,59 @@ async fn cap_stays_local() -> TestResult<()> {
     // Active-job caps are per-origin: a full origin rejects while another
     // origin still accepts, and cap rows never leave their origin.
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
-    let import_spec = |seed: u8| {
-        ImportRoCrateSpec {
-            auth_context: AuthContext {
-                user_id: realm.user_id,
-                realm_id: realm.realm_id,
-                path_restrictions: None,
-            },
-            source: ImportRoCrateSource::Upload {
-                upload_id: Ulid::from_bytes([seed; 16]),
-            },
-            target: ImportRoCrateTarget {
-                bucket: "target".to_string(),
-                prefix: String::new(),
-            },
-            metadata: ImportMetadataTarget {
-                group_id: Ulid::from_bytes([90; 16]),
-                path: format!("crate-{seed}"),
-                public: false,
-            },
-            limits: RoCrateLimits {
-                max_active_jobs: 1,
-                ..RoCrateLimits::default()
-            },
-            document_id: Ulid::from_bytes([seed; 16]),
-        }
+    let import_spec = |seed: u8| ImportRoCrateSpec {
+        auth_context: AuthContext {
+            user_id: realm.user_id,
+            realm_id: realm.realm_id,
+            path_restrictions: None,
+        },
+        source: ImportRoCrateSource::Upload {
+            upload_id: Ulid::from_bytes([seed; 16]),
+        },
+        target: ImportRoCrateTarget {
+            bucket: "target".to_string(),
+            prefix: String::new(),
+        },
+        metadata: ImportMetadataTarget {
+            group_id: Ulid::from_bytes([90; 16]),
+            path: format!("crate-{seed}"),
+            public: false,
+        },
+        limits: RoCrateLimits {
+            max_active_jobs: 1,
+            ..RoCrateLimits::default()
+        },
+        document_id: Ulid::from_bytes([seed; 16]),
     };
     let ingress = realm.node(0);
-    let first = submit_rocrate_import(ingress.context.as_ref(), import_spec(1), ingress.node_id(), None)
-        .await?;
+    let first = submit_rocrate_import(
+        ingress.context.as_ref(),
+        import_spec(1),
+        ingress.node_id(),
+        None,
+    )
+    .await?;
     assert!(first.created);
-    let capped =
-        submit_rocrate_import(ingress.context.as_ref(), import_spec(2), ingress.node_id(), None)
-            .await;
+    let capped = submit_rocrate_import(
+        ingress.context.as_ref(),
+        import_spec(2),
+        ingress.node_id(),
+        None,
+    )
+    .await;
     assert!(matches!(
         capped,
         Err(SubmitJobError::ActiveJobLimit { limit: 1 })
     ));
 
     let other = realm.node(1);
-    let accepted =
-        submit_rocrate_import(other.context.as_ref(), import_spec(3), other.node_id(), None)
-            .await?;
+    let accepted = submit_rocrate_import(
+        other.context.as_ref(),
+        import_spec(3),
+        other.node_id(),
+        None,
+    )
+    .await?;
     assert!(accepted.created, "another origin counts its own cap");
 
     realm.shutdown().await;

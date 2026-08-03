@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 use aruna_compute::executor::docker::DockerBackend;
 use aruna_compute::{DockerConfig, ExecutorBackend, ExecutorRegistry};
 use aruna_core::structs::{
-    ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, FIRST_GRANTABLE_HANDLE,
-    JobId, JobPayload, JobRecord, JobState, OutputDestination, OutputSelection, RunCrateStatus,
+    ComputeResources, ExecutionSpec, FIRST_GRANTABLE_HANDLE, InputMode, InputSelection,
+    InputSource, JobId, JobPayload, JobRecord, JobState, OutputDestination, OutputSelection,
+    RunCrateStatus,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_operations::driver::DriverContext;
