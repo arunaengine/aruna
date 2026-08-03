@@ -14,7 +14,7 @@ use aruna_core::structs::{
 };
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::jobs::service::{list_owned_jobs, read_record_routed, submit_staging_job};
+use aruna_operations::jobs::service::{list_owned_jobs, read_staging_routed, submit_staging_job};
 use aruna_operations::jobs::staging::read_staging_checkpoint;
 use aruna_operations::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
@@ -596,7 +596,7 @@ pub async fn get_staging_job(
     let job_id =
         aruna_core::structs::JobId::from_str(&job_id).map_err(|_| ServerError::BadRequest)?;
     // The owner is the sole 404 authority; a non-owner routes or reports 503.
-    let record = read_record_routed(
+    let (record, checkpoint) = read_staging_routed(
         &state.get_ctx(),
         auth.user_id,
         job_id,
@@ -604,12 +604,8 @@ pub async fn get_staging_job(
     )
     .await
     .map_err(super::jobs::map_job_route)?
-    .filter(|record| staging_job_visible(record, &auth))
+    .filter(|(record, _)| staging_job_visible(record, &auth))
     .ok_or(ServerError::NotFound)?;
-    // The checkpoint lives on the owner; a remote job reads none locally.
-    let checkpoint = read_staging_checkpoint(&state.get_ctx(), job_id)
-        .await
-        .map_err(ServerError::InternalError)?;
     Ok((
         StatusCode::OK,
         Json(staging_job_response(&record, checkpoint.as_ref())?),

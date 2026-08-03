@@ -4,7 +4,7 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{AuthContext, JobId, RealmId};
+use aruna_core::structs::{AuthContext, JobId, JobPayload, RealmId};
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_net::streams::{BiStream, RecvStream, SendStream};
@@ -24,6 +24,7 @@ use super::service::{
     read_artifact_range, read_job_run_crate_status, read_owned_artifact, read_owned_job,
     read_owned_report, resolve_job_owner,
 };
+use super::staging::read_staging_checkpoint;
 use crate::driver::DriverContext;
 use crate::metadata::MetadataWritePeerError;
 
@@ -282,11 +283,23 @@ async fn prepare_record(
     user_id: UserId,
     job_id: JobId,
 ) -> PreparedResponse {
-    match read_owned_job(context, user_id, job_id).await {
-        Ok(Some(record)) => PreparedResponse::new(JobResponse::Record(Box::new(record))),
-        Ok(None) => PreparedResponse::new(JobResponse::NotFound),
-        Err(error) => PreparedResponse::new(JobResponse::Unavailable(error)),
-    }
+    let record = match read_owned_job(context, user_id, job_id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return PreparedResponse::new(JobResponse::NotFound),
+        Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error)),
+    };
+    let checkpoint = if matches!(&record.payload, JobPayload::Staging(_)) {
+        match read_staging_checkpoint(context, job_id).await {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error)),
+        }
+    } else {
+        None
+    };
+    PreparedResponse::new(JobResponse::Record {
+        record: Box::new(record),
+        checkpoint,
+    })
 }
 
 /// Owner-directed requests are answered only by the derived owner, the sole

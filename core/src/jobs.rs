@@ -9,7 +9,8 @@ use serde_json::Value as JsonValue;
 
 use crate::metadata::MetadataAuthToken;
 use crate::structs::{
-    JobError, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, JobState, WorkspaceMode,
+    JobError, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, JobState,
+    StagingJobCheckpoint, WorkspaceMode,
 };
 use crate::types::UserId;
 
@@ -224,5 +225,8 @@ pub enum JobResponse {
         job: JobStatusView,
         terminal: bool,
     },
-    Record(Box<JobRecord>),
+    Record {
+        record: Box<JobRecord>,
+        checkpoint: Option<StagingJobCheckpoint>,
+    },
 }

@@ -5,7 +5,8 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     ArtifactRef, DEFAULT_SHARD_COUNT, ExecutionSpec, ExportRoCrateSpec, FIRST_GRANTABLE_HANDLE,
     ImportRoCrateSpec, JobId, JobOwnerError, JobPayload, JobRecord, JobResultPayload, JobState,
-    RealmId, RunCrateStatus, StagingJobSpec, WorkspaceMode, shard_for_subject, user_dedup_key,
+    RealmId, RunCrateStatus, StagingJobCheckpoint, StagingJobSpec, WorkspaceMode,
+    shard_for_subject, user_dedup_key,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
@@ -20,6 +21,7 @@ use tracing::warn;
 use super::JOB_REPORT_MAX_ROWS;
 use super::protocol::{JobRequest, JobResponse, JobRouteError, WireRange, send_job_request};
 use super::runtime::JobsRuntime;
+use super::staging::read_staging_checkpoint;
 use super::store::{
     CancelRequestOutcome, JobMutationError, find_dedup_plan, list_job_entries, list_jobs_for_user,
     read_artifact_tombstone, read_job_record, read_run_crate_status, set_cancel_requested,
@@ -351,26 +353,62 @@ pub async fn read_record_routed(
     job_id: JobId,
     auth_token: Option<crate::metadata::MetadataAuthToken>,
 ) -> Result<Option<JobRecord>, JobRouteError> {
+    Ok(route_record(context, user_id, job_id, auth_token)
+        .await?
+        .map(|(record, _)| record))
+}
+
+/// Returns a staging record and its checkpoint from the immutable owner.
+pub async fn read_staging_routed(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+    auth_token: Option<crate::metadata::MetadataAuthToken>,
+) -> Result<Option<(JobRecord, Option<StagingJobCheckpoint>)>, JobRouteError> {
+    route_record(context, user_id, job_id, auth_token).await
+}
+
+async fn read_record_data(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+) -> Result<Option<(JobRecord, Option<StagingJobCheckpoint>)>, String> {
+    let record = read_owned_job(context, user_id, job_id).await?;
+    let checkpoint = match &record {
+        Some(record) if matches!(&record.payload, JobPayload::Staging(_)) => {
+            read_staging_checkpoint(context, job_id).await?
+        }
+        _ => None,
+    };
+    Ok(record.map(|record| (record, checkpoint)))
+}
+
+async fn route_record(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+    auth_token: Option<crate::metadata::MetadataAuthToken>,
+) -> Result<Option<(JobRecord, Option<StagingJobCheckpoint>)>, JobRouteError> {
     let Some(net) = context.net_handle.as_ref() else {
-        return read_owned_job(context, user_id, job_id)
+        return read_record_data(context, user_id, job_id)
             .await
             .map_err(JobRouteError::Internal);
     };
     let request = auth_token.map(|auth_token| JobRequest::Record { auth_token, job_id });
     let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request);
     match drive(operation, context).await? {
-        JobRouteOutcome::Local => read_owned_job(context, user_id, job_id)
+        JobRouteOutcome::Local => read_record_data(context, user_id, job_id)
             .await
             .map_err(JobRouteError::Internal),
         JobRouteOutcome::Remote(response) => match response {
-            JobResponse::Record(record)
+            JobResponse::Record { record, checkpoint }
                 if record.job_id == job_id
                     && record.created_by == user_id
                     && !record.payload.is_internal() =>
             {
-                Ok(Some(*record))
+                Ok(Some((*record, checkpoint)))
             }
-            JobResponse::Record(_) => Err(JobRouteError::NotFound),
+            JobResponse::Record { .. } => Err(JobRouteError::NotFound),
             JobResponse::Unauthorized => Err(JobRouteError::Unauthorized),
             JobResponse::Forbidden => Err(JobRouteError::Forbidden),
             JobResponse::NotFound => Ok(None),
