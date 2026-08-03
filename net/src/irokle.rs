@@ -6442,7 +6442,7 @@ mod tests {
     };
     use aruna_core::structs::{
         Actor, BandPool, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, Group,
-        GroupAuthorizationDocument, GroupQuotaOverride, HANDLE_BANDS, METADATA_HANDLE,
+        GroupAuthorizationDocument, GroupQuotaOverride, HANDLE_BANDS, HandleRange, METADATA_HANDLE,
         MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
         PlacementBinding, PlacementOverride, PlacementRef, PlacementStrategy, QuotaConfig,
         RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
@@ -12171,6 +12171,132 @@ mod tests {
             .expect("storage succeeds"),
             AdminEventValidation::Deferred { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn inbound_checks_grants() {
+        // Replicated grants outside or misaligned with an issuer pool are
+        // rejected; a canonical grant waits until its pool replicates.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([75; 32]);
+        let coordinator = test_actor(75, UserId::local(Ulid::generate(), realm_id), realm_id);
+        let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let admin_target = AdminDocumentTarget::RealmConfig { realm_id };
+        let topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        let publisher = irokle_crate::actor_id_for(topic, node_id_to_peer_id(&coordinator.node_id));
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(coordinator.node_id, RealmNodeKind::Management);
+        config.band_pools.push(BandPool {
+            pool_id: Ulid::from_bytes([93; 16]),
+            parent: None,
+            issuer: coordinator.node_id,
+            owner: coordinator.node_id,
+            start: band_start(0),
+            end: band_start(2),
+        });
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                config_target.clone(),
+                config
+                    .to_bytes(&coordinator)
+                    .expect("config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("config writes");
+
+        for (event_id, range, expected) in [
+            (
+                Ulid::from_parts(1_704, 1),
+                HandleRange {
+                    range_id: Ulid::from_bytes([94; 16]),
+                    owner: node(76),
+                    start: band_start(3),
+                    end: band_start(4),
+                },
+                "handle grant lies outside the coordinator band pool",
+            ),
+            (
+                Ulid::from_parts(1_705, 1),
+                HandleRange {
+                    range_id: Ulid::from_bytes([95; 16]),
+                    owner: node(76),
+                    start: band_start(0) + 1,
+                    end: band_start(0) + 1 + HANDLE_RANGE_SIZE,
+                },
+                "handle grant is not one canonical band",
+            ),
+        ] {
+            let event = test_admin_event(
+                event_id,
+                admin_target.clone(),
+                &coordinator,
+                1,
+                AdminDocumentOperation::RealmConfigHandleRangeGranted { range },
+            );
+            assert_eq!(
+                validate_replicated_admin_event(
+                    &storage,
+                    topic,
+                    publisher,
+                    &config_target,
+                    &event,
+                    realm_id,
+                    &PlacementRef::NIL,
+                )
+                .await
+                .expect("storage succeeds"),
+                AdminEventValidation::Rejected(expected.to_string())
+            );
+        }
+
+        config.band_pools.clear();
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                config_target.clone(),
+                config
+                    .to_bytes(&coordinator)
+                    .expect("config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("config writes");
+        let waiting = test_admin_event(
+            Ulid::from_parts(1_706, 1),
+            admin_target,
+            &coordinator,
+            1,
+            AdminDocumentOperation::RealmConfigHandleRangeGranted {
+                range: HandleRange {
+                    range_id: Ulid::from_bytes([96; 16]),
+                    owner: node(76),
+                    start: band_start(0),
+                    end: band_start(1),
+                },
+            },
+        );
+        assert_eq!(
+            validate_replicated_admin_event(
+                &storage,
+                topic,
+                publisher,
+                &config_target,
+                &waiting,
+                realm_id,
+                &PlacementRef::NIL,
+            )
+            .await
+            .expect("storage succeeds"),
+            AdminEventValidation::Deferred {
+                dependency: None,
+                reason: "coordinator band pool is not yet replicated".to_string(),
+            }
+        );
     }
 
     #[tokio::test]
