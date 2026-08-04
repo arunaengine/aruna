@@ -136,6 +136,7 @@ pub struct S3Server {
     domain: String,
     driver_ctx: Arc<DriverContext>,
     metrics: Arc<NodeMetrics>,
+    rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
 }
 
 #[derive(Clone)]
@@ -147,6 +148,9 @@ pub struct WrappingService {
     metrics: Arc<NodeMetrics>,
     // The accepted connection's peer, stamped into every request it carries.
     peer_ip: Option<std::net::IpAddr>,
+    // Shared with the access hook: the IP bucket is charged here, the
+    // per-principal bucket after authentication.
+    rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
 }
 
 impl S3Server {
@@ -167,11 +171,12 @@ impl S3Server {
             .with_rocrate_limits(rocrate_limits);
         let hostname = hostname.into();
 
+        let rate_limits = Arc::new(crate::rate_limit::ApiRateLimits::default());
         let auth = AuthProvider {
             driver_ctx: driver_ctx.clone(),
             realm_id,
             node_id,
-            rate_limits: Arc::new(crate::rate_limit::ApiRateLimits::default()),
+            rate_limits: rate_limits.clone(),
         };
 
         let service = {
@@ -190,6 +195,7 @@ impl S3Server {
             domain: hostname,
             driver_ctx,
             metrics,
+            rate_limits,
         })
     }
 
@@ -205,6 +211,7 @@ impl S3Server {
             driver_ctx: self.driver_ctx,
             metrics: self.metrics,
             peer_ip: None,
+            rate_limits: self.rate_limits,
         };
         let connection = ConnBuilder::new(TokioExecutor::new());
 
@@ -255,11 +262,6 @@ impl Service<Request<Incoming>> for WrappingService {
         // reaches the check through the request extensions.
         let op_label = S3OpLabel::new();
         parts.extensions.insert(op_label.clone());
-        if let Some(peer_ip) = self.peer_ip {
-            parts
-                .extensions
-                .insert(crate::s3::auth::S3ClientAddr(peer_ip));
-        }
         let span = make_request_span("s3", &parts.headers, &method, &path);
         let started = Instant::now();
         {
@@ -315,7 +317,21 @@ impl Service<Request<Incoming>> for WrappingService {
         let cors = self.cors.clone();
         let driver_ctx = self.driver_ctx.clone();
         let metrics = self.metrics.clone();
+        let rate_limits = self.rate_limits.clone();
+        let peer_ip = self.peer_ip;
         Box::pin(async move {
+            // Charge the transport IP before CORS, signature checks, credential
+            // reads, or body handling, so unsigned or invalid requests cannot
+            // bypass admission.
+            if let Some(peer_ip) = peer_ip
+                && let Err(retry_after) = rate_limits.check_ip(peer_ip)
+            {
+                let response = slow_down_response(retry_after);
+                let code = response.status().as_u16();
+                emit_request_completed(&span, "s3", code, started);
+                record_s3_request(&metrics, &method, code, "rate_limited", started.elapsed());
+                return Ok(response);
+            }
             let bucket_cors = if origin_header.is_some() {
                 match load_bucket_cors_config(driver_ctx, bucket).await {
                     Ok(bucket_cors) => bucket_cors,
@@ -422,6 +438,22 @@ impl Service<Request<Incoming>> for WrappingService {
             result
         })
     }
+}
+
+fn slow_down_response(retry_after: u64) -> HttpResponse {
+    const SLOW_DOWN_BODY: &[u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>SlowDown</Code><Message>Reduce your request rate.</Message></Error>";
+    let mut response = http::Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .body(s3s::Body::from(SLOW_DOWN_BODY.to_vec()))
+        .expect("static response must build");
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/xml"),
+    );
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, header::HeaderValue::from(retry_after));
+    response
 }
 
 fn extract_bucket_name(host: Option<&str>, path: &str, domain: &str) -> Option<String> {

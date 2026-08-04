@@ -49,10 +49,6 @@ pub struct AuthProvider {
     pub(crate) rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
 }
 
-/// Client address of the S3 connection, inserted by the connection service.
-#[derive(Clone, Copy, Debug)]
-pub struct S3ClientAddr(pub std::net::IpAddr);
-
 #[async_trait::async_trait]
 impl S3Auth for AuthProvider {
     async fn get_secret_key(&self, access_key_id: &str) -> S3Result<SecretKey> {
@@ -74,19 +70,14 @@ impl S3Access for AuthProvider {
         let action = get_s3_operation_permission(&operation_name)
             .ok_or_else(|| s3_error!(InvalidRequest, "Unknown Operation"))?;
 
-        // Per-IP and per-access-key budgets, before any storage read.
-        let client_ip = cx
-            .extensions_mut()
-            .get::<S3ClientAddr>()
-            .map(|addr| addr.0)
-            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        // Per-access-key budget after authentication; the connection's IP bucket
+        // is charged earlier in `WrappingService`, so a request is never
+        // double-charged for its address.
         let principal = cx
             .credentials()
             .map(|credentials| credentials.access_key.clone());
-        if self
-            .rate_limits
-            .check(client_ip, principal.as_deref())
-            .is_err()
+        if let Some(principal) = principal.as_deref()
+            && self.rate_limits.check_principal(principal).is_err()
         {
             return Err(s3_error!(SlowDown, "Reduce your request rate"));
         }
