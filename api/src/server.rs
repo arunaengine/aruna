@@ -182,9 +182,12 @@ mod tests {
         use aruna_core::structs::{NodeCapabilities, RealmId};
 
         let dir = tempfile::tempdir().unwrap();
-        let storage =
-            aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let realm_id = RealmId::from_bytes([5u8; 32]);
+        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let realm_id = RealmId::from_bytes(
+            ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
         let node_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
         let driver_ctx = Arc::new(aruna_operations::driver::DriverContext {
             storage_handle: storage,
