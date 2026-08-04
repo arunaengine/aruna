@@ -5922,6 +5922,31 @@ async fn resolve_graph_visibility_scope(
             .map(|record| record.group_id),
     )
     .await;
+    // RBAC/public visibility is additionally constrained by the metadata.read
+    // request policies; a policy-denied record is dropped from the scope so the
+    // eager and lazy (SPARQL) paths both fail closed on it.
+    let evaluators = crate::request_policy::PolicyEvaluator::load_bulk(
+        &context,
+        records.iter().map(|record| (record.realm_id, record.group_id)),
+    )
+    .await;
+    let policy_user = auth_context.as_ref().map(|auth| auth.user_id);
+    let records = Arc::new(
+        records
+            .iter()
+            .filter(|record| {
+                evaluators.get(&record.group_id).is_some_and(|evaluator| {
+                    evaluator
+                        .evaluate(&crate::metadata::api::metadata_read_request(
+                            &record.permission_path,
+                            policy_user.as_ref(),
+                        ))
+                        .is_ok()
+                })
+            })
+            .cloned()
+            .collect(),
+    );
     Ok(GraphVisibilityScope {
         records,
         permissions,

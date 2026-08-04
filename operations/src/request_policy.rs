@@ -13,6 +13,7 @@ use aruna_core::request_policy::{
 use aruna_core::structs::RealmId;
 use aruna_core::types::GroupId;
 use lru::LruCache;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
@@ -100,6 +101,31 @@ impl PolicyEvaluator {
             None => None,
         };
         Ok(Self { realm, group })
+    }
+
+    /// Loads a per-group evaluator for a bulk read: each distinct group is read
+    /// once under its own realm. A group whose policy state cannot be read is
+    /// omitted so its records stay invisible (fail-closed).
+    pub async fn load_bulk(
+        context: &DriverContext,
+        groups: impl IntoIterator<Item = (RealmId, GroupId)>,
+    ) -> HashMap<GroupId, PolicyEvaluator> {
+        // Collect distinct groups up front so no borrowed iterator is held across
+        // the awaits below.
+        let mut distinct = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (realm_id, group_id) in groups {
+            if seen.insert(group_id) {
+                distinct.push((realm_id, group_id));
+            }
+        }
+        let mut evaluators = HashMap::new();
+        for (realm_id, group_id) in distinct {
+            if let Ok(evaluator) = Self::load(context, realm_id, Some(group_id)).await {
+                evaluators.insert(group_id, evaluator);
+            }
+        }
+        evaluators
     }
 
     /// Evaluates the realm then the group scope; either may deny, neither grants.

@@ -405,7 +405,28 @@ pub async fn list_visible_metadata_documents(
             .map(|record| record.group_id),
     )
     .await;
-    let record_visible = |record: &MetadataRegistryRecord| permissions.record_visible(record);
+    // RBAC/public visibility is additionally constrained by the metadata.read
+    // request policies, loaded once per distinct group (fail-closed on error).
+    let evaluators = crate::request_policy::PolicyEvaluator::load_bulk(
+        context,
+        records
+            .iter()
+            .filter(|record| record.realm_id == realm_id)
+            .map(|record| (record.realm_id, record.group_id)),
+    )
+    .await;
+    let policy_user = auth.map(|auth| auth.user_id);
+    let record_visible = |record: &MetadataRegistryRecord| {
+        permissions.record_visible(record)
+            && evaluators.get(&record.group_id).is_some_and(|evaluator| {
+                evaluator
+                    .evaluate(&metadata_read_request(
+                        &record.permission_path,
+                        policy_user.as_ref(),
+                    ))
+                    .is_ok()
+            })
+    };
 
     let mut total_estimate = None;
     if limit >= METADATA_ESTIMATE_MIN_LIMIT {
@@ -851,6 +872,14 @@ pub(crate) async fn local_path_candidates(
         records.iter().map(|record| record.group_id),
     )
     .await;
+    let evaluators = crate::request_policy::PolicyEvaluator::load_bulk(
+        context,
+        records.iter().map(|record| (record.realm_id, record.group_id)),
+    )
+    .await;
+    let policy_user = auth
+        .filter(|auth| auth.realm_id == realm_id)
+        .map(|auth| auth.user_id);
     let mut candidates = records
         .into_iter()
         .map(|record| {
@@ -861,7 +890,16 @@ pub(crate) async fn local_path_candidates(
                 establishing_event_id: record.establishing_event_id,
                 requested_path: record.document_path.clone(),
             };
-            let record = permissions.record_visible(&record).then_some(record);
+            let visible = permissions.record_visible(&record)
+                && evaluators.get(&record.group_id).is_some_and(|evaluator| {
+                    evaluator
+                        .evaluate(&metadata_read_request(
+                            &record.permission_path,
+                            policy_user.as_ref(),
+                        ))
+                        .is_ok()
+                });
+            let record = visible.then_some(record);
             Ok(MetadataPathCandidate { claim, record })
         })
         .collect::<Result<Vec<_>, MetadataApiError>>()?;
@@ -1768,6 +1806,20 @@ async fn ensure_record_materialized_for_graph_read(
             Err(MetadataApiError::Internal(error.to_string()))
         }
     }
+}
+
+/// The canonical `metadata.read` policy request for one record path and caller,
+/// shared by the single-record and bulk visibility seams.
+pub(crate) fn metadata_read_request(
+    permission_path: &str,
+    user: Option<&aruna_core::UserId>,
+) -> aruna_core::request_policy::PolicyRequest {
+    crate::request_policy::policy_request_with(
+        permission_path,
+        &Permission::READ,
+        user,
+        crate::request_policy::PolicyRequestExtras::operation("metadata.read"),
+    )
 }
 
 async fn ensure_record_readable(
@@ -3026,11 +3078,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use aruna_core::UserId;
-    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::metadata::MetadataCreateEventPayload;
     use aruna_core::storage_entries::metadata_create_event_and_pending_projection_write_entries;
     use aruna_core::structs::{
-        Actor, GroupAuthorizationDocument, PlacementRef, RealmAuthorizationDocument, Role,
+        Actor, Group, GroupAuthorizationDocument, PlacementRef, RealmAuthorizationDocument, Role,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::{Key, RoleId};
@@ -3654,27 +3706,43 @@ mod tests {
             realm_id: TEST_REALM_ID,
         };
         let realm_doc = RealmAuthorizationDocument::new_default_realm_doc(TEST_REALM_ID);
+        let group = Group {
+            display_name: "Test".to_string(),
+            group_id,
+            realm_id: TEST_REALM_ID,
+            owner: actor.user_id,
+            roles: roles.keys().copied().collect(),
+        };
         let group_doc = GroupAuthorizationDocument {
             group_id,
             roles,
             policies,
         };
+        // The policy evaluator reads the group through GetGroupOperation, which
+        // needs the group record as well as the auth doc.
         let entries = [
             (
+                AUTH_KEYSPACE,
                 Key::from(*TEST_REALM_ID.as_bytes()),
                 realm_doc.to_bytes(&actor).expect("realm doc encodes"),
             ),
             (
+                AUTH_KEYSPACE,
                 Key::from(group_id.to_bytes()),
                 group_doc.to_bytes(&actor).expect("group doc encodes"),
             ),
+            (
+                GROUP_KEYSPACE,
+                Key::from(group_id.to_bytes()),
+                group.to_bytes(&actor).expect("group encodes"),
+            ),
         ];
-        for (key, value) in entries {
+        for (key_space, key, value) in entries {
             match test
                 .context
                 .storage_handle
                 .send_storage_effect(StorageEffect::Write {
-                    key_space: AUTH_KEYSPACE.to_string(),
+                    key_space: key_space.to_string(),
                     key,
                     value: value.into(),
                     txn_id: None,
@@ -3734,6 +3802,46 @@ mod tests {
             .await;
             assert!(matches!(result, Err(MetadataApiError::NotFound)));
         }
+    }
+
+    #[tokio::test]
+    async fn policy_hides_record() {
+        // A group deny policy removes one public record from the bulk listing
+        // while leaving an allowed public record visible.
+        let test = metadata_test();
+        let group_id = Ulid::generate();
+        let stranger = UserId::local(Ulid::generate(), TEST_REALM_ID);
+        let hidden = public_record(group_id, Ulid::generate());
+        let visible = public_record(group_id, Ulid::generate());
+        write_policy_docs(
+            &test,
+            group_id,
+            HashMap::new(),
+            vec![aruna_core::request_policy::RequestPolicy {
+                policy_id: Ulid::generate(),
+                name: "hide-one".to_string(),
+                kind: aruna_core::request_policy::PolicyKind::Deny,
+                when: None,
+                expression: format!("path.contains('{}')", hidden.document_id),
+                enabled: true,
+            }],
+        )
+        .await;
+        seed_registry_cache(&test, &hidden).await;
+        seed_registry_cache(&test, &visible).await;
+
+        let page = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            ListVisibleMetadataDocumentsRequest {
+                auth: Some(auth_for(stranger)),
+                ..summary_request(group_id, false)
+            },
+        )
+        .await
+        .expect("listing succeeds");
+        assert_eq!(listed_ids(&page), vec![visible.document_id]);
+        assert_eq!(page.total_estimate, Some(1));
     }
 
     // A caller who holds no role in the group sees the public records only, and
