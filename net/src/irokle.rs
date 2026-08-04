@@ -3432,6 +3432,12 @@ fn overlay_realm_config_reducer_materialization(
         config.request_policies = request_policies;
     }
 
+    // Append-only union: a locally accepted revocation is never dropped because
+    // the replicated set has not carried it yet.
+    let mut revoked: BTreeSet<String> = config.revoked_tokens.drain(..).collect();
+    revoked.extend(reducer_state.materialized_revoked_tokens());
+    config.revoked_tokens = revoked.into_iter().collect();
+
     for path in reducer_state.conflicts.keys() {
         if let Some(node_id) = realm_config_node_id_from_path(path) {
             remove_realm_config_node(config, &node_id);
@@ -3497,6 +3503,7 @@ fn realm_config_from_reducer_materialization(
         placement_bindings: Vec::new(),
         placement_handle_ranges: Vec::new(),
         band_pools: Vec::new(),
+        revoked_tokens: Vec::new(),
     };
     overlay_realm_config_reducer_materialization(&mut config, reducer_state);
     Some(config)
@@ -4308,9 +4315,10 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
             | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
             | AdminDocumentOperation::RealmConfigPoliciesSet { .. }
+            | AdminDocumentOperation::RealmConfigTokenRevoked { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, description updates, quota updates, placement updates, and policy updates"
+            "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, description updates, quota updates, placement updates, policy updates, and token revocations"
                 .to_string(),
         ));
     }
@@ -5391,7 +5399,8 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
         | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
         | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
-        | AdminDocumentOperation::RealmConfigPoliciesSet { .. } => {
+        | AdminDocumentOperation::RealmConfigPoliciesSet { .. }
+        | AdminDocumentOperation::RealmConfigTokenRevoked { .. } => {
             AdminOperationFamily::RealmConfig
         }
     };
@@ -5529,6 +5538,11 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::GroupPoliciesSet { policies } => {
             if let Err(error) = aruna_core::request_policy::validate_policy_set(policies) {
                 return reject(&format!("invalid policy set: {error}"));
+            }
+        }
+        AdminDocumentOperation::RealmConfigTokenRevoked { token_hash } => {
+            if !aruna_core::auth::valid_token_hash(token_hash) {
+                return reject("revoked bearer token hash is malformed");
             }
         }
     }
@@ -5712,6 +5726,19 @@ async fn validate_realm_config_admin_authority(
             }
             _ => false,
         };
+        // Revocation is deny-only and append-only, so any configured realm node
+        // may broadcast one; requiring Management would strand revocations
+        // accepted by the server node that serves the caller.
+        let server_revocation = matches!(
+            (
+                configured_node_kind(config, &event.origin_node_id),
+                &event.op,
+            ),
+            (
+                Some(RealmNodeKind::Server),
+                AdminDocumentOperation::RealmConfigTokenRevoked { .. },
+            )
+        );
         if matches!(
             configured_node_kind(config, &event.origin_node_id),
             Some(RealmNodeKind::Management)
@@ -5732,6 +5759,7 @@ async fn validate_realm_config_admin_authority(
                 configured_node_kind(config, &event.origin_node_id),
                 Some(RealmNodeKind::Management)
             ) || server_binding
+                || server_revocation
             {
                 AdminEventValidation::Accepted
             } else {
@@ -7913,6 +7941,61 @@ mod tests {
 
         let config = read_realm_config_doc(&storage, realm_id).await;
         assert_eq!(config.request_policies, policies);
+    }
+
+    #[tokio::test]
+    async fn revocations_replicate_and_apply() {
+        // A revocation replicated from another node must pass the realm-config
+        // storage-apply whitelist and deny the token on this node.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([59; 32]);
+        let actor = test_actor(
+            11,
+            UserId::local(Ulid::from_parts(1_630, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_631, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication: MetadataReplicationConfig::new(3),
+                    discovery: test_discovery(25, "https://revocation.example:443"),
+                },
+            ),
+        )
+        .await
+        .expect("settings bootstrap the config doc");
+
+        let token_hash = aruna_core::auth::bearer_token_hash("replicated-token");
+        for (index, seq) in [(1_632u64, 2u64), (1_633, 3)] {
+            apply_admin_document_operation_to_storage(
+                &storage,
+                document_target.clone(),
+                test_admin_event(
+                    Ulid::from_parts(index, 1),
+                    target.clone(),
+                    &actor,
+                    seq,
+                    AdminDocumentOperation::RealmConfigTokenRevoked {
+                        token_hash: token_hash.clone(),
+                    },
+                ),
+            )
+            .await
+            .expect("revocation replicates and applies");
+        }
+
+        let config = read_realm_config_doc(&storage, realm_id).await;
+        assert!(config.token_revoked(&token_hash));
+        assert_eq!(config.revoked_tokens.len(), 1);
     }
 
     #[tokio::test]
