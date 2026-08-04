@@ -99,9 +99,9 @@ impl S3Access for AuthProvider {
         // Fetch user access -> GetUserAccess state machine
         let user_access = self.query_user_access(&access_key_id).await?;
 
-        // Realm-valid credentials: accept any key issued by a configured realm
-        // node, so a key created on one node authenticates on every node. Every
-        // other check below validates against realm-replicated state.
+        // Credentials are issuer-local: the secret was verified by s3s against
+        // the issuing node's state. Here we only confirm that issuing node is
+        // configured in this realm before authorizing the request.
         if !self.issuer_in_realm(&user_access.issued_by).await? {
             return Err(s3_error!(
                 InvalidAccessKeyId,
