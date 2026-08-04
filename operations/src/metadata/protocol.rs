@@ -9,6 +9,7 @@ use ulid::Ulid;
 
 use crate::create_metadata_document::CreateMetadataDocumentPayload;
 use crate::metadata::api::MetadataRoCrateExportView;
+use crate::request_policy::PolicyRequestExtras;
 use crate::s3::search_buckets::BucketSearchHit;
 use crate::update_metadata_document::UpdateMetadataDocumentMutation;
 
@@ -119,10 +120,12 @@ pub enum MetadataTransportMessage {
         auth_token: Option<MetadataAuthToken>,
         source_group_id: GroupId,
         relationship: Box<SyncRelationship>,
+        extras: PolicyRequestExtras,
     },
     DeleteSyncMirror {
         auth_token: Option<MetadataAuthToken>,
         relationship: Box<SyncRelationship>,
+        extras: PolicyRequestExtras,
     },
     SyncMirrorCreated,
     SyncMirrorDeleted,

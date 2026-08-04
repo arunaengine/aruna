@@ -26,6 +26,7 @@ use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation
 use crate::driver::{DriverContext, drive};
 use crate::metadata::MetadataAuthToken;
 use crate::queue_backoff::queue_retry_after_ms;
+use crate::request_policy::PolicyRequestExtras;
 use crate::s3::get_bucket_info::GetBucketInfoOperation;
 use crate::sync_relationship::{
     DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, StoreSyncRelationshipOperation,
@@ -235,13 +236,20 @@ pub async fn request_sync_mirror_create(
     auth_token: MetadataAuthToken,
     source_group_id: Ulid,
     relationship: SyncRelationship,
+    extras: PolicyRequestExtras,
 ) -> Result<(), MetadataError> {
     let metadata_handle = context
         .metadata_handle
         .as_ref()
         .ok_or(MetadataError::HandleMissing)?;
     metadata_handle
-        .request_sync_create(target_node, Some(auth_token), source_group_id, relationship)
+        .request_sync_create(
+            target_node,
+            Some(auth_token),
+            source_group_id,
+            relationship,
+            extras,
+        )
         .await
 }
 
@@ -318,6 +326,7 @@ pub async fn ensure_sync_mirror(
             })),
             source_group_id,
             relationship.clone(),
+            PolicyRequestExtras::operation("s3.PutBucketReplication"),
         )
         .await
         .map_err(|error| SyncMirrorRepairError::Mirror(error.to_string()))
@@ -356,6 +365,7 @@ pub async fn delete_sync_mirror(
                 path_restrictions: None,
             })),
             relationship.clone(),
+            PolicyRequestExtras::operation("s3.DeleteBucketReplication"),
         )
         .await
     {

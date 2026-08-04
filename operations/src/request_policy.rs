@@ -224,12 +224,38 @@ fn decide(
 /// Extra request context threaded to a policy at a choke point. Body-content
 /// policies only ever run for operations whose handler already holds the full
 /// parsed body; the engine never reads or buffers a streaming body.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PolicyRequestExtras {
     pub operation: String,
     pub params: std::collections::BTreeMap<String, String>,
     pub headers: std::collections::BTreeMap<String, String>,
+    // Encoded as an optional JSON string so non-self-describing wire formats
+    // such as postcard can carry the body across the mirror messages.
+    #[serde(with = "json_body")]
     pub body: Option<serde_json::Value>,
+}
+
+mod json_body {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(value: &Option<serde_json::Value>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        value
+            .as_ref()
+            .map(serde_json::Value::to_string)
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer)?
+            .map(|text| serde_json::from_str(&text).map_err(serde::de::Error::custom))
+            .transpose()
+    }
 }
 
 impl PolicyRequestExtras {
@@ -369,5 +395,24 @@ mod tests {
         );
         assert_eq!(request.operation, "s3.PutObject");
         assert_eq!(request.permission, "write");
+    }
+
+    #[test]
+    fn extras_survive_postcard() {
+        // The mirror messages carry extras over postcard, which cannot decode a
+        // bare serde_json::Value; the body must ride as an encoded string.
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("versionId".to_string(), "1".to_string());
+        let extras = PolicyRequestExtras {
+            operation: "s3.PutBucketReplication".to_string(),
+            params,
+            headers: std::collections::BTreeMap::new(),
+            body: Some(serde_json::json!({"rule": "deny"})),
+        };
+        let bytes = postcard::to_allocvec(&extras).unwrap();
+        let decoded: PolicyRequestExtras = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.operation, extras.operation);
+        assert_eq!(decoded.params, extras.params);
+        assert_eq!(decoded.body, extras.body);
     }
 }

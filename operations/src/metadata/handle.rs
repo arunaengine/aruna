@@ -66,10 +66,11 @@ use crate::auth::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache,
     validate_aruna_bearer_token,
 };
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::permission_rules::GroupPermissionRules;
 use crate::realm_peer::{RealmPeerError, ensure_realm_peer};
+use crate::request_authorization::{AuthorizeError, authorize};
+use crate::request_policy::PolicyRequestExtras;
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, SearchBucketsOperation};
@@ -1300,6 +1301,7 @@ impl MetadataHandle {
                 auth_token,
                 source_group_id,
                 relationship,
+                extras,
             } => {
                 self.apply_sync_mirror(
                     context,
@@ -1308,14 +1310,16 @@ impl MetadataHandle {
                     *relationship,
                     Some(source_group_id),
                     false,
+                    extras,
                 )
                 .await
             }
             MetadataTransportMessage::DeleteSyncMirror {
                 auth_token,
                 relationship,
+                extras,
             } => {
-                self.apply_sync_mirror(context, peer, auth_token, *relationship, None, true)
+                self.apply_sync_mirror(context, peer, auth_token, *relationship, None, true, extras)
                     .await
             }
             query @ MetadataTransportMessage::QueryDocument { .. } => {
@@ -1491,6 +1495,7 @@ impl MetadataHandle {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn apply_sync_mirror(
         &self,
         context: &Arc<DriverContext>,
@@ -1499,6 +1504,7 @@ impl MetadataHandle {
         relationship: SyncRelationship,
         source_group_id: Option<GroupId>,
         delete: bool,
+        extras: PolicyRequestExtras,
     ) -> MetadataTransportMessage {
         let Some(net_handle) = self.inner.net_handle.as_ref() else {
             return MetadataTransportMessage::Reject("mirror_internal".to_string());
@@ -1568,6 +1574,45 @@ impl MetadataHandle {
             if !sync_identity_matches(&stored, &relationship) {
                 return MetadataTransportMessage::Reject("invalid_relationship".to_string());
             }
+            // A still-present bucket must pass the same RBAC and policy boundary
+            // the origin ran; a gone bucket leaves nothing to authorize against.
+            match drive(
+                GetBucketInfoOperation::new(local_bucket.to_string()),
+                context.as_ref(),
+            )
+            .await
+            {
+                Ok(Some(Ok(bucket_info))) => {
+                    let path = blob_bucket_permission_path(
+                        *net_handle.realm_id(),
+                        bucket_info.group_id,
+                        local_node,
+                        local_bucket,
+                    );
+                    match authorize(
+                        context.as_ref(),
+                        *net_handle.realm_id(),
+                        &auth,
+                        &path,
+                        &Permission::WRITE,
+                        extras,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(AuthorizeError::CheckFailed(_)) => {
+                            return MetadataTransportMessage::Reject("mirror_internal".to_string());
+                        }
+                        Err(_) => {
+                            return MetadataTransportMessage::Reject("access_denied".to_string());
+                        }
+                    }
+                }
+                Ok(Some(Err(GetBucketInfoError::NotFound))) | Ok(None) => {}
+                Ok(Some(Err(_))) | Err(_) => {
+                    return MetadataTransportMessage::Reject("mirror_internal".to_string());
+                }
+            }
             // Outgoing reference relationships are detached instead of
             // deleted so the peer's retained reference records stay readable.
             let removed = match direction {
@@ -1606,26 +1651,27 @@ impl MetadataHandle {
             }
             Err(_) => return MetadataTransportMessage::Reject("mirror_internal".to_string()),
         };
-        let permitted = match drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: auth,
-                path: blob_bucket_permission_path(
-                    *net_handle.realm_id(),
-                    group_id,
-                    net_handle.node_id(),
-                    local_bucket,
-                ),
-                required_permission: Permission::WRITE,
-            }),
+        let path = blob_bucket_permission_path(
+            *net_handle.realm_id(),
+            group_id,
+            net_handle.node_id(),
+            local_bucket,
+        );
+        match authorize(
             context.as_ref(),
+            *net_handle.realm_id(),
+            &auth,
+            &path,
+            &Permission::WRITE,
+            extras,
         )
         .await
         {
-            Ok(permitted) => permitted,
-            Err(_) => return MetadataTransportMessage::Reject("mirror_internal".to_string()),
-        };
-        if !permitted {
-            return MetadataTransportMessage::Reject("access_denied".to_string());
+            Ok(()) => {}
+            Err(AuthorizeError::CheckFailed(_)) => {
+                return MetadataTransportMessage::Reject("mirror_internal".to_string());
+            }
+            Err(_) => return MetadataTransportMessage::Reject("access_denied".to_string()),
         }
         if create_bucket
             && create_sync_bucket(context.as_ref(), local_bucket, group_id, &relationship)
@@ -2098,6 +2144,7 @@ impl MetadataHandle {
         auth_token: Option<MetadataAuthToken>,
         source_group_id: GroupId,
         relationship: SyncRelationship,
+        extras: PolicyRequestExtras,
     ) -> Result<(), MetadataError> {
         match with_sync_timeout(send_remote_metadata_request(
             &self.inner,
@@ -2107,6 +2154,7 @@ impl MetadataHandle {
                 auth_token,
                 source_group_id,
                 relationship: Box::new(relationship),
+                extras,
             },
         ))
         .await?
@@ -2124,6 +2172,7 @@ impl MetadataHandle {
         node_id: NodeId,
         auth_token: Option<MetadataAuthToken>,
         relationship: SyncRelationship,
+        extras: PolicyRequestExtras,
     ) -> Result<(), MetadataError> {
         match with_sync_timeout(send_remote_metadata_request(
             &self.inner,
@@ -2132,6 +2181,7 @@ impl MetadataHandle {
             MetadataTransportMessage::DeleteSyncMirror {
                 auth_token,
                 relationship: Box::new(relationship),
+                extras,
             },
         ))
         .await?

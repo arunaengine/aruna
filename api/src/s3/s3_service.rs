@@ -557,6 +557,7 @@ impl ArunaS3Service {
             auth_token,
             user_access.group_id,
             relationship.clone(),
+            extras.clone(),
         )
         .await
         .map_err(|error| match error {

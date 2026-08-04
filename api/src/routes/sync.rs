@@ -15,6 +15,7 @@ use aruna_operations::replication::queue::{QueueBlobReplicationOperation, relati
 use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeTarget,
 };
+use aruna_operations::request_policy::PolicyRequestExtras;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::sync_mirror_repair::{
     SyncMirrorRepairIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
@@ -775,6 +776,7 @@ async fn create_mirror(
         auth_token,
         source_group_id,
         relationship,
+        PolicyRequestExtras::rest(),
     )
     .await
     .map_err(map_mirror_error)
