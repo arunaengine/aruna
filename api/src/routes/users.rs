@@ -1,10 +1,11 @@
-use crate::auth::{OidcIdentity, bearer_token};
+use crate::auth::{OidcIdentity, bearer_token, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::UserId;
 use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecret};
 use aruna_core::structs::{
-    Actor, AuthContext, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, Role, User,
+    Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument,
+    Role, User,
 };
 use aruna_operations::consume_onboarding_secret::{
     ConsumeOnboardingSecretError, ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
@@ -959,6 +960,19 @@ async fn update_user(
         return Err(ServerError::Forbidden);
     }
 
+    // A non-self update is a privileged write; run the realm policy and RBAC
+    // boundary at the route before the operation repeats it as defense in depth.
+    let target_user_id = UserId::from_string(&user_id).map_err(|_| ServerError::BadRequest)?;
+    if auth.user_id != target_user_id {
+        ensure_permission(
+            &state,
+            &auth,
+            format!("/{realm_id}/admin/u/{target_user_id}"),
+            Permission::WRITE,
+        )
+        .await?;
+    }
+
     let user = drive(
         UpdateUserOperation::new(UpdateUserInput {
             actor: Actor {
@@ -1571,6 +1585,98 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        node.server_task.abort();
+        node.net.shutdown().await;
+        oidc_task.abort();
+    }
+
+    #[tokio::test]
+    async fn update_user_denied_by_policy() {
+        // A realm deny-writes policy must block a non-self update at the route,
+        // even though the admin holds the RBAC write the operation would accept.
+        let issuer = "https://issuer.example";
+        let kid = "main-key";
+        let signing_key = generate_signing_key();
+        let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
+        let node = spawn_test_node(provider, true).await;
+
+        let (target, _target_token) = register_via_oidc(
+            &node,
+            issuer,
+            kid,
+            &signing_key,
+            "subject-target",
+            "Target Bob",
+            None,
+        )
+        .await;
+        let admin = aruna_core::structs::AuthContext {
+            user_id: node.realm_admin_id,
+            realm_id: node.realm_id,
+            path_restrictions: None,
+        };
+
+        let rename = |name: &str| super::UpdateUserRequest {
+            name: Some(name.to_string()),
+            set_attributes: Default::default(),
+            remove_attributes: Default::default(),
+        };
+
+        let allowed = super::update_user(
+            axum::extract::State(node.state.clone()),
+            axum::Extension(Some(admin.clone())),
+            axum::extract::Path(target.id.clone()),
+            axum::Json(rename("FirstRename")),
+        )
+        .await;
+        assert!(matches!(allowed, Ok((StatusCode::OK, _))));
+
+        let mut config = read_realm_config(node.context.as_ref(), &node.realm_id).await;
+        config
+            .request_policies
+            .push(aruna_core::request_policy::RequestPolicy {
+                policy_id: Ulid::generate(),
+                name: "deny-writes".to_string(),
+                kind: aruna_core::request_policy::PolicyKind::Deny,
+                when: None,
+                expression: "permission == 'write'".to_string(),
+                enabled: true,
+            });
+        let actor = Actor {
+            node_id: node.net.node_id(),
+            user_id: node.realm_admin_id,
+            realm_id: node.realm_id,
+        };
+        let bytes = config.to_bytes(&actor).unwrap();
+        let _ = node
+            .context
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: ByteView::from(node.realm_id.as_bytes().to_vec()),
+                value: ByteView::from(bytes),
+                txn_id: None,
+            }))
+            .await;
+
+        let denied = super::update_user(
+            axum::extract::State(node.state.clone()),
+            axum::Extension(Some(admin.clone())),
+            axum::extract::Path(target.id.clone()),
+            axum::Json(rename("SecondRename")),
+        )
+        .await;
+        assert!(matches!(denied, Err(crate::error::ServerError::Forbidden)));
+
+        let fetched = super::get_user(
+            axum::extract::State(node.state.clone()),
+            axum::Extension(Some(admin)),
+            axum::extract::Path(target.id.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fetched.1.0.name, "FirstRename");
 
         node.server_task.abort();
         node.net.shutdown().await;
