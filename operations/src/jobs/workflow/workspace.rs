@@ -210,6 +210,13 @@ async fn mint_credential(
     node_id: NodeId,
     restrictions: Vec<PathRestriction>,
 ) -> Result<WorkspaceCredential, JobError> {
+    // Reject an oversized mount set permanently before any attempt intent so a
+    // job cannot loop retrying a credential the evaluator would reject.
+    if let Err(error) = aruna_core::permission_path::validate_restriction_limits(&restrictions) {
+        return Err(JobError::permanent(format!(
+            "workspace credential restrictions invalid: {error}"
+        )));
+    }
     let key_id = workspace_credential_id(record.job_id);
     let access_key = UserAccess::build_access_key(&key_id).map_err(|error| {
         JobError::permanent(format!("workspace credential key failed: {error}"))

@@ -4,6 +4,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
 use aruna_core::operation::Operation;
+use aruna_core::permission_path::{RestrictionLimitError, validate_restriction_limits};
 use aruna_core::structs::{PathRestriction, UserAccess};
 use aruna_core::types::{Effects, GroupId};
 use rand::distr::Alphanumeric;
@@ -29,6 +30,8 @@ pub enum CreateUserAccessError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    RestrictionLimit(#[from] RestrictionLimitError),
     #[error("Invalid state [{current:?}] - expected [{expected:?}]")]
     InvalidState {
         current: CreateUserAccessState,
@@ -83,6 +86,11 @@ impl CreateUserAccessOperation {
 
     fn handle_init(&mut self) -> Effects {
         if let CreateUserAccessState::Init = self.state {
+            if let Some(restrictions) = self.config.path_restrictions.as_deref()
+                && let Err(err) = validate_restriction_limits(restrictions)
+            {
+                return self.handle_error(err.into());
+            }
             let access_key = match UserAccess::build_access_key(&self.key_id) {
                 Ok(access_key) => access_key,
                 Err(err) => return self.handle_error(err.into()),
@@ -276,6 +284,30 @@ mod tests {
         assert_eq!(returned_access.user_identity, user_identity);
         assert_eq!(returned_access.group_id, group_id);
         assert_eq!(returned_access.access_key, access_key);
+    }
+
+    #[test]
+    fn rejects_oversized_restrictions() {
+        // Over the cap the operation fails with no storage write emitted.
+        use aruna_core::permission_path::MAX_TOKEN_RESTRICTIONS;
+        use aruna_core::structs::Permission;
+        let restrictions = (0..=MAX_TOKEN_RESTRICTIONS)
+            .map(|index| PathRestriction {
+                pattern: format!("/r/{index}/**"),
+                permission: Permission::READ,
+            })
+            .collect::<Vec<_>>();
+        let mut config = make_config(make_user_identity(), Ulid::generate());
+        config.path_restrictions = Some(restrictions);
+        let mut op = CreateUserAccessOperation::new(config);
+
+        let effects = op.start();
+        assert!(effects.is_empty());
+        assert_eq!(op.state, CreateUserAccessState::Error);
+        assert!(matches!(
+            op.finalize().unwrap_err(),
+            CreateUserAccessError::RestrictionLimit(_)
+        ));
     }
 
     #[test]
