@@ -15,7 +15,7 @@ use aruna_core::structs::{
     Actor, AuthContext, NodeCapabilities, OidcProviderConfig, RealmId, RoCrateLimits,
 };
 use aruna_operations::auth::{
-    ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache,
+    ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache, realm_token_revoked,
 };
 use aruna_operations::claim_initial_realm_admin::{
     ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
@@ -566,7 +566,15 @@ impl ServerState {
 #[async_trait]
 impl ArunaBearerTokenValidationState for ServerState {
     async fn is_bearer_token_revoked(&self, token_hash: &str) -> bool {
+        // Node-local list first as a fast path; the replicated realm config is
+        // what makes a revocation from any other node binding here.
         self.token_revocation_list.read().await.contains(token_hash)
+            || realm_token_revoked(
+                &self.driver_ctx.storage_handle,
+                self.realm_id,
+                token_hash,
+            )
+            .await
     }
 
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {

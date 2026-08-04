@@ -1,7 +1,10 @@
 use crate::auth::{handle_token, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult, TokenError};
 use crate::server_state::ServerState;
-use aruna_core::structs::AuthContext;
+use aruna_core::auth::bearer_token_hash;
+use aruna_core::structs::{Actor, AuthContext};
+use aruna_operations::driver::drive;
+use aruna_operations::revoke_token::{RevokeTokenConfig, RevokeTokenOperation};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::post;
@@ -44,17 +47,30 @@ pub async fn revoke_token(
     Extension(auth): Extension<Option<AuthContext>>,
     Json(request): Json<RevokeTokenRequest>,
 ) -> ServerResult<StatusCode> {
-    require_realm_auth(&state, auth)?;
+    let auth = require_realm_auth(&state, auth)?;
     // Validate the target is a real bearer token of a trusted realm before
-    // recording it, so the blacklist cannot be filled with arbitrary strings.
-    // An already-revoked token is accepted so revocation stays idempotent.
+    // recording it, so the revocation set cannot be filled with arbitrary
+    // strings. An already-revoked token is accepted so revocation is idempotent.
     match handle_token(&state, &request.token).await {
-        Ok(_) | Err(TokenError::TokenBlacklisted) => {
-            state.add_token_to_blacklist(&request.token).await;
-            Ok(StatusCode::NO_CONTENT)
-        }
-        Err(_) => Err(ServerError::BadRequest),
+        Ok(_) | Err(TokenError::TokenBlacklisted) => {}
+        Err(_) => return Err(ServerError::BadRequest),
     }
+
+    drive(
+        RevokeTokenOperation::new(RevokeTokenConfig {
+            actor: Actor {
+                node_id: state.get_node_id(),
+                user_id: auth.user_id,
+                realm_id: auth.realm_id,
+            },
+            token_hash: bearer_token_hash(&request.token),
+        }),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    state.add_token_to_blacklist(&request.token).await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
@@ -65,7 +81,8 @@ mod tests {
     use aruna_core::structs::{Actor, NodeCapabilities, RealmId};
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
-    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::driver::DriverContext;
+    use aruna_operations::get_realm_config::GetRealmConfigOperation;
     use aruna_operations::jobs::runtime::JobsRuntime;
     use aruna_storage::storage::FjallStorage;
     use ed25519_dalek::SigningKey;
@@ -176,6 +193,88 @@ mod tests {
             handle_token(&state, &token).await,
             Err(TokenError::TokenBlacklisted)
         ));
+    }
+
+    #[tokio::test]
+    async fn revocation_reaches_realm_config() {
+        // The route must record the revocation in the replicated realm config,
+        // which is what carries it to the other nodes of the realm.
+        let (state, realm_id, user_id, token) = state_with_token().await;
+        revoke_token(
+            State(state.clone()),
+            Extension(caller(realm_id, user_id)),
+            Json(RevokeTokenRequest {
+                token: token.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let config = drive(GetRealmConfigOperation::new(realm_id), state.get_ctx().as_ref())
+            .await
+            .unwrap();
+        assert!(config.token_revoked(&bearer_token_hash(&token)));
+    }
+
+    #[tokio::test]
+    async fn replicated_revocation_rejects_token() {
+        // A revocation that only arrived through the replicated realm config,
+        // with an empty node-local list, must still deny the token here and
+        // after a restart that rebuilds the in-memory state.
+        let (state, realm_id, _user, token) = state_with_token().await;
+        assert!(handle_token(&state, &token).await.is_ok());
+
+        let ctx = state.get_ctx();
+        let mut config = drive(GetRealmConfigOperation::new(realm_id), ctx.as_ref())
+            .await
+            .unwrap();
+        config.revoked_tokens.push(bearer_token_hash(&token));
+        write_realm_config(ctx.as_ref(), realm_id, &config).await;
+
+        assert!(!state.is_token_blacklisted(&token).await);
+        assert!(matches!(
+            handle_token(&state, &token).await,
+            Err(TokenError::TokenBlacklisted)
+        ));
+
+        let restarted = ServerState::new(
+            ctx.clone(),
+            realm_id,
+            state.get_node_id(),
+            NodeCapabilities::local_node(realm_id).unwrap(),
+            false,
+            None,
+            JobsRuntime::new(),
+        )
+        .await;
+        assert!(matches!(
+            handle_token(&restarted, &token).await,
+            Err(TokenError::TokenBlacklisted)
+        ));
+    }
+
+    async fn write_realm_config(
+        ctx: &DriverContext,
+        realm_id: RealmId,
+        config: &aruna_core::structs::RealmConfigDocument,
+    ) {
+        let target = aruna_core::document::DocumentSyncTarget::RealmConfig { realm_id };
+        let bytes = postcard::to_allocvec(config).unwrap();
+        match ctx
+            .storage_handle
+            .send_storage_effect(aruna_core::effects::StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: bytes.into(),
+                txn_id: None,
+            })
+            .await
+        {
+            aruna_core::events::Event::Storage(
+                aruna_core::events::StorageEvent::WriteResult { .. },
+            ) => {}
+            other => panic!("unexpected realm config write result: {other:?}"),
+        }
     }
 
     #[tokio::test]
