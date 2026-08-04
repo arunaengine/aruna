@@ -372,7 +372,7 @@ fn apply_reducer_policies(
         .contains_key(REALM_CONFIG_POLICIES_PATH)
         && let Some(policies) = reducer_state.materialized_realm_config_policies()
     {
-        document.deny_policies = policies;
+        document.request_policies = policies;
     }
 }
 
@@ -394,6 +394,8 @@ mod tests {
         RequestPolicy {
             policy_id: Ulid::from_bytes([7u8; 16]),
             name: "no-writes".to_string(),
+            kind: aruna_core::request_policy::PolicyKind::Deny,
+            when: None,
             expression: expression.to_string(),
             enabled: true,
         }
@@ -446,12 +448,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(document.deny_policies, policies);
+        assert_eq!(document.request_policies, policies);
 
         let read = drive(GetRealmConfigOperation::new(actor.realm_id), &context)
             .await
             .unwrap();
-        assert_eq!(read.deny_policies, policies);
+        assert_eq!(read.request_policies, policies);
     }
 
     #[tokio::test]

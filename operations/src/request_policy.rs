@@ -26,10 +26,10 @@ pub async fn enforce_policies(
     let Ok(config) = drive(GetRealmConfigOperation::new(realm_id), context).await else {
         return Ok(());
     };
-    if config.deny_policies.is_empty() {
+    if config.request_policies.is_empty() {
         return Ok(());
     }
-    match evaluate_policies(&config.deny_policies, request) {
+    match evaluate_policies(&config.request_policies, request) {
         PolicyDecision::Allowed => Ok(()),
         PolicyDecision::Denied {
             policy_id,
@@ -54,16 +54,19 @@ pub fn policy_request(
     permission: &aruna_core::structs::Permission,
     user: Option<&aruna_core::UserId>,
 ) -> PolicyRequest {
-    PolicyRequest {
-        path: path.to_string(),
-        permission: match permission {
-            aruna_core::structs::Permission::READ => "read".to_string(),
-            aruna_core::structs::Permission::WRITE => "write".to_string(),
-            aruna_core::structs::Permission::DENY => "deny".to_string(),
-        },
-        user: user
-            .filter(|user| !user.is_nil())
+    PolicyRequest::basic(
+        path.to_string(),
+        permission_label(permission),
+        user.filter(|user| !user.is_nil())
             .map(|user| user.to_string())
             .unwrap_or_default(),
+    )
+}
+
+fn permission_label(permission: &aruna_core::structs::Permission) -> String {
+    match permission {
+        aruna_core::structs::Permission::READ => "read".to_string(),
+        aruna_core::structs::Permission::WRITE => "write".to_string(),
+        aruna_core::structs::Permission::DENY => "deny".to_string(),
     }
 }

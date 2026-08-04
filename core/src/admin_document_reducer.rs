@@ -1551,7 +1551,7 @@ pub const REALM_CONFIG_METADATA_REPLICATION_PATH: &str =
 pub const REALM_CONFIG_DISCOVERY_PATH: &str = "realm_config.settings.discovery";
 pub const REALM_CONFIG_DESCRIPTION_PATH: &str = "realm_config.description";
 pub const REALM_CONFIG_QUOTA_PATH: &str = "realm_config.quota";
-pub const REALM_CONFIG_POLICIES_PATH: &str = "realm_config.deny_policies";
+pub const REALM_CONFIG_POLICIES_PATH: &str = "realm_config.request_policies";
 pub const REALM_CONFIG_DEFAULT_STRATEGY_PATH: &str = "realm_config.placement.default_strategy";
 
 fn event_observes_dot(event: &AdminDocumentEvent, dot: &AdminDocumentDot) -> bool {

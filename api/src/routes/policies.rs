@@ -151,6 +151,8 @@ pub async fn set_realm_policies(
             Ok(RequestPolicy {
                 policy_id,
                 name: policy.name.clone(),
+                kind: aruna_core::request_policy::PolicyKind::Deny,
+                when: None,
                 expression: policy.expression.clone(),
                 enabled: policy.enabled,
             })
@@ -177,7 +179,7 @@ pub async fn set_realm_policies(
     Ok((
         StatusCode::OK,
         Json(PoliciesResponse {
-            policies: document.deny_policies.iter().map(map_policy).collect(),
+            policies: document.request_policies.iter().map(map_policy).collect(),
         }),
     ))
 }
@@ -207,7 +209,7 @@ pub async fn effective_policies(
     Ok((
         StatusCode::OK,
         Json(PoliciesResponse {
-            policies: config.deny_policies.iter().map(map_policy).collect(),
+            policies: config.request_policies.iter().map(map_policy).collect(),
         }),
     ))
 }
@@ -260,6 +262,8 @@ pub async fn dry_run_policy(
         Some(expression) => vec![RequestPolicy {
             policy_id: Ulid::generate(),
             name: "dry-run".to_string(),
+            kind: aruna_core::request_policy::PolicyKind::Deny,
+            when: None,
             expression: expression.clone(),
             enabled: true,
         }],
@@ -270,16 +274,16 @@ pub async fn dry_run_policy(
             )
             .await
             .map_err(|error| ServerError::InternalError(error.to_string()))?
-            .deny_policies
+            .request_policies
         }
     };
     let decision = evaluate_policies(
         &policies,
-        &PolicyRequest {
-            path: request.path,
-            permission: request.permission,
-            user: request.user.unwrap_or_default(),
-        },
+        &PolicyRequest::basic(
+            request.path,
+            request.permission,
+            request.user.unwrap_or_default(),
+        ),
     );
     let response = match decision {
         PolicyDecision::Allowed => DryRunResponse {

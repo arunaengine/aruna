@@ -3342,9 +3342,9 @@ fn overlay_realm_config_reducer_materialization(
     if !reducer_state
         .conflicts
         .contains_key(REALM_CONFIG_POLICIES_PATH)
-        && let Some(deny_policies) = reducer_state.materialized_realm_config_policies()
+        && let Some(request_policies) = reducer_state.materialized_realm_config_policies()
     {
-        config.deny_policies = deny_policies;
+        config.request_policies = request_policies;
     }
 
     for path in reducer_state.conflicts.keys() {
@@ -3400,7 +3400,7 @@ fn realm_config_from_reducer_materialization(
         quota: reducer_state
             .materialized_realm_config_quota()
             .unwrap_or_default(),
-        deny_policies: reducer_state
+        request_policies: reducer_state
             .materialized_realm_config_policies()
             .unwrap_or_default(),
         description: String::new(),

@@ -170,10 +170,10 @@ pub struct RealmConfigDocument {
     /// Each coordinator grants node bands only from pools it owns; precedence
     /// is by lineage (see [`coordinator_spans`]).
     pub band_pools: Vec<BandPool>,
-    /// Deny-only CEL request policies applied realm-wide (Class-1 replicated,
-    /// so evaluation is local on every node).
+    /// CEL request policies applied realm-wide (Class-1 replicated, so
+    /// evaluation is local on every node).
     #[serde(default)]
-    pub deny_policies: Vec<crate::request_policy::RequestPolicy>,
+    pub request_policies: Vec<crate::request_policy::RequestPolicy>,
 }
 
 /// Realm-wide quota policy. Lives in the realm config (Class-1, replicated
@@ -392,7 +392,7 @@ impl RealmConfigDocument {
             quota: QuotaConfig::default(),
             description: String::new(),
             placement_map: Vec::new(),
-            deny_policies: Vec::new(),
+            request_policies: Vec::new(),
             strategies: Vec::new(),
             default_strategy_id: None,
             strategy_bindings: Vec::new(),
@@ -770,7 +770,7 @@ mod test {
             discovery: default_realm_discovery_config(),
             nodes: Vec::new(),
             quota: super::QuotaConfig::default(),
-            deny_policies: Vec::new(),
+            request_policies: Vec::new(),
             description: "Example Realm".to_string(),
             placement_map: Vec::new(),
             strategies: Vec::new(),
@@ -931,7 +931,7 @@ mod test {
             discovery: default_realm_discovery_config(),
             nodes: Vec::new(),
             quota: super::QuotaConfig::default(),
-            deny_policies: Vec::new(),
+            request_policies: Vec::new(),
             description: String::new(),
             placement_map: Vec::new(),
             strategies: Vec::new(),
