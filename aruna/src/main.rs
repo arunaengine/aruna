@@ -385,7 +385,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .with_metrics(metrics.clone())
         .with_rocrate_limits(config.rocrate_limits.clone())
         .with_s3_mounts(s3_mounts_available)
-        .with_trusted_proxies(config.trusted_proxies.clone()),
+        .with_trusted_proxies(config.trusted_proxies.clone())
+        .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
+            config.rate_limits.ip_per_minute,
+            config.rate_limits.ip_burst,
+            config.rate_limits.principal_per_minute,
+            config.rate_limits.principal_burst,
+        )),
     );
     portal::initialize(config.portal.clone(), state.clone()).await;
 
@@ -411,7 +417,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         metrics.clone(),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .with_concurrency_limits(
+        config.rate_limits.s3_max_connections as usize,
+        config.rate_limits.s3_max_requests as usize,
+    );
 
     let s3_listener = TcpListener::bind(&config.s3_address).await.unwrap();
     let s3_bound_addr = s3_listener.local_addr().unwrap();
