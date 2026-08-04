@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use ulid::Ulid;
 
-use super::api::{load_metadata_realm_nodes_with_status, load_realm_config};
+use super::api::load_realm_config;
 use super::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
@@ -442,28 +442,33 @@ pub async fn list_audit(
         .unwrap_or(DEFAULT_AUDIT_PAGE_SIZE)
         .clamp(1, MAX_AUDIT_PAGE_SIZE);
 
-    let discovery = load_metadata_realm_nodes_with_status(context, realm_id, local_node).await;
-    let mut partial = discovery.failed;
-    let mut peers: Vec<NodeId> = discovery
-        .nodes
-        .into_iter()
-        .filter(|node| *node != local_node)
-        .collect();
-    let config_digest = if peers.is_empty() {
-        [0u8; 32]
-    } else {
-        match load_realm_config(context, realm_id)
-            .await
-            .and_then(|config| config.digest().ok())
-        {
-            Some(digest) => digest,
-            None => {
-                partial = true;
-                peers.clear();
-                [0u8; 32]
+    // The completeness set is the realm's configured sync-eligible membership,
+    // not who is currently reachable: an offline configured holder must surface
+    // as a missing node with partial results rather than being silently dropped.
+    let mut partial = false;
+    let mut peers: Vec<NodeId> = Vec::new();
+    let mut config_digest = [0u8; 32];
+    match load_realm_config(context, realm_id).await {
+        None => partial = true,
+        Some(config) => match config.sync_eligible_node_ids() {
+            Err(_) => partial = true,
+            Ok(nodes) => {
+                peers = nodes
+                    .into_iter()
+                    .filter(|node| *node != local_node)
+                    .collect();
+                if !peers.is_empty() {
+                    match config.digest() {
+                        Ok(digest) => config_digest = digest,
+                        Err(_) => {
+                            partial = true;
+                            peers.clear();
+                        }
+                    }
+                }
             }
-        }
-    };
+        },
+    }
 
     let operation = ListAuditOperation::new(
         request.group_id,

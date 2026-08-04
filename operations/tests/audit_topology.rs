@@ -140,6 +140,27 @@ async fn nonholder_audit_trail() -> TestResult<()> {
         "live holders still supply the full trail"
     );
 
+    // An offline configured holder must surface through list_audit as missing:
+    // the completeness set is the configured membership, not who is reachable.
+    let offline = holders[0];
+    realm.find(offline).net.shutdown().await;
+    let offline_audit = list_audit(
+        reader.context.as_ref(),
+        realm.realm_id,
+        reader.node_id(),
+        Some(realm.bearer_token()),
+        request(group_id, None, None, DOCUMENTS * 4),
+    )
+    .await?;
+    assert!(
+        offline_audit.partial,
+        "an offline configured holder must mark the audit partial"
+    );
+    assert!(
+        offline_audit.missing_nodes.contains(&offline),
+        "the offline configured holder must be named in missing_nodes"
+    );
+
     realm.shutdown().await;
     Ok(())
 }
