@@ -1,5 +1,6 @@
 #![allow(clippy::result_large_err)]
 
+use crate::s3::auth::map_authorize_error;
 use crate::s3::checksum::{
     ApplyChecksums, ChecksumSelection, UploadChecksumRequest, checksum_mode_enabled,
     encode_checksums, parse_complete_multipart_checksum_request, parse_upload_checksum_request,
@@ -27,17 +28,16 @@ use aruna_core::structs::{
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
-use crate::s3::auth::map_authorize_error;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{DriverContext, bucket_snapshot, drive, routing_snapshot};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::metadata::MetadataAuthToken;
-use aruna_operations::request_authorization::{AuthorizeError, authorize};
-use aruna_operations::request_policy::PolicyRequestExtras;
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
 use aruna_operations::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
 };
+use aruna_operations::request_authorization::{AuthorizeError, authorize};
+use aruna_operations::request_policy::PolicyRequestExtras;
 use aruna_operations::s3::abort_multipart_upload::{
     AbortMultipartUploadInput as AMUI, AbortMultipartUploadOperation,
 };
@@ -272,12 +272,7 @@ impl ArunaS3Service {
                 realm_id: user_access.user_identity.realm_id,
                 path_restrictions: None,
             },
-            &blob_bucket_permission_path(
-                self.realm_id,
-                bucket_info.group_id,
-                self.node_id,
-                bucket,
-            ),
+            &blob_bucket_permission_path(self.realm_id, bucket_info.group_id, self.node_id, bucket),
             &Permission::READ,
             extras.clone(),
         )
@@ -1209,10 +1204,14 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
-        let extras = req.extensions.get::<PolicyRequestExtras>().cloned().ok_or_else(|| {
-            error!(error = "Missing policy context");
-            s3_error!(InternalError, "Missing policy context")
-        })?;
+        let extras = req
+            .extensions
+            .get::<PolicyRequestExtras>()
+            .cloned()
+            .ok_or_else(|| {
+                error!(error = "Missing policy context");
+                s3_error!(InternalError, "Missing policy context")
+            })?;
 
         let result = drive(
             ListBucketsOperation::new(LBI {
@@ -1690,10 +1689,14 @@ impl S3 for ArunaS3Service {
         } else {
             AuthContext::anonymous(self.realm_id)
         };
-        let source_extras = req.extensions.get::<PolicyRequestExtras>().cloned().ok_or_else(|| {
-            error!(error = "Missing policy context");
-            s3_error!(InternalError, "Missing policy context")
-        })?;
+        let source_extras = req
+            .extensions
+            .get::<PolicyRequestExtras>()
+            .cloned()
+            .ok_or_else(|| {
+                error!(error = "Missing policy context");
+                s3_error!(InternalError, "Missing policy context")
+            })?;
         authorize(
             &self.state,
             self.realm_id,
@@ -2031,10 +2034,14 @@ impl S3 for ArunaS3Service {
         } else {
             AuthContext::anonymous(self.realm_id)
         };
-        let source_extras = req.extensions.get::<PolicyRequestExtras>().cloned().ok_or_else(|| {
-            error!(error = "Missing policy context");
-            s3_error!(InternalError, "Missing policy context")
-        })?;
+        let source_extras = req
+            .extensions
+            .get::<PolicyRequestExtras>()
+            .cloned()
+            .ok_or_else(|| {
+                error!(error = "Missing policy context");
+                s3_error!(InternalError, "Missing policy context")
+            })?;
         authorize(
             &self.state,
             self.realm_id,
@@ -3023,10 +3030,14 @@ impl S3 for ArunaS3Service {
         // The access hook deferred per-object policy evaluation; reuse the request
         // context it stashed so each entry is decided against the real query and
         // allowlisted headers rather than an empty operation-only context.
-        let extras = req.extensions.get::<PolicyRequestExtras>().cloned().ok_or_else(|| {
-            error!(error = "Missing policy context");
-            s3_error!(InternalError, "Missing policy context")
-        })?;
+        let extras = req
+            .extensions
+            .get::<PolicyRequestExtras>()
+            .cloned()
+            .ok_or_else(|| {
+                error!(error = "Missing policy context");
+                s3_error!(InternalError, "Missing policy context")
+            })?;
 
         if req.input.delete.objects.len() > 1000 {
             return Err(s3_error!(
@@ -3207,10 +3218,14 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
-        let extras = req.extensions.get::<PolicyRequestExtras>().cloned().ok_or_else(|| {
-            error!(error = "Missing policy context");
-            s3_error!(InternalError, "Missing policy context")
-        })?;
+        let extras = req
+            .extensions
+            .get::<PolicyRequestExtras>()
+            .cloned()
+            .ok_or_else(|| {
+                error!(error = "Missing policy context");
+                s3_error!(InternalError, "Missing policy context")
+            })?;
         let bucket = req.input.bucket;
         let targets =
             self.parse_replication_targets(&bucket, &req.input.replication_configuration)?;

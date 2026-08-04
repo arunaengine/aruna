@@ -5927,7 +5927,9 @@ async fn resolve_graph_visibility_scope(
     // eager and lazy (SPARQL) paths both fail closed on it.
     let evaluators = crate::request_policy::PolicyEvaluator::load_bulk(
         &context,
-        records.iter().map(|record| (record.realm_id, record.group_id)),
+        records
+            .iter()
+            .map(|record| (record.realm_id, record.group_id)),
     )
     .await;
     let policy_user = auth_context.as_ref().map(|auth| auth.user_id);

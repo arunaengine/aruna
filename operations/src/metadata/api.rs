@@ -874,7 +874,9 @@ pub(crate) async fn local_path_candidates(
     .await;
     let evaluators = crate::request_policy::PolicyEvaluator::load_bulk(
         context,
-        records.iter().map(|record| (record.realm_id, record.group_id)),
+        records
+            .iter()
+            .map(|record| (record.realm_id, record.group_id)),
     )
     .await;
     let policy_user = auth
