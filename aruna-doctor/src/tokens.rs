@@ -21,6 +21,7 @@ use aruna_operations::create_onboarding_secret::{
 };
 use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::inspect_onboarding_secret::{
     InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
 };
@@ -417,7 +418,7 @@ struct DoctorTokenValidationState {
 
 impl DoctorTokenValidationState {
     async fn load(driver_ctx: &DriverContext) -> Self {
-        let revoked_token_hashes = load_persisted_state::<HashSet<String, ahash::RandomState>>(
+        let mut revoked_token_hashes = load_persisted_state::<HashSet<String, ahash::RandomState>>(
             driver_ctx,
             TOKEN_REVOCATION_LIST_KEY,
         )
@@ -429,6 +430,13 @@ impl DoctorTokenValidationState {
         )
         .await
         .unwrap_or_default();
+        // The replicated realm config is the realm-wide authority; the local
+        // list only carries revocations this node accepted itself.
+        for realm_id in &trusted_realms {
+            if let Ok(config) = drive(GetRealmConfigOperation::new(*realm_id), driver_ctx).await {
+                revoked_token_hashes.extend(config.revoked_tokens);
+            }
+        }
 
         Self {
             revoked_token_hashes,
