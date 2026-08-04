@@ -19,10 +19,11 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::{
-    Actor, MetadataRegistryRecord, PlacementRef, RealmAuthorizationDocument, RealmConfigDocument,
-    RealmId, RealmNodeKind, TokenClaims,
+    Actor, AuthContext, MetadataRegistryRecord, Permission, PlacementRef,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
@@ -545,22 +546,29 @@ async fn seed_group(realm: &Realm, nodes: &[TestNode]) -> Result<Ulid, Box<dyn s
     )
     .await?;
 
-    wait_for_group(nodes, group.group_id).await?;
+    wait_for_group(realm, nodes, group.group_id).await?;
     Ok(group.group_id)
 }
 
-/// Waits for the group's authorization document — what the permission check
-/// reads — on every sync-eligible node. A User node is never a sync target, so it
-/// never receives the group it may itself have created.
+/// Waits until the group's owner holds WRITE on every sync-eligible node. The
+/// auth document materializes from admin events one at a time, so its existence
+/// precedes the owner's role assignment that the forwarded write re-checks.
 async fn wait_for_group(
+    realm: &Realm,
     nodes: &[TestNode],
     group_id: Ulid,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let path = MetadataRegistryRecord::permission_path_for(
+        &realm.realm_id,
+        group_id,
+        "datasets/forwarded",
+        Ulid::nil(),
+    );
     let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
     loop {
         let mut pending = false;
         for node in nodes.iter().filter(|node| node.sync_eligible) {
-            if read_group_auth(node, group_id).await?.is_none() {
+            if !owner_can_write(realm, node, path.clone()).await {
                 pending = true;
             }
         }
@@ -568,10 +576,32 @@ async fn wait_for_group(
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err("the group's authorization document never reached every holder".into());
+            return Err("the group owner never gained write on every holder".into());
         }
         sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Whether the realm's owner is granted WRITE on the group path by this node's
+/// local authorization state. A not-yet-converged group denies or fails to load,
+/// both of which count as "not ready".
+async fn owner_can_write(realm: &Realm, node: &TestNode, path: String) -> bool {
+    matches!(
+        drive(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: AuthContext {
+                    user_id: realm.user_id,
+                    realm_id: realm.realm_id,
+                    path_restrictions: None,
+                },
+                path,
+                required_permission: Permission::WRITE,
+            }),
+            node.context.as_ref(),
+        )
+        .await,
+        Ok(true)
+    )
 }
 
 async fn registry_record(
