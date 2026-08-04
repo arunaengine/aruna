@@ -454,37 +454,56 @@ async fn run_groups(
     if !requested {
         return Ok(None);
     }
-    let output = drive(
-        SearchGroupsOperation::new(SearchGroupsInput {
-            query: query.to_string(),
-            limit,
-            start_after: cursor,
-        }),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
     let realm_id = state.get_realm_id();
-    let mut hits = Vec::new();
-    for group in output.groups {
-        // Per-result visibility: only disclose a group the caller can read,
-        // mirroring document search (READ on the group's data root).
-        let path = format!("/{realm_id}/g/{}/data/**", group.group_id);
-        if crate::auth::ensure_permission(state, auth, path, Permission::READ)
-            .await
-            .is_ok()
-        {
-            hits.push(GroupHit {
-                group_id: group.group_id.to_string(),
-                display_name: group.display_name,
-            });
+    let mut hits: Vec<GroupHit> = Vec::new();
+    let mut next_cursor: Option<String> = None;
+    let mut scan_cursor = cursor;
+    // Fill the page across raw scans so a hidden first match cannot become an
+    // empty page; the continuation cursor is only ever a visible group's id.
+    'fill: for _ in 0..MAX_GROUP_SCAN_ROUNDS {
+        let output = drive(
+            SearchGroupsOperation::new(SearchGroupsInput {
+                query: query.to_string(),
+                limit,
+                start_after: scan_cursor.clone(),
+            }),
+            &state.get_ctx(),
+        )
+        .await
+        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+        let raw_next = output.next_start_after;
+        let total = output.groups.len();
+        for (index, group) in output.groups.into_iter().enumerate() {
+            // Per-result visibility: only disclose a group the caller can read,
+            // mirroring document search (READ on the group's data root).
+            let path = format!("/{realm_id}/g/{}/data/**", group.group_id);
+            if crate::auth::ensure_permission(state, auth, path, Permission::READ)
+                .await
+                .is_ok()
+            {
+                let group_id = group.group_id.to_string();
+                hits.push(GroupHit {
+                    group_id: group_id.clone(),
+                    display_name: group.display_name,
+                });
+                if hits.len() >= limit {
+                    let more = index + 1 < total || raw_next.is_some();
+                    next_cursor = more.then_some(group_id);
+                    break 'fill;
+                }
+            }
+        }
+        match raw_next {
+            Some(key) => scan_cursor = Some(key),
+            None => break 'fill,
         }
     }
-    Ok(Some(GroupsSection {
-        hits,
-        next_cursor: output.next_start_after,
-    }))
+    Ok(Some(GroupsSection { hits, next_cursor }))
 }
+
+/// Bounds the visibility fill loop so a realm of hidden matches cannot make one
+/// request scan without limit; the operation already batches storage internally.
+const MAX_GROUP_SCAN_ROUNDS: usize = 64;
 
 async fn run_users(
     state: &ServerState,
@@ -988,6 +1007,44 @@ mod tests {
         assert_eq!(second.hits.len(), 1);
         assert_eq!(second.hits[0].group_id, fx.groups[1].to_string());
         assert!(second.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn hidden_first_group_no_leak() {
+        // A hidden first match at limit 1 must not yield an empty page whose
+        // cursor exposes the hidden group's id.
+        let fx = setup().await;
+        let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
+        let hidden_owner = UserId::local(Ulid::from_bytes([240u8; 16]), fx.realm_id);
+        let viewer = UserId::local(Ulid::from_bytes([241u8; 16]), fx.realm_id);
+        let hidden_actor = Actor {
+            node_id,
+            user_id: hidden_owner,
+            realm_id: fx.realm_id,
+        };
+        let viewer_actor = Actor {
+            node_id,
+            user_id: viewer,
+            realm_id: fx.realm_id,
+        };
+        seed_group(&fx.state, &hidden_actor, fx.groups[0], "alpha-hidden").await;
+        seed_group(&fx.state, &viewer_actor, fx.groups[1], "alpha-visible").await;
+
+        let viewer_auth = AuthContext {
+            user_id: viewer,
+            realm_id: fx.realm_id,
+            path_restrictions: None,
+        };
+        let section = run_groups(&fx.state, &viewer_auth, true, "alpha", 1, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(section.hits.len(), 1);
+        assert_eq!(section.hits[0].group_id, fx.groups[1].to_string());
+        assert_ne!(
+            section.next_cursor.as_deref(),
+            Some(fx.groups[0].to_string().as_str())
+        );
     }
 
     #[tokio::test]
