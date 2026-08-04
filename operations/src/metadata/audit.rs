@@ -114,7 +114,10 @@ fn parse_audit_page(
 /// Merges node pages into one deterministic page. Records are deduplicated by
 /// their raw key; the horizon is the smallest last-key of any truncated page, so
 /// only keys every node has fully covered are emitted before the next request.
-fn merge_pages(pages: &[AuditPageResponse], limit: usize) -> (Vec<MetadataAuditRecord>, Option<Vec<u8>>) {
+fn merge_pages(
+    pages: &[AuditPageResponse],
+    limit: usize,
+) -> (Vec<MetadataAuditRecord>, Option<Vec<u8>>) {
     let mut horizon: Option<Vec<u8>> = None;
     let mut any_truncated = false;
     for page in pages {
@@ -323,17 +326,19 @@ impl Operation for ListAuditOperation {
         )];
         self.pending = 1;
         for &node in &self.peers {
-            effects.push(Effect::Net(NetEffect::AuditPage(Box::new(AuditPageEffect {
-                node,
-                request: AuditPageRequest {
-                    auth_token: self.auth_token.clone(),
-                    config_digest: self.config_digest,
-                    group_id: self.group_id,
-                    document_id: self.document_id,
-                    start_after: self.start_after.clone(),
-                    limit: self.limit,
+            effects.push(Effect::Net(NetEffect::AuditPage(Box::new(
+                AuditPageEffect {
+                    node,
+                    request: AuditPageRequest {
+                        auth_token: self.auth_token.clone(),
+                        config_digest: self.config_digest,
+                        group_id: self.group_id,
+                        document_id: self.document_id,
+                        start_after: self.start_after.clone(),
+                        limit: self.limit,
+                    },
                 },
-            }))));
+            ))));
             self.pending += 1;
         }
         effects
@@ -601,7 +606,12 @@ mod tests {
         }
     }
 
-    fn entry(group_id: Ulid, document_id: Ulid, audit_id: Ulid, realm_id: RealmId) -> AuditPageEntry {
+    fn entry(
+        group_id: Ulid,
+        document_id: Ulid,
+        audit_id: Ulid,
+        realm_id: RealmId,
+    ) -> AuditPageEntry {
         AuditPageEntry {
             key: metadata_audit_key(group_id, document_id, audit_id).to_vec(),
             record: record(group_id, document_id, realm_id),
@@ -667,7 +677,10 @@ mod tests {
 
         let (records, cutoff) = merge_pages(&[page], 2);
         assert_eq!(records.len(), 2);
-        assert_eq!(cutoff, Some(metadata_audit_key(group, doc, ids[1]).to_vec()));
+        assert_eq!(
+            cutoff,
+            Some(metadata_audit_key(group, doc, ids[1]).to_vec())
+        );
     }
 
     #[tokio::test]

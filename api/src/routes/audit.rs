@@ -5,7 +5,9 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::structs::{AuthContext, MetadataAuditOperation, Permission};
 use aruna_operations::metadata::api::forwarded_bearer;
-use aruna_operations::metadata::audit::{ListAuditError, ListAuditRequest, list_audit as gather_audit};
+use aruna_operations::metadata::audit::{
+    ListAuditError, ListAuditRequest, list_audit as gather_audit,
+};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
