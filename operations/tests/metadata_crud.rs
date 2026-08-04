@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::StructuredId;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -25,7 +26,7 @@ use aruna_core::structs::{
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload,
+    CreateMetadataDocumentPayload, mint_local_document,
 };
 use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::driver::{DriverContext, drive};
@@ -65,7 +66,13 @@ struct TestContext {
 async fn lost_response_retries() -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
     let group_id = Ulid::generate();
-    let document_id = Ulid::generate();
+    let document_id = mint_local_document(
+        &test.config,
+        &test.actor,
+        group_id,
+        "datasets/lost-response",
+    )?
+    .as_ulid();
     let config = CreateMetadataDocumentConfig {
         actor: test.actor.clone(),
         group_id,
@@ -162,7 +169,13 @@ impl TestContext {
 async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context().await?;
     let group_id = Ulid::generate();
-    let document_id = Ulid::generate();
+    let document_id = mint_local_document(
+        &test.config,
+        &test.actor,
+        group_id,
+        "datasets/public-dataset",
+    )?
+    .as_ulid();
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
@@ -315,7 +328,13 @@ async fn generated_metadata_create_foreground_storage_effect_count_is_reduced()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
     let group_id = Ulid::generate();
-    let document_id = Ulid::generate();
+    let document_id = mint_local_document(
+        &test.config,
+        &test.actor,
+        group_id,
+        "datasets/generated-fast-path",
+    )?
+    .as_ulid();
     let before = test
         .context
         .storage_handle
@@ -383,6 +402,7 @@ async fn metadata_event_log_replay_repairs_wal_only_create()
         holder_node_ids: vec![test.actor.node_id],
         created_at_ms: 1,
         updated_at_ms: 1,
+        establishing_event_id: event_id,
         last_event_id: event_id,
     };
     let create_event = MetadataCreateEventRecord {
@@ -778,6 +798,7 @@ fn build_create_event(
         holder_node_ids: vec![test.actor.node_id],
         created_at_ms: 1,
         updated_at_ms: 1,
+        establishing_event_id: event_id,
         last_event_id: event_id,
     };
     let event = MetadataCreateEventRecord {

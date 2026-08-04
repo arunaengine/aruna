@@ -1618,7 +1618,7 @@ mod tests {
     #[tokio::test]
     async fn per_class_slots() {
         let runtime = JobsRuntime::with_capacity(2);
-        for byte in 0..2u8 {
+        for byte in 1..=2u8 {
             runtime.register_test_execution(
                 JobId::from_bytes([byte; 16]),
                 JobExecutionClass::InProcess,

@@ -15,6 +15,8 @@ pub enum Alpn {
     Notification,
     /// Shard holder-manifest exchange protocol
     Shard,
+    /// Placement-routed durable job control protocol
+    JobControl,
 }
 
 impl Alpn {
@@ -27,6 +29,7 @@ impl Alpn {
             Alpn::NativeReference => b"aruna/native/1",
             Alpn::Notification => b"aruna/notification/1",
             Alpn::Shard => b"aruna/shard/1",
+            Alpn::JobControl => b"aruna/job-control/1",
         }
     }
 
@@ -39,6 +42,7 @@ impl Alpn {
             b"aruna/native/1" => Some(Alpn::NativeReference),
             b"aruna/notification/1" => Some(Alpn::Notification),
             b"aruna/shard/1" => Some(Alpn::Shard),
+            b"aruna/job-control/1" => Some(Alpn::JobControl),
             _ => None,
         }
     }
@@ -57,6 +61,7 @@ impl std::fmt::Display for Alpn {
             Alpn::NativeReference => write!(f, "aruna/native/1"),
             Alpn::Notification => write!(f, "aruna/notification/1"),
             Alpn::Shard => write!(f, "aruna/shard/1"),
+            Alpn::JobControl => write!(f, "aruna/job-control/1"),
         }
     }
 }
@@ -86,6 +91,10 @@ mod tests {
             Some(Alpn::Notification)
         );
         assert_eq!(Alpn::from_bytes(Alpn::Shard.as_bytes()), Some(Alpn::Shard));
+        assert_eq!(
+            Alpn::from_bytes(Alpn::JobControl.as_bytes()),
+            Some(Alpn::JobControl)
+        );
     }
 
     #[test]

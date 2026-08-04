@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::StructuredId;
 use aruna_core::UserId;
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
 use aruna_core::document::{
@@ -25,6 +26,7 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    mint_forward_document, mint_local_document,
 };
 use aruna_operations::document_sync_outbox::{
     new_outbox_record, outbox_key, read_outbox_record, schedule_outbox_drain_effect,
@@ -79,7 +81,7 @@ async fn user_node_forwards_create() -> Result<(), Box<dyn std::error::Error>> {
     let user_node = nodes.last().expect("user node");
 
     let group_id = seed_group(&realm, &nodes).await?;
-    let document_id = Ulid::generate();
+    let document_id = forward_id(&config, &realm, user_node, group_id, "datasets/forwarded")?;
     let created = drive_forwarded_create(&realm, user_node, group_id, document_id).await?;
 
     // The user node holds nothing, so the record it got back was written by a
@@ -125,7 +127,7 @@ async fn forwarded_invalid_terminal() -> Result<(), Box<dyn std::error::Error>> 
     let (nodes, config) = build_realm(&realm, 3, 1).await?;
     let user_node = nodes.last().expect("user node");
     let group_id = seed_group(&realm, &nodes).await?;
-    let document_id = Ulid::generate();
+    let document_id = forward_id(&config, &realm, user_node, group_id, "datasets/forwarded")?;
     let record = drive_forwarded_create(&realm, user_node, group_id, document_id).await?;
     let holders = resolve_shard_holders(&config, &record.placement);
     wait_for_record_on_holders(&nodes, &holders, document_id).await?;
@@ -137,7 +139,8 @@ async fn forwarded_invalid_terminal() -> Result<(), Box<dyn std::error::Error>> 
             user_id: realm.user_id,
             realm_id: realm.realm_id,
         },
-        &record,
+        Some(&record),
+        document_id,
         None,
         UpdateMetadataDocumentMutation::UpsertDataEntity {
             jsonld: "{}".to_string(),
@@ -238,7 +241,7 @@ async fn forwarded_create_is_idempotent() -> Result<(), Box<dyn std::error::Erro
     let user_node = nodes.last().expect("user node");
 
     let group_id = seed_group(&realm, &nodes).await?;
-    let document_id = Ulid::generate();
+    let document_id = forward_id(&config, &realm, user_node, group_id, "datasets/forwarded")?;
 
     let first = drive_forwarded_create(&realm, user_node, group_id, document_id).await?;
     let holders = resolve_shard_holders(&config, &first.placement);
@@ -274,7 +277,13 @@ async fn create_replay_rejects() -> Result<(), Box<dyn std::error::Error>> {
     let user_node = nodes.last().expect("user node");
     let first_group = seed_group(&realm, &nodes).await?;
     let other_group = seed_group(&realm, &nodes).await?;
-    let document_id = Ulid::generate();
+    let document_id = forward_id(
+        &config,
+        &realm,
+        user_node,
+        first_group,
+        "datasets/forwarded",
+    )?;
 
     let created = drive_forwarded_create(&realm, user_node, first_group, document_id).await?;
     let holders = resolve_shard_holders(&config, &created.placement);
@@ -368,15 +377,17 @@ async fn nonholder_resolves_document() -> Result<(), Box<dyn std::error::Error>>
     let realm = Realm::new();
     let (nodes, config) = build_realm(&realm, 5, 0).await?;
     let group_id = Ulid::generate();
-    let document_id = Ulid::generate();
+    let actor = Actor {
+        node_id: nodes[0].net.node_id(),
+        user_id: realm.user_id,
+        realm_id: realm.realm_id,
+    };
+    let document_id =
+        mint_local_document(&config, &actor, group_id, "datasets/nonholder")?.as_ulid();
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
-            actor: Actor {
-                node_id: nodes[0].net.node_id(),
-                user_id: realm.user_id,
-                realm_id: realm.realm_id,
-            },
+            actor: actor.clone(),
             group_id,
             document_id,
             document_path: "datasets/nonholder".to_string(),
@@ -591,6 +602,28 @@ async fn read_group_auth(
         }
         other => Err(format!("unexpected group auth read event: {other:?}").into()),
     }
+}
+
+/// Mints the D8 blind-bucket structured id a non-holder forward carries, so the
+/// forwarded create routes to that bucket's holders regardless of the origin.
+fn forward_id(
+    config: &RealmConfigDocument,
+    realm: &Realm,
+    node: &TestNode,
+    group_id: Ulid,
+    path: &str,
+) -> Result<Ulid, Box<dyn std::error::Error>> {
+    Ok(mint_forward_document(
+        config,
+        &Actor {
+            node_id: node.net.node_id(),
+            user_id: realm.user_id,
+            realm_id: realm.realm_id,
+        },
+        group_id,
+        path,
+    )?
+    .as_ulid())
 }
 
 async fn drive_forwarded_create(

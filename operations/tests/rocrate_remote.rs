@@ -24,10 +24,10 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     ARUNA_DATA_PREFIX, Actor, ArtifactRef, AuthContext, Backend, BackendConfig, BackendLocation,
     BackendRef, BlobLocationKey, BlobVersion, BucketInfo, ExportReportRow, ExportReportSource,
-    ExportRoCrateSpec, GroupAuthorizationDocument, JobId, JobPayload, JobRecord, JobResultPayload,
-    MetadataRegistryRecord, PathRestriction, Permission, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId, RealmNodeKind, ReasonCode, RoCrateLimits, VersionKey,
-    VersionedObjectArn,
+    ExportRoCrateSpec, FIRST_GRANTABLE_HANDLE, GroupAuthorizationDocument, JobId, JobPayload,
+    JobRecord, JobResultPayload, MetadataRegistryRecord, PathRestriction, Permission,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, ReasonCode,
+    RoCrateLimits, VersionKey, VersionedObjectArn,
 };
 use aruna_core::types::{GroupId, UserId};
 use aruna_core::util::unix_timestamp_millis;
@@ -43,6 +43,7 @@ use aruna_operations::jobs::service::read_artifact_range;
 use aruna_operations::jobs::store::{
     ClaimOutcome, claim_job, insert_job, list_job_entries, read_job_record, transition_to_running,
 };
+use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
@@ -54,12 +55,31 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
+use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::{MetaResourceId, StructuredId};
+
 const BUCKET: &str = "remote";
 const KEY: &str = "payload";
 const DOC_PATH: &str = "datasets/remote";
 const PAYLOAD: &[u8] = b"remote bao export payload";
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+/// A fixed structured id (handle 1, bucket 0); the RF-3 realm over two nodes
+/// makes every node hold every bucket, so bucket 0 is always held.
+fn doc_id(seed: u64) -> Ulid {
+    MetaResourceId::try_from((1u128 << 60) | u128::from(seed))
+        .unwrap()
+        .as_ulid()
+}
+
+fn job_id() -> JobId {
+    mint_job_id(
+        PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
+        BucketId::new(0).unwrap(),
+    )
+    .unwrap()
+}
 
 struct Node {
     _root: TempDir,
@@ -74,7 +94,7 @@ async fn remote_export_streams() -> TestResult {
     let owner = UserId::local(Ulid::generate(), realm_id);
     let group_id = Ulid::generate();
     let version_id = Ulid::generate();
-    let document_id = Ulid::generate();
+    let document_id = doc_id(1);
 
     let (holder, exporter) =
         setup_remote(realm_id, owner, group_id, version_id, document_id).await?;
@@ -88,7 +108,7 @@ async fn remote_export_streams() -> TestResult {
         document_id,
         limits: RoCrateLimits::default(),
     };
-    let job_id = JobId::new();
+    let job_id = job_id();
     let ctx = claim_context(
         &exporter,
         owner,
@@ -147,7 +167,7 @@ async fn remote_denial_omits() -> TestResult {
     let owner = UserId::local(Ulid::generate(), realm_id);
     let group_id = Ulid::generate();
     let version_id = Ulid::generate();
-    let document_id = Ulid::generate();
+    let document_id = doc_id(1);
 
     let (holder, exporter) =
         setup_remote(realm_id, owner, group_id, version_id, document_id).await?;
@@ -166,7 +186,7 @@ async fn remote_denial_omits() -> TestResult {
         document_id,
         limits: RoCrateLimits::default(),
     };
-    let job_id = JobId::new();
+    let job_id = job_id();
     let ctx = claim_context(
         &exporter,
         owner,

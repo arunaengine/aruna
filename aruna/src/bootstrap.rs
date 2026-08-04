@@ -215,7 +215,7 @@ pub async fn wait_for_onboarding_placement(
     tokio::time::timeout(ONBOARDING_DOCUMENT_SYNC_TIMEOUT, async {
         loop {
             let config = drive(GetRealmConfigOperation::new(realm_id), driver_ctx).await?;
-            if realm_config_has_node_placement(&config, node_id) {
+            if node_is_ready(&config, node_id) {
                 return Ok::<(), Box<dyn std::error::Error>>(());
             }
 
@@ -241,11 +241,16 @@ pub async fn wait_for_onboarding_placement(
     })?
 }
 
-fn realm_config_has_node_placement(
-    config: &aruna_core::structs::RealmConfigDocument,
-    node_id: NodeId,
-) -> bool {
-    config.has_node(node_id) && config.placement_entry(node_id).is_some()
+fn node_is_ready(config: &aruna_core::structs::RealmConfigDocument, node_id: NodeId) -> bool {
+    // A usable band grant plus its JobControl binding: the node must be able
+    // to mint owner-encoded JobIds before it starts serving.
+    config.has_node(node_id)
+        && config.placement_entry(node_id).is_some()
+        && !config
+            .handle_range_directory()
+            .granted_to(&node_id)
+            .is_empty()
+        && config.job_control_handle(&node_id).is_some()
 }
 
 async fn load_realm_config(
@@ -354,7 +359,7 @@ pub async fn ensure_initial_local_onboarding_secret(
 
 #[cfg(test)]
 mod tests {
-    use super::{core_document_targets, realm_config_has_node_placement, unique_user_topic};
+    use super::{core_document_targets, node_is_ready, unique_user_topic};
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -409,14 +414,14 @@ mod tests {
     }
 
     #[test]
-    fn onboarding_readiness_requires_node_and_placement() {
+    fn readiness_requires_all() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
 
-        assert!(!realm_config_has_node_placement(&config, node_id));
+        assert!(!node_is_ready(&config, node_id));
         config.ensure_node(node_id, RealmNodeKind::Server);
-        assert!(!realm_config_has_node_placement(&config, node_id));
+        assert!(!node_is_ready(&config, node_id));
         config.placement_map.push(NodePlacementEntry {
             node_id,
             location: String::new(),
@@ -425,7 +430,33 @@ mod tests {
             draining: false,
             labels: Default::default(),
         });
-        assert!(realm_config_has_node_placement(&config, node_id));
+        config.seed_default_placement();
+        config
+            .placement_handle_ranges
+            .push(aruna_core::structs::HandleRange {
+                range_id: ulid::Ulid::from_bytes([3; 16]),
+                owner: node_id,
+                start: aruna_core::structs::FIRST_GRANTABLE_HANDLE,
+                end: aruna_core::structs::FIRST_GRANTABLE_HANDLE
+                    + aruna_core::structs::HANDLE_RANGE_SIZE,
+            });
+        // A grant without its JobControl binding is not ready yet.
+        assert!(!node_is_ready(&config, node_id));
+        config
+            .placement_bindings
+            .push(aruna_core::structs::PlacementBinding {
+                handle: aruna_core::structured_id::PlacementHandle::new(
+                    aruna_core::structs::FIRST_GRANTABLE_HANDLE,
+                )
+                .unwrap(),
+                scope: aruna_core::structs::PlacementScope::Realm(realm_id),
+                document_class: aruna_core::structs::DocumentClass::JobControl,
+                strategy_id: config.default_strategy_id.unwrap(),
+                allocator_range_id: Some(ulid::Ulid::from_bytes([3; 16])),
+                allocated_by: Some(node_id),
+                allocated_at_ms: Some(1),
+            });
+        assert!(node_is_ready(&config, node_id));
     }
 
     async fn read_digest(

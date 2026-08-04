@@ -1,12 +1,17 @@
 use std::sync::Arc;
 
 use aruna_core::NodeId;
-use aruna_core::document::DocumentSyncTarget;
-use aruna_core::metadata::MetadataError;
+use aruna_core::effects::StorageEffect;
+use aruna_core::errors::AuthorizationError;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::METADATA_CREATE_ACCEPTANCE_KEYSPACE;
+use aruna_core::metadata::{MetadataCreateEventRecord, MetadataError, MetadataQueryResults};
+use aruna_core::storage_entries::metadata_create_acceptance_key;
 use aruna_core::structs::{
     Actor, AuthContext, MetadataRegistryRecord, Permission, PlacementRef, RealmConfigDocument,
-    RealmId,
+    RealmId, RealmNodeKind,
 };
+use aruna_core::{MetaResourceId, StructuredId};
 use thiserror::Error;
 use tracing::{error, warn};
 use ulid::Ulid;
@@ -14,18 +19,23 @@ use ulid::Ulid;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentResult, create_metadata_document,
+    CreateMetadataDocumentResult, accepted_create_matches, create_metadata_document,
+    mint_forward_document, resolve_metadata_id,
 };
 use crate::delete_metadata_document::{
     DeleteMetadataDocumentError, DeleteMetadataDocumentOperation, delete_metadata_document,
 };
 use crate::driver::{DriverContext, drive};
 use crate::get_metadata_document::load_metadata_record_by_document;
-use crate::metadata::handle::MetadataRequestDelivery;
-use crate::metadata::protocol::{MetadataAuthToken, MetadataTransportMessage};
-use crate::placement::{
-    PlacementResolutionContext, holds_placement, plan_target_placement, resolve_shard_holders,
+use crate::metadata::api::{
+    ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
+    MetadataApiError, export_metadata_rocrate, get_visible_metadata_document,
 };
+use crate::metadata::handle::{MetadataRequestDelivery, MetadataWritePeerError};
+use crate::metadata::protocol::{
+    MetadataAuthToken, MetadataReadError, MetadataTransportMessage, MetadataWriteAuthError,
+};
+use crate::placement::{holds_placement, resolve_shard_holders};
 use crate::process_placements::load_realm_config;
 use crate::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
@@ -47,6 +57,12 @@ pub enum MetadataWriteRoute {
 
 #[derive(Debug, Error)]
 pub enum MetadataWriteError {
+    #[error("metadata write requires authentication")]
+    Unauthorized,
+    #[error("metadata write is forbidden")]
+    Forbidden,
+    #[error("metadata document not found")]
+    NotFound,
     #[error(transparent)]
     Create(#[from] CreateMetadataDocumentError),
     #[error(transparent)]
@@ -84,26 +100,244 @@ pub fn write_route(
     MetadataWriteRoute::Forward(resolve_shard_holders(config, placement))
 }
 
-/// Route resolved against the live realm config. The presence of a local
-/// registry record is deliberately not consulted: after a rebalance a node keeps
-/// a stale copy of a document it no longer holds, and that copy is not authority.
-pub async fn resolve_write_route(
+/// User-kind nodes hold no metadata or authorization buckets, so their HTTP
+/// write handlers must defer permission checks to the selected holder.
+pub async fn is_user_origin(
     context: &Arc<DriverContext>,
-    placement: &PlacementRef,
-) -> MetadataWriteRoute {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return MetadataWriteRoute::Local;
-    };
-    let config = load_realm_config(context, *net_handle.realm_id()).await;
-    write_route(config.as_ref(), placement, net_handle.node_id())
+    realm_id: RealmId,
+    local_node_id: NodeId,
+) -> Result<bool, MetadataApiError> {
+    let config = drive(
+        crate::get_realm_config::GetRealmConfigOperation::new(realm_id),
+        context.as_ref(),
+    )
+    .await
+    .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let node = config
+        .nodes
+        .into_iter()
+        .find(|node| node.node_id == local_node_id.to_string())
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    Ok(node.kind == RealmNodeKind::User)
 }
 
-/// Creates locally when the origin holds a bucket of the governing strategy, and
-/// forwards to a holder when it holds none (a User-kind node, or one filtered out
-/// by affinity/`weight = 0`/`full`/`draining`). A forwarded create is offered to
-/// the holders of the document's blind-hashed bucket, each of which stamps that
-/// same bucket, so retrying the next holder after a lost response cannot fork the
-/// document onto a second topic.
+/// Whether the origin currently holds a structured metadata document's bucket.
+pub async fn origin_holds_document(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    document_id: Ulid,
+) -> Result<bool, MetadataApiError> {
+    let config = drive(
+        crate::get_realm_config::GetRealmConfigOperation::new(realm_id),
+        context.as_ref(),
+    )
+    .await
+    .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    if !config.has_node(local_node_id) {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    let placement = resolve_metadata_id(&config, realm_id, None, document_id)
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    Ok(holds_placement(&config, &placement, local_node_id))
+}
+
+pub async fn get_metadata_routed(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    request: GetVisibleMetadataDocumentRequest,
+    auth_token: Option<MetadataAuthToken>,
+) -> Result<MetadataRegistryRecord, MetadataApiError> {
+    if context.net_handle.is_none() {
+        return get_visible_metadata_document(context.as_ref(), realm_id, request).await;
+    }
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let config_digest = config
+        .digest()
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let placement = resolve_metadata_id(&config, realm_id, None, request.document_id)
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let holders = resolve_shard_holders(&config, &placement);
+    let holder_count = holders.len();
+    let mut not_found = 0usize;
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    if local_node.is_some_and(|node| holders.contains(&node)) {
+        match get_visible_metadata_document(context.as_ref(), realm_id, request.clone()).await {
+            Ok(record)
+                if routed_record_matches(
+                    &config,
+                    realm_id,
+                    request.document_id,
+                    &placement,
+                    &record,
+                ) =>
+            {
+                return Ok(record);
+            }
+            Ok(_) => {}
+            Err(MetadataApiError::NotFound) => not_found += 1,
+            Err(MetadataApiError::ServiceUnavailable) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if holder_count > 0 && not_found == holder_count {
+        return Err(MetadataApiError::NotFound);
+    }
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    for holder in holders
+        .into_iter()
+        .filter(|holder| Some(*holder) != local_node)
+    {
+        let response = metadata
+            .request_forwarded_write(
+                holder,
+                MetadataTransportMessage::ForwardReadDocument {
+                    auth_token: auth_token.clone(),
+                    config_digest,
+                    document_id: request.document_id,
+                },
+            )
+            .await;
+        match response {
+            Ok(MetadataTransportMessage::ForwardedRead { result: Ok(record) }) => {
+                if routed_record_matches(
+                    &config,
+                    realm_id,
+                    request.document_id,
+                    &placement,
+                    &record,
+                ) {
+                    return Ok(*record);
+                }
+            }
+            Ok(MetadataTransportMessage::ForwardedRead {
+                result: Err(MetadataReadError::Unauthorized),
+            }) => return Err(MetadataApiError::Unauthorized),
+            Ok(MetadataTransportMessage::ForwardedRead {
+                result: Err(MetadataReadError::Forbidden),
+            }) => return Err(MetadataApiError::Forbidden),
+            Ok(MetadataTransportMessage::ForwardedRead {
+                result: Err(MetadataReadError::NotFound),
+            }) => not_found += 1,
+            Ok(MetadataTransportMessage::ForwardedRead {
+                result: Err(MetadataReadError::Unavailable),
+            })
+            | Ok(MetadataTransportMessage::Reject(_))
+            | Err(_) => {}
+            Ok(_) => {}
+        }
+    }
+    if holder_count > 0 && not_found == holder_count {
+        Err(MetadataApiError::NotFound)
+    } else {
+        Err(MetadataApiError::ServiceUnavailable)
+    }
+}
+
+/// Exports locally on a holder or forwards with the caller's bearer or
+/// peer-attested internal principal for another READ check.
+pub async fn export_rocrate_routed(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    request: ExportMetadataRoCrateRequest,
+    forward_token: Option<MetadataAuthToken>,
+    metadata_bytes: u64,
+) -> Result<ExportMetadataRoCrateResult, MetadataApiError> {
+    if context.net_handle.is_none() {
+        let export = export_metadata_rocrate(context.as_ref(), realm_id, request).await?;
+        ensure_export_limit(&export, metadata_bytes)?;
+        return Ok(export);
+    }
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let config_digest = config
+        .digest()
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let placement = resolve_metadata_id(&config, realm_id, None, request.document_id)
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let holders = resolve_shard_holders(&config, &placement);
+    let holder_count = holders.len();
+    let mut not_found = 0usize;
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    if local_node.is_some_and(|node| holders.contains(&node)) {
+        match export_metadata_rocrate(context.as_ref(), realm_id, request.clone()).await {
+            Ok(result) => {
+                ensure_export_limit(&result, metadata_bytes)?;
+                return Ok(result);
+            }
+            Err(MetadataApiError::NotFound) => not_found += 1,
+            Err(MetadataApiError::ServiceUnavailable) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if holder_count > 0 && not_found == holder_count {
+        return Err(MetadataApiError::NotFound);
+    }
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    for holder in holders
+        .into_iter()
+        .filter(|holder| Some(*holder) != local_node)
+    {
+        let response = metadata
+            .request_export(
+                holder,
+                MetadataTransportMessage::ForwardExportDocument {
+                    auth_token: forward_token.clone(),
+                    config_digest,
+                    document_id: request.document_id,
+                    view: request.view,
+                    metadata_bytes,
+                    limit: request.limit,
+                    offset: request.offset,
+                    after: request.after.clone(),
+                },
+            )
+            .await;
+        match response {
+            Ok(Ok(export)) => return Ok(export),
+            Ok(Err(MetadataReadError::Unauthorized)) => {
+                return Err(MetadataApiError::Unauthorized);
+            }
+            Ok(Err(MetadataReadError::Forbidden)) => return Err(MetadataApiError::Forbidden),
+            Ok(Err(MetadataReadError::NotFound)) => not_found += 1,
+            Ok(Err(MetadataReadError::Unavailable)) | Err(_) => {}
+        }
+    }
+    if holder_count > 0 && not_found == holder_count {
+        Err(MetadataApiError::NotFound)
+    } else {
+        Err(MetadataApiError::ServiceUnavailable)
+    }
+}
+
+fn ensure_export_limit(
+    export: &ExportMetadataRoCrateResult,
+    metadata_bytes: u64,
+) -> Result<(), MetadataApiError> {
+    let length = match export {
+        ExportMetadataRoCrateResult::Full { jsonld, .. }
+        | ExportMetadataRoCrateResult::Summary { jsonld, .. } => jsonld.len(),
+        ExportMetadataRoCrateResult::Page { page, .. } => page.jsonld.len(),
+        ExportMetadataRoCrateResult::Raw { raw, .. } => raw.revision.jsonld.len(),
+    };
+    if u64::try_from(length).unwrap_or(u64::MAX) > metadata_bytes {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    Ok(())
+}
+
+/// Creates locally when the origin holds the bucket, otherwise at a holder.
+/// Definitely unsent requests may try another holder; ambiguous delivery is
+/// terminal so the create is not replayed.
 pub async fn create_metadata_document_routed(
     operation: CreateMetadataDocumentOperation,
     context: Arc<DriverContext>,
@@ -116,25 +350,63 @@ pub async fn create_metadata_document_routed(
         Err(error) => return Err(error.into()),
     }
 
-    let holders = create_forward_holders(&context, &config).await;
+    // Mint the forwarded id at the origin with the blind-hash bucket of the D8
+    // subject, so every candidate holder stamps the same bucket (D3/D4).
+    let realm_config = load_realm_config(&context, config.actor.realm_id)
+        .await
+        .ok_or_else(|| {
+            MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
+        })?;
+    let document_id = if config.document_id.is_nil() {
+        mint_forward_document(
+            &realm_config,
+            &config.actor,
+            config.group_id,
+            &config.document_path,
+        )?
+    } else {
+        MetaResourceId::from_bytes(config.document_id.to_bytes()).map_err(|error| {
+            CreateMetadataDocumentError::PlacementBindingUnavailable(format!(
+                "forwarded document id is not a structured id: {error}"
+            ))
+        })?
+    };
+    let (placement, holders) =
+        create_forward_holders(&realm_config, &config, document_id.as_ulid()).ok_or_else(|| {
+            MetadataWriteError::Undeliverable(
+                "document id has no resolvable metadata placement".to_string(),
+            )
+        })?;
+    let config_digest = realm_config
+        .digest()
+        .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
     let response = forward_to_holders(
         &context,
         &holders,
         MetadataTransportMessage::ForwardCreateDocument {
             auth_token,
+            config_digest,
             group_id: config.group_id,
-            document_id: config.document_id,
+            document_id: document_id.as_ulid(),
             document_path: config.document_path.clone(),
             public: config.public,
             payload: config.payload.clone(),
         },
+        None,
     )
     .await?;
     match response {
-        MetadataTransportMessage::ForwardedRecord { record } => Ok(CreateMetadataDocumentResult {
-            event_id: record.last_event_id,
-            record: *record,
-        }),
+        MetadataTransportMessage::ForwardedRecord { record }
+            if create_record_matches(&config, document_id.as_ulid(), &placement, &record) =>
+        {
+            Ok(CreateMetadataDocumentResult {
+                event_id: record.last_event_id,
+                record: *record,
+            })
+        }
+        MetadataTransportMessage::ForwardedRecord { .. } => Err(MetadataWriteError::Undeliverable(
+            "holder returned a metadata create record for another document".to_string(),
+        )),
         other => Err(unexpected_response(other)),
     }
 }
@@ -142,42 +414,82 @@ pub async fn create_metadata_document_routed(
 pub async fn update_metadata_document_routed(
     context: &Arc<DriverContext>,
     actor: Actor,
-    record: &MetadataRegistryRecord,
+    record: Option<&MetadataRegistryRecord>,
+    document_id: Ulid,
     public: Option<bool>,
     mutation: UpdateMetadataDocumentMutation,
     auth_token: Option<MetadataAuthToken>,
 ) -> Result<MetadataRegistryRecord, MetadataWriteError> {
-    let holders = match resolve_write_route(context, &record.placement).await {
-        MetadataWriteRoute::Local => {
-            return update_metadata_document(
-                UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
-                    actor,
-                    group_id: record.group_id,
-                    document_id: record.document_id,
-                    public: public.unwrap_or(record.public),
-                    mutation,
-                }),
-                context.as_ref(),
-            )
-            .await
-            .map_err(Into::into);
-        }
-        MetadataWriteRoute::Forward(holders) => holders,
-    };
+    let config = load_realm_config(context, actor.realm_id)
+        .await
+        .ok_or_else(|| {
+            MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
+        })?;
+    let placement = resolve_metadata_id(
+        &config,
+        actor.realm_id,
+        record.map(|record| record.group_id),
+        document_id,
+    )
+    .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
+    let config_digest = config
+        .digest()
+        .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
+    if record.is_some_and(|record| {
+        !routed_record_matches(&config, actor.realm_id, document_id, &placement, record)
+    }) {
+        return Err(MetadataWriteError::Undeliverable(
+            "local metadata registry record does not match the routed document".to_string(),
+        ));
+    }
+    let local_node_id = actor.node_id;
+    let local_holds = holds_placement(&config, &placement, local_node_id);
+    if local_holds && let Some(record) = record {
+        return update_metadata_document(
+            UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+                actor,
+                group_id: record.group_id,
+                document_id,
+                public: public.unwrap_or(record.public),
+                mutation,
+            }),
+            context.as_ref(),
+        )
+        .await
+        .map_err(Into::into);
+    }
+    let holders = resolve_shard_holders(&config, &placement);
 
     let response = forward_to_holders(
         context,
         &holders,
         MetadataTransportMessage::ForwardUpdateDocument {
             auth_token,
-            document_id: record.document_id,
+            config_digest,
+            document_id,
             public,
             mutation,
         },
+        local_holds.then_some(local_node_id),
     )
     .await?;
     match response {
-        MetadataTransportMessage::ForwardedRecord { record } => Ok(*record),
+        MetadataTransportMessage::ForwardedRecord {
+            record: response_record,
+        } if routed_record_matches(
+            &config,
+            actor.realm_id,
+            document_id,
+            &placement,
+            &response_record,
+        ) && record.is_none_or(|record| update_record_matches(record, &response_record))
+            && public.is_none_or(|public| response_record.public == public) =>
+        {
+            Ok(*response_record)
+        }
+        MetadataTransportMessage::ForwardedRecord { .. } => Err(MetadataWriteError::Undeliverable(
+            "holder returned a metadata update record for another document".to_string(),
+        )),
         MetadataTransportMessage::ForwardedUpdateInvalidInput { message } => Err(
             UpdateMetadataDocumentError::MetadataError(MetadataError::InvalidInput(message)).into(),
         ),
@@ -188,35 +500,169 @@ pub async fn update_metadata_document_routed(
 pub async fn delete_metadata_document_routed(
     context: &Arc<DriverContext>,
     actor: Actor,
-    record: &MetadataRegistryRecord,
+    record: Option<&MetadataRegistryRecord>,
+    document_id: Ulid,
     auth_token: Option<MetadataAuthToken>,
 ) -> Result<(), MetadataWriteError> {
-    let holders = match resolve_write_route(context, &record.placement).await {
-        MetadataWriteRoute::Local => {
-            return delete_metadata_document(
-                DeleteMetadataDocumentOperation::new(actor, record.group_id, record.document_id),
-                context.as_ref(),
-                record.document_id,
-            )
-            .await
-            .map_err(Into::into);
-        }
-        MetadataWriteRoute::Forward(holders) => holders,
-    };
+    let config = load_realm_config(context, actor.realm_id)
+        .await
+        .ok_or_else(|| {
+            MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
+        })?;
+    let placement = resolve_metadata_id(
+        &config,
+        actor.realm_id,
+        record.map(|record| record.group_id),
+        document_id,
+    )
+    .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
+    let config_digest = config
+        .digest()
+        .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
+    if record.is_some_and(|record| {
+        !routed_record_matches(&config, actor.realm_id, document_id, &placement, record)
+    }) {
+        return Err(MetadataWriteError::Undeliverable(
+            "local metadata registry record does not match the routed document".to_string(),
+        ));
+    }
+    let local_node_id = actor.node_id;
+    let local_holds = holds_placement(&config, &placement, local_node_id);
+    if local_holds && let Some(record) = record {
+        return delete_metadata_document(
+            DeleteMetadataDocumentOperation::new(actor, record.group_id, document_id),
+            context.as_ref(),
+            document_id,
+        )
+        .await
+        .map_err(Into::into);
+    }
+    let holders = resolve_shard_holders(&config, &placement);
 
     let response = forward_to_holders(
         context,
         &holders,
         MetadataTransportMessage::ForwardDeleteDocument {
             auth_token,
-            document_id: record.document_id,
+            config_digest,
+            document_id,
         },
+        local_holds.then_some(local_node_id),
     )
     .await?;
     match response {
         MetadataTransportMessage::ForwardedDelete => Ok(()),
         other => Err(unexpected_response(other)),
     }
+}
+
+pub(crate) async fn apply_forwarded_export(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+    local_limit: u64,
+) -> Result<(ExportMetadataRoCrateResult, u64), MetadataReadError> {
+    let MetadataTransportMessage::ForwardExportDocument {
+        auth_token,
+        config_digest,
+        document_id,
+        view,
+        metadata_bytes,
+        limit,
+        offset,
+        after,
+    } = message
+    else {
+        return Err(MetadataReadError::Unavailable);
+    };
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or(MetadataReadError::Unavailable)?;
+    let realm_id = *net_handle.realm_id();
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(MetadataReadError::Unavailable)?;
+    if config.digest().ok() != Some(config_digest) {
+        return Err(MetadataReadError::Unavailable);
+    }
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(MetadataReadError::Unavailable)?;
+    let auth = metadata
+        .authorize_read_peer(peer, auth_token, false)
+        .await?;
+    if !holds_metadata_id(&config, realm_id, net_handle.node_id(), document_id) {
+        return Err(MetadataReadError::Unavailable);
+    }
+    let export = export_metadata_rocrate(
+        context.as_ref(),
+        realm_id,
+        ExportMetadataRoCrateRequest {
+            document_id,
+            auth,
+            view,
+            limit,
+            offset,
+            after,
+        },
+    )
+    .await
+    .map_err(read_error)?;
+    let metadata_bytes = metadata_bytes.min(local_limit);
+    ensure_export_limit(&export, metadata_bytes).map_err(read_error)?;
+    Ok((export, metadata_bytes))
+}
+
+pub(crate) async fn apply_document_query(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> Result<MetadataQueryResults, MetadataReadError> {
+    let MetadataTransportMessage::QueryDocument {
+        auth_token,
+        config_digest,
+        document_id,
+        sparql,
+    } = message
+    else {
+        return Err(MetadataReadError::Unavailable);
+    };
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or(MetadataReadError::Unavailable)?;
+    let realm_id = *net_handle.realm_id();
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(MetadataReadError::Unavailable)?;
+    if config.digest().ok() != Some(config_digest)
+        || !holds_metadata_id(&config, realm_id, net_handle.node_id(), document_id)
+    {
+        return Err(MetadataReadError::Unavailable);
+    }
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(MetadataReadError::Unavailable)?;
+    let auth = metadata
+        .authorize_read_peer(peer, auth_token, false)
+        .await?;
+    let record = get_visible_metadata_document(
+        context.as_ref(),
+        realm_id,
+        GetVisibleMetadataDocumentRequest {
+            document_id,
+            auth: auth.clone(),
+        },
+    )
+    .await
+    .map_err(read_error)?;
+    metadata
+        .query_authorized_local(auth, Some(vec![record.graph_iri]), sparql)
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)
 }
 
 /// Applies a write forwarded by a non-holder, under the caller's authority.
@@ -240,16 +686,60 @@ pub(crate) async fn apply_forwarded_write(
     message: MetadataTransportMessage,
 ) -> MetadataTransportMessage {
     let Some(net_handle) = context.net_handle.as_ref() else {
-        return reject("forwarded metadata write needs a net handle");
+        return forwarded_unavailable(&message);
     };
     let realm_id = *net_handle.realm_id();
     let Some(config) = load_realm_config(context, realm_id).await else {
-        return reject(format!("realm `{realm_id}` config unavailable"));
+        return forwarded_unavailable(&message);
     };
+    let expected_digest = match &message {
+        MetadataTransportMessage::ForwardCreateDocument { config_digest, .. }
+        | MetadataTransportMessage::ForwardUpdateDocument { config_digest, .. }
+        | MetadataTransportMessage::ForwardDeleteDocument { config_digest, .. }
+        | MetadataTransportMessage::ForwardReadDocument { config_digest, .. } => *config_digest,
+        _ => return reject("unexpected forwarded metadata message"),
+    };
+    if config.digest().ok() != Some(expected_digest) {
+        return forwarded_unavailable(&message);
+    };
+
+    if let MetadataTransportMessage::ForwardReadDocument {
+        auth_token,
+        document_id,
+        ..
+    } = &message
+    {
+        let Some(metadata) = context.metadata_handle.as_ref() else {
+            return reject("forwarded metadata read needs a metadata handle");
+        };
+        let result = match metadata
+            .authorize_read_peer(peer, auth_token.clone(), false)
+            .await
+        {
+            Ok(auth)
+                if holds_metadata_id(&config, realm_id, net_handle.node_id(), *document_id) =>
+            {
+                get_visible_metadata_document(
+                    context.as_ref(),
+                    realm_id,
+                    GetVisibleMetadataDocumentRequest {
+                        document_id: *document_id,
+                        auth,
+                    },
+                )
+                .await
+                .map(Box::new)
+                .map_err(read_error)
+            }
+            Ok(_) => Err(MetadataReadError::Unavailable),
+            Err(error) => Err(error),
+        };
+        return MetadataTransportMessage::ForwardedRead { result };
+    }
 
     let auth = match authorize_forwarded_caller(context, peer, realm_id, &message).await {
         Ok(auth) => auth,
-        Err(error) => return reject(error),
+        Err(error) => return forward_auth_error(error),
     };
 
     match message {
@@ -273,37 +763,26 @@ pub(crate) async fn apply_forwarded_write(
                 document_id,
             );
             if let Err(error) = authorize_write(context, auth.clone(), path).await {
-                return reject(error);
+                return forward_auth_error(error);
             }
-            // Idempotent on the document's identity, never on its bucket: a
-            // forward whose response was lost is retried, possibly against a
-            // different holder, and a second create under the same document id
-            // would fork one document into two. Replay the record instead.
-            match existing_record(context, document_id).await {
-                Ok(Some(record)) => {
-                    return forwarded_create_replay(
-                        record,
-                        realm_id,
-                        group_id,
-                        &normalized_document_path,
-                    );
-                }
+            let create_config = CreateMetadataDocumentConfig {
+                actor: Actor {
+                    node_id: net_handle.node_id(),
+                    user_id: auth.user_id,
+                    realm_id,
+                },
+                group_id,
+                document_id,
+                document_path,
+                public,
+                payload,
+            };
+            match forwarded_create_replay(context, &create_config).await {
+                Ok(Some(response)) => return response,
                 Ok(None) => {}
                 Err(error) => return reject(error),
             }
-            let operation =
-                CreateMetadataDocumentOperation::new_forwarded(CreateMetadataDocumentConfig {
-                    actor: Actor {
-                        node_id: net_handle.node_id(),
-                        user_id: auth.user_id,
-                        realm_id,
-                    },
-                    group_id,
-                    document_id,
-                    document_path,
-                    public,
-                    payload,
-                });
+            let operation = CreateMetadataDocumentOperation::new_forwarded(create_config.clone());
             match create_metadata_document(operation, context.clone()).await {
                 Ok(created) => MetadataTransportMessage::ForwardedRecord {
                     record: Box::new(created.record),
@@ -311,13 +790,8 @@ pub(crate) async fn apply_forwarded_write(
                 // Lost the race against a concurrent delivery of the same
                 // forward: the winner's record is the answer, not an error.
                 Err(CreateMetadataDocumentError::DocumentAlreadyExists) => {
-                    match existing_record(context, document_id).await {
-                        Ok(Some(record)) => forwarded_create_replay(
-                            record,
-                            realm_id,
-                            group_id,
-                            &normalized_document_path,
-                        ),
+                    match forwarded_create_replay(context, &create_config).await {
+                        Ok(Some(response)) => response,
                         Ok(None) => reject(format!(
                             "forwarded metadata create for `{document_id}` raced a delete"
                         )),
@@ -336,12 +810,18 @@ pub(crate) async fn apply_forwarded_write(
             let record =
                 match held_record(context, &config, net_handle.node_id(), document_id).await {
                     Ok(record) => record,
-                    Err(error) => return reject(error),
+                    Err(HeldRecordError::NotFound) => {
+                        return MetadataTransportMessage::ForwardedWriteNotFound;
+                    }
+                    Err(HeldRecordError::Unavailable(error)) => {
+                        warn!(%document_id, %error, "Forwarded metadata update is unavailable");
+                        return MetadataTransportMessage::ForwardedWriteUnavailable;
+                    }
                 };
             if let Err(error) =
                 authorize_write(context, auth.clone(), record.permission_path.clone()).await
             {
-                return reject(error);
+                return forward_auth_error(error);
             }
             let operation = UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
                 actor: Actor {
@@ -368,12 +848,18 @@ pub(crate) async fn apply_forwarded_write(
             let record =
                 match held_record(context, &config, net_handle.node_id(), document_id).await {
                     Ok(record) => record,
-                    Err(error) => return reject(error),
+                    Err(HeldRecordError::NotFound) => {
+                        return MetadataTransportMessage::ForwardedWriteNotFound;
+                    }
+                    Err(HeldRecordError::Unavailable(error)) => {
+                        warn!(%document_id, %error, "Forwarded metadata delete is unavailable");
+                        return MetadataTransportMessage::ForwardedWriteUnavailable;
+                    }
                 };
             if let Err(error) =
                 authorize_write(context, auth.clone(), record.permission_path.clone()).await
             {
-                return reject(error);
+                return forward_auth_error(error);
             }
             let operation = DeleteMetadataDocumentOperation::new(
                 Actor {
@@ -396,21 +882,136 @@ pub(crate) async fn apply_forwarded_write(
     }
 }
 
-fn forwarded_create_replay(
-    record: MetadataRegistryRecord,
+fn routed_record_matches(
+    config: &RealmConfigDocument,
     realm_id: RealmId,
-    group_id: Ulid,
-    normalized_document_path: &str,
-) -> MetadataTransportMessage {
-    if record.realm_id == realm_id
-        && record.group_id == group_id
-        && record.document_path == normalized_document_path
+    document_id: Ulid,
+    placement: &PlacementRef,
+    record: &MetadataRegistryRecord,
+) -> bool {
+    record.realm_id == realm_id
+        && record.document_id == document_id
+        && record.placement == *placement
+        && record.graph_iri == MetadataRegistryRecord::graph_iri_for(document_id)
+        && record.permission_path
+            == MetadataRegistryRecord::permission_path_for(
+                &realm_id,
+                record.group_id,
+                &record.document_path,
+                document_id,
+            )
+        && resolve_metadata_id(config, realm_id, Some(record.group_id), record.document_id)
+            .is_ok_and(|resolved| resolved == *placement)
+}
+
+fn create_record_matches(
+    config: &CreateMetadataDocumentConfig,
+    document_id: Ulid,
+    placement: &PlacementRef,
+    record: &MetadataRegistryRecord,
+) -> bool {
+    let normalized_path = MetadataRegistryRecord::normalize_document_path(&config.document_path);
+    record.realm_id == config.actor.realm_id
+        && record.group_id == config.group_id
+        && record.document_id == document_id
+        && record.document_path == normalized_path
+        && record.graph_iri == MetadataRegistryRecord::graph_iri_for(document_id)
+        && record.permission_path
+            == MetadataRegistryRecord::permission_path_for(
+                &config.actor.realm_id,
+                config.group_id,
+                &normalized_path,
+                document_id,
+            )
+        && record.placement == *placement
+        && record.public == config.public
+}
+
+fn update_record_matches(
+    expected: &MetadataRegistryRecord,
+    actual: &MetadataRegistryRecord,
+) -> bool {
+    expected.realm_id == actual.realm_id
+        && expected.group_id == actual.group_id
+        && expected.document_id == actual.document_id
+        && expected.document_path == actual.document_path
+        && expected.graph_iri == actual.graph_iri
+        && expected.permission_path == actual.permission_path
+        && expected.placement == actual.placement
+        && expected.created_at_ms == actual.created_at_ms
+        && expected.establishing_event_id == actual.establishing_event_id
+}
+
+fn holds_metadata_id(
+    config: &RealmConfigDocument,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    document_id: Ulid,
+) -> bool {
+    resolve_metadata_id(config, realm_id, None, document_id)
+        .is_ok_and(|placement| holds_placement(config, &placement, local_node_id))
+}
+
+fn read_error(error: MetadataApiError) -> MetadataReadError {
+    match error {
+        MetadataApiError::Unauthorized => MetadataReadError::Unauthorized,
+        MetadataApiError::Forbidden => MetadataReadError::Forbidden,
+        MetadataApiError::NotFound => MetadataReadError::NotFound,
+        MetadataApiError::BadRequest
+        | MetadataApiError::ServiceUnavailable
+        | MetadataApiError::InvalidCursor(_)
+        | MetadataApiError::Internal(_) => MetadataReadError::Unavailable,
+    }
+}
+
+async fn forwarded_create_replay(
+    context: &Arc<DriverContext>,
+    config: &CreateMetadataDocumentConfig,
+) -> Result<Option<MetadataTransportMessage>, String> {
+    let Some(record) = existing_record(context, config.document_id).await? else {
+        return Ok(None);
+    };
+    let accepted = accepted_create(context, config.document_id)
+        .await?
+        .ok_or_else(|| "existing metadata document has no create acceptance".to_string())?;
+    if !accepted_create_matches(config, &accepted)
+        || record.realm_id != config.actor.realm_id
+        || record.group_id != config.group_id
+        || record.document_path
+            != MetadataRegistryRecord::normalize_document_path(&config.document_path)
     {
-        MetadataTransportMessage::ForwardedRecord {
-            record: Box::new(record),
+        return Err("forwarded metadata create collides with an existing document".to_string());
+    }
+    Ok(Some(MetadataTransportMessage::ForwardedRecord {
+        record: Box::new(record),
+    }))
+}
+
+async fn accepted_create(
+    context: &Arc<DriverContext>,
+    document_id: Ulid,
+) -> Result<Option<MetadataCreateEventRecord>, String> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+            key: metadata_create_acceptance_key(document_id),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => postcard::from_bytes(&bytes)
+            .map(Some)
+            .map_err(|error| format!("metadata create acceptance decode failed: {error}")),
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(format!("metadata create acceptance read failed: {error}"))
         }
-    } else {
-        reject("forwarded metadata create collides with an existing document")
+        other => Err(format!(
+            "unexpected metadata create acceptance read result: {other:?}"
+        )),
     }
 }
 
@@ -424,24 +1025,36 @@ async fn existing_record(
         .map_err(|error| format!("metadata registry read failed: {error:?}"))
 }
 
-/// The document as this node holds it. A forward is never chained: a node that
-/// is not a holder rejects, so the origin tries the next holder in rank order.
+enum HeldRecordError {
+    NotFound,
+    Unavailable(String),
+}
+
+/// Loads a document only when this node holds its current structured placement.
 async fn held_record(
     context: &Arc<DriverContext>,
     config: &RealmConfigDocument,
     local_node_id: NodeId,
     document_id: Ulid,
-) -> Result<MetadataRegistryRecord, String> {
-    let record = existing_record(context, document_id)
-        .await?
-        .ok_or_else(|| format!("metadata document `{document_id}` not found"))?;
-    match write_route(Some(config), &record.placement, local_node_id) {
-        MetadataWriteRoute::Local => Ok(record),
-        MetadataWriteRoute::Forward(_) => Err(format!(
+) -> Result<MetadataRegistryRecord, HeldRecordError> {
+    let placement = resolve_metadata_id(config, config.realm_id, None, document_id)
+        .map_err(|error| HeldRecordError::Unavailable(error.to_string()))?;
+    if !holds_placement(config, &placement, local_node_id) {
+        return Err(HeldRecordError::Unavailable(format!(
             "node does not hold bucket {}/{} of metadata document `{document_id}`",
-            record.placement.strategy_id, record.placement.shard
-        )),
+            placement.strategy_id, placement.shard
+        )));
     }
+    let record = existing_record(context, document_id)
+        .await
+        .map_err(HeldRecordError::Unavailable)?
+        .ok_or(HeldRecordError::NotFound)?;
+    if !routed_record_matches(config, config.realm_id, document_id, &placement, &record) {
+        return Err(HeldRecordError::Unavailable(
+            "metadata registry record does not match its structured placement".to_string(),
+        ));
+    }
+    Ok(record)
 }
 
 async fn authorize_forwarded_caller(
@@ -449,9 +1062,11 @@ async fn authorize_forwarded_caller(
     peer: NodeId,
     realm_id: RealmId,
     message: &MetadataTransportMessage,
-) -> Result<AuthContext, String> {
+) -> Result<AuthContext, ForwardAuthError> {
     let Some(metadata_handle) = context.metadata_handle.as_ref() else {
-        return Err("forwarded metadata write needs a metadata handle".to_string());
+        return Err(ForwardAuthError::Unavailable(
+            "forwarded metadata write needs a metadata handle".to_string(),
+        ));
     };
     let auth_token = match message {
         MetadataTransportMessage::ForwardCreateDocument { auth_token, .. }
@@ -460,15 +1075,16 @@ async fn authorize_forwarded_caller(
         _ => None,
     };
     let auth = metadata_handle
-        .authorize_remote_peer(peer, auth_token)
+        .authorize_write_peer(peer, auth_token)
         .await
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "forwarded metadata write needs an authenticated caller".to_string())?;
+        .map_err(|error| match error {
+            MetadataWritePeerError::Unauthorized => ForwardAuthError::Unauthorized,
+            MetadataWritePeerError::Unavailable(error) => {
+                ForwardAuthError::Unavailable(error.to_string())
+            }
+        })?;
     if auth.realm_id != realm_id {
-        return Err(format!(
-            "forwarded metadata write carries a token for realm `{}`, not `{realm_id}`",
-            auth.realm_id
-        ));
+        return Err(ForwardAuthError::Forbidden);
     }
     Ok(auth)
 }
@@ -477,7 +1093,7 @@ async fn authorize_write(
     context: &Arc<DriverContext>,
     auth_context: AuthContext,
     path: String,
-) -> Result<(), String> {
+) -> Result<(), ForwardAuthError> {
     match drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context,
@@ -489,10 +1105,14 @@ async fn authorize_write(
     .await
     {
         Ok(true) => Ok(()),
-        Ok(false) => Err(format!(
-            "forwarded metadata write is not permitted on `{path}`"
-        )),
-        Err(error) => Err(error.to_string()),
+        Ok(false) => Err(ForwardAuthError::Forbidden),
+        Err(
+            AuthorizationError::InvalidRealmId
+            | AuthorizationError::InvalidGroupId
+            | AuthorizationError::GroupNotFound
+            | AuthorizationError::AuthDocNotFound,
+        ) => Err(ForwardAuthError::Forbidden),
+        Err(error) => Err(ForwardAuthError::Unavailable(error.to_string())),
     }
 }
 
@@ -500,45 +1120,42 @@ async fn authorize_write(
 /// origin cannot place. Every candidate holds that one bucket, and a forwarded
 /// create stamps exactly it (see `CreateMetadataDocumentOperation::new_forwarded`),
 /// so which candidate answers cannot change where the document lands.
-async fn create_forward_holders(
-    context: &Arc<DriverContext>,
+fn create_forward_holders(
+    realm_config: &RealmConfigDocument,
     config: &CreateMetadataDocumentConfig,
-) -> Vec<NodeId> {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return Vec::new();
-    };
-    let Some(realm_config) = load_realm_config(context, *net_handle.realm_id()).await else {
-        return Vec::new();
-    };
-    let target = DocumentSyncTarget::MetadataDocumentLifecycle {
-        document_id: config.document_id,
-    };
-    let document_path = MetadataRegistryRecord::normalize_document_path(&config.document_path);
-    plan_target_placement(
-        &realm_config,
-        &target,
-        PlacementResolutionContext {
-            group_id: Some(config.group_id),
-            metadata_path: Some(document_path.as_str()),
-        },
+    document_id: Ulid,
+) -> Option<(PlacementRef, Vec<NodeId>)> {
+    let placement = resolve_metadata_id(
+        realm_config,
+        config.actor.realm_id,
+        Some(config.group_id),
+        document_id,
     )
-    .map(|plan| plan.holders)
-    .unwrap_or_default()
+    .ok()?;
+    let holders = resolve_shard_holders(realm_config, &placement);
+    Some((placement, holders))
 }
 
 async fn forward_to_holders(
     context: &Arc<DriverContext>,
     holders: &[NodeId],
     message: MetadataTransportMessage,
+    local_miss: Option<NodeId>,
 ) -> Result<MetadataTransportMessage, MetadataWriteError> {
     let Some(metadata_handle) = context.metadata_handle.as_ref() else {
         return Err(MetadataWriteError::Undeliverable(
             "no metadata handle to forward with".to_string(),
         ));
     };
-    let local_node_id = context.net_handle.as_ref().map(|net| net.node_id());
+    let local_node_id = local_miss.or_else(|| context.net_handle.as_ref().map(|net| net.node_id()));
+    let tracks_not_found = matches!(
+        &message,
+        MetadataTransportMessage::ForwardUpdateDocument { .. }
+            | MetadataTransportMessage::ForwardDeleteDocument { .. }
+    );
 
     let mut failures: Vec<String> = Vec::new();
+    let mut not_found = usize::from(local_miss.is_some());
     for holder in holders
         .iter()
         .filter(|holder| Some(**holder) != local_node_id)
@@ -547,14 +1164,33 @@ async fn forward_to_holders(
             .request_forwarded_write(*holder, message.clone())
             .await
         {
+            Ok(MetadataTransportMessage::ForwardedWriteDenied {
+                error: MetadataWriteAuthError::Unauthorized,
+            }) => return Err(MetadataWriteError::Unauthorized),
+            Ok(MetadataTransportMessage::ForwardedWriteDenied {
+                error: MetadataWriteAuthError::Forbidden,
+            }) => return Err(MetadataWriteError::Forbidden),
+            Ok(MetadataTransportMessage::ForwardedWriteNotFound) if tracks_not_found => {
+                not_found += 1;
+            }
+            Ok(MetadataTransportMessage::ForwardedWriteNotFound) => {
+                failures.push(format!(
+                    "{holder}: holder returned not found for a forwarded create"
+                ));
+            }
+            Ok(MetadataTransportMessage::ForwardedWriteUnavailable) => {
+                failures.push(format!("{holder}: holder placement view is unavailable"));
+            }
             Ok(MetadataTransportMessage::Reject(error)) => {
                 warn!(holder = %holder, error = %error, "Holder rejected a forwarded metadata write");
-                failures.push(format!("{holder}: {error}"));
+                return Err(MetadataWriteError::Undeliverable(format!(
+                    "holder `{holder}` rejected the forwarded metadata write; refusing to replay it: {error}"
+                )));
             }
             Ok(response) => return Ok(response),
             Err(error) => {
                 warn!(holder = %holder, error = %error, "Failed to forward a metadata write to holder");
-                if retry_disposition(&message, error.delivery()) == RetryDisposition::Stop {
+                if retry_disposition(error.delivery()) == RetryDisposition::Stop {
                     return Err(MetadataWriteError::Undeliverable(format!(
                         "forward to holder `{holder}` may have applied the metadata write before failing; refusing to replay it: {error}"
                     )));
@@ -562,6 +1198,10 @@ async fn forward_to_holders(
                 failures.push(format!("{holder}: {error}"));
             }
         }
+    }
+
+    if tracks_not_found && !holders.is_empty() && not_found == holders.len() {
+        return Err(MetadataWriteError::NotFound);
     }
 
     let detail = if failures.is_empty() {
@@ -583,18 +1223,10 @@ enum RetryDisposition {
     Stop,
 }
 
-fn retry_disposition(
-    message: &MetadataTransportMessage,
-    delivery: MetadataRequestDelivery,
-) -> RetryDisposition {
+fn retry_disposition(delivery: MetadataRequestDelivery) -> RetryDisposition {
     match delivery {
         MetadataRequestDelivery::DefinitelyNotSent => RetryDisposition::TryNext,
-        MetadataRequestDelivery::PossiblySent => match message {
-            MetadataTransportMessage::ForwardCreateDocument { .. } => RetryDisposition::TryNext,
-            MetadataTransportMessage::ForwardUpdateDocument { .. }
-            | MetadataTransportMessage::ForwardDeleteDocument { .. } => RetryDisposition::Stop,
-            _ => RetryDisposition::Stop,
-        },
+        MetadataRequestDelivery::PossiblySent => RetryDisposition::Stop,
     }
 }
 
@@ -609,10 +1241,49 @@ fn reject(error: impl Into<String>) -> MetadataTransportMessage {
     MetadataTransportMessage::Reject(error.into())
 }
 
+fn forwarded_unavailable(message: &MetadataTransportMessage) -> MetadataTransportMessage {
+    match message {
+        MetadataTransportMessage::ForwardReadDocument { .. } => {
+            MetadataTransportMessage::ForwardedRead {
+                result: Err(MetadataReadError::Unavailable),
+            }
+        }
+        MetadataTransportMessage::ForwardCreateDocument { .. }
+        | MetadataTransportMessage::ForwardUpdateDocument { .. }
+        | MetadataTransportMessage::ForwardDeleteDocument { .. } => {
+            MetadataTransportMessage::ForwardedWriteUnavailable
+        }
+        _ => reject("unexpected forwarded metadata message"),
+    }
+}
+
+enum ForwardAuthError {
+    Unauthorized,
+    Forbidden,
+    Unavailable(String),
+}
+
+fn forward_auth_error(error: ForwardAuthError) -> MetadataTransportMessage {
+    match error {
+        ForwardAuthError::Unauthorized => MetadataTransportMessage::ForwardedWriteDenied {
+            error: MetadataWriteAuthError::Unauthorized,
+        },
+        ForwardAuthError::Forbidden => MetadataTransportMessage::ForwardedWriteDenied {
+            error: MetadataWriteAuthError::Forbidden,
+        },
+        ForwardAuthError::Unavailable(error) => {
+            warn!(%error, "Forwarded metadata authorization is unavailable");
+            MetadataTransportMessage::ForwardedWriteUnavailable
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{PlacementStrategy, RealmNodeKind};
+    use aruna_core::structs::{METADATA_HANDLE, PlacementStrategy, RealmNodeKind};
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
+    use aruna_core::{MetaResourceId, StructuredId};
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -715,45 +1386,131 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_mutations_stop() {
-        let update = MetadataTransportMessage::ForwardUpdateDocument {
-            auth_token: None,
-            document_id: Ulid::nil(),
-            public: None,
-            mutation: UpdateMetadataDocumentMutation::UpsertDataEntity {
-                jsonld: "{}".to_string(),
-            },
-        };
-        let delete = MetadataTransportMessage::ForwardDeleteDocument {
-            auth_token: None,
-            document_id: Ulid::nil(),
-        };
-        let create = MetadataTransportMessage::ForwardCreateDocument {
-            auth_token: None,
-            group_id: Ulid::nil(),
-            document_id: Ulid::nil(),
-            document_path: "datasets/forwarded".to_string(),
-            public: false,
-            payload: crate::create_metadata_document::CreateMetadataDocumentPayload::RoCrate {
-                jsonld: "{}".to_string(),
-            },
+    fn ambiguous_delivery_stops() {
+        assert_eq!(
+            retry_disposition(MetadataRequestDelivery::PossiblySent),
+            RetryDisposition::Stop
+        );
+        assert_eq!(
+            retry_disposition(MetadataRequestDelivery::DefinitelyNotSent),
+            RetryDisposition::TryNext
+        );
+    }
+
+    #[test]
+    fn nonholder_read_rejected() {
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.seed_default_placement();
+        for seed in 1..=4u8 {
+            config.ensure_node(node(seed), RealmNodeKind::Server);
+        }
+        let document_id = MetaResourceId::from_parts(
+            1,
+            PlacementHandle::new(METADATA_HANDLE).unwrap(),
+            BucketId::new(9).unwrap(),
+            1,
+        )
+        .unwrap()
+        .as_ulid();
+        let placement = resolve_metadata_id(&config, realm_id, None, document_id).unwrap();
+        let holders = resolve_shard_holders(&config, &placement);
+        let outsider = (1..=4u8)
+            .map(node)
+            .find(|candidate| !holders.contains(candidate))
+            .unwrap();
+
+        assert!(!holds_metadata_id(&config, realm_id, outsider, document_id));
+    }
+
+    #[test]
+    fn response_records_checked() {
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let group_id = Ulid::from_bytes([3u8; 16]);
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.seed_default_placement();
+        let document_id = MetaResourceId::from_parts(
+            1,
+            PlacementHandle::new(METADATA_HANDLE).unwrap(),
+            BucketId::new(9).unwrap(),
+            1,
+        )
+        .unwrap()
+        .as_ulid();
+        let placement =
+            resolve_metadata_id(&config, realm_id, Some(group_id), document_id).unwrap();
+        let record = MetadataRegistryRecord {
+            realm_id,
+            group_id,
+            document_id,
+            document_path: "docs/one".to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: true,
+            permission_path: MetadataRegistryRecord::permission_path_for(
+                &realm_id,
+                group_id,
+                "docs/one",
+                document_id,
+            ),
+            placement,
+            holder_node_ids: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            establishing_event_id: Ulid::from_bytes([4u8; 16]),
+            last_event_id: Ulid::from_bytes([4u8; 16]),
         };
 
-        assert_eq!(
-            retry_disposition(&update, MetadataRequestDelivery::PossiblySent),
-            RetryDisposition::Stop
-        );
-        assert_eq!(
-            retry_disposition(&delete, MetadataRequestDelivery::PossiblySent),
-            RetryDisposition::Stop
-        );
-        assert_eq!(
-            retry_disposition(&update, MetadataRequestDelivery::DefinitelyNotSent),
-            RetryDisposition::TryNext
-        );
-        assert_eq!(
-            retry_disposition(&create, MetadataRequestDelivery::PossiblySent),
-            RetryDisposition::TryNext
-        );
+        assert!(routed_record_matches(
+            &config,
+            realm_id,
+            document_id,
+            &placement,
+            &record,
+        ));
+        let mut substituted = record.clone();
+        substituted.document_id = Ulid::from_bytes([5u8; 16]);
+        assert!(!routed_record_matches(
+            &config,
+            realm_id,
+            document_id,
+            &placement,
+            &substituted,
+        ));
+
+        let create = CreateMetadataDocumentConfig {
+            actor: Actor {
+                node_id: node(1),
+                user_id: aruna_core::UserId::local(Ulid::from_bytes([6u8; 16]), realm_id),
+                realm_id,
+            },
+            group_id,
+            document_id: Ulid::nil(),
+            document_path: "/docs/one/".to_string(),
+            public: true,
+            payload: crate::create_metadata_document::CreateMetadataDocumentPayload::Scaffold {
+                name: "one".to_string(),
+                description: String::new(),
+                date_published: "2026-01-01".to_string(),
+                license: None,
+            },
+        };
+        assert!(create_record_matches(
+            &create,
+            document_id,
+            &placement,
+            &record
+        ));
+        let mut moved = record.clone();
+        moved.placement.shard += 1;
+        assert!(!create_record_matches(
+            &create,
+            document_id,
+            &placement,
+            &moved
+        ));
+
+        let mut changed = record.clone();
+        changed.document_path = "docs/two".to_string();
+        assert!(!update_record_matches(&record, &changed));
     }
 }

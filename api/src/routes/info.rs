@@ -6,11 +6,13 @@ use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::{
-    Actor, AuthContext, GroupQuotaOverride, Permission, QuotaConfig, UserGroupCapOverride,
+    Actor, AuthContext, GroupQuotaOverride, Permission, PlacementScope, QuotaConfig,
+    UserGroupCapOverride,
 };
 use aruna_core::structs::{BackendRef, USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
 use aruna_core::structs::{RealmConfigDocument, RealmNodeKind};
+use aruna_operations::allocate_handle::{HandleAllocationError, provision_metadata_binding};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{backend_used_bytes, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
@@ -454,6 +456,7 @@ pub enum RealmPlacementDocumentClass {
     User,
     Metadata,
     MetadataRegistry,
+    JobControl,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -487,6 +490,18 @@ pub enum RealmPlacementMutationRequest {
     },
     RemoveOverride {
         subject: String,
+    },
+    ProvisionMetadataBinding {
+        strategy_id: String,
+        group_id: Option<String>,
+    },
+}
+
+enum RealmPlacementAction {
+    Mutation(RealmPlacementMutation),
+    Provision {
+        strategy_id: Ulid,
+        group_id: Option<Ulid>,
     },
 }
 
@@ -633,6 +648,7 @@ impl From<aruna_core::structs::DocumentClass> for RealmPlacementDocumentClass {
             aruna_core::structs::DocumentClass::User => Self::User,
             aruna_core::structs::DocumentClass::Metadata => Self::Metadata,
             aruna_core::structs::DocumentClass::MetadataRegistry => Self::MetadataRegistry,
+            aruna_core::structs::DocumentClass::JobControl => Self::JobControl,
         }
     }
 }
@@ -645,6 +661,7 @@ impl From<RealmPlacementDocumentClass> for aruna_core::structs::DocumentClass {
             RealmPlacementDocumentClass::User => Self::User,
             RealmPlacementDocumentClass::Metadata => Self::Metadata,
             RealmPlacementDocumentClass::MetadataRegistry => Self::MetadataRegistry,
+            RealmPlacementDocumentClass::JobControl => Self::JobControl,
         }
     }
 }
@@ -675,8 +692,8 @@ impl RealmPlacementOverride {
 }
 
 impl RealmPlacementMutationRequest {
-    fn into_core(self) -> ServerResult<RealmPlacementMutation> {
-        Ok(match self {
+    fn into_core(self) -> ServerResult<RealmPlacementAction> {
+        let mutation = match self {
             Self::UpsertStrategy { strategy } => {
                 RealmPlacementMutation::UpsertStrategy(strategy.into_core()?)
             }
@@ -698,7 +715,19 @@ impl RealmPlacementMutationRequest {
             Self::RemoveOverride { subject } => {
                 RealmPlacementMutation::RemoveOverride(parse_subject(&subject)?)
             }
-        })
+            Self::ProvisionMetadataBinding {
+                strategy_id,
+                group_id,
+            } => {
+                return Ok(RealmPlacementAction::Provision {
+                    strategy_id: parse_ulid(&strategy_id, "strategy_id")?,
+                    group_id: group_id
+                        .map(|group_id| parse_ulid(&group_id, "group_id"))
+                        .transpose()?,
+                });
+            }
+        };
+        Ok(RealmPlacementAction::Mutation(mutation))
     }
 }
 
@@ -1054,22 +1083,62 @@ pub async fn mutate_realm_placement(
     let auth = authorize_realm_config_admin(&state, auth).await?;
     let Json(request) =
         request.map_err(|error| ServerError::BadRequestReason(error.body_text()))?;
-    let mutation = request.into_core()?;
+    let action = request.into_core()?;
     let actor = Actor {
         node_id: state.get_node_id(),
         user_id: auth.user_id,
         realm_id: auth.realm_id,
     };
-    let document = drive_realm_placement_mutation(
-        MutateRealmPlacementConfig { actor, mutation },
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(map_mutate_realm_placement_error)?;
+    let context = state.get_ctx();
+    let document = match action {
+        RealmPlacementAction::Mutation(mutation) => {
+            drive_realm_placement_mutation(MutateRealmPlacementConfig { actor, mutation }, &context)
+                .await
+                .map_err(map_mutate_realm_placement_error)?
+        }
+        RealmPlacementAction::Provision {
+            strategy_id,
+            group_id,
+        } => {
+            let scope = group_id
+                .map(PlacementScope::Group)
+                .unwrap_or(PlacementScope::Realm(actor.realm_id));
+            provision_metadata_binding(context.as_ref(), actor.clone(), scope, strategy_id)
+                .await
+                .map_err(map_handle_error)?;
+            drive(GetRealmConfigOperation::new(actor.realm_id), &context)
+                .await
+                .map_err(|error| match error {
+                    aruna_operations::get_realm_config::GetRealmConfigError::DocumentNotFound => {
+                        ServerError::NotFound
+                    }
+                    other => ServerError::InternalError(other.to_string()),
+                })?
+        }
+    };
     Ok((
         StatusCode::OK,
         Json(RealmPlacementConfigResponse::from_document(&document)),
     ))
+}
+
+fn map_handle_error(error: HandleAllocationError) -> ServerError {
+    match error {
+        HandleAllocationError::StrategyNotFound(strategy_id) => ServerError::BadRequestReason(
+            format!("placement strategy {strategy_id} does not exist"),
+        ),
+        HandleAllocationError::PlacementHandleExhausted { .. } => {
+            ServerError::Conflict("placement handle space is exhausted".to_string())
+        }
+        HandleAllocationError::Append(error) => map_mutate_realm_placement_error(error),
+        HandleAllocationError::ReadConfig(
+            aruna_operations::get_realm_config::GetRealmConfigError::DocumentNotFound,
+        ) => ServerError::NotFound,
+        HandleAllocationError::Storage(StorageError::TransactionConflict) => {
+            ServerError::Conflict("concurrent placement provisioning conflict; retry".to_string())
+        }
+        other => ServerError::InternalError(other.to_string()),
+    }
 }
 
 fn map_mutate_realm_placement_error(error: MutateRealmPlacementError) -> ServerError {
@@ -1626,6 +1695,7 @@ fn protocol_name(alpn: Option<Alpn>) -> Option<String> {
         Alpn::NativeReference => "native_reference".to_string(),
         Alpn::Notification => "notification".to_string(),
         Alpn::Shard => "shard".to_string(),
+        Alpn::JobControl => "job_control".to_string(),
     })
 }
 
@@ -1660,7 +1730,10 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::errors::StorageError;
     use aruna_core::keys::generate_signing_key;
-    use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, QuotaConfig, RealmId};
+    use aruna_core::structs::{
+        Actor, AuthContext, DocumentClass, NodeCapabilities, PlacementScope, QuotaConfig, RealmId,
+    };
+    use aruna_operations::allocate_handle::allocate_placement_binding;
     use aruna_operations::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
@@ -2085,6 +2158,7 @@ mod tests {
                 holder_node_ids: Vec::new(),
                 created_at_ms: 1,
                 updated_at_ms: 1,
+                establishing_event_id: Ulid::nil(),
                 last_event_id: Ulid::nil(),
             };
             writes.extend(metadata_registry_write_entries(&record).unwrap());
@@ -2269,6 +2343,18 @@ mod tests {
         }
     }
 
+    async fn provision_strategy(state: &ServerState, actor: Actor, strategy_id: Ulid) {
+        allocate_placement_binding(
+            state.get_ctx().as_ref(),
+            actor.clone(),
+            PlacementScope::Realm(actor.realm_id),
+            DocumentClass::Metadata,
+            strategy_id,
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn realm_placement_admin_endpoints_require_auth_and_management_node() {
         let (state, realm_id, _admin, _tempdir) = setup_management_state().await;
@@ -2320,10 +2406,29 @@ mod tests {
         let scope = RealmPlacementBindingScope::Realm;
         let node_id = state.get_node_id().to_string();
 
-        for request in [
-            RealmPlacementMutationRequest::UpsertStrategy {
+        let (_status, _body) = mutate_realm_placement(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Ok(Json(RealmPlacementMutationRequest::UpsertStrategy {
                 strategy: placement_strategy(strategy_id),
-            },
+            })),
+        )
+        .await
+        .unwrap();
+        let _ = mutate_realm_placement(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Ok(Json(
+                RealmPlacementMutationRequest::ProvisionMetadataBinding {
+                    strategy_id: strategy_id.to_string(),
+                    group_id: None,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+
+        for request in [
             RealmPlacementMutationRequest::SetDefaultStrategy {
                 strategy_id: strategy_id.to_string(),
             },
@@ -2388,9 +2493,6 @@ mod tests {
             RealmPlacementMutationRequest::SetDefaultStrategy {
                 strategy_id: initial_default,
             },
-            RealmPlacementMutationRequest::RemoveStrategy {
-                strategy_id: strategy_id.to_string(),
-            },
         ] {
             let (_status, _body) = mutate_realm_placement(
                 State(state.clone()),
@@ -2401,11 +2503,22 @@ mod tests {
             .unwrap();
         }
 
+        let error = mutate_realm_placement(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Ok(Json(RealmPlacementMutationRequest::RemoveStrategy {
+                strategy_id: strategy_id.to_string(),
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ServerError::Conflict(message) if message.contains("referenced")));
+
         let (_, Json(stored)) = get_realm_placement(State(state), Extension(Some(auth)))
             .await
             .unwrap();
         assert!(
-            !stored
+            stored
                 .strategies
                 .iter()
                 .any(|strategy| strategy.strategy_id == strategy_id.to_string())
@@ -2425,22 +2538,34 @@ mod tests {
         let auth = admin_auth(realm_id, admin);
         let strategy_id = Ulid::from_bytes([24; 16]);
 
-        for request in [
-            RealmPlacementMutationRequest::UpsertStrategy {
+        let (_status, _body) = mutate_realm_placement(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Ok(Json(RealmPlacementMutationRequest::UpsertStrategy {
                 strategy: placement_strategy(strategy_id),
+            })),
+        )
+        .await
+        .unwrap();
+        provision_strategy(
+            state.as_ref(),
+            Actor {
+                node_id: state.get_node_id(),
+                user_id: admin,
+                realm_id,
             },
-            RealmPlacementMutationRequest::SetDefaultStrategy {
+            strategy_id,
+        )
+        .await;
+        let (_status, _body) = mutate_realm_placement(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Ok(Json(RealmPlacementMutationRequest::SetDefaultStrategy {
                 strategy_id: strategy_id.to_string(),
-            },
-        ] {
-            let _ = mutate_realm_placement(
-                State(state.clone()),
-                Extension(Some(auth.clone())),
-                Ok(Json(request)),
-            )
-            .await
-            .unwrap();
-        }
+            })),
+        )
+        .await
+        .unwrap();
 
         let (_, Json(info)) = get_realm_info(State(state.clone()), Extension(Some(auth.clone())))
             .await
@@ -2510,6 +2635,10 @@ mod tests {
                     excluded: Vec::new(),
                     strategy_id: Some(missing.to_string()),
                 },
+            },
+            RealmPlacementMutationRequest::ProvisionMetadataBinding {
+                strategy_id: missing.to_string(),
+                group_id: None,
             },
         ] {
             assert!(matches!(

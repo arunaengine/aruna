@@ -1688,13 +1688,12 @@ impl OperationsTaskHandler {
         if !self.jobs_runtime.is_started() {
             return;
         }
-        let Some(net_handle) = self.context.net_handle.as_ref() else {
+        let Some(owner_node_id) = self.context.net_handle.as_ref().map(|net| net.node_id()) else {
             warn!(task_id = ?TaskKey::DrainJobQueue, "Cannot drain job queue without net handle");
             self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
                 .await;
             return;
         };
-        let node_id = net_handle.node_id();
         let Some(claim_producer) = self.jobs_runtime.claim_producer().await else {
             return;
         };
@@ -1712,7 +1711,7 @@ impl OperationsTaskHandler {
         let reconciler = self.jobs_runtime.reconciler();
         let result = match process_job_queue_batch(
             &self.context.storage_handle,
-            node_id,
+            owner_node_id,
             budget,
             reconciler.as_ref(),
         )
@@ -2133,9 +2132,10 @@ mod tests {
     use aruna_core::metadata::{MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord};
     use aruna_core::storage_entries::notification_outbox_write_entry;
     use aruna_core::structs::{
-        Actor, JobId, JobPayload, JobRecord, JobState, NotificationClass, NotificationKind,
-        NotificationOutboxRecord, RealmConfigDocument, RealmId, RealmNodeKind,
+        Actor, FIRST_GRANTABLE_HANDLE, JobId, JobPayload, JobRecord, JobState, NotificationClass,
+        NotificationKind, NotificationOutboxRecord, RealmConfigDocument, RealmId, RealmNodeKind,
     };
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
@@ -2146,6 +2146,14 @@ mod tests {
     use ulid::Ulid;
 
     use crate::notifications::outbox::new_notification_outbox_record;
+
+    fn job_id() -> JobId {
+        crate::jobs::submit::mint_job_id(
+            PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
+            BucketId::new(0).unwrap(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn blocked_batch_waits() {
@@ -2234,7 +2242,7 @@ mod tests {
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
         });
-        let job_id = JobId::new();
+        let job_id = job_id();
         let record = JobRecord::new(
             job_id,
             JobPayload::Probe {

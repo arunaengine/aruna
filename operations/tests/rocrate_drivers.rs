@@ -19,11 +19,12 @@ use aruna_core::keyspaces::{
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     Actor, AuthContext, Backend, BackendConfig, BucketInfo, ExportRoCrateSpec,
-    GroupAuthorizationDocument, ImportMetadataTarget, ImportReportRow, ImportRoCrateSource,
-    ImportRoCrateSpec, ImportRoCrateTarget, JobId, JobPayload, JobRecord, JobResultPayload,
-    MetadataRegistryRecord, PathRestriction, Permission, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId, RealmNodeKind, ReasonCode, RoCrateLimits, RoCrateMediaType,
-    RoCrateUploadRecord, RoutingSnapshot, SourceConnectorKind, VersionKey,
+    FIRST_GRANTABLE_HANDLE, GroupAuthorizationDocument, ImportMetadataTarget, ImportReportRow,
+    ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobId, JobPayload, JobRecord,
+    JobResultPayload, MetadataRegistryRecord, PathRestriction, Permission,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, ReasonCode,
+    RoCrateLimits, RoCrateMediaType, RoCrateUploadRecord, RoutingSnapshot, SourceConnectorKind,
+    VersionKey,
 };
 use aruna_core::types::{GroupId, UserId};
 use aruna_core::util::unix_timestamp_millis;
@@ -39,6 +40,7 @@ use aruna_operations::jobs::service::read_artifact_range;
 use aruna_operations::jobs::store::{
     ClaimOutcome, claim_job, insert_job, list_job_entries, release_job, transition_to_running,
 };
+use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
@@ -61,6 +63,25 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
+
+use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::{MetaResourceId, StructuredId};
+
+/// A fixed structured id (handle 1, bucket 0). The single-node import fixture
+/// holds every bucket, so bucket 0 is always held and the create resolves.
+fn doc_id(seed: u64) -> Ulid {
+    MetaResourceId::try_from((1u128 << 60) | u128::from(seed))
+        .unwrap()
+        .as_ulid()
+}
+
+fn job_id() -> JobId {
+    mint_job_id(
+        PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
+        BucketId::new(0).unwrap(),
+    )
+    .unwrap()
+}
 
 const ELABFTW: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -128,10 +149,10 @@ impl StorageGate {
 #[tokio::test]
 async fn drivers_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = build_fixture(false).await?;
-    let document_id = Ulid::generate();
+    let document_id = doc_id(1);
     let upload_id = create_upload(&fixture, crate_archive().await?).await?;
     let import = import_spec(&fixture, upload_id, document_id);
-    let import_job = JobId::new();
+    let import_job = job_id();
     let import_context = claim_context(
         &fixture,
         import_job,
@@ -162,7 +183,7 @@ async fn drivers_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
         document_id,
         limits: RoCrateLimits::default(),
     };
-    let export_job = JobId::new();
+    let export_job = job_id();
     let export_context = claim_context(
         &fixture,
         export_job,
@@ -191,10 +212,10 @@ async fn drivers_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
 async fn imports_eln_export() -> Result<(), Box<dyn std::error::Error>> {
     // The eLabFTW export identifies its folders and files with literal spaces.
     let fixture = build_fixture(false).await?;
-    let document_id = Ulid::generate();
+    let document_id = doc_id(1);
     let upload_id = upload_media(&fixture, ELABFTW.to_vec(), RoCrateMediaType::Eln).await?;
     let spec = import_spec(&fixture, upload_id, document_id);
-    let job_id = JobId::new();
+    let job_id = job_id();
     let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
     let result = match run_rocrate_import(&context, &spec).await {
         JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) => result,
@@ -235,10 +256,10 @@ async fn imports_eln_export() -> Result<(), Box<dyn std::error::Error>> {
 async fn imports_nested_folders() -> Result<(), Box<dyn std::error::Error>> {
     // Mirrors an ELN export: wrapper directory, doubled separator, spaced ids.
     let fixture = build_fixture(false).await?;
-    let document_id = Ulid::generate();
+    let document_id = doc_id(1);
     let upload_id = upload_media(&fixture, nested_eln().await?, RoCrateMediaType::Eln).await?;
     let spec = import_spec(&fixture, upload_id, document_id);
-    let job_id = JobId::new();
+    let job_id = job_id();
     let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
     let result = match run_rocrate_import(&context, &spec).await {
         JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) => result,
@@ -274,10 +295,10 @@ async fn imports_nested_folders() -> Result<(), Box<dyn std::error::Error>> {
 async fn imports_mixed_encoding() -> Result<(), Box<dyn std::error::Error>> {
     // One entity is encoded and referenced literally; the other is the reverse.
     let fixture = build_fixture(false).await?;
-    let document_id = Ulid::generate();
+    let document_id = doc_id(1);
     let upload_id = create_upload(&fixture, mixed_archive().await?).await?;
     let spec = import_spec(&fixture, upload_id, document_id);
-    let job_id = JobId::new();
+    let job_id = job_id();
     let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
     let result = match run_rocrate_import(&context, &spec).await {
         JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) => result,
@@ -299,10 +320,10 @@ async fn imports_mixed_encoding() -> Result<(), Box<dyn std::error::Error>> {
 async fn rejects_before_writes() -> Result<(), Box<dyn std::error::Error>> {
     // An unreachable file entity must fail the job without touching the bucket.
     let fixture = build_fixture(false).await?;
-    let document_id = Ulid::generate();
+    let document_id = doc_id(1);
     let upload_id = create_upload(&fixture, orphan_archive().await?).await?;
     let spec = import_spec(&fixture, upload_id, document_id);
-    let job_id = JobId::new();
+    let job_id = job_id();
     let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
     let JobRunOutcome::Failed(error) = run_rocrate_import(&context, &spec).await else {
         return Err("orphaned crate was imported".into());
@@ -336,10 +357,10 @@ async fn rollback_removes_writes() -> Result<(), Box<dyn std::error::Error>> {
     let central = zip_offsets(&archive, b"PK\x01\x02")[2];
     write_u32(&mut archive, local + 14, 0);
     write_u32(&mut archive, central + 16, 0);
-    let document_id = Ulid::generate();
+    let document_id = doc_id(1);
     let upload_id = create_upload(&fixture, archive).await?;
     let spec = import_spec(&fixture, upload_id, document_id);
-    let job_id = JobId::new();
+    let job_id = job_id();
     let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
 
     let JobRunOutcome::Failed(error) = run_rocrate_import(&context, &spec).await else {
@@ -378,10 +399,10 @@ async fn resumes_pending_rollback() -> Result<(), Box<dyn std::error::Error>> {
     // A run that dies inside cleanup leaves written versions behind, so the
     // resumed run must load the plan and roll them back.
     let mut fixture = build_fixture(true).await?;
-    let document_id = Ulid::generate();
+    let document_id = doc_id(1);
     let upload_id = create_upload(&fixture, pair_archive().await?).await?;
     let spec = import_spec(&fixture, upload_id, document_id);
-    let job_id = JobId::new();
+    let job_id = job_id();
     let mut first_context =
         claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
     first_context.final_attempt = true;
@@ -496,10 +517,10 @@ async fn report_rows_coexist() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    let document_id = Ulid::generate();
+    let document_id = doc_id(1);
     let upload_id = create_upload(&fixture, archive.close().await?).await?;
     let spec = import_spec(&fixture, upload_id, document_id);
-    let job_id = JobId::new();
+    let job_id = job_id();
     let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
     let JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) =
         run_rocrate_import(&context, &spec).await
@@ -770,12 +791,12 @@ async fn accepts_unicode_path() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn local_denial_omits() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = build_fixture(false).await?;
-    let document_id = Ulid::generate();
+    let document_id = doc_id(1);
     let upload_id = create_upload(&fixture, crate_archive().await?).await?;
     let import = import_spec(&fixture, upload_id, document_id);
     let import_context = claim_context(
         &fixture,
-        JobId::new(),
+        job_id(),
         JobPayload::ImportRoCrate(import.clone()),
     )
     .await?;
@@ -816,7 +837,7 @@ async fn local_denial_omits() -> Result<(), Box<dyn std::error::Error>> {
     };
     let export_context = claim_context(
         &fixture,
-        JobId::new(),
+        job_id(),
         JobPayload::ExportRoCrate(export.clone()),
     )
     .await?;
@@ -839,10 +860,10 @@ async fn local_denial_omits() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn write_restart_dedupes() -> Result<(), Box<dyn std::error::Error>> {
     let mut fixture = build_fixture(true).await?;
-    let document_id = Ulid::generate();
+    let document_id = doc_id(1);
     let upload_id = create_upload(&fixture, crate_archive().await?).await?;
     let spec = import_spec(&fixture, upload_id, document_id);
-    let job_id = JobId::new();
+    let job_id = job_id();
     let first_context =
         claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
     let first_token = first_context.claim_token;
@@ -918,14 +939,14 @@ async fn write_restart_dedupes() -> Result<(), Box<dyn std::error::Error>> {
 async fn object_source_imports() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = build_fixture(false).await?;
     let source_version = put_object(&fixture, SOURCE_KEY, crate_archive().await?).await?;
-    let document_id = Ulid::generate();
+    let document_id = doc_id(1);
     let source = ImportRoCrateSource::Object {
         bucket: BUCKET.to_string(),
         key: SOURCE_KEY.to_string(),
         version: Some(source_version.version_id),
     };
     let spec = spec_with_source(&fixture, source, document_id);
-    let job_id = JobId::new();
+    let job_id = job_id();
     let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
 
     let JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) =
@@ -946,7 +967,7 @@ async fn object_source_imports() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("imported report row is missing")?;
     assert_eq!(imported.code, ReasonCode::Imported);
     assert_eq!(imported.detail.version_id, Some(versions[0]));
-    assert_eq!(hidden_count(&fixture, job_id.0).await?, 0);
+    assert_eq!(hidden_count(&fixture, job_id.as_ulid()).await?, 0);
 
     fixture.stop().await;
     Ok(())
@@ -958,19 +979,15 @@ async fn object_source_pins() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = build_fixture(false).await?;
     let pinned = put_object(&fixture, SOURCE_KEY, crate_archive().await?).await?;
     put_object(&fixture, SOURCE_KEY, b"corrupted archive bytes".to_vec()).await?;
-    let document_id = Ulid::generate();
+    let document_id = doc_id(1);
     let source = ImportRoCrateSource::Object {
         bucket: BUCKET.to_string(),
         key: SOURCE_KEY.to_string(),
         version: Some(pinned.version_id),
     };
     let spec = spec_with_source(&fixture, source, document_id);
-    let context = claim_context(
-        &fixture,
-        JobId::new(),
-        JobPayload::ImportRoCrate(spec.clone()),
-    )
-    .await?;
+    let context =
+        claim_context(&fixture, job_id(), JobPayload::ImportRoCrate(spec.clone())).await?;
 
     let JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) =
         run_rocrate_import(&context, &spec).await
@@ -989,14 +1006,14 @@ async fn connector_source_imports() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = build_fixture(false).await?;
     let (address, server) = serve_archive(crate_archive().await?).await?;
     let connector_id = create_connector(&fixture, &format!("http://{address}")).await?;
-    let document_id = Ulid::generate();
+    let document_id = doc_id(1);
     let source = ImportRoCrateSource::Connector {
         group_id: fixture.group_id,
         connector_id,
         path: "crate.zip".to_string(),
     };
     let spec = spec_with_source(&fixture, source, document_id);
-    let job_id = JobId::new();
+    let job_id = job_id();
     let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
 
     let outcome = run_rocrate_import(&context, &spec).await;
@@ -1013,7 +1030,7 @@ async fn connector_source_imports() -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err("connector-source import did not succeed".into()),
     }
     assert_eq!(object_versions(&fixture, TARGET_KEY).await?.len(), 1);
-    assert_eq!(hidden_count(&fixture, job_id.0).await?, 0);
+    assert_eq!(hidden_count(&fixture, job_id.as_ulid()).await?, 0);
 
     fixture.stop().await;
     Ok(())
@@ -1023,14 +1040,14 @@ async fn connector_source_imports() -> Result<(), Box<dyn std::error::Error>> {
 async fn cancel_mid_write() -> Result<(), Box<dyn std::error::Error>> {
     // Cancelling after the first payload commits must freeze the remaining entries.
     let mut fixture = build_fixture(true).await?;
-    let document_id = Ulid::generate();
+    let document_id = doc_id(1);
     let upload_id = create_upload(&fixture, pair_archive().await?).await?;
     let spec = spec_with_source(
         &fixture,
         ImportRoCrateSource::Upload { upload_id },
         document_id,
     );
-    let job_id = JobId::new();
+    let job_id = job_id();
     let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
     let cancel = context.cancel.clone();
     let mut run = tokio::spawn({
@@ -1515,16 +1532,11 @@ async fn run_import(
     archive: Vec<u8>,
     limits: RoCrateLimits,
 ) -> Result<JobRunOutcome, Box<dyn std::error::Error>> {
-    let document_id = Ulid::generate();
+    let document_id = doc_id(1);
     let upload_id = create_upload(fixture, archive).await?;
     let mut spec = import_spec(fixture, upload_id, document_id);
     spec.limits = limits;
-    let context = claim_context(
-        fixture,
-        JobId::new(),
-        JobPayload::ImportRoCrate(spec.clone()),
-    )
-    .await?;
+    let context = claim_context(fixture, job_id(), JobPayload::ImportRoCrate(spec.clone())).await?;
     Ok(run_rocrate_import(&context, &spec).await)
 }
 

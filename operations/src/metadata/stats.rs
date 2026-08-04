@@ -120,6 +120,7 @@ mod tests {
             holder_node_ids: Vec::new(),
             created_at_ms: 1,
             updated_at_ms: 1,
+            establishing_event_id: Ulid::nil(),
             last_event_id: Ulid::nil(),
         }
     }

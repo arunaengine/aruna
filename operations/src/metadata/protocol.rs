@@ -1,80 +1,44 @@
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
-use aruna_core::structs::{MetadataRegistryRecord, RealmId, SyncRelationship};
-use aruna_core::types::{GroupId, UserId};
+use aruna_core::structs::{MetadataRegistryRecord, PathClaimRecord, SyncRelationship};
+use aruna_core::types::GroupId;
 use aruna_net::streams::BiStream;
-use serde::{Deserialize, Deserializer, Serialize};
-use std::fmt;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
 use crate::create_metadata_document::CreateMetadataDocumentPayload;
+use crate::metadata::api::MetadataRoCrateExportView;
 use crate::s3::search_buckets::BucketSearchHit;
 use crate::update_metadata_document::UpdateMetadataDocumentMutation;
 
+pub use aruna_core::metadata::{MetadataAuthToken, MetadataAuthTokenError};
+
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
-pub const MAX_METADATA_BEARER_TOKEN_LEN: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MetadataAuthToken {
-    Bearer(MetadataBearerToken),
-    Internal { user_id: UserId, realm_id: RealmId },
+pub struct MetadataPathCandidate {
+    pub claim: PathClaimRecord,
+    pub record: Option<MetadataRegistryRecord>,
 }
 
-impl MetadataAuthToken {
-    pub fn bearer(token: impl Into<String>) -> Result<Self, MetadataAuthTokenError> {
-        MetadataBearerToken::new(token).map(Self::Bearer)
-    }
-
-    pub fn internal(user_id: UserId, realm_id: RealmId) -> Self {
-        Self::Internal { user_id, realm_id }
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataPathWinner {
+    pub realm_id: aruna_core::structs::RealmId,
+    pub group_id: GroupId,
+    pub document_id: Ulid,
+    pub document_path: String,
+    pub graph_iri: String,
+    pub public: bool,
+    pub replicas: usize,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct MetadataBearerToken(String);
-
-impl MetadataBearerToken {
-    pub fn new(token: impl Into<String>) -> Result<Self, MetadataAuthTokenError> {
-        let token = token.into();
-        if token.len() > MAX_METADATA_BEARER_TOKEN_LEN {
-            return Err(MetadataAuthTokenError {
-                length: token.len(),
-            });
-        }
-        Ok(Self(token))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataPathResolution {
+    pub winner: MetadataPathWinner,
+    pub conflicts: Vec<Ulid>,
 }
-
-impl<'de> Deserialize<'de> for MetadataBearerToken {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let token = String::deserialize(deserializer)?;
-        Self::new(token).map_err(serde::de::Error::custom)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MetadataAuthTokenError {
-    length: usize,
-}
-
-impl fmt::Display for MetadataAuthTokenError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "metadata bearer token length {} exceeds maximum {}",
-            self.length, MAX_METADATA_BEARER_TOKEN_LEN
-        )
-    }
-}
-
-impl std::error::Error for MetadataAuthTokenError {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MetadataTransportMessage {
@@ -102,6 +66,7 @@ pub enum MetadataTransportMessage {
     /// holder re-runs the same permission checks the origin would have run.
     ForwardCreateDocument {
         auth_token: Option<MetadataAuthToken>,
+        config_digest: [u8; 32],
         group_id: GroupId,
         document_id: Ulid,
         document_path: String,
@@ -110,6 +75,7 @@ pub enum MetadataTransportMessage {
     },
     ForwardUpdateDocument {
         auth_token: Option<MetadataAuthToken>,
+        config_digest: [u8; 32],
         document_id: Ulid,
         /// `None` leaves the holder's current visibility untouched: the origin's
         /// record copy may be stale, so only an explicit request value travels.
@@ -118,6 +84,7 @@ pub enum MetadataTransportMessage {
     },
     ForwardDeleteDocument {
         auth_token: Option<MetadataAuthToken>,
+        config_digest: [u8; 32],
         document_id: Ulid,
     },
     ForwardedRecord {
@@ -158,6 +125,75 @@ pub enum MetadataTransportMessage {
     },
     SyncMirrorCreated,
     SyncMirrorDeleted,
+    ForwardReadDocument {
+        auth_token: Option<MetadataAuthToken>,
+        config_digest: [u8; 32],
+        document_id: Ulid,
+    },
+    ForwardedRead {
+        result: Result<Box<MetadataRegistryRecord>, MetadataReadError>,
+    },
+    ForwardPathLookup {
+        auth_token: Option<MetadataAuthToken>,
+        group_id: GroupId,
+        document_path: String,
+        config_digest: [u8; 32],
+    },
+    ForwardedPathLookup {
+        result: Result<Vec<MetadataPathCandidate>, MetadataReadError>,
+    },
+    ForwardedWriteDenied {
+        error: MetadataWriteAuthError,
+    },
+    ForwardPathResolution {
+        auth_token: Option<MetadataAuthToken>,
+        group_id: GroupId,
+        document_path: String,
+        config_digest: [u8; 32],
+    },
+    ForwardedPathResolution {
+        result: Result<Box<MetadataPathResolution>, MetadataReadError>,
+    },
+    ForwardedWriteNotFound,
+    ForwardedWriteUnavailable,
+    /// An RO-Crate export forwarded to a holder with the caller's bearer or
+    /// peer-attested internal principal for another READ check.
+    ForwardExportDocument {
+        auth_token: Option<MetadataAuthToken>,
+        config_digest: [u8; 32],
+        document_id: Ulid,
+        view: MetadataRoCrateExportView,
+        metadata_bytes: u64,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        after: Option<String>,
+    },
+    ForwardedExport {
+        result: Result<u64, MetadataReadError>,
+    },
+    QueryDocument {
+        auth_token: Option<MetadataAuthToken>,
+        config_digest: [u8; 32],
+        document_id: Ulid,
+        sparql: String,
+    },
+    DocumentQueryResults {
+        result: Result<MetadataQueryResults, MetadataReadError>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataReadError {
+    Unauthorized,
+    Forbidden,
+    NotFound,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataWriteAuthError {
+    Unauthorized,
+    Forbidden,
 }
 
 pub async fn write_message(
@@ -219,6 +255,9 @@ pub async fn read_message(stream: &mut BiStream) -> Result<MetadataTransportMess
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::metadata::MAX_METADATA_BEARER_TOKEN_LEN;
+    use aruna_core::structs::{AuthContext, PathRestriction, Permission, RealmId};
+    use aruna_core::types::UserId;
 
     #[test]
     fn transport_messages_use_auth_token_fields() {
@@ -257,6 +296,7 @@ mod tests {
         // unauthenticated internal write path.
         assert_has_auth_token_field(MetadataTransportMessage::ForwardCreateDocument {
             auth_token: Some(MetadataAuthToken::bearer("create-token").unwrap()),
+            config_digest: [0; 32],
             group_id: Ulid::nil(),
             document_id: Ulid::nil(),
             document_path: "datasets/forwarded".to_string(),
@@ -267,6 +307,7 @@ mod tests {
         });
         assert_has_auth_token_field(MetadataTransportMessage::ForwardUpdateDocument {
             auth_token: Some(MetadataAuthToken::bearer("update-token").unwrap()),
+            config_digest: [0; 32],
             document_id: Ulid::nil(),
             public: None,
             mutation: UpdateMetadataDocumentMutation::UpsertDataEntity {
@@ -275,7 +316,18 @@ mod tests {
         });
         assert_has_auth_token_field(MetadataTransportMessage::ForwardDeleteDocument {
             auth_token: Some(MetadataAuthToken::bearer("delete-token").unwrap()),
+            config_digest: [0; 32],
             document_id: Ulid::nil(),
+        });
+        assert_has_auth_token_field(MetadataTransportMessage::ForwardExportDocument {
+            auth_token: Some(MetadataAuthToken::bearer("export-token").unwrap()),
+            config_digest: [0; 32],
+            document_id: Ulid::nil(),
+            view: MetadataRoCrateExportView::Raw,
+            metadata_bytes: 16 * 1024 * 1024,
+            limit: None,
+            offset: None,
+            after: None,
         });
     }
 
@@ -283,6 +335,7 @@ mod tests {
     fn forwarded_create_round_trips() {
         let message = MetadataTransportMessage::ForwardCreateDocument {
             auth_token: Some(MetadataAuthToken::bearer("create-token").unwrap()),
+            config_digest: [0; 32],
             group_id: Ulid::from_bytes([3u8; 16]),
             document_id: Ulid::from_bytes([4u8; 16]),
             document_path: "datasets/forwarded".to_string(),
@@ -293,6 +346,38 @@ mod tests {
                 date_published: "2026-01-01".to_string(),
                 license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             },
+        };
+        let bytes = postcard::to_allocvec(&message).unwrap();
+
+        assert_eq!(
+            postcard::from_bytes::<MetadataTransportMessage>(&bytes).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn path_lookup_roundtrip() {
+        let message = MetadataTransportMessage::ForwardPathLookup {
+            auth_token: Some(MetadataAuthToken::bearer("path-token").unwrap()),
+            group_id: Ulid::from_bytes([3u8; 16]),
+            document_path: "datasets/private".to_string(),
+            config_digest: [4u8; 32],
+        };
+        let bytes = postcard::to_allocvec(&message).unwrap();
+
+        assert_eq!(
+            postcard::from_bytes::<MetadataTransportMessage>(&bytes).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn path_resolution_roundtrip() {
+        let message = MetadataTransportMessage::ForwardPathResolution {
+            auth_token: Some(MetadataAuthToken::bearer("path-token").unwrap()),
+            group_id: Ulid::from_bytes([3u8; 16]),
+            document_path: "datasets/private".to_string(),
+            config_digest: [4u8; 32],
         };
         let bytes = postcard::to_allocvec(&message).unwrap();
 
@@ -345,6 +430,26 @@ mod tests {
             panic!("expected bearer token");
         };
         assert_eq!(bearer.as_str(), "bearer-token");
+    }
+
+    #[test]
+    fn internal_auth_roundtrip() {
+        let realm_id = RealmId([7; 32]);
+        let auth = AuthContext {
+            user_id: UserId::new(Ulid::from_bytes([8; 16]), realm_id),
+            realm_id,
+            path_restrictions: Some(vec![PathRestriction {
+                pattern: format!("/{realm_id}/g/**"),
+                permission: Permission::READ,
+            }]),
+        };
+        let token = MetadataAuthToken::internal(auth);
+        let bytes = postcard::to_allocvec(&token).unwrap();
+
+        assert_eq!(
+            postcard::from_bytes::<MetadataAuthToken>(&bytes).unwrap(),
+            token
+        );
     }
 
     #[test]

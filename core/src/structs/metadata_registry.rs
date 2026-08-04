@@ -22,6 +22,8 @@ pub struct MetadataRegistryRecord {
     pub holder_node_ids: Vec<NodeId>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    /// Immutable event that established this document's path claim.
+    pub establishing_event_id: Ulid,
     pub last_event_id: Ulid,
 }
 

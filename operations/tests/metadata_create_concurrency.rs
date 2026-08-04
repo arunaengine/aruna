@@ -7,7 +7,7 @@ use std::sync::Arc;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::structs::{Actor, RealmConfigDocument, RealmId};
+use aruna_core::structs::{Actor, RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     create_metadata_document,
@@ -69,7 +69,11 @@ async fn concurrent_creates_succeed() -> Result<(), BoxError> {
         user_id: UserId::local(Ulid::generate(), realm_id),
         realm_id,
     };
-    let realm_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    let mut realm_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    // Provision the default strategy + metadata binding the create mints from, and
+    // register the node as a holder so it holds the bucket the id embeds.
+    realm_config.seed_default_placement();
+    realm_config.ensure_node(node_id, RealmNodeKind::Server);
     storage
         .send_storage_effect(StorageEffect::Write {
             key_space: REALM_CONFIG_KEYSPACE.to_string(),
@@ -83,7 +87,6 @@ async fn concurrent_creates_succeed() -> Result<(), BoxError> {
     for index in 0..CONCURRENT_CREATES {
         let context = context.clone();
         handles.push(tokio::spawn(async move {
-            let document_id = Ulid::generate();
             let operation = CreateMetadataDocumentOperation::new_for_generated_document_id(
                 CreateMetadataDocumentConfig {
                     actor: Actor {
@@ -92,7 +95,8 @@ async fn concurrent_creates_succeed() -> Result<(), BoxError> {
                         realm_id,
                     },
                     group_id,
-                    document_id,
+                    // Unminted sentinel: the driver mints a structured id.
+                    document_id: Ulid::nil(),
                     document_path: format!("datasets/concurrent-{index}"),
                     public: true,
                     payload: scaffold(index),

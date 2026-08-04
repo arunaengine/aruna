@@ -533,12 +533,21 @@ mod tests {
     use crate::jobs::store::{insert_job, record_attempt_intent};
     use crate::jobs::workflow::tests::{execution_spec, node_id};
     use aruna_compute::ExecutorRegistry;
-    use aruna_core::structs::{AttemptIntent, JobClaim, JobId, RealmId};
+    use aruna_core::structs::{AttemptIntent, FIRST_GRANTABLE_HANDLE, JobClaim, JobId, RealmId};
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::UserId;
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
     use ulid::Ulid;
+
+    fn job_id() -> JobId {
+        crate::jobs::submit::mint_job_id(
+            PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
+            BucketId::new(0).unwrap(),
+        )
+        .unwrap()
+    }
 
     // A node whose registry lacks the executor cannot observe the container, so no
     // number of sweeps by it may spend an attempt or terminalize the job.
@@ -554,7 +563,7 @@ mod tests {
             task_handle: Some(TaskHandle::new()),
             compute_handle: Some(Arc::new(ExecutorRegistry::new())),
         });
-        let job_id = JobId::new();
+        let job_id = job_id();
         let token = Ulid::generate();
         let mut record = JobRecord::new(
             job_id,

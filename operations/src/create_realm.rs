@@ -10,11 +10,15 @@ use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::admin_document_reducer_state_write_entry;
 use aruna_core::structs::{
-    Actor, NodePlacementEntry, OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument,
-    RealmNodeKind, normalize_node_placement_input,
+    Actor, BandPool, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE,
+    HandleRange, NodePlacementEntry, OidcProviderConfig, PlacementBinding, PlacementScope,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind, band_start,
+    normalize_node_placement_input,
 };
+use aruna_core::structured_id::PlacementHandle;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, Value};
+use aruna_core::util::unix_timestamp_millis;
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -103,7 +107,38 @@ impl CreateRealmOperation {
             RealmConfigDocument::default_for_realm(realm_id, self.config.oidc_providers.clone());
         config_doc.description = self.config.realm_description.clone();
         config_doc.ensure_node(self.config.actor.node_id, RealmNodeKind::Management);
+        // The creating coordinator owns the whole assignable band space as a
+        // self-issued root pool and consumes its own first band before any
+        // other node can onboard.
+        config_doc.band_pools.push(BandPool {
+            pool_id: Ulid::generate(),
+            parent: None,
+            issuer: self.config.actor.node_id,
+            owner: self.config.actor.node_id,
+            start: FIRST_GRANTABLE_HANDLE,
+            end: band_start(HANDLE_BANDS),
+        });
+        let creator_range = HandleRange {
+            range_id: Ulid::generate(),
+            owner: self.config.actor.node_id,
+            start: FIRST_GRANTABLE_HANDLE,
+            end: FIRST_GRANTABLE_HANDLE + HANDLE_RANGE_SIZE,
+        };
+        config_doc.placement_handle_ranges.push(creator_range);
         seed_placement_defaults(&mut config_doc);
+        // The band's reserved first handle is the creator's JobControl handle.
+        config_doc.placement_bindings.push(PlacementBinding {
+            handle: PlacementHandle::new(creator_range.start)
+                .expect("the first grantable handle is allocatable"),
+            scope: PlacementScope::Realm(realm_id),
+            document_class: DocumentClass::JobControl,
+            strategy_id: config_doc
+                .default_strategy_id
+                .expect("seed_default_placement sets a default strategy"),
+            allocator_range_id: Some(creator_range.range_id),
+            allocated_by: Some(self.config.actor.node_id),
+            allocated_at_ms: Some(unix_timestamp_millis()),
+        });
         config_doc
             .placement_map
             .push(self.creating_node_placement_entry()?);
@@ -171,6 +206,18 @@ impl CreateRealmOperation {
             },
         )?;
         let mut config_events = vec![config_node_event];
+        for pool in &config_doc.band_pools {
+            config_events.push(config_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigBandPoolAssigned { pool: *pool },
+            )?);
+        }
+        for range in &config_doc.placement_handle_ranges {
+            config_events.push(config_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigHandleRangeGranted { range: *range },
+            )?);
+        }
         let mut oidc_providers = self.config.oidc_providers.clone();
         oidc_providers.sort_by(|left, right| left.id.cmp(&right.id));
         for provider in oidc_providers {
@@ -197,6 +244,14 @@ impl CreateRealmOperation {
                 &self.config.actor,
                 AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
                     strategy: strategy.clone(),
+                },
+            )?);
+        }
+        for binding in &config_doc.placement_bindings {
+            config_events.push(config_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                    binding: binding.clone(),
                 },
             )?);
         }
@@ -696,6 +751,7 @@ mod test {
         let seeded_strategies = config_doc.strategies.clone();
         let seeded_default_strategy_id = config_doc.default_strategy_id.unwrap();
         let seeded_bindings = config_doc.strategy_bindings.clone();
+        let seeded_placements = config_doc.placement_bindings.clone();
         assert_eq!(seeded_strategies.len(), 2);
         assert_eq!(seeded_strategies[0].name, "default");
         assert_eq!(seeded_strategies[0].replica_count, Some(3));
@@ -706,6 +762,7 @@ mod test {
             Some(seeded_strategies[0].strategy_id)
         );
         assert_eq!(seeded_bindings.len(), 4);
+        assert_eq!(seeded_placements.len(), 2);
         assert_eq!(
             config_state.materialized_realm_config_default_strategy(),
             Some(seeded_default_strategy_id)
@@ -722,13 +779,13 @@ mod test {
                 .len(),
             4
         );
+        assert_eq!(config_state.materialized_placement_bindings().len(), 2);
 
         let outbox_records = write_values(writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)
             .into_iter()
             .map(|value| postcard::from_bytes::<DocumentSyncOutboxRecord>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
-        // Two more than the strategies alone: the group and user class bindings.
-        assert_eq!(outbox_records.len(), 14);
+        assert_eq!(outbox_records.len(), 18);
         assert!(outbox_records.iter().any(|record| {
             record.target == DocumentSyncTarget::RealmAuthorization { realm_id }
                 && matches!(
@@ -772,73 +829,97 @@ mod test {
                 ),
                 (
                     2,
+                    AdminDocumentOperation::RealmConfigBandPoolAssigned {
+                        pool: config_doc.band_pools[0],
+                    },
+                ),
+                (
+                    3,
+                    AdminDocumentOperation::RealmConfigHandleRangeGranted {
+                        range: config_doc.placement_handle_ranges[0],
+                    },
+                ),
+                (
+                    4,
                     AdminDocumentOperation::RealmConfigOidcProviderUpserted {
                         provider: alpha_provider,
                     },
                 ),
                 (
-                    3,
+                    5,
                     AdminDocumentOperation::RealmConfigOidcProviderUpserted {
                         provider: beta_provider,
                     },
                 ),
                 (
-                    4,
+                    6,
                     AdminDocumentOperation::RealmConfigSettingsSet {
                         metadata_replication: config_doc.metadata_replication,
                         discovery: config_doc.discovery,
                     },
                 ),
                 (
-                    5,
+                    7,
                     AdminDocumentOperation::RealmConfigDescriptionSet {
                         description: config_doc.description,
                     },
                 ),
                 (
-                    6,
+                    8,
                     AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
                         strategy: seeded_strategies[0].clone(),
                     },
                 ),
                 (
-                    7,
+                    9,
                     AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
                         strategy: seeded_strategies[1].clone(),
                     },
                 ),
                 (
-                    8,
+                    10,
+                    AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                        binding: seeded_placements[0].clone(),
+                    },
+                ),
+                (
+                    11,
+                    AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                        binding: seeded_placements[1].clone(),
+                    },
+                ),
+                (
+                    12,
                     AdminDocumentOperation::RealmConfigDefaultStrategySet {
                         strategy_id: seeded_default_strategy_id,
                     },
                 ),
                 (
-                    9,
+                    13,
                     AdminDocumentOperation::RealmConfigStrategyBindingSet {
                         binding: seeded_bindings[0].clone(),
                     },
                 ),
                 (
-                    10,
+                    14,
                     AdminDocumentOperation::RealmConfigStrategyBindingSet {
                         binding: seeded_bindings[1].clone(),
                     },
                 ),
                 (
-                    11,
+                    15,
                     AdminDocumentOperation::RealmConfigStrategyBindingSet {
                         binding: seeded_bindings[2].clone(),
                     },
                 ),
                 (
-                    12,
+                    16,
                     AdminDocumentOperation::RealmConfigStrategyBindingSet {
                         binding: seeded_bindings[3].clone(),
                     },
                 ),
                 (
-                    13,
+                    17,
                     AdminDocumentOperation::RealmConfigNodePlacementSet {
                         entry: NodePlacementEntry {
                             node_id: actor.node_id,

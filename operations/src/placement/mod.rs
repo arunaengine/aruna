@@ -9,6 +9,8 @@ use aruna_core::structs::{
     DocumentClass, PlacementOverride, PlacementRef, PlacementStrategy, RealmConfigDocument,
     shard_for_subject,
 };
+use aruna_core::types::GroupId;
+use ulid::Ulid;
 
 use crate::placement::selector::{ROLE_SHARD, rank_weighted};
 
@@ -77,19 +79,30 @@ pub fn registry_placement(
     config: &RealmConfigDocument,
     record: &aruna_core::structs::MetadataRegistryRecord,
 ) -> PlacementRef {
-    let Some(strategy) = resolver::strategy_for_class(config, DocumentClass::MetadataRegistry)
-    else {
+    registry_placement_for(config, record.group_id, record.document_id)
+}
+
+pub(crate) fn registry_placement_for(
+    config: &RealmConfigDocument,
+    group_id: GroupId,
+    document_id: Ulid,
+) -> PlacementRef {
+    let Some(strategy) = registry_strategy(config) else {
         return PlacementRef::NIL;
     };
     let target = DocumentSyncTarget::MetadataRegistry {
-        group_id: record.group_id,
-        document_id: record.document_id,
+        group_id,
+        document_id,
     };
     PlacementRef {
         strategy_id: strategy.strategy_id,
         epoch: 0,
         shard: shard_for_subject(&subject_bytes(&target), strategy.shard_count),
     }
+}
+
+pub(crate) fn registry_strategy(config: &RealmConfigDocument) -> Option<&PlacementStrategy> {
+    resolver::strategy_for_class(config, DocumentClass::MetadataRegistry)
 }
 
 /// Placement plan for a document `target`: its shard's rank-ordered holder set
@@ -224,6 +237,10 @@ pub fn first_empty_referenced_shard(config: &RealmConfigDocument) -> Option<Plac
         let referenced = config.default_strategy_id == Some(id)
             || config
                 .strategy_bindings
+                .iter()
+                .any(|binding| binding.strategy_id == id)
+            || config
+                .placement_bindings
                 .iter()
                 .any(|binding| binding.strategy_id == id)
             || config
@@ -519,6 +536,7 @@ mod tests {
             holder_node_ids: Vec::new(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            establishing_event_id: Ulid::from_bytes([9u8; 16]),
             last_event_id: Ulid::from_bytes([9u8; 16]),
         };
 

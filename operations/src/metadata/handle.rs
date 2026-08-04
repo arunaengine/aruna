@@ -52,7 +52,7 @@ use tracing::{Instrument, Span, debug, debug_span, field, warn};
 use ulid::Ulid;
 
 use super::protocol::{
-    MetadataAuthToken, MetadataTransportMessage, encode_message, read_message,
+    MetadataAuthToken, MetadataReadError, MetadataTransportMessage, encode_message, read_message,
     write_encoded_message, write_message,
 };
 use super::query_cache::{
@@ -80,6 +80,8 @@ use crate::sync_relationship::{
 };
 
 const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
+const METADATA_CHUNK_SIZE: usize = 64 * 1024;
+const METADATA_ENVELOPE_BYTES: u64 = 16 * 1024 * 1024;
 const SYNC_MIRROR_REQUEST_TIMEOUT: Duration =
     RECONCILE_GRACE.saturating_sub(Duration::from_secs(10));
 const METADATA_GRAPH_SYNC_ATTEMPTS: usize = 3;
@@ -171,6 +173,12 @@ pub struct MetadataHandle {
 pub(crate) enum MetadataRequestDelivery {
     DefinitelyNotSent,
     PossiblySent,
+}
+
+#[derive(Debug)]
+pub(crate) enum MetadataWritePeerError {
+    Unauthorized,
+    Unavailable(MetadataError),
 }
 
 #[derive(Debug)]
@@ -1151,6 +1159,7 @@ impl MetadataHandle {
         context: &Arc<DriverContext>,
         mut stream: BiStream,
         peer: NodeId,
+        metadata_bytes: u64,
     ) -> Result<(), MetadataError> {
         let total_started = Instant::now();
         let read_started = Instant::now();
@@ -1160,6 +1169,7 @@ impl MetadataHandle {
         span.record("request", transport_message_kind(&message));
 
         let process_started = Instant::now();
+        let mut response_body = None;
         let response = match message {
             MetadataTransportMessage::QueryGraphs {
                 auth_token,
@@ -1308,9 +1318,132 @@ impl MetadataHandle {
                 self.apply_sync_mirror(context, peer, auth_token, *relationship, None, true)
                     .await
             }
+            query @ MetadataTransportMessage::QueryDocument { .. } => {
+                let result = super::forward::apply_document_query(context, peer, query).await;
+                MetadataTransportMessage::DocumentQueryResults { result }
+            }
+            MetadataTransportMessage::ForwardPathLookup {
+                auth_token,
+                group_id,
+                document_path,
+                config_digest,
+            } => {
+                let result = match self.authorize_read_peer(peer, auth_token, true).await {
+                    Ok(auth) => match context.net_handle.as_ref() {
+                        Some(net) => {
+                            let realm_id = *net.realm_id();
+                            if !config_digest_matches(context.as_ref(), realm_id, &config_digest)
+                                .await
+                            {
+                                Err(MetadataReadError::Unavailable)
+                            } else {
+                                let result = super::api::local_path_candidates(
+                                    context.as_ref(),
+                                    realm_id,
+                                    group_id,
+                                    &document_path,
+                                    auth.as_ref(),
+                                )
+                                .await
+                                .map_err(claim_read_error);
+                                if !config_digest_matches(
+                                    context.as_ref(),
+                                    realm_id,
+                                    &config_digest,
+                                )
+                                .await
+                                {
+                                    Err(MetadataReadError::Unavailable)
+                                } else {
+                                    result
+                                }
+                            }
+                        }
+                        None => Err(MetadataReadError::Unavailable),
+                    },
+                    Err(error) => Err(error),
+                };
+                MetadataTransportMessage::ForwardedPathLookup { result }
+            }
+            MetadataTransportMessage::ForwardPathResolution {
+                auth_token,
+                group_id,
+                document_path,
+                config_digest,
+            } => {
+                let result = match self.authorize_read_peer(peer, auth_token, false).await {
+                    Ok(auth) => match context.net_handle.as_ref() {
+                        Some(net) => {
+                            let realm_id = *net.realm_id();
+                            if !config_digest_matches(context.as_ref(), realm_id, &config_digest)
+                                .await
+                            {
+                                Err(MetadataReadError::Unavailable)
+                            } else {
+                                let result = super::api::lookup_metadata_path(
+                                    context.as_ref(),
+                                    realm_id,
+                                    super::api::MetadataPathLookupRequest {
+                                        group_id,
+                                        document_path,
+                                        auth,
+                                    },
+                                    None,
+                                )
+                                .await
+                                .map(|result| {
+                                    Box::new(super::protocol::MetadataPathResolution {
+                                        winner: result.winner,
+                                        conflicts: result.conflicts,
+                                    })
+                                })
+                                .map_err(claim_read_error);
+                                if !config_digest_matches(
+                                    context.as_ref(),
+                                    realm_id,
+                                    &config_digest,
+                                )
+                                .await
+                                {
+                                    Err(MetadataReadError::Unavailable)
+                                } else {
+                                    result
+                                }
+                            }
+                        }
+                        None => Err(MetadataReadError::Unavailable),
+                    },
+                    Err(error) => Err(error),
+                };
+                MetadataTransportMessage::ForwardedPathResolution { result }
+            }
+            forward @ MetadataTransportMessage::ForwardExportDocument { .. } => {
+                match super::forward::apply_forwarded_export(context, peer, forward, metadata_bytes)
+                    .await
+                {
+                    Ok((export, metadata_bytes)) => match postcard::to_allocvec(&export) {
+                        Ok(bytes) => {
+                            let length = bytes.len() as u64;
+                            if length > metadata_body_limit(metadata_bytes) {
+                                MetadataTransportMessage::ForwardedExport {
+                                    result: Err(MetadataReadError::Unavailable),
+                                }
+                            } else {
+                                response_body = Some(bytes);
+                                MetadataTransportMessage::ForwardedExport { result: Ok(length) }
+                            }
+                        }
+                        Err(_) => MetadataTransportMessage::ForwardedExport {
+                            result: Err(MetadataReadError::Unavailable),
+                        },
+                    },
+                    Err(error) => MetadataTransportMessage::ForwardedExport { result: Err(error) },
+                }
+            }
             forward @ (MetadataTransportMessage::ForwardCreateDocument { .. }
             | MetadataTransportMessage::ForwardUpdateDocument { .. }
-            | MetadataTransportMessage::ForwardDeleteDocument { .. }) => {
+            | MetadataTransportMessage::ForwardDeleteDocument { .. }
+            | MetadataTransportMessage::ForwardReadDocument { .. }) => {
                 super::forward::apply_forwarded_write(context, peer, forward).await
             }
             MetadataTransportMessage::QueryResults { .. }
@@ -1319,8 +1452,16 @@ impl MetadataHandle {
             | MetadataTransportMessage::SyncMirrorCreated
             | MetadataTransportMessage::SyncMirrorDeleted
             | MetadataTransportMessage::ForwardedRecord { .. }
+            | MetadataTransportMessage::ForwardedRead { .. }
+            | MetadataTransportMessage::ForwardedPathLookup { .. }
+            | MetadataTransportMessage::ForwardedPathResolution { .. }
+            | MetadataTransportMessage::ForwardedWriteDenied { .. }
+            | MetadataTransportMessage::ForwardedWriteNotFound
+            | MetadataTransportMessage::ForwardedWriteUnavailable
             | MetadataTransportMessage::ForwardedDelete
             | MetadataTransportMessage::ForwardedUpdateInvalidInput { .. }
+            | MetadataTransportMessage::ForwardedExport { .. }
+            | MetadataTransportMessage::DocumentQueryResults { .. }
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -1332,7 +1473,13 @@ impl MetadataHandle {
         record_elapsed_ms(&span, "drain_ms", drain_started);
 
         let write_started = Instant::now();
-        let _ = write_transport_message(&mut stream, &response).await;
+        if write_transport_message(&mut stream, &response)
+            .await
+            .is_ok()
+            && let Some(body) = response_body
+        {
+            let _ = write_stream_body(&mut stream, &body).await;
+        }
         record_elapsed_ms(&span, "write_ms", write_started);
         close_stream(&mut stream).await;
         record_elapsed_ms(&span, "elapsed_ms", total_started);
@@ -1513,6 +1660,89 @@ impl MetadataHandle {
         .await
     }
 
+    pub(crate) async fn authorize_read_peer(
+        &self,
+        peer: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        require_trusted: bool,
+    ) -> Result<Option<AuthContext>, MetadataReadError> {
+        let auth = match auth_token {
+            Some(token @ MetadataAuthToken::Bearer(_)) => {
+                Some(self.authorize_write_peer(peer, Some(token)).await.map_err(
+                    |error| match error {
+                        MetadataWritePeerError::Unauthorized => MetadataReadError::Unauthorized,
+                        MetadataWritePeerError::Unavailable(_) => MetadataReadError::Unavailable,
+                    },
+                )?)
+            }
+            token => self
+                .authorize_remote_peer(peer, token)
+                .await
+                .map_err(|_| MetadataReadError::Unavailable)?,
+        };
+        let realm_id = self
+            .inner
+            .net_handle
+            .as_ref()
+            .map(|net| *net.realm_id())
+            .ok_or(MetadataReadError::Unavailable)?;
+        if auth.as_ref().is_some_and(|auth| auth.realm_id != realm_id) {
+            return Err(MetadataReadError::Forbidden);
+        }
+        if require_trusted {
+            ensure_remote_metadata_peer_is_configured_for_realm(
+                &self.inner.storage_handle,
+                peer,
+                realm_id,
+                true,
+            )
+            .await
+            .map_err(|_| MetadataReadError::Unavailable)?;
+        }
+        Ok(auth)
+    }
+
+    pub(crate) async fn authorize_write_peer(
+        &self,
+        peer: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+    ) -> Result<AuthContext, MetadataWritePeerError> {
+        let Some(auth_token) = auth_token else {
+            return Err(MetadataWritePeerError::Unauthorized);
+        };
+        let MetadataAuthToken::Bearer(token) = auth_token else {
+            return self
+                .authorize_remote_peer(peer, Some(auth_token))
+                .await
+                .map_err(MetadataWritePeerError::Unavailable)?
+                .ok_or(MetadataWritePeerError::Unauthorized);
+        };
+        let auth = validate_aruna_bearer_token(&self.inner.auth_validation, token.as_str())
+            .await
+            .map_err(|_| MetadataWritePeerError::Unauthorized)?;
+        let local_realm_id = self
+            .inner
+            .net_handle
+            .as_ref()
+            .map(|net| *net.realm_id())
+            .ok_or_else(|| {
+                MetadataWritePeerError::Unavailable(MetadataError::InvalidInput(
+                    "forwarded metadata auth requires a local serving realm".to_string(),
+                ))
+            })?;
+        if auth.realm_id == local_realm_id {
+            ensure_remote_metadata_peer_is_configured_for_realm(
+                &self.inner.storage_handle,
+                peer,
+                auth.realm_id,
+                false,
+            )
+            .await
+            .map_err(MetadataWritePeerError::Unavailable)?;
+        }
+        Ok(auth)
+    }
+
     #[tracing::instrument(
         name = "metadata.forward.remote",
         level = "debug",
@@ -1536,6 +1766,17 @@ impl MetadataHandle {
             record_error(&span, &error.to_string());
         }
         result
+    }
+
+    pub(crate) async fn request_export(
+        &self,
+        node_id: NodeId,
+        message: MetadataTransportMessage,
+    ) -> Result<
+        Result<super::api::ExportMetadataRoCrateResult, MetadataReadError>,
+        MetadataRequestError,
+    > {
+        send_export_request(&self.inner, node_id, message).await
     }
 
     #[tracing::instrument(
@@ -1728,6 +1969,41 @@ impl MetadataHandle {
             Err(error) => record_error(&span, &error.to_string()),
         }
         result
+    }
+
+    pub(crate) async fn request_document_query(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        config_digest: [u8; 32],
+        document_id: Ulid,
+        sparql: String,
+    ) -> Result<MetadataQueryResults, MetadataError> {
+        match send_remote_metadata_request(
+            &self.inner,
+            &Span::current(),
+            node_id,
+            MetadataTransportMessage::QueryDocument {
+                auth_token,
+                config_digest,
+                document_id,
+                sparql,
+            },
+        )
+        .await
+        .map_err(MetadataRequestError::into_metadata_error)?
+        {
+            MetadataTransportMessage::DocumentQueryResults {
+                result: Ok(results),
+            } => Ok(results),
+            MetadataTransportMessage::DocumentQueryResults { result: Err(error) } => Err(
+                MetadataError::Backend(format!("document query failed: {error:?}")),
+            ),
+            response => Err(MetadataError::Backend(format!(
+                "unexpected document query response: {}",
+                transport_message_kind(&response)
+            ))),
+        }
     }
 
     #[tracing::instrument(
@@ -1996,34 +2272,31 @@ async fn authorize_remote_metadata_peer<S>(
 where
     S: ArunaBearerTokenValidationState + ?Sized,
 {
-    let internal_auth = matches!(&auth_token, Some(MetadataAuthToken::Internal { .. }));
+    let internal_auth = matches!(&auth_token, Some(MetadataAuthToken::Internal(_)));
     let auth_context = match auth_token {
-        Some(MetadataAuthToken::Internal { user_id, realm_id }) if allow_internal => {
+        Some(MetadataAuthToken::Internal(auth)) if allow_internal => {
             let local_realm_id = local_realm_id.ok_or_else(|| {
                 MetadataError::InvalidInput(
                     "internal metadata auth requires a local serving realm".to_string(),
                 )
             })?;
-            if realm_id != local_realm_id {
+            if auth.realm_id != local_realm_id {
                 return Err(MetadataError::InvalidInput(format!(
-                    "internal metadata auth realm `{realm_id}` does not match local realm `{local_realm_id}`"
+                    "internal metadata auth realm `{}` does not match local realm `{local_realm_id}`",
+                    auth.realm_id
                 )));
             }
-            if user_id.realm_id != realm_id {
+            if auth.user_id.realm_id != auth.realm_id {
                 return Err(MetadataError::InvalidInput(format!(
-                    "internal metadata auth user realm `{}` does not match token realm `{realm_id}`",
-                    user_id.realm_id
+                    "internal metadata auth user realm `{}` does not match token realm `{}`",
+                    auth.user_id.realm_id, auth.realm_id
                 )));
             }
-            Some(AuthContext {
-                user_id,
-                realm_id,
-                path_restrictions: None,
-            })
+            Some(auth)
         }
-        Some(MetadataAuthToken::Internal { .. }) => {
+        Some(MetadataAuthToken::Internal(_)) => {
             return Err(MetadataError::Backend(
-                "internal metadata auth is limited to forwarded writes".to_string(),
+                "internal metadata auth is limited to forwarded requests".to_string(),
             ));
         }
         auth_token => remote_metadata_auth_context(state, auth_token).await?,
@@ -3770,6 +4043,27 @@ fn record_metadata_query_result_counts(span: &Span, results: &MetadataQueryResul
     }
 }
 
+fn claim_read_error(error: super::api::MetadataApiError) -> MetadataReadError {
+    match error {
+        super::api::MetadataApiError::Unauthorized => MetadataReadError::Unauthorized,
+        super::api::MetadataApiError::Forbidden => MetadataReadError::Forbidden,
+        super::api::MetadataApiError::NotFound => MetadataReadError::NotFound,
+        _ => MetadataReadError::Unavailable,
+    }
+}
+
+async fn config_digest_matches(
+    context: &DriverContext,
+    realm_id: RealmId,
+    expected: &[u8; 32],
+) -> bool {
+    super::api::load_realm_config(context, realm_id)
+        .await
+        .and_then(|config| config.digest().ok())
+        .as_ref()
+        == Some(expected)
+}
+
 pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'static str {
     match message {
         MetadataTransportMessage::QueryGraphs { .. } => "query_graphs",
@@ -3786,8 +4080,21 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardCreateDocument { .. } => "forward_create_document",
         MetadataTransportMessage::ForwardUpdateDocument { .. } => "forward_update_document",
         MetadataTransportMessage::ForwardDeleteDocument { .. } => "forward_delete_document",
+        MetadataTransportMessage::ForwardReadDocument { .. } => "forward_read_document",
         MetadataTransportMessage::ForwardedRecord { .. } => "forwarded_record",
+        MetadataTransportMessage::ForwardedRead { .. } => "forwarded_read",
+        MetadataTransportMessage::ForwardPathLookup { .. } => "forward_path_lookup",
+        MetadataTransportMessage::ForwardedPathLookup { .. } => "forwarded_path_lookup",
+        MetadataTransportMessage::ForwardPathResolution { .. } => "forward_path_resolution",
+        MetadataTransportMessage::ForwardedPathResolution { .. } => "forwarded_path_resolution",
+        MetadataTransportMessage::ForwardedWriteDenied { .. } => "forwarded_write_denied",
+        MetadataTransportMessage::ForwardedWriteNotFound => "forwarded_write_not_found",
+        MetadataTransportMessage::ForwardedWriteUnavailable => "forwarded_write_unavailable",
         MetadataTransportMessage::ForwardedDelete => "forwarded_delete",
+        MetadataTransportMessage::ForwardExportDocument { .. } => "forward_export_document",
+        MetadataTransportMessage::ForwardedExport { .. } => "forwarded_export",
+        MetadataTransportMessage::QueryDocument { .. } => "query_document",
+        MetadataTransportMessage::DocumentQueryResults { .. } => "document_query_results",
         MetadataTransportMessage::Reject(_) => "reject",
         MetadataTransportMessage::ForwardedUpdateInvalidInput { .. } => {
             "forwarded_update_invalid_input"
@@ -5707,6 +6014,72 @@ async fn send_request(
     Ok(response)
 }
 
+async fn send_export_request(
+    inner: &MetadataInner,
+    node_id: NodeId,
+    message: MetadataTransportMessage,
+) -> Result<Result<super::api::ExportMetadataRoCrateResult, MetadataReadError>, MetadataRequestError>
+{
+    let metadata_bytes = match &message {
+        MetadataTransportMessage::ForwardExportDocument { metadata_bytes, .. } => *metadata_bytes,
+        _ => {
+            return Err(MetadataRequestError::definitely_not_sent(
+                MetadataError::InvalidInput("expected a metadata export request".to_string()),
+            ));
+        }
+    };
+    let bytes = encode_message(&message)
+        .map_err(MetadataError::Backend)
+        .map_err(MetadataRequestError::definitely_not_sent)?;
+    let net_handle = inner
+        .net_handle
+        .clone()
+        .ok_or_else(|| MetadataRequestError::definitely_not_sent(MetadataError::HandleMissing))?;
+    let mut stream = net_handle
+        .open_stream(node_id, Alpn::Metadata)
+        .await
+        .map_err(|error| MetadataError::Backend(error.to_string()))
+        .map_err(MetadataRequestError::definitely_not_sent)?;
+    write_encoded_transport_message(&mut stream, &bytes)
+        .await
+        .map_err(MetadataRequestError::possibly_sent)?;
+    stream
+        .0
+        .finish()
+        .map_err(|error| MetadataError::Backend(error.to_string()))
+        .map_err(MetadataRequestError::possibly_sent)?;
+    let response = read_transport_message(&mut stream)
+        .await
+        .map_err(MetadataRequestError::possibly_sent)?;
+    let result = match response {
+        MetadataTransportMessage::ForwardedExport { result: Err(error) } => Err(error),
+        MetadataTransportMessage::ForwardedExport { result: Ok(length) } => {
+            if length > metadata_body_limit(metadata_bytes) {
+                return Err(MetadataRequestError::possibly_sent(MetadataError::Backend(
+                    "metadata export body exceeds the protocol limit".to_string(),
+                )));
+            }
+            let bytes = read_stream_body(&mut stream, length)
+                .await
+                .map_err(MetadataRequestError::possibly_sent)?;
+            postcard::from_bytes(&bytes)
+                .map_err(|error| MetadataError::Backend(error.to_string()))
+                .map_err(MetadataRequestError::possibly_sent)
+                .map(Ok)?
+        }
+        response => {
+            return Err(MetadataRequestError::possibly_sent(MetadataError::Backend(
+                format!(
+                    "unexpected metadata export response: {}",
+                    transport_message_kind(&response)
+                ),
+            )));
+        }
+    };
+    close_stream(&mut stream).await;
+    Ok(result)
+}
+
 async fn write_transport_message(
     stream: &mut BiStream,
     message: &MetadataTransportMessage,
@@ -5737,6 +6110,37 @@ async fn read_transport_message(
     result
         .map_err(|_| MetadataError::Backend("timed out waiting for metadata message".to_string()))?
         .map_err(MetadataError::Backend)
+}
+
+async fn write_stream_body(stream: &mut BiStream, bytes: &[u8]) -> Result<(), MetadataError> {
+    for chunk in bytes.chunks(METADATA_CHUNK_SIZE) {
+        timeout(METADATA_IO_TIMEOUT, stream.0.write_all(chunk))
+            .await
+            .map_err(|_| MetadataError::Backend("timed out writing metadata body".to_string()))?
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn metadata_body_limit(metadata_bytes: u64) -> u64 {
+    metadata_bytes.saturating_add(METADATA_ENVELOPE_BYTES)
+}
+
+async fn read_stream_body(stream: &mut BiStream, length: u64) -> Result<Vec<u8>, MetadataError> {
+    let length = usize::try_from(length)
+        .map_err(|_| MetadataError::Backend("metadata body length is unsupported".to_string()))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| MetadataError::Backend("metadata body allocation failed".to_string()))?;
+    bytes.resize(length, 0);
+    for chunk in bytes.chunks_mut(METADATA_CHUNK_SIZE) {
+        timeout(METADATA_IO_TIMEOUT, stream.1.read_exact(chunk))
+            .await
+            .map_err(|_| MetadataError::Backend("timed out reading metadata body".to_string()))?
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    }
+    Ok(bytes)
 }
 
 async fn close_stream(stream: &mut BiStream) {
@@ -6059,6 +6463,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_auth_preserves() {
+        let realm_id = RealmId([13; 32]);
+        let peer = node_id_from_seed(14);
+        let user_id = UserId::new(Ulid::from_bytes([15; 16]), realm_id);
+        let restrictions = vec![PathRestriction {
+            pattern: format!("/{realm_id}/g/**"),
+            permission: Permission::READ,
+        }];
+        let expected = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: Some(restrictions),
+        };
+        let (_dir, storage) = auth_storage();
+        persist_realm_config(&storage, realm_id, &[peer]).await;
+
+        let auth = authorize_remote_metadata_peer(
+            &MetadataAuthValidationState::new(storage.clone()),
+            &storage,
+            peer,
+            Some(realm_id),
+            Some(MetadataAuthToken::internal(expected.clone())),
+            true,
+        )
+        .await
+        .expect("internal peer accepted");
+
+        assert_eq!(auth, Some(expected));
+    }
+
+    #[tokio::test]
     async fn bad_bucket_token() {
         let (_dir, storage) = auth_storage();
         let realm_id = RealmId([17u8; 32]);
@@ -6374,6 +6809,7 @@ mod tests {
             holder_node_ids: Vec::new(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            establishing_event_id: Ulid::nil(),
             last_event_id: Ulid::nil(),
         }
     }

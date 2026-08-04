@@ -455,6 +455,7 @@ impl NetHandle {
             Alpn::NativeReference.as_bytes().to_vec(),
             Alpn::Notification.as_bytes().to_vec(),
             Alpn::Shard.as_bytes().to_vec(),
+            Alpn::JobControl.as_bytes().to_vec(),
         ];
 
         let mut endpoint_builder = Endpoint::builder(presets::Minimal)
@@ -2365,6 +2366,7 @@ fn net_handle_effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::Dht(_)) => "dht",
         Effect::Net(NetEffect::DocumentSync(_)) => "document_sync",
         Effect::Net(NetEffect::Stream(_)) => "stream",
+        Effect::Net(NetEffect::JobControl(_)) => "job_control",
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
         Effect::Storage(_) => "storage",

@@ -81,6 +81,19 @@ impl PlacementHandle {
     }
 }
 
+impl Serialize for PlacementHandle {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u32(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for PlacementHandle {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = u32::deserialize(deserializer)?;
+        PlacementHandle::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A 12-bit bucket carried inside the id (REQ-META-ID-FORMAT-001).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BucketId(u16);
@@ -221,6 +234,13 @@ macro_rules! structured_id_newtype {
         impl sealed::Sealed for $name {
             fn from_ulid(ulid: Ulid, _token: sealed::Token) -> Self {
                 Self(ulid)
+            }
+        }
+
+        impl $name {
+            /// Reconstructs validated structured-id bytes, rejecting handle zero.
+            pub fn from_bytes(bytes: [u8; 16]) -> Result<Self, FieldError> {
+                Self::try_from(u128::from_be_bytes(bytes))
             }
         }
 
@@ -400,8 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_ulid_distinguishable() {
-        // A structured id always carries a non-zero handle and round-trips.
+    fn plain_ulid_rejected() {
         let structured = MetaResourceId::from_parts(
             1,
             PlacementHandle::new(42).unwrap(),
@@ -412,27 +431,19 @@ mod tests {
         assert_ne!(structured.placement_handle().get(), 0);
         assert!(MetaResourceId::parse(&structured.to_string()).is_ok());
 
-        // A generic ULID does not preserve the structured fields: a zero handle
-        // is rejected on parse, and a bucket outside a small bucket_count is
-        // flagged by validation.
-        let bucket_count = 8u16;
-        let mut flagged = 0;
-        for _ in 0..512 {
-            let generic = Ulid::generate();
-            let fields = layout::unpack(generic.0);
-            match MetaResourceId::parse(&generic.to_string()) {
-                Err(ParseError::ReservedHandle) => assert_eq!(fields.handle, 0),
-                Ok(parsed) => {
-                    assert_ne!(fields.handle, 0);
-                    if fields.bucket >= bucket_count {
-                        assert!(parsed.validate_bucket(bucket_count).is_err());
-                        flagged += 1;
-                    }
-                }
-                Err(other) => panic!("unexpected parse error: {other:?}"),
-            }
-        }
-        assert!(flagged > 0);
+        let plain = Ulid::from_parts(1, 0);
+        assert_eq!(
+            MetaResourceId::parse(&plain.to_string()),
+            Err(ParseError::ReservedHandle)
+        );
+        let out_of_range = MetaResourceId::from_parts(
+            1,
+            PlacementHandle::new(42).unwrap(),
+            BucketId::new(8).unwrap(),
+            9,
+        )
+        .unwrap();
+        assert!(out_of_range.validate_bucket(8).is_err());
     }
 
     #[test]
@@ -478,6 +489,31 @@ mod tests {
 
         let zero = Ulid(layout::pack(1, 0, 1, 1)).to_string();
         assert!(serde_json::from_str::<MetaResourceId>(&format!("\"{zero}\"")).is_err());
+    }
+
+    #[test]
+    fn serde_matches_ulid() {
+        // The typed id must serialize to the exact same bytes a raw `Ulid` would,
+        // so migrating a `document_id` field never changes the on-the-wire or
+        // on-disk record layout (postcard is the record codec; JSON the API one).
+        let id = MetaResourceId::parse(KAT_STRING).unwrap();
+        let ulid = id.as_ulid();
+        assert_eq!(
+            postcard::to_allocvec(&id).unwrap(),
+            postcard::to_allocvec(&ulid).unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_vec(&id).unwrap(),
+            serde_json::to_vec(&ulid).unwrap(),
+        );
+        // The storage-key bytes (`to_bytes`) also match, and `from_bytes` inverts
+        // them under the zero-handle guard.
+        assert_eq!(id.to_bytes(), ulid.to_bytes());
+        assert_eq!(MetaResourceId::from_bytes(ulid.to_bytes()).unwrap(), id);
+        assert_eq!(
+            MetaResourceId::from_bytes(Ulid(layout::pack(1, 0, 1, 1)).to_bytes()),
+            Err(FieldError::ReservedHandle),
+        );
     }
 
     #[test]

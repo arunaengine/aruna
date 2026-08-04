@@ -3,7 +3,6 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aruna_core::NodeId;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError};
 use aruna_core::events::{Event, StorageEvent};
@@ -20,13 +19,16 @@ use aruna_core::storage_entries::{
     metadata_event_log_key, metadata_graph_lifecycle_key, metadata_pending_projection_target,
 };
 use aruna_core::structs::{
-    AuthContext, MetadataRegistryRecord, Permission, RealmConfigDocument, RealmId,
+    AuthContext, MetadataRegistryRecord, PathClaimRecord, Permission, PlacementRef,
+    RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::GroupId;
+use aruna_core::{MetaResourceId, NodeId, StructuredId};
 use futures_util::StreamExt;
 use futures_util::future::{BoxFuture, FutureExt};
 use futures_util::stream;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
@@ -34,6 +36,10 @@ use ulid::Ulid;
 use super::MetadataAuthToken;
 use super::handle::{
     METADATA_QUERY_MAX_BYTES, METADATA_QUERY_MAX_RESULT_BYTES, METADATA_QUERY_MAX_ROWS,
+};
+use super::protocol::{
+    MetadataPathCandidate, MetadataPathResolution, MetadataPathWinner, MetadataReadError,
+    MetadataTransportMessage,
 };
 use super::search_cursor::{
     METADATA_SEARCH_DEFAULT_PAGE_SIZE, METADATA_SEARCH_MAX_PAGE_SIZE,
@@ -52,7 +58,10 @@ use crate::list_groups::ListGroupOperation;
 use crate::list_metadata_documents::ListMetadataDocumentsOperation;
 use crate::metadata::repository::{LIST_METADATA_PAGE_SIZE, StorageReadError};
 use crate::permission_rules::GroupPermissionRules;
-use crate::placement::resolve_shard_holders;
+use crate::placement::{
+    holds_placement, registry_placement, registry_placement_for, registry_strategy,
+    resolve_shard_holders,
+};
 use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, SearchBucketsOperation};
 
 const DEFAULT_LIST_METADATA_LIMIT: usize = 50;
@@ -92,7 +101,7 @@ pub enum MetadataApiError {
 }
 
 /// Order the visible metadata listing is paginated in.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetadataListOrder {
     /// Ascending document id, which is creation order for ULID ids.
     #[default]
@@ -112,13 +121,13 @@ pub struct ListVisibleMetadataDocumentsRequest {
     pub auth: Option<AuthContext>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListedMetadataDocument {
     pub record: MetadataRegistryRecord,
     pub rocrate_summary_jsonld: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListVisibleMetadataDocumentsResult {
     pub documents: Vec<ListedMetadataDocument>,
     pub limit: usize,
@@ -132,12 +141,25 @@ pub struct ListVisibleMetadataDocumentsResult {
 }
 
 #[derive(Debug, Clone)]
+pub struct MetadataPathLookupRequest {
+    pub group_id: GroupId,
+    pub document_path: String,
+    pub auth: Option<AuthContext>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataPathLookupResult {
+    pub winner: MetadataPathWinner,
+    pub conflicts: Vec<Ulid>,
+}
+
+#[derive(Debug, Clone)]
 pub struct GetVisibleMetadataDocumentRequest {
     pub document_id: Ulid,
     pub auth: Option<AuthContext>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetadataRoCrateExportView {
     Full,
     Summary,
@@ -155,7 +177,7 @@ pub struct ExportMetadataRoCrateRequest {
     pub after: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ExportMetadataRoCrateResult {
     Full {
         record: MetadataRegistryRecord,
@@ -356,7 +378,6 @@ pub async fn list_visible_metadata_documents(
         }
         records.extend(group_records);
     }
-
     // Ordering precedes both the estimate scan and the offset window so that
     // pagination and the early exit page the same sequence.
     if recent {
@@ -384,6 +405,7 @@ pub async fn list_visible_metadata_documents(
             .map(|record| record.group_id),
     )
     .await;
+    let record_visible = |record: &MetadataRegistryRecord| permissions.record_visible(record);
 
     let mut total_estimate = None;
     if limit >= METADATA_ESTIMATE_MIN_LIMIT {
@@ -392,7 +414,7 @@ pub async fn list_visible_metadata_documents(
             .filter(|record| {
                 metadata_record_matches_filters(record, request.path_prefix.as_deref())
             })
-            .filter(|record| permissions.record_visible(record))
+            .filter(|record| record_visible(record))
             .count();
         total_estimate = Some(matching);
     }
@@ -404,7 +426,7 @@ pub async fn list_visible_metadata_documents(
         if !metadata_record_matches_filters(&record, request.path_prefix.as_deref()) {
             continue;
         }
-        if !permissions.record_visible(&record) {
+        if !record_visible(&record) {
             continue;
         }
         visible_count += 1;
@@ -461,6 +483,484 @@ pub async fn list_visible_metadata_documents(
         total_returned,
         // Never report fewer than the page already discloses.
         total_estimate: total_estimate.map(|estimate| estimate.max(total_returned)),
+    })
+}
+
+pub async fn lookup_metadata_path(
+    context: &DriverContext,
+    realm_id: RealmId,
+    request: MetadataPathLookupRequest,
+    auth_token: Option<MetadataAuthToken>,
+) -> Result<MetadataPathLookupResult, MetadataApiError> {
+    let normalized = MetadataRegistryRecord::normalize_document_path(&request.document_path);
+    if normalized.is_empty() {
+        return Err(MetadataApiError::BadRequest);
+    }
+    if context.net_handle.is_none() {
+        let candidates = local_path_candidates(
+            context,
+            realm_id,
+            request.group_id,
+            &normalized,
+            request.auth.as_ref(),
+        )
+        .await?;
+        return reduce_path_candidates(candidates);
+    }
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let config_digest = config
+        .digest()
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let local_node = context
+        .net_handle
+        .as_ref()
+        .map(|net| net.node_id())
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let trusted_origin = config.nodes.iter().any(|node| {
+        node.node_id == local_node.to_string()
+            && matches!(node.kind, RealmNodeKind::Management | RealmNodeKind::Server)
+    });
+    if !trusted_origin {
+        return forward_path_resolution(context, realm_id, &config, request, auth_token).await;
+    }
+    let strategy = registry_strategy(&config).ok_or(MetadataApiError::ServiceUnavailable)?;
+    if strategy.shard_count == 0 {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    let shard_count = strategy.shard_count;
+    let auth_token = auth_token.or_else(|| request.auth.clone().map(MetadataAuthToken::internal));
+    let group_id = request.group_id;
+    let auth = request.auth.as_ref();
+    let mut replica_counts = vec![0usize; shard_count as usize];
+    let mut holder_shards: HashMap<NodeId, Vec<u32>> = HashMap::new();
+    for shard in 0..shard_count {
+        let placement = PlacementRef {
+            strategy_id: strategy.strategy_id,
+            epoch: 0,
+            shard,
+        };
+        let holders = resolve_shard_holders(&config, &placement);
+        if holders.is_empty() {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
+        for holder in holders {
+            replica_counts[shard as usize] += 1;
+            holder_shards.entry(holder).or_default().push(shard);
+        }
+    }
+    if holder_shards.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    let mut holders = holder_shards.into_iter().collect::<Vec<_>>();
+    holders.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    let requests = stream::iter(holders.into_iter().map(|(holder, shards)| {
+        let auth_token = auth_token.clone();
+        let normalized = normalized.clone();
+        async move {
+            let result = if holder == local_node {
+                local_path_candidates(context, realm_id, group_id, &normalized, auth).await
+            } else {
+                load_path_holder(
+                    context,
+                    group_id,
+                    &normalized,
+                    holder,
+                    auth_token,
+                    config_digest,
+                )
+                .await
+            };
+            (holder, shards, result)
+        }
+    }))
+    .buffer_unordered(METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT)
+    .collect::<Vec<_>>();
+    let responses = tokio::time::timeout(METADATA_DISTRIBUTED_QUERY_DEADLINE, requests)
+        .await
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let mut views = Vec::new();
+    let mut auth_error = None;
+    let mut failed = false;
+    let mut only_auth = true;
+    for (_holder, shards, response) in responses {
+        match response {
+            Ok(returned) => {
+                only_auth = false;
+                let mut partitions = shards.iter().map(|_| Vec::new()).collect::<Vec<_>>();
+                for candidate in returned {
+                    let placement = validate_path_candidate(
+                        &config,
+                        realm_id,
+                        group_id,
+                        &normalized,
+                        &candidate,
+                    )?;
+                    let index = shards
+                        .binary_search(&placement.shard)
+                        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+                    partitions[index].push(candidate);
+                }
+                views.extend(
+                    shards
+                        .into_iter()
+                        .zip(partitions)
+                        .map(|(shard, candidates)| PathShardView { shard, candidates }),
+                );
+            }
+            Err(error @ (MetadataApiError::Unauthorized | MetadataApiError::Forbidden)) => {
+                failed = true;
+                auth_error.get_or_insert(error);
+            }
+            Err(_) => {
+                failed = true;
+                only_auth = false;
+            }
+        }
+    }
+    if failed {
+        if only_auth && let Some(error) = auth_error {
+            return Err(error);
+        }
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    let candidates = merge_path_views(&replica_counts, views)?;
+    reduce_path_candidates(candidates)
+}
+
+async fn forward_path_resolution(
+    context: &DriverContext,
+    realm_id: RealmId,
+    config: &RealmConfigDocument,
+    request: MetadataPathLookupRequest,
+    auth_token: Option<MetadataAuthToken>,
+) -> Result<MetadataPathLookupResult, MetadataApiError> {
+    if request.auth.is_some() && auth_token.is_none() {
+        return Err(MetadataApiError::Unauthorized);
+    }
+    let local_node = context
+        .net_handle
+        .as_ref()
+        .map(|net| net.node_id())
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let mut coordinators = config
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.kind, RealmNodeKind::Management | RealmNodeKind::Server))
+        .map(|node| {
+            node.node_id
+                .parse::<NodeId>()
+                .map_err(|_| MetadataApiError::ServiceUnavailable)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    coordinators.retain(|node| *node != local_node);
+    coordinators.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let config_digest = config
+        .digest()
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    for coordinator in coordinators {
+        let response = tokio::time::timeout(
+            METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT,
+            metadata.request_forwarded_write(
+                coordinator,
+                MetadataTransportMessage::ForwardPathResolution {
+                    auth_token: auth_token.clone(),
+                    group_id: request.group_id,
+                    document_path: request.document_path.clone(),
+                    config_digest,
+                },
+            ),
+        )
+        .await;
+        match response {
+            Ok(Ok(MetadataTransportMessage::ForwardedPathResolution { result: Ok(result) })) => {
+                if validate_path_resolution(
+                    realm_id,
+                    request.group_id,
+                    &request.document_path,
+                    &result,
+                )
+                .is_err()
+                {
+                    continue;
+                }
+                return Ok(MetadataPathLookupResult {
+                    winner: result.winner,
+                    conflicts: result.conflicts,
+                });
+            }
+            Ok(Ok(MetadataTransportMessage::ForwardedPathResolution {
+                result: Err(MetadataReadError::Unauthorized),
+            })) => return Err(MetadataApiError::Unauthorized),
+            Ok(Ok(MetadataTransportMessage::ForwardedPathResolution {
+                result: Err(MetadataReadError::Forbidden),
+            })) => return Err(MetadataApiError::Forbidden),
+            Ok(Ok(MetadataTransportMessage::ForwardedPathResolution {
+                result: Err(MetadataReadError::NotFound),
+            })) => return Err(MetadataApiError::NotFound),
+            _ => {}
+        }
+    }
+    Err(MetadataApiError::ServiceUnavailable)
+}
+
+fn validate_path_resolution(
+    realm_id: RealmId,
+    group_id: GroupId,
+    document_path: &str,
+    resolution: &MetadataPathResolution,
+) -> Result<(), MetadataApiError> {
+    let normalized = MetadataRegistryRecord::normalize_document_path(document_path);
+    let winner_id = MetaResourceId::from_bytes(resolution.winner.document_id.to_bytes())
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    if resolution.winner.realm_id != realm_id
+        || resolution.winner.group_id != group_id
+        || resolution.winner.document_path != normalized
+        || resolution.winner.graph_iri
+            != MetadataRegistryRecord::graph_iri_for(resolution.winner.document_id)
+    {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    let mut seen = HashSet::from([winner_id]);
+    for conflict in &resolution.conflicts {
+        let conflict = MetaResourceId::from_bytes(conflict.to_bytes())
+            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+        if !seen.insert(conflict) {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
+    }
+    Ok(())
+}
+
+struct PathShardView {
+    shard: u32,
+    candidates: Vec<MetadataPathCandidate>,
+}
+
+fn merge_path_views(
+    expected: &[usize],
+    views: Vec<PathShardView>,
+) -> Result<Vec<MetadataPathCandidate>, MetadataApiError> {
+    let mut consensus = vec![None; expected.len()];
+    let mut seen = vec![0usize; expected.len()];
+    for mut view in views {
+        let shard = view.shard as usize;
+        if shard >= expected.len() || seen[shard] >= expected[shard] {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
+        normalize_path_view(&mut view.candidates)?;
+        seen[shard] += 1;
+        match consensus[shard].as_ref() {
+            Some(current) if current != &view.candidates => {
+                return Err(MetadataApiError::ServiceUnavailable);
+            }
+            Some(_) => {}
+            None => consensus[shard] = Some(view.candidates),
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for (shard, expected) in expected.iter().copied().enumerate() {
+        if expected == 0 || seen[shard] != expected {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
+        candidates.extend(consensus[shard].take().unwrap_or_default());
+    }
+    Ok(candidates)
+}
+
+fn normalize_path_view(candidates: &mut [MetadataPathCandidate]) -> Result<(), MetadataApiError> {
+    candidates.sort_by_key(|candidate| {
+        (
+            candidate.claim.document_id,
+            candidate.claim.establishing_event_id,
+        )
+    });
+    if candidates
+        .windows(2)
+        .any(|pair| pair[0].claim.document_id == pair[1].claim.document_id)
+    {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    Ok(())
+}
+
+async fn load_path_holder(
+    context: &DriverContext,
+    group_id: GroupId,
+    document_path: &str,
+    holder: NodeId,
+    auth_token: Option<MetadataAuthToken>,
+    config_digest: [u8; 32],
+) -> Result<Vec<MetadataPathCandidate>, MetadataApiError> {
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    match tokio::time::timeout(
+        METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT,
+        metadata.request_forwarded_write(
+            holder,
+            MetadataTransportMessage::ForwardPathLookup {
+                auth_token,
+                group_id,
+                document_path: document_path.to_string(),
+                config_digest,
+            },
+        ),
+    )
+    .await
+    {
+        Ok(Ok(MetadataTransportMessage::ForwardedPathLookup { result: Ok(result) })) => Ok(result),
+        Ok(Ok(MetadataTransportMessage::ForwardedPathLookup {
+            result: Err(MetadataReadError::Unauthorized),
+        })) => Err(MetadataApiError::Unauthorized),
+        Ok(Ok(MetadataTransportMessage::ForwardedPathLookup {
+            result: Err(MetadataReadError::Forbidden),
+        })) => Err(MetadataApiError::Forbidden),
+        _ => Err(MetadataApiError::ServiceUnavailable),
+    }
+}
+
+pub(crate) async fn local_path_candidates(
+    context: &DriverContext,
+    realm_id: RealmId,
+    group_id: GroupId,
+    document_path: &str,
+    auth: Option<&AuthContext>,
+) -> Result<Vec<MetadataPathCandidate>, MetadataApiError> {
+    let mut records = load_claim_records(context, realm_id, Some(group_id)).await?;
+    records.retain(|record| record.document_path == document_path);
+    if let Some(net) = context.net_handle.as_ref() {
+        let config = load_realm_config(context, realm_id)
+            .await
+            .ok_or(MetadataApiError::ServiceUnavailable)?;
+        registry_strategy(&config).ok_or(MetadataApiError::ServiceUnavailable)?;
+        records.retain(|record| {
+            holds_placement(&config, &registry_placement(&config, record), net.node_id())
+        });
+    }
+    let permissions = GroupPermissionRules::collect(
+        context,
+        auth.filter(|auth| auth.realm_id == realm_id),
+        records.iter().map(|record| record.group_id),
+    )
+    .await;
+    let mut candidates = records
+        .into_iter()
+        .map(|record| {
+            let document_id = MetaResourceId::from_bytes(record.document_id.to_bytes())
+                .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+            let claim = PathClaimRecord {
+                document_id,
+                establishing_event_id: record.establishing_event_id,
+                requested_path: record.document_path.clone(),
+            };
+            let record = permissions.record_visible(&record).then_some(record);
+            Ok(MetadataPathCandidate { claim, record })
+        })
+        .collect::<Result<Vec<_>, MetadataApiError>>()?;
+    candidates.sort_by_key(|candidate| {
+        (
+            candidate.claim.document_id,
+            candidate.claim.establishing_event_id,
+        )
+    });
+    Ok(candidates)
+}
+
+fn validate_path_candidate(
+    config: &RealmConfigDocument,
+    realm_id: RealmId,
+    group_id: GroupId,
+    document_path: &str,
+    candidate: &MetadataPathCandidate,
+) -> Result<PlacementRef, MetadataApiError> {
+    if candidate.claim.requested_path != document_path {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    let placement = registry_placement_for(config, group_id, candidate.claim.document_id.as_ulid());
+    if let Some(record) = candidate.record.as_ref()
+        && (record.realm_id != realm_id
+            || record.group_id != group_id
+            || record.document_id != candidate.claim.document_id.as_ulid()
+            || record.establishing_event_id != candidate.claim.establishing_event_id
+            || record.document_path != document_path
+            || record.graph_iri != MetadataRegistryRecord::graph_iri_for(record.document_id)
+            || record.permission_path
+                != MetadataRegistryRecord::permission_path_for(
+                    &realm_id,
+                    group_id,
+                    document_path,
+                    record.document_id,
+                )
+            || registry_placement(config, record) != placement)
+    {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    Ok(placement)
+}
+
+fn reduce_path_candidates(
+    candidates: Vec<MetadataPathCandidate>,
+) -> Result<MetadataPathLookupResult, MetadataApiError> {
+    let claims = candidates
+        .iter()
+        .map(|candidate| candidate.claim.clone())
+        .collect::<Vec<_>>();
+    let resolution =
+        aruna_core::structs::resolve_path_claim(&claims).ok_or(MetadataApiError::NotFound)?;
+    let winner = candidates
+        .iter()
+        .filter(|candidate| candidate.claim == resolution.winner)
+        .find_map(|candidate| candidate.record.clone())
+        .ok_or(MetadataApiError::NotFound)?;
+    let winner = sanitize_path_winner(winner)?;
+    let conflicts = resolution
+        .conflicts
+        .iter()
+        .filter_map(|claim| {
+            candidates
+                .iter()
+                .filter(|candidate| candidate.claim == *claim)
+                .find_map(|candidate| candidate.record.as_ref())
+                .map(|record| record.document_id)
+        })
+        .collect::<Vec<_>>();
+    Ok(MetadataPathLookupResult { winner, conflicts })
+}
+
+fn sanitize_path_winner(
+    record: MetadataRegistryRecord,
+) -> Result<MetadataPathWinner, MetadataApiError> {
+    MetaResourceId::from_bytes(record.document_id.to_bytes())
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    if record.graph_iri != MetadataRegistryRecord::graph_iri_for(record.document_id)
+        || record.permission_path
+            != MetadataRegistryRecord::permission_path_for(
+                &record.realm_id,
+                record.group_id,
+                &record.document_path,
+                record.document_id,
+            )
+    {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    Ok(MetadataPathWinner {
+        realm_id: record.realm_id,
+        group_id: record.group_id,
+        document_id: record.document_id,
+        document_path: record.document_path,
+        graph_iri: record.graph_iri,
+        public: record.public,
+        replicas: record.holder_node_ids.len(),
+        created_at_ms: record.created_at_ms,
+        updated_at_ms: record.updated_at_ms,
     })
 }
 
@@ -541,40 +1041,101 @@ pub async fn query_metadata_document(
     ensure_supported_query_form(&request.query)?;
     let record = load_record_by_document(context, request.document_id).await?;
     ensure_record_readable(context, realm_id, request.auth.as_ref(), &record).await?;
-    ensure_record_materialized_for_graph_read(context, &record).await?;
-    let config = load_realm_config(context, realm_id).await;
-    let discovery_failed = context.net_handle.is_some()
-        && request.mode.unwrap_or(MetadataApiQueryMode::Distributed)
-            == MetadataApiQueryMode::Distributed
-        && config.is_none();
-    if discovery_failed && !request.allow_partial {
-        return Err(MetadataApiError::ServiceUnavailable);
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
+    if request.mode == Some(MetadataApiQueryMode::Local) {
+        ensure_record_materialized_for_graph_read(context, &record).await?;
+        let results = metadata
+            .query_authorized_local(request.auth, Some(vec![record.graph_iri]), request.query)
+            .await
+            .map_err(map_metadata_query_error)?;
+        return Ok(MetadataQueryExecution {
+            results,
+            fanout_stats: MetadataFanoutStats {
+                nodes_queried: 1,
+                ..MetadataFanoutStats::default()
+            },
+        });
     }
 
-    let mut execution = query_metadata(
-        context,
-        realm_id,
-        local_node_id,
-        MetadataQueryRequest {
-            auth: request.auth,
-            bearer_token: request.bearer_token,
-            graph_iris: Some(vec![record.graph_iri.clone()]),
-            query: request.query,
-            mode: request.mode,
-            target_nodes: Some(document_replica_query_nodes(
-                config.as_ref(),
-                &record,
-                local_node_id,
-            )),
-            allow_partial: request.allow_partial,
-        },
-    )
-    .await?;
-    if discovery_failed {
-        execution.fanout_stats.nodes_failed += 1;
-        execution.fanout_stats.discovery_failed = true;
+    let Some(config) = load_realm_config(context, realm_id).await else {
+        if !request.allow_partial {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
+        ensure_record_materialized_for_graph_read(context, &record).await?;
+        let results = metadata
+            .query_authorized_local(request.auth, Some(vec![record.graph_iri]), request.query)
+            .await
+            .map_err(map_metadata_query_error)?;
+        return Ok(MetadataQueryExecution {
+            results,
+            fanout_stats: MetadataFanoutStats {
+                nodes_queried: 1,
+                nodes_failed: 1,
+                discovery_failed: true,
+                ..MetadataFanoutStats::default()
+            },
+        });
+    };
+    let config_digest = config
+        .digest()
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let mut holders = document_replica_query_nodes(Some(&config), &record, local_node_id);
+    if let Some(index) = holders.iter().position(|holder| *holder == local_node_id) {
+        holders.swap(0, index);
     }
-    Ok(execution)
+    let remote_auth = match request.bearer_token.as_deref() {
+        Some(token) => {
+            Some(MetadataAuthToken::bearer(token).map_err(|_| MetadataApiError::BadRequest)?)
+        }
+        None => request.auth.clone().map(MetadataAuthToken::internal),
+    };
+    let mut fanout_stats = MetadataFanoutStats::default();
+    for holder in holders {
+        fanout_stats.nodes_queried += 1;
+        let result = if holder == local_node_id {
+            match ensure_record_materialized_for_graph_read(context, &record).await {
+                Ok(()) => {
+                    metadata
+                        .query_authorized_local(
+                            request.auth.clone(),
+                            Some(vec![record.graph_iri.clone()]),
+                            request.query.clone(),
+                        )
+                        .await
+                }
+                Err(error) => Err(MetadataError::Backend(error.to_string())),
+            }
+        } else {
+            metadata
+                .request_document_query(
+                    holder,
+                    remote_auth.clone(),
+                    config_digest,
+                    request.document_id,
+                    request.query.clone(),
+                )
+                .await
+        };
+        match result {
+            Ok(results) => {
+                fanout_stats.nodes_failed = 0;
+                fanout_stats.failed_partitions.clear();
+                return Ok(MetadataQueryExecution {
+                    results,
+                    fanout_stats,
+                });
+            }
+            Err(error) => {
+                fanout_stats.nodes_failed += 1;
+                fanout_stats.failed_partitions.push(holder);
+                warn!(%holder, %error, "Document query holder failed; trying the next replica");
+            }
+        }
+    }
+    Err(MetadataApiError::ServiceUnavailable)
 }
 
 pub async fn query_metadata(
@@ -1003,6 +1564,37 @@ async fn load_group_records(
     drive(ListMetadataDocumentsOperation::new(group_id), context)
         .await
         .map_err(|err| MetadataApiError::Internal(err.to_string()))
+}
+
+async fn load_claim_records(
+    context: &DriverContext,
+    realm_id: RealmId,
+    group_id: Option<GroupId>,
+) -> Result<Vec<MetadataRegistryRecord>, MetadataApiError> {
+    let group_ids = match group_id {
+        Some(group_id) => vec![group_id],
+        None => drive(ListGroupOperation::new(), context)
+            .await
+            .map_err(|error| MetadataApiError::Internal(error.to_string()))?
+            .into_iter()
+            .map(|group| group.group_id)
+            .collect(),
+    };
+    let mut pending = load_pending_records(context, group_id).await?;
+    let mut records = Vec::new();
+    for group_id in group_ids {
+        let mut group_records = load_group_records(context, group_id).await?;
+        if let Some(pending_records) = pending.remove(&group_id) {
+            merge_pending_metadata_records(&mut group_records, pending_records);
+        }
+        group_records.sort_by_key(|record| record.document_id);
+        records.extend(group_records);
+    }
+    for pending_records in pending.into_values() {
+        records.extend(pending_records);
+    }
+    records.retain(|record| record.realm_id == realm_id);
+    Ok(records)
 }
 
 async fn load_pending_records(
@@ -1576,7 +2168,16 @@ fn fanout_nodes_with_local(mut nodes: Vec<NodeId>, local_node_id: NodeId) -> Vec
     deduplicate_fanout_nodes(nodes)
 }
 
-pub fn metadata_auth_token_from_bearer(token: Option<&str>) -> Option<MetadataAuthToken> {
+pub fn forwarded_bearer(
+    token: Option<&str>,
+) -> Result<Option<MetadataAuthToken>, MetadataApiError> {
+    token
+        .map(MetadataAuthToken::bearer)
+        .transpose()
+        .map_err(|_| MetadataApiError::BadRequest)
+}
+
+fn fanout_bearer(token: Option<&str>) -> Option<MetadataAuthToken> {
     token.and_then(|token| MetadataAuthToken::bearer(token).ok())
 }
 
@@ -1899,7 +2500,7 @@ pub async fn search_buckets_distributed(
         .metadata_handle
         .clone()
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    let remote_auth_token = metadata_auth_token_from_bearer(request.bearer_token.as_deref());
+    let remote_auth_token = fanout_bearer(request.bearer_token.as_deref());
     let local_call: MetadataNodeCall<Vec<BucketSearchHit>> = metadata_node_call(
         (
             context.clone(),
@@ -2038,7 +2639,7 @@ async fn run_query_distributed(
         MetadataQueryForm::Select => query_select_limit(&query),
         MetadataQueryForm::Ask => None,
     };
-    let remote_auth_token = metadata_auth_token_from_bearer(bearer_token.as_deref());
+    let remote_auth_token = fanout_bearer(bearer_token.as_deref());
 
     // Remote partitions authorize on the forwarded credential, so entries are
     // partitioned by credential digest. The local invalidation signals only
@@ -2186,7 +2787,7 @@ async fn run_search_distributed(
         .metadata_handle
         .clone()
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    let remote_auth_token = metadata_auth_token_from_bearer(bearer_token.as_deref());
+    let remote_auth_token = fanout_bearer(bearer_token.as_deref());
     let resume = Arc::new(resume);
 
     let local_call: MetadataNodeCall<(Vec<MetadataSearchHit>, usize)> = metadata_node_call(
@@ -2389,6 +2990,7 @@ mod tests {
     use aruna_core::structs::{
         Actor, GroupAuthorizationDocument, PlacementRef, RealmAuthorizationDocument, Role,
     };
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::{Key, RoleId};
     use aruna_storage::storage;
     use tempfile::{TempDir, tempdir};
@@ -2433,24 +3035,35 @@ mod tests {
     }
 
     fn public_record(group_id: GroupId, document_id: Ulid) -> MetadataRegistryRecord {
+        let event_id = Ulid::generate();
+        let document_id = MetaResourceId::from_parts(
+            document_id.timestamp_ms(),
+            PlacementHandle::new(1).unwrap(),
+            BucketId::new(0).unwrap(),
+            document_id.0 as u64 & ((1_u64 << 48) - 1),
+        )
+        .unwrap()
+        .as_ulid();
+        let document_path = format!("datasets/cached/{document_id}");
         MetadataRegistryRecord {
             realm_id: TEST_REALM_ID,
             group_id,
             document_id,
-            document_path: "datasets/cached".to_string(),
+            document_path: document_path.clone(),
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
             public: true,
             permission_path: MetadataRegistryRecord::permission_path_for(
                 &TEST_REALM_ID,
                 group_id,
-                "datasets/cached",
+                &document_path,
                 document_id,
             ),
             placement: PlacementRef::NIL,
             holder_node_ids: Vec::new(),
             created_at_ms: 1,
             updated_at_ms: 1,
-            last_event_id: Ulid::generate(),
+            establishing_event_id: event_id,
+            last_event_id: event_id,
         }
     }
 
@@ -2717,6 +3330,244 @@ mod tests {
         assert_eq!(result.documents.len(), 1);
         assert_eq!(result.documents[0].record.document_id, readable.document_id);
         assert_eq!(result.total_estimate, Some(1));
+    }
+
+    #[tokio::test]
+    async fn cross_shard_unknown() {
+        // Local listings cannot resolve claims that may live on another registry shard.
+        let test = metadata_test();
+        let group_id = Ulid::generate();
+        let mut config = RealmConfigDocument::new(TEST_REALM_ID, Vec::new(), 3);
+        config.seed_default_placement();
+        let mut first = public_record(group_id, Ulid::generate());
+        let first_shard = registry_placement(&config, &first).shard;
+        let mut second = loop {
+            let candidate = public_record(group_id, Ulid::generate());
+            if registry_placement(&config, &candidate).shard != first_shard {
+                break candidate;
+            }
+        };
+        second.document_path = first.document_path.clone();
+        second.permission_path = MetadataRegistryRecord::permission_path_for(
+            &TEST_REALM_ID,
+            group_id,
+            &second.document_path,
+            second.document_id,
+        );
+        let claims = [&first, &second]
+            .into_iter()
+            .map(|record| PathClaimRecord {
+                document_id: MetaResourceId::from_bytes(record.document_id.to_bytes()).unwrap(),
+                establishing_event_id: record.establishing_event_id,
+                requested_path: record.document_path.clone(),
+            })
+            .collect::<Vec<_>>();
+        let resolution = aruna_core::structs::resolve_path_claim(&claims).unwrap();
+        let winner_id = resolution.winner.document_id.as_ulid();
+        let loser_id = resolution.conflicts[0].document_id.as_ulid();
+        first.public = first.document_id == loser_id;
+        second.public = second.document_id == loser_id;
+        seed_registry_cache(&test, &first).await;
+        seed_registry_cache(&test, &second).await;
+
+        let listed = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            summary_request(group_id, false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(listed.documents.len(), 1);
+        assert_eq!(listed.documents[0].record.document_id, loser_id);
+        assert_ne!(winner_id, loser_id);
+    }
+
+    #[test]
+    fn user_result_opaque() {
+        // An unreadable winner still participates and cannot promote a readable loser.
+        let group_id = Ulid::generate();
+        let first = public_record(group_id, Ulid::generate());
+        let mut second = public_record(group_id, Ulid::generate());
+        second.document_path = first.document_path.clone();
+        let mut candidates = [&first, &second]
+            .into_iter()
+            .map(|record| MetadataPathCandidate {
+                claim: PathClaimRecord {
+                    document_id: MetaResourceId::from_bytes(record.document_id.to_bytes()).unwrap(),
+                    establishing_event_id: record.establishing_event_id,
+                    requested_path: record.document_path.clone(),
+                },
+                record: Some(record.clone()),
+            })
+            .collect::<Vec<_>>();
+        let claims = candidates
+            .iter()
+            .map(|candidate| candidate.claim.clone())
+            .collect::<Vec<_>>();
+        let winner = aruna_core::structs::resolve_path_claim(&claims)
+            .unwrap()
+            .winner;
+        let hidden_id = winner.document_id.to_bytes();
+        candidates
+            .iter_mut()
+            .find(|candidate| candidate.claim == winner)
+            .unwrap()
+            .record = None;
+
+        let result = reduce_path_candidates(candidates);
+        assert!(matches!(result, Err(MetadataApiError::NotFound)));
+        let response = MetadataTransportMessage::ForwardedPathResolution {
+            result: Err(MetadataReadError::NotFound),
+        };
+        let encoded = postcard::to_allocvec(&response).unwrap();
+        assert!(
+            !encoded
+                .windows(hidden_id.len())
+                .any(|window| window == hidden_id)
+        );
+    }
+
+    fn path_candidate(record: &MetadataRegistryRecord) -> MetadataPathCandidate {
+        MetadataPathCandidate {
+            claim: PathClaimRecord {
+                document_id: MetaResourceId::from_bytes(record.document_id.to_bytes()).unwrap(),
+                establishing_event_id: record.establishing_event_id,
+                requested_path: record.document_path.clone(),
+            },
+            record: Some(record.clone()),
+        }
+    }
+
+    #[test]
+    fn missing_replica_fails() {
+        let record = public_record(Ulid::generate(), Ulid::generate());
+        let views = vec![PathShardView {
+            shard: 0,
+            candidates: vec![path_candidate(&record)],
+        }];
+
+        assert!(matches!(
+            merge_path_views(&[2], views),
+            Err(MetadataApiError::ServiceUnavailable)
+        ));
+    }
+
+    #[test]
+    fn stale_replica_fails() {
+        let record = public_record(Ulid::generate(), Ulid::generate());
+        let views = vec![
+            PathShardView {
+                shard: 0,
+                candidates: vec![path_candidate(&record)],
+            },
+            PathShardView {
+                shard: 0,
+                candidates: Vec::new(),
+            },
+        ];
+
+        assert!(matches!(
+            merge_path_views(&[2], views),
+            Err(MetadataApiError::ServiceUnavailable)
+        ));
+    }
+
+    #[test]
+    fn divergent_claims_fail() {
+        let record = public_record(Ulid::generate(), Ulid::generate());
+        let mut divergent = record.clone();
+        divergent.establishing_event_id = Ulid::generate();
+        let views = vec![
+            PathShardView {
+                shard: 0,
+                candidates: vec![path_candidate(&record)],
+            },
+            PathShardView {
+                shard: 0,
+                candidates: vec![path_candidate(&divergent)],
+            },
+        ];
+
+        assert!(matches!(
+            merge_path_views(&[2], views),
+            Err(MetadataApiError::ServiceUnavailable)
+        ));
+    }
+
+    #[test]
+    fn divergent_evidence_fails() {
+        let record = public_record(Ulid::generate(), Ulid::generate());
+        let mut divergent = record.clone();
+        divergent.public = false;
+        let views = vec![
+            PathShardView {
+                shard: 0,
+                candidates: vec![path_candidate(&record)],
+            },
+            PathShardView {
+                shard: 0,
+                candidates: vec![path_candidate(&divergent)],
+            },
+        ];
+
+        assert!(matches!(
+            merge_path_views(&[2], views),
+            Err(MetadataApiError::ServiceUnavailable)
+        ));
+    }
+
+    #[test]
+    fn invalid_resolution_fails() {
+        let record = public_record(Ulid::generate(), Ulid::generate());
+        let mut unrelated = MetadataPathResolution {
+            winner: sanitize_path_winner(record.clone()).unwrap(),
+            conflicts: Vec::new(),
+        };
+        unrelated.winner.group_id = Ulid::generate();
+        assert!(matches!(
+            validate_path_resolution(
+                TEST_REALM_ID,
+                record.group_id,
+                &record.document_path,
+                &unrelated,
+            ),
+            Err(MetadataApiError::ServiceUnavailable)
+        ));
+
+        let duplicate = MetadataPathResolution {
+            winner: sanitize_path_winner(record.clone()).unwrap(),
+            conflicts: vec![record.document_id],
+        };
+        assert!(matches!(
+            validate_path_resolution(
+                TEST_REALM_ID,
+                record.group_id,
+                &record.document_path,
+                &duplicate,
+            ),
+            Err(MetadataApiError::ServiceUnavailable)
+        ));
+    }
+
+    #[test]
+    fn winner_wire_sanitized() {
+        let mut record = public_record(Ulid::generate(), Ulid::generate());
+        let holder = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
+        record.holder_node_ids = vec![holder];
+        let permission_path = record.permission_path.clone();
+        let winner = sanitize_path_winner(record).unwrap();
+        let encoded = postcard::to_allocvec(&winner).unwrap();
+
+        assert!(
+            !encoded
+                .windows(holder.as_bytes().len())
+                .any(|window| window == holder.as_bytes())
+        );
+        assert!(
+            !encoded
+                .windows(permission_path.len())
+                .any(|window| window == permission_path.as_bytes())
+        );
     }
 
     fn auth_for(user_id: UserId) -> AuthContext {
@@ -3230,6 +4081,7 @@ mod tests {
             holder_node_ids: vec![stale_node_id],
             created_at_ms: 0,
             updated_at_ms: 0,
+            establishing_event_id: Ulid::nil(),
             last_event_id: Ulid::nil(),
         };
 
@@ -3374,11 +4226,16 @@ mod tests {
     }
 
     #[test]
-    fn metadata_auth_token_helper_uses_validated_carrier_only() {
-        assert_eq!(
-            metadata_auth_token_from_bearer(Some("raw-aruna-token")),
-            Some(MetadataAuthToken::bearer("raw-aruna-token").unwrap())
-        );
-        assert_eq!(metadata_auth_token_from_bearer(None), None);
+    fn bearer_limits() {
+        assert!(matches!(
+            forwarded_bearer(Some(&"x".repeat(4096))),
+            Ok(Some(MetadataAuthToken::Bearer(_)))
+        ));
+        assert!(matches!(
+            forwarded_bearer(Some(&"x".repeat(4097))),
+            Err(MetadataApiError::BadRequest)
+        ));
+        assert!(fanout_bearer(Some(&"x".repeat(4097))).is_none());
+        assert!(matches!(forwarded_bearer(None), Ok(None)));
     }
 }

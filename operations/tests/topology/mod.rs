@@ -29,9 +29,11 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::{
-    Actor, MetadataRegistryRecord, NodePlacementEntry, PlacementRef, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
+    Actor, DocumentClass, HandleRange, MetadataRegistryRecord, NodePlacementEntry,
+    PlacementBinding, PlacementRef, PlacementScope, RealmAuthorizationDocument,
+    RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims, band_start,
 };
+use aruna_core::structured_id::PlacementHandle;
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::announce_realm_presence::{
@@ -190,6 +192,12 @@ impl Topology {
     /// A bearer token for [`Topology::user_id`], signed by the realm key that the
     /// realm id is. A holder re-validates this before applying a forwarded write.
     pub fn bearer_token(&self) -> MetadataAuthToken {
+        MetadataAuthToken::bearer(self.bearer_string()).expect("token is within the length bound")
+    }
+
+    /// The raw signed JWT backing [`Topology::bearer_token`], for callers that pass
+    /// a bearer string rather than a [`MetadataAuthToken`].
+    pub fn bearer_string(&self) -> String {
         let now = chrono::Utc::now().timestamp().max(0) as u64;
         let claims = TokenClaims {
             sub: self.user_id.to_string(),
@@ -205,13 +213,12 @@ impl Topology {
             .signing_key
             .to_pkcs8_pem(LineEnding::LF)
             .expect("realm key encodes");
-        let token = encode(
+        encode(
             &Header::new(Algorithm::EdDSA),
             &claims,
             &EncodingKey::from_ed_pem(key_pem.as_bytes()).expect("realm key is an ed25519 key"),
         )
-        .expect("token signs");
-        MetadataAuthToken::bearer(token).expect("token is within the length bound")
+        .expect("token signs")
     }
 
     /// A group owned by [`Topology::user_id`], replicated to every sync-eligible
@@ -365,6 +372,26 @@ impl Topology {
             .count()
     }
 
+    /// Reinstalls a mutated realm config on every node, as an admin change would.
+    pub async fn apply_config(&mut self, config: RealmConfigDocument) -> TestResult<()> {
+        for node in &self.nodes {
+            let actor = Actor {
+                node_id: node.node_id(),
+                user_id: self.user_id,
+                realm_id: self.realm_id,
+            };
+            write(
+                node,
+                REALM_CONFIG_KEYSPACE,
+                self.realm_id.as_bytes().to_vec(),
+                config.to_bytes(&actor)?,
+            )
+            .await?;
+        }
+        self.config = config;
+        Ok(())
+    }
+
     pub async fn shutdown(self) {
         for node in self.nodes {
             node.net.shutdown().await;
@@ -409,7 +436,7 @@ async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<TestNo
     initialize_task_incoming(
         context.clone(),
         task_handle,
-        aruna_operations::jobs::runtime::JobsRuntime::new(),
+        aruna_operations::jobs::runtime::JobsRuntime::new_paused(),
     )
     .await;
 
@@ -444,6 +471,7 @@ async fn install_realm_config(
 ) -> TestResult<RealmConfigDocument> {
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), replication_factor);
     config.seed_default_placement();
+    let mut band = 0u32;
     for (index, node) in nodes.iter().enumerate() {
         let node_id = node.node_id();
         config.ensure_node(node_id, node.kind.clone());
@@ -458,6 +486,27 @@ async fn install_realm_config(
             draining: false,
             labels: BTreeMap::new(),
         });
+        // Every sync-eligible node gets its onboarding band; the band's first
+        // handle carries its immutable JobControl binding.
+        let range = HandleRange {
+            range_id: Ulid::from_bytes([band as u8 + 1; 16]),
+            owner: node_id,
+            start: band_start(band),
+            end: band_start(band + 1),
+        };
+        config.placement_handle_ranges.push(range);
+        config.placement_bindings.push(PlacementBinding {
+            handle: PlacementHandle::new(range.start).expect("band start is a valid handle"),
+            scope: PlacementScope::Realm(realm_id),
+            document_class: DocumentClass::JobControl,
+            strategy_id: config
+                .default_strategy_id
+                .expect("seeded config has a default strategy"),
+            allocator_range_id: Some(range.range_id),
+            allocated_by: Some(node_id),
+            allocated_at_ms: Some(1),
+        });
+        band += 1;
     }
 
     let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);

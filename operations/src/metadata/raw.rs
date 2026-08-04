@@ -56,7 +56,7 @@ impl RawEventPlan {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataRawView {
     pub revision: MetadataRawRevision,
     pub projection_state: MetadataMaterializationState,
@@ -490,6 +490,7 @@ mod tests {
                 holder_node_ids: vec![node_id],
                 created_at_ms: 1,
                 updated_at_ms,
+                establishing_event_id: event_id,
                 last_event_id: event_id,
             },
             user_id: aruna_core::UserId::local(Ulid::from_parts(1, 3), realm_id),

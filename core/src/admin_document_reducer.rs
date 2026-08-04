@@ -11,11 +11,12 @@ use crate::admin_documents::{
     AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use crate::structs::{
-    Actor, BindingScope, DocumentClass, MAX_PLACEMENT_SHARD_COUNT, MetadataRegistryRecord,
-    MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, PlacementOverride,
-    PlacementStrategy, QuotaConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
-    RealmNodeKind, StrategyBinding, reserved_label,
+    Actor, BandPool, BindingScope, DocumentClass, HandleRange, MAX_PLACEMENT_SHARD_COUNT,
+    MetadataRegistryRecord, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig,
+    PlacementBinding, PlacementOverride, PlacementStrategy, QuotaConfig, RealmConfigDocument,
+    RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding, reserved_label,
 };
+use crate::structured_id::PlacementHandle;
 use crate::types::{RoleId, UserId};
 use crate::user_update_validation::{
     UserAttributeValidationError, validate_user_attribute_key, validate_user_attribute_value,
@@ -47,6 +48,8 @@ pub enum AdminDocumentReducerError {
     InvalidPlacementShardCount,
     #[error("placement strategy shard count cannot be changed")]
     PlacementShardCountChanged,
+    #[error("placement handle range is malformed")]
+    InvalidHandleRange,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,10 +205,102 @@ pub fn overlay_realm_config_placement_reducer_materialization(
         }
     }
 
+    // Placement bindings are immutable and fail closed: unlike strategy bindings
+    // (which drop a conflicted scope), every divergent value for a conflicted
+    // handle is retained so the derived binding directory reports a conflict.
+    let materialized_bindings = reducer_state.materialized_placement_bindings();
+    for (path, conflict) in &reducer_state.conflicts {
+        let Some(handle) = placement_binding_handle(path) else {
+            continue;
+        };
+        config
+            .placement_bindings
+            .retain(|binding| binding.handle != handle);
+        for value in &conflict.values {
+            if let Some(binding) = value.value.as_deref().and_then(parse_placement_binding) {
+                config.placement_bindings.push(binding);
+            }
+        }
+    }
+    for path in reducer_state.user_subject_ids.keys() {
+        let Some(handle) = placement_binding_handle(path) else {
+            continue;
+        };
+        config
+            .placement_bindings
+            .retain(|binding| binding.handle != handle);
+        if reducer_state.conflicts.contains_key(path) {
+            continue;
+        }
+        if let Some(binding) = materialized_bindings.get(&handle) {
+            config.placement_bindings.push(binding.clone());
+        }
+    }
+
+    // Same-id grant conflicts retain every value; the range directory derives
+    // distinct-id overlap conflicts.
+    let materialized_ranges = reducer_state.materialized_handle_ranges();
+    for (path, conflict) in &reducer_state.conflicts {
+        let Some(range_id) = handle_range_id(path) else {
+            continue;
+        };
+        config
+            .placement_handle_ranges
+            .retain(|range| range.range_id != range_id);
+        for value in &conflict.values {
+            if let Some(range) = value.value.as_deref().and_then(parse_handle_range) {
+                config.placement_handle_ranges.push(range);
+            }
+        }
+    }
+    for path in reducer_state.user_subject_ids.keys() {
+        let Some(range_id) = handle_range_id(path) else {
+            continue;
+        };
+        config
+            .placement_handle_ranges
+            .retain(|range| range.range_id != range_id);
+        if reducer_state.conflicts.contains_key(path) {
+            continue;
+        }
+        if let Some(range) = materialized_ranges.get(&range_id) {
+            config.placement_handle_ranges.push(*range);
+        }
+    }
+
+    // Band pools mirror handle ranges: same-id divergence retains every value.
+    let materialized_pools = reducer_state.materialized_band_pools();
+    for (path, conflict) in &reducer_state.conflicts {
+        let Some(pool_id) = band_pool_id(path) else {
+            continue;
+        };
+        config.band_pools.retain(|pool| pool.pool_id != pool_id);
+        for value in &conflict.values {
+            if let Some(pool) = value.value.as_deref().and_then(parse_band_pool) {
+                config.band_pools.push(pool);
+            }
+        }
+    }
+    for path in reducer_state.user_subject_ids.keys() {
+        let Some(pool_id) = band_pool_id(path) else {
+            continue;
+        };
+        config.band_pools.retain(|pool| pool.pool_id != pool_id);
+        if reducer_state.conflicts.contains_key(path) {
+            continue;
+        }
+        if let Some(pool) = materialized_pools.get(&pool_id) {
+            config.band_pools.push(*pool);
+        }
+    }
+
     repair_realm_config_placement_references(config);
 }
 
 fn repair_realm_config_placement_references(config: &mut RealmConfigDocument) {
+    // `placement_bindings` are intentionally exempt: they are immutable, so a
+    // binding naming a removed strategy fails closed at resolve rather than
+    // being repaired here.
     let live_strategy_ids: BTreeSet<_> = config
         .strategies
         .iter()
@@ -286,7 +381,12 @@ impl AdminDocumentReducerState {
         if self.applied_event_ids.contains(&event.event_id) {
             return Ok(AdminDocumentApplyStatus::Duplicate);
         }
-        let stale_on_all_paths = operation_paths(&event.op)
+        let stale_on_all_paths = !matches!(
+            &event.op,
+            AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
+                | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
+                | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
+        ) && operation_paths(&event.op)
             .iter()
             .all(|path| self.event_is_stale_for_path(event, path));
 
@@ -552,6 +652,30 @@ impl AdminDocumentReducerState {
                     realm_config_placement_override_path(subject),
                     None,
                 );
+            }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding },
+            ) => {
+                self.apply_placement_binding(event, binding);
+            }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigHandleRangeGranted { range },
+            ) => {
+                if !range.is_well_formed() {
+                    return Err(AdminDocumentReducerError::InvalidHandleRange);
+                }
+                self.apply_handle_range(event, range);
+            }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigBandPoolAssigned { pool },
+            ) => {
+                if !pool.is_well_formed() {
+                    return Err(AdminDocumentReducerError::InvalidHandleRange);
+                }
+                self.apply_band_pool(event, pool);
             }
             _ => return Err(AdminDocumentReducerError::UnsupportedTarget),
         }
@@ -894,6 +1018,54 @@ impl AdminDocumentReducerState {
             .collect()
     }
 
+    pub fn materialized_placement_bindings(&self) -> BTreeMap<PlacementHandle, PlacementBinding> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let handle = placement_binding_handle(path)?;
+                let binding = version.value.as_deref().and_then(parse_placement_binding)?;
+
+                (binding.handle == handle).then_some((handle, binding))
+            })
+            .collect()
+    }
+
+    pub fn materialized_handle_ranges(&self) -> BTreeMap<Ulid, HandleRange> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let range_id = handle_range_id(path)?;
+                let range = version.value.as_deref().and_then(parse_handle_range)?;
+
+                (range.range_id == range_id).then_some((range_id, range))
+            })
+            .collect()
+    }
+
+    pub fn materialized_band_pools(&self) -> BTreeMap<Ulid, BandPool> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let pool_id = band_pool_id(path)?;
+                let pool = version.value.as_deref().and_then(parse_band_pool)?;
+
+                (pool.pool_id == pool_id).then_some((pool_id, pool))
+            })
+            .collect()
+    }
+
     fn apply_user_name(&mut self, event: &AdminDocumentEvent, name: &str) {
         self.user_name = self.reduce_value(
             event,
@@ -1145,6 +1317,57 @@ impl AdminDocumentReducerState {
         }
     }
 
+    fn apply_placement_binding(&mut self, event: &AdminDocumentEvent, binding: &PlacementBinding) {
+        self.apply_immutable_value(
+            event,
+            placement_binding_path(binding.handle),
+            placement_binding_value(binding),
+        );
+    }
+
+    fn apply_handle_range(&mut self, event: &AdminDocumentEvent, range: &HandleRange) {
+        // Like bindings, divergent values for one id fail closed. Distinct-id
+        // overlap is derived later by `HandleRangeDirectory::from_ranges`.
+        self.apply_immutable_value(
+            event,
+            handle_range_path(range.range_id),
+            handle_range_value(range),
+        );
+    }
+
+    fn apply_band_pool(&mut self, event: &AdminDocumentEvent, pool: &BandPool) {
+        self.apply_immutable_value(event, band_pool_path(pool.pool_id), band_pool_value(pool));
+    }
+
+    /// Append-only path: a divergent value for an existing path fails closed as
+    /// a conflict instead of selecting a winner.
+    fn apply_immutable_value(&mut self, event: &AdminDocumentEvent, path: String, value: String) {
+        let value = Some(value);
+        if self.conflicts.contains_key(&path) {
+            self.record_conflict_value(&path, value, event.dot());
+            return;
+        }
+
+        let Some(current) = self.user_subject_ids.get(&path).cloned() else {
+            let version = self.version_with_dots(&path, value, BTreeSet::from([event.dot()]));
+            self.user_subject_ids.insert(path, version);
+            return;
+        };
+        let mut dots = self.take_version_dots(&path, &current);
+        if current.value != value {
+            for dot in dots {
+                self.record_conflict_value(&path, current.value.clone(), dot);
+            }
+            self.record_conflict_value(&path, value, event.dot());
+            self.user_subject_ids.remove(&path);
+            return;
+        }
+
+        dots.insert(event.dot());
+        let version = self.version_with_dots(&path, value, dots);
+        self.user_subject_ids.insert(path, version);
+    }
+
     fn reduce_value(
         &mut self,
         event: &AdminDocumentEvent,
@@ -1389,6 +1612,15 @@ fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { subject } => {
             vec![realm_config_placement_override_path(subject)]
         }
+        AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding } => {
+            vec![placement_binding_path(binding.handle)]
+        }
+        AdminDocumentOperation::RealmConfigHandleRangeGranted { range } => {
+            vec![handle_range_path(range.range_id)]
+        }
+        AdminDocumentOperation::RealmConfigBandPoolAssigned { pool } => {
+            vec![band_pool_path(pool.pool_id)]
+        }
     }
 }
 
@@ -1447,6 +1679,18 @@ pub fn realm_config_placement_override_path(subject: &[u8]) -> String {
     format!("realm_config.placement.overrides.{}", hex::encode(subject))
 }
 
+pub fn placement_binding_path(handle: PlacementHandle) -> String {
+    format!("realm_config.placement.placement_bindings.{}", handle.get())
+}
+
+pub fn handle_range_path(range_id: Ulid) -> String {
+    format!("realm_config.placement.handle_ranges.{range_id}")
+}
+
+pub fn band_pool_path(pool_id: Ulid) -> String {
+    format!("realm_config.placement.band_pools.{pool_id}")
+}
+
 pub fn binding_scope_key(scope: &BindingScope) -> String {
     match scope {
         BindingScope::Realm => "realm".to_string(),
@@ -1457,6 +1701,7 @@ pub fn binding_scope_key(scope: &BindingScope) -> String {
             DocumentClass::User => "class:user",
             DocumentClass::Metadata => "class:metadata",
             DocumentClass::MetadataRegistry => "class:metadata_registry",
+            DocumentClass::JobControl => "class:job_control",
         }
         .to_string(),
         BindingScope::MetadataPathPrefix(prefix) => format!(
@@ -1522,6 +1767,22 @@ fn strategy_binding_value(binding: &StrategyBinding) -> String {
 
 fn placement_override_value(record: &PlacementOverride) -> String {
     serde_json::to_string(record).expect("admin document placement override serializes")
+}
+
+fn placement_binding_value(binding: &PlacementBinding) -> String {
+    serde_json::to_string(binding).expect("admin document placement binding serializes")
+}
+
+fn handle_range_value(range: &HandleRange) -> String {
+    // A handle range carries no provenance to normalize away: the whole record
+    // (id, owner, bounds) is the identity compared for same-key divergence.
+    serde_json::to_string(range).expect("admin document handle range serializes")
+}
+
+fn band_pool_value(pool: &BandPool) -> String {
+    // The whole record (id, lineage, owner, bounds) is the identity compared
+    // for same-key divergence.
+    serde_json::to_string(pool).expect("admin document band pool serializes")
 }
 
 fn oidc_provider_value(provider: &OidcProviderConfig) -> String {
@@ -1613,6 +1874,21 @@ pub fn realm_config_placement_override_subject_key_from_path(path: &str) -> Opti
     path.strip_prefix("realm_config.placement.overrides.")
 }
 
+pub fn placement_binding_handle(path: &str) -> Option<PlacementHandle> {
+    let handle = path.strip_prefix("realm_config.placement.placement_bindings.")?;
+    PlacementHandle::new(handle.parse().ok()?).ok()
+}
+
+pub fn band_pool_id(path: &str) -> Option<Ulid> {
+    let pool_id = path.strip_prefix("realm_config.placement.band_pools.")?;
+    Ulid::from_string(pool_id).ok()
+}
+
+pub fn handle_range_id(path: &str) -> Option<Ulid> {
+    let range_id = path.strip_prefix("realm_config.placement.handle_ranges.")?;
+    Ulid::from_string(range_id).ok()
+}
+
 fn oidc_provider_from_value(value: &str) -> Option<OidcProviderConfig> {
     serde_json::from_str(value).ok()
 }
@@ -1647,6 +1923,18 @@ fn placement_override_from_value(value: &str) -> Option<PlacementOverride> {
     serde_json::from_str(value).ok()
 }
 
+fn parse_placement_binding(value: &str) -> Option<PlacementBinding> {
+    serde_json::from_str(value).ok()
+}
+
+fn parse_handle_range(value: &str) -> Option<HandleRange> {
+    serde_json::from_str(value).ok()
+}
+
+fn parse_band_pool(value: &str) -> Option<BandPool> {
+    serde_json::from_str(value).ok()
+}
+
 fn realm_node_kind_from_value(value: &str) -> Option<RealmNodeKind> {
     match value {
         "management" => Some(RealmNodeKind::Management),
@@ -1665,29 +1953,31 @@ mod tests {
         REALM_CONFIG_DESCRIPTION_PATH, REALM_CONFIG_DISCOVERY_PATH,
         REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_QUOTA_PATH, USER_NAME_PATH,
         binding_scope_key, group_role_id_from_path, group_role_path,
-        group_role_user_assignment_from_path, group_role_user_assignment_path,
+        group_role_user_assignment_from_path, group_role_user_assignment_path, handle_range_path,
         metadata_replication_value, oidc_provider_value,
-        overlay_realm_config_placement_reducer_materialization, realm_config_node_id_from_path,
-        realm_config_node_path, realm_config_oidc_provider_id_from_path,
-        realm_config_oidc_provider_path, realm_config_placement_node_id_from_path,
-        realm_config_placement_node_path, realm_config_placement_strategy_id_from_path,
-        realm_config_placement_strategy_path, realm_config_strategy_binding_path,
-        realm_config_strategy_binding_scope_key_from_path, realm_discovery_value,
-        realm_role_id_from_path, realm_role_path, realm_role_user_assignment_from_path,
-        realm_role_user_assignment_path, role_definition_value, user_attribute_path,
-        user_subject_id_path,
+        overlay_realm_config_placement_reducer_materialization, placement_binding_handle,
+        placement_binding_path, realm_config_node_id_from_path, realm_config_node_path,
+        realm_config_oidc_provider_id_from_path, realm_config_oidc_provider_path,
+        realm_config_placement_node_id_from_path, realm_config_placement_node_path,
+        realm_config_placement_strategy_id_from_path, realm_config_placement_strategy_path,
+        realm_config_strategy_binding_path, realm_config_strategy_binding_scope_key_from_path,
+        realm_discovery_value, realm_role_id_from_path, realm_role_path,
+        realm_role_user_assignment_from_path, realm_role_user_assignment_path,
+        role_definition_value, user_attribute_path, user_subject_id_path,
     };
     use crate::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation,
         AdminDocumentRoleDefinition, AdminDocumentTarget,
     };
     use crate::structs::{
-        Actor, AffinityEffect, AffinityRule, BindingScope, DocumentClass, GroupQuotaOverride,
-        KIND_LABEL_KEY, LabelMatch, MAX_PLACEMENT_SHARD_COUNT, MetadataReplicationConfig,
-        NodePlacementEntry, OidcProviderConfig, Permission, PlacementOverride, PlacementStrategy,
-        QuotaConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind,
-        STORAGE_CLASS_LABEL_PREFIX, StrategyBinding, UserGroupCapOverride,
+        Actor, AffinityEffect, AffinityRule, BindingError, BindingScope, DocumentClass,
+        FIRST_GRANTABLE_HANDLE, GroupQuotaOverride, HandleRange, KIND_LABEL_KEY, LabelMatch,
+        MAX_PLACEMENT_SHARD_COUNT, MetadataReplicationConfig, NodePlacementEntry,
+        OidcProviderConfig, Permission, PlacementBinding, PlacementOverride, PlacementScope,
+        PlacementStrategy, QuotaConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
+        RealmNodeKind, STORAGE_CLASS_LABEL_PREFIX, StrategyBinding, UserGroupCapOverride,
     };
+    use crate::structured_id::PlacementHandle;
     use crate::types::{GroupId, RoleId};
     use crate::user_update_validation::UserAttributeValidationError;
     use crate::{NodeId, UserId};
@@ -3857,6 +4147,10 @@ mod tests {
                 "class:metadata_registry".to_string(),
             ),
             (
+                BindingScope::Class(DocumentClass::JobControl),
+                "class:job_control".to_string(),
+            ),
+            (
                 BindingScope::MetadataPathPrefix(" /datasets/important/ ".to_string()),
                 "metadata_path_prefix:datasets/important".to_string(),
             ),
@@ -4744,5 +5038,292 @@ mod tests {
             Err(AdminDocumentReducerError::UnsupportedTarget)
         );
         assert_eq!(state, before);
+    }
+
+    fn placement_binding(handle: u32, strategy_seed: u8) -> PlacementBinding {
+        PlacementBinding {
+            handle: PlacementHandle::new(handle).unwrap(),
+            scope: PlacementScope::Realm(realm_id()),
+            document_class: DocumentClass::MetadataRegistry,
+            strategy_id: Ulid::from_bytes([strategy_seed; 16]),
+            allocator_range_id: None,
+            allocated_by: None,
+            allocated_at_ms: None,
+        }
+    }
+
+    fn append_placement_binding(
+        event_seed: u8,
+        origin_seed: u8,
+        binding: PlacementBinding,
+    ) -> AdminDocumentEvent {
+        realm_config_event(
+            event_seed,
+            node(origin_seed),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding },
+        )
+    }
+
+    fn handle_range(range_seed: u8, owner: NodeId, start: u32, end: u32) -> HandleRange {
+        HandleRange {
+            range_id: Ulid::from_bytes([range_seed; 16]),
+            owner,
+            start,
+            end,
+        }
+    }
+
+    fn grant_handle_range(
+        event_seed: u8,
+        origin_seed: u8,
+        range: HandleRange,
+    ) -> AdminDocumentEvent {
+        realm_config_event(
+            event_seed,
+            node(origin_seed),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigHandleRangeGranted { range },
+        )
+    }
+
+    #[test]
+    fn grants_replicate_usable() {
+        let owner = node(3);
+        let first = grant_handle_range(1, 1, handle_range(10, owner, FIRST_GRANTABLE_HANDLE, 1027));
+        let second = grant_handle_range(2, 2, handle_range(20, owner, 1027, 2051));
+
+        let mut state = realm_config_state();
+        state.apply(&first).unwrap();
+        state.apply(&second).unwrap();
+        assert!(state.conflicts.is_empty());
+        assert_eq!(state.materialized_handle_ranges().len(), 2);
+
+        let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+        overlay_realm_config_placement_reducer_materialization(&mut config, &state);
+        let directory = config.handle_range_directory();
+        assert_eq!(directory.conflicts(), 0);
+        assert_eq!(directory.granted_to(&owner).len(), 2);
+        assert_eq!(
+            directory.free_band_in(&[(
+                FIRST_GRANTABLE_HANDLE,
+                crate::structs::band_start(crate::structs::HANDLE_BANDS)
+            )]),
+            Some((2051, 3075))
+        );
+    }
+
+    #[test]
+    fn malformed_range_rejected() {
+        let event = grant_handle_range(1, 1, handle_range(10, node(3), 1, 1025));
+        let mut state = realm_config_state();
+
+        assert_eq!(
+            state.apply(&event),
+            Err(AdminDocumentReducerError::InvalidHandleRange)
+        );
+    }
+
+    #[test]
+    fn overlap_conflicts_converge() {
+        let owner = node(3);
+        let first = grant_handle_range(1, 1, handle_range(10, owner, FIRST_GRANTABLE_HANDLE, 1027));
+        let second = grant_handle_range(2, 2, handle_range(20, owner, 512, 2049));
+
+        let mut left = realm_config_state();
+        left.apply(&first).unwrap();
+        left.apply(&second).unwrap();
+
+        let mut right = realm_config_state();
+        right.apply(&second).unwrap();
+        right.apply(&first).unwrap();
+
+        // Distinct ids retain separate paths; the derived directory catches overlap.
+        assert!(left.conflicts.is_empty());
+        assert_eq!(left.conflicts, right.conflicts);
+        for range_seed in [10u8, 20] {
+            let path = handle_range_path(Ulid::from_bytes([range_seed; 16]));
+            assert!(left.user_subject_ids.contains_key(&path));
+        }
+        assert_eq!(left.materialized_handle_ranges().len(), 2);
+
+        for state in [&left, &right] {
+            let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+            overlay_realm_config_placement_reducer_materialization(&mut config, state);
+            assert_eq!(config.placement_handle_ranges.len(), 2);
+            let directory = config.handle_range_directory();
+            assert_eq!(directory.conflicts(), 2);
+            assert!(directory.granted_to(&owner).is_empty());
+        }
+    }
+
+    #[test]
+    fn binding_paths_disjoint() {
+        let handle = PlacementHandle::new(42).unwrap();
+        let path = placement_binding_path(handle);
+        assert_eq!(path, "realm_config.placement.placement_bindings.42");
+        assert_eq!(placement_binding_handle(&path), Some(handle));
+        // The two placement-binding namespaces must not parse each other's paths.
+        assert_eq!(
+            realm_config_strategy_binding_scope_key_from_path(&path),
+            None
+        );
+        let strategy_path = realm_config_strategy_binding_path(&BindingScope::Realm);
+        assert_eq!(placement_binding_handle(&strategy_path), None);
+    }
+
+    #[test]
+    fn binding_conflicts_converge() {
+        let handle = PlacementHandle::new(7).unwrap();
+        let first = append_placement_binding(1, 1, placement_binding(7, 1));
+        let second = append_placement_binding(2, 2, placement_binding(7, 2));
+        let observed_second = realm_config_event(
+            2,
+            node(1),
+            2,
+            AdminDocumentClock::default().with_observed(node(1), 1),
+            AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                binding: placement_binding(7, 2),
+            },
+        );
+
+        let mut left = realm_config_state();
+        left.apply(&first).unwrap();
+        left.apply(&second).unwrap();
+
+        let mut right = realm_config_state();
+        right.apply(&second).unwrap();
+        right.apply(&first).unwrap();
+
+        let mut observed = realm_config_state();
+        observed.apply(&first).unwrap();
+        observed.apply(&observed_second).unwrap();
+
+        let mut observed_reversed = realm_config_state();
+        observed_reversed.apply(&observed_second).unwrap();
+        assert_eq!(
+            observed_reversed.apply(&first),
+            Ok(AdminDocumentApplyStatus::Applied)
+        );
+
+        assert_eq!(left.conflicts, right.conflicts);
+        let path = placement_binding_path(handle);
+        assert!(left.conflicts.contains_key(&path));
+        assert_eq!(observed.conflicts, observed_reversed.conflicts);
+        assert!(observed.conflicts.contains_key(&path));
+        assert!(left.materialized_placement_bindings().is_empty());
+        assert!(right.materialized_placement_bindings().is_empty());
+
+        for state in [&left, &right] {
+            let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+            overlay_realm_config_placement_reducer_materialization(&mut config, state);
+            let directory = config.binding_directory();
+            assert_eq!(
+                directory.resolve(handle),
+                Err(BindingError::Conflicted(handle))
+            );
+            assert_eq!(directory.conflicted(), 1);
+        }
+    }
+
+    #[test]
+    fn provenance_conflicts() {
+        let handle = PlacementHandle::new(9).unwrap();
+        let mut first = placement_binding(9, 1);
+        first.allocated_by = Some(node(3));
+        first.allocated_at_ms = Some(1);
+        let mut second = placement_binding(9, 1);
+        second.allocated_by = Some(node(4));
+        second.allocated_at_ms = Some(2);
+
+        let mut state = realm_config_state();
+        state.apply(&append_placement_binding(1, 1, first)).unwrap();
+        state
+            .apply(&append_placement_binding(2, 2, second))
+            .unwrap();
+
+        assert_eq!(state.conflicts.len(), 1);
+        assert!(state.materialized_placement_bindings().is_empty());
+
+        let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+        overlay_realm_config_placement_reducer_materialization(&mut config, &state);
+        assert_eq!(config.placement_bindings.len(), 2);
+        assert_eq!(
+            config.binding_directory().resolve(handle),
+            Err(BindingError::Conflicted(handle))
+        );
+    }
+
+    #[test]
+    fn binding_reappend_idempotent() {
+        let handle = PlacementHandle::new(11).unwrap();
+        let origin = node(1);
+        let range_id = Ulid::from_bytes([8; 16]);
+        let mut binding = placement_binding(11, 1);
+        binding.allocator_range_id = Some(range_id);
+        binding.allocated_by = Some(origin);
+        binding.allocated_at_ms = Some(1);
+        let first = append_placement_binding(1, 1, binding.clone());
+        let second = realm_config_event(
+            2,
+            node(2),
+            1,
+            AdminDocumentClock::default().with_observed(origin, 1),
+            AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                binding: binding.clone(),
+            },
+        );
+
+        let mut state = realm_config_state();
+        state.apply(&first).unwrap();
+        state.apply(&second).unwrap();
+
+        assert!(state.conflicts.is_empty());
+        assert_eq!(state.materialized_placement_bindings().len(), 1);
+        let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+        config
+            .placement_handle_ranges
+            .push(handle_range(8, origin, 3, 20));
+        overlay_realm_config_placement_reducer_materialization(&mut config, &state);
+        assert_eq!(config.placement_bindings.len(), 1);
+        assert_eq!(
+            config
+                .binding_directory()
+                .resolve(handle)
+                .map(|tuple| tuple.strategy_id),
+            Ok(binding.strategy_id)
+        );
+    }
+
+    #[test]
+    fn overlay_retains_conflicts() {
+        let first = placement_binding(13, 1);
+        let second = placement_binding(13, 2);
+        let mut state = realm_config_state();
+        state
+            .apply(&append_placement_binding(1, 1, first.clone()))
+            .unwrap();
+        state
+            .apply(&append_placement_binding(2, 2, second.clone()))
+            .unwrap();
+
+        let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+        // A stale local entry for the handle must be replaced, not accumulated.
+        config.placement_bindings.push(first.clone());
+        overlay_realm_config_placement_reducer_materialization(&mut config, &state);
+
+        assert_eq!(config.placement_bindings.len(), 2);
+        let strategies: BTreeSet<_> = config
+            .placement_bindings
+            .iter()
+            .map(|binding| binding.strategy_id)
+            .collect();
+        assert_eq!(
+            strategies,
+            BTreeSet::from([first.strategy_id, second.strategy_id])
+        );
+        assert_eq!(config.binding_directory().conflicted(), 1);
     }
 }

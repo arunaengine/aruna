@@ -1,20 +1,21 @@
 use std::path::{Component, Path as FsPath};
 use std::sync::{Arc, Mutex};
 
+use aruna_core::StructuredId;
 use aruna_core::errors::{BlobError, SourceConnectorResolutionError, StagingSourceError};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
-    AuthContext, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget,
-    JobPayload, MetadataRegistryRecord, Permission, RoCrateMediaType, blob_bucket_permission_path,
-    blob_object_permission_path, user_dedup_key,
+    Actor, AuthContext, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
+    ImportRoCrateTarget, JobPayload, MetadataRegistryRecord, Permission, RoCrateMediaType,
+    blob_bucket_permission_path, blob_object_permission_path, user_dedup_key,
 };
+use aruna_operations::create_metadata_document::mint_job_document;
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::import::{
     CreateRoCrateUploadConfig, CreateRoCrateUploadError, CreateRoCrateUploadOperation,
     load_rocrate_upload,
 };
 use aruna_operations::jobs::service::{lookup_job_dedup, read_owned_job, submit_rocrate_import};
-use aruna_operations::list_metadata_documents::ListMetadataDocumentsOperation;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::staging::head_source::{
@@ -197,7 +198,8 @@ pub async fn upload_rocrate(
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Source or target not found", body = ErrorResponse),
-        (status = 409, description = "Idempotency conflict or active-job cap", body = ErrorResponse)
+        (status = 409, description = "Idempotency conflict or active-job cap", body = ErrorResponse),
+        (status = 503, description = "Placement binding unavailable or conflicted", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -207,17 +209,16 @@ pub async fn submit_import(
     Json(request): Json<SubmitImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
-    let document_id = Ulid::generate();
     let source = parse_import_source(request.source)?;
     let target = parse_import_target(request.target, state.rocrate_limits().key_bytes)?;
     let metadata = parse_import_metadata(request.metadata, state.rocrate_limits().key_bytes)?;
-    let spec = ImportRoCrateSpec {
+    let mut spec = ImportRoCrateSpec {
         auth_context: auth,
         source,
         target,
         metadata,
         limits: state.rocrate_limits().clone(),
-        document_id,
+        document_id: Ulid::nil(),
     };
     let replay = if let Some(idempotency_key) = request.idempotency_key.as_deref() {
         lookup_job_dedup(
@@ -234,6 +235,21 @@ pub async fn submit_import(
     let result = if let Some(result) = replay {
         result
     } else {
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: spec.auth_context.user_id,
+            realm_id: state.get_realm_id(),
+        };
+        let document_id = mint_job_document(
+            state.get_ctx().as_ref(),
+            &actor,
+            spec.metadata.group_id,
+            &spec.metadata.path,
+        )
+        .await
+        .map_err(super::metadata::map_create_error)?
+        .as_ulid();
+        spec.document_id = document_id;
         fast_source_check(
             &state,
             &spec.auth_context,
@@ -504,21 +520,6 @@ async fn fast_metadata_check(
         Permission::WRITE,
     )
     .await?;
-    let records = drive(
-        ListMetadataDocumentsOperation::new(metadata.group_id),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
-    if records
-        .iter()
-        .any(|record| record.document_path == metadata.path && record.document_id != document_id)
-    {
-        return Err(ServerError::Conflict(format!(
-            "metadata path `{}` already exists",
-            metadata.path
-        )));
-    }
     Ok(())
 }
 
@@ -643,11 +644,13 @@ mod tests {
     use aruna_blob::blob::BlobHandler;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+    };
     use aruna_core::structs::{
         Actor, Backend, BackendConfig, BackendLocation, BackendRef, BucketInfo, Group,
         GroupAuthorizationDocument, NodeCapabilities, PathRestriction, RealmAuthorizationDocument,
-        RealmId, RoCrateLimits, RoCrateUploadRecord,
+        RealmConfigDocument, RealmId, RealmNodeKind, RoCrateLimits, RoCrateUploadRecord,
     };
     use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -854,6 +857,21 @@ mod tests {
             .await
             .with_rocrate_limits(limits),
         );
+        let mut config = RealmConfigDocument::default_for_realm(realm(), Vec::new());
+        config.seed_default_placement();
+        config.ensure_node(node_id, RealmNodeKind::Server);
+        let actor = Actor {
+            node_id,
+            user_id: user,
+            realm_id: realm(),
+        };
+        write_doc(
+            &state,
+            REALM_CONFIG_KEYSPACE,
+            realm().as_bytes().to_vec().into(),
+            config.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
         (dir, state, user)
     }
 

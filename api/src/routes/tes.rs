@@ -15,8 +15,10 @@ use aruna_core::structs::{
 };
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
+use aruna_operations::jobs::JobRouteError;
 use aruna_operations::jobs::service::{
-    CancelJobOutcome, cancel_owned_job, list_owned_jobs, read_owned_job, submit_execution_job,
+    RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_record_routed,
+    submit_execution_job,
 };
 use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
 use axum::extract::{Path, Query, RawQuery, State};
@@ -30,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 
-use crate::auth::require_unrestricted_realm_auth;
+use crate::auth::{ValidatedArunaBearerTokenCarrier, require_unrestricted_realm_auth};
 use crate::error::ServerError;
 use crate::server_state::ServerState;
 
@@ -515,13 +517,15 @@ pub async fn create_task(
         (status = 200, body = TesTask),
         (status = 400, body = TesErrorPayload),
         (status = 401, body = TesErrorPayload),
-        (status = 404, body = TesErrorPayload)
+        (status = 404, body = TesErrorPayload),
+        (status = 503, body = TesErrorPayload)
     ),
     security(("bearer_auth" = []), ("basic_auth" = []))
 )]
 pub async fn get_task(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     headers: HeaderMap,
     Path(id): Path<String>,
     Query(query): Query<ViewQuery>,
@@ -539,11 +543,17 @@ pub async fn get_task(
         Err(_) => return TesError::not_found("TES task not found").into_response(),
     };
 
-    let record = match read_owned_job(&state.get_ctx(), caller.auth.user_id, job_id).await {
-        Ok(Some(record)) => record,
-        Ok(None) => return TesError::not_found("TES task not found").into_response(),
-        Err(error) => return TesError::internal(error).into_response(),
+    let forwarded = match super::jobs::forwarded_job_auth(bearer) {
+        Ok(token) => token,
+        Err(error) => return TesError::from_server(error).into_response(),
     };
+    // The owner is the sole 404 authority; a non-owner routes or reports 503.
+    let record =
+        match read_record_routed(&state.get_ctx(), caller.auth.user_id, job_id, forwarded).await {
+            Ok(Some(record)) => record,
+            Ok(None) => return TesError::not_found("TES task not found").into_response(),
+            Err(error) => return TesError::from_job_route(error).into_response(),
+        };
     // Only execution jobs are TES tasks; other job kinds are not addressable here.
     if !task_in_group(&record, caller.credential_group) {
         return TesError::not_found("TES task not found").into_response();
@@ -567,7 +577,7 @@ pub async fn get_task(
         ("tag_value" = Vec<String>, Query, description = "Repeated tag values")
     ),
     responses(
-        (status = 200, body = TesListTasksResponse),
+        (status = 200, description = "Node-local tasks page; tasks owned by other nodes are omitted", body = TesListTasksResponse),
         (status = 400, body = TesErrorPayload),
         (status = 401, body = TesErrorPayload)
     ),
@@ -638,13 +648,15 @@ pub async fn list_tasks(
     responses(
         (status = 200, description = "Cancellation requested"),
         (status = 401, body = TesErrorPayload),
-        (status = 404, body = TesErrorPayload)
+        (status = 404, body = TesErrorPayload),
+        (status = 503, body = TesErrorPayload)
     ),
     security(("bearer_auth" = []), ("basic_auth" = []))
 )]
 pub async fn cancel_task(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
@@ -661,28 +673,43 @@ pub async fn cancel_task(
         Ok(job_id) => job_id,
         Err(_) => return TesError::not_found("TES task not found").into_response(),
     };
-    let record = match read_owned_job(&state.get_ctx(), caller.auth.user_id, job_id).await {
+    let forwarded = match super::jobs::forwarded_job_auth(bearer) {
+        Ok(token) => token,
+        Err(error) => return TesError::from_server(error).into_response(),
+    };
+    // Group scoping needs the owner record; the owner is the 404 authority.
+    let record = match read_record_routed(
+        &state.get_ctx(),
+        caller.auth.user_id,
+        job_id,
+        forwarded.clone(),
+    )
+    .await
+    {
         Ok(Some(record)) => record,
         Ok(None) => return TesError::not_found("TES task not found").into_response(),
-        Err(error) => return TesError::internal(error).into_response(),
+        Err(error) => return TesError::from_job_route(error).into_response(),
     };
     if !task_in_group(&record, caller.credential_group) {
         return TesError::not_found("TES task not found").into_response();
     }
 
-    match cancel_owned_job(
+    match cancel_job_routed(
         &state.get_ctx(),
         &state.jobs_runtime(),
         caller.auth.user_id,
         job_id,
+        forwarded,
     )
     .await
     {
-        Ok(CancelJobOutcome::NotFound) => TesError::not_found("TES task not found").into_response(),
-        Ok(CancelJobOutcome::AlreadyTerminal(_) | CancelJobOutcome::Requested(_)) => {
+        Ok(RoutedCancelOutcome::NotFound) => {
+            TesError::not_found("TES task not found").into_response()
+        }
+        Ok(RoutedCancelOutcome::AlreadyTerminal(_) | RoutedCancelOutcome::Requested(_)) => {
             tes_json_response(StatusCode::OK, serde_json::json!({}))
         }
-        Err(error) => TesError::internal(error).into_response(),
+        Err(error) => TesError::from_job_route(error).into_response(),
     }
 }
 
@@ -1460,6 +1487,19 @@ impl TesError {
             other => Self::internal(other.to_string()),
         }
     }
+
+    fn from_job_route(error: JobRouteError) -> Self {
+        match error {
+            JobRouteError::Unauthorized => Self::unauthorized(),
+            JobRouteError::Forbidden => Self::forbidden("forbidden"),
+            JobRouteError::NotFound => Self::not_found("TES task not found"),
+            JobRouteError::Unavailable(message) => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message,
+            },
+            JobRouteError::Internal(message) => Self::internal(message),
+        }
+    }
 }
 
 impl IntoResponse for TesError {
@@ -1485,6 +1525,8 @@ impl IntoResponse for TesError {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    use aruna_operations::jobs::service::read_owned_job;
 
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, USER_ACCESS_KEYSPACE};
@@ -2399,6 +2441,7 @@ mod tests {
         let visible = get_task(
             State(state.clone()),
             Extension(None),
+            Extension(None),
             headers.clone(),
             Path(visible_id.to_string()),
             Query(ViewQuery::default()),
@@ -2407,6 +2450,7 @@ mod tests {
         assert_eq!(visible.status(), StatusCode::OK);
         let hidden = get_task(
             State(state.clone()),
+            Extension(None),
             Extension(None),
             headers.clone(),
             Path(hidden_id.to_string()),
@@ -2418,6 +2462,7 @@ mod tests {
         let hidden_cancel = cancel_task(
             State(state.clone()),
             Extension(None),
+            Extension(None),
             headers.clone(),
             Path(format!("{hidden_id}:cancel")),
         )
@@ -2425,6 +2470,7 @@ mod tests {
         assert_eq!(hidden_cancel.status(), StatusCode::NOT_FOUND);
         let visible_cancel = cancel_task(
             State(state.clone()),
+            Extension(None),
             Extension(None),
             headers.clone(),
             Path(format!("{visible_id}:cancel")),
@@ -2502,6 +2548,7 @@ mod tests {
         let response = get_task(
             State(state.clone()),
             Extension(auth_for(owner)),
+            Extension(None),
             HeaderMap::new(),
             Path(job_id.to_string()),
             Query(ViewQuery {
@@ -2515,6 +2562,7 @@ mod tests {
         let foreign = get_task(
             State(state.clone()),
             Extension(auth_for(user(3))),
+            Extension(None),
             HeaderMap::new(),
             Path(job_id.to_string()),
             Query(ViewQuery::default()),
@@ -2540,6 +2588,7 @@ mod tests {
         let ok = cancel_task(
             State(state.clone()),
             Extension(auth_for(owner)),
+            Extension(None),
             HeaderMap::new(),
             Path(format!("{job_id}:cancel")),
         )
@@ -2550,6 +2599,7 @@ mod tests {
         let bad = cancel_task(
             State(state.clone()),
             Extension(auth_for(owner)),
+            Extension(None),
             HeaderMap::new(),
             Path(job_id.to_string()),
         )

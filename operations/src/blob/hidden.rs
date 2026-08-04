@@ -6,14 +6,15 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{JOB_KEYSPACE, ROCRATE_JOB_STATE_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE};
 use aruna_core::structs::{
-    BackendLocation, HiddenBlobEntry, HiddenBlobKey, JobId, JobRecord, JobResultPayload,
-    RoCrateCheckpointRefs, RoCrateUploadRecord,
+    BackendLocation, HiddenBlobEntry, HiddenBlobKey, JOB_RECORD_KEY_PREFIX, JobId, JobRecord,
+    JobResultPayload, RoCrateCheckpointRefs, RoCrateUploadRecord,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Key;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
+use byteview::ByteView;
 use tracing::warn;
 
 use crate::driver::DriverContext;
@@ -91,10 +92,11 @@ async fn scan_jobs(
     let mut referenced = HashSet::new();
     let mut start_after = None;
     loop {
+        // Scan the versioned record prefix only.
         let (values, next) = iter_prefix_page(
             storage,
             JOB_KEYSPACE,
-            None,
+            Some(ByteView::from(JOB_RECORD_KEY_PREFIX.to_vec())),
             start_after.take(),
             SWEEP_PAGE_SIZE,
             None,
@@ -211,11 +213,10 @@ fn is_orphaned(
     if referenced.contains(&entry.key) {
         return false;
     }
-    if entry
-        .key
-        .namespace()
-        .is_ok_and(|namespace| active_rocrate.contains(&JobId(namespace)))
-    {
+    if entry.key.namespace().is_ok_and(|namespace| {
+        JobId::try_from_bytes(namespace.to_bytes())
+            .is_ok_and(|job_id| active_rocrate.contains(&job_id))
+    }) {
         return false;
     }
     entry.modified_at.is_some_and(|modified| modified <= cutoff)
@@ -363,7 +364,7 @@ mod tests {
         assert!(!is_orphaned(
             &entry,
             &HashSet::new(),
-            &HashSet::from([JobId(namespace)]),
+            &HashSet::from([JobId::from_bytes(namespace.to_bytes())]),
             UNIX_EPOCH
         ));
     }

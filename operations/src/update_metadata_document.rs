@@ -554,6 +554,7 @@ mod tests {
             holder_node_ids: vec![actor.node_id],
             created_at_ms: 1,
             updated_at_ms: 1,
+            establishing_event_id: Ulid::from_parts(1, 1),
             last_event_id: Ulid::from_parts(1, 1),
         }
     }

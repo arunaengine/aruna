@@ -1074,6 +1074,7 @@ mod tests {
             holder_node_ids: vec![node(2)],
             created_at_ms: 1_000,
             updated_at_ms: 1_000,
+            establishing_event_id: event_id,
             last_event_id: event_id,
         };
         MetadataCreateEventRecord {
@@ -1624,8 +1625,9 @@ mod tests {
     fn skew_event(updated_at_ms: u64, occurred_at_ms: u64) -> MetadataCreateEventRecord {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let document_id = Ulid::generate();
+        let event_id = Ulid::generate();
         MetadataCreateEventRecord {
-            event_id: Ulid::generate(),
+            event_id,
             record: MetadataRegistryRecord {
                 realm_id,
                 group_id: Ulid::generate(),
@@ -1638,7 +1640,8 @@ mod tests {
                 holder_node_ids: Vec::new(),
                 created_at_ms: updated_at_ms,
                 updated_at_ms,
-                last_event_id: Ulid::generate(),
+                establishing_event_id: event_id,
+                last_event_id: event_id,
             },
             user_id: UserId::nil(realm_id),
             node_id: iroh::SecretKey::from_bytes(&[2u8; 32]).public(),

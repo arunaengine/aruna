@@ -616,7 +616,7 @@ async fn mark_crate_failed(
         && !matches!(
             RunCrateStatus::from_bytes(value.as_ref())
                 .map_err(|error| JobMutationError::Storage(error.to_string()))?,
-            RunCrateStatus::Pending
+            RunCrateStatus::Pending | RunCrateStatus::Minted { .. }
         )
     {
         return Ok(());
@@ -1837,11 +1837,16 @@ pub async fn list_jobs_for_user(
         }
         let scanned = values.len();
         let mut resume = None;
-        for (key, _) in values {
+        for (key, value) in values {
             let (_, created_at_ms, job_id) =
                 parse_job_owner_index_key(key.as_ref()).map_err(|error| error.to_string())?;
             resume = Some(key);
-            if let Some(record) = read_job_record(storage, job_id, None).await?
+            let record = if value.is_empty() {
+                read_job_record(storage, job_id, None).await?
+            } else {
+                decode_job_record(value.as_ref()).ok()
+            };
+            if let Some(record) = record
                 && !record.payload.is_internal()
                 && filter(&record)
             {
@@ -2126,11 +2131,12 @@ async fn delete_raw(
 mod tests {
     use super::*;
     use aruna_core::structs::{
-        AuthContext, ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportReportDetail,
-        ImportReportRow, ImportRoCrateResult, ImportRoCrateSource, ImportRoCrateSpec,
-        ImportRoCrateTarget, JOB_LEASE_INDEX_PREFIX, JobPayload, RealmId, ReasonCode,
-        RoCrateLimits, parse_job_schedule_index_key,
+        AuthContext, ComputeResources, ExecutionSpec, FIRST_GRANTABLE_HANDLE, ImportMetadataTarget,
+        ImportReportDetail, ImportReportRow, ImportRoCrateResult, ImportRoCrateSource,
+        ImportRoCrateSpec, ImportRoCrateTarget, JOB_LEASE_INDEX_PREFIX, JobPayload, RealmId,
+        ReasonCode, RoCrateLimits, parse_job_schedule_index_key,
     };
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::UserId;
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
@@ -2146,6 +2152,16 @@ mod tests {
         let mut seed_bytes = [0u8; 32];
         seed_bytes[0] = seed;
         iroh::SecretKey::from_bytes(&seed_bytes).public()
+    }
+
+    fn job_id(timestamp_ms: u64) -> JobId {
+        JobId::from_parts(
+            timestamp_ms,
+            PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
+            BucketId::new(0).unwrap(),
+            0,
+        )
+        .unwrap()
     }
 
     fn queued_record(job_id: JobId) -> JobRecord {
@@ -3015,7 +3031,7 @@ mod tests {
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
         let make = |seq: u64, state: JobState| {
             let mut record = JobRecord::new(
-                JobId(Ulid::from_parts(seq, 0)),
+                job_id(seq),
                 JobPayload::Probe {
                     steps: 1,
                     step_sleep_ms: 0,
@@ -3043,7 +3059,7 @@ mod tests {
             &storage,
             vec![(
                 JOB_OWNER_INDEX_KEYSPACE.to_string(),
-                job_owner_index_key(owner, 2_000, JobId(Ulid::from_parts(2, 0))),
+                job_owner_index_key(owner, 2_000, job_id(2)),
                 empty_value(),
             )],
             None,

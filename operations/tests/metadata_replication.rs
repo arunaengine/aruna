@@ -26,16 +26,17 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::{
     Actor, MetadataRegistryRecord, NodePlacementEntry, PlacementRef, RealmConfigDocument, RealmId,
-    RealmNodeKind, shard_for_subject,
+    RealmNodeKind,
 };
 use aruna_core::util::unix_timestamp_millis;
-use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
+use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent, MetaResourceId, NodeId, StructuredId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    mint_local_document,
 };
 use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::document_sync_outbox::read_outbox_records;
@@ -66,6 +67,36 @@ use tempfile::TempDir;
 use tokio::time::{Instant, sleep};
 use ulid::Ulid;
 
+/// Mints the held-bucket structured id a local create embeds on `node_id`.
+fn mint_local(
+    config: &RealmConfigDocument,
+    node_id: NodeId,
+    realm_id: RealmId,
+    group_id: Ulid,
+    path: &str,
+) -> Ulid {
+    mint_local_document(
+        config,
+        &Actor {
+            node_id,
+            user_id: UserId::local(Ulid::generate(), realm_id),
+            realm_id,
+        },
+        group_id,
+        path,
+    )
+    .expect("mint local structured id")
+    .as_ulid()
+}
+
+/// A fixed structured id (handle 1, bucket 0) for direct-record/projection tests
+/// that do not exercise the create-mint flow.
+fn doc_id(seed: u64) -> Ulid {
+    MetaResourceId::try_from((1u128 << 60) | u128::from(seed))
+        .unwrap()
+        .as_ulid()
+}
+
 // Every wait below polls to a condition; the ceiling only bounds a genuine
 // hang. Post-replan convergence measures ~1s (registry row) to ~10s (event
 // log behind a holder-transition graph sync) under tenfold contention, but a
@@ -83,9 +114,15 @@ struct TestNode {
 async fn metadata_creation_replicates_to_all_three_holders()
 -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([41u8; 32]);
-    let (nodes, _config) = build_realm_nodes(&realm_id, 3).await?;
+    let (nodes, config) = build_realm_nodes(&realm_id, 3).await?;
     let group_id = Ulid::generate();
-    let document_id = Ulid::generate();
+    let document_id = mint_local(
+        &config,
+        nodes[0].net.node_id(),
+        realm_id,
+        group_id,
+        "datasets/bootstrap",
+    );
 
     let visible_nodes = drive(
         GetRealmNodesOperation::new(realm_id),
@@ -136,10 +173,16 @@ async fn metadata_creation_replicates_to_all_three_holders()
 #[tokio::test]
 async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([46u8; 32]);
-    let (nodes, _config) = build_realm_nodes(&realm_id, 4).await?;
+    let (nodes, config) = build_realm_nodes(&realm_id, 4).await?;
     let group_id = Ulid::generate();
-    let document_id = Ulid::generate();
     let document_path = "datasets/replan-holder-refresh";
+    let document_id = mint_local(
+        &config,
+        nodes[0].net.node_id(),
+        realm_id,
+        group_id,
+        document_path,
+    );
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
@@ -276,10 +319,16 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
 #[tokio::test]
 async fn flush_after_drain() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([47u8; 32]);
-    let (nodes, _config, refreshers) =
+    let (nodes, config, refreshers) =
         build_pinned_realm(&realm_id, &[11, 12, 13, 14], &[false, true, true, true]).await?;
     let group_id = Ulid::generate();
-    let document_id = Ulid::generate();
+    let document_id = mint_local(
+        &config,
+        nodes[0].net.node_id(),
+        realm_id,
+        group_id,
+        "datasets/flush-after-drain",
+    );
     let (placement, initial_holders, update_event_id) = seed_and_update(
         &nodes,
         realm_id,
@@ -326,10 +375,16 @@ async fn flush_after_drain() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn publish_before_drain() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([48u8; 32]);
-    let (nodes, _config, refreshers) =
+    let (nodes, config, refreshers) =
         build_pinned_realm(&realm_id, &[21, 22, 23, 24], &[false, true, true, true]).await?;
     let group_id = Ulid::generate();
-    let document_id = Ulid::generate();
+    let document_id = mint_local(
+        &config,
+        nodes[0].net.node_id(),
+        realm_id,
+        group_id,
+        "datasets/publish-before-drain",
+    );
     let (placement, initial_holders, update_event_id) = seed_and_update(
         &nodes,
         realm_id,
@@ -560,19 +615,16 @@ async fn origin_off_hash_converges() -> Result<(), Box<dyn std::error::Error>> {
         metadata_path: Some(document_path),
     };
     let sample = DocumentSyncTarget::MetadataDocumentLifecycle {
-        document_id: Ulid::generate(),
+        document_id: doc_id(1),
     };
     let (strategy, _) =
         strategy_for_target(&config, &sample, context).expect("metadata strategy resolves");
     let held = held_buckets(&config, strategy, origin);
     assert!(!held.is_empty() && held.len() < strategy.shard_count as usize);
 
-    let hashed_shard =
-        |document_id: Ulid| shard_for_subject(&document_id.to_bytes(), strategy.shard_count);
-    let mut document_id = Ulid::generate();
-    while held.contains(&hashed_shard(document_id)) {
-        document_id = Ulid::generate();
-    }
+    // The bucket is chosen from the origin's held set and embedded in the id, so
+    // the id never hashes the origin out of its own bucket: the create converges.
+    let document_id = mint_local(&config, origin, realm_id, group_id, document_path);
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
@@ -597,7 +649,8 @@ async fn origin_off_hash_converges() -> Result<(), Box<dyn std::error::Error>> {
     .await?
     .record;
 
-    assert!(!held.contains(&hashed_shard(document_id)));
+    // The stamped bucket is one the origin holds (chosen from its held set),
+    // never a blind hash of the id, so the origin can always publish it.
     assert!(held.contains(&created.placement.shard));
 
     let mut holders = resolve_shard_holders(&config, &created.placement);
@@ -613,9 +666,15 @@ async fn origin_off_hash_converges() -> Result<(), Box<dyn std::error::Error>> {
 async fn metadata_updates_and_deletes_apply_to_local_holder()
 -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([42u8; 32]);
-    let (nodes, _config) = build_realm_nodes(&realm_id, 3).await?;
+    let (nodes, config) = build_realm_nodes(&realm_id, 3).await?;
     let group_id = Ulid::generate();
-    let document_id = Ulid::generate();
+    let document_id = mint_local(
+        &config,
+        nodes[0].net.node_id(),
+        realm_id,
+        group_id,
+        "datasets/propagation",
+    );
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
@@ -739,11 +798,12 @@ async fn batched_metadata_create_projection_materializes_many_documents()
     let mut events = Vec::new();
 
     for index in 0..8u8 {
-        let document_id = Ulid::generate();
+        let placement_seed = Ulid::generate();
         let now = unix_timestamp_millis().saturating_add(index.into());
         let document_path = format!("datasets/batch-{index}");
-        let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
-        let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: placement_seed,
+        };
         let (strategy, _) = strategy_for_target(
             &config,
             &target,
@@ -760,6 +820,13 @@ async fn batched_metadata_create_projection_materializes_many_documents()
             &subject_bytes(&target),
         )
         .expect("origin holds a bucket");
+        let document_id = MetaResourceId::try_from(
+            (1u128 << 60) | (u128::from(placement.shard) << 48) | u128::from(index + 1),
+        )
+        .unwrap()
+        .as_ulid();
+        let event_id = Ulid::generate();
+        let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
         let record = MetadataRegistryRecord {
             realm_id,
             group_id,
@@ -777,10 +844,11 @@ async fn batched_metadata_create_projection_materializes_many_documents()
             holder_node_ids: vec![node.net.node_id()],
             created_at_ms: now,
             updated_at_ms: now,
-            last_event_id: Ulid::nil(),
+            establishing_event_id: event_id,
+            last_event_id: event_id,
         };
         events.push(MetadataCreateEventRecord {
-            event_id: Ulid::generate(),
+            event_id,
             record,
             user_id: UserId::local(Ulid::generate(), realm_id),
             node_id: node.net.node_id(),
@@ -859,6 +927,7 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
         holder_node_ids: vec![nodes[0].net.node_id(), nodes[1].net.node_id()],
         created_at_ms: 1,
         updated_at_ms: 1,
+        establishing_event_id: event_id,
         last_event_id: event_id,
     };
     let create_event = MetadataCreateEventRecord {

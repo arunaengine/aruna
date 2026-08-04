@@ -3,6 +3,7 @@ use std::time::Duration;
 use crate::alpn::Alpn;
 use crate::document::DocumentSyncEffect;
 use crate::id::{DhtKeyId, NodeId};
+use crate::jobs::JobRequest;
 use crate::metadata::MetadataEffect;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
@@ -239,6 +240,15 @@ pub enum NetEffect {
     Dht(DhtEffect),
     DocumentSync(DocumentSyncEffect),
     Stream(StreamEffect),
+    JobControl(Box<JobControlEffect>),
+}
+
+/// Discrete job-control request to a job's immutable owner. The adapter performs
+/// the frame round-trip; the routing operation only emits this.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobControlEffect {
+    pub owner: NodeId,
+    pub request: JobRequest,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -20,9 +20,9 @@ use aruna_core::storage_entries::{
     stale_admin_document_conflict_delete_entries,
 };
 use aruna_core::structs::{
-    Actor, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, MetadataRegistryRecord,
-    NodePlacementEntry, PlacementOverride, PlacementRef, PlacementStrategy, RealmConfigDocument,
-    StrategyBinding,
+    Actor, BindingError, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DocumentClass,
+    MetadataRegistryRecord, NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementRef,
+    PlacementScope, PlacementStrategy, RealmConfigDocument, StrategyBinding,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -50,6 +50,7 @@ pub enum RealmPlacementMutation {
     RemoveBinding(BindingScope),
     SetOverride(PlacementOverride),
     RemoveOverride(Vec<u8>),
+    AppendPlacementBinding(PlacementBinding),
 }
 
 impl RealmPlacementMutation {
@@ -92,6 +93,11 @@ impl RealmPlacementMutation {
                     subject: subject.clone(),
                 }
             }
+            Self::AppendPlacementBinding(binding) => {
+                AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                    binding: binding.clone(),
+                }
+            }
         }
     }
 
@@ -124,10 +130,61 @@ impl RealmPlacementMutation {
                 ))
             }
             Self::SetDefaultStrategy(strategy_id) => {
-                require_strategy(document, strategy_id, "default strategy")
+                require_strategy(document, strategy_id, "default strategy")?;
+                require_metadata_binding(
+                    document,
+                    PlacementScope::Realm(document.realm_id),
+                    *strategy_id,
+                )
             }
             Self::SetBinding(binding) => {
-                require_strategy(document, &binding.strategy_id, "binding")
+                require_strategy(document, &binding.strategy_id, "binding")?;
+                let scope = match binding.scope {
+                    BindingScope::Group(group_id) => Some(PlacementScope::Group(group_id)),
+                    BindingScope::Realm
+                    | BindingScope::MetadataPathPrefix(_)
+                    | BindingScope::Class(DocumentClass::Metadata) => {
+                        Some(PlacementScope::Realm(document.realm_id))
+                    }
+                    BindingScope::Class(_) => None,
+                };
+                match scope {
+                    Some(scope) => require_metadata_binding(document, scope, binding.strategy_id),
+                    None => Ok(()),
+                }
+            }
+            Self::AppendPlacementBinding(binding) => {
+                require_strategy(document, &binding.strategy_id, "placement binding")?;
+                if matches!(
+                    binding.scope,
+                    PlacementScope::Realm(binding_realm_id)
+                        if binding_realm_id != document.realm_id
+                ) {
+                    return Err(MutateRealmPlacementError::InvalidInput(
+                        "placement binding realm does not match the realm config".to_string(),
+                    ));
+                }
+                if !binding.has_valid_provenance(&document.handle_range_directory()) {
+                    return Err(MutateRealmPlacementError::InvalidInput(
+                        "placement binding provenance does not match an owned handle range"
+                            .to_string(),
+                    ));
+                }
+                match document.binding_directory().resolve(binding.handle) {
+                    Ok(existing) if existing != binding.tuple() => {
+                        Err(MutateRealmPlacementError::InvalidInput(format!(
+                            "placement binding handle {} is already bound to a different tuple",
+                            binding.handle.get()
+                        )))
+                    }
+                    Err(BindingError::Conflicted(_)) => {
+                        Err(MutateRealmPlacementError::InvalidInput(format!(
+                            "placement binding handle {} is conflicted",
+                            binding.handle.get()
+                        )))
+                    }
+                    Ok(_) | Err(_) => Ok(()),
+                }
             }
             Self::SetOverride(record) => match &record.strategy_id {
                 Some(strategy_id) => require_strategy(document, strategy_id, "override"),
@@ -137,6 +194,10 @@ impl RealmPlacementMutation {
                 let referenced = document.default_strategy_id == Some(*strategy_id)
                     || document
                         .strategy_bindings
+                        .iter()
+                        .any(|binding| binding.strategy_id == *strategy_id)
+                    || document
+                        .placement_bindings
                         .iter()
                         .any(|binding| binding.strategy_id == *strategy_id)
                     || document
@@ -164,6 +225,31 @@ fn require_strategy(
     if document.strategy(strategy_id).is_none() {
         return Err(MutateRealmPlacementError::InvalidInput(format!(
             "{reference} references missing strategy {strategy_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_metadata_binding(
+    document: &RealmConfigDocument,
+    scope: PlacementScope,
+    strategy_id: Ulid,
+) -> Result<(), MutateRealmPlacementError> {
+    let directory = document.binding_directory();
+    let exact = directory
+        .handle_for(scope, DocumentClass::Metadata, strategy_id)
+        .is_some();
+    let realm_fallback = matches!(scope, PlacementScope::Group(_))
+        && directory
+            .handle_for(
+                PlacementScope::Realm(document.realm_id),
+                DocumentClass::Metadata,
+                strategy_id,
+            )
+            .is_some();
+    if !exact && !realm_fallback {
+        return Err(MutateRealmPlacementError::InvalidInput(format!(
+            "metadata policy strategy {strategy_id} has no binding for {scope:?}"
         )));
     }
     Ok(())
@@ -779,8 +865,10 @@ mod tests {
     };
     use aruna_core::structs::{
         AffinityEffect, AffinityRule, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT, DocumentClass,
-        LabelMatch, MetadataRegistryRecord, PlacementRef, RealmId, RealmNodeKind,
+        FIRST_GRANTABLE_HANDLE, HandleRange, LabelMatch, MetadataRegistryRecord, PlacementBinding,
+        PlacementRef, PlacementScope, RealmId, RealmNodeKind,
     };
+    use aruna_core::structured_id::PlacementHandle;
     use aruna_core::task::{TaskEffect, TaskKey};
     use aruna_core::types::UserId;
     use tempfile::tempdir;
@@ -815,6 +903,12 @@ mod tests {
     async fn seed_config(context: &DriverContext, actor: &Actor) -> RealmConfigDocument {
         let mut document = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
         document.seed_default_placement();
+        document.placement_handle_ranges.push(HandleRange {
+            range_id: Ulid::from_bytes([9; 16]),
+            owner: actor.node_id,
+            start: FIRST_GRANTABLE_HANDLE,
+            end: FIRST_GRANTABLE_HANDLE + 1024,
+        });
         let target = DocumentSyncTarget::RealmConfig {
             realm_id: actor.realm_id,
         };
@@ -885,6 +979,7 @@ mod tests {
                 holder_node_ids: vec![actor.node_id],
                 created_at_ms: 1,
                 updated_at_ms: 1,
+                establishing_event_id: event_id,
                 last_event_id: event_id,
             },
             user_id: actor.user_id,
@@ -929,6 +1024,32 @@ mod tests {
             &context,
             &actor,
             RealmPlacementMutation::UpsertStrategy(strategy(strategy_id)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            mutate(
+                &context,
+                &actor,
+                RealmPlacementMutation::SetDefaultStrategy(strategy_id),
+            )
+            .await,
+            Err(MutateRealmPlacementError::InvalidInput(reason))
+                if reason.contains("has no binding")
+        ));
+        let range_id = initial.placement_handle_ranges[0].range_id;
+        mutate(
+            &context,
+            &actor,
+            RealmPlacementMutation::AppendPlacementBinding(PlacementBinding {
+                handle: PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
+                scope: PlacementScope::Realm(realm_id),
+                document_class: DocumentClass::Metadata,
+                strategy_id,
+                allocator_range_id: Some(range_id),
+                allocated_by: Some(actor.node_id),
+                allocated_at_ms: Some(1),
+            }),
         )
         .await
         .unwrap();
@@ -995,18 +1116,22 @@ mod tests {
         )
         .await
         .unwrap();
-        mutate(
+        assert!(matches!(
+            mutate(
             &context,
             &actor,
             RealmPlacementMutation::RemoveStrategy(strategy_id),
         )
-        .await
-        .unwrap();
+            .await,
+            Err(MutateRealmPlacementError::StrategyReferenced {
+                strategy_id: referenced
+            }) if referenced == strategy_id
+        ));
 
         let stored = drive(GetRealmConfigOperation::new(realm_id), &context)
             .await
             .unwrap();
-        assert!(stored.strategy(&strategy_id).is_none());
+        assert!(stored.strategy(&strategy_id).is_some());
         assert_eq!(stored.default_strategy_id, Some(initial_default));
         assert!(
             !stored
@@ -1123,6 +1248,20 @@ mod tests {
                 Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("missing strategy")
             ));
         }
+    }
+
+    #[test]
+    fn group_reuses_realm() {
+        let realm_id = RealmId::from_bytes([14; 32]);
+        let mut document = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        document.seed_default_placement();
+        let strategy_id = document.default_strategy_id.unwrap();
+        let mutation = RealmPlacementMutation::SetBinding(StrategyBinding {
+            scope: BindingScope::Group(Ulid::generate()),
+            strategy_id,
+        });
+
+        assert_eq!(mutation.validate(&document), Ok(()));
     }
 
     #[tokio::test]
@@ -1451,6 +1590,96 @@ mod tests {
             mutation.admin_operation(),
             AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy: stored }
                 if stored == strategy
+        ));
+    }
+
+    fn placement_binding(realm_id: RealmId, handle: u32, strategy_id: Ulid) -> PlacementBinding {
+        PlacementBinding {
+            handle: PlacementHandle::new(handle).unwrap(),
+            scope: PlacementScope::Realm(realm_id),
+            document_class: DocumentClass::MetadataRegistry,
+            strategy_id,
+            allocator_range_id: Some(Ulid::from_bytes([44; 16])),
+            allocated_by: None,
+            allocated_at_ms: None,
+        }
+    }
+
+    // Removing a strategy still named by an immutable placement binding is a
+    // StrategyReferenced conflict, like the other reference kinds above.
+    #[test]
+    fn binding_blocks_removal() {
+        let realm_id = RealmId::from_bytes([14; 32]);
+        let strategy_id = Ulid::from_bytes([14; 16]);
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        document.strategies.push(strategy(strategy_id));
+        document
+            .placement_bindings
+            .push(placement_binding(realm_id, 1, strategy_id));
+
+        assert_eq!(
+            RealmPlacementMutation::RemoveStrategy(strategy_id).validate(&document),
+            Err(MutateRealmPlacementError::StrategyReferenced { strategy_id })
+        );
+    }
+
+    #[test]
+    fn binding_requires_strategy() {
+        let realm_id = RealmId::from_bytes([31; 32]);
+        let document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        let binding = placement_binding(realm_id, 5, Ulid::from_bytes([9; 16]));
+        assert!(matches!(
+            RealmPlacementMutation::AppendPlacementBinding(binding).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("missing strategy")
+        ));
+    }
+
+    #[test]
+    fn rejects_divergent_rebind() {
+        let realm_id = RealmId::from_bytes([32; 32]);
+        let strategy_a = Ulid::from_bytes([1; 16]);
+        let strategy_b = Ulid::from_bytes([2; 16]);
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        document.strategies.push(strategy(strategy_a));
+        document.strategies.push(strategy(strategy_b));
+        let handle = FIRST_GRANTABLE_HANDLE;
+        let mut existing = placement_binding(realm_id, handle, strategy_a);
+        existing.allocated_by = Some(node(4));
+        existing.allocated_at_ms = Some(1);
+        document.placement_handle_ranges.push(HandleRange {
+            range_id: Ulid::from_bytes([44; 16]),
+            owner: node(4),
+            start: handle,
+            end: handle + 1024,
+        });
+        document.placement_bindings.push(existing.clone());
+
+        assert!(
+            RealmPlacementMutation::AppendPlacementBinding(existing)
+                .validate(&document)
+                .is_ok()
+        );
+        let mut same = placement_binding(realm_id, handle, strategy_a);
+        same.allocated_by = Some(node(4));
+        same.allocated_at_ms = Some(1);
+        same.allocator_range_id = Some(Ulid::from_bytes([77; 16]));
+        assert!(matches!(
+            RealmPlacementMutation::AppendPlacementBinding(same).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("provenance")
+        ));
+
+        let mut divergent = placement_binding(realm_id, handle, strategy_b);
+        divergent.allocated_by = Some(node(4));
+        divergent.allocated_at_ms = Some(1);
+        assert!(matches!(
+            RealmPlacementMutation::AppendPlacementBinding(divergent).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("different tuple")
+        ));
+
+        let foreign = placement_binding(RealmId::from_bytes([33; 32]), 6, strategy_a);
+        assert!(matches!(
+            RealmPlacementMutation::AppendPlacementBinding(foreign).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("does not match")
         ));
     }
 }

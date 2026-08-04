@@ -311,10 +311,11 @@ pub async fn ensure_sync_mirror(
     metadata_handle
         .request_sync_create(
             relationship.target.node_id,
-            Some(MetadataAuthToken::internal(
-                relationship.created_by,
-                relationship.source.realm_id,
-            )),
+            Some(MetadataAuthToken::internal(AuthContext {
+                user_id: relationship.created_by,
+                realm_id: relationship.source.realm_id,
+                path_restrictions: None,
+            })),
             source_group_id,
             relationship.clone(),
         )
@@ -349,10 +350,11 @@ pub async fn delete_sync_mirror(
     match metadata_handle
         .request_sync_delete(
             remote_node,
-            Some(MetadataAuthToken::internal(
-                relationship.created_by,
-                relationship.source.realm_id,
-            )),
+            Some(MetadataAuthToken::internal(AuthContext {
+                user_id: relationship.created_by,
+                realm_id: relationship.source.realm_id,
+                path_restrictions: None,
+            })),
             relationship.clone(),
         )
         .await

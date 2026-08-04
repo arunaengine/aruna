@@ -475,6 +475,7 @@ fn create_event_with_payload(
         holder_node_ids: vec![test.actor.node_id],
         created_at_ms: 1,
         updated_at_ms: 1,
+        establishing_event_id: event_id,
         last_event_id: event_id,
     };
     MetadataCreateEventRecord {

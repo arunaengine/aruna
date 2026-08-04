@@ -1,6 +1,6 @@
 use crate::auth::{
-    bucket_blob_permission_path, ensure_permission, parse_group_id, parse_source_connector_id,
-    require_realm_auth,
+    ValidatedArunaBearerTokenCarrier, bucket_blob_permission_path, ensure_permission,
+    parse_group_id, parse_source_connector_id, require_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::connectors::ApiSourceConnectorKind;
@@ -14,7 +14,7 @@ use aruna_core::structs::{
 };
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::jobs::service::{list_owned_jobs, read_owned_job, submit_staging_job};
+use aruna_operations::jobs::service::{list_owned_jobs, read_staging_routed, submit_staging_job};
 use aruna_operations::jobs::staging::read_staging_checkpoint;
 use aruna_operations::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
@@ -535,7 +535,7 @@ pub async fn submit_staging(
         ("cursor" = Option<String>, Query, description = "Opaque pagination cursor from a previous page")
     ),
     responses(
-        (status = 200, description = "Staging jobs", body = StagingJobListResponse),
+        (status = 200, description = "Node-local staging jobs; jobs owned by other nodes are omitted", body = StagingJobListResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -582,26 +582,31 @@ pub async fn list_staging_jobs(
     responses(
         (status = 200, description = "Staging job", body = StagingJobResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 404, description = "Not found", body = ErrorResponse)
+        (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 503, description = "Job owner unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn get_staging_job(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     AxumPath(job_id): AxumPath<String>,
 ) -> ServerResult<(StatusCode, Json<StagingJobResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let job_id =
         aruna_core::structs::JobId::from_str(&job_id).map_err(|_| ServerError::BadRequest)?;
-    let record = read_owned_job(&state.get_ctx(), auth.user_id, job_id)
-        .await
-        .map_err(ServerError::InternalError)?
-        .filter(|record| staging_job_visible(record, &auth))
-        .ok_or(ServerError::NotFound)?;
-    let checkpoint = read_staging_checkpoint(&state.get_ctx(), job_id)
-        .await
-        .map_err(ServerError::InternalError)?;
+    // The owner is the sole 404 authority; a non-owner routes or reports 503.
+    let (record, checkpoint) = read_staging_routed(
+        &state.get_ctx(),
+        auth.user_id,
+        job_id,
+        super::jobs::forwarded_job_auth(bearer)?,
+    )
+    .await
+    .map_err(super::jobs::map_job_route)?
+    .filter(|(record, _)| staging_job_visible(record, &auth))
+    .ok_or(ServerError::NotFound)?;
     Ok((
         StatusCode::OK,
         Json(staging_job_response(&record, checkpoint.as_ref())?),

@@ -11,6 +11,9 @@ use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::invert_timestamp_ms;
 use crate::structs::{AuthContext, BackendLocation, StagingStrategy};
+use crate::structured_id::{
+    BucketId, FieldError, JobId as RoutableJobId, PlacementHandle, StructuredId,
+};
 use crate::types::{GroupId, Key, UserId};
 
 /// Version prefix keeping the record wrappable in a version envelope later (#286).
@@ -23,35 +26,54 @@ pub const JOB_PRUNE_INDEX_PREFIX: &[u8] = b"prune/";
 pub const JOB_SYSTEM_ENTRY_PREFIX: u8 = u8::MAX;
 pub const DEFAULT_JOB_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
-/// Creation-ordered job identifier.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct JobId(pub Ulid);
+/// Creation-ordered job identifier stored at API and persistence boundaries.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+pub struct JobId(Ulid);
 
 impl JobId {
-    #[inline]
-    pub fn new() -> Self {
-        Self(Ulid::generate())
+    pub fn from_routable(job_id: RoutableJobId) -> Self {
+        Self(job_id.as_ulid())
     }
 
-    #[inline]
+    pub fn try_from_bytes(bytes: [u8; 16]) -> Result<Self, FieldError> {
+        RoutableJobId::from_bytes(bytes).map(Self::from_routable)
+    }
+
+    /// Constructs an id from trusted structured bytes.
     pub fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self(Ulid::from_bytes(bytes))
+        Self::try_from_bytes(bytes).expect("job id bytes carry a structured placement handle")
     }
 
-    #[inline]
+    pub fn from_parts(
+        timestamp_ms: u64,
+        handle: PlacementHandle,
+        bucket: BucketId,
+        nonce: u64,
+    ) -> Result<Self, FieldError> {
+        RoutableJobId::from_parts(timestamp_ms, handle, bucket, nonce).map(Self::from_routable)
+    }
+
+    pub fn as_routable(self) -> Result<RoutableJobId, FieldError> {
+        RoutableJobId::from_bytes(self.to_bytes())
+    }
+
+    pub fn as_ulid(self) -> Ulid {
+        self.0
+    }
+
     pub fn to_bytes(&self) -> [u8; 16] {
         self.0.to_bytes()
     }
 
-    #[inline]
     pub fn timestamp_ms(&self) -> u64 {
         self.0.timestamp_ms()
     }
 }
 
-impl Default for JobId {
-    fn default() -> Self {
-        Self::new()
+impl<'de> Deserialize<'de> for JobId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let ulid = Ulid::deserialize(deserializer)?;
+        Self::try_from_bytes(ulid.to_bytes()).map_err(serde::de::Error::custom)
     }
 }
 
@@ -71,7 +93,9 @@ impl FromStr for JobId {
     type Err = ConversionError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self(Ulid::from_string(value)?))
+        RoutableJobId::parse(value)
+            .map(Self::from_routable)
+            .map_err(|error| ConversionError::FromStrError(error.to_string()))
     }
 }
 
@@ -683,7 +707,8 @@ pub fn parse_job_dedup_value(bytes: &[u8]) -> Result<(JobId, [u8; 32]), Conversi
             bytes.len()
         )));
     }
-    let job_id = JobId::from_bytes(bytes[..16].try_into()?);
+    let job_id = JobId::try_from_bytes(bytes[..16].try_into()?)
+        .map_err(|error| ConversionError::FromStrError(error.to_string()))?;
     let plan_digest: [u8; 32] = bytes[16..48].try_into()?;
     Ok((job_id, plan_digest))
 }
@@ -811,6 +836,7 @@ impl JobResultPayload {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunCrateStatus {
     Pending,
+    Minted { document_id: Ulid },
     Written { resource: String },
     Denied { message: String },
     Failed { message: String },
@@ -820,6 +846,7 @@ impl RunCrateStatus {
     pub fn name(&self) -> &'static str {
         match self {
             RunCrateStatus::Pending => "pending",
+            RunCrateStatus::Minted { .. } => "pending",
             RunCrateStatus::Written { .. } => "written",
             RunCrateStatus::Denied { .. } => "denied",
             RunCrateStatus::Failed { .. } => "failed",
@@ -837,6 +864,7 @@ impl RunCrateStatus {
     pub fn to_public_json(&self) -> serde_json::Value {
         match self {
             RunCrateStatus::Pending => serde_json::json!({ "status": "pending" }),
+            RunCrateStatus::Minted { .. } => serde_json::json!({ "status": "pending" }),
             RunCrateStatus::Written { resource } => {
                 serde_json::json!({ "status": "written", "resource": resource })
             }
@@ -1142,15 +1170,31 @@ pub fn run_crate_dedup_key(job_id: JobId) -> Vec<u8> {
     format!("internal/run-crate/{job_id}").into_bytes()
 }
 
+/// Deterministic child-job id that remains on its parent's JobControl bucket.
+fn child_job_id(job_id: JobId, domain: &[u8]) -> JobId {
+    let parent = job_id
+        .as_routable()
+        .expect("JobId preserves its structured-id invariant");
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(domain);
+    hasher.update(&job_id.to_bytes());
+    let nonce = u64::from_be_bytes(
+        hasher.finalize().as_bytes()[..8]
+            .try_into()
+            .expect("8 bytes"),
+    ) & ((1u64 << 48) - 1);
+    JobId::from_parts(
+        job_id.timestamp_ms(),
+        parent.placement_handle(),
+        parent.bucket(),
+        nonce,
+    )
+    .expect("structured child job id")
+}
+
 /// Stable child-job identity for the durable run-crate obligation.
 pub fn crate_job_id(job_id: JobId) -> JobId {
-    let parent = job_id.to_bytes();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"aruna/run-crate-job/v1");
-    hasher.update(&parent);
-    let mut child = parent;
-    child[6..].copy_from_slice(&hasher.finalize().as_bytes()[..10]);
-    JobId::from_bytes(child)
+    child_job_id(job_id, b"aruna/run-crate-job/v1")
 }
 
 pub fn cleanup_dedup_key(job_id: JobId) -> Vec<u8> {
@@ -1158,13 +1202,7 @@ pub fn cleanup_dedup_key(job_id: JobId) -> Vec<u8> {
 }
 
 pub fn cleanup_job_id(job_id: JobId) -> JobId {
-    let parent = job_id.to_bytes();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"aruna/terminal-cleanup-job/v1");
-    hasher.update(&parent);
-    let mut child = parent;
-    child[6..].copy_from_slice(&hasher.finalize().as_bytes()[..10]);
-    JobId::from_bytes(child)
+    child_job_id(job_id, b"aruna/terminal-cleanup-job/v1")
 }
 
 pub fn workspace_credential_id(job_id: JobId) -> String {
@@ -1220,7 +1258,8 @@ pub fn parse_job_schedule_index_key(key: &[u8]) -> Result<(u64, JobId), Conversi
                 )));
             }
             let timestamp_ms = u64::from_be_bytes(rest[..8].try_into()?);
-            let job_id = JobId::from_bytes(rest[8..24].try_into()?);
+            let job_id = JobId::try_from_bytes(rest[8..24].try_into()?)
+                .map_err(|error| ConversionError::FromStrError(error.to_string()))?;
             return Ok((timestamp_ms, job_id));
         }
     }
@@ -1294,7 +1333,8 @@ pub fn parse_job_owner_index_key(key: &[u8]) -> Result<(UserId, u64, JobId), Con
     }
     let created_by = UserId::from_storage_key(&key[..48])?;
     let created_at_ms = invert_timestamp_ms(u64::from_be_bytes(key[48..56].try_into()?));
-    let job_id = JobId::from_bytes(key[56..72].try_into()?);
+    let job_id = JobId::try_from_bytes(key[56..72].try_into()?)
+        .map_err(|error| ConversionError::FromStrError(error.to_string()))?;
     Ok((created_by, created_at_ms, job_id))
 }
 
@@ -1549,6 +1589,38 @@ mod tests {
     }
 
     #[test]
+    fn routable_child_ids() {
+        // Child obligations remain on a non-default, high parent bucket.
+        let parent = JobId::from_parts(
+            1,
+            PlacementHandle::new(crate::structs::FIRST_GRANTABLE_HANDLE).unwrap(),
+            BucketId::new(3_000).unwrap(),
+            4,
+        )
+        .unwrap();
+        assert_eq!(crate_job_id(parent), crate_job_id(parent));
+        assert_eq!(cleanup_job_id(parent), cleanup_job_id(parent));
+        assert_ne!(crate_job_id(parent), cleanup_job_id(parent));
+        for child in [crate_job_id(parent), cleanup_job_id(parent)] {
+            let routed = child.as_routable().unwrap();
+            assert_eq!(
+                routed.placement_handle(),
+                parent.as_routable().unwrap().placement_handle()
+            );
+            assert_eq!(routed.bucket(), parent.as_routable().unwrap().bucket());
+        }
+    }
+
+    #[test]
+    fn rejects_plain_ids() {
+        let plain = Ulid::from_parts(1, 0);
+        assert!(JobId::try_from_bytes(plain.to_bytes()).is_err());
+        assert!(plain.to_string().parse::<JobId>().is_err());
+        let encoded = postcard::to_allocvec(&plain).unwrap();
+        assert!(postcard::from_bytes::<JobId>(&encoded).is_err());
+    }
+
+    #[test]
     fn dedup_value_roundtrips() {
         let id = JobId::from_bytes([7u8; 16]);
         let digest = [9u8; 32];
@@ -1660,7 +1732,7 @@ mod tests {
     fn owner_key_roundtrips() {
         let u = user(5, 9);
         let ts = 1_700_000_000_000u64;
-        let id = JobId::new();
+        let id = JobId::from_bytes([8u8; 16]);
         let key = job_owner_index_key(u, ts, id);
         assert_eq!(parse_job_owner_index_key(&key).unwrap(), (u, ts, id));
         assert_eq!(job_owner_cursor(ts, id).as_slice(), &key[48..72]);

@@ -543,7 +543,11 @@ impl ArunaS3Service {
                 .await;
         }
 
-        let auth_token = MetadataAuthToken::internal(user_access.user_identity, self.realm_id);
+        let auth_token = MetadataAuthToken::internal(AuthContext {
+            user_id: user_access.user_identity,
+            realm_id: self.realm_id,
+            path_restrictions: user_access.path_restrictions.clone(),
+        });
         request_sync_mirror_create(
             &self.state,
             relationship.target.node_id,

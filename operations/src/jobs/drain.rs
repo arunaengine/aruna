@@ -55,6 +55,7 @@ impl JobClassBudget {
 #[derive(Debug, Default)]
 pub struct JobDrainResult {
     pub claimed: Vec<JobRecord>,
+    pub terminal: Vec<JobRecord>,
     pub cancelled_fresh: usize,
     pub swept: usize,
     /// Expired external attempts routed to the reconcile hook instead of a requeue.
@@ -70,17 +71,18 @@ pub struct JobDrainResult {
 
 /// Claim due jobs within each class's `budget` and re-queue expired leases; claimed
 /// records are returned. An expired external attempt is routed to `reconciler`
-/// instead of requeued.
+/// instead of requeued. Only records owned by `owner_node_id` are claimed: a JobId
+/// executes on its immutable owner and nowhere else.
 pub async fn process_job_queue_batch(
     storage: &StorageHandle,
-    holder_node_id: NodeId,
+    owner_node_id: NodeId,
     budget: JobClassBudget,
     reconciler: Option<&Arc<dyn ExternalReconciler>>,
 ) -> Result<JobDrainResult, String> {
     let now_ms = unix_timestamp_millis();
     let mut result = JobDrainResult::default();
 
-    claim_due_jobs(storage, holder_node_id, now_ms, budget, &mut result).await?;
+    claim_due_jobs(storage, owner_node_id, now_ms, budget, &mut result).await?;
 
     if !result.retry_after_error {
         let mut start_after = None;
@@ -116,6 +118,10 @@ pub async fn process_job_queue_batch(
                                     reconciler.reconcile_lost_attempt(storage, record).await;
                                 }
                                 result.reconciled = result.reconciled.saturating_add(1);
+                            }
+                            Ok(RequeueOutcome::Failed(record)) => {
+                                result.swept = result.swept.saturating_add(1);
+                                result.terminal.push(record);
                             }
                             Ok(_) => result.swept = result.swept.saturating_add(1),
                             Err(JobMutationError::NotFound) => {
@@ -172,7 +178,7 @@ pub async fn process_job_queue_batch(
 /// again, churning storage while the drain re-arms at zero.
 async fn claim_due_jobs(
     storage: &StorageHandle,
-    holder_node_id: NodeId,
+    owner_node_id: NodeId,
     now_ms: u64,
     mut budget: JobClassBudget,
     result: &mut JobDrainResult,
@@ -222,8 +228,8 @@ async fn claim_due_jobs(
             if ts > now_ms {
                 break 'pages;
             }
-            let class = match read_job_record(storage, job_id, None).await {
-                Ok(Some(record)) => record.execution_class,
+            let record = match read_job_record(storage, job_id, None).await {
+                Ok(Some(record)) => record,
                 // Orphaned index row (record gone/quarantined): drop it so it cannot
                 // pin the drain timer at zero forever.
                 Ok(None) => {
@@ -240,11 +246,24 @@ async fn claim_due_jobs(
                     break 'pages;
                 }
             };
+            // A due row for a foreign owner is a local index inconsistency: only
+            // the immutable owner may run the job, so drop the row rather than
+            // claim it or let it pin the drain timer at zero.
+            if record.owner_node_id != owner_node_id {
+                warn!(job_id = %job_id, owner = %record.owner_node_id, "Dropping due row for a foreign-owned job");
+                if let Err(error) = delete_schedule_row(storage, key).await {
+                    warn!(error = %error, "Failed to drop foreign-owned job due row");
+                    result.retry_after_error = true;
+                    break 'pages;
+                }
+                continue;
+            }
+            let class = record.execution_class;
             if budget.remaining(class) == 0 {
                 result.deferred_saturated = true;
                 continue;
             }
-            match claim_job(storage, job_id, holder_node_id, now_ms).await {
+            match claim_job(storage, job_id, owner_node_id, now_ms).await {
                 Ok(ClaimOutcome::Claimed(record)) => {
                     budget.take(record.execution_class);
                     result.claimed.push(record);
@@ -252,8 +271,9 @@ async fn claim_due_jobs(
                         break 'pages;
                     }
                 }
-                Ok(ClaimOutcome::CancelledFresh(_)) => {
-                    result.cancelled_fresh = result.cancelled_fresh.saturating_add(1)
+                Ok(ClaimOutcome::CancelledFresh(record)) => {
+                    result.cancelled_fresh = result.cancelled_fresh.saturating_add(1);
+                    result.terminal.push(record);
                 }
                 Ok(ClaimOutcome::NotEligible) => {}
                 Err(JobMutationError::NotFound) => {
@@ -398,8 +418,10 @@ mod tests {
     use crate::jobs::JOB_LEASE_MS;
     use crate::jobs::store::insert_job;
     use aruna_core::structs::{
-        AttemptIntent, JobClaim, JobPayload, JobState, RealmId, job_due_index_key,
+        AttemptIntent, FIRST_GRANTABLE_HANDLE, JobClaim, JobPayload, JobState, RealmId,
+        job_due_index_key,
     };
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::UserId;
     use aruna_storage::FjallStorage;
     use std::sync::Mutex;
@@ -422,6 +444,16 @@ mod tests {
         let mut seed_bytes = [0u8; 32];
         seed_bytes[0] = seed;
         iroh::SecretKey::from_bytes(&seed_bytes).public()
+    }
+
+    fn job_id(timestamp_ms: u64) -> JobId {
+        JobId::from_parts(
+            timestamp_ms,
+            PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
+            BucketId::new(0).unwrap(),
+            0,
+        )
+        .unwrap()
     }
 
     fn budget_of(slots: usize) -> JobClassBudget {
@@ -454,19 +486,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         for seq in 1..=3u128 {
-            insert_job(
-                &storage,
-                &queued_record(JobId(Ulid::from_parts(seq as u64, 0)), 1),
-            )
-            .await
-            .unwrap();
+            insert_job(&storage, &queued_record(job_id(seq as u64), 1))
+                .await
+                .unwrap();
         }
 
         let budget = JobClassBudget {
             in_process: 2,
             external: 0,
         };
-        let result = process_job_queue_batch(&storage, node_id(3), budget, None)
+        let result = process_job_queue_batch(&storage, node_id(7), budget, None)
             .await
             .unwrap();
         assert_eq!(result.claimed.len(), 2, "capacity caps claims");
@@ -480,11 +509,11 @@ mod tests {
         // index must not claim and release the external row it cannot run.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let external = JobId(Ulid::from_parts(1, 0));
+        let external = job_id(1);
         let mut record = queued_record(external, 1);
         record.execution_class = JobExecutionClass::ExternalAttempt;
         insert_job(&storage, &record).await.unwrap();
-        let internal = JobId(Ulid::from_parts(2, 0));
+        let internal = job_id(2);
         insert_job(&storage, &queued_record(internal, 1))
             .await
             .unwrap();
@@ -493,7 +522,7 @@ mod tests {
             in_process: 4,
             external: 0,
         };
-        let result = process_job_queue_batch(&storage, node_id(3), budget, None)
+        let result = process_job_queue_batch(&storage, node_id(7), budget, None)
             .await
             .unwrap();
 
@@ -527,7 +556,7 @@ mod tests {
         // back off instead of re-arming the drain at zero.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let job_id = JobId(Ulid::from_parts(1, 0));
+        let job_id = job_id(1);
         insert_job(&storage, &queued_record(job_id, 1))
             .await
             .unwrap();
@@ -545,6 +574,32 @@ mod tests {
             .unwrap();
         assert_eq!(stored.state, JobState::Queued);
         assert_eq!(stored.updated_at_ms, 1);
+    }
+
+    #[tokio::test]
+    async fn drops_foreign_rows() {
+        // A due row for a job owned elsewhere is dropped, never claimed: only
+        // the immutable owner may run a JobId, and the dead row must not pin
+        // the drain timer at zero.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let foreign = job_id(1);
+        insert_job(&storage, &queued_record(foreign, 1))
+            .await
+            .unwrap();
+
+        let result = process_job_queue_batch(&storage, node_id(3), budget_of(8), None)
+            .await
+            .unwrap();
+
+        assert!(result.claimed.is_empty(), "no claim on a foreign owner");
+        let stored = read_job_record(&storage, foreign, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Queued, "the record is untouched");
+        assert!(stored.claim.is_none());
+        assert_eq!(next_job_drain_timer_after(&storage).await.unwrap(), None);
     }
 
     #[tokio::test]
