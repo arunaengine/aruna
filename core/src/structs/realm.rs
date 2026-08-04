@@ -375,7 +375,10 @@ impl RealmConfigDocument {
         sort_canonical(&mut canonical.placement_bindings)?;
         sort_canonical(&mut canonical.placement_handle_ranges)?;
         sort_canonical(&mut canonical.band_pools)?;
-        canonical.revoked_tokens.sort_unstable();
+        // Revocations are excluded: the digest binds routing agreement between
+        // nodes, and a deny-list that converges independently would otherwise
+        // make every revocation reject forwarded requests until it replicated.
+        canonical.revoked_tokens.clear();
         let encoded = postcard::to_allocvec(&canonical)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"aruna-realm-config-v1");
@@ -813,6 +816,20 @@ mod test {
 
         assert_eq!(config.digest().unwrap(), config.clone().digest().unwrap());
         assert_ne!(config.digest().unwrap(), changed.digest().unwrap());
+    }
+
+    #[test]
+    fn digest_ignores_revocations() {
+        // A revocation converges on its own; if it moved the digest, forwarded
+        // requests would be rejected between nodes until it replicated.
+        let config = RealmConfigDocument::new(RealmId([5u8; 32]), Vec::new(), 3);
+        let mut revoked = config.clone();
+        revoked
+            .revoked_tokens
+            .push(crate::auth::bearer_token_hash("token"));
+
+        assert!(revoked.token_revoked(&crate::auth::bearer_token_hash("token")));
+        assert_eq!(config.digest().unwrap(), revoked.digest().unwrap());
     }
 
     #[test]
