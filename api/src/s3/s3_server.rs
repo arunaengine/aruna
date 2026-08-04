@@ -31,8 +31,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, error, info, trace};
+
+/// Concurrent S3 connections served at once; further connections wait for a
+/// slot so a flood cannot spawn unbounded connection tasks.
+pub const DEFAULT_S3_MAX_CONNECTIONS: usize = 1_024;
+/// Concurrent S3 requests processed at once, acquired before the expensive
+/// s3s parse/body/storage work.
+pub const DEFAULT_S3_MAX_CONCURRENT_REQUESTS: usize = 512;
 
 /// Carries the resolved S3 operation name from the access check back to the
 /// wrapper so request metrics can be labelled by operation. The wrapper inserts
@@ -137,6 +145,8 @@ pub struct S3Server {
     driver_ctx: Arc<DriverContext>,
     metrics: Arc<NodeMetrics>,
     rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
+    connection_limit: Arc<Semaphore>,
+    request_limit: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -151,6 +161,8 @@ pub struct WrappingService {
     // Shared with the access hook: the IP bucket is charged here, the
     // per-principal bucket after authentication.
     rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
+    // Held across each request so concurrent expensive processing is bounded.
+    request_limit: Arc<Semaphore>,
 }
 
 impl S3Server {
@@ -196,7 +208,17 @@ impl S3Server {
             driver_ctx,
             metrics,
             rate_limits,
+            connection_limit: Arc::new(Semaphore::new(DEFAULT_S3_MAX_CONNECTIONS)),
+            request_limit: Arc::new(Semaphore::new(DEFAULT_S3_MAX_CONCURRENT_REQUESTS)),
         })
+    }
+
+    /// Installs operator-configured concurrency ceilings; each floors at one so
+    /// a permit is always available.
+    pub fn with_concurrency_limits(mut self, max_connections: usize, max_requests: usize) -> Self {
+        self.connection_limit = Arc::new(Semaphore::new(max_connections.max(1)));
+        self.request_limit = Arc::new(Semaphore::new(max_requests.max(1)));
+        self
     }
 
     pub fn run_with_listener(
@@ -204,6 +226,7 @@ impl S3Server {
         listener: TcpListener,
     ) -> Result<(SocketAddr, JoinHandle<()>), S3ServerError> {
         let local_addr = listener.local_addr()?;
+        let connection_limit = self.connection_limit.clone();
         let service = WrappingService {
             shared: self.s3service,
             cors: self.cors,
@@ -212,6 +235,7 @@ impl S3Server {
             metrics: self.metrics,
             peer_ip: None,
             rate_limits: self.rate_limits,
+            request_limit: self.request_limit,
         };
         let connection = ConnBuilder::new(TokioExecutor::new());
 
@@ -224,10 +248,17 @@ impl S3Server {
                         continue;
                     }
                 };
+                // Bound concurrent connections: wait for a slot before spawning,
+                // and hold the permit for the connection's whole lifetime.
+                let permit = match connection_limit.clone().acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                };
                 let mut service = service.clone();
                 service.peer_ip = Some(peer.ip());
                 let conn = connection.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let _ = conn.serve_connection(TokioIo::new(socket), service).await;
                 });
             }
@@ -319,6 +350,7 @@ impl Service<Request<Incoming>> for WrappingService {
         let metrics = self.metrics.clone();
         let rate_limits = self.rate_limits.clone();
         let peer_ip = self.peer_ip;
+        let request_limit = self.request_limit.clone();
         Box::pin(async move {
             // Charge the transport IP before CORS, signature checks, credential
             // reads, or body handling, so unsigned or invalid requests cannot
@@ -332,6 +364,9 @@ impl Service<Request<Incoming>> for WrappingService {
                 record_s3_request(&metrics, &method, code, "rate_limited", started.elapsed());
                 return Ok(response);
             }
+            // Bound concurrent request processing before the expensive s3s
+            // parse, body handling, and storage work.
+            let _request_permit = request_limit.acquire_owned().await.ok();
             let bucket_cors = if origin_header.is_some() {
                 match load_bucket_cors_config(driver_ctx, bucket).await {
                     Ok(bucket_cors) => bucket_cors,
