@@ -1,9 +1,9 @@
 use aruna_blob::blob::{BlobHandle, GroupHold};
 use aruna_compute::ExecutorRegistry;
-use aruna_core::effects::{Effect, JobControlEffect, NetEffect, StorageEffect};
+use aruna_core::effects::{AuditPageEffect, Effect, JobControlEffect, NetEffect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{
-    BlobEvent, Event, JobControlEvent, NetEvent, StorageEvent, SubOperationEvent,
+    AuditPageEvent, BlobEvent, Event, JobControlEvent, NetEvent, StorageEvent, SubOperationEvent,
 };
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE};
@@ -318,6 +318,10 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
         Effect::Net(NetEffect::JobControl(job_control)) => {
             Box::pin(dispatch_job_control(*job_control, context)).await
         }
+        // Audit fan-out runs its frame I/O here for the same reason.
+        Effect::Net(NetEffect::AuditPage(audit)) => {
+            Box::pin(dispatch_audit_page(*audit, context)).await
+        }
         Effect::Net(net_effect) => {
             if let Some(net_handle) = &context.net_handle {
                 Box::pin(net_handle.send_effect(Effect::Net(net_effect))).await
@@ -423,6 +427,23 @@ async fn dispatch_job_control(effect: JobControlEffect, context: &DriverContext)
         Err(error) => JobControlEvent::Unavailable(error.to_string()),
     };
     Event::Net(NetEvent::JobControl(event))
+}
+
+/// Requests one node's local audit page over the metadata control transport; an
+/// unreachable or denied node is reported so the aggregator records it as missing.
+async fn dispatch_audit_page(effect: AuditPageEffect, context: &DriverContext) -> Event {
+    let AuditPageEffect { node, request } = effect;
+    let event = match crate::metadata::audit::send_audit_request(context, node, request).await {
+        Ok(response) => AuditPageEvent::Page {
+            node,
+            response: Box::new(response),
+        },
+        Err(error) => AuditPageEvent::Unavailable {
+            node,
+            message: format!("{error:?}"),
+        },
+    };
+    Event::Net(NetEvent::AuditPage(event))
 }
 
 /// Reserves every tenant backend an effect names for the rest of the operation.

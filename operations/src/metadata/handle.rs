@@ -1446,6 +1446,9 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardReadDocument { .. }) => {
                 super::forward::apply_forwarded_write(context, peer, forward).await
             }
+            MetadataTransportMessage::ForwardAuditPage { request } => {
+                super::audit::serve_local_audit(context, peer, request).await
+            }
             MetadataTransportMessage::QueryResults { .. }
             | MetadataTransportMessage::SearchResults { .. }
             | MetadataTransportMessage::BucketSearchResults { .. }
@@ -1462,6 +1465,7 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardedUpdateInvalidInput { .. }
             | MetadataTransportMessage::ForwardedExport { .. }
             | MetadataTransportMessage::DocumentQueryResults { .. }
+            | MetadataTransportMessage::ForwardedAuditPage { .. }
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -4099,6 +4103,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedUpdateInvalidInput { .. } => {
             "forwarded_update_invalid_input"
         }
+        MetadataTransportMessage::ForwardAuditPage { .. } => "forward_audit_page",
+        MetadataTransportMessage::ForwardedAuditPage { .. } => "forwarded_audit_page",
     }
 }
 

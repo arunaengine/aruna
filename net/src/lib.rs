@@ -2371,6 +2371,7 @@ fn net_handle_effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::DocumentSync(_)) => "document_sync",
         Effect::Net(NetEffect::Stream(_)) => "stream",
         Effect::Net(NetEffect::JobControl(_)) => "job_control",
+        Effect::Net(NetEffect::AuditPage(_)) => "audit_page",
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
         Effect::Storage(_) => "storage",

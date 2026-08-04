@@ -303,9 +303,9 @@ pub struct MetadataFanoutStats {
 }
 
 #[derive(Debug, Clone)]
-struct MetadataRealmNodeDiscovery {
-    nodes: Vec<NodeId>,
-    failed: bool,
+pub(crate) struct MetadataRealmNodeDiscovery {
+    pub(crate) nodes: Vec<NodeId>,
+    pub(crate) failed: bool,
 }
 
 #[derive(Debug)]
@@ -1505,7 +1505,7 @@ pub async fn load_metadata_realm_nodes(
         .nodes
 }
 
-async fn load_metadata_realm_nodes_with_status(
+pub(crate) async fn load_metadata_realm_nodes_with_status(
     context: &DriverContext,
     realm_id: RealmId,
     local_node_id: NodeId,

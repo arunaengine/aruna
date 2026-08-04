@@ -1,3 +1,4 @@
+use aruna_core::audit::{AuditPageRequest, AuditPageResponse};
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
 use aruna_core::structs::{MetadataRegistryRecord, PathClaimRecord, SyncRelationship};
 use aruna_core::types::GroupId;
@@ -179,6 +180,14 @@ pub enum MetadataTransportMessage {
     },
     DocumentQueryResults {
         result: Result<MetadataQueryResults, MetadataReadError>,
+    },
+    /// A request for one node's local page of a group's audit trail. Appended
+    /// last so existing control-message discriminants stay stable.
+    ForwardAuditPage {
+        request: AuditPageRequest,
+    },
+    ForwardedAuditPage {
+        result: Result<AuditPageResponse, MetadataReadError>,
     },
 }
 

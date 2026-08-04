@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use crate::alpn::Alpn;
+use crate::audit::AuditPageRequest;
 use crate::document::DocumentSyncEffect;
 use crate::id::{DhtKeyId, NodeId};
 use crate::jobs::JobRequest;
@@ -241,6 +242,7 @@ pub enum NetEffect {
     DocumentSync(DocumentSyncEffect),
     Stream(StreamEffect),
     JobControl(Box<JobControlEffect>),
+    AuditPage(Box<AuditPageEffect>),
 }
 
 /// Discrete job-control request to a job's immutable owner. The adapter performs
@@ -249,6 +251,14 @@ pub enum NetEffect {
 pub struct JobControlEffect {
     pub owner: NodeId,
     pub request: JobRequest,
+}
+
+/// One realm node's local audit page request. The adapter performs the frame
+/// round-trip; the aggregating operation only emits this.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuditPageEffect {
+    pub node: NodeId,
+    pub request: AuditPageRequest,
 }
 
 #[derive(Debug, Clone, PartialEq)]

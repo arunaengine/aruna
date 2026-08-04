@@ -1,8 +1,11 @@
-use crate::auth::{ensure_permission, parse_group_id, require_realm_auth};
+use crate::auth::{
+    ValidatedArunaBearerTokenCarrier, ensure_permission, parse_group_id, require_realm_auth,
+};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::structs::{AuthContext, MetadataAuditOperation, Permission};
-use aruna_operations::metadata::audit::{ListAuditError, ListAuditRequest, list_audit_records};
+use aruna_operations::metadata::api::forwarded_bearer;
+use aruna_operations::metadata::audit::{ListAuditError, ListAuditRequest, list_audit as gather_audit};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
@@ -57,6 +60,11 @@ pub struct AuditPageResponse {
     pub records: Vec<AuditRecordResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// True when a required realm node could not be reached or attested, so the
+    /// page may be missing records from the nodes listed in `missing_nodes`.
+    pub partial: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missing_nodes: Vec<String>,
 }
 
 fn operation_name(operation: &MetadataAuditOperation) -> &'static str {
@@ -92,6 +100,7 @@ fn operation_name(operation: &MetadataAuditOperation) -> &'static str {
 pub async fn list_audit(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Query(query): Query<AuditQuery>,
 ) -> ServerResult<(StatusCode, Json<AuditPageResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
@@ -110,8 +119,15 @@ pub async fn list_audit(
     )
     .await?;
 
-    let page = list_audit_records(
-        &state.get_ctx(),
+    // Peers re-check the same group-admin authority, so carry the caller's token.
+    let forward_token = forwarded_bearer(bearer_token.as_ref().map(|carrier| carrier.as_str()))
+        .map_err(|_| ServerError::BadRequest)?;
+    let ctx = state.get_ctx();
+    let page = gather_audit(
+        ctx.as_ref(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        forward_token,
         ListAuditRequest {
             group_id,
             document_id,
@@ -143,6 +159,12 @@ pub async fn list_audit(
                 })
                 .collect(),
             next_cursor: page.next_cursor,
+            partial: page.partial,
+            missing_nodes: page
+                .missing_nodes
+                .iter()
+                .map(|node| node.to_string())
+                .collect(),
         }),
     ))
 }

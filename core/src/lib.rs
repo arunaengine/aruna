@@ -3,6 +3,7 @@
 pub mod admin_document_reducer;
 pub mod admin_documents;
 pub mod alpn;
+pub mod audit;
 pub mod auth;
 pub mod compute;
 pub mod document;
