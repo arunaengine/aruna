@@ -42,7 +42,7 @@ pub struct ApiRateLimits {
 
 impl Default for ApiRateLimits {
     fn default() -> Self {
-        Self::with_quotas(
+        Self::new(
             IP_REQUESTS_PER_MINUTE,
             IP_BURST,
             PRINCIPAL_REQUESTS_PER_MINUTE,
@@ -57,10 +57,12 @@ fn quota(per_minute: u32, burst: u32) -> Quota {
 }
 
 impl ApiRateLimits {
-    fn with_quotas(ip_per_minute: u32, ip_burst: u32, per_minute: u32, burst: u32) -> Self {
+    /// Operator-configurable quotas; each value floors at one so a limiter is
+    /// always valid.
+    pub fn new(ip_per_minute: u32, ip_burst: u32, principal_per_minute: u32, burst: u32) -> Self {
         Self {
             per_ip: RateLimiter::keyed(quota(ip_per_minute, ip_burst)),
-            per_principal: RateLimiter::keyed(quota(per_minute, burst)),
+            per_principal: RateLimiter::keyed(quota(principal_per_minute, burst)),
             clock: DefaultClock::default(),
             checks: AtomicU64::new(0),
         }
@@ -69,12 +71,10 @@ impl ApiRateLimits {
     /// Tight quotas for tests that must observe a denial quickly.
     #[cfg(test)]
     pub(crate) fn for_test(burst: u32) -> Self {
-        Self::with_quotas(60, burst, 60, burst)
+        Self::new(60, burst, 60, burst)
     }
 
-    /// One request against the caller's buckets. `Err` carries the seconds
-    /// after which a retry can conform (never zero).
-    pub fn check(&self, ip: IpAddr, principal: Option<&str>) -> Result<(), u64> {
+    fn maybe_maintain(&self) {
         if self
             .checks
             .fetch_add(1, Ordering::Relaxed)
@@ -83,16 +83,26 @@ impl ApiRateLimits {
             self.per_ip.retain_recent();
             self.per_principal.retain_recent();
         }
+    }
+
+    /// Charges the caller's IP bucket. `Err` carries the seconds after which a
+    /// retry can conform (never zero).
+    pub fn check_ip(&self, ip: IpAddr) -> Result<(), u64> {
+        self.maybe_maintain();
         let now = self.clock.now();
-        if let Err(not_until) = self.per_ip.check_key(&ip) {
-            return Err(retry_secs(not_until.wait_time_from(now).as_secs()));
-        }
-        if let Some(principal) = principal
-            && let Err(not_until) = self.per_principal.check_key(&principal.to_string())
-        {
-            return Err(retry_secs(not_until.wait_time_from(now).as_secs()));
-        }
-        Ok(())
+        self.per_ip
+            .check_key(&ip)
+            .map_err(|not_until| retry_secs(not_until.wait_time_from(now).as_secs()))
+    }
+
+    /// Charges the authenticated principal's bucket, independent of the IP
+    /// bucket so a request is never double-charged for its address.
+    pub fn check_principal(&self, principal: &str) -> Result<(), u64> {
+        self.maybe_maintain();
+        let now = self.clock.now();
+        self.per_principal
+            .check_key(&principal.to_string())
+            .map_err(|not_until| retry_secs(not_until.wait_time_from(now).as_secs()))
     }
 }
 
@@ -100,9 +110,10 @@ fn retry_secs(secs: u64) -> u64 {
     secs.max(1)
 }
 
-/// REST-plane limiter. Runs inside the auth middleware so an authenticated
-/// caller is attributed to its principal on top of its client address.
-pub async fn rate_limit_middleware(
+/// REST IP limiter. Runs at the outer transport boundary, before CORS, bearer
+/// parsing, or extraction, so an invalid or expensive authentication attempt
+/// still consumes IP capacity.
+pub async fn rate_limit_ip_middleware(
     State(state): State<std::sync::Arc<ServerState>>,
     request: Request,
     next: Next,
@@ -115,13 +126,29 @@ pub async fn rate_limit_middleware(
         .map(|info| info.0.ip())
         .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
     let ip = client_ip(state.trusted_proxies(), peer, request.headers());
+    match state.rate_limits().check_ip(ip) {
+        Ok(()) => next.run(request).await,
+        Err(retry_after) => too_many_requests(retry_after),
+    }
+}
+
+/// REST principal limiter. Runs after authentication so an authenticated caller
+/// is charged once to its principal, on top of the outer IP charge.
+pub async fn rate_limit_principal_middleware(
+    State(state): State<std::sync::Arc<ServerState>>,
+    request: Request,
+    next: Next,
+) -> Response {
     let principal = request
         .extensions()
         .get::<Option<AuthContext>>()
         .cloned()
         .flatten()
         .map(|auth| auth.user_id.to_string());
-    match state.rate_limits().check(ip, principal.as_deref()) {
+    let Some(principal) = principal else {
+        return next.run(request).await;
+    };
+    match state.rate_limits().check_principal(&principal) {
         Ok(()) => next.run(request).await,
         Err(retry_after) => too_many_requests(retry_after),
     }
@@ -159,27 +186,39 @@ mod tests {
         let limits = ApiRateLimits::for_test(3);
         let ip = IpAddr::from_str("203.0.113.7").unwrap();
         for _ in 0..3 {
-            assert!(limits.check(ip, None).is_ok());
+            assert!(limits.check_ip(ip).is_ok());
         }
-        let retry_after = limits.check(ip, None).expect_err("over budget");
+        let retry_after = limits.check_ip(ip).expect_err("over budget");
         assert!(retry_after >= 1);
         assert!(
             limits
-                .check(IpAddr::from_str("203.0.113.8").unwrap(), None)
+                .check_ip(IpAddr::from_str("203.0.113.8").unwrap())
                 .is_ok()
         );
     }
 
     #[test]
     fn limits_by_principal() {
-        // A principal is bounded across source addresses.
+        // A principal is bounded independently of any source address.
         let limits = ApiRateLimits::for_test(3);
-        for i in 0..3u8 {
-            let ip = IpAddr::from_str(&format!("198.51.100.{i}")).unwrap();
-            assert!(limits.check(ip, Some("user-a")).is_ok());
+        for _ in 0..3 {
+            assert!(limits.check_principal("user-a").is_ok());
         }
-        let ip = IpAddr::from_str("198.51.100.9").unwrap();
-        assert!(limits.check(ip, Some("user-a")).is_err());
-        assert!(limits.check(ip, Some("user-b")).is_ok());
+        assert!(limits.check_principal("user-a").is_err());
+        assert!(limits.check_principal("user-b").is_ok());
+    }
+
+    #[test]
+    fn ip_and_principal_independent() {
+        // Draining the IP bucket must not spend the principal's, and vice versa.
+        let limits = ApiRateLimits::for_test(2);
+        let ip = IpAddr::from_str("203.0.113.10").unwrap();
+        assert!(limits.check_ip(ip).is_ok());
+        assert!(limits.check_ip(ip).is_ok());
+        assert!(limits.check_ip(ip).is_err());
+        // The principal bucket is untouched by the exhausted IP bucket.
+        assert!(limits.check_principal("user-a").is_ok());
+        assert!(limits.check_principal("user-a").is_ok());
+        assert!(limits.check_principal("user-a").is_err());
     }
 }

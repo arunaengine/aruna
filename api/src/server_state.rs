@@ -232,6 +232,12 @@ impl ServerState {
         &self.trusted_proxies
     }
 
+    /// Installs operator-configured request limiters. Call before serving.
+    pub fn with_rate_limits(mut self, limits: crate::rate_limit::ApiRateLimits) -> Self {
+        self.rate_limits = Arc::new(limits);
+        self
+    }
+
     pub fn rate_limits(&self) -> &crate::rate_limit::ApiRateLimits {
         &self.rate_limits
     }
