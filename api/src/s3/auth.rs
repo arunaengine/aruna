@@ -119,6 +119,11 @@ impl S3Access for AuthProvider {
             .build_authorization_path(cx, &user_access, &action)
             .await?;
 
+        // The policy request context is built once: ordinary authorization uses a
+        // clone and the original is stashed so per-object and secondary-resource
+        // handlers evaluate against the real query and allowlisted headers.
+        let extras = request_extras(cx, &operation_name);
+
         // DeleteObjects lists its target keys in the request body rather than the
         // URL, so per-object authorization (RBAC and policy) is deferred to the
         // handler, which evaluates each entry against one loaded policy set.
@@ -126,19 +131,19 @@ impl S3Access for AuthProvider {
         // already validated above, so anonymous and cross-group requests still
         // fail closed here.
         if cx.s3_op().name() != "DeleteObjects" {
-            let extras = request_extras(cx, &operation_name);
             authorize(
                 self.driver_ctx.as_ref(),
                 self.realm_id,
                 &auth_context,
                 &path,
                 &required_permission,
-                extras,
+                extras.clone(),
             )
             .await
             .map_err(map_authorize_error)?;
         }
 
+        cx.extensions_mut().insert(extras);
         cx.extensions_mut().insert(user_access);
         Ok(())
     }
@@ -146,7 +151,7 @@ impl S3Access for AuthProvider {
 
 /// Maps an authorization failure to an S3 error, keeping RBAC and policy denials
 /// indistinguishable and control-plane failures fail-closed.
-fn map_authorize_error(error: AuthorizeError) -> s3s::S3Error {
+pub(super) fn map_authorize_error(error: AuthorizeError) -> s3s::S3Error {
     match error {
         AuthorizeError::CheckFailed(_) => s3_error!(InternalError, "Failed to check permissions"),
         _ => s3_error!(AccessDenied, "Permission denied"),
@@ -227,7 +232,7 @@ impl AuthProvider {
             &AuthContext::anonymous(self.realm_id),
             &path,
             &Permission::READ,
-            extras,
+            extras.clone(),
         )
         .await
         .map_err(map_authorize_error)?;
@@ -236,6 +241,7 @@ impl AuthProvider {
         // hand them the Everyone principal scoped to the bucket's group. The
         // key/secret fields are blank — nothing downstream signs with them —
         // and expiry is irrelevant because this access was just checked.
+        cx.extensions_mut().insert(extras);
         cx.extensions_mut().insert(bucket_info);
         cx.extensions_mut().insert(UserAccess {
             access_key: String::new(),

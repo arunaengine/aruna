@@ -27,10 +27,13 @@ use aruna_core::structs::{
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
+use crate::s3::auth::map_authorize_error;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{DriverContext, bucket_snapshot, drive, routing_snapshot};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::metadata::MetadataAuthToken;
+use aruna_operations::request_authorization::{AuthorizeError, authorize};
+use aruna_operations::request_policy::PolicyRequestExtras;
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
 use aruna_operations::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
@@ -259,26 +262,33 @@ impl ArunaS3Service {
         user_access: &UserAccess,
         bucket: &str,
         bucket_info: &BucketInfo,
+        extras: &PolicyRequestExtras,
     ) -> S3Result<bool> {
-        drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: AuthContext {
-                    user_id: user_access.user_identity,
-                    realm_id: user_access.user_identity.realm_id,
-                    path_restrictions: None,
-                },
-                path: blob_bucket_permission_path(
-                    self.realm_id,
-                    bucket_info.group_id,
-                    self.node_id,
-                    bucket,
-                ),
-                required_permission: Permission::READ,
-            }),
+        match authorize(
             &self.state,
+            self.realm_id,
+            &AuthContext {
+                user_id: user_access.user_identity,
+                realm_id: user_access.user_identity.realm_id,
+                path_restrictions: None,
+            },
+            &blob_bucket_permission_path(
+                self.realm_id,
+                bucket_info.group_id,
+                self.node_id,
+                bucket,
+            ),
+            &Permission::READ,
+            extras.clone(),
         )
         .await
-        .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))
+        {
+            Ok(()) => Ok(true),
+            Err(AuthorizeError::CheckFailed(message)) => {
+                Err(s3_error!(InternalError, "{}", message))
+            }
+            Err(_) => Ok(false),
+        }
     }
 
     /// Resolves the hard byte ceiling for a group's realm-wide `logical_bytes`
@@ -502,6 +512,7 @@ impl ArunaS3Service {
         &self,
         user_access: &UserAccess,
         relationship: &SyncRelationship,
+        extras: &PolicyRequestExtras,
     ) -> S3Result<()> {
         if relationship.target.node_id == self.node_id {
             let target_bucket = relationship
@@ -516,28 +527,25 @@ impl ArunaS3Service {
             .and_then(|result| result.transpose())
             .map_err(IntoS3Error::into_s3_error)?
             .ok_or_else(|| s3_error!(InternalError, "Failed to load replication target"))?;
-            let permitted = drive(
-                CheckPermissionsOperation::new(CheckPermissionsConfig {
-                    auth_context: AuthContext {
-                        user_id: user_access.user_identity,
-                        realm_id: user_access.user_identity.realm_id,
-                        path_restrictions: user_access.path_restrictions.clone(),
-                    },
-                    path: blob_bucket_permission_path(
-                        self.realm_id,
-                        bucket_info.group_id,
-                        self.node_id,
-                        target_bucket,
-                    ),
-                    required_permission: Permission::WRITE,
-                }),
+            authorize(
                 &self.state,
+                self.realm_id,
+                &AuthContext {
+                    user_id: user_access.user_identity,
+                    realm_id: user_access.user_identity.realm_id,
+                    path_restrictions: user_access.path_restrictions.clone(),
+                },
+                &blob_bucket_permission_path(
+                    self.realm_id,
+                    bucket_info.group_id,
+                    self.node_id,
+                    target_bucket,
+                ),
+                &Permission::WRITE,
+                extras.clone(),
             )
             .await
-            .map_err(|error| s3_error!(InternalError, "{}", error.to_string()))?;
-            if !permitted {
-                return Err(s3_error!(AccessDenied, "Permission denied"));
-            }
+            .map_err(map_authorize_error)?;
             return self
                 .store_sync_relationship(relationship.clone(), SyncRelationshipDirection::Incoming)
                 .await;
@@ -1201,6 +1209,10 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        let extras = req.extensions.get::<PolicyRequestExtras>().cloned().ok_or_else(|| {
+            error!(error = "Missing policy context");
+            s3_error!(InternalError, "Missing policy context")
+        })?;
 
         let result = drive(
             ListBucketsOperation::new(LBI {
@@ -1222,7 +1234,7 @@ impl S3 for ArunaS3Service {
         let mut buckets = Vec::new();
         for (bucket, bucket_info) in result.buckets {
             if self
-                .can_access_bucket(&user_access, &bucket, &bucket_info)
+                .can_access_bucket(&user_access, &bucket, &bucket_info, &extras)
                 .await?
             {
                 buckets.push(Bucket {
@@ -1678,25 +1690,26 @@ impl S3 for ArunaS3Service {
         } else {
             AuthContext::anonymous(self.realm_id)
         };
-        let source_allowed = drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: source_auth_context,
-                path: blob_object_permission_path(
-                    self.realm_id,
-                    source_bucket_info.group_id,
-                    self.node_id,
-                    &source_bucket,
-                    &source_key,
-                ),
-                required_permission: Permission::READ,
-            }),
+        let source_extras = req.extensions.get::<PolicyRequestExtras>().cloned().ok_or_else(|| {
+            error!(error = "Missing policy context");
+            s3_error!(InternalError, "Missing policy context")
+        })?;
+        authorize(
             &self.state,
+            self.realm_id,
+            &source_auth_context,
+            &blob_object_permission_path(
+                self.realm_id,
+                source_bucket_info.group_id,
+                self.node_id,
+                &source_bucket,
+                &source_key,
+            ),
+            &Permission::READ,
+            source_extras,
         )
         .await
-        .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?;
-        if !source_allowed {
-            return Err(s3_error!(AccessDenied, "Permission denied"));
-        }
+        .map_err(map_authorize_error)?;
 
         let dest_bucket = req.input.bucket.clone();
         let dest_key = req.input.key.clone();
@@ -2018,25 +2031,26 @@ impl S3 for ArunaS3Service {
         } else {
             AuthContext::anonymous(self.realm_id)
         };
-        let source_allowed = drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: source_auth_context,
-                path: blob_object_permission_path(
-                    self.realm_id,
-                    source_bucket_info.group_id,
-                    self.node_id,
-                    &source_bucket,
-                    &source_key,
-                ),
-                required_permission: Permission::READ,
-            }),
+        let source_extras = req.extensions.get::<PolicyRequestExtras>().cloned().ok_or_else(|| {
+            error!(error = "Missing policy context");
+            s3_error!(InternalError, "Missing policy context")
+        })?;
+        authorize(
             &self.state,
+            self.realm_id,
+            &source_auth_context,
+            &blob_object_permission_path(
+                self.realm_id,
+                source_bucket_info.group_id,
+                self.node_id,
+                &source_bucket,
+                &source_key,
+            ),
+            &Permission::READ,
+            source_extras,
         )
         .await
-        .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?;
-        if !source_allowed {
-            return Err(s3_error!(AccessDenied, "Permission denied"));
-        }
+        .map_err(map_authorize_error)?;
 
         let result = upload_part_copy(
             &self.state,
@@ -3188,6 +3202,10 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        let extras = req.extensions.get::<PolicyRequestExtras>().cloned().ok_or_else(|| {
+            error!(error = "Missing policy context");
+            s3_error!(InternalError, "Missing policy context")
+        })?;
         let bucket = req.input.bucket;
         let targets =
             self.parse_replication_targets(&bucket, &req.input.replication_configuration)?;
@@ -3220,7 +3238,10 @@ impl S3 for ArunaS3Service {
             stage_mirror_reconcile(&self.state, relationship)
                 .await
                 .map_err(|error| s3_error!(InternalError, "{}", error))?;
-            if let Err(error) = self.create_sync_mirror(&user_access, relationship).await {
+            if let Err(error) = self
+                .create_sync_mirror(&user_access, relationship, &extras)
+                .await
+            {
                 kick_mirror_repair(&self.state).await;
                 for created in &stored {
                     if stage_mirror_delete(&self.state, created).await.is_ok() {
@@ -4391,6 +4412,7 @@ mod tests {
         let mut extensions = Extensions::new();
         extensions.insert(user_access);
         extensions.insert(bucket_info);
+        extensions.insert(PolicyRequestExtras::rest());
         S3Request {
             input,
             method: Method::PUT,
@@ -4471,6 +4493,101 @@ mod tests {
                 "same_group={same_group}, public={public}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn source_policy_denied() {
+        // A group deny policy on the source path blocks the copy even when RBAC
+        // and destination write are allowed.
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let realm_id = RealmId([37u8; 32]);
+        let node_id = NodeId::from_bytes(&[0u8; 32]).unwrap();
+        let group_id = Ulid::generate();
+        let user_access = test_user_access(group_id, realm_id);
+        let actor = Actor {
+            node_id,
+            user_id: user_access.user_identity,
+            realm_id,
+        };
+        let mut source_auth = GroupAuthorizationDocument::new_default_group_doc(
+            user_access.user_identity,
+            realm_id,
+            group_id,
+        );
+        source_auth.policies = vec![aruna_core::request_policy::RequestPolicy {
+            policy_id: Ulid::generate(),
+            name: "no-reads".to_string(),
+            kind: aruna_core::request_policy::PolicyKind::Deny,
+            when: None,
+            expression: "permission == 'read'".to_string(),
+            enabled: true,
+        }];
+        let source_group = aruna_core::structs::Group {
+            display_name: "src".to_string(),
+            group_id,
+            realm_id,
+            owner: user_access.user_identity,
+            roles: source_auth.roles.keys().copied().collect(),
+        };
+        write_storage_value(
+            &storage_handle,
+            AUTH_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+                .to_bytes(&actor)
+                .unwrap(),
+        )
+        .await;
+        write_storage_value(
+            &storage_handle,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            source_auth.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        write_storage_value(
+            &storage_handle,
+            aruna_core::keyspaces::GROUP_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            source_group.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        write_storage_value(
+            &storage_handle,
+            S3_BUCKET_KEYSPACE,
+            b"source".to_vec(),
+            test_bucket_info(group_id, user_access.user_identity)
+                .to_bytes()
+                .unwrap(),
+        )
+        .await;
+
+        let service = ArunaS3Service::new(context, realm_id, node_id).await;
+        let input = CopyObjectInput::builder()
+            .bucket("destination".to_string())
+            .key("copied".to_string())
+            .copy_source(s3s::dto::CopySource::parse("source/object").unwrap())
+            .metadata_directive(Some(MetadataDirective::from_static(
+                MetadataDirective::REPLACE,
+            )))
+            .build()
+            .unwrap();
+        let bucket_info = test_bucket_info(group_id, user_access.user_identity);
+        let error = service
+            .copy_object(test_copy_request(input, user_access, bucket_info))
+            .await
+            .unwrap_err();
+        assert_eq!(*error.code(), S3ErrorCode::AccessDenied);
     }
 
     async fn seed_materialized_keys(
