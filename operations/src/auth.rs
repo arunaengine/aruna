@@ -1,6 +1,10 @@
 use aruna_core::auth::bearer_token_hash;
+use aruna_core::document::DocumentSyncTarget;
+use aruna_core::effects::StorageEffect;
 use aruna_core::errors::ConversionError;
-use aruna_core::structs::{AuthContext, RealmId, TokenClaims};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::structs::{AuthContext, RealmConfigDocument, RealmId, TokenClaims};
+use aruna_storage::StorageHandle;
 use async_trait::async_trait;
 use base64::Engine;
 use ed25519_dalek::pkcs8::EncodePublicKey;
@@ -15,6 +19,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::Mutex;
+use tracing::warn;
 
 #[async_trait]
 pub trait ArunaBearerTokenValidationState: Sync {
@@ -53,6 +58,40 @@ pub enum ArunaBearerTokenError {
     JwtError(#[from] jsonwebtoken::errors::Error),
     #[error(transparent)]
     Base64Error(#[from] base64::DecodeError),
+}
+
+/// Whether the realm's replicated revocation set denies this token hash. This
+/// is the realm-wide authority; a node-local list is only a fast path. Storage
+/// and decode failures fail closed, a realm without a config document does not.
+pub async fn realm_token_revoked(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+    token_hash: &str,
+) -> bool {
+    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => match RealmConfigDocument::from_bytes(&bytes) {
+            Ok(config) => config.token_revoked(token_hash),
+            Err(error) => {
+                warn!(error = %error, "Failed to decode realm config for token revocation");
+                true
+            }
+        },
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => false,
+        other => {
+            warn!(event = ?other, "Failed to read realm config for token revocation");
+            true
+        }
+    }
 }
 
 pub async fn validate_aruna_bearer_token<S>(

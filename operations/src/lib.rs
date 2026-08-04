@@ -71,6 +71,7 @@ pub mod request_authorization;
 pub mod request_policy;
 pub mod reserve_onboarding_secret;
 pub mod resolve_users;
+pub mod revoke_token;
 pub mod s3;
 pub mod search_groups;
 pub mod search_users;

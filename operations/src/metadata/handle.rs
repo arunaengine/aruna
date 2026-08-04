@@ -63,7 +63,7 @@ use super::search_cursor::{METADATA_SEARCH_MAX_PAGINATION_DEPTH, compare_hits};
 use super::search_enrichment::{hit_snippet, hit_title};
 use super::summary_cache::summary_cache;
 use crate::auth::{
-    ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache,
+    ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache, realm_token_revoked,
     validate_aruna_bearer_token,
 };
 use crate::driver::{DriverContext, drive};
@@ -279,13 +279,17 @@ struct MetadataInner {
 #[derive(Clone)]
 struct MetadataAuthValidationState {
     storage_handle: StorageHandle,
+    /// Realm this node serves; without one there is no replicated revocation
+    /// set to consult and only the node-local list applies.
+    realm_id: Option<RealmId>,
     issuer_keys: Arc<IssuerKeyCache>,
 }
 
 impl MetadataAuthValidationState {
-    fn new(storage_handle: StorageHandle) -> Self {
+    fn new(storage_handle: StorageHandle, realm_id: Option<RealmId>) -> Self {
         Self {
             storage_handle,
+            realm_id,
             issuer_keys: Arc::new(IssuerKeyCache::new()),
         }
     }
@@ -294,6 +298,11 @@ impl MetadataAuthValidationState {
 #[async_trait]
 impl ArunaBearerTokenValidationState for MetadataAuthValidationState {
     async fn is_bearer_token_revoked(&self, token_hash: &str) -> bool {
+        if let Some(realm_id) = self.realm_id
+            && realm_token_revoked(&self.storage_handle, realm_id, token_hash).await
+        {
+            return true;
+        }
         match load_metadata_auth_state::<HashSet<String>>(
             &self.storage_handle,
             TOKEN_REVOCATION_LIST_KEY,
@@ -744,7 +753,10 @@ impl MetadataHandle {
         Ok(Self {
             inner: Arc::new(MetadataInner {
                 node: Arc::new(node),
-                auth_validation: MetadataAuthValidationState::new(storage_handle.clone()),
+                auth_validation: MetadataAuthValidationState::new(
+                    storage_handle.clone(),
+                    net_handle.as_ref().map(|net| *net.realm_id()),
+                ),
                 storage_handle,
                 net_handle,
                 document_sync_db,
@@ -6527,7 +6539,7 @@ mod tests {
         )
         .await;
         persist_realm_config(&storage, realm_id, &[configured_peer]).await;
-        let state = MetadataAuthValidationState::new(storage.clone());
+        let state = MetadataAuthValidationState::new(storage.clone(), Some(realm_id));
 
         let auth = authorize_remote_metadata_peer(
             &state,
@@ -6563,7 +6575,7 @@ mod tests {
         persist_realm_config(&storage, realm_id, &[peer]).await;
 
         let auth = authorize_remote_metadata_peer(
-            &MetadataAuthValidationState::new(storage.clone()),
+            &MetadataAuthValidationState::new(storage.clone(), Some(realm_id)),
             &storage,
             peer,
             Some(realm_id),
@@ -6581,7 +6593,7 @@ mod tests {
         let (_dir, storage) = auth_storage();
         let realm_id = RealmId([17u8; 32]);
         let auth = bucket_search_auth(
-            &MetadataAuthValidationState::new(storage.clone()),
+            &MetadataAuthValidationState::new(storage.clone(), Some(realm_id)),
             &storage,
             node_id_from_seed(18),
             Some(realm_id),
@@ -6608,7 +6620,7 @@ mod tests {
         .await;
         persist_realm_config(&storage, wrong_realm_id, &[wrong_realm_peer]).await;
         persist_realm_config(&storage, realm_id, &[auth_realm_peer]).await;
-        let state = MetadataAuthValidationState::new(storage.clone());
+        let state = MetadataAuthValidationState::new(storage.clone(), Some(realm_id));
 
         let error = authorize_remote_metadata_peer(
             &state,
@@ -6635,7 +6647,7 @@ mod tests {
         let (_dir, storage) = auth_storage();
         let local_peer = node_id_from_seed(26);
         persist_realm_config(&storage, local_realm_id, &[local_peer]).await;
-        let state = MetadataAuthValidationState::new(storage.clone());
+        let state = MetadataAuthValidationState::new(storage.clone(), Some(local_realm_id));
 
         let auth = authorize_remote_metadata_peer(
             &state,
@@ -6658,7 +6670,7 @@ mod tests {
         let (_dir, storage) = auth_storage();
         let wrong_realm_peer = node_id_from_seed(29);
         persist_realm_config(&storage, wrong_realm_id, &[wrong_realm_peer]).await;
-        let state = MetadataAuthValidationState::new(storage.clone());
+        let state = MetadataAuthValidationState::new(storage.clone(), Some(local_realm_id));
 
         let error = authorize_remote_metadata_peer(
             &state,
@@ -6690,7 +6702,7 @@ mod tests {
             &HashSet::from([realm_id]),
         )
         .await;
-        let state = MetadataAuthValidationState::new(storage);
+        let state = MetadataAuthValidationState::new(storage, Some(realm_id));
 
         let auth =
             remote_metadata_auth_context(&state, Some(MetadataAuthToken::bearer(token).unwrap()))
@@ -6719,7 +6731,7 @@ mod tests {
             &HashSet::from([realm_id]),
         )
         .await;
-        let state = MetadataAuthValidationState::new(storage);
+        let state = MetadataAuthValidationState::new(storage, Some(realm_id));
 
         let auth =
             remote_metadata_auth_context(&state, Some(MetadataAuthToken::bearer(token).unwrap()))
@@ -6750,23 +6762,42 @@ mod tests {
             &HashSet::from([bearer_token_hash(&token)]),
         )
         .await;
-        let revoked_state = MetadataAuthValidationState::new(revoked_storage);
+        let revoked_state = MetadataAuthValidationState::new(revoked_storage, Some(realm_id));
         assert_metadata_auth_rejected(&revoked_state, &token, "Token is revoked").await;
 
         let (_untrusted_dir, untrusted_storage) = auth_storage();
-        let untrusted_state = MetadataAuthValidationState::new(untrusted_storage);
+        let untrusted_state = MetadataAuthValidationState::new(untrusted_storage, Some(realm_id));
         assert_metadata_auth_rejected(&untrusted_state, &token, "Realm is not trusted").await;
 
         let (_invalid_dir, invalid_storage) = auth_storage();
-        let invalid_state = MetadataAuthValidationState::new(invalid_storage);
+        let invalid_state = MetadataAuthValidationState::new(invalid_storage, Some(realm_id));
         assert_metadata_auth_rejected(&invalid_state, "not-a-jwt", "invalid metadata auth token")
             .await;
     }
 
     #[tokio::test]
+    async fn replicated_revocation_rejects_token() {
+        // A revocation that arrived only through the replicated realm config,
+        // with an empty node-local list, must still deny the token here.
+        let (realm_signing_key, realm_id, user_id) = realm_fixture();
+        let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
+        let (_dir, storage) = auth_storage();
+        persist_auth_state(
+            &storage,
+            TRUSTED_REALMS_LIST_KEY,
+            &HashSet::from([realm_id]),
+        )
+        .await;
+        persist_revoked_config(&storage, realm_id, &token).await;
+        let state = MetadataAuthValidationState::new(storage, Some(realm_id));
+
+        assert_metadata_auth_rejected(&state, &token, "Token is revoked").await;
+    }
+
+    #[tokio::test]
     async fn remote_metadata_auth_allows_missing_token_as_anonymous() {
         let (_dir, storage) = auth_storage();
-        let state = MetadataAuthValidationState::new(storage);
+        let state = MetadataAuthValidationState::new(storage, None);
 
         assert_eq!(
             remote_metadata_auth_context(&state, None)
@@ -6818,12 +6849,26 @@ mod tests {
         }
     }
 
+    async fn persist_revoked_config(storage: &StorageHandle, realm_id: RealmId, token: &str) {
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.revoked_tokens.push(bearer_token_hash(token));
+        write_realm_config(storage, realm_id, &config).await;
+    }
+
     async fn persist_realm_config(storage: &StorageHandle, realm_id: RealmId, node_ids: &[NodeId]) {
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         for node_id in node_ids {
             config.ensure_node(*node_id, RealmNodeKind::Server);
         }
-        let bytes = postcard::to_allocvec(&config).expect("realm config serializes");
+        write_realm_config(storage, realm_id, &config).await;
+    }
+
+    async fn write_realm_config(
+        storage: &StorageHandle,
+        realm_id: RealmId,
+        config: &RealmConfigDocument,
+    ) {
+        let bytes = postcard::to_allocvec(config).expect("realm config serializes");
 
         match storage
             .send_storage_effect(StorageEffect::Write {
