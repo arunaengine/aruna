@@ -569,12 +569,7 @@ impl ArunaBearerTokenValidationState for ServerState {
         // Node-local list first as a fast path; the replicated realm config is
         // what makes a revocation from any other node binding here.
         self.token_revocation_list.read().await.contains(token_hash)
-            || realm_token_revoked(
-                &self.driver_ctx.storage_handle,
-                self.realm_id,
-                token_hash,
-            )
-            .await
+            || realm_token_revoked(&self.driver_ctx.storage_handle, self.realm_id, token_hash).await
     }
 
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {

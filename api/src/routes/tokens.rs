@@ -210,9 +210,12 @@ mod tests {
         .await
         .unwrap();
 
-        let config = drive(GetRealmConfigOperation::new(realm_id), state.get_ctx().as_ref())
-            .await
-            .unwrap();
+        let config = drive(
+            GetRealmConfigOperation::new(realm_id),
+            state.get_ctx().as_ref(),
+        )
+        .await
+        .unwrap();
         assert!(config.token_revoked(&bearer_token_hash(&token)));
     }
 
@@ -270,9 +273,9 @@ mod tests {
             })
             .await
         {
-            aruna_core::events::Event::Storage(
-                aruna_core::events::StorageEvent::WriteResult { .. },
-            ) => {}
+            aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::WriteResult {
+                ..
+            }) => {}
             other => panic!("unexpected realm config write result: {other:?}"),
         }
     }

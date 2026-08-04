@@ -1,6 +1,4 @@
-use aruna_core::admin_document_reducer::{
-    AdminDocumentReducerError, AdminDocumentReducerState,
-};
+use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::auth::valid_token_hash;
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
@@ -363,7 +361,8 @@ fn apply_reducer_revocations(
     document: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
 ) {
-    let mut revoked: std::collections::BTreeSet<String> = document.revoked_tokens.drain(..).collect();
+    let mut revoked: std::collections::BTreeSet<String> =
+        document.revoked_tokens.drain(..).collect();
     revoked.extend(reducer_state.materialized_revoked_tokens());
     document.revoked_tokens = revoked.into_iter().collect();
 }

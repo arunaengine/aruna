@@ -6,11 +6,11 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::auth::valid_token_hash;
 use crate::admin_documents::{
     AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
     AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
+use crate::auth::valid_token_hash;
 use crate::structs::{
     Actor, BandPool, BindingScope, DocumentClass, HandleRange, MAX_PLACEMENT_SHARD_COUNT,
     MetadataRegistryRecord, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig,
