@@ -127,7 +127,7 @@ impl RevokeTokenOperation {
         })]
     }
 
-    fn emit_write_document_and_admin_state(
+    fn emit_batch_write(
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
@@ -265,10 +265,8 @@ impl Operation for RevokeTokenOperation {
                             format!("{values:?}"),
                         );
                     };
-                    match self.emit_write_document_and_admin_state(
-                        document_value.clone(),
-                        reducer_state_value.clone(),
-                    ) {
+                    match self.emit_batch_write(document_value.clone(), reducer_state_value.clone())
+                    {
                         Ok(effects) => effects,
                         Err(error) => self.fail(error),
                     }
