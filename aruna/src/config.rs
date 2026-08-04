@@ -696,18 +696,9 @@ fn rate_limits_env() -> Result<RateLimitSettings, SetupError> {
             "RATE_LIMIT_PRINCIPAL_PER_MINUTE",
             defaults.principal_per_minute,
         )?,
-        principal_burst: positive_u32_env(
-            "RATE_LIMIT_PRINCIPAL_BURST",
-            defaults.principal_burst,
-        )?,
-        s3_max_connections: positive_u32_env(
-            "S3_MAX_CONNECTIONS",
-            defaults.s3_max_connections,
-        )?,
-        s3_max_requests: positive_u32_env(
-            "S3_MAX_CONCURRENT_REQUESTS",
-            defaults.s3_max_requests,
-        )?,
+        principal_burst: positive_u32_env("RATE_LIMIT_PRINCIPAL_BURST", defaults.principal_burst)?,
+        s3_max_connections: positive_u32_env("S3_MAX_CONNECTIONS", defaults.s3_max_connections)?,
+        s3_max_requests: positive_u32_env("S3_MAX_CONCURRENT_REQUESTS", defaults.s3_max_requests)?,
     })
 }
 

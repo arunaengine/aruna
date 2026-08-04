@@ -202,9 +202,13 @@ impl AddGroupRoleOperation {
             self.input.realm_id,
             self.input.group_id,
         );
-        if self.input.role.permissions.keys().any(|pattern| {
-            !aruna_core::permission_path::role_path_confined(pattern, &subtree_root)
-        }) {
+        if self
+            .input
+            .role
+            .permissions
+            .keys()
+            .any(|pattern| !aruna_core::permission_path::role_path_confined(pattern, &subtree_root))
+        {
             return Err(AddGroupRoleError::UnconfinedRolePath);
         }
 
