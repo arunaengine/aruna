@@ -3020,6 +3020,13 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        // The access hook deferred per-object policy evaluation; reuse the request
+        // context it stashed so each entry is decided against the real query and
+        // allowlisted headers rather than an empty operation-only context.
+        let extras = req.extensions.get::<PolicyRequestExtras>().cloned().ok_or_else(|| {
+            error!(error = "Missing policy context");
+            s3_error!(InternalError, "Missing policy context")
+        })?;
 
         if req.input.delete.objects.len() > 1000 {
             return Err(s3_error!(
@@ -3084,9 +3091,7 @@ impl S3 for ArunaS3Service {
                 &object_path,
                 &Permission::WRITE,
                 Some(&replication_auth.user_id),
-                aruna_operations::request_policy::PolicyRequestExtras::operation(
-                    "s3.DeleteObjects",
-                ),
+                extras.clone(),
             );
             if !allowed || policy_evaluator.evaluate(&policy_request).is_err() {
                 errors.push(S3DeleteError {
@@ -4588,6 +4593,140 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(*error.code(), S3ErrorCode::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn delete_uses_request_context() {
+        // The per-object policy must see the real query parameters and allowlisted
+        // headers the access hook captured, not an empty operation-only context.
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let realm_id = RealmId([38u8; 32]);
+        let node_id = NodeId::from_bytes(&[0u8; 32]).unwrap();
+        let group_id = Ulid::generate();
+        let user_access = test_user_access(group_id, realm_id);
+        let actor = Actor {
+            node_id,
+            user_id: user_access.user_identity,
+            realm_id,
+        };
+        let mut auth_doc = GroupAuthorizationDocument::new_default_group_doc(
+            user_access.user_identity,
+            realm_id,
+            group_id,
+        );
+        auth_doc.policies = vec![aruna_core::request_policy::RequestPolicy {
+            policy_id: Ulid::generate(),
+            name: "context-deny".to_string(),
+            kind: aruna_core::request_policy::PolicyKind::Deny,
+            when: None,
+            expression: "('mode' in params && params['mode'] == 'purge') \
+                || ('x-amz-meta-env' in headers && headers['x-amz-meta-env'] == 'prod')"
+                .to_string(),
+            enabled: true,
+        }];
+        let group = aruna_core::structs::Group {
+            display_name: "g".to_string(),
+            group_id,
+            realm_id,
+            owner: user_access.user_identity,
+            roles: auth_doc.roles.keys().copied().collect(),
+        };
+        write_storage_value(
+            &storage_handle,
+            AUTH_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+                .to_bytes(&actor)
+                .unwrap(),
+        )
+        .await;
+        write_storage_value(
+            &storage_handle,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            auth_doc.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        write_storage_value(
+            &storage_handle,
+            aruna_core::keyspaces::GROUP_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            group.to_bytes(&actor).unwrap(),
+        )
+        .await;
+
+        let service = ArunaS3Service::new(context, realm_id, node_id).await;
+        let param_extras = PolicyRequestExtras {
+            operation: "s3.DeleteObjects".to_string(),
+            params: std::collections::BTreeMap::from([("mode".to_string(), "purge".to_string())]),
+            headers: std::collections::BTreeMap::new(),
+            body: None,
+        };
+        let header_extras = PolicyRequestExtras {
+            operation: "s3.DeleteObjects".to_string(),
+            params: std::collections::BTreeMap::new(),
+            headers: std::collections::BTreeMap::from([(
+                "x-amz-meta-env".to_string(),
+                "prod".to_string(),
+            )]),
+            body: None,
+        };
+
+        for extras in [param_extras, header_extras] {
+            let delete = s3s::dto::Delete {
+                objects: vec![
+                    s3s::dto::ObjectIdentifier {
+                        key: "a".to_string(),
+                        ..Default::default()
+                    },
+                    s3s::dto::ObjectIdentifier {
+                        key: "b".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                quiet: None,
+            };
+            let input = DeleteObjectsInput::builder()
+                .bucket("bucket".to_string())
+                .delete(delete)
+                .build()
+                .unwrap();
+            let mut extensions = Extensions::new();
+            extensions.insert(user_access.clone());
+            extensions.insert(DeleteObjectsBody::default());
+            extensions.insert(extras);
+            let mut headers = HeaderMap::new();
+            headers.insert("content-md5", "1B2M2Y8AsgTpgAmY7PhCfg==".parse().unwrap());
+            let request = S3Request {
+                input,
+                method: Method::POST,
+                uri: Uri::from_static("/"),
+                headers,
+                extensions,
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            };
+            let output = service.delete_objects(request).await.unwrap();
+            let errors = output.output.errors.unwrap_or_default();
+            assert_eq!(errors.len(), 2);
+            assert!(
+                errors
+                    .iter()
+                    .all(|error| error.code.as_deref() == Some("AccessDenied"))
+            );
+        }
     }
 
     async fn seed_materialized_keys(
