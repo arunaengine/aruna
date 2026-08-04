@@ -2,7 +2,6 @@
 #![recursion_limit = "256"]
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use aruna_core::admin_document_reducer::AdminDocumentReducerState;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
@@ -37,10 +36,10 @@ use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
-use tokio::time::{Instant, sleep};
 use ulid::Ulid;
 
-const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
+mod convergence;
+use convergence::wait_for_convergence;
 
 struct TestNode {
     _temp_dir: TempDir,
@@ -190,20 +189,22 @@ async fn shared_node_info_topic_propagates_placement_authoritative_document()
     .find(|node| node.node_id == publisher_id)
     .expect("publisher should be present in placement view")
     .labels;
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    let received = loop {
-        if let Some(document) = read_node_info_document(&peer.context.storage_handle, publisher_id)
-            .await
-            .map_err(std::io::Error::other)?
-        {
-            break document;
-        }
-        if Instant::now() >= deadline {
-            shutdown_nodes(nodes).await;
-            return Err("node info document did not propagate over the shared topic".into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    };
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "node info document did not propagate over the shared topic",
+        || async {
+            Ok(usize::from(
+                read_node_info_document(&peer.context.storage_handle, publisher_id)
+                    .await
+                    .map_err(std::io::Error::other)?
+                    .is_none(),
+            ))
+        },
+    )
+    .await?;
+    let received = read_node_info_document(&peer.context.storage_handle, publisher_id)
+        .await
+        .map_err(std::io::Error::other)?
+        .expect("node info document present after convergence");
 
     assert_eq!(received.node_id, publisher_id);
     assert_eq!(received.executors.len(), 1);
@@ -277,8 +278,8 @@ async fn wait_for_document(
     node: &TestNode,
     target: &DocumentSyncTarget,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
+    let context = format!("document did not reach final holder {}", node.net.node_id());
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(&context, || async {
         match node
             .context
             .storage_handle
@@ -289,17 +290,12 @@ async fn wait_for_document(
             }))
             .await
         {
-            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => return Ok(()),
-            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {}
-            other => return Err(format!("unexpected document read event: {other:?}").into()),
+            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => Ok(0),
+            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(1),
+            other => Err(format!("unexpected document read event: {other:?}").into()),
         }
-        if Instant::now() >= deadline {
-            return Err(
-                format!("document did not reach final holder {}", node.net.node_id()).into(),
-            );
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+    })
+    .await
 }
 
 async fn wait_for_policy_convergence(
@@ -308,34 +304,43 @@ async fn wait_for_policy_convergence(
     draining_node: aruna_core::NodeId,
     replica_count: u32,
 ) -> Result<Vec<RealmConfigDocument>, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
-        let mut configs = Vec::with_capacity(nodes.len());
-        let mut converged = true;
-        for node in nodes {
-            let config = drive(
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "placement policy did not converge on all nodes",
+        || async {
+            let mut pending = 0;
+            for node in nodes {
+                let config = drive(
+                    GetRealmConfigOperation::new(realm_id),
+                    node.context.as_ref(),
+                )
+                .await?;
+                let strategy_matches = config
+                    .default_strategy_id
+                    .and_then(|strategy_id| config.strategy(&strategy_id))
+                    .is_some_and(|strategy| strategy.replica_count == Some(replica_count));
+                let node_matches = config
+                    .placement_entry(draining_node)
+                    .is_some_and(|entry| entry.draining);
+                if !(strategy_matches && node_matches) {
+                    pending += 1;
+                }
+            }
+            Ok(pending)
+        },
+    )
+    .await?;
+
+    let mut configs = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        configs.push(
+            drive(
                 GetRealmConfigOperation::new(realm_id),
                 node.context.as_ref(),
             )
-            .await?;
-            let strategy_matches = config
-                .default_strategy_id
-                .and_then(|strategy_id| config.strategy(&strategy_id))
-                .is_some_and(|strategy| strategy.replica_count == Some(replica_count));
-            let node_matches = config
-                .placement_entry(draining_node)
-                .is_some_and(|entry| entry.draining);
-            converged &= strategy_matches && node_matches;
-            configs.push(config);
-        }
-        if converged {
-            return Ok(configs);
-        }
-        if Instant::now() >= deadline {
-            return Err("placement policy did not converge on all nodes".into());
-        }
-        sleep(Duration::from_millis(100)).await;
+            .await?,
+        );
     }
+    Ok(configs)
 }
 
 fn assert_weighted_distinct_resolution(nodes: &[TestNode], config: &RealmConfigDocument) {

@@ -39,7 +39,9 @@ use ulid::Ulid;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+mod convergence;
+use convergence::{NO_PROGRESS_TIMEOUT, wait_for_convergence};
+
 const PROJECTION_BATCH: usize = 32;
 const TOTAL_CREATES: usize = 2000;
 
@@ -165,14 +167,7 @@ fn convergence_gate() -> Result<(), BoxError> {
             .collect();
 
         let contexts: Vec<Arc<DriverContext>> = nodes.iter().map(|n| n.context.clone()).collect();
-        let result = wait_for_visibility(
-            &contexts,
-            &last,
-            Duration::from_millis(200),
-            Duration::from_secs(60),
-            t0,
-        )
-        .await;
+        let result = wait_for_visibility(&contexts, &last, Duration::from_millis(200), t0).await;
         shutdown_nodes(nodes).await;
         result
     })?;
@@ -226,15 +221,8 @@ fn production_path_convergence_gate() -> Result<(), BoxError> {
             .map(|(group_id, document_id, _)| (*group_id, *document_id))
             .collect();
         let contexts: Vec<Arc<DriverContext>> = nodes.iter().map(|n| n.context.clone()).collect();
-        wait_for_visibility(
-            &contexts,
-            &pairs,
-            Duration::from_millis(200),
-            Duration::from_secs(300),
-            started,
-        )
-        .await?;
-        wait_for_empty_materialization_queues(&contexts, Duration::from_secs(300), started).await?;
+        wait_for_visibility(&contexts, &pairs, Duration::from_millis(200), started).await?;
+        wait_for_empty_materialization_queues(&contexts).await?;
         let seconds = started.elapsed().as_secs_f64();
         shutdown_nodes(nodes).await;
         Ok::<(f64, usize), BoxError>((seconds, total))
@@ -253,10 +241,8 @@ fn production_path_convergence_gate() -> Result<(), BoxError> {
 
 async fn wait_for_empty_materialization_queues(
     contexts: &[Arc<DriverContext>],
-    timeout: Duration,
-    t0: Instant,
 ) -> Result<(), BoxError> {
-    loop {
+    wait_for_convergence("materialization queues never drained", || async {
         let mut busy = 0usize;
         for context in contexts {
             if metadata_materialization_jobs_exist(&context.storage_handle)
@@ -266,17 +252,9 @@ async fn wait_for_empty_materialization_queues(
                 busy += 1;
             }
         }
-        if busy == 0 {
-            return Ok(());
-        }
-        if t0.elapsed() > timeout {
-            return Err(format!(
-                "materialization queues still busy on {busy} nodes after {timeout:?}"
-            )
-            .into());
-        }
-        sleep(Duration::from_millis(200)).await;
-    }
+        Ok(busy)
+    })
+    .await
 }
 
 #[test]
@@ -345,7 +323,6 @@ async fn churn_convergence_body() -> Result<f64, BoxError> {
             &contexts,
             &initial_pair,
             Duration::from_millis(200),
-            SETUP_TIMEOUT,
             Instant::now(),
         )
         .await?;
@@ -385,7 +362,6 @@ async fn churn_convergence_body() -> Result<f64, BoxError> {
         std::slice::from_ref(&node2.context),
         &pairs,
         Duration::from_millis(500),
-        Duration::from_secs(60),
         t0,
     )
     .await;
@@ -515,15 +491,18 @@ async fn flush_projection_batches(
     Ok(())
 }
 
+// Keeps the per-node pruning and elapsed-time return, but fails on a lost-progress
+// window rather than a fixed budget so a slow-but-converging run is not flunked.
 async fn wait_for_visibility(
     contexts: &[Arc<DriverContext>],
     pairs: &[(GroupId, Ulid)],
     poll_interval: Duration,
-    timeout: Duration,
     t0: Instant,
 ) -> Result<f64, BoxError> {
     let mut remaining: Vec<Vec<(GroupId, Ulid)>> =
         contexts.iter().map(|_| pairs.to_vec()).collect();
+    let mut best = usize::MAX;
+    let mut deadline = Instant::now() + NO_PROGRESS_TIMEOUT;
 
     loop {
         for (context, missing) in contexts.iter().zip(remaining.iter_mut()) {
@@ -541,15 +520,17 @@ async fn wait_for_visibility(
             }
             *missing = still_missing;
         }
-        if remaining.iter().all(Vec::is_empty) {
+        let pending: usize = remaining.iter().map(Vec::len).sum();
+        if pending == 0 {
             return Ok(t0.elapsed().as_secs_f64());
         }
-        if t0.elapsed() > timeout {
+        if pending < best {
+            best = pending;
+            deadline = Instant::now() + NO_PROGRESS_TIMEOUT;
+        }
+        if Instant::now() >= deadline {
             let counts: Vec<usize> = remaining.iter().map(Vec::len).collect();
-            return Err(format!(
-                "visibility timeout after {timeout:?}; missing per node: {counts:?}"
-            )
-            .into());
+            return Err(format!("visibility stalled; missing per node: {counts:?}").into());
         }
         sleep(poll_interval).await;
     }
@@ -724,10 +705,8 @@ async fn wait_for_realm_node_convergence(
     realm_id: &RealmId,
 ) -> Result<(), BoxError> {
     let expected: HashSet<_> = nodes.iter().map(|node| node.net.node_id()).collect();
-    let deadline = Instant::now() + SETUP_TIMEOUT;
-
-    loop {
-        let mut converged = true;
+    wait_for_convergence("realm nodes did not converge", || async {
+        let mut pending = 0;
         for node in nodes {
             match drive(
                 GetRealmNodesOperation::new(*realm_id),
@@ -736,20 +715,12 @@ async fn wait_for_realm_node_convergence(
             .await
             {
                 Ok(realm_nodes) if realm_nodes == expected => {}
-                _ => {
-                    converged = false;
-                    break;
-                }
+                _ => pending += 1,
             }
         }
-        if converged {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("realm nodes did not converge".into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+        Ok(pending)
+    })
+    .await
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {

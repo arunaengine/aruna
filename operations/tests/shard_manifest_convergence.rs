@@ -1,7 +1,6 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use aruna_core::document::{DocumentSyncTarget, ShardManifest, ShardManifestEntry};
 use aruna_core::effects::{Effect, StorageEffect};
@@ -34,8 +33,10 @@ use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
-use tokio::time::sleep;
 use ulid::Ulid;
+
+mod convergence;
+use convergence::wait_for_convergence;
 
 /// A fixed structured id (handle 1, bucket 0) for the strategy-resolution sample,
 /// which does not exercise the create-mint flow.
@@ -44,13 +45,6 @@ fn doc_id(seed: u64) -> Ulid {
         .unwrap()
         .as_ulid()
 }
-
-// Realm-node and manifest convergence poll to a condition; the ceilings only
-// bound a genuine hang. Convergence measures single-digit seconds, but a
-// loaded CI runner can stall consecutive peer syncs for the full 30s peer-sync
-// timeout each, so the backstop is 2-3x that timeout, not the expected latency.
-const SETUP_TIMEOUT: Duration = Duration::from_secs(120);
-const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 
 struct TestNode {
     _temp_dir: TempDir,
@@ -130,40 +124,39 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
     )
     .await?;
 
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
-        let left = assemble_shard_manifest(nodes[0].context.as_ref(), realm_id, placement).await?;
-        let right = assemble_shard_manifest(nodes[1].context.as_ref(), realm_id, placement).await?;
-        let left_tomb = left
-            .entries
-            .iter()
-            .find(|entry| entry.target == deleted_target)
-            .map(|entry| entry.revision);
-        let right_tomb = right
-            .entries
-            .iter()
-            .find(|entry| entry.target == deleted_target)
-            .map(|entry| entry.revision);
-        if left_tomb.is_some() && left_tomb == right_tomb {
-            // Both holders now carry the same tombstone row: the whole entry set
-            // (tombstone included) and the digest must be identical.
-            assert_eq!(
-                left.entries.len(),
-                document_ids.len(),
-                "the delete keeps a tombstone row"
-            );
-            assert_eq!(sorted_entries(&left), sorted_entries(&right));
-            assert_eq!(left.digest, right.digest);
-            break;
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "delete tombstone did not converge across holders: left={left_tomb:?} right={right_tomb:?}"
-            )
-            .into());
-        }
-        sleep(Duration::from_millis(150)).await;
-    }
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "delete tombstone did not converge across holders",
+        || async {
+            let left =
+                assemble_shard_manifest(nodes[0].context.as_ref(), realm_id, placement).await?;
+            let right =
+                assemble_shard_manifest(nodes[1].context.as_ref(), realm_id, placement).await?;
+            let left_tomb = left
+                .entries
+                .iter()
+                .find(|entry| entry.target == deleted_target)
+                .map(|entry| entry.revision);
+            let right_tomb = right
+                .entries
+                .iter()
+                .find(|entry| entry.target == deleted_target)
+                .map(|entry| entry.revision);
+            if left_tomb.is_some() && left_tomb == right_tomb {
+                // Both holders now carry the same tombstone row: the whole entry set
+                // (tombstone included) and the digest must be identical.
+                assert_eq!(
+                    left.entries.len(),
+                    document_ids.len(),
+                    "the delete keeps a tombstone row"
+                );
+                assert_eq!(sorted_entries(&left), sorted_entries(&right));
+                assert_eq!(left.digest, right.digest);
+                return Ok(0);
+            }
+            Ok(1)
+        },
+    )
+    .await?;
 
     shutdown_nodes(nodes).await;
     Ok(())
@@ -250,29 +243,18 @@ async fn wait_for_manifest_agreement(
     placement: PlacementRef,
     expected: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
+    wait_for_convergence("manifests did not converge", || async {
         let left_manifest =
             assemble_shard_manifest(left.context.as_ref(), realm_id, placement).await?;
         let right_manifest =
             assemble_shard_manifest(right.context.as_ref(), realm_id, placement).await?;
-        if left_manifest.entries.len() == expected
-            && right_manifest.entries.len() == expected
-            && left_manifest.digest == right_manifest.digest
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "manifests did not converge: left={} right={} digest_eq={}",
-                left_manifest.entries.len(),
-                right_manifest.entries.len(),
-                left_manifest.digest == right_manifest.digest
-            )
-            .into());
-        }
-        sleep(Duration::from_millis(150)).await;
-    }
+        Ok(usize::from(
+            !(left_manifest.entries.len() == expected
+                && right_manifest.entries.len() == expected
+                && left_manifest.digest == right_manifest.digest),
+        ))
+    })
+    .await
 }
 
 async fn build_realm_nodes(
@@ -408,9 +390,8 @@ async fn wait_for_realm_node_convergence(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let expected: std::collections::HashSet<NodeId> =
         nodes.iter().map(|node| node.net.node_id()).collect();
-    let deadline = Instant::now() + SETUP_TIMEOUT;
-    loop {
-        let mut converged = true;
+    wait_for_convergence("realm nodes did not converge", || async {
+        let mut pending = 0;
         for node in nodes {
             match drive(
                 GetRealmNodesOperation::new(*realm_id),
@@ -419,20 +400,12 @@ async fn wait_for_realm_node_convergence(
             .await
             {
                 Ok(realm_nodes) if realm_nodes == expected => {}
-                _ => {
-                    converged = false;
-                    break;
-                }
+                _ => pending += 1,
             }
         }
-        if converged {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("realm nodes did not converge".into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+        Ok(pending)
+    })
+    .await
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {

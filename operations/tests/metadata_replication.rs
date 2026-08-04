@@ -64,8 +64,11 @@ use aruna_operations::update_metadata_document::{
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
-use tokio::time::{Instant, sleep};
+use tokio::time::sleep;
 use ulid::Ulid;
+
+mod convergence;
+use convergence::wait_for_convergence;
 
 /// Mints the held-bucket structured id a local create embeds on `node_id`.
 fn mint_local(
@@ -96,13 +99,6 @@ fn doc_id(seed: u64) -> Ulid {
         .unwrap()
         .as_ulid()
 }
-
-// Every wait below polls to a condition; the ceiling only bounds a genuine
-// hang. Post-replan convergence measures ~1s (registry row) to ~10s (event
-// log behind a holder-transition graph sync) under tenfold contention, but a
-// loaded CI runner can stall consecutive peer syncs for the full 30s peer-sync
-// timeout each, so the backstop is 2-3x that timeout, not the expected latency.
-const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 
 struct TestNode {
     _temp_dir: TempDir,
@@ -423,22 +419,12 @@ async fn publish_before_drain() -> Result<(), Box<dyn std::error::Error>> {
 // push that loses a race under load is retried instead of stranding the record;
 // an undeliverable record is retained forever and trips the deadline.
 async fn drain_until_empty(node: &TestNode) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
+    wait_for_convergence("outbox never drained", || async {
         drive_document_sync_outbox_drain(node.context.clone()).await;
         let remaining = read_outbox_records(&node.context.storage_handle, &[], None, 16).await?;
-        if remaining.records.is_empty() {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "outbox never drained: {} records remain",
-                remaining.records.len()
-            )
-            .into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+        Ok(remaining.records.len())
+    })
+    .await
 }
 
 // Creates a document on the hand-driven origin (index 0), replicates the create
@@ -1390,20 +1376,21 @@ async fn wait_for_event_log_value(
     document_id: Ulid,
     event_id: Ulid,
 ) -> Result<aruna_core::types::Value, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
-        if let Some(value) = read_metadata_event_log_value(node, document_id, event_id).await? {
-            return Ok(value);
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "node={} never persisted metadata event {event_id} of document {document_id}",
-                node.net.node_id()
-            )
-            .into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+    let context = format!(
+        "node={} never persisted metadata event {event_id} of document {document_id}",
+        node.net.node_id()
+    );
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(&context, || async {
+        Ok(usize::from(
+            read_metadata_event_log_value(node, document_id, event_id)
+                .await?
+                .is_none(),
+        ))
+    })
+    .await?;
+    read_metadata_event_log_value(node, document_id, event_id)
+        .await?
+        .ok_or_else(|| context.into())
 }
 
 async fn wait_for_persisted_update(
@@ -1412,23 +1399,25 @@ async fn wait_for_persisted_update(
     document_id: Ulid,
     expected_event_id: Ulid,
 ) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
-        let last = match read_persisted_holder_set(node, group_id, document_id).await? {
-            Some((registry, _)) if registry.last_event_id == expected_event_id => {
-                return Ok(registry);
-            }
-            Some((registry, _)) => format!("last_event_id={}", registry.last_event_id),
-            None => "missing".to_string(),
-        };
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "replacement did not converge to update {expected_event_id}: {last}"
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        &format!("replacement did not converge to update {expected_event_id}"),
+        || async {
+            Ok(
+                match read_persisted_holder_set(node, group_id, document_id).await? {
+                    Some((registry, _)) if registry.last_event_id == expected_event_id => 0,
+                    _ => 1,
+                },
             )
-            .into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+        },
+    )
+    .await?;
+    let (registry, _) = read_persisted_holder_set(node, group_id, document_id)
+        .await?
+        .filter(|(registry, _)| registry.last_event_id == expected_event_id)
+        .ok_or_else(|| -> Box<dyn std::error::Error> {
+            format!("replacement did not converge to update {expected_event_id}").into()
+        })?;
+    Ok(registry)
 }
 
 async fn wait_for_persisted_holder_set(
@@ -1438,47 +1427,26 @@ async fn wait_for_persisted_holder_set(
     document_id: Ulid,
     expected_holders: &[aruna_core::NodeId],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    let mut last = Vec::new();
-    loop {
-        let mut converged = true;
-        last.clear();
-        for node_id in node_ids {
-            let node = nodes
-                .iter()
-                .find(|node| node.net.node_id() == *node_id)
-                .ok_or("holder fixture node missing")?;
-            match read_persisted_holder_set(node, group_id, document_id).await? {
-                Some((registry, holders))
-                    if same_holder_set(&registry.holder_node_ids, expected_holders)
-                        && same_holder_set(&holders, expected_holders) =>
-                {
-                    last.push(format!("{node_id}=converged"));
-                }
-                Some((registry, holders)) => {
-                    last.push(format!(
-                        "{node_id}=registry:{:?},holders:{holders:?}",
-                        registry.holder_node_ids
-                    ));
-                    converged = false;
-                }
-                None => {
-                    last.push(format!("{node_id}=missing"));
-                    converged = false;
+    wait_for_convergence(
+        &format!("metadata holder indexes did not converge to {expected_holders:?}"),
+        || async {
+            let mut pending = 0;
+            for node_id in node_ids {
+                let node = nodes
+                    .iter()
+                    .find(|node| node.net.node_id() == *node_id)
+                    .ok_or("holder fixture node missing")?;
+                match read_persisted_holder_set(node, group_id, document_id).await? {
+                    Some((registry, holders))
+                        if same_holder_set(&registry.holder_node_ids, expected_holders)
+                            && same_holder_set(&holders, expected_holders) => {}
+                    _ => pending += 1,
                 }
             }
-        }
-        if converged {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "metadata holder indexes did not converge to {expected_holders:?}: {last:?}"
-            )
-            .into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+            Ok(pending)
+        },
+    )
+    .await
 }
 
 fn same_holder_set(left: &[aruna_core::NodeId], right: &[aruna_core::NodeId]) -> bool {
@@ -1492,10 +1460,8 @@ async fn wait_for_realm_node_convergence(
     realm_id: &RealmId,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let expected: HashSet<_> = nodes.iter().map(|node| node.net.node_id()).collect();
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-
-    loop {
-        let mut converged = true;
+    wait_for_convergence("realm nodes did not converge", || async {
+        let mut pending = 0;
         for node in nodes {
             match drive(
                 GetRealmNodesOperation::new(*realm_id),
@@ -1504,21 +1470,12 @@ async fn wait_for_realm_node_convergence(
             .await
             {
                 Ok(realm_nodes) if realm_nodes == expected => {}
-                _ => {
-                    converged = false;
-                    break;
-                }
+                _ => pending += 1,
             }
         }
-
-        if converged {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("realm nodes did not converge".into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+        Ok(pending)
+    })
+    .await
 }
 
 async fn wait_for_metadata_convergence(
@@ -1546,21 +1503,13 @@ async fn wait_for_metadata_state(
     expected_holder_count: usize,
     expected_text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
     let expected_holders = nodes
         .iter()
         .map(|node| node.net.node_id())
         .collect::<HashSet<_>>();
-    let mut last_states = Vec::new();
-
-    loop {
-        let mut converged = true;
-        last_states.clear();
-
+    wait_for_convergence("metadata state did not converge", || async {
+        let mut pending = 0;
         for node in nodes {
-            if !converged {
-                break;
-            }
             match drive(
                 GetMetadataDocumentOperation::new(group_id, document_id),
                 node.context.as_ref(),
@@ -1577,56 +1526,13 @@ async fn wait_for_metadata_state(
                             .copied()
                             .collect::<HashSet<_>>()
                             == expected_holders
-                        && document.jsonld.contains(expected_text) =>
-                {
-                    last_states.push(format!("node={} converged", node.net.node_id()));
-                }
-                Ok(document) => {
-                    last_states.push(format!(
-                        "node={} graph={} holders={} jsonld_contains={}",
-                        node.net.node_id(),
-                        document.record.graph_iri,
-                        document.record.holder_node_ids.len(),
-                        document.jsonld.contains(expected_text)
-                    ));
-                    converged = false;
-                    break;
-                }
-                Err(error) => {
-                    let graph_state = match node
-                        .context
-                        .metadata_handle
-                        .as_ref()
-                        .unwrap()
-                        .send_effect(Effect::Metadata(MetadataEffect::ExportRoCrate {
-                            graph_iri: graph_iri.to_string(),
-                        }))
-                        .await
-                    {
-                        Event::Metadata(MetadataEvent::RoCrateExportResult { .. }) => {
-                            "graph-present"
-                        }
-                        Event::Metadata(MetadataEvent::Error { .. }) => "graph-missing",
-                        _ => "graph-unknown",
-                    };
-                    last_states.push(format!(
-                        "node={} error={error:?} {graph_state}",
-                        node.net.node_id()
-                    ));
-                    converged = false;
-                    break;
-                }
+                        && document.jsonld.contains(expected_text) => {}
+                _ => pending += 1,
             }
         }
-
-        if converged {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(format!("metadata state did not converge: {last_states:?}").into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+        Ok(pending)
+    })
+    .await
 }
 
 async fn wait_for_metadata_absence(
@@ -1635,66 +1541,33 @@ async fn wait_for_metadata_absence(
     document_id: Ulid,
     graph_iri: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    let mut last_states = Vec::new();
-
-    loop {
-        let mut converged = true;
-        last_states.clear();
-
+    wait_for_convergence("metadata deletion did not converge", || async {
+        let mut pending = 0;
         for node in nodes {
-            if !converged {
-                break;
-            }
-            match drive(
+            let document_absent = drive(
                 GetMetadataDocumentOperation::new(group_id, document_id),
                 node.context.as_ref(),
             )
             .await
-            {
-                Err(error) => {
-                    let graph_state = match node
-                        .context
-                        .metadata_handle
-                        .as_ref()
-                        .unwrap()
-                        .send_effect(Effect::Metadata(MetadataEffect::ExportRoCrate {
-                            graph_iri: graph_iri.to_string(),
-                        }))
-                        .await
-                    {
-                        Event::Metadata(MetadataEvent::Error { .. }) => "graph-missing",
-                        _ => "graph-present",
-                    };
-                    if graph_state != "graph-missing" {
-                        last_states.push(format!(
-                            "node={} error={error:?} graph still present",
-                            node.net.node_id()
-                        ));
-                        converged = false;
-                        break;
-                    }
-                    last_states.push(format!("node={} absent", node.net.node_id()));
-                }
-                Ok(_) => {
-                    last_states.push(format!(
-                        "node={} document still present",
-                        node.net.node_id()
-                    ));
-                    converged = false;
-                    break;
-                }
+            .is_err();
+            let graph_absent = matches!(
+                node.context
+                    .metadata_handle
+                    .as_ref()
+                    .unwrap()
+                    .send_effect(Effect::Metadata(MetadataEffect::ExportRoCrate {
+                        graph_iri: graph_iri.to_string(),
+                    }))
+                    .await,
+                Event::Metadata(MetadataEvent::Error { .. })
+            );
+            if !(document_absent && graph_absent) {
+                pending += 1;
             }
         }
-
-        if converged {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(format!("metadata deletion did not converge: {last_states:?}").into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+        Ok(pending)
+    })
+    .await
 }
 
 async fn wait_for_batched_metadata_projection(
@@ -1702,58 +1575,33 @@ async fn wait_for_batched_metadata_projection(
     group_id: Ulid,
     events: &[MetadataCreateEventRecord],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    let mut last_states = Vec::new();
-
-    loop {
-        let mut converged = true;
-        last_states.clear();
-
-        for event in events {
-            let document_id = event.record.document_id;
-            let expected_name = match &event.payload {
-                MetadataCreateEventPayload::Scaffold { name, .. } => name.as_str(),
-                _ => "",
-            };
-            match drive(
-                GetMetadataDocumentOperation::new(group_id, document_id),
-                node.context.as_ref(),
-            )
-            .await
-            {
-                Ok(document)
-                    if document.record.graph_iri == event.record.graph_iri
-                        && document.record.holder_node_ids == vec![node.net.node_id()]
-                        && document.jsonld.contains(expected_name) => {}
-                Ok(document) => {
-                    last_states.push(format!(
-                        "document={} holders={} jsonld_contains={}",
-                        document_id,
-                        document.record.holder_node_ids.len(),
-                        document.jsonld.contains(expected_name)
-                    ));
-                    converged = false;
-                    break;
-                }
-                Err(error) => {
-                    last_states.push(format!("document={document_id} error={error:?}"));
-                    converged = false;
-                    break;
+    wait_for_convergence(
+        "batched metadata projection did not materialize",
+        || async {
+            let mut pending = 0;
+            for event in events {
+                let document_id = event.record.document_id;
+                let expected_name = match &event.payload {
+                    MetadataCreateEventPayload::Scaffold { name, .. } => name.as_str(),
+                    _ => "",
+                };
+                match drive(
+                    GetMetadataDocumentOperation::new(group_id, document_id),
+                    node.context.as_ref(),
+                )
+                .await
+                {
+                    Ok(document)
+                        if document.record.graph_iri == event.record.graph_iri
+                            && document.record.holder_node_ids == vec![node.net.node_id()]
+                            && document.jsonld.contains(expected_name) => {}
+                    _ => pending += 1,
                 }
             }
-        }
-
-        if converged {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "batched metadata projection did not materialize: {last_states:?}"
-            )
-            .into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+            Ok(pending)
+        },
+    )
+    .await
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {

@@ -1,7 +1,6 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
 use std::sync::Arc;
-use std::time::Duration;
 
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -27,13 +26,10 @@ use aruna_operations::usage_stats::{RealmUsageScope, load_realm_usage, publish_u
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
-use tokio::time::{Instant, sleep};
 use ulid::Ulid;
 
-const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
-// Comfortably above the durable re-arm interval (5s) plus the publish debounce
-// (2s) so the steady-state publish is observed without flaking.
-const STEADY_STATE_TIMEOUT: Duration = Duration::from_secs(30);
+mod convergence;
+use convergence::wait_for_convergence;
 
 struct TestNode {
     _temp_dir: TempDir,
@@ -83,36 +79,32 @@ async fn node_usage_snapshot_reaches_peer_realm_aggregate() -> Result<(), Box<dy
     // Node B receives A's snapshots over the sync layer and folds them into the
     // realm aggregate (global and per-group).
     let a_snapshot_key = node_usage_global_key(node_a.net.node_id());
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
-        let received = read_node_stats(node_b, a_snapshot_key.clone())
-            .await
-            .is_some();
-        let global = load_realm_usage(
-            node_b.context.as_ref(),
-            node_b.net.node_id(),
-            RealmUsageScope::Global,
-        )
-        .await
-        .unwrap_or_default();
-        let group = load_realm_usage(
-            node_b.context.as_ref(),
-            node_b.net.node_id(),
-            RealmUsageScope::Group(group_id),
-        )
-        .await
-        .unwrap_or_default();
-        if received && global.buckets == 1 && group.buckets == 1 {
-            break;
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "node B never observed A's usage snapshot; received={received} global={global:?} group={group:?}"
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "node B never observed A's usage snapshot",
+        || async {
+            let received = read_node_stats(node_b, a_snapshot_key.clone())
+                .await
+                .is_some();
+            let global = load_realm_usage(
+                node_b.context.as_ref(),
+                node_b.net.node_id(),
+                RealmUsageScope::Global,
             )
-            .into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+            .await
+            .unwrap_or_default();
+            let group = load_realm_usage(
+                node_b.context.as_ref(),
+                node_b.net.node_id(),
+                RealmUsageScope::Group(group_id),
+            )
+            .await
+            .unwrap_or_default();
+            Ok(usize::from(
+                !(received && global.buckets == 1 && group.buckets == 1),
+            ))
+        },
+    )
+    .await?;
 
     // Realm aggregate on B includes A's bucket even though B created nothing.
     let realm_global = load_realm_usage(
@@ -178,36 +170,32 @@ async fn rich_node_usage_snapshot_ingest_is_counter_neutral()
     .await?;
 
     let a_snapshot_key = node_usage_global_key(node_a.net.node_id());
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
-        let received = read_node_stats(node_b, a_snapshot_key.clone())
-            .await
-            .is_some();
-        let global = load_realm_usage(
-            node_b.context.as_ref(),
-            node_b.net.node_id(),
-            RealmUsageScope::Global,
-        )
-        .await
-        .unwrap_or_default();
-        let group = load_realm_usage(
-            node_b.context.as_ref(),
-            node_b.net.node_id(),
-            RealmUsageScope::Group(group_id),
-        )
-        .await
-        .unwrap_or_default();
-        if received && global.objects == rich.objects && group.objects == rich.objects {
-            break;
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "node B never observed A's rich usage snapshot; received={received} global={global:?} group={group:?}"
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "node B never observed A's rich usage snapshot",
+        || async {
+            let received = read_node_stats(node_b, a_snapshot_key.clone())
+                .await
+                .is_some();
+            let global = load_realm_usage(
+                node_b.context.as_ref(),
+                node_b.net.node_id(),
+                RealmUsageScope::Global,
             )
-            .into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+            .await
+            .unwrap_or_default();
+            let group = load_realm_usage(
+                node_b.context.as_ref(),
+                node_b.net.node_id(),
+                RealmUsageScope::Group(group_id),
+            )
+            .await
+            .unwrap_or_default();
+            Ok(usize::from(
+                !(received && global.objects == rich.objects && group.objects == rich.objects),
+            ))
+        },
+    )
+    .await?;
 
     // Every field of A's snapshot surfaces in B's realm aggregate.
     let realm_global = load_realm_usage(
@@ -276,23 +264,17 @@ async fn steady_state_write_publishes_snapshot_without_restart()
     .unwrap();
 
     let snapshot_key = node_usage_global_key(node.net.node_id());
-    let deadline = Instant::now() + STEADY_STATE_TIMEOUT;
-    loop {
-        let published = read_node_stats(node, snapshot_key.clone()).await.is_some();
-        let dirty_cleared = read_node_stats(node, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec())
-            .await
-            .is_none();
-        if published && dirty_cleared {
-            break;
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "steady-state write never published a snapshot; published={published} dirty_cleared={dirty_cleared}"
-            )
-            .into());
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "steady-state write never published a snapshot",
+        || async {
+            let published = read_node_stats(node, snapshot_key.clone()).await.is_some();
+            let dirty_cleared = read_node_stats(node, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec())
+                .await
+                .is_none();
+            Ok(usize::from(!(published && dirty_cleared)))
+        },
+    )
+    .await?;
 
     shutdown_nodes(nodes).await;
     Ok(())
@@ -357,19 +339,17 @@ async fn bootstrap_node_usage_genesis(
     )
     .await?;
 
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
-        if read_node_stats(subscriber, snapshot_key.clone())
-            .await
-            .is_some()
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("bootstrap node-usage genesis did not reach peer".into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+    wait_for_convergence(
+        "bootstrap node-usage genesis did not reach peer",
+        || async {
+            Ok(usize::from(
+                read_node_stats(subscriber, snapshot_key.clone())
+                    .await
+                    .is_none(),
+            ))
+        },
+    )
+    .await
 }
 async fn read_node_stats(node: &TestNode, key: Vec<u8>) -> Option<Vec<u8>> {
     match node

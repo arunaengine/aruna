@@ -1,7 +1,6 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
 use std::sync::Arc;
-use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
@@ -25,10 +24,10 @@ use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
-use tokio::time::{Instant, sleep};
 use ulid::Ulid;
 
-const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
+mod convergence;
+use convergence::wait_for_convergence;
 
 struct TestNode {
     _temp_dir: TempDir,
@@ -283,12 +282,8 @@ async fn wait_for_group_convergence(
     expected_group: &Group,
     expected_auth: &GroupAuthorizationDocument,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    let mut last_states = Vec::new();
-
-    loop {
-        let mut converged = true;
-        last_states.clear();
+    wait_for_convergence("group state did not converge", || async {
+        let mut pending = 0;
         for node in nodes {
             match drive(
                 GetGroupOperation::new(GetGroupConfig { group_id }),
@@ -296,37 +291,13 @@ async fn wait_for_group_convergence(
             )
             .await
             {
-                Ok((group, auth)) if group == *expected_group && auth == *expected_auth => {
-                    last_states.push(format!("node={} converged", node.net.node_id()));
-                }
-                Ok((group, auth)) => {
-                    last_states.push(format!(
-                        "node={} group={group:?} auth={auth:?}",
-                        node.net.node_id()
-                    ));
-                    converged = false;
-                    break;
-                }
-                Err(error) => {
-                    last_states.push(format!("node={} error={error:?}", node.net.node_id()));
-                    converged = false;
-                    break;
-                }
+                Ok((group, auth)) if group == *expected_group && auth == *expected_auth => {}
+                _ => pending += 1,
             }
         }
-
-        if converged {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "group state did not converge; expected_group={expected_group:?}; expected_auth={expected_auth:?}; last_states={last_states:?}"
-            )
-            .into());
-        }
-
-        sleep(Duration::from_millis(50)).await;
-    }
+        Ok(pending)
+    })
+    .await
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {

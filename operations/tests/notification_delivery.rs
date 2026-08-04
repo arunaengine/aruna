@@ -30,11 +30,12 @@ use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
-use tokio::time::{Instant, sleep};
+use tokio::time::sleep;
 use ulid::Ulid;
 
-const POLL_TIMEOUT: Duration = Duration::from_secs(60);
-const RESPAWN_POLL_TIMEOUT: Duration = Duration::from_secs(120);
+mod convergence;
+use convergence::wait_for_convergence;
+
 const LIST_LIMIT: u32 = LIST_NOTIFICATIONS_MAX_LIMIT as u32;
 
 struct TestNode {
@@ -55,7 +56,7 @@ async fn notification_emitted_on_a_is_visible_via_b() -> Result<(), Box<dyn std:
 
     emit_on(&nodes[0], vec![record]).await?;
 
-    wait_for(POLL_TIMEOUT, || {
+    wait_for(|| {
         let nodes = &nodes;
         async move {
             list_via(&nodes[1], recipient)
@@ -111,7 +112,7 @@ async fn delivery_retries_through_holder_outage() -> Result<(), Box<dyn std::err
     mesh_nodes(&nodes).await;
     install_realm_config(&nodes, realm_id).await?;
 
-    wait_for(RESPAWN_POLL_TIMEOUT, || {
+    wait_for(|| {
         let nodes = &nodes;
         async move {
             let delivered = list_via(&nodes[2], recipient)
@@ -138,7 +139,7 @@ async fn duplicate_delivery_is_idempotent_across_nodes() -> Result<(), Box<dyn s
     let target = record.notification_id;
 
     emit_on(&nodes[0], vec![record.clone()]).await?;
-    wait_for(POLL_TIMEOUT, || {
+    wait_for(|| {
         let nodes = &nodes;
         async move {
             list_via(&nodes[2], recipient)
@@ -153,7 +154,7 @@ async fn duplicate_delivery_is_idempotent_across_nodes() -> Result<(), Box<dyn s
     assert_eq!(marked, 1);
 
     emit_on(&nodes[0], vec![record]).await?;
-    wait_for(POLL_TIMEOUT, || {
+    wait_for(|| {
         let nodes = &nodes;
         async move { outbox_records(&nodes[0]).await.is_empty() }
     })
@@ -193,7 +194,7 @@ async fn unread_and_mark_read_across_nodes() -> Result<(), Box<dyn std::error::E
     let ids: Vec<Ulid> = vec![records[0].notification_id, records[1].notification_id];
 
     emit_on(&nodes[0], records).await?;
-    wait_for(POLL_TIMEOUT, || {
+    wait_for(|| {
         let nodes = &nodes;
         async move { list_via(&nodes[1], recipient).await.len() >= 3 }
     })
@@ -258,7 +259,7 @@ async fn dispatch_proxies_inbox_ops_from_non_holder() -> Result<(), Box<dyn std:
     let ids: Vec<Ulid> = vec![records[0].notification_id, records[1].notification_id];
 
     emit_on(&nodes[0], records).await?;
-    wait_for(POLL_TIMEOUT, || {
+    wait_for(|| {
         let reader_ctx = reader_ctx.clone();
         async move {
             list_notifications_for_user(
@@ -323,23 +324,26 @@ async fn wait_for_dispatch_error(
     local_node_id: NodeId,
     recipient: UserId,
 ) -> NotificationDispatchError {
-    let deadline = Instant::now() + POLL_TIMEOUT;
-    loop {
-        match list_notifications_for_user(
-            context,
-            local_node_id,
-            recipient,
-            None,
-            LIST_LIMIT as usize,
-        )
+    wait_for_convergence("holder never became unreachable", || async {
+        Ok::<usize, Box<dyn std::error::Error>>(usize::from(
+            list_notifications_for_user(
+                context,
+                local_node_id,
+                recipient,
+                None,
+                LIST_LIMIT as usize,
+            )
+            .await
+            .is_ok(),
+        ))
+    })
+    .await
+    .expect("holder never became unreachable");
+    match list_notifications_for_user(context, local_node_id, recipient, None, LIST_LIMIT as usize)
         .await
-        {
-            Err(error) => return error,
-            Ok(_) => {
-                assert!(Instant::now() < deadline, "holder never became unreachable");
-                sleep(Duration::from_millis(100)).await;
-            }
-        }
+    {
+        Err(error) => error,
+        Ok(_) => panic!("holder never became unreachable"),
     }
 }
 
@@ -580,24 +584,15 @@ async fn install_realm_config(
     Ok(())
 }
 
-async fn wait_for<F, Fut>(
-    timeout: Duration,
-    mut condition: F,
-) -> Result<(), Box<dyn std::error::Error>>
+async fn wait_for<F, Fut>(condition: F) -> Result<(), Box<dyn std::error::Error>>
 where
-    F: FnMut() -> Fut,
+    F: Fn() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if condition().await {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("condition not met before deadline".into());
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
+    wait_for_convergence("condition not met before deadline", || async {
+        Ok(usize::from(!condition().await))
+    })
+    .await
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {
