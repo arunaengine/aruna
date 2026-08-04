@@ -6776,7 +6776,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replicated_revocation_rejects_token() {
+    async fn replicated_revocation_rejects() {
         // A revocation that arrived only through the replicated realm config,
         // with an empty node-local list, must still deny the token here.
         let (realm_signing_key, realm_id, user_id) = realm_fixture();

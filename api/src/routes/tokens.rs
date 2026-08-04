@@ -196,7 +196,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revocation_reaches_realm_config() {
+    async fn revocation_reaches_config() {
         // The route must record the revocation in the replicated realm config,
         // which is what carries it to the other nodes of the realm.
         let (state, realm_id, user_id, token) = state_with_token().await;
@@ -220,7 +220,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replicated_revocation_rejects_token() {
+    async fn replicated_revocation_rejects() {
         // A revocation that only arrived through the replicated realm config,
         // with an empty node-local list, must still deny the token here and
         // after a restart that rebuilds the in-memory state.

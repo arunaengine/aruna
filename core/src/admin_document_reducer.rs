@@ -571,7 +571,7 @@ impl AdminDocumentReducerState {
                 }
                 self.apply_immutable_value(
                     event,
-                    realm_config_revoked_token_path(token_hash),
+                    revoked_token_path(token_hash),
                     token_hash.clone(),
                 );
             }
@@ -1704,7 +1704,7 @@ fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
             vec![band_pool_path(pool.pool_id)]
         }
         AdminDocumentOperation::RealmConfigTokenRevoked { token_hash } => {
-            vec![realm_config_revoked_token_path(token_hash)]
+            vec![revoked_token_path(token_hash)]
         }
     }
 }
@@ -1776,7 +1776,7 @@ pub fn band_pool_path(pool_id: Ulid) -> String {
     format!("realm_config.placement.band_pools.{pool_id}")
 }
 
-pub fn realm_config_revoked_token_path(token_hash: &str) -> String {
+pub fn revoked_token_path(token_hash: &str) -> String {
     format!("{REALM_CONFIG_REVOKED_TOKENS_PATH}.{token_hash}")
 }
 
@@ -5484,7 +5484,7 @@ mod tests {
     }
 
     #[test]
-    fn revocation_survives_stale_origin() {
+    fn stale_revocation_applies() {
         // A revocation from a lagging origin sequence must still deny the token.
         let mut state = realm_config_state();
         let mut ahead = revoke_token(1, 1, "ahead");

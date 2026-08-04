@@ -65,7 +65,7 @@ impl ArunaBearerTokenValidationState for PeerAuthState {
 }
 
 #[tokio::test]
-async fn revocation_denies_token_on_peer() -> TestResult<()> {
+async fn peer_denies_token() -> TestResult<()> {
     // A token revoked on node A must be rejected on node B once the realm
     // config converges, without B ever seeing the raw token.
     let signing_key = generate_signing_key();
@@ -259,7 +259,7 @@ async fn install_realm_config(nodes: &[TestNode], realm_id: RealmId) -> TestResu
         }
         node.net.refresh_realm_peers_from_document(&config).await?;
     }
-    seed_config_sync_topic(nodes, realm_id, &config).await?;
+    seed_sync_topic(nodes, realm_id, &config).await?;
     for node in nodes {
         aruna_operations::process_placements::process_shard_placements(
             &node.context,
@@ -273,7 +273,7 @@ async fn install_realm_config(nodes: &[TestNode], realm_id: RealmId) -> TestResu
 
 /// Creates the realm config sync topic on both nodes, as the production realm
 /// config apply path does, so a later admin event has a topic to ride.
-async fn seed_config_sync_topic(
+async fn seed_sync_topic(
     nodes: &[TestNode],
     realm_id: RealmId,
     config: &RealmConfigDocument,

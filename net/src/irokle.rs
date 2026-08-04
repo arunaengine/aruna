@@ -7944,7 +7944,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revocations_replicate_and_apply() {
+    async fn replicated_revocation_applies() {
         // A revocation replicated from another node must pass the realm-config
         // storage-apply whitelist and deny the token on this node.
         let (_dir, storage) = test_storage();
