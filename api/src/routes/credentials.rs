@@ -291,24 +291,27 @@ pub async fn create_s3_credentials(
     }
     let expiry = credential_expiry(SystemTime::now(), request.expires_in_seconds)?;
     let result = drive(
-        CreateUserAccessOperation::new(CreateUserAccessConfig {
-            user_identity,
-            group_id,
-            expiry,
-            path_restrictions,
-            issued_by: *node_id.as_bytes(),
-        }),
+        CreateUserAccessOperation::new(
+            CreateUserAccessConfig {
+                user_identity,
+                group_id,
+                expiry,
+                path_restrictions,
+                issued_by: *node_id.as_bytes(),
+            },
+            state.credential_seal_key().clone(),
+        ),
         &state.get_ctx(),
     )
     .await
     .map_err(|err| ServerError::InternalError(err.to_string()))?;
 
     match result {
-        Ok((access_key_id, access_secret)) => Ok((
+        Ok((access_key_id, access_secret, _)) => Ok((
             StatusCode::CREATED,
             Json(CreateS3CredentialsResponse {
                 access_key_id,
-                access_secret: access_secret.secret,
+                access_secret: access_secret.expose().to_string(),
             }),
         )),
         Err(err) => Err(ServerError::InternalError(err.to_string())),

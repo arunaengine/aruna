@@ -828,6 +828,14 @@ impl NetHandle {
         self.inner.endpoint.secret_key().sign(message)
     }
 
+    /// Issuer-local key that seals S3 credential secrets at rest. Derived from
+    /// this node's long-term secret, so only this node can unseal what it sealed.
+    pub fn credential_seal_key(&self) -> aruna_core::credential_seal::CredentialSealKey {
+        aruna_core::credential_seal::CredentialSealKey::derive(
+            &self.inner.endpoint.secret_key().to_bytes(),
+        )
+    }
+
     pub fn realm_id(&self) -> &RealmId {
         &self.inner.realm_id
     }

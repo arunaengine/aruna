@@ -6,6 +6,7 @@ pub mod alpn;
 pub mod audit;
 pub mod auth;
 pub mod compute;
+pub mod credential_seal;
 pub mod document;
 pub mod effects;
 pub mod egress;

@@ -8,6 +8,7 @@ use crate::cors::CorsConfig;
 use crate::error::S3ServerError;
 use crate::telemetry::{emit_request_completed, make_request_span};
 use aruna_core::NodeId;
+use aruna_core::credential_seal::CredentialSealKey;
 use aruna_core::metrics::{NodeMetrics, RequestLabels, RouteLabels, method_label};
 use aruna_core::structs::{BucketCorsConfiguration, RealmId, RoCrateLimits};
 use aruna_operations::driver::{DriverContext, drive};
@@ -148,6 +149,7 @@ pub struct S3Server {
     driver_ctx: Arc<DriverContext>,
     metrics: Arc<NodeMetrics>,
     rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
+    seal_key: CredentialSealKey,
     connection_limit: Arc<Semaphore>,
     request_limit: Arc<Semaphore>,
 }
@@ -199,6 +201,14 @@ impl S3Server {
             .with_rocrate_limits(rocrate_limits);
         let hostname = hostname.into();
 
+        // Issuer-local sealing key: the node's own secret unseals only what it
+        // sealed. A node without a net handle can never issue usable credentials.
+        let seal_key = driver_ctx
+            .net_handle
+            .as_ref()
+            .map(|net| net.credential_seal_key())
+            .unwrap_or_else(CredentialSealKey::random);
+
         let rate_limits = Arc::new(crate::rate_limit::ApiRateLimits::default());
         let service = build_s3_service(
             &aruna_service,
@@ -207,6 +217,7 @@ impl S3Server {
                 driver_ctx: driver_ctx.clone(),
                 realm_id,
                 node_id,
+                seal_key: seal_key.clone(),
                 rate_limits: rate_limits.clone(),
             },
         )?;
@@ -222,6 +233,7 @@ impl S3Server {
             driver_ctx,
             metrics,
             rate_limits,
+            seal_key,
             connection_limit: Arc::new(Semaphore::new(DEFAULT_S3_MAX_CONNECTIONS)),
             request_limit: Arc::new(Semaphore::new(DEFAULT_S3_MAX_CONCURRENT_REQUESTS)),
         })
@@ -250,6 +262,7 @@ impl S3Server {
                 driver_ctx: self.driver_ctx.clone(),
                 realm_id: self.realm_id,
                 node_id: self.node_id,
+                seal_key: self.seal_key.clone(),
                 rate_limits: rate_limits.clone(),
             },
         )?;

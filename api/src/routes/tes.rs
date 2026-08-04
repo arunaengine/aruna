@@ -1298,8 +1298,13 @@ async fn authenticate_tes(
         | Err(GetUserAccessError::NotFound) => return Err(TesError::unauthorized()),
         Ok(Some(Err(error))) | Err(error) => return Err(TesError::internal(error.to_string())),
     };
-    let secret_matches =
-        blake3::hash(provided_secret.as_slice()) == blake3::hash(access.secret.as_bytes());
+    // The secret seals with this node's issuer-local key, so it opens only for a
+    // credential this node issued; a foreign or tampered record never matches.
+    let secret_matches = access
+        .open_secret(state.credential_seal_key())
+        .is_ok_and(|plaintext| {
+            blake3::hash(provided_secret.as_slice()) == blake3::hash(plaintext.as_bytes())
+        });
     if access.access_key != access_key
         || access.user_identity.realm_id != state.get_realm_id()
         || access.issued_by != *state.get_node_id().as_bytes()
@@ -1543,18 +1548,30 @@ mod tests {
         })
     }
 
+    const TES_SECRET: &str = "tes-secret";
+
     fn credential(group_id: Ulid) -> UserAccess {
         let user_identity = user(2);
         UserAccess {
             access_key: UserAccess::build_access_key("tes").unwrap(),
             user_identity,
             group_id,
-            secret: "tes-secret".to_string(),
+            secret: aruna_core::credential_seal::SealedS3Secret::empty(),
             expiry: SystemTime::now() + Duration::from_secs(60),
             path_restrictions: None,
             issued_by: *node_id().as_bytes(),
             revoked_at: None,
         }
+    }
+
+    /// A credential whose secret is sealed with the node's issuer-local key, as
+    /// the create-credential path would have produced.
+    fn sealed(state: &ServerState, group_id: Ulid) -> UserAccess {
+        let mut access = credential(group_id);
+        access
+            .seal_secret(state.credential_seal_key(), TES_SECRET)
+            .unwrap();
+        access
     }
 
     fn basic_headers(access: &UserAccess, secret: &str) -> HeaderMap {
@@ -2272,7 +2289,7 @@ mod tests {
     async fn rejects_basic() {
         let (_dir, state) = build_state(false).await;
         let group = Ulid::from_bytes([5u8; 16]);
-        let access = credential(group);
+        let access = sealed(&state, group);
         let mut revoked = access.clone();
         revoked.revoked_at = Some(SystemTime::now());
         let mut expired = access.clone();
@@ -2297,17 +2314,13 @@ mod tests {
     #[tokio::test]
     async fn rejects_restricted_basic() {
         let (_dir, state) = build_state(false).await;
-        let mut access = credential(Ulid::from_bytes([5u8; 16]));
+        let mut access = sealed(&state, Ulid::from_bytes([5u8; 16]));
         access.path_restrictions = Some(Vec::new());
         write_credential(&state, &access).await;
 
-        let error = authenticate_tes(
-            &state,
-            None,
-            &basic_headers(&access, access.secret.as_str()),
-        )
-        .await
-        .unwrap_err();
+        let error = authenticate_tes(&state, None, &basic_headers(&access, TES_SECRET))
+            .await
+            .unwrap_err();
         assert_eq!(error.status, StatusCode::FORBIDDEN);
     }
 
@@ -2315,7 +2328,7 @@ mod tests {
     async fn creates_tagless_basic() {
         let (_dir, state) = build_state(true).await;
         let group = Ulid::from_bytes([5u8; 16]);
-        let access = credential(group);
+        let access = sealed(&state, group);
         write_credential(&state, &access).await;
         write_auth(&state, group, access.user_identity).await;
         let mut task = sample_task(group);
@@ -2324,7 +2337,7 @@ mod tests {
         let response = create_task(
             State(state.clone()),
             Extension(None),
-            basic_headers(&access, access.secret.as_str()),
+            basic_headers(&access, TES_SECRET),
             Json(task),
         )
         .await;
@@ -2364,14 +2377,14 @@ mod tests {
         // Without S3 mounts, TES falls back to a kept workspace and snapshot inputs.
         let (_dir, state) = build_state(false).await;
         let group = Ulid::from_bytes([5u8; 16]);
-        let access = credential(group);
+        let access = sealed(&state, group);
         write_credential(&state, &access).await;
         write_auth(&state, group, access.user_identity).await;
 
         let response = create_task(
             State(state.clone()),
             Extension(None),
-            basic_headers(&access, access.secret.as_str()),
+            basic_headers(&access, TES_SECRET),
             Json(sample_task(group)),
         )
         .await;
@@ -2401,9 +2414,9 @@ mod tests {
         let owner = user(2);
         let group = Ulid::from_bytes([5u8; 16]);
         let sibling = Ulid::from_bytes([6u8; 16]);
-        let access = credential(group);
+        let access = sealed(&state, group);
         write_credential(&state, &access).await;
-        let headers = basic_headers(&access, access.secret.as_str());
+        let headers = basic_headers(&access, TES_SECRET);
         let caller = authenticate_tes(&state, None, &headers).await.unwrap();
         assert_eq!(caller.auth.user_id, owner);
         assert_eq!(caller.credential_group, Some(group));
@@ -2486,9 +2499,9 @@ mod tests {
         let (_dir, state) = build_state(false).await;
         let owner = user(2);
         let group = Ulid::from_bytes([5u8; 16]);
-        let access = credential(group);
+        let access = sealed(&state, group);
         write_credential(&state, &access).await;
-        let headers = basic_headers(&access, access.secret.as_str());
+        let headers = basic_headers(&access, TES_SECRET);
         let (spec, _) = map_task_to_spec(&sample_task(group), None, true).unwrap();
         insert_job(
             &state.get_ctx().storage_handle,

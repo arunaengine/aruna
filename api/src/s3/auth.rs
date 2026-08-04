@@ -1,5 +1,6 @@
 use super::s3_server::S3OpLabel;
 use super::util::{get_s3_operation_permission, is_anonymous_object_read_operation};
+use aruna_core::credential_seal::{CredentialSealKey, SealedS3Secret};
 use aruna_core::structs::{
     AuthContext, BucketInfo, Permission, RealmId, UserAccess, blob_bucket_permission_path,
     blob_group_permission_path, blob_object_permission_path,
@@ -46,6 +47,7 @@ pub struct AuthProvider {
     pub(crate) driver_ctx: Arc<DriverContext>,
     pub(crate) realm_id: RealmId,
     pub(crate) node_id: NodeId,
+    pub(crate) seal_key: CredentialSealKey,
     pub(crate) rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
 }
 
@@ -53,7 +55,22 @@ pub struct AuthProvider {
 impl S3Auth for AuthProvider {
     async fn get_secret_key(&self, access_key_id: &str) -> S3Result<SecretKey> {
         let user_access = self.query_user_access(access_key_id).await?;
-        Ok(SecretKey::from(user_access.secret))
+        // Secrets seal at rest with an issuer-local key, so only the issuing
+        // node can recover the plaintext s3s needs to verify a signature. A
+        // record copied to another node, or with a rebound field, never opens.
+        if user_access.issued_by != *self.node_id.as_bytes() {
+            return Err(s3_error!(
+                InvalidAccessKeyId,
+                "The Access Key Id you provided does not exist in our records."
+            ));
+        }
+        let secret = user_access.open_secret(&self.seal_key).map_err(|_| {
+            s3_error!(
+                InvalidAccessKeyId,
+                "The Access Key Id you provided does not exist in our records."
+            )
+        })?;
+        Ok(SecretKey::from(secret))
     }
 }
 
@@ -92,9 +109,9 @@ impl S3Access for AuthProvider {
         // Fetch user access -> GetUserAccess state machine
         let user_access = self.query_user_access(&access_key_id).await?;
 
-        // Credentials are issuer-local: the secret was verified by s3s against
-        // the issuing node's state. Here we only confirm that issuing node is
-        // configured in this realm before authorizing the request.
+        // Credentials are issuer-local and sealed at rest: s3s only had a secret
+        // to verify this signature because `get_secret_key` unsealed it on the
+        // issuing node. Confirm that node is still a member of this realm.
         if !self.issuer_in_realm(&user_access.issued_by).await? {
             return Err(s3_error!(
                 InvalidAccessKeyId,
@@ -247,7 +264,7 @@ impl AuthProvider {
             access_key: String::new(),
             user_identity: UserId::nil(self.realm_id),
             group_id,
-            secret: String::new(),
+            secret: SealedS3Secret::empty(),
             expiry: SystemTime::now(),
             path_restrictions: None,
             issued_by: *self.node_id.as_bytes(),
@@ -281,8 +298,9 @@ impl AuthProvider {
     }
 
     /// Whether `issued_by` is a node configured in this realm. Credentials are
-    /// replicated realm-wide, so the issuer only has to be a realm member rather
-    /// than the serving node.
+    /// issuer-local and sealed with an issuer-local key, so a verified signature
+    /// already proves this serving node issued them; this only confirms the
+    /// issuing node is still a realm member.
     async fn issuer_in_realm(&self, issued_by: &[u8; 32]) -> S3Result<bool> {
         let config = drive(
             GetRealmConfigOperation::new(self.realm_id),
@@ -391,8 +409,42 @@ mod tests {
             driver_ctx,
             realm_id: RealmId([1u8; 32]),
             node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+            seal_key: CredentialSealKey::derive(&[7u8; 32]),
             rate_limits: Arc::new(crate::rate_limit::ApiRateLimits::default()),
         }
+    }
+
+    async fn store_access(provider: &AuthProvider, access: &UserAccess) {
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
+        provider
+            .driver_ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: USER_ACCESS_KEYSPACE.to_string(),
+                key: access.access_key.as_bytes().into(),
+                value: access.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    fn sealed_access(provider: &AuthProvider, issued_by: [u8; 32]) -> UserAccess {
+        use ulid::Ulid;
+        let mut access = UserAccess {
+            access_key: UserAccess::build_access_key(&Ulid::generate().to_string()).unwrap(),
+            user_identity: UserId::local(Ulid::generate(), provider.realm_id),
+            group_id: Ulid::generate(),
+            secret: SealedS3Secret::empty(),
+            expiry: SystemTime::now() + std::time::Duration::from_secs(3600),
+            path_restrictions: None,
+            issued_by,
+            revoked_at: None,
+        };
+        access
+            .seal_secret(&CredentialSealKey::derive(&[7u8; 32]), "unsealed-secret")
+            .unwrap();
+        access
     }
 
     #[tokio::test]
@@ -402,6 +454,26 @@ mod tests {
         let provider = provider(dir.path().to_str().unwrap());
         let legacy = "01ARZ3NDEKTSV4RRFFQ69G5FAV@01ARZ3NDEKTSV4RRFFQ69G5FAW:workspace-01ARZ3";
         let error = provider.get_secret_key(legacy).await.unwrap_err();
+        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidAccessKeyId);
+    }
+
+    #[tokio::test]
+    async fn unseals_on_issuer() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider(dir.path().to_str().unwrap());
+
+        let local = sealed_access(&provider, *provider.node_id.as_bytes());
+        store_access(&provider, &local).await;
+        let secret = provider.get_secret_key(&local.access_key).await.unwrap();
+        assert_eq!(secret.expose(), "unsealed-secret");
+
+        // A record issued by another node (a copied DB) yields no usable secret.
+        let foreign = sealed_access(&provider, [9u8; 32]);
+        store_access(&provider, &foreign).await;
+        let error = provider
+            .get_secret_key(&foreign.access_key)
+            .await
+            .unwrap_err();
         assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidAccessKeyId);
     }
 }

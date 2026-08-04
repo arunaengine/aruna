@@ -221,6 +221,13 @@ async fn mint_credential(
     let access_key = UserAccess::build_access_key(&key_id).map_err(|error| {
         JobError::permanent(format!("workspace credential key failed: {error}"))
     })?;
+    // The credential is issued and consumed on this node, so its secret seals
+    // and unseals with this node's issuer-local key.
+    let seal_key = context
+        .net_handle
+        .as_ref()
+        .map(|net| net.credential_seal_key())
+        .ok_or_else(|| JobError::permanent("workspace credential needs a net handle"))?;
     match Box::pin(drive(
         GetUserAccessOperation::new(access_key.clone()),
         context,
@@ -237,9 +244,12 @@ async fn mint_credential(
                 return Err(JobError::permanent("workspace credential is invalid"));
             }
             if !access.is_expired(SystemTime::now()) {
+                let secret = access.open_secret(&seal_key).map_err(|error| {
+                    JobError::permanent(format!("workspace credential unseal failed: {error}"))
+                })?;
                 return Ok(WorkspaceCredential {
                     access_key: access.access_key,
-                    secret: access.secret,
+                    secret,
                 });
             }
             if record.attempt_intent.is_some() {
@@ -261,7 +271,7 @@ async fn mint_credential(
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_WALLTIME);
     let expiry = SystemTime::now() + walltime + CREDENTIAL_SLACK;
-    let (_, access) = Box::pin(drive(
+    let (_, secret, access) = Box::pin(drive(
         CreateUserAccessOperation::new_with_key(
             CreateUserAccessConfig {
                 user_identity: record.created_by,
@@ -271,6 +281,7 @@ async fn mint_credential(
                 issued_by: *node_id.as_bytes(),
             },
             key_id,
+            seal_key,
         ),
         context,
     ))
@@ -279,7 +290,7 @@ async fn mint_credential(
     .map_err(|error| JobError::retryable(format!("workspace credential mint failed: {error}")))?;
     Ok(WorkspaceCredential {
         access_key: access.access_key,
-        secret: access.secret,
+        secret: secret.expose().to_string(),
     })
 }
 
@@ -1209,9 +1220,21 @@ mod tests {
                 })
                 .await;
         }
+        let net = aruna_net::NetHandle::new(
+            aruna_net::NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                realm_id,
+                discovery_method: aruna_net::DiscoveryMethod::None,
+                relay_method: aruna_net::RelayMethod::None,
+                ..aruna_net::NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .unwrap();
         let context = DriverContext {
             storage_handle: storage,
-            net_handle: None,
+            net_handle: Some(net.clone()),
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
@@ -1260,6 +1283,7 @@ mod tests {
         assert!(permits(&bucket_path));
         assert!(permits(&format!("{bucket_path}/object")));
         assert!(!permits(&format!("{bucket_path}-sibling")));
+        net.shutdown().await;
     }
 
     #[test]

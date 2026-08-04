@@ -1,3 +1,4 @@
+use crate::credential_seal::{CredentialSealKey, SealError, SealedS3Secret, credential_aad};
 use crate::errors::{BlobError, ConversionError};
 use crate::structs::checksum::HASH_BLAKE3;
 use crate::structs::{
@@ -901,7 +902,9 @@ pub struct UserAccess {
     pub access_key: String,
     pub user_identity: UserId,
     pub group_id: Ulid,
-    pub secret: String,
+    /// Authenticated ciphertext of the S3 secret, sealed with an issuer-local
+    /// key and bound to this record's identity. The plaintext never rests here.
+    pub secret: SealedS3Secret,
     pub expiry: SystemTime,
     pub path_restrictions: Option<Vec<PathRestriction>>,
     pub issued_by: [u8; 32],
@@ -939,6 +942,32 @@ impl UserAccess {
 
     pub fn is_revoked(&self) -> bool {
         self.revoked_at.is_some()
+    }
+
+    /// AAD binding the sealed secret to this record's identity fields.
+    pub fn credential_aad(&self) -> Vec<u8> {
+        credential_aad(
+            &self.access_key,
+            self.user_identity,
+            self.group_id,
+            self.issued_by,
+            self.expiry,
+        )
+    }
+
+    /// Seals `plaintext` into `self.secret`, bound to this record's identity.
+    pub fn seal_secret(
+        &mut self,
+        key: &CredentialSealKey,
+        plaintext: &str,
+    ) -> Result<(), SealError> {
+        self.secret = SealedS3Secret::seal(key, plaintext, &self.credential_aad())?;
+        Ok(())
+    }
+
+    /// Recovers the plaintext secret; only the issuing node's key can succeed.
+    pub fn open_secret(&self, key: &CredentialSealKey) -> Result<String, SealError> {
+        self.secret.open(key, &self.credential_aad())
     }
 }
 
@@ -985,7 +1014,7 @@ mod tests {
             access_key: "access".into(),
             user_identity: UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
             group_id: Ulid::generate(),
-            secret: "secret".into(),
+            secret: crate::credential_seal::SealedS3Secret::empty(),
             expiry: now + Duration::from_secs(60),
             path_restrictions: None,
             issued_by: [0u8; 32],
@@ -1001,6 +1030,36 @@ mod tests {
         let mut revoked = base.clone();
         revoked.revoked_at = Some(now);
         assert!(revoked.is_revoked());
+    }
+
+    // Sealed credentials open only on the issuing node and only while unmoved.
+    #[test]
+    fn sealed_binds_record() {
+        use super::UserAccess;
+        use crate::credential_seal::{CredentialSealKey, SealedS3Secret};
+        use std::time::Duration;
+
+        let issuer = *iroh::SecretKey::from_bytes(&[9u8; 32]).public().as_bytes();
+        let key = CredentialSealKey::derive(&[9u8; 32]);
+        let mut access = UserAccess {
+            access_key: "AKIA".into(),
+            user_identity: UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
+            group_id: Ulid::generate(),
+            secret: SealedS3Secret::empty(),
+            expiry: SystemTime::now() + Duration::from_secs(60),
+            path_restrictions: None,
+            issued_by: issuer,
+            revoked_at: None,
+        };
+        access.seal_secret(&key, "the-secret").unwrap();
+        assert_eq!(access.open_secret(&key).unwrap(), "the-secret");
+
+        let other = CredentialSealKey::derive(&[1u8; 32]);
+        assert!(access.open_secret(&other).is_err());
+
+        let mut moved = access.clone();
+        moved.group_id = Ulid::generate();
+        assert!(moved.open_secret(&key).is_err());
     }
 
     #[test]

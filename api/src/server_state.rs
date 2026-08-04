@@ -3,6 +3,7 @@ use crate::error::OidcError;
 use crate::openapi::ApiDoc;
 use aruna_core::NodeId;
 use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
+use aruna_core::credential_seal::CredentialSealKey;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -64,6 +65,9 @@ pub struct ServerState {
     realm_id: RealmId,
     // Realm membership
     node_id: NodeId,
+    // Issuer-local key that seals S3 credential secrets at rest, derived from
+    // this node's secret so it matches the S3 verifier on the same node.
+    credential_seal_key: CredentialSealKey,
     // Contains OIDC config and Client
     oidc_validator: Option<Arc<OidcValidator>>,
     jobs_runtime: Arc<JobsRuntime>,
@@ -165,10 +169,16 @@ impl ServerState {
             None
         };
         trusted_realms.insert(realm_id);
+        let credential_seal_key = driver_ctx
+            .net_handle
+            .as_ref()
+            .map(|net| net.credential_seal_key())
+            .unwrap_or_else(CredentialSealKey::random);
         let state = Self {
             driver_ctx,
             realm_id,
             node_id,
+            credential_seal_key,
             oidc_validator,
             jobs_runtime,
             node_capabilities,
@@ -267,6 +277,10 @@ impl ServerState {
 
     pub fn get_node_id(&self) -> NodeId {
         self.node_id
+    }
+
+    pub fn credential_seal_key(&self) -> &CredentialSealKey {
+        &self.credential_seal_key
     }
 
     pub fn node_capabilities(&self) -> &NodeCapabilities {

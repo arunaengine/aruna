@@ -1,4 +1,6 @@
 use aruna_core::UserId;
+use aruna_core::compute::Secret;
+use aruna_core::credential_seal::{CredentialSealKey, SealError, SealedS3Secret};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -32,6 +34,8 @@ pub enum CreateUserAccessError {
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
     RestrictionLimit(#[from] RestrictionLimitError),
+    #[error(transparent)]
+    Seal(#[from] SealError),
     #[error("Invalid state [{current:?}] - expected [{expected:?}]")]
     InvalidState {
         current: CreateUserAccessState,
@@ -66,19 +70,27 @@ pub struct CreateUserAccessConfig {
 pub struct CreateUserAccessOperation {
     config: CreateUserAccessConfig,
     key_id: String,
+    seal_key: CredentialSealKey,
+    pending_secret: Option<Secret>,
     state: CreateUserAccessState,
-    output: Result<(String, UserAccess), CreateUserAccessError>,
+    output: Result<(String, Secret, UserAccess), CreateUserAccessError>,
 }
 
 impl CreateUserAccessOperation {
-    pub fn new(config: CreateUserAccessConfig) -> Self {
-        Self::new_with_key(config, Ulid::generate().to_string())
+    pub fn new(config: CreateUserAccessConfig, seal_key: CredentialSealKey) -> Self {
+        Self::new_with_key(config, Ulid::generate().to_string(), seal_key)
     }
 
-    pub fn new_with_key(config: CreateUserAccessConfig, key_id: String) -> Self {
+    pub fn new_with_key(
+        config: CreateUserAccessConfig,
+        key_id: String,
+        seal_key: CredentialSealKey,
+    ) -> Self {
         Self {
             config,
             key_id,
+            seal_key,
+            pending_secret: None,
             state: CreateUserAccessState::Init,
             output: Err(CreateUserAccessError::NotFinished),
         }
@@ -95,25 +107,30 @@ impl CreateUserAccessOperation {
                 Ok(access_key) => access_key,
                 Err(err) => return self.handle_error(err.into()),
             };
-            let access = UserAccess {
+            let plaintext = rng()
+                .sample_iter(&Alphanumeric)
+                .take(30)
+                .map(char::from)
+                .collect::<String>();
+            let mut access = UserAccess {
                 access_key: access_key.clone(),
                 user_identity: self.config.user_identity,
                 group_id: self.config.group_id,
-                secret: rng()
-                    .sample_iter(&Alphanumeric)
-                    .take(30)
-                    .map(char::from)
-                    .collect::<String>(),
+                secret: SealedS3Secret::empty(),
                 expiry: self.config.expiry,
                 path_restrictions: self.config.path_restrictions.clone(),
                 issued_by: self.config.issued_by,
                 revoked_at: None,
             };
+            if let Err(err) = access.seal_secret(&self.seal_key, &plaintext) {
+                return self.handle_error(err.into());
+            }
             let bytes = match access.to_bytes() {
                 Ok(bytes) => bytes,
                 Err(err) => return self.handle_error(err.into()),
             };
 
+            self.pending_secret = Some(Secret::new(plaintext));
             self.state = CreateUserAccessState::CreateUserAccess(access);
             smallvec![Effect::Storage(StorageEffect::Write {
                 key_space: USER_ACCESS_KEYSPACE.to_string(),
@@ -127,7 +144,7 @@ impl CreateUserAccessOperation {
     }
 
     fn handle_user_access_created(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::WriteResult { key }) = event else {
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.handle_error(CreateUserAccessError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::WriteResult)",
@@ -141,16 +158,13 @@ impl CreateUserAccessOperation {
                 expected: "CreateUserAccessState::CreateUserAccess(..)".to_string(),
             });
         };
-
-        let access_key = match String::from_utf8(key.to_vec()) {
-            Ok(access_key) => access_key,
-            Err(err) => {
-                return self.handle_error(CreateUserAccessError::ConversionError(err.into()));
-            }
+        let access = access.clone();
+        let Some(secret) = self.pending_secret.take() else {
+            return self.handle_error(CreateUserAccessError::CreateUserAccessFailed);
         };
-        // Issuer-local by design: the credential is never replicated, so it
-        // only ever authenticates on the node that issued it.
-        self.output = Ok((access_key, access.clone()));
+        // Issuer-local by design: the credential is never replicated, so the
+        // plaintext is handed back only here, once, at issuance.
+        self.output = Ok((access.access_key.clone(), secret, access));
         self.state = CreateUserAccessState::Finish;
         smallvec![]
     }
@@ -163,7 +177,7 @@ impl CreateUserAccessOperation {
 }
 
 impl Operation for CreateUserAccessOperation {
-    type Output = Result<(String, UserAccess), CreateUserAccessError>;
+    type Output = Result<(String, Secret, UserAccess), CreateUserAccessError>;
     type Error = CreateUserAccessError;
 
     fn start(&mut self) -> Effects {
@@ -195,7 +209,7 @@ impl Operation for CreateUserAccessOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        let Ok((access_key, _)) = self.output.as_ref() else {
+        let Ok((access_key, _, _)) = self.output.as_ref() else {
             return smallvec![];
         };
         let access_key = access_key.clone();
@@ -217,6 +231,10 @@ mod tests {
         *iroh::SecretKey::from_bytes(&[9u8; 32]).public().as_bytes()
     }
 
+    fn test_seal_key() -> CredentialSealKey {
+        CredentialSealKey::derive(&[9u8; 32])
+    }
+
     fn make_config(user_identity: UserId, group_id: GroupId) -> CreateUserAccessConfig {
         CreateUserAccessConfig {
             user_identity,
@@ -235,7 +253,8 @@ mod tests {
     fn test_create_user_access_happy_path() {
         let user_identity = make_user_identity();
         let group_id = Ulid::generate();
-        let mut op = CreateUserAccessOperation::new(make_config(user_identity, group_id));
+        let mut op =
+            CreateUserAccessOperation::new(make_config(user_identity, group_id), test_seal_key());
 
         // 1. Start -> Should transition to CreateUserAccess and emit Storage::Write
         let effects = op.start();
@@ -262,7 +281,7 @@ mod tests {
         };
         assert_eq!(access.user_identity, user_identity);
         assert_eq!(access.group_id, group_id);
-        assert_eq!(access.secret.len(), 30);
+        assert_eq!(access.open_secret(&test_seal_key()).unwrap().len(), 30);
         assert_eq!(access.path_restrictions, None);
         assert_eq!(access.issued_by, test_issuer());
         assert_eq!(access.revoked_at, None);
@@ -275,15 +294,20 @@ mod tests {
         assert_eq!(op.state, CreateUserAccessState::Finish);
         assert!(op.is_complete());
 
-        // 4. Finalize -> Should return Ok with (String, UserAccess)
+        // 4. Finalize -> Should return Ok with (access_key, plaintext, UserAccess)
         let result = op.finalize();
         assert!(result.is_ok());
         let inner = result.unwrap();
         assert!(inner.is_ok());
-        let (access_key, returned_access) = inner.unwrap();
+        let (access_key, plaintext, returned_access) = inner.unwrap();
         assert_eq!(returned_access.user_identity, user_identity);
         assert_eq!(returned_access.group_id, group_id);
         assert_eq!(returned_access.access_key, access_key);
+        // The one-time plaintext opens the stored ciphertext on the issuing key.
+        assert_eq!(
+            returned_access.open_secret(&test_seal_key()).unwrap(),
+            plaintext.expose()
+        );
     }
 
     #[test]
@@ -299,7 +323,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut config = make_config(make_user_identity(), Ulid::generate());
         config.path_restrictions = Some(restrictions);
-        let mut op = CreateUserAccessOperation::new(config);
+        let mut op = CreateUserAccessOperation::new(config, test_seal_key());
 
         let effects = op.start();
         assert!(effects.is_empty());
@@ -316,7 +340,8 @@ mod tests {
         let group_id = Ulid::generate();
 
         // 1. Invalid state: start twice -> second start calls abort since state is not Init
-        let mut op = CreateUserAccessOperation::new(make_config(user_identity, group_id));
+        let mut op =
+            CreateUserAccessOperation::new(make_config(user_identity, group_id), test_seal_key());
         op.start();
         // State is now CreateUserAccess; calling start again calls handle_init which calls abort.
         // abort returns empty effects (output is still Err since WriteResult not yet received).
@@ -329,7 +354,8 @@ mod tests {
         ));
 
         // 2. Invalid event at CreateUserAccess state (wrong event type)
-        let mut op = CreateUserAccessOperation::new(make_config(user_identity, group_id));
+        let mut op =
+            CreateUserAccessOperation::new(make_config(user_identity, group_id), test_seal_key());
         op.start();
         // Feed a ReadResult instead of WriteResult
         let key = Ulid::generate().to_bytes().into();

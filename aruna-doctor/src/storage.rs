@@ -703,20 +703,23 @@ mod tests {
             .unwrap();
 
             let credentials = drive(
-                CreateUserAccessOperation::new(CreateUserAccessConfig {
-                    user_identity: realm_admin,
-                    group_id: group.0.group_id,
-                    expiry: SystemTime::now() + DEFAULT_CREDENTIAL_TTL,
-                    path_restrictions: None,
-                    issued_by: *config.node_id.as_bytes(),
-                }),
+                CreateUserAccessOperation::new(
+                    CreateUserAccessConfig {
+                        user_identity: realm_admin,
+                        group_id: group.0.group_id,
+                        expiry: SystemTime::now() + DEFAULT_CREDENTIAL_TTL,
+                        path_restrictions: None,
+                        issued_by: *config.node_id.as_bytes(),
+                    },
+                    aruna_core::credential_seal::CredentialSealKey::random(),
+                ),
                 context.as_ref(),
             )
             .await
             .unwrap()
             .unwrap();
             assert!(!credentials.0.is_empty());
-            assert!(!credentials.1.secret.is_empty());
+            assert!(!credentials.1.expose().is_empty());
 
             let bucket_name = "snapshot-bucket".to_string();
             drive(
