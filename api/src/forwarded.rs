@@ -32,17 +32,25 @@ pub fn external_base_url(trusted_proxies: &[IpNet], peer: IpAddr, headers: &Head
     format!("{scheme}://{host}")
 }
 
-/// Client address for attribution. Behind a trusted proxy the client is the
-/// address that proxy appended to `x-forwarded-for`; a direct caller is its
-/// own transport address, no matter what headers it sends.
+/// Client address for attribution. Behind a trusted proxy the chain is walked
+/// right-to-left, peeling every configured trusted hop; the first untrusted
+/// address is the client. A direct caller, an all-trusted chain, or a malformed
+/// entry falls back to the transport address.
 pub fn client_ip(trusted_proxies: &[IpNet], peer: IpAddr, headers: &HeaderMap) -> IpAddr {
     if !peer_is_trusted(trusted_proxies, peer) {
         return peer;
     }
-    header_str(headers, "x-forwarded-for")
-        .and_then(|value| value.rsplit(',').next())
-        .and_then(|entry| entry.trim().parse::<IpAddr>().ok())
-        .unwrap_or(peer)
+    let Some(chain) = header_str(headers, "x-forwarded-for") else {
+        return peer;
+    };
+    for entry in chain.rsplit(',') {
+        match entry.trim().parse::<IpAddr>() {
+            Ok(addr) if peer_is_trusted(trusted_proxies, addr) => continue,
+            Ok(addr) => return addr,
+            Err(_) => return peer,
+        }
+    }
+    peer
 }
 
 #[cfg(test)]
@@ -117,6 +125,33 @@ mod tests {
             IpAddr::from_str("198.51.100.7").unwrap()
         );
         assert_eq!(client_ip(&proxies(), proxy, &HeaderMap::new()), proxy);
+    }
+
+    #[test]
+    fn peels_trusted_chain() {
+        // Two trusted hops are peeled to the real client, not the last proxy.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.9, 10.0.0.5"),
+        );
+        let proxy = IpAddr::from_str("10.1.2.3").unwrap();
+        assert_eq!(
+            client_ip(&proxies(), proxy, &headers),
+            IpAddr::from_str("203.0.113.9").unwrap()
+        );
+
+        // An all-trusted chain and a malformed entry both fall back to peer.
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("10.0.0.1, 10.0.0.5"),
+        );
+        assert_eq!(client_ip(&proxies(), proxy, &headers), proxy);
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("bogus, 10.0.0.5"),
+        );
+        assert_eq!(client_ip(&proxies(), proxy, &headers), proxy);
     }
 
     #[test]
