@@ -5939,6 +5939,9 @@ async fn validate_group_admin_authority(
         | AdminDocumentOperation::GroupRoleRemoved { .. } => {
             format!("/{realm_id}/g/{group_id}/admin")
         }
+        AdminDocumentOperation::GroupPoliciesSet { .. } => {
+            format!("/{realm_id}/g/{group_id}/admin/config")
+        }
         AdminDocumentOperation::GroupCreated { .. } => unreachable!(),
         _ => unreachable!("group authority only receives group operations"),
     };
@@ -7968,6 +7971,111 @@ mod tests {
 
         let auth_doc = read_group_auth_doc(&storage, group_id).await;
         assert_eq!(auth_doc.policies, policies);
+    }
+
+    #[tokio::test]
+    async fn policies_authority_gate() {
+        // GroupPoliciesSet must reach the config-path check, not the unreachable
+        // arm: a non-owner config admin is accepted, one without config write is
+        // rejected, and neither path panics.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([59; 32]);
+        let group_id = Ulid::from_parts(1_630, 1);
+        let owner = UserId::local(Ulid::from_parts(1_631, 1), realm_id);
+        let admin_user = UserId::local(Ulid::from_parts(1_632, 1), realm_id);
+        let role_id = Ulid::from_parts(1_633, 1);
+        let actor = test_actor(11, admin_user, realm_id);
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(actor.node_id, RealmNodeKind::Management);
+        let group = Group {
+            display_name: "Engineering".to_string(),
+            group_id,
+            realm_id,
+            owner,
+            roles: HashSet::from([role_id]),
+        };
+        let realm_auth = RealmAuthorizationDocument {
+            realm_id,
+            roles: HashMap::new(),
+            operation_restrictions: Default::default(),
+        };
+        storage_batch_write_to(
+            &storage,
+            vec![
+                target_write_entry(
+                    DocumentSyncTarget::RealmConfig { realm_id },
+                    config.to_bytes(&actor).expect("config serializes").into(),
+                ),
+                target_write_entry(
+                    DocumentSyncTarget::RealmAuthorization { realm_id },
+                    realm_auth
+                        .to_bytes(&actor)
+                        .expect("realm auth serializes")
+                        .into(),
+                ),
+                (
+                    GROUP_KEYSPACE.to_string(),
+                    group_id.to_bytes().into(),
+                    group.to_bytes(&actor).expect("group serializes").into(),
+                ),
+            ],
+        )
+        .await
+        .expect("realm and group state writes");
+
+        let config_path = format!("/{realm_id}/g/{group_id}/admin/config");
+        let policies = vec![aruna_core::request_policy::RequestPolicy {
+            policy_id: Ulid::from_bytes([7; 16]),
+            name: "deny-writes".to_string(),
+            kind: aruna_core::request_policy::PolicyKind::Deny,
+            when: None,
+            expression: "permission == 'write'".to_string(),
+            enabled: true,
+        }];
+        let event = test_admin_event(
+            Ulid::from_parts(1_634, 1),
+            AdminDocumentTarget::Group { group_id },
+            &actor,
+            1,
+            AdminDocumentOperation::GroupPoliciesSet { policies },
+        );
+
+        for (permission, expect_accept) in [(Permission::WRITE, true), (Permission::READ, false)] {
+            let auth_doc = GroupAuthorizationDocument {
+                group_id,
+                policies: Vec::new(),
+                roles: HashMap::from([(
+                    role_id,
+                    Role {
+                        role_id,
+                        name: "config_admin".to_string(),
+                        permissions: HashMap::from([(config_path.clone(), permission)]),
+                        assigned_users: HashSet::from([admin_user]),
+                    },
+                )]),
+            };
+            storage_batch_write_to(
+                &storage,
+                vec![target_write_entry(
+                    DocumentSyncTarget::GroupAuthorization { group_id },
+                    auth_doc
+                        .to_bytes(&actor)
+                        .expect("auth doc serializes")
+                        .into(),
+                )],
+            )
+            .await
+            .expect("group auth doc writes");
+
+            let validation = validate_group_admin_authority(&storage, &event)
+                .await
+                .expect("validation runs without panic");
+            assert_eq!(
+                matches!(validation, AdminEventValidation::Accepted),
+                expect_accept
+            );
+        }
     }
 
     #[tokio::test]
