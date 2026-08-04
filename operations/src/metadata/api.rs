@@ -1777,7 +1777,8 @@ async fn ensure_record_readable(
     record: &MetadataRegistryRecord,
 ) -> Result<(), MetadataApiError> {
     if record.public {
-        // Deny-only policies still constrain public reads.
+        // A policy denial on a found public record must read as NotFound, matching
+        // the private-denied path, so read-by-id is not an existence oracle.
         return crate::request_policy::enforce_policies(
             context,
             realm_id,
@@ -1789,7 +1790,7 @@ async fn ensure_record_readable(
             ),
         )
         .await
-        .map_err(|_| MetadataApiError::Forbidden);
+        .map_err(|_| MetadataApiError::NotFound);
     }
     // Read-by-id must not distinguish an unreadable record from an absent one:
     // present-but-unreadable, including anonymous callers, maps to NotFound so
@@ -3638,6 +3639,15 @@ mod tests {
     // The rules collection reads both documents; without them a group yields no
     // rules and every non-public record in it stays hidden.
     async fn write_auth_docs(test: &MetadataTest, group_id: GroupId, roles: HashMap<RoleId, Role>) {
+        write_policy_docs(test, group_id, roles, Vec::new()).await;
+    }
+
+    async fn write_policy_docs(
+        test: &MetadataTest,
+        group_id: GroupId,
+        roles: HashMap<RoleId, Role>,
+        policies: Vec<aruna_core::request_policy::RequestPolicy>,
+    ) {
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
             user_id: UserId::local(Ulid::generate(), TEST_REALM_ID),
@@ -3647,7 +3657,7 @@ mod tests {
         let group_doc = GroupAuthorizationDocument {
             group_id,
             roles,
-            policies: Vec::new(),
+            policies,
         };
         let entries = [
             (
@@ -3674,6 +3684,55 @@ mod tests {
                 Event::Storage(StorageEvent::WriteResult { .. }) => {}
                 other => panic!("unexpected write event: {other:?}"),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn hidden_ids_match() {
+        // Missing, private-denied, and policy-denied public ids must all return
+        // NotFound so read-by-id cannot probe existence.
+        let test = metadata_test();
+        let group_id = Ulid::generate();
+        let stranger = UserId::local(Ulid::generate(), TEST_REALM_ID);
+        write_policy_docs(
+            &test,
+            group_id,
+            user_role(
+                UserId::local(Ulid::generate(), TEST_REALM_ID),
+                HashMap::from([(
+                    format!("/{TEST_REALM_ID}/g/{group_id}/**"),
+                    Permission::WRITE,
+                )]),
+            ),
+            vec![aruna_core::request_policy::RequestPolicy {
+                policy_id: Ulid::generate(),
+                name: "no-reads".to_string(),
+                kind: aruna_core::request_policy::PolicyKind::Deny,
+                when: None,
+                expression: "permission == 'read'".to_string(),
+                enabled: true,
+            }],
+        )
+        .await;
+
+        let public = public_record(group_id, Ulid::generate());
+        seed_registry_cache(&test, &public).await;
+        let mut private = public_record(group_id, Ulid::generate());
+        private.public = false;
+        seed_registry_cache(&test, &private).await;
+        let missing = public_record(group_id, Ulid::generate());
+
+        for document_id in [public.document_id, private.document_id, missing.document_id] {
+            let result = get_visible_metadata_document(
+                &test.context,
+                TEST_REALM_ID,
+                GetVisibleMetadataDocumentRequest {
+                    document_id,
+                    auth: Some(auth_for(stranger)),
+                },
+            )
+            .await;
+            assert!(matches!(result, Err(MetadataApiError::NotFound)));
         }
     }
 
