@@ -808,6 +808,7 @@ mod tests {
                 compute_handle: None,
             }),
             RoCrateLimits::default(),
+            JobsRuntime::new(),
         );
 
         assert!(handler.peer_is_sync_eligible(realm_id, server).await);

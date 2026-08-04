@@ -3005,6 +3005,7 @@ mod tests {
         let owner = get_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(None),
             Path(document_id.clone()),
         )
         .await;
@@ -3018,6 +3019,7 @@ mod tests {
         let stranger_result = get_metadata_document(
             State(test.state.clone()),
             Extension(Some(stranger)),
+            Extension(None),
             Path(document_id.clone()),
         )
         .await;
@@ -3026,6 +3028,7 @@ mod tests {
         let anonymous_result = get_metadata_document(
             State(test.state.clone()),
             Extension(None),
+            Extension(None),
             Path(document_id),
         )
         .await;
@@ -3033,6 +3036,7 @@ mod tests {
 
         let absent = get_metadata_document(
             State(test.state.clone()),
+            Extension(None),
             Extension(None),
             Path(Ulid::generate().to_string()),
         )
