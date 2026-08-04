@@ -968,6 +968,7 @@ pub mod test {
         };
         let auth_doc = GroupAuthorizationDocument {
             group_id,
+            policies: Vec::new(),
             roles: HashMap::from([(
                 role_id,
                 Role {
@@ -1048,6 +1049,7 @@ pub mod test {
         };
         let auth_doc = GroupAuthorizationDocument {
             group_id,
+            policies: Vec::new(),
             roles: HashMap::from([(
                 role_id,
                 Role {
@@ -1478,6 +1480,7 @@ pub mod test {
     fn seeded_user_role_doc(group_id: Ulid, role_id: Ulid) -> GroupAuthorizationDocument {
         GroupAuthorizationDocument {
             group_id,
+            policies: Vec::new(),
             roles: HashMap::from([(
                 role_id,
                 Role {

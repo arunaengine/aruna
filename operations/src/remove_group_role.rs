@@ -799,6 +799,7 @@ pub mod test {
         };
         let auth_doc = GroupAuthorizationDocument {
             group_id,
+            policies: Vec::new(),
             roles: HashMap::from([(role_id, role)]),
         };
         let mut operation = RemoveGroupRoleOperation::new(RemoveGroupRoleConfig {

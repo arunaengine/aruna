@@ -905,6 +905,7 @@ pub mod test {
         };
         let auth_doc = GroupAuthorizationDocument {
             group_id,
+            policies: Vec::new(),
             roles: HashMap::from([(
                 role_id,
                 Role {
@@ -1174,6 +1175,7 @@ pub mod test {
         };
         let auth_doc = GroupAuthorizationDocument {
             group_id,
+            policies: Vec::new(),
             roles: HashMap::from([(
                 role_id,
                 Role {

@@ -3620,7 +3620,11 @@ mod tests {
             realm_id: TEST_REALM_ID,
         };
         let realm_doc = RealmAuthorizationDocument::new_default_realm_doc(TEST_REALM_ID);
-        let group_doc = GroupAuthorizationDocument { group_id, roles };
+        let group_doc = GroupAuthorizationDocument {
+            group_id,
+            roles,
+            policies: Vec::new(),
+        };
         let entries = [
             (
                 Key::from(*TEST_REALM_ID.as_bytes()),

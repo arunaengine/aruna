@@ -437,6 +437,12 @@ impl AdminDocumentReducerState {
                 self.apply_group_role_user_assignment(event, role_id, user_id, None);
             }
             (
+                AdminDocumentTarget::Group { .. },
+                AdminDocumentOperation::GroupPoliciesSet { policies },
+            ) => {
+                self.apply_group_field(event, GROUP_POLICIES_PATH, Some(policies_value(policies)));
+            }
+            (
                 AdminDocumentTarget::Realm { .. },
                 AdminDocumentOperation::RealmRoleAdded { role_id },
             ) => {
@@ -768,6 +774,19 @@ impl AdminDocumentReducerState {
             .get(GROUP_OWNER_PATH)
             .and_then(|version| version.value.as_deref())
             .and_then(|value| UserId::from_string(value).ok())
+    }
+
+    pub fn materialized_group_policies(
+        &self,
+    ) -> Option<Vec<crate::request_policy::RequestPolicy>> {
+        if !matches!(&self.target, AdminDocumentTarget::Group { .. }) {
+            return None;
+        }
+
+        self.user_subject_ids
+            .get(GROUP_POLICIES_PATH)
+            .and_then(|version| version.value.as_deref())
+            .and_then(policies_from_value)
     }
 
     pub fn materialized_group_roles(&self) -> BTreeSet<RoleId> {
@@ -1546,6 +1565,7 @@ pub const USER_NAME_PATH: &str = "user.name";
 pub const GROUP_DISPLAY_NAME_PATH: &str = "group.display_name";
 pub const GROUP_REALM_ID_PATH: &str = "group.realm_id";
 pub const GROUP_OWNER_PATH: &str = "group.owner";
+pub const GROUP_POLICIES_PATH: &str = "group.policies";
 pub const REALM_CONFIG_METADATA_REPLICATION_PATH: &str =
     "realm_config.settings.metadata_replication";
 pub const REALM_CONFIG_DISCOVERY_PATH: &str = "realm_config.settings.discovery";
@@ -1611,6 +1631,9 @@ fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         }
         AdminDocumentOperation::RealmConfigPoliciesSet { .. } => {
             vec![REALM_CONFIG_POLICIES_PATH.to_string()]
+        }
+        AdminDocumentOperation::GroupPoliciesSet { .. } => {
+            vec![GROUP_POLICIES_PATH.to_string()]
         }
         AdminDocumentOperation::RealmConfigNodePlacementSet { entry } => {
             vec![realm_config_placement_node_path(&entry.node_id)]
@@ -2992,6 +3015,28 @@ mod tests {
                 .iter()
                 .any(|value| value.value.as_deref() == Some("Bob"))
         );
+    }
+
+    #[test]
+    fn group_policies_set_materializes() {
+        let mut state = group_state();
+        let policies = vec![crate::request_policy::RequestPolicy {
+            policy_id: Ulid::from_bytes([2; 16]),
+            name: "no-writes".to_string(),
+            kind: crate::request_policy::PolicyKind::Deny,
+            when: None,
+            expression: "permission == 'write'".to_string(),
+            enabled: true,
+        }];
+        state
+            .apply_operation(
+                &actor(node(1)),
+                AdminDocumentOperation::GroupPoliciesSet {
+                    policies: policies.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(state.materialized_group_policies(), Some(policies));
     }
 
     #[test]

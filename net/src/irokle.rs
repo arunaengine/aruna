@@ -4019,9 +4019,10 @@ async fn apply_group_authorization_admin_document_operation_to_storage(
             | AdminDocumentOperation::GroupRoleRemoved { .. }
             | AdminDocumentOperation::GroupRoleUserAssignmentAdded { .. }
             | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { .. }
+            | AdminDocumentOperation::GroupPoliciesSet { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "group admin operation sync only supports group creation, role seeds, role creation/removal, and role user assignment updates"
+            "group admin operation sync only supports group creation, role seeds, role creation/removal, role user assignment updates, and policy updates"
                 .to_string(),
         ));
     }
@@ -4057,6 +4058,7 @@ async fn apply_group_authorization_admin_document_operation_to_storage(
     let mut auth_doc = previous_auth_doc.unwrap_or_else(|| GroupAuthorizationDocument {
         group_id,
         roles: Default::default(),
+        policies: Default::default(),
     });
     materialize_group_authorization_admin_document_operation(&mut auth_doc, &reducer_state, &event);
     let group_writes = group_write_entries_from_reducer(storage, group_id, &reducer_state).await?;
@@ -4220,9 +4222,10 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
             | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
             | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
+            | AdminDocumentOperation::RealmConfigPoliciesSet { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, description updates, quota updates, and placement updates"
+            "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, description updates, quota updates, placement updates, and policy updates"
                 .to_string(),
         ));
     }
@@ -4298,6 +4301,17 @@ fn materialize_group_authorization_admin_document_operation(
     reducer_state: &AdminDocumentReducerState,
     event: &AdminDocumentEvent,
 ) {
+    if let AdminDocumentOperation::GroupPoliciesSet { .. } = &event.op {
+        if !reducer_state
+            .conflicts
+            .contains_key(aruna_core::admin_document_reducer::GROUP_POLICIES_PATH)
+            && let Some(policies) = reducer_state.materialized_group_policies()
+        {
+            auth_doc.policies = policies;
+        }
+        return;
+    }
+
     if let AdminDocumentOperation::GroupRoleCreated { role } = &event.op {
         materialize_group_authorization_role(auth_doc, reducer_state, role);
         return;
@@ -5261,7 +5275,8 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { .. }
         | AdminDocumentOperation::GroupRoleCreated { .. }
         | AdminDocumentOperation::GroupRoleRemoved { .. }
-        | AdminDocumentOperation::GroupCreated { .. } => AdminOperationFamily::Group,
+        | AdminDocumentOperation::GroupCreated { .. }
+        | AdminDocumentOperation::GroupPoliciesSet { .. } => AdminOperationFamily::Group,
         AdminDocumentOperation::RealmRoleAdded { .. }
         | AdminDocumentOperation::RealmRoleUserAssignmentAdded { .. }
         | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { .. }
@@ -5410,7 +5425,8 @@ async fn validate_replicated_admin_event(
             return reject("placement strategy replica count must be greater than zero");
         }
         AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { .. } => {}
-        AdminDocumentOperation::RealmConfigPoliciesSet { policies } => {
+        AdminDocumentOperation::RealmConfigPoliciesSet { policies }
+        | AdminDocumentOperation::GroupPoliciesSet { policies } => {
             if let Err(error) = aruna_core::request_policy::validate_policy_set(policies) {
                 return reject(&format!("invalid policy set: {error}"));
             }
@@ -7666,6 +7682,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn realm_policies_replicate_and_apply() {
+        // S2: a policy event replicated from another node must pass the
+        // realm-config storage-apply whitelist and materialize here.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([57; 32]);
+        let actor = test_actor(
+            9,
+            UserId::local(Ulid::from_parts(1_610, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_611, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication: MetadataReplicationConfig::new(3),
+                    discovery: test_discovery(24, "https://policies.example:443"),
+                },
+            ),
+        )
+        .await
+        .expect("settings bootstrap the config doc");
+
+        let policies = vec![aruna_core::request_policy::RequestPolicy {
+            policy_id: Ulid::from_bytes([2; 16]),
+            name: "no-writes".to_string(),
+            kind: aruna_core::request_policy::PolicyKind::Deny,
+            when: None,
+            expression: "permission == 'write'".to_string(),
+            enabled: true,
+        }];
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_612, 1),
+                target.clone(),
+                &actor,
+                2,
+                AdminDocumentOperation::RealmConfigPoliciesSet {
+                    policies: policies.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("policy event replicates and applies");
+
+        let config = read_realm_config_doc(&storage, realm_id).await;
+        assert_eq!(config.request_policies, policies);
+    }
+
+    #[tokio::test]
+    async fn group_policies_replicate_and_apply() {
+        // GroupPoliciesSet must pass the group storage-apply whitelist and land
+        // on the receiving node's group authorization document.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([58; 32]);
+        let group_id = Ulid::from_parts(1_620, 1);
+        let owner = UserId::local(Ulid::from_parts(1_621, 1), realm_id);
+        let actor = test_actor(10, owner, realm_id);
+        let target = AdminDocumentTarget::Group { group_id };
+        let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_622, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::GroupCreated {
+                    realm_id,
+                    display_name: "Engineering".to_string(),
+                    owner,
+                },
+            ),
+        )
+        .await
+        .expect("group creation bootstraps the auth doc");
+
+        let policies = vec![aruna_core::request_policy::RequestPolicy {
+            policy_id: Ulid::from_bytes([3; 16]),
+            name: "no-writes".to_string(),
+            kind: aruna_core::request_policy::PolicyKind::Deny,
+            when: None,
+            expression: "permission == 'write'".to_string(),
+            enabled: true,
+        }];
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_623, 1),
+                target.clone(),
+                &actor,
+                2,
+                AdminDocumentOperation::GroupPoliciesSet {
+                    policies: policies.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("group policy event replicates and applies");
+
+        let auth_doc = read_group_auth_doc(&storage, group_id).await;
+        assert_eq!(auth_doc.policies, policies);
+    }
+
+    #[tokio::test]
     async fn quota_survives_reducer_materialization_without_existing_config_doc() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([61; 32]);
@@ -8609,6 +8742,7 @@ mod tests {
         };
         let auth_doc = GroupAuthorizationDocument {
             group_id,
+            policies: Vec::new(),
             roles: HashMap::from([(
                 role_id,
                 Role {
@@ -9063,6 +9197,7 @@ mod tests {
         };
         let auth_doc = GroupAuthorizationDocument {
             group_id,
+            policies: Vec::new(),
             roles: HashMap::from([(
                 role_id,
                 Role {
@@ -9312,6 +9447,7 @@ mod tests {
         };
         let auth_doc = GroupAuthorizationDocument {
             group_id,
+            policies: Vec::new(),
             roles: HashMap::from([(
                 role_id,
                 Role {

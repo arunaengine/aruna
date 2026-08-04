@@ -201,6 +201,9 @@ pub enum AdminDocumentOperation {
     RealmConfigPoliciesSet {
         policies: Vec<crate::request_policy::RequestPolicy>,
     },
+    GroupPoliciesSet {
+        policies: Vec<crate::request_policy::RequestPolicy>,
+    },
 }
 
 #[cfg(test)]
@@ -239,6 +242,17 @@ mod tests {
             role_id,
             name: "admin".to_string(),
             permissions: BTreeMap::from([("/dataset/**".to_string(), Permission::READ)]),
+        }
+    }
+
+    fn request_policy(expression: &str) -> crate::request_policy::RequestPolicy {
+        crate::request_policy::RequestPolicy {
+            policy_id: Ulid::from_bytes([2; 16]),
+            name: "test".to_string(),
+            kind: crate::request_policy::PolicyKind::Deny,
+            when: None,
+            expression: expression.to_string(),
+            enabled: true,
         }
     }
 
@@ -389,6 +403,12 @@ mod tests {
                     start: 3,
                     end: 1027,
                 },
+            },
+            AdminDocumentOperation::RealmConfigPoliciesSet {
+                policies: vec![request_policy("permission == 'write'")],
+            },
+            AdminDocumentOperation::GroupPoliciesSet {
+                policies: vec![request_policy("anonymous")],
             },
         ];
 

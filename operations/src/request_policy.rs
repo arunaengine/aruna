@@ -4,17 +4,20 @@
 //! that fails for any reason other than an absent config also denies.
 
 use crate::driver::{DriverContext, drive};
+use crate::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use crate::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
 use aruna_core::request_policy::{
     CompiledPolicySet, PolicyCompileError, PolicyDecision, PolicyFunctions, PolicyRequest,
     RequestPolicy, policy_set_hash,
 };
 use aruna_core::structs::RealmId;
+use aruna_core::types::GroupId;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
 use tracing::warn;
+use ulid::Ulid;
 
 /// Compiled policy sets are content-addressed, so a bounded LRU without a TTL or
 /// invalidation protocol is enough: any change mints a new key and stale sets
@@ -58,20 +61,40 @@ fn lock(cache: &PolicyProgramCache) -> std::sync::MutexGuard<'_, LruCache<[u8; 3
     cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Evaluates the realm's request policies against one request. An absent realm
-/// config carries no policies and allows; every other read failure, a policy
-/// that cannot be compiled, and any evaluation error deny.
+/// Evaluates the realm's then the group's request policies against one request.
+/// An absent realm config or group document carries no policies and allows;
+/// every other read failure, a policy that cannot be compiled, and any
+/// evaluation error deny. Either scope may deny; neither may grant.
 pub async fn enforce_policies(
     context: &DriverContext,
     realm_id: RealmId,
     request: &PolicyRequest,
 ) -> Result<(), PolicyEnforcementError> {
-    let config = match drive(GetRealmConfigOperation::new(realm_id), context).await {
-        Ok(config) => config,
-        Err(GetRealmConfigError::DocumentNotFound) => return Ok(()),
+    match drive(GetRealmConfigOperation::new(realm_id), context).await {
+        Ok(config) => evaluate_scope(&config.request_policies, request, "realm")?,
+        Err(GetRealmConfigError::DocumentNotFound) => {}
         Err(error) => return Err(PolicyEnforcementError::Unavailable(error.to_string())),
-    };
-    evaluate_scope(&config.request_policies, request, "realm")
+    }
+    if let Some(group_id) = group_id_from_path(&request.path) {
+        match drive(GetGroupOperation::new(GetGroupConfig { group_id }), context).await {
+            Ok((_, auth_doc)) => evaluate_scope(&auth_doc.policies, request, "group")?,
+            Err(GetGroupError::GroupNotFound | GetGroupError::AuthDocNotFound) => {}
+            Err(error) => return Err(PolicyEnforcementError::Unavailable(error.to_string())),
+        }
+    }
+    Ok(())
+}
+
+/// Extracts the group id from a canonical `/{realm}/g/{group}/...` path, mirroring
+/// the permission-rule parser. Non-group paths carry no group scope.
+fn group_id_from_path(path: &str) -> Option<GroupId> {
+    let mut segments = path.split('/');
+    segments.next();
+    segments.next();
+    if segments.next() != Some("g") {
+        return None;
+    }
+    segments.next().and_then(|value| Ulid::from_string(value).ok())
 }
 
 /// Evaluates one scope's policy set, mapping a compile error, an evaluation
