@@ -42,6 +42,7 @@ impl ApiDoc {
         openapi.merge(crate::routes::policies::PoliciesApiDoc::openapi());
         openapi.merge(crate::routes::search::SearchApiDoc::openapi());
         openapi.merge(crate::routes::tes::TesApiDoc::openapi());
+        openapi.merge(crate::routes::tokens::TokensApiDoc::openapi());
         openapi.merge(crate::routes::users::UsersApiDoc::openapi());
         openapi
     }

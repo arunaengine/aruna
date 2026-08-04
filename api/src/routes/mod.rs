@@ -24,6 +24,7 @@ pub mod staging;
 pub mod storage_routing;
 pub mod sync;
 pub mod tes;
+pub mod tokens;
 pub mod users;
 
 pub fn rest_router(state: Arc<ServerState>) -> Router {
@@ -47,6 +48,7 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
         .merge(policies::router())
         .merge(search::router())
         .merge(tes::router())
+        .merge(tokens::router())
         .merge(users::router())
         .layer(from_fn_with_state(
             state.clone(),
