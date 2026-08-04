@@ -1012,7 +1012,7 @@ impl NetHandle {
         }
         let peers = unique_peer_nodes(
             document
-                .node_ids()
+                .sync_eligible_node_ids()
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?,
             self.inner.node_id,
         );
@@ -3009,6 +3009,9 @@ mod tests {
         );
         document.ensure_node(peer_b, aruna_core::structs::RealmNodeKind::Server);
         document.ensure_node(peer_a, aruna_core::structs::RealmNodeKind::Server);
+        // A User-kind node must never enter the sync fan-out set.
+        let user_node = make_secret(13).public();
+        document.ensure_node(user_node, aruna_core::structs::RealmNodeKind::User);
         let expected = unique_peer_nodes(vec![peer_a, peer_b], handle.node_id());
 
         let peers = handle.refresh_realm_peers_from_document(&document).await?;

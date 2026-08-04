@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use aruna_core::MetaResourceId;
@@ -96,6 +97,10 @@ const DOCUMENT_SYNC_INBOUND_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
 // drained, per pushing peer and for the node as a whole.
 const DOCUMENT_SYNC_INBOUND_PEER_STREAMS: usize = 8;
 const DOCUMENT_SYNC_INBOUND_GLOBAL_STREAMS: usize = 64;
+// Aggregate buffered-byte ceilings, well below 64 independent 256 MiB streams,
+// so concurrent streams cannot pin more memory than the node can absorb.
+const DOCUMENT_SYNC_INBOUND_PEER_BYTES: usize = 512 * 1024 * 1024;
+const DOCUMENT_SYNC_INBOUND_GLOBAL_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const DOCUMENT_SYNC_FRAME_LEN_LIMIT: usize = 16 * 1024 * 1024;
 const MAX_DEFERRED_TOPICS: usize = 1_024;
 const MAX_DEFERRED_TOPICS_PER_DEPENDENCY: usize = 256;
@@ -180,6 +185,8 @@ struct InboundSyncBudget {
 struct InboundSyncCounters {
     global: usize,
     per_peer: BTreeMap<PeerId, usize>,
+    global_bytes: usize,
+    per_peer_bytes: BTreeMap<PeerId, usize>,
 }
 
 impl InboundSyncBudget {
@@ -198,6 +205,35 @@ impl InboundSyncBudget {
             peer,
         })
     }
+
+    // Reserves declared frame bytes against the per-peer and global ceilings
+    // before the payload is allocated; false leaves both counters untouched.
+    fn reserve_bytes(&self, peer: PeerId, bytes: usize) -> bool {
+        let mut state = self.state.lock();
+        let held = state.per_peer_bytes.get(&peer).copied().unwrap_or(0);
+        if state.global_bytes.saturating_add(bytes) > DOCUMENT_SYNC_INBOUND_GLOBAL_BYTES
+            || held.saturating_add(bytes) > DOCUMENT_SYNC_INBOUND_PEER_BYTES
+        {
+            return false;
+        }
+        state.global_bytes = state.global_bytes.saturating_add(bytes);
+        *state.per_peer_bytes.entry(peer).or_insert(0) += bytes;
+        true
+    }
+
+    fn release_bytes(&self, peer: PeerId, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let mut state = self.state.lock();
+        state.global_bytes = state.global_bytes.saturating_sub(bytes);
+        if let Some(held) = state.per_peer_bytes.get_mut(&peer) {
+            *held = held.saturating_sub(bytes);
+            if *held == 0 {
+                state.per_peer_bytes.remove(&peer);
+            }
+        }
+    }
 }
 
 struct InboundSyncPermit {
@@ -215,6 +251,41 @@ impl Drop for InboundSyncPermit {
                 state.per_peer.remove(&self.peer);
             }
         }
+    }
+}
+
+/// Holds a peer's buffered-byte reservation for the lifetime of one inbound
+/// stream, releasing it on success, decode failure, cancellation, or drop.
+struct InboundByteReservation {
+    budget: Arc<InboundSyncBudget>,
+    peer: PeerId,
+    reserved: usize,
+}
+
+impl InboundByteReservation {
+    fn new(budget: Arc<InboundSyncBudget>, peer: PeerId) -> Self {
+        Self {
+            budget,
+            peer,
+            reserved: 0,
+        }
+    }
+
+    fn reserve(&mut self, bytes: usize) -> Result<()> {
+        if !self.budget.reserve_bytes(self.peer, bytes) {
+            return Err(NetError::AdmissionRejected(format!(
+                "document sync byte budget exhausted for peer {}",
+                self.peer
+            )));
+        }
+        self.reserved = self.reserved.saturating_add(bytes);
+        Ok(())
+    }
+}
+
+impl Drop for InboundByteReservation {
+    fn drop(&mut self) {
+        self.budget.release_bytes(self.peer, self.reserved);
     }
 }
 
@@ -239,9 +310,13 @@ pub struct DocumentSyncService {
     // their own, so their topic derivation reads it from here.
     realm_id: RealmId,
     inbound_budget: Arc<InboundSyncBudget>,
-    // Peers configured at open. A realm-config refresh replaces `default_peers`,
-    // but a configured bootstrap peer stays admitted for inbound sync.
+    // Peers configured at open. They admit inbound sync only during the
+    // bootstrap window; once realm config materializes the current
+    // sync-eligible `default_peers` set is authoritative.
     configured_peers: BTreeSet<PeerId>,
+    // Flips true on the first realm-config-driven peer refresh, after which
+    // `configured_peers` no longer grant admission.
+    realm_config_materialized: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for DocumentSyncService {
@@ -329,6 +404,7 @@ impl DocumentSyncService {
             realm_id,
             inbound_budget: Arc::new(InboundSyncBudget::default()),
             configured_peers: default_peers,
+            realm_config_materialized: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -501,10 +577,11 @@ impl DocumentSyncService {
         self.node
             .add_peers_to_whitelist(peers.iter().copied())
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        // The underlying sync node exposes additive whitelist updates only; this
-        // refresh replaces the default fan-out set while retaining previously
-        // allowed peers until process restart.
+        // Realm config is now authoritative: replace the fan-out/admission set
+        // and stop honoring the bootstrap `configured_peers`. The transport
+        // whitelist is additive, but `admit_inbound` gates before any read.
         *self.default_peers.write() = peers;
+        self.realm_config_materialized.store(true, Ordering::Release);
         self.flush_database()?;
         Ok(())
     }
@@ -793,15 +870,19 @@ impl DocumentSyncService {
     /// per-peer and global stream budgets.
     fn admit_inbound(&self, peer: NodeId) -> Result<InboundSyncPermit> {
         let peer_id = node_id_to_peer_id(&peer);
-        if !self.configured_peers.contains(&peer_id)
-            && !self.default_peers.read().contains(&peer_id)
-        {
-            return Err(NetError::Stream(format!(
-                "document sync peer {peer_id} is not a configured realm peer"
+        // The bootstrap peers admit only until realm config materializes; after
+        // that the current sync-eligible set is the sole authority, so a removed
+        // startup peer fails here without a restart.
+        let bootstrap_window = !self.realm_config_materialized.load(Ordering::Acquire);
+        let admitted = self.default_peers.read().contains(&peer_id)
+            || (bootstrap_window && self.configured_peers.contains(&peer_id));
+        if !admitted {
+            return Err(NetError::AdmissionRejected(format!(
+                "document sync peer {peer_id} is not a current realm peer"
             )));
         }
         self.inbound_budget.acquire(peer_id).ok_or_else(|| {
-            NetError::Stream(format!(
+            NetError::AdmissionRejected(format!(
                 "document sync stream budget exhausted for peer {peer_id}"
             ))
         })
@@ -816,7 +897,10 @@ impl DocumentSyncService {
         let _permit = self.admit_inbound(peer)?;
         self.net.note_peer_reachable(node_id_to_peer_id(&peer));
         let BiStream(mut send, mut recv, _) = stream;
-        let (messages, touched_topics) = read_inbound_sync_messages(&mut recv).await?;
+        let mut byte_reservation =
+            InboundByteReservation::new(self.inbound_budget.clone(), node_id_to_peer_id(&peer));
+        let (messages, touched_topics) =
+            read_inbound_sync_messages(&mut recv, &mut byte_reservation).await?;
         let read_elapsed = stream_started.elapsed();
         let message_count = messages.len();
         let handle_started = Instant::now();
@@ -5386,8 +5470,23 @@ async fn validate_replicated_admin_event(
                 return reject("role assignment user belongs to a different realm");
             }
         }
+        AdminDocumentOperation::GroupRoleCreated { role } => {
+            // Distributed events must enforce the same subtree confinement as
+            // local issuance; the publisher is not trusted to have done so.
+            let AdminDocumentTarget::Group { group_id } = &event.target else {
+                return reject("group role event target must be a group");
+            };
+            let subtree_root = aruna_core::permission_path::group_role_subtree_root(
+                event.actor.realm_id,
+                group_id,
+            );
+            if role.permissions.keys().any(|pattern| {
+                !aruna_core::permission_path::role_path_confined(pattern, &subtree_root)
+            }) {
+                return reject("group role grants outside its group subtree");
+            }
+        }
         AdminDocumentOperation::GroupRoleAdded { .. }
-        | AdminDocumentOperation::GroupRoleCreated { .. }
         | AdminDocumentOperation::GroupRoleRemoved { .. }
         | AdminDocumentOperation::RealmRoleAdded { .. }
         | AdminDocumentOperation::RealmRoleCreated { .. }
@@ -6128,12 +6227,13 @@ fn deferred_topics_key() -> ByteView {
 
 async fn read_inbound_sync_messages(
     recv: &mut iroh::endpoint::RecvStream,
+    reservation: &mut InboundByteReservation,
 ) -> Result<(Vec<SyncMessage>, Vec<irokle_crate::TopicId>)> {
     let mut messages = Vec::new();
     let mut topics = BTreeSet::new();
     let mut bytes_read = 0usize;
     let mut frame_index = 0usize;
-    while let Some(frame) = read_next_inbound_sync_frame(recv, &mut bytes_read).await? {
+    while let Some(frame) = read_next_inbound_sync_frame(recv, &mut bytes_read, reservation).await? {
         frame_index = frame_index.saturating_add(1);
         if messages.len() >= DOCUMENT_SYNC_INBOUND_SYNC_MESSAGE_LIMIT {
             return Err(NetError::Stream(format!(
@@ -6155,6 +6255,7 @@ async fn read_inbound_sync_messages(
 async fn read_next_inbound_sync_frame(
     recv: &mut iroh::endpoint::RecvStream,
     bytes_read: &mut usize,
+    reservation: &mut InboundByteReservation,
 ) -> Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
     let Some(first_read) = read_some_inbound_sync(recv, &mut len_buf[..1]).await? else {
@@ -6191,6 +6292,7 @@ async fn read_next_inbound_sync_frame(
             "document sync stream exceeded {DOCUMENT_SYNC_INBOUND_SYNC_STREAM_BYTES} bytes"
         )));
     }
+    reservation.reserve(len)?;
 
     let mut payload = vec![0u8; len];
     let mut payload_read = 0usize;
@@ -6593,6 +6695,74 @@ mod tests {
             .expect("peer added");
         let permit = service.admit_inbound(stranger);
         assert!(permit.is_ok());
+    }
+
+    #[test]
+    fn budget_caps_bytes() {
+        // Per-peer and global byte ceilings hold, and release restores both.
+        let budget = Arc::new(InboundSyncBudget::default());
+        assert!(budget.reserve_bytes(peer(1), DOCUMENT_SYNC_INBOUND_PEER_BYTES));
+        assert!(!budget.reserve_bytes(peer(1), 1));
+        budget.release_bytes(peer(1), DOCUMENT_SYNC_INBOUND_PEER_BYTES);
+        assert!(budget.reserve_bytes(peer(1), 1));
+        budget.release_bytes(peer(1), 1);
+
+        let mut reserved = 0usize;
+        for seed in 10..u8::MAX {
+            if budget.reserve_bytes(peer(seed), DOCUMENT_SYNC_INBOUND_PEER_BYTES) {
+                reserved = reserved.saturating_add(DOCUMENT_SYNC_INBOUND_PEER_BYTES);
+            } else {
+                break;
+            }
+        }
+        assert!(reserved <= DOCUMENT_SYNC_INBOUND_GLOBAL_BYTES);
+        assert!(!budget.reserve_bytes(peer(9), DOCUMENT_SYNC_INBOUND_PEER_BYTES));
+    }
+
+    #[test]
+    fn reservation_releases_on_drop() {
+        // A stream's reservation is returned to the budget when it drops.
+        let budget = Arc::new(InboundSyncBudget::default());
+        {
+            let mut reservation = InboundByteReservation::new(budget.clone(), peer(1));
+            reservation
+                .reserve(DOCUMENT_SYNC_INBOUND_PEER_BYTES)
+                .expect("first reservation fits");
+            assert!(reservation.reserve(1).is_err());
+        }
+        assert!(budget.reserve_bytes(peer(1), DOCUMENT_SYNC_INBOUND_PEER_BYTES));
+    }
+
+    #[tokio::test]
+    async fn removed_startup_peer_denied() {
+        // A startup peer admits during bootstrap, then loses admission once
+        // realm config materializes without it, with no restart.
+        let root = TempDir::new().expect("tempdir");
+        let startup = node(51);
+        let current = node(52);
+        let service = DocumentSyncService::open_with_persist_policy(
+            restart_endpoint().await,
+            storage_at(&root.join("storage")),
+            root.join("document-sync"),
+            &[startup],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            restart_realm(),
+        )
+        .expect("service opens");
+
+        assert!(service.admit_inbound(startup).is_ok());
+
+        service
+            .refresh_potential_peer_nodes([current])
+            .expect("refresh applies");
+
+        assert!(matches!(
+            service.admit_inbound(startup),
+            Err(NetError::AdmissionRejected(_))
+        ));
+        assert!(service.admit_inbound(current).is_ok());
     }
 
     fn topic(seed: u8) -> irokle_crate::TopicId {
@@ -8560,6 +8730,47 @@ mod tests {
                 .roles
                 .contains_key(&role_id)
         );
+    }
+
+    #[tokio::test]
+    async fn replicated_group_role_confined() {
+        // An allowed publisher cannot replicate a role granting outside its group.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([71; 32]);
+        let group_id = Ulid::from_parts(210, 1);
+        let role_id = Ulid::from_parts(211, 1);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(212, 1), realm_id),
+            realm_id,
+        );
+        let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+        let placement = admin_test_placement();
+        let topic_id = document_target.sync_topic_id(realm_id, &placement);
+        let actor_id = irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&actor.node_id));
+
+        let event = test_admin_event(
+            Ulid::from_parts(213, 1),
+            AdminDocumentTarget::Group { group_id },
+            &actor,
+            1,
+            AdminDocumentOperation::GroupRoleCreated {
+                role: test_admin_role_definition(role_id, "escalated", "/**", Permission::WRITE),
+            },
+        );
+
+        let outcome = validate_replicated_admin_event(
+            &storage,
+            topic_id,
+            actor_id,
+            &document_target,
+            &event,
+            realm_id,
+            &placement,
+        )
+        .await
+        .expect("validation runs");
+        assert!(matches!(outcome, AdminEventValidation::Rejected(_)));
     }
 
     #[tokio::test]
