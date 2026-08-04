@@ -61,6 +61,54 @@ fn lock(cache: &PolicyProgramCache) -> std::sync::MutexGuard<'_, LruCache<[u8; 3
     cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// A realm and optional group policy set loaded and compiled once so a bulk
+/// request can evaluate many candidate paths in memory without re-reading the
+/// control-plane state per candidate.
+pub struct PolicyEvaluator {
+    realm: Option<Arc<CompiledPolicySet>>,
+    group: Option<Arc<CompiledPolicySet>>,
+}
+
+impl PolicyEvaluator {
+    /// Reads and compiles the realm's, and optionally one group's, policy set.
+    /// An absent realm config or group document carries no policies; every other
+    /// read failure or a compile failure fails closed.
+    pub async fn load(
+        context: &DriverContext,
+        realm_id: RealmId,
+        group_id: Option<GroupId>,
+    ) -> Result<Self, PolicyEnforcementError> {
+        let realm = match drive(GetRealmConfigOperation::new(realm_id), context).await {
+            Ok(config) => compile_scope(&config.request_policies, "realm")?,
+            Err(GetRealmConfigError::DocumentNotFound) => None,
+            Err(error) => return Err(PolicyEnforcementError::Unavailable(error.to_string())),
+        };
+        let group = match group_id {
+            Some(group_id) => {
+                match drive(GetGroupOperation::new(GetGroupConfig { group_id }), context).await {
+                    Ok((_, auth_doc)) => compile_scope(&auth_doc.policies, "group")?,
+                    Err(GetGroupError::GroupNotFound | GetGroupError::AuthDocNotFound) => None,
+                    Err(error) => {
+                        return Err(PolicyEnforcementError::Unavailable(error.to_string()));
+                    }
+                }
+            }
+            None => None,
+        };
+        Ok(Self { realm, group })
+    }
+
+    /// Evaluates the realm then the group scope; either may deny, neither grants.
+    pub fn evaluate(&self, request: &PolicyRequest) -> Result<(), PolicyEnforcementError> {
+        for (scope, set) in [("realm", &self.realm), ("group", &self.group)] {
+            if let Some(set) = set {
+                decide(set, request, scope)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Evaluates the realm's then the group's request policies against one request.
 /// An absent realm config or group document carries no policies and allows;
 /// every other read failure, a policy that cannot be compiled, and any
@@ -70,19 +118,10 @@ pub async fn enforce_policies(
     realm_id: RealmId,
     request: &PolicyRequest,
 ) -> Result<(), PolicyEnforcementError> {
-    match drive(GetRealmConfigOperation::new(realm_id), context).await {
-        Ok(config) => evaluate_scope(&config.request_policies, request, "realm")?,
-        Err(GetRealmConfigError::DocumentNotFound) => {}
-        Err(error) => return Err(PolicyEnforcementError::Unavailable(error.to_string())),
-    }
-    if let Some(group_id) = group_id_from_path(&request.path) {
-        match drive(GetGroupOperation::new(GetGroupConfig { group_id }), context).await {
-            Ok((_, auth_doc)) => evaluate_scope(&auth_doc.policies, request, "group")?,
-            Err(GetGroupError::GroupNotFound | GetGroupError::AuthDocNotFound) => {}
-            Err(error) => return Err(PolicyEnforcementError::Unavailable(error.to_string())),
-        }
-    }
-    Ok(())
+    let group_id = group_id_from_path(&request.path);
+    PolicyEvaluator::load(context, realm_id, group_id)
+        .await?
+        .evaluate(request)
 }
 
 /// Extracts the group id from a canonical `/{realm}/g/{group}/...` path, mirroring
@@ -97,18 +136,17 @@ fn group_id_from_path(path: &str) -> Option<GroupId> {
     segments.next().and_then(|value| Ulid::from_string(value).ok())
 }
 
-/// Evaluates one scope's policy set, mapping a compile error, an evaluation
-/// error, or a match to a denial.
-fn evaluate_scope(
+/// Compiles one scope's policy set, mapping a compile failure to a fail-closed
+/// error. An empty set needs no compiled program.
+fn compile_scope(
     policies: &[RequestPolicy],
-    request: &PolicyRequest,
     scope: &str,
-) -> Result<(), PolicyEnforcementError> {
+) -> Result<Option<Arc<CompiledPolicySet>>, PolicyEnforcementError> {
     if policies.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
-    let set = match compiled_set(policies) {
-        Ok(set) => set,
+    match compiled_set(policies) {
+        Ok(set) => Ok(Some(set)),
         Err(error) => {
             warn!(
                 policy_id = %error.policy_id,
@@ -116,12 +154,21 @@ fn evaluate_scope(
                 scope,
                 "Policy set failed to compile; denying request"
             );
-            return Err(PolicyEnforcementError::Unavailable(format!(
+            Err(PolicyEnforcementError::Unavailable(format!(
                 "policy `{}` failed to compile: {}",
                 error.name, error.reason
-            )));
+            )))
         }
-    };
+    }
+}
+
+/// Evaluates one compiled scope, mapping a match or an evaluation error to a
+/// denial.
+fn decide(
+    set: &CompiledPolicySet,
+    request: &PolicyRequest,
+    scope: &str,
+) -> Result<(), PolicyEnforcementError> {
     match set.evaluate(request, &PolicyFunctions::default()) {
         PolicyDecision::Allowed => Ok(()),
         PolicyDecision::Denied {
@@ -142,6 +189,35 @@ fn evaluate_scope(
     }
 }
 
+/// Extra request context threaded to a policy at a choke point. Body-content
+/// policies only ever run for operations whose handler already holds the full
+/// parsed body; the engine never reads or buffers a streaming body.
+#[derive(Debug, Clone, Default)]
+pub struct PolicyRequestExtras {
+    pub operation: String,
+    pub params: std::collections::BTreeMap<String, String>,
+    pub headers: std::collections::BTreeMap<String, String>,
+    pub body: Option<serde_json::Value>,
+}
+
+impl PolicyRequestExtras {
+    /// Generic REST context with no parameters, headers, or body.
+    pub fn rest() -> Self {
+        Self {
+            operation: "rest".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Context carrying only an operation identifier.
+    pub fn operation(operation: impl Into<String>) -> Self {
+        Self {
+            operation: operation.into(),
+            ..Default::default()
+        }
+    }
+}
+
 /// Builds the policy request for one authorized action.
 pub fn policy_request(
     path: &str,
@@ -155,6 +231,24 @@ pub fn policy_request(
             .map(|user| user.to_string())
             .unwrap_or_default(),
     )
+}
+
+/// Builds a policy request that additionally carries operation, parameters,
+/// headers, and an already-parsed body.
+pub fn policy_request_with(
+    path: &str,
+    permission: &aruna_core::structs::Permission,
+    user: Option<&aruna_core::UserId>,
+    extras: PolicyRequestExtras,
+) -> PolicyRequest {
+    let mut request = policy_request(path, permission, user);
+    if !extras.operation.is_empty() {
+        request.operation = extras.operation;
+    }
+    request.params = extras.params;
+    request.headers = extras.headers;
+    request.body = extras.body;
+    request
 }
 
 fn permission_label(permission: &aruna_core::structs::Permission) -> String {
@@ -196,15 +290,46 @@ mod tests {
 
     #[test]
     fn compile_failure_is_unavailable() {
-        let request = PolicyRequest::basic("/p".to_string(), "read".to_string(), "u".to_string());
-        let error = evaluate_scope(&[policy("path.startsWith(")], &request, "realm").unwrap_err();
-        assert!(matches!(error, PolicyEnforcementError::Unavailable(_)));
+        let result = compile_scope(&[policy("path.startsWith(")], "realm");
+        assert!(matches!(
+            result,
+            Err(PolicyEnforcementError::Unavailable(_))
+        ));
     }
 
     #[test]
     fn match_denies() {
         let request = PolicyRequest::basic("/p".to_string(), "write".to_string(), "u".to_string());
-        let error = evaluate_scope(&[policy("permission == 'write'")], &request, "realm").unwrap_err();
+        let set = compile_scope(&[policy("permission == 'write'")], "realm")
+            .unwrap()
+            .unwrap();
+        let error = decide(&set, &request, "realm").unwrap_err();
         assert!(matches!(error, PolicyEnforcementError::Denied { .. }));
+    }
+
+    #[test]
+    fn evaluates_each_member_path() {
+        // The DeleteObjects model: one loaded set, each member path decided
+        // separately so a path rule can deny one member and allow another.
+        let set = compiled_set(&[policy("path.endsWith('/secret')")]).unwrap();
+        let denied =
+            PolicyRequest::basic("/r/g/x/data/secret".to_string(), "write".to_string(), "u".to_string());
+        let allowed =
+            PolicyRequest::basic("/r/g/x/data/public".to_string(), "write".to_string(), "u".to_string());
+        assert!(decide(&set, &denied, "realm").is_err());
+        assert!(decide(&set, &allowed, "realm").is_ok());
+    }
+
+    #[test]
+    fn extras_thread_operation_and_body() {
+        let extras = PolicyRequestExtras::operation("s3.PutObject");
+        let request = policy_request_with(
+            "/r/g/x/data/o",
+            &aruna_core::structs::Permission::WRITE,
+            None,
+            extras,
+        );
+        assert_eq!(request.operation, "s3.PutObject");
+        assert_eq!(request.permission, "write");
     }
 }

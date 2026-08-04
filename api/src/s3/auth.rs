@@ -5,15 +5,17 @@ use aruna_core::structs::{
     blob_group_permission_path, blob_object_permission_path,
 };
 use aruna_core::{NodeId, UserId};
-use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::request_authorization::{AuthorizeError, authorize};
+use aruna_operations::request_policy::PolicyRequestExtras;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::{S3Auth, SecretKey};
 use s3s::{S3Result, s3_error};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -127,53 +129,75 @@ impl S3Access for AuthProvider {
             .await?;
 
         // DeleteObjects lists its target keys in the request body rather than the
-        // URL, so the path resolves to the bucket and a bucket-level check would
-        // deny prefix-scoped tokens outright. Defer object authorization to the
-        // handler, which checks each entry individually. Credentials, issuer,
-        // expiry, revocation and bucket ownership are already validated above, so
-        // anonymous and cross-group requests still fail closed here.
+        // URL, so per-object authorization (RBAC and policy) is deferred to the
+        // handler, which evaluates each entry against one loaded policy set.
+        // Credentials, issuer, expiry, revocation and bucket ownership are
+        // already validated above, so anonymous and cross-group requests still
+        // fail closed here.
         if cx.s3_op().name() != "DeleteObjects" {
-            let allowed = drive(
-                CheckPermissionsOperation::new(CheckPermissionsConfig {
-                    auth_context: auth_context.clone(),
-                    path: path.clone(),
-                    required_permission: required_permission.clone(),
-                }),
+            let extras = request_extras(cx, &operation_name);
+            authorize(
                 self.driver_ctx.as_ref(),
+                self.realm_id,
+                &auth_context,
+                &path,
+                &required_permission,
+                extras,
             )
             .await
-            .map_err(|_| s3_error!(InternalError, "Failed to check permissions"))?;
-
-            if !allowed {
-                return Err(s3_error!(AccessDenied, "Permission denied"));
-            }
+            .map_err(map_authorize_error)?;
         }
-
-        // Deny-only request policies narrow what authorization allowed; for
-        // DeleteObjects they run against the bucket path like the deferred check.
-        self.enforce_policies(&path, &required_permission, Some(&auth_context.user_id))
-            .await?;
 
         cx.extensions_mut().insert(user_access);
         Ok(())
     }
 }
 
-impl AuthProvider {
-    async fn enforce_policies(
-        &self,
-        path: &str,
-        permission: &Permission,
-        user: Option<&UserId>,
-    ) -> S3Result<()> {
-        aruna_operations::request_policy::enforce_policies(
-            &self.driver_ctx,
-            self.realm_id,
-            &aruna_operations::request_policy::policy_request(path, permission, user),
-        )
-        .await
-        .map_err(|_| s3_error!(AccessDenied, "Request denied by policy"))
+/// Maps an authorization failure to an S3 error, keeping RBAC and policy denials
+/// indistinguishable and control-plane failures fail-closed.
+fn map_authorize_error(error: AuthorizeError) -> s3s::S3Error {
+    match error {
+        AuthorizeError::CheckFailed(_) => s3_error!(InternalError, "Failed to check permissions"),
+        _ => s3_error!(AccessDenied, "Permission denied"),
     }
+}
+
+/// Threads the S3 operation, query parameters (last value wins), and an
+/// allowlisted, lowercased header subset into the policy context. Object bytes
+/// are never buffered, so the body stays absent.
+fn request_extras(cx: &S3AccessContext<'_>, operation_name: &str) -> PolicyRequestExtras {
+    let mut params = BTreeMap::new();
+    if let Some(query) = cx.uri().query() {
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            params.insert(key.into_owned(), value.into_owned());
+        }
+    }
+    let mut headers = BTreeMap::new();
+    for (name, value) in cx.headers() {
+        let name = name.as_str().to_ascii_lowercase();
+        if header_allowed(&name)
+            && let Ok(value) = value.to_str()
+        {
+            headers.insert(name, value.to_string());
+        }
+    }
+    PolicyRequestExtras {
+        operation: format!("s3.{operation_name}"),
+        params,
+        headers,
+        body: None,
+    }
+}
+
+/// Header allowlist for policy context; authorization and cookies never appear.
+fn header_allowed(name: &str) -> bool {
+    matches!(
+        name,
+        "content-type" | "content-length" | "x-amz-tagging" | "x-amz-acl"
+    ) || name.starts_with("x-amz-meta-")
+}
+
+impl AuthProvider {
 
     /// Anonymous access: object bytes only, addressed to a concrete object, and
     /// allowed only when a public role — one assigned to the Everyone principal
@@ -206,23 +230,17 @@ impl AuthProvider {
         let path =
             blob_object_permission_path(self.realm_id, group_id, self.node_id, &bucket, &key);
 
-        let allowed = drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: AuthContext::anonymous(self.realm_id),
-                path: path.clone(),
-                required_permission: Permission::READ,
-            }),
+        let extras = request_extras(cx, cx.s3_op().name());
+        authorize(
             self.driver_ctx.as_ref(),
+            self.realm_id,
+            &AuthContext::anonymous(self.realm_id),
+            &path,
+            &Permission::READ,
+            extras,
         )
         .await
-        .map_err(|_| s3_error!(InternalError, "Failed to check permissions"))?;
-
-        if !allowed {
-            return Err(s3_error!(AccessDenied, "Permission denied"));
-        }
-
-        self.enforce_policies(&path, &Permission::READ, None)
-            .await?;
+        .map_err(map_authorize_error)?;
 
         // Handlers read UserAccess/BucketInfo from the request extensions;
         // hand them the Everyone principal scoped to the bucket's group. The

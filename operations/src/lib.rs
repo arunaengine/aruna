@@ -67,6 +67,7 @@ pub mod remove_group_role;
 pub mod remove_user_from_group;
 pub mod replicate_documents;
 pub mod replication;
+pub mod request_authorization;
 pub mod request_policy;
 pub mod reserve_onboarding_secret;
 pub mod resolve_users;

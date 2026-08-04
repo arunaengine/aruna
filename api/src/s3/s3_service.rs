@@ -3022,6 +3022,17 @@ impl S3 for ArunaS3Service {
         };
         let bucket = req.input.bucket;
 
+        // DeleteObjects carries no object key in the request path, so the auth
+        // layer defers per-object authorization to here. Load the realm and
+        // group policy sets once and evaluate every entry against them in memory.
+        let policy_evaluator = aruna_operations::request_policy::PolicyEvaluator::load(
+            &self.state,
+            self.realm_id,
+            Some(user_access.group_id),
+        )
+        .await
+        .map_err(|_| s3_error!(AccessDenied, "Request denied by policy"))?;
+
         let mut entries = Vec::with_capacity(req.input.delete.objects.len());
         let mut errors: Vec<S3DeleteError> = Vec::new();
         for object in req.input.delete.objects {
@@ -3038,25 +3049,30 @@ impl S3 for ArunaS3Service {
                 }
             };
 
-            // DeleteObjects carries no object key in the request path, so the auth
-            // layer defers object authorization to here; check every entry.
+            let object_path = blob_object_permission_path(
+                self.realm_id,
+                user_access.group_id,
+                self.node_id,
+                &bucket,
+                &object.key,
+            );
             let allowed = drive(
                 CheckPermissionsOperation::new(CheckPermissionsConfig {
                     auth_context: replication_auth.clone(),
-                    path: blob_object_permission_path(
-                        self.realm_id,
-                        user_access.group_id,
-                        self.node_id,
-                        &bucket,
-                        &object.key,
-                    ),
+                    path: object_path.clone(),
                     required_permission: Permission::WRITE,
                 }),
                 &self.state,
             )
             .await
             .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?;
-            if !allowed {
+            let policy_request = aruna_operations::request_policy::policy_request_with(
+                &object_path,
+                &Permission::WRITE,
+                Some(&replication_auth.user_id),
+                aruna_operations::request_policy::PolicyRequestExtras::operation("s3.DeleteObjects"),
+            );
+            if !allowed || policy_evaluator.evaluate(&policy_request).is_err() {
                 errors.push(S3DeleteError {
                     code: Some("AccessDenied".to_string()),
                     key: Some(object.key),

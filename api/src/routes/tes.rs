@@ -7,13 +7,11 @@ use std::time::SystemTime;
 use aruna_core::compute::{
     has_wildcard, literal_prefix, output_glob, output_suffix, paths_overlap,
 };
-use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
     AuthContext, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId,
     JobPayload, JobRecord, JobResultPayload, JobState, OutputDestination, OutputSelection,
     blob_group_permission_path,
 };
-use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::JobRouteError;
 use aruna_operations::jobs::service::{
@@ -1369,27 +1367,17 @@ async fn ensure_group_write(
     auth: &AuthContext,
     group_id: Ulid,
 ) -> Result<(), TesError> {
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth.clone(),
-            path: blob_group_permission_path(state.get_realm_id(), group_id, state.get_node_id()),
-            required_permission: aruna_core::structs::Permission::WRITE,
-        }),
-        &state.get_ctx(),
+    crate::auth::ensure_permission(
+        state,
+        auth,
+        blob_group_permission_path(state.get_realm_id(), group_id, state.get_node_id()),
+        aruna_core::structs::Permission::WRITE,
     )
     .await
     .map_err(|error| match error {
-        AuthorizationError::InvalidRealmId
-        | AuthorizationError::InvalidGroupId
-        | AuthorizationError::GroupNotFound
-        | AuthorizationError::AuthDocNotFound => TesError::forbidden("no write access to group"),
-        other => TesError::internal(other.to_string()),
-    })?;
-    if allowed {
-        Ok(())
-    } else {
-        Err(TesError::forbidden("no write access to group"))
-    }
+        crate::error::ServerError::InternalError(message) => TesError::internal(message),
+        _ => TesError::forbidden("no write access to group"),
+    })
 }
 
 fn decode_page_token(token: Option<&str>) -> Result<Option<Vec<u8>>, TesError> {

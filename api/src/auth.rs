@@ -6,8 +6,6 @@ use aruna_core::structs::{
     AuthContext, OidcProviderConfig, Permission, TokenClaims, blob_object_permission_path,
 };
 use aruna_operations::auth::{decode_aruna_bearer_token, validate_aruna_bearer_token_claims};
-use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_operations::driver::drive;
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
@@ -497,36 +495,44 @@ pub(crate) async fn ensure_permission(
     path: String,
     required_permission: Permission,
 ) -> ServerResult<()> {
-    let allowed = aruna_core::telemetry::time_stage(
-        "permission",
-        drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: auth.clone(),
-                path: path.clone(),
-                required_permission: required_permission.clone(),
-            }),
-            &state.get_ctx(),
-        ),
+    ensure_permission_with(
+        state,
+        auth,
+        path,
+        required_permission,
+        aruna_operations::request_policy::PolicyRequestExtras::rest(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+}
 
-    if !allowed {
-        return Err(ServerError::Forbidden);
-    }
-    // Deny-only request policies narrow what authorization allowed.
-    aruna_operations::request_policy::enforce_policies(
-        &state.get_ctx(),
-        state.get_realm_id(),
-        &aruna_operations::request_policy::policy_request(
+/// Single REST authorization choke point: ordinary RBAC and public visibility
+/// first, then the realm and group request policies, sharing the one
+/// operations-owned boundary with the S3 hook.
+pub(crate) async fn ensure_permission_with(
+    state: &ServerState,
+    auth: &AuthContext,
+    path: String,
+    required_permission: Permission,
+    extras: aruna_operations::request_policy::PolicyRequestExtras,
+) -> ServerResult<()> {
+    aruna_core::telemetry::time_stage(
+        "permission",
+        aruna_operations::request_authorization::authorize(
+            &state.get_ctx(),
+            state.get_realm_id(),
+            auth,
             &path,
             &required_permission,
-            Some(&auth.user_id),
+            extras,
         ),
     )
     .await
-    .map_err(|_| ServerError::Forbidden)?;
-    Ok(())
+    .map_err(|error| match error {
+        aruna_operations::request_authorization::AuthorizeError::CheckFailed(message) => {
+            ServerError::InternalError(message)
+        }
+        _ => ServerError::Forbidden,
+    })
 }
 
 pub(crate) fn bucket_blob_permission_path(

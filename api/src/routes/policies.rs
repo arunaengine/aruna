@@ -908,6 +908,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn realm_write_deny_covers_every_route() {
+        // A realm `permission == "write"` deny must block write, delete, and
+        // admin routes the admin could otherwise reach, while reads still pass.
+        let fx = setup().await;
+        let (_, Json(_stored)) = set_realm_policies(
+            State(fx.state.clone()),
+            Extension(Some(fx.admin.clone())),
+            Json(body("permission == 'write'")),
+        )
+        .await
+        .unwrap();
+
+        let realm = fx.realm_id;
+        let write_routes = [
+            format!("/{realm}/admin/roles/example"),
+            format!("/{realm}/admin/config"),
+            format!("/{realm}/admin/onboarding"),
+        ];
+        for path in write_routes {
+            let denied =
+                ensure_permission(&fx.state, &fx.admin, path.clone(), Permission::WRITE).await;
+            assert!(
+                matches!(denied, Err(ServerError::Forbidden)),
+                "write not blocked on {path}"
+            );
+        }
+        // A read on the same admin path is unaffected by the write deny.
+        ensure_permission(
+            &fx.state,
+            &fx.admin,
+            format!("/{realm}/admin/config"),
+            Permission::READ,
+        )
+        .await
+        .unwrap();
+
+        // Anonymous callers are denied outright on a write route.
+        let anonymous = AuthContext::anonymous(realm);
+        let denied = ensure_permission(
+            &fx.state,
+            &anonymous,
+            format!("/{realm}/admin/config"),
+            Permission::WRITE,
+        )
+        .await;
+        assert!(matches!(denied, Err(ServerError::Forbidden)));
+    }
+
+    #[tokio::test]
     async fn requires_admin() {
         // A non-admin realm member cannot replace the policy set.
         let fx = setup().await;

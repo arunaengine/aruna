@@ -5,7 +5,6 @@ use aruna_core::structs::{
     AuthContext, BucketInfo, Permission, blob_bucket_permission_path, blob_object_permission_path,
 };
 use aruna_operations::blob_holders::{GetBlobHoldersError, GetBlobHoldersOperation};
-use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::replication::location_summary::{
     LocationSummaryError, LocationSummaryOperation, QueuedReplicaNodesOperation, QueuedReplicas,
@@ -133,19 +132,7 @@ pub async fn replicate_blob(
         ),
     };
 
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth.clone(),
-            path: permission_path,
-            required_permission: Permission::WRITE,
-        }),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
-    if !allowed {
-        return Err(ServerError::Forbidden);
-    }
+    crate::auth::ensure_permission(&state, &auth, permission_path, Permission::WRITE).await?;
 
     let node_id = NodeId::from_str(&request.node_id).map_err(|_| ServerError::BadRequest)?;
     let target = match (request.path.as_deref(), request.version_id.as_deref()) {

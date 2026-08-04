@@ -4,7 +4,7 @@ use crate::auth::{
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::errors::{AuthorizationError, StorageError};
+use aruna_core::errors::StorageError;
 use aruna_core::metadata::{
     MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
@@ -14,11 +14,11 @@ use aruna_core::structs::{
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{MetaResourceId, StructuredId};
-use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentPayload,
 };
+#[cfg(test)]
 use aruna_operations::driver::drive;
 use aruna_operations::get_metadata_document::load_metadata_record_by_document as load_metadata_record_by_document_from_operations;
 use aruna_operations::jobs::service::submit_export_job;
@@ -1835,30 +1835,9 @@ async fn ensure_permission(
     if auth.realm_id != state.get_realm_id() {
         return Err(ServerError::Forbidden);
     }
-    let allowed = aruna_core::telemetry::time_stage(
-        "permission",
-        drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: auth,
-                path,
-                required_permission,
-            }),
-            &state.get_ctx(),
-        ),
-    )
-    .await
-    .map_err(|err| match err {
-        AuthorizationError::InvalidRealmId
-        | AuthorizationError::InvalidGroupId
-        | AuthorizationError::GroupNotFound
-        | AuthorizationError::AuthDocNotFound => ServerError::Forbidden,
-        _ => ServerError::InternalError(err.to_string()),
-    })?;
-    if allowed {
-        Ok(())
-    } else {
-        Err(ServerError::Forbidden)
-    }
+    // Route metadata writes through the single authorization boundary so realm
+    // and group request policies apply here as on every other REST path.
+    crate::auth::ensure_permission(state, &auth, path, required_permission).await
 }
 
 async fn load_metadata_record_by_document(

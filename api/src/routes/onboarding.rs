@@ -12,7 +12,6 @@ use aruna_operations::bootstrap_onboarding_finalize::{
     BootstrapOnboardingFinalizeError, BootstrapOnboardingFinalizeInput,
     bootstrap_onboarding_finalize,
 };
-use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::consume_onboarding_secret::ConsumeOnboardingSecretError;
 use aruna_operations::create_onboarding_secret::{
     CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
@@ -147,19 +146,15 @@ async fn authorize_onboarding_admin(
         return Err(ServerError::Forbidden);
     }
 
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth.clone(),
-            path: format!("/{realm_id}/admin/onboarding"),
-            required_permission: Permission::WRITE,
-        }),
-        &state.get_ctx(),
+    // Route through the single authorization boundary so realm and group
+    // request policies also constrain onboarding administration.
+    crate::auth::ensure_permission(
+        state,
+        &auth,
+        format!("/{realm_id}/admin/onboarding"),
+        Permission::WRITE,
     )
-    .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
-    if !allowed {
-        return Err(ServerError::Forbidden);
-    }
+    .await?;
 
     Ok(auth)
 }

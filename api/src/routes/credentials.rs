@@ -1,10 +1,8 @@
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
     AuthContext, PathRestriction, Permission, UserAccess, blob_group_permission_path,
 };
-use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::s3::create_user_access::{
     CreateUserAccessConfig, CreateUserAccessOperation, DEFAULT_CREDENTIAL_TTL,
@@ -350,23 +348,13 @@ pub async fn revoke_s3_credentials(
         Ok(Some(Err(err))) | Err(err) => return Err(ServerError::InternalError(err.to_string())),
     };
 
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth,
-            path: blob_group_permission_path(
-                state.get_realm_id(),
-                credential.group_id,
-                state.get_node_id(),
-            ),
-            required_permission: Permission::WRITE,
-        }),
-        &state.get_ctx(),
+    crate::auth::ensure_permission(
+        &state,
+        &auth,
+        blob_group_permission_path(state.get_realm_id(), credential.group_id, state.get_node_id()),
+        Permission::WRITE,
     )
-    .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
-    if !allowed {
-        return Err(ServerError::Forbidden);
-    }
+    .await?;
 
     match drive(
         RevokeUserAccessOperation::new(access_key_id),
@@ -641,28 +629,7 @@ async fn check_permission(
     path: String,
     required_permission: Permission,
 ) -> ServerResult<()> {
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth.clone(),
-            path,
-            required_permission,
-        }),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|err| match err {
-        AuthorizationError::InvalidRealmId
-        | AuthorizationError::InvalidGroupId
-        | AuthorizationError::GroupNotFound
-        | AuthorizationError::AuthDocNotFound => ServerError::Forbidden,
-        _ => ServerError::InternalError(err.to_string()),
-    })?;
-
-    if allowed {
-        Ok(())
-    } else {
-        Err(ServerError::Forbidden)
-    }
+    crate::auth::ensure_permission(state, auth, path, required_permission).await
 }
 
 fn auth_pattern_may_apply_to_group_root(pattern: &str, group_root: &str) -> bool {
