@@ -6,6 +6,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::NodeId;
+use crate::auth::valid_token_hash;
 use crate::admin_documents::{
     AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
     AdminDocumentRoleDefinition, AdminDocumentTarget,
@@ -50,6 +51,8 @@ pub enum AdminDocumentReducerError {
     PlacementShardCountChanged,
     #[error("placement handle range is malformed")]
     InvalidHandleRange,
+    #[error("revoked bearer token hash is malformed")]
+    InvalidTokenHash,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -386,6 +389,7 @@ impl AdminDocumentReducerState {
             AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
                 | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
                 | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
+                | AdminDocumentOperation::RealmConfigTokenRevoked { .. }
         ) && operation_paths(&event.op)
             .iter()
             .all(|path| self.event_is_stale_for_path(event, path));
@@ -556,6 +560,19 @@ impl AdminDocumentReducerState {
                     event,
                     REALM_CONFIG_POLICIES_PATH,
                     policies_value(policies),
+                );
+            }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigTokenRevoked { token_hash },
+            ) => {
+                if !valid_token_hash(token_hash) {
+                    return Err(AdminDocumentReducerError::InvalidTokenHash);
+                }
+                self.apply_immutable_value(
+                    event,
+                    realm_config_revoked_token_path(token_hash),
+                    token_hash.clone(),
                 );
             }
             (
@@ -1090,6 +1107,22 @@ impl AdminDocumentReducerState {
             .collect()
     }
 
+    /// Realm-wide bearer token revocations, keyed by hash. Append-only, so a
+    /// materialized entry is never removed by a later event.
+    pub fn materialized_revoked_tokens(&self) -> BTreeSet<String> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeSet::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let hash = revoked_token_hash(path)?;
+                (version.value.as_deref() == Some(hash)).then(|| hash.to_string())
+            })
+            .collect()
+    }
+
     pub fn materialized_band_pools(&self) -> BTreeMap<Ulid, BandPool> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return BTreeMap::new();
@@ -1571,6 +1604,7 @@ pub const REALM_CONFIG_DESCRIPTION_PATH: &str = "realm_config.description";
 pub const REALM_CONFIG_QUOTA_PATH: &str = "realm_config.quota";
 pub const REALM_CONFIG_POLICIES_PATH: &str = "realm_config.request_policies";
 pub const REALM_CONFIG_DEFAULT_STRATEGY_PATH: &str = "realm_config.placement.default_strategy";
+pub const REALM_CONFIG_REVOKED_TOKENS_PATH: &str = "realm_config.revoked_tokens";
 
 fn event_observes_dot(event: &AdminDocumentEvent, dot: &AdminDocumentDot) -> bool {
     event.observed.observes(dot)
@@ -1669,6 +1703,9 @@ fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         AdminDocumentOperation::RealmConfigBandPoolAssigned { pool } => {
             vec![band_pool_path(pool.pool_id)]
         }
+        AdminDocumentOperation::RealmConfigTokenRevoked { token_hash } => {
+            vec![realm_config_revoked_token_path(token_hash)]
+        }
     }
 }
 
@@ -1737,6 +1774,16 @@ pub fn handle_range_path(range_id: Ulid) -> String {
 
 pub fn band_pool_path(pool_id: Ulid) -> String {
     format!("realm_config.placement.band_pools.{pool_id}")
+}
+
+pub fn realm_config_revoked_token_path(token_hash: &str) -> String {
+    format!("{REALM_CONFIG_REVOKED_TOKENS_PATH}.{token_hash}")
+}
+
+pub fn revoked_token_hash(path: &str) -> Option<&str> {
+    let hash = path.strip_prefix(REALM_CONFIG_REVOKED_TOKENS_PATH)?;
+    let hash = hash.strip_prefix('.')?;
+    valid_token_hash(hash).then_some(hash)
 }
 
 pub fn binding_scope_key(scope: &BindingScope) -> String {
@@ -5403,5 +5450,73 @@ mod tests {
             BTreeSet::from([first.strategy_id, second.strategy_id])
         );
         assert_eq!(config.binding_directory().conflicted(), 1);
+    }
+
+    fn revoke_token(event_seed: u8, origin_seed: u8, token: &str) -> AdminDocumentEvent {
+        realm_config_event(
+            event_seed,
+            node(origin_seed),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: crate::auth::bearer_token_hash(token),
+            },
+        )
+    }
+
+    #[test]
+    fn revocations_accumulate() {
+        // Append-only: two origins revoking different tokens both survive, and a
+        // repeat of one revocation is not a conflict.
+        let mut state = realm_config_state();
+        state.apply(&revoke_token(1, 1, "first")).unwrap();
+        state.apply(&revoke_token(2, 2, "second")).unwrap();
+        state.apply(&revoke_token(3, 2, "first")).unwrap();
+
+        assert!(state.conflicts.is_empty());
+        assert_eq!(
+            state.materialized_revoked_tokens(),
+            BTreeSet::from([
+                crate::auth::bearer_token_hash("first"),
+                crate::auth::bearer_token_hash("second"),
+            ])
+        );
+    }
+
+    #[test]
+    fn revocation_survives_stale_origin() {
+        // A revocation from a lagging origin sequence must still deny the token.
+        let mut state = realm_config_state();
+        let mut ahead = revoke_token(1, 1, "ahead");
+        ahead.origin_seq = 9;
+        state.apply(&ahead).unwrap();
+        let behind = revoke_token(2, 1, "behind");
+
+        state.apply(&behind).unwrap();
+        assert!(
+            state
+                .materialized_revoked_tokens()
+                .contains(&crate::auth::bearer_token_hash("behind"))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_hash() {
+        let mut state = realm_config_state();
+        let event = realm_config_event(
+            4,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: "not-a-hash".to_string(),
+            },
+        );
+
+        assert_eq!(
+            state.apply(&event),
+            Err(AdminDocumentReducerError::InvalidTokenHash)
+        );
+        assert!(state.materialized_revoked_tokens().is_empty());
     }
 }

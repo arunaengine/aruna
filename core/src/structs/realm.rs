@@ -174,6 +174,10 @@ pub struct RealmConfigDocument {
     /// evaluation is local on every node).
     #[serde(default)]
     pub request_policies: Vec<crate::request_policy::RequestPolicy>,
+    /// Hashes of bearer tokens revoked realm-wide. Append-only and Class-1
+    /// replicated, so every node rejects a token revoked on any other node.
+    #[serde(default)]
+    pub revoked_tokens: Vec<String>,
 }
 
 /// Realm-wide quota policy. Lives in the realm config (Class-1, replicated
@@ -371,6 +375,7 @@ impl RealmConfigDocument {
         sort_canonical(&mut canonical.placement_bindings)?;
         sort_canonical(&mut canonical.placement_handle_ranges)?;
         sort_canonical(&mut canonical.band_pools)?;
+        canonical.revoked_tokens.sort_unstable();
         let encoded = postcard::to_allocvec(&canonical)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"aruna-realm-config-v1");
@@ -393,6 +398,7 @@ impl RealmConfigDocument {
             description: String::new(),
             placement_map: Vec::new(),
             request_policies: Vec::new(),
+            revoked_tokens: Vec::new(),
             strategies: Vec::new(),
             default_strategy_id: None,
             strategy_bindings: Vec::new(),
@@ -491,6 +497,11 @@ impl RealmConfigDocument {
         }
 
         self.nodes.push(RealmNode { node_id, kind });
+    }
+
+    /// Whether the realm-wide revocation set denies this bearer token hash.
+    pub fn token_revoked(&self, token_hash: &str) -> bool {
+        self.revoked_tokens.iter().any(|entry| entry == token_hash)
     }
 
     pub fn has_node(&self, node_id: NodeId) -> bool {
@@ -771,6 +782,7 @@ mod test {
             nodes: Vec::new(),
             quota: super::QuotaConfig::default(),
             request_policies: Vec::new(),
+            revoked_tokens: Vec::new(),
             description: "Example Realm".to_string(),
             placement_map: Vec::new(),
             strategies: Vec::new(),
@@ -932,6 +944,7 @@ mod test {
             nodes: Vec::new(),
             quota: super::QuotaConfig::default(),
             request_policies: Vec::new(),
+            revoked_tokens: Vec::new(),
             description: String::new(),
             placement_map: Vec::new(),
             strategies: Vec::new(),

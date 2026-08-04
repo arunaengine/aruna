@@ -9,6 +9,15 @@ pub fn bearer_token_hash(token: &str) -> String {
     credential_hash(token)
 }
 
+/// Shape check for a replicated revocation entry, so a realm-wide revocation
+/// set can never be filled with arbitrary strings.
+pub fn valid_token_hash(hash: &str) -> bool {
+    hash.len() == blake3::OUT_LEN * 2
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
