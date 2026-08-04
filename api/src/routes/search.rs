@@ -125,6 +125,9 @@ pub struct GroupsSection {
     pub hits: Vec<GroupHit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// True when the visibility scan stopped at the round cap with more raw
+    /// matches pending before a visible page was filled.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -458,9 +461,10 @@ async fn run_groups(
     let mut hits: Vec<GroupHit> = Vec::new();
     let mut next_cursor: Option<String> = None;
     let mut scan_cursor = cursor;
+    let mut truncated = false;
     // Fill the page across raw scans so a hidden first match cannot become an
     // empty page; the continuation cursor is only ever a visible group's id.
-    'fill: for _ in 0..MAX_GROUP_SCAN_ROUNDS {
+    'fill: for round in 0..MAX_GROUP_SCAN_ROUNDS {
         let output = drive(
             SearchGroupsOperation::new(SearchGroupsInput {
                 query: query.to_string(),
@@ -497,8 +501,17 @@ async fn run_groups(
             Some(key) => scan_cursor = Some(key),
             None => break 'fill,
         }
+        // The round cap stopped the scan while raw matches remain and the page
+        // is not yet full: report truncation instead of a false completion.
+        if round + 1 == MAX_GROUP_SCAN_ROUNDS {
+            truncated = true;
+        }
     }
-    Ok(Some(GroupsSection { hits, next_cursor }))
+    Ok(Some(GroupsSection {
+        hits,
+        next_cursor,
+        truncated,
+    }))
 }
 
 /// Bounds the visibility fill loop so a realm of hidden matches cannot make one
@@ -1045,6 +1058,45 @@ mod tests {
             section.next_cursor.as_deref(),
             Some(fx.groups[0].to_string().as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn caps_report_truncation() {
+        // More hidden matches than the scan cap must report truncation instead of
+        // a false completion with an empty page and no cursor.
+        let fx = setup().await;
+        let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
+        let hidden_owner = UserId::local(Ulid::from_bytes([230u8; 16]), fx.realm_id);
+        let viewer = UserId::local(Ulid::from_bytes([231u8; 16]), fx.realm_id);
+        let hidden_actor = Actor {
+            node_id,
+            user_id: hidden_owner,
+            realm_id: fx.realm_id,
+        };
+        for index in 0..=MAX_GROUP_SCAN_ROUNDS as u8 {
+            let mut bytes = [16u8; 16];
+            bytes[15] = index;
+            seed_group(
+                &fx.state,
+                &hidden_actor,
+                Ulid::from_bytes(bytes),
+                &format!("alpha-hidden-{index}"),
+            )
+            .await;
+        }
+
+        let viewer_auth = AuthContext {
+            user_id: viewer,
+            realm_id: fx.realm_id,
+            path_restrictions: None,
+        };
+        let section = run_groups(&fx.state, &viewer_auth, true, "alpha", 1, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(section.hits.is_empty());
+        assert!(section.next_cursor.is_none());
+        assert!(section.truncated);
     }
 
     #[tokio::test]
