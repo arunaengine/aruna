@@ -163,16 +163,6 @@ fn is_reserved_group_role_name(name: &str) -> bool {
     RESERVED_GROUP_ROLE_NAMES.contains(&name.trim())
 }
 
-/// A group role may only grant on its own group subtree. The pattern must
-/// compile and be the subtree root or literally prefixed by it, so wildcards
-/// cannot reach another group, realm, or admin namespace.
-fn role_path_confined(pattern: &str, subtree_root: &str) -> bool {
-    if aruna_core::permission_path::compile_permission_matcher(pattern).is_err() {
-        return false;
-    }
-    pattern == subtree_root || pattern.starts_with(&format!("{subtree_root}/"))
-}
-
 impl AddGroupRoleOperation {
     pub fn new(input: AddGroupRoleConfig) -> Self {
         AddGroupRoleOperation {
@@ -208,14 +198,13 @@ impl AddGroupRoleOperation {
             return Err(AddGroupRoleError::InvalidPublicRole);
         }
 
-        let subtree_root = format!("/{}/g/{}", self.input.realm_id, self.input.group_id);
-        if self
-            .input
-            .role
-            .permissions
-            .keys()
-            .any(|pattern| !role_path_confined(pattern, &subtree_root))
-        {
+        let subtree_root = aruna_core::permission_path::group_role_subtree_root(
+            self.input.realm_id,
+            self.input.group_id,
+        );
+        if self.input.role.permissions.keys().any(|pattern| {
+            !aruna_core::permission_path::role_path_confined(pattern, &subtree_root)
+        }) {
             return Err(AddGroupRoleError::UnconfinedRolePath);
         }
 

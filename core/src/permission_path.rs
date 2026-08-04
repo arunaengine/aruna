@@ -27,6 +27,24 @@ pub fn permission_pattern_matches(pattern: &str, path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The path subtree a group's roles may grant on.
+pub fn group_role_subtree_root(
+    realm_id: impl std::fmt::Display,
+    group_id: impl std::fmt::Display,
+) -> String {
+    format!("/{realm_id}/g/{group_id}")
+}
+
+/// A group-role permission pattern may only grant on its own group subtree: it
+/// must compile and be the subtree root or literally prefixed by it, so
+/// wildcards cannot reach another group, realm, or admin namespace.
+pub fn role_path_confined(pattern: &str, subtree_root: &str) -> bool {
+    if compile_permission_matcher(pattern).is_err() {
+        return false;
+    }
+    pattern == subtree_root || pattern.starts_with(&format!("{subtree_root}/"))
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RestrictionLimitError {
     #[error("too many path restrictions ({count})")]
