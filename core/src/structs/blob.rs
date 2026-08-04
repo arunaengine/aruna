@@ -737,6 +737,11 @@ pub struct BlobVersion {
     pub created_by: UserId,
     pub state: BlobVersionState,
     pub metadata: HashMap<String, String>,
+    /// The authenticated node that published this version. Set for replicated
+    /// versions so the record is accountable to the asserting node rather than
+    /// only to the manifest's self-asserted `created_by`.
+    #[serde(default)]
+    pub published_by: Option<NodeId>,
 }
 
 impl BlobVersion {
@@ -756,6 +761,7 @@ impl BlobVersion {
                 source,
             },
             metadata: HashMap::new(),
+            published_by: None,
         }
     }
 
@@ -765,6 +771,7 @@ impl BlobVersion {
             created_by,
             state: BlobVersionState::Deleted,
             metadata: HashMap::new(),
+            published_by: None,
         }
     }
 
@@ -784,11 +791,17 @@ impl BlobVersion {
                 last_refresh,
             },
             metadata: HashMap::new(),
+            published_by: None,
         }
     }
 
     pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    pub fn with_publisher(mut self, node_id: NodeId) -> Self {
+        self.published_by = Some(node_id);
         self
     }
 

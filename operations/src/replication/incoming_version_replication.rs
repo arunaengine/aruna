@@ -158,6 +158,9 @@ pub struct IncomingVersionReplicationOperation {
     state: IncomingVersionReplicationState,
     stream_id: Ulid,
     local_node_id: NodeId,
+    /// The authenticated remote peer that pushed this stream, proven at Bao
+    /// ingress. It is the accountable publisher, not the forgeable manifest.
+    publisher_node_id: NodeId,
     local_realm_id: RealmId,
     manifest: VersionReplicationManifest,
     txn_id: Option<Ulid>,
@@ -203,6 +206,9 @@ impl IncomingVersionReplicationOperation {
             state: IncomingVersionReplicationState::Init,
             stream_id,
             local_node_id,
+            // Defaults to the local node; the ingress handler overrides it with
+            // the authenticated remote peer via `with_publisher_node`.
+            publisher_node_id: local_node_id,
             local_realm_id,
             manifest,
             txn_id: None,
@@ -242,6 +248,13 @@ impl IncomingVersionReplicationOperation {
 
     pub fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
         self.rocrate_limits = limits;
+        self
+    }
+
+    /// Binds the authenticated remote peer proven at Bao ingress as the
+    /// accountable publisher of every version this stream writes.
+    pub fn with_publisher_node(mut self, publisher_node_id: NodeId) -> Self {
+        self.publisher_node_id = publisher_node_id;
         self
     }
 
@@ -421,7 +434,8 @@ impl IncomingVersionReplicationOperation {
             self.manifest.created_by,
             self.manifest.created_at,
         )
-        .with_metadata(self.manifest.metadata.clone()))
+        .with_metadata(self.manifest.metadata.clone())
+        .with_publisher(self.publisher_node_id))
     }
 
     fn incoming_logical_bytes(&self) -> Result<u64, IncomingVersionReplicationError> {
@@ -1032,13 +1046,15 @@ impl IncomingVersionReplicationOperation {
                             self.manifest.created_by,
                             self.manifest.source.clone(),
                         )
-                        .with_metadata(self.manifest.metadata.clone()),
+                        .with_metadata(self.manifest.metadata.clone())
+                        .with_publisher(self.publisher_node_id),
                         Some(hash),
                     )
                 }
             }
             ReplicationItemKind::DeleteMarker => (
-                BlobVersion::deleted(self.manifest.created_at, self.manifest.created_by),
+                BlobVersion::deleted(self.manifest.created_at, self.manifest.created_by)
+                    .with_publisher(self.publisher_node_id),
                 None,
             ),
         };
@@ -2574,6 +2590,34 @@ mod tests {
         let usage = op.usage_delta().unwrap();
         assert_eq!(usage.logical_bytes, 0);
         assert_eq!(usage.referenced_bytes, 1_000_000);
+    }
+
+    #[test]
+    fn version_binds_publisher_node() {
+        // A forged manifest cannot forge attribution: the persisted version is
+        // bound to the authenticated publisher, never to its self-asserted user.
+        let publisher = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
+        let forged = UserId::local(Ulid::from_bytes([9u8; 16]), test_realm_id());
+        let mut manifest = make_reference_manifest();
+        manifest.created_by = forged;
+        manifest.auth_context.user_id = forged;
+        manifest.writer_auth_context = None;
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            test_realm_id(),
+            manifest,
+        )
+        .with_publisher_node(publisher);
+        op.txn_id = Some(Ulid::generate());
+
+        let effects = op.write_blob_version();
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected reference version write")
+        };
+        let version = BlobVersion::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(version.published_by, Some(publisher));
+        assert_eq!(version.created_by, forged);
     }
 
     #[test]

@@ -408,7 +408,8 @@ impl InboundEventHandler for OperationsInboundHandler {
                                             manifest,
                                         )
                                         .with_routing(routing)
-                                        .with_rocrate_limits(self.rocrate_limits.clone());
+                                        .with_rocrate_limits(self.rocrate_limits.clone())
+                                        .with_publisher_node(node_id);
                                         match drive(op, self.context.as_ref()).await {
                                             Ok(Ok(result)) => {
                                                 emit_replication_watch(

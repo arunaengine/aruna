@@ -1659,6 +1659,7 @@ impl Operation for ReplicateObjectVersionOperation {
                     created_by,
                     state,
                     metadata,
+                    published_by: _,
                 } = version;
 
                 match state {
