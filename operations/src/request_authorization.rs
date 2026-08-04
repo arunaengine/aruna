@@ -9,6 +9,7 @@ use crate::driver::{DriverContext, drive};
 use crate::request_policy::{
     PolicyEnforcementError, PolicyRequestExtras, enforce_policies, policy_request_with,
 };
+use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{AuthContext, Permission, RealmId};
 use thiserror::Error;
 
@@ -42,7 +43,15 @@ pub async fn authorize(
         context,
     )
     .await
-    .map_err(|error| AuthorizeError::CheckFailed(error.to_string()))?;
+    .map_err(|error| match error {
+        // A missing or malformed target is an authorization failure, not an
+        // internal error, matching the choke points that fed this boundary.
+        AuthorizationError::InvalidRealmId
+        | AuthorizationError::InvalidGroupId
+        | AuthorizationError::GroupNotFound
+        | AuthorizationError::AuthDocNotFound => AuthorizeError::PermissionDenied,
+        other => AuthorizeError::CheckFailed(other.to_string()),
+    })?;
     if !allowed {
         return Err(AuthorizeError::PermissionDenied);
     }
