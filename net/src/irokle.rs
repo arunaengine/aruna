@@ -581,7 +581,8 @@ impl DocumentSyncService {
         // and stop honoring the bootstrap `configured_peers`. The transport
         // whitelist is additive, but `admit_inbound` gates before any read.
         *self.default_peers.write() = peers;
-        self.realm_config_materialized.store(true, Ordering::Release);
+        self.realm_config_materialized
+            .store(true, Ordering::Release);
         self.flush_database()?;
         Ok(())
     }
@@ -6233,7 +6234,8 @@ async fn read_inbound_sync_messages(
     let mut topics = BTreeSet::new();
     let mut bytes_read = 0usize;
     let mut frame_index = 0usize;
-    while let Some(frame) = read_next_inbound_sync_frame(recv, &mut bytes_read, reservation).await? {
+    while let Some(frame) = read_next_inbound_sync_frame(recv, &mut bytes_read, reservation).await?
+    {
         frame_index = frame_index.saturating_add(1);
         if messages.len() >= DOCUMENT_SYNC_INBOUND_SYNC_MESSAGE_LIMIT {
             return Err(NetError::Stream(format!(
@@ -6742,8 +6744,8 @@ mod tests {
         let current = node(52);
         let service = DocumentSyncService::open_with_persist_policy(
             restart_endpoint().await,
-            storage_at(&root.join("storage")),
-            root.join("document-sync"),
+            storage_at(&root.path().join("storage")),
+            root.path().join("document-sync"),
             &[startup],
             vec![Alpn::DocumentSync.as_bytes().to_vec()],
             irokle_crate::net::IrohRuntimeConfig::default(),
