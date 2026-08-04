@@ -1199,27 +1199,7 @@ async fn require_data_read(
     auth: &AuthContext,
     path: String,
 ) -> ServerResult<()> {
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth.clone(),
-            path,
-            required_permission: Permission::READ,
-        }),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|err| match err {
-        AuthorizationError::InvalidRealmId
-        | AuthorizationError::InvalidGroupId
-        | AuthorizationError::GroupNotFound
-        | AuthorizationError::AuthDocNotFound => ServerError::Forbidden,
-        _ => ServerError::InternalError(err.to_string()),
-    })?;
-    if allowed {
-        Ok(())
-    } else {
-        Err(ServerError::Forbidden)
-    }
+    crate::auth::ensure_permission(state, auth, path, Permission::READ).await
 }
 
 async fn list_group_buckets(
