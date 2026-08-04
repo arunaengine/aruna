@@ -351,7 +351,11 @@ pub async fn revoke_s3_credentials(
     crate::auth::ensure_permission(
         &state,
         &auth,
-        blob_group_permission_path(state.get_realm_id(), credential.group_id, state.get_node_id()),
+        blob_group_permission_path(
+            state.get_realm_id(),
+            credential.group_id,
+            state.get_node_id(),
+        ),
         Permission::WRITE,
     )
     .await?;

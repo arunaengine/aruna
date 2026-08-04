@@ -776,9 +776,7 @@ impl AdminDocumentReducerState {
             .and_then(|value| UserId::from_string(value).ok())
     }
 
-    pub fn materialized_group_policies(
-        &self,
-    ) -> Option<Vec<crate::request_policy::RequestPolicy>> {
+    pub fn materialized_group_policies(&self) -> Option<Vec<crate::request_policy::RequestPolicy>> {
         if !matches!(&self.target, AdminDocumentTarget::Group { .. }) {
             return None;
         }

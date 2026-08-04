@@ -57,8 +57,12 @@ fn compiled_set(policies: &[RequestPolicy]) -> Result<Arc<CompiledPolicySet>, Po
     Ok(set)
 }
 
-fn lock(cache: &PolicyProgramCache) -> std::sync::MutexGuard<'_, LruCache<[u8; 32], Arc<CompiledPolicySet>>> {
-    cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+fn lock(
+    cache: &PolicyProgramCache,
+) -> std::sync::MutexGuard<'_, LruCache<[u8; 32], Arc<CompiledPolicySet>>> {
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// A realm and optional group policy set loaded and compiled once so a bulk
@@ -133,7 +137,9 @@ fn group_id_from_path(path: &str) -> Option<GroupId> {
     if segments.next() != Some("g") {
         return None;
     }
-    segments.next().and_then(|value| Ulid::from_string(value).ok())
+    segments
+        .next()
+        .and_then(|value| Ulid::from_string(value).ok())
 }
 
 /// Compiles one scope's policy set, mapping a compile failure to a fail-closed
@@ -312,10 +318,16 @@ mod tests {
         // The DeleteObjects model: one loaded set, each member path decided
         // separately so a path rule can deny one member and allow another.
         let set = compiled_set(&[policy("path.endsWith('/secret')")]).unwrap();
-        let denied =
-            PolicyRequest::basic("/r/g/x/data/secret".to_string(), "write".to_string(), "u".to_string());
-        let allowed =
-            PolicyRequest::basic("/r/g/x/data/public".to_string(), "write".to_string(), "u".to_string());
+        let denied = PolicyRequest::basic(
+            "/r/g/x/data/secret".to_string(),
+            "write".to_string(),
+            "u".to_string(),
+        );
+        let allowed = PolicyRequest::basic(
+            "/r/g/x/data/public".to_string(),
+            "write".to_string(),
+            "u".to_string(),
+        );
         assert!(decide(&set, &denied, "realm").is_err());
         assert!(decide(&set, &allowed, "realm").is_ok());
     }

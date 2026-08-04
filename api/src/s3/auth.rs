@@ -198,7 +198,6 @@ fn header_allowed(name: &str) -> bool {
 }
 
 impl AuthProvider {
-
     /// Anonymous access: object bytes only, addressed to a concrete object, and
     /// allowed only when a public role — one assigned to the Everyone principal
     /// — grants READ on the object permission path. The bucket's own group

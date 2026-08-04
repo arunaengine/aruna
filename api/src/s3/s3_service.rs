@@ -3070,7 +3070,9 @@ impl S3 for ArunaS3Service {
                 &object_path,
                 &Permission::WRITE,
                 Some(&replication_auth.user_id),
-                aruna_operations::request_policy::PolicyRequestExtras::operation("s3.DeleteObjects"),
+                aruna_operations::request_policy::PolicyRequestExtras::operation(
+                    "s3.DeleteObjects",
+                ),
             );
             if !allowed || policy_evaluator.evaluate(&policy_request).is_err() {
                 errors.push(S3DeleteError {

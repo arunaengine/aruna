@@ -271,8 +271,11 @@ impl Operation for SetGroupPoliciesOperation {
             },
             SetGroupPoliciesState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [(_, document_value), (_, reducer_state_value), (_, realm_config_value)] =
-                        values.as_slice()
+                    let [
+                        (_, document_value),
+                        (_, reducer_state_value),
+                        (_, realm_config_value),
+                    ] = values.as_slice()
                     else {
                         return self.unexpected_event(
                             "storage batch read result with group auth doc, admin state, and realm config",
@@ -321,7 +324,8 @@ impl Operation for SetGroupPoliciesOperation {
             SetGroupPoliciesState::CommitTransaction { document } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
-                    self.state = SetGroupPoliciesState::ScheduleDocumentSyncOutboxDrain { document };
+                    self.state =
+                        SetGroupPoliciesState::ScheduleDocumentSyncOutboxDrain { document };
                     smallvec![schedule_outbox_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
@@ -458,9 +462,12 @@ mod tests {
         .unwrap();
         assert_eq!(document.policies, policies);
 
-        let (_, auth_doc) = drive(GetGroupOperation::new(GetGroupConfig { group_id }), &context)
-            .await
-            .unwrap();
+        let (_, auth_doc) = drive(
+            GetGroupOperation::new(GetGroupConfig { group_id }),
+            &context,
+        )
+        .await
+        .unwrap();
         assert_eq!(auth_doc.policies, policies);
     }
 

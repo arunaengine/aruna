@@ -2,8 +2,8 @@ use crate::auth::{ensure_permission, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::request_policy::{
-    CompiledPolicySet, PolicyDecision, PolicyFunctions, PolicyKind, PolicyRequest, PolicyTraceEntry,
-    RequestPolicy, analyze_policy_source, policy_set_hash, validate_policy_set,
+    CompiledPolicySet, PolicyDecision, PolicyFunctions, PolicyKind, PolicyRequest,
+    PolicyTraceEntry, RequestPolicy, analyze_policy_source, policy_set_hash, validate_policy_set,
 };
 use aruna_core::structs::{Actor, AuthContext, Permission};
 use aruna_operations::driver::drive;
@@ -234,10 +234,12 @@ fn set_hash_hex(policies: &[RequestPolicy]) -> String {
 
 fn hex_encode(bytes: &[u8; 32]) -> String {
     use std::fmt::Write;
-    bytes.iter().fold(String::with_capacity(64), |mut out, byte| {
-        let _ = write!(out, "{byte:02x}");
-        out
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 fn policies_response(policies: &[RequestPolicy]) -> PoliciesResponse {
@@ -248,7 +250,12 @@ fn policies_response(policies: &[RequestPolicy]) -> PoliciesResponse {
 }
 
 async fn realm_policies(state: &ServerState) -> ServerResult<Vec<RequestPolicy>> {
-    match drive(GetRealmConfigOperation::new(state.get_realm_id()), &state.get_ctx()).await {
+    match drive(
+        GetRealmConfigOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    {
         Ok(config) => Ok(config.request_policies),
         Err(aruna_operations::get_realm_config::GetRealmConfigError::DocumentNotFound) => {
             Ok(Vec::new())
@@ -258,7 +265,12 @@ async fn realm_policies(state: &ServerState) -> ServerResult<Vec<RequestPolicy>>
 }
 
 async fn group_policies(state: &ServerState, group_id: Ulid) -> ServerResult<Vec<RequestPolicy>> {
-    match drive(GetGroupOperation::new(GetGroupConfig { group_id }), &state.get_ctx()).await {
+    match drive(
+        GetGroupOperation::new(GetGroupConfig { group_id }),
+        &state.get_ctx(),
+    )
+    .await
+    {
         Ok((_, auth_doc)) => Ok(auth_doc.policies),
         Err(
             aruna_operations::get_group::GetGroupError::GroupNotFound
@@ -483,12 +495,15 @@ pub async fn effective_policies(
     if let Some(group_id) = &query.group_id {
         let group_id = parse_group_id(group_id)?;
         let label = format!("group({group_id})");
-        policies.extend(group_policies(&state, group_id).await?.iter().map(|policy| {
-            ScopedPolicy {
-                scope: label.clone(),
-                policy: map_policy(policy),
-            }
-        }));
+        policies.extend(
+            group_policies(&state, group_id)
+                .await?
+                .iter()
+                .map(|policy| ScopedPolicy {
+                    scope: label.clone(),
+                    policy: map_policy(policy),
+                }),
+        );
     }
     Ok((StatusCode::OK, Json(EffectivePoliciesResponse { policies })))
 }
@@ -551,7 +566,10 @@ pub async fn dry_run_policy(
         path: request.path.clone(),
         permission: request.permission.clone(),
         user: request.user.clone().unwrap_or_default(),
-        operation: request.operation.clone().unwrap_or_else(|| "rest".to_string()),
+        operation: request
+            .operation
+            .clone()
+            .unwrap_or_else(|| "rest".to_string()),
         params: request.params.clone().unwrap_or_default(),
         headers: request.headers.clone().unwrap_or_default(),
         body: request.body.clone(),
@@ -839,7 +857,11 @@ mod tests {
         .await
         .unwrap();
         assert!(result.valid);
-        assert!(result.unknown_variables.contains(&"unknown_var".to_string()));
+        assert!(
+            result
+                .unknown_variables
+                .contains(&"unknown_var".to_string())
+        );
         assert!(result.unknown_functions.contains(&"mystery".to_string()));
     }
 

@@ -6,7 +6,9 @@
 
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
-use crate::request_policy::{PolicyEnforcementError, PolicyRequestExtras, enforce_policies, policy_request_with};
+use crate::request_policy::{
+    PolicyEnforcementError, PolicyRequestExtras, enforce_policies, policy_request_with,
+};
 use aruna_core::structs::{AuthContext, Permission, RealmId};
 use thiserror::Error;
 
