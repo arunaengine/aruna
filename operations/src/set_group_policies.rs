@@ -8,7 +8,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::request_policy::{RequestPolicy, validate_policy_set};
+use aruna_core::request_policy::{RequestPolicy, policy_set_hash, validate_policy_set};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
@@ -31,6 +31,9 @@ pub struct SetGroupPoliciesConfig {
     pub actor: Actor,
     pub group_id: GroupId,
     pub policies: Vec<RequestPolicy>,
+    /// When set, the write applies only if the stored set still hashes to it,
+    /// compared inside the write transaction to close the check/use window.
+    pub expected_hash: Option<[u8; 32]>,
 }
 
 /// Replaces a group's deny-only request policy set. Rides the group admin
@@ -76,6 +79,8 @@ pub enum SetGroupPoliciesError {
     AdminDocumentReducerError(#[from] AdminDocumentReducerError),
     #[error("group authorization document missing")]
     GroupAuthDocNotFound,
+    #[error("stored policy set changed")]
+    StaleHash,
     #[error("invalid policy set: {reason}")]
     InvalidPolicies { reason: String },
     #[error("missing active transaction")]
@@ -150,6 +155,12 @@ impl SetGroupPoliciesOperation {
             return Err(SetGroupPoliciesError::GroupAuthDocNotFound);
         };
         let mut document = GroupAuthorizationDocument::from_bytes(&document_value)?;
+
+        if let Some(expected) = self.config.expected_hash
+            && policy_set_hash(&document.policies) != expected
+        {
+            return Err(SetGroupPoliciesError::StaleHash);
+        }
 
         let target = self.admin_target();
         let previous_reducer_state = reducer_state_value
@@ -455,6 +466,7 @@ mod tests {
                 actor: actor.clone(),
                 group_id,
                 policies: policies.clone(),
+                expected_hash: None,
             }),
             &context,
         )
@@ -472,6 +484,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_hash_aborts() {
+        // A concurrent write moves the stored hash; the second write must abort
+        // on its stale expected_hash and leave the first set in place.
+        use aruna_core::request_policy::policy_set_hash;
+        let (_dir, context, actor, group_id) = setup_group().await;
+        let empty_hash = policy_set_hash(&[]);
+        let first = vec![policy("permission == 'write'")];
+        drive(
+            SetGroupPoliciesOperation::new(SetGroupPoliciesConfig {
+                actor: actor.clone(),
+                group_id,
+                policies: first.clone(),
+                expected_hash: Some(empty_hash),
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        let stale = drive(
+            SetGroupPoliciesOperation::new(SetGroupPoliciesConfig {
+                actor: actor.clone(),
+                group_id,
+                policies: vec![policy("permission == 'read'")],
+                expected_hash: Some(empty_hash),
+            }),
+            &context,
+        )
+        .await;
+        assert!(matches!(stale, Err(SetGroupPoliciesError::StaleHash)));
+
+        let (_, auth_doc) = drive(
+            GetGroupOperation::new(GetGroupConfig { group_id }),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(auth_doc.policies, first);
+    }
+
+    #[tokio::test]
     async fn rejects_invalid_set() {
         // An uncompilable expression is refused at administration time.
         let (_dir, context, actor, group_id) = setup_group().await;
@@ -480,6 +533,7 @@ mod tests {
                 actor,
                 group_id,
                 policies: vec![policy("path.startsWith(")],
+                expected_hash: None,
             }),
             &context,
         )

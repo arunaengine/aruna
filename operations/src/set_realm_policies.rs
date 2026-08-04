@@ -8,7 +8,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::request_policy::{RequestPolicy, validate_policy_set};
+use aruna_core::request_policy::{RequestPolicy, policy_set_hash, validate_policy_set};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
@@ -29,6 +29,9 @@ use crate::placement::placement_ref_for_target;
 pub struct SetRealmPoliciesConfig {
     pub actor: Actor,
     pub policies: Vec<RequestPolicy>,
+    /// When set, the write applies only if the stored set still hashes to it,
+    /// compared inside the write transaction to close the check/use window.
+    pub expected_hash: Option<[u8; 32]>,
 }
 
 /// Replaces the realm's deny-only request policy set. Rides the same admin
@@ -74,6 +77,8 @@ pub enum SetRealmPoliciesError {
     AdminDocumentReducerError(#[from] AdminDocumentReducerError),
     #[error("realm config document missing")]
     RealmConfigNotFound,
+    #[error("stored policy set changed")]
+    StaleHash,
     #[error("invalid policy set: {reason}")]
     InvalidPolicies { reason: String },
     #[error("missing active transaction")]
@@ -143,6 +148,12 @@ impl SetRealmPoliciesOperation {
             return Err(SetRealmPoliciesError::RealmConfigNotFound);
         };
         let mut document = RealmConfigDocument::from_bytes(&document_value)?;
+
+        if let Some(expected) = self.config.expected_hash
+            && policy_set_hash(&document.request_policies) != expected
+        {
+            return Err(SetRealmPoliciesError::StaleHash);
+        }
 
         let target = self.admin_target();
         let previous_reducer_state = reducer_state_value
@@ -443,6 +454,7 @@ mod tests {
             SetRealmPoliciesOperation::new(SetRealmPoliciesConfig {
                 actor: actor.clone(),
                 policies: policies.clone(),
+                expected_hash: None,
             }),
             &context,
         )
@@ -457,6 +469,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_hash_aborts() {
+        // A concurrent write moves the stored hash; the second write must abort
+        // on its stale expected_hash and leave the first set in place.
+        use aruna_core::request_policy::policy_set_hash;
+        let (_dir, context, actor) = setup_realm().await;
+        let empty_hash = policy_set_hash(&[]);
+        let first = vec![policy("permission == 'write'")];
+        drive(
+            SetRealmPoliciesOperation::new(SetRealmPoliciesConfig {
+                actor: actor.clone(),
+                policies: first.clone(),
+                expected_hash: Some(empty_hash),
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        let stale = drive(
+            SetRealmPoliciesOperation::new(SetRealmPoliciesConfig {
+                actor: actor.clone(),
+                policies: vec![policy("permission == 'read'")],
+                expected_hash: Some(empty_hash),
+            }),
+            &context,
+        )
+        .await;
+        assert!(matches!(stale, Err(SetRealmPoliciesError::StaleHash)));
+
+        let read = drive(GetRealmConfigOperation::new(actor.realm_id), &context)
+            .await
+            .unwrap();
+        assert_eq!(read.request_policies, first);
+    }
+
+    #[tokio::test]
     async fn rejects_invalid_set() {
         // An uncompilable expression is refused at administration time.
         let (_dir, context, actor) = setup_realm().await;
@@ -464,6 +512,7 @@ mod tests {
             SetRealmPoliciesOperation::new(SetRealmPoliciesConfig {
                 actor,
                 policies: vec![policy("path.startsWith(")],
+                expected_hash: None,
             }),
             &context,
         )

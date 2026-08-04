@@ -232,6 +232,15 @@ fn set_hash_hex(policies: &[RequestPolicy]) -> String {
     hex_encode(&policy_set_hash(policies))
 }
 
+/// Decodes a client-supplied `expected_hash` into the 32-byte digest the set
+/// operations compare inside their write transaction.
+fn parse_expected_hash(hash: &str) -> ServerResult<[u8; 32]> {
+    hex::decode(hash)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or(ServerError::BadRequest)
+}
+
 fn hex_encode(bytes: &[u8; 32]) -> String {
     use std::fmt::Write;
     bytes
@@ -351,14 +360,11 @@ pub async fn set_realm_policies(
         .map(to_request_policy)
         .collect::<ServerResult<Vec<_>>>()?;
 
-    if let Some(expected) = &request.expected_hash {
-        let current = set_hash_hex(&realm_policies(&state).await?);
-        if &current != expected {
-            return Err(ServerError::Conflict(
-                "stored realm policy set changed".to_string(),
-            ));
-        }
-    }
+    let expected_hash = request
+        .expected_hash
+        .as_deref()
+        .map(parse_expected_hash)
+        .transpose()?;
 
     let document = drive(
         SetRealmPoliciesOperation::new(SetRealmPoliciesConfig {
@@ -368,12 +374,16 @@ pub async fn set_realm_policies(
                 realm_id: auth.realm_id,
             },
             policies,
+            expected_hash,
         }),
         &state.get_ctx(),
     )
     .await
     .map_err(|error| match error {
         SetRealmPoliciesError::InvalidPolicies { reason } => ServerError::BadRequestMessage(reason),
+        SetRealmPoliciesError::StaleHash => {
+            ServerError::Conflict("stored realm policy set changed".to_string())
+        }
         other => ServerError::InternalError(other.to_string()),
     })?;
 
@@ -436,14 +446,11 @@ pub async fn set_group_policies(
         .map(to_request_policy)
         .collect::<ServerResult<Vec<_>>>()?;
 
-    if let Some(expected) = &request.expected_hash {
-        let current = set_hash_hex(&group_policies(&state, group_id).await?);
-        if &current != expected {
-            return Err(ServerError::Conflict(
-                "stored group policy set changed".to_string(),
-            ));
-        }
-    }
+    let expected_hash = request
+        .expected_hash
+        .as_deref()
+        .map(parse_expected_hash)
+        .transpose()?;
 
     let document = drive(
         SetGroupPoliciesOperation::new(SetGroupPoliciesConfig {
@@ -454,6 +461,7 @@ pub async fn set_group_policies(
             },
             group_id,
             policies,
+            expected_hash,
         }),
         &state.get_ctx(),
     )
@@ -461,6 +469,9 @@ pub async fn set_group_policies(
     .map_err(|error| match error {
         SetGroupPoliciesError::InvalidPolicies { reason } => ServerError::BadRequestMessage(reason),
         SetGroupPoliciesError::GroupAuthDocNotFound => ServerError::NotFound,
+        SetGroupPoliciesError::StaleHash => {
+            ServerError::Conflict("stored group policy set changed".to_string())
+        }
         other => ServerError::InternalError(other.to_string()),
     })?;
 
@@ -792,7 +803,8 @@ mod tests {
     async fn stale_expected_hash_conflicts() {
         let fx = setup().await;
         let mut request = body("permission == 'write'");
-        request.expected_hash = Some("deadbeef".to_string());
+        // A well-formed but stale digest must abort the write transaction as 409.
+        request.expected_hash = Some("ff".repeat(32));
         let result = set_realm_policies(
             State(fx.state.clone()),
             Extension(Some(fx.admin.clone())),
