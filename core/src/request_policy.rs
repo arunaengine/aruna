@@ -321,6 +321,10 @@ impl CompiledPolicySet {
         self.policies.is_empty()
     }
 
+    pub fn len(&self) -> usize {
+        self.policies.len()
+    }
+
     fn build_context(
         &self,
         request: &PolicyRequest,
@@ -415,6 +419,36 @@ impl CompiledPolicySet {
         }
         TracedDecision { decision, trace }
     }
+}
+
+/// Content address of a policy set, over the fields that change compilation or a
+/// deny message, in order. Any local, replicated, or conflict-driven change
+/// yields a new key so a cached compiled set can never be served stale.
+pub fn policy_set_hash(policies: &[RequestPolicy]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(policies.len() as u64).to_le_bytes());
+    for policy in policies {
+        hasher.update(&policy.policy_id.to_bytes());
+        hasher.update(&[policy.enabled as u8]);
+        hasher.update(&[policy.kind as u8]);
+        match &policy.when {
+            Some(guard) => {
+                hasher.update(&[1]);
+                hash_str(&mut hasher, guard);
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        hash_str(&mut hasher, &policy.expression);
+        hash_str(&mut hasher, &policy.name);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn hash_str(hasher: &mut blake3::Hasher, value: &str) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
 }
 
 fn compile_program(policy: &RequestPolicy, source: &str) -> Result<Program, PolicyCompileError> {
