@@ -9,10 +9,9 @@ pub const MAX_RESTRICTION_PATTERN_BYTES: usize = 512;
 /// Maximum combined byte length of all restriction patterns.
 pub const MAX_RESTRICTIONS_TOTAL_BYTES: usize = 16 * 1024;
 
-/// Compiles a permission path pattern with separator-anchored wildcards: `*`
-/// and `?` never cross `/`, and only `**` spans path segments. This mirrors the
-/// realm/group permission path layout so a pattern scoped to one subtree cannot
-/// leak into a deeper namespace (globset's default lets `*` cross `/`).
+/// Compiles a permission path pattern with separator-anchored wildcards: `*` and
+/// `?` never cross `/`, only `**` spans segments, so a pattern scoped to one
+/// subtree cannot leak into a deeper namespace (globset default lets `*` cross).
 pub fn compile_permission_matcher(pattern: &str) -> Result<GlobMatcher, globset::Error> {
     Ok(globset::GlobBuilder::new(pattern)
         .literal_separator(true)

@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 pub fn oidc_subject_key(issuer: &str, subject_id: &str) -> Result<String, ConversionError> {
     use base64::Engine;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(crate::keys::oidc_subject_index_key(issuer, subject_id)))
+        .encode(crate::keys::oidc_subject_key(issuer, subject_id)))
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]

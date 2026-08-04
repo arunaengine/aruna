@@ -42,7 +42,7 @@ pub fn dht_key_from_domain(domain: &[u8], input: &[u8]) -> DhtKeyId {
 /// subject out of the plaintext keyspace while staying collision resistant.
 #[must_use]
 #[inline]
-pub fn oidc_subject_index_key(issuer: &str, subject_id: &str) -> [u8; 32] {
+pub fn oidc_subject_key(issuer: &str, subject_id: &str) -> [u8; 32] {
     let mut input = Vec::with_capacity(issuer.len() + subject_id.len() + 1);
     input.extend_from_slice(issuer.as_bytes());
     input.push(0);

@@ -77,7 +77,7 @@ impl OperationsInboundHandler {
     /// Blob replication is trusted only from realm nodes eligible to hold and
     /// sync data; unknown or user-kind peers are rejected. Fails closed when
     /// the realm config cannot be read.
-    async fn peer_is_sync_eligible(&self, realm_id: RealmId, peer: NodeId) -> bool {
+    async fn peer_sync_eligible(&self, realm_id: RealmId, peer: NodeId) -> bool {
         match drive(
             GetRealmConfigOperation::new(realm_id),
             self.context.as_ref(),
@@ -353,7 +353,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                         // #332: only an authenticated sync-eligible realm peer
                         // may open the blob replication plane at all.
                         if !self
-                            .peer_is_sync_eligible(*net_handle.realm_id(), node_id)
+                            .peer_sync_eligible(*net_handle.realm_id(), node_id)
                             .await
                         {
                             warn!(peer = %node_id, "Rejecting bao stream from non-sync-eligible peer");
@@ -811,10 +811,10 @@ mod tests {
             JobsRuntime::new(),
         );
 
-        assert!(handler.peer_is_sync_eligible(realm_id, server).await);
-        assert!(!handler.peer_is_sync_eligible(realm_id, user).await);
+        assert!(handler.peer_sync_eligible(realm_id, server).await);
+        assert!(!handler.peer_sync_eligible(realm_id, user).await);
         let unknown = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
-        assert!(!handler.peer_is_sync_eligible(realm_id, unknown).await);
+        assert!(!handler.peer_sync_eligible(realm_id, unknown).await);
     }
 
     #[tokio::test]
