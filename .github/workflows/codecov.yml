@@ -17,6 +17,9 @@ jobs:
     name: Generate Coverage Report
     environment: coverage
     runs-on: ubuntu-latest
+    # Hang cap, not a performance budget. The instrumented build is several times
+    # slower than the plain suite, so this ceiling is higher than the CI tests job.
+    timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0

@@ -22,6 +22,9 @@ env:
 jobs:
   tests:
     runs-on: ubuntu-latest
+    # Hang cap, not a performance budget: far above the minutes a healthy run
+    # takes, so only a deadlocked or unbounded-wait test trips it.
+    timeout-minutes: 45
 
     steps:
       - name: Check out repository
@@ -43,6 +46,8 @@ jobs:
 
   s3-backend:
     runs-on: ubuntu-latest
+    # Hang cap for the MinIO-backed suite, not a performance budget.
+    timeout-minutes: 30
 
     steps:
       - name: Check out repository
