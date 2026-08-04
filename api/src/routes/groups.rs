@@ -1,4 +1,4 @@
-use crate::auth::require_realm_auth;
+use crate::auth::{ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::UserId;
@@ -784,6 +784,19 @@ pub async fn add_group_member(
     let group_id = parse_group_id(&group_id)?;
     let user_id = parse_member_user_id(&request.user_id)?;
 
+    ensure_permission(
+        &state,
+        &auth,
+        format!(
+            "/{}/g/{}/admin/users/{}",
+            state.get_realm_id(),
+            group_id,
+            user_id
+        ),
+        Permission::WRITE,
+    )
+    .await?;
+
     let role_ids: HashSet<Ulid> = match &request.role_ids {
         Some(role_ids) if !role_ids.is_empty() => role_ids
             .iter()
@@ -859,6 +872,22 @@ pub async fn remove_group_member(
         .map(|role_id| parse_role_id(role_id).map(|role_id| HashSet::from([role_id])))
         .transpose()?;
 
+    // Self-leave via this endpoint needs no admin permission, matching the operation.
+    if user_id != auth.user_id {
+        ensure_permission(
+            &state,
+            &auth,
+            format!(
+                "/{}/g/{}/admin/users/{}",
+                state.get_realm_id(),
+                group_id,
+                user_id
+            ),
+            Permission::WRITE,
+        )
+        .await?;
+    }
+
     drive(
         RemoveUserFromGroupOperation::new(RemoveUserFromGroupInput {
             actor: actor_for(&state, &auth),
@@ -933,6 +962,14 @@ pub async fn create_group_role(
     let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
     let realm_id = state.get_realm_id();
+
+    ensure_permission(
+        &state,
+        &auth,
+        format!("/{realm_id}/g/{group_id}/admin"),
+        Permission::WRITE,
+    )
+    .await?;
 
     let name = request.name.trim().to_string();
     if name.is_empty() || matches!(name.as_str(), "admin" | "user") {
@@ -1025,6 +1062,14 @@ pub async fn delete_group_role(
     let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
     let role_id = parse_role_id(&role_id)?;
+
+    ensure_permission(
+        &state,
+        &auth,
+        format!("/{}/g/{}/admin", state.get_realm_id(), group_id),
+        Permission::WRITE,
+    )
+    .await?;
 
     drive(
         RemoveGroupRoleOperation::new(RemoveGroupRoleConfig {
@@ -2033,5 +2078,86 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(ServerError::Unauthorized)));
+    }
+
+    #[tokio::test]
+    async fn policy_denies_role() {
+        // A group deny policy on the admin path blocks role creation with 403
+        // and emits no role, even for the group owner.
+        let (state, _tempdir) = setup_state().await;
+        let realm_id = state.get_realm_id();
+        let owner = UserId::local(Ulid::generate(), realm_id);
+        store_user(&state, owner, "Owner").await;
+        let group_id = Ulid::generate();
+
+        let mut auth_doc =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        auth_doc.policies = vec![aruna_core::request_policy::RequestPolicy {
+            policy_id: Ulid::generate(),
+            name: "no-writes".to_string(),
+            kind: aruna_core::request_policy::PolicyKind::Deny,
+            when: None,
+            expression: "permission == 'write'".to_string(),
+            enabled: true,
+        }];
+        let group = Group {
+            display_name: "Test".to_string(),
+            group_id,
+            realm_id,
+            roles: auth_doc.roles.keys().copied().collect(),
+            owner,
+        };
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: owner,
+            realm_id,
+        };
+        store_bytes(
+            &state,
+            GROUP_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            group.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        store_bytes(
+            &state,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            auth_doc.to_bytes(&actor).unwrap(),
+        )
+        .await;
+
+        let result = super::create_group_role(
+            State(state.clone()),
+            Extension(Some(member_auth(owner))),
+            Path(group_id.to_string()),
+            Json(super::CreateGroupRoleRequest {
+                name: "readers".to_string(),
+                permissions: HashMap::from([(
+                    format!("/{realm_id}/g/{group_id}/data/**"),
+                    "read".to_string(),
+                )]),
+                assigned_users: Vec::new(),
+                public: false,
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::Forbidden)));
+
+        let value = match state
+            .get_ctx()
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: AUTH_KEYSPACE.to_string(),
+                key: ByteView::from(group_id.to_bytes().to_vec()),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value.unwrap(),
+            other => panic!("unexpected read result: {other:?}"),
+        };
+        let stored = GroupAuthorizationDocument::from_bytes(&value).unwrap();
+        assert_eq!(stored.roles.len(), auth_doc.roles.len());
     }
 }
