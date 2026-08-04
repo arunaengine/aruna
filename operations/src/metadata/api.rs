@@ -1777,7 +1777,19 @@ async fn ensure_record_readable(
     record: &MetadataRegistryRecord,
 ) -> Result<(), MetadataApiError> {
     if record.public {
-        return Ok(());
+        // Deny-only policies still constrain public reads.
+        return crate::request_policy::enforce_policies(
+            context,
+            realm_id,
+            &crate::request_policy::policy_request_with(
+                &record.permission_path,
+                &Permission::READ,
+                auth.map(|auth| &auth.user_id),
+                crate::request_policy::PolicyRequestExtras::operation("metadata.read"),
+            ),
+        )
+        .await
+        .map_err(|_| MetadataApiError::Forbidden);
     }
     // Read-by-id must not distinguish an unreadable record from an absent one:
     // present-but-unreadable, including anonymous callers, maps to NotFound so
@@ -1809,7 +1821,19 @@ async fn can_read_record(
     record: &MetadataRegistryRecord,
 ) -> Result<bool, MetadataApiError> {
     if record.public {
-        return Ok(true);
+        let allowed = crate::request_policy::enforce_policies(
+            context,
+            realm_id,
+            &crate::request_policy::policy_request_with(
+                &record.permission_path,
+                &Permission::READ,
+                auth.map(|auth| &auth.user_id),
+                crate::request_policy::PolicyRequestExtras::operation("metadata.read"),
+            ),
+        )
+        .await
+        .is_ok();
+        return Ok(allowed);
     }
     let Some(auth) = auth.cloned() else {
         return Ok(false);
@@ -1820,18 +1844,18 @@ async fn can_read_record(
 
     match aruna_core::telemetry::time_stage(
         "permission",
-        drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: auth,
-                path: record.permission_path.clone(),
-                required_permission: Permission::READ,
-            }),
+        crate::request_authorization::authorize(
             context,
+            realm_id,
+            &auth,
+            &record.permission_path,
+            &Permission::READ,
+            crate::request_policy::PolicyRequestExtras::operation("metadata.read"),
         ),
     )
     .await
     {
-        Ok(allowed) => Ok(allowed),
+        Ok(()) => Ok(true),
         Err(_) => Ok(false),
     }
 }
