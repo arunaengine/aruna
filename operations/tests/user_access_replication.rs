@@ -19,10 +19,10 @@ use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
-use tokio::time::{Instant, sleep};
 use ulid::Ulid;
 
-const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
+mod convergence;
+use convergence::wait_for_convergence;
 
 struct TestNode {
     _temp_dir: TempDir,
@@ -106,8 +106,7 @@ async fn wait_for_access(
     access_key: &str,
     predicate: impl Fn(&aruna_core::structs::UserAccess) -> bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
+    wait_for_convergence("user access did not converge before timeout", || async {
         if let Ok(Some(Ok(access))) = drive(
             GetUserAccessOperation::new(access_key.to_string()),
             node.context.as_ref(),
@@ -115,13 +114,11 @@ async fn wait_for_access(
         .await
             && predicate(&access)
         {
-            return Ok(());
+            return Ok(0);
         }
-        if Instant::now() >= deadline {
-            return Err("user access did not converge before timeout".into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+        Ok(1)
+    })
+    .await
 }
 
 async fn build_realm_nodes(

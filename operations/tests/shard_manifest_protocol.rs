@@ -1,7 +1,6 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use aruna_core::StructuredId;
 use aruna_core::document::{DocumentSyncTarget, ShardManifest};
@@ -32,8 +31,10 @@ use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
-use tokio::time::sleep;
 use ulid::Ulid;
+
+mod convergence;
+use convergence::wait_for_convergence;
 
 struct TestNode {
     _temp_dir: TempDir,
@@ -356,17 +357,14 @@ async fn wait_for_manifest_entry(
     placement: PlacementRef,
     target: &DocumentSyncTarget,
 ) -> Result<ShardManifest, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
+    wait_for_convergence("timed out waiting for manifest entry", || async {
         let manifest = assemble_shard_manifest(node.context.as_ref(), realm_id, placement).await?;
-        if manifest.entries.iter().any(|entry| &entry.target == target) {
-            return Ok(manifest);
-        }
-        if Instant::now() >= deadline {
-            return Err("timed out waiting for manifest entry".into());
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
+        Ok::<_, Box<dyn std::error::Error>>(usize::from(
+            !manifest.entries.iter().any(|entry| &entry.target == target),
+        ))
+    })
+    .await?;
+    Ok(assemble_shard_manifest(node.context.as_ref(), realm_id, placement).await?)
 }
 
 async fn build_realm_nodes(
@@ -499,9 +497,8 @@ async fn wait_for_realm_node_convergence(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let expected: std::collections::HashSet<NodeId> =
         nodes.iter().map(|node| node.net.node_id()).collect();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let mut converged = true;
+    wait_for_convergence("realm nodes did not converge", || async {
+        let mut pending = 0;
         for node in nodes {
             match drive(
                 GetRealmNodesOperation::new(*realm_id),
@@ -510,20 +507,12 @@ async fn wait_for_realm_node_convergence(
             .await
             {
                 Ok(realm_nodes) if realm_nodes == expected => {}
-                _ => {
-                    converged = false;
-                    break;
-                }
+                _ => pending += 1,
             }
         }
-        if converged {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("realm nodes did not converge".into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+        Ok(pending)
+    })
+    .await
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {

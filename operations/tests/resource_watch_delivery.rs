@@ -42,15 +42,12 @@ use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
-use tokio::time::Instant;
 use tokio::time::sleep;
 use ulid::Ulid;
 
-// Positive delivery waits poll to a condition; the ceiling only bounds a
-// genuine hang. Delivery measures single-digit seconds, but a loaded CI runner
-// can stall consecutive peer syncs for the full 30s peer-sync timeout each, so
-// the backstop is 2-3x that timeout, not the expected latency.
-const POLL_TIMEOUT: Duration = Duration::from_secs(120);
+mod convergence;
+use convergence::wait_for_convergence;
+
 const LIST_LIMIT: usize = LIST_NOTIFICATIONS_MAX_LIMIT;
 // Interest publication is debounced by 2s, so a few seconds comfortably bounds
 // the window an erroneous delivery would need to land in for negative assertions.
@@ -128,7 +125,7 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
     emit_resource_watch_event(nodes[1].context.as_ref(), event).await;
 
     let expected_id = watch_notification_id(event_id, subscription.watch_id);
-    wait_for(POLL_TIMEOUT, || {
+    wait_for(|| {
         let node_c = &nodes[2];
         async move {
             list_via(node_c, watcher)
@@ -246,7 +243,7 @@ async fn same_node_delivery() -> Result<(), Box<dyn std::error::Error>> {
     emit_resource_watch_event(nodes[0].context.as_ref(), event).await;
 
     let expected_id = watch_notification_id(event_id, subscription.watch_id);
-    wait_for(POLL_TIMEOUT, || async {
+    wait_for(|| async {
         list_via(&nodes[0], watcher)
             .await
             .iter()
@@ -269,7 +266,7 @@ async fn same_node_delivery() -> Result<(), Box<dyn std::error::Error>> {
 
     // Deleting through the creating node retracts its local registration.
     delete_watch_via(&nodes[0], watcher, subscription.watch_id).await?;
-    wait_for(POLL_TIMEOUT, || async {
+    wait_for(|| async {
         list_watches_for_user(nodes[0].context.as_ref(), nodes[0].net.node_id(), watcher)
             .await
             .is_ok_and(|rows| rows.is_empty())
@@ -379,7 +376,7 @@ async fn self_event_delivers() -> Result<(), Box<dyn std::error::Error>> {
     emit_resource_watch_event(nodes[1].context.as_ref(), event).await;
 
     let expected_id = watch_notification_id(event_id, subscription.watch_id);
-    wait_for(POLL_TIMEOUT, || async {
+    wait_for(|| async {
         list_via(&nodes[2], watcher)
             .await
             .iter()
@@ -523,7 +520,7 @@ async fn subscription_survives_inbox_holder_rerank() -> Result<(), Box<dyn std::
     )
     .await?;
     let old_holder_node = node_by_id(&nodes, old_holder);
-    wait_for(POLL_TIMEOUT, || async {
+    wait_for(|| async {
         list_watch_subscriptions(&old_holder_node.context.storage_handle, watcher)
             .await
             .is_ok_and(|rows| rows.contains(&subscription))
@@ -531,10 +528,8 @@ async fn subscription_survives_inbox_holder_rerank() -> Result<(), Box<dyn std::
     .await?;
     // The row and outbox record commit atomically; wait until the record has
     // published into topic history before changing which node holds the inbox.
-    wait_for(POLL_TIMEOUT, || async {
-        iter_len(old_holder_node, DOCUMENT_SYNC_OUTBOX_KEYSPACE).await == 0
-    })
-    .await?;
+    wait_for(|| async { iter_len(old_holder_node, DOCUMENT_SYNC_OUTBOX_KEYSPACE).await == 0 })
+        .await?;
 
     install_config_document(&nodes, realm_id, &full_config).await?;
     let new_holder_node = node_by_id(&nodes, new_holder);
@@ -563,13 +558,13 @@ async fn subscription_survives_inbox_holder_rerank() -> Result<(), Box<dyn std::
         mark_watch_interest_dirty(node.context.as_ref(), realm_id).await?;
     }
 
-    wait_for(POLL_TIMEOUT, || async {
+    wait_for(|| async {
         list_watch_subscriptions(&new_holder_node.context.storage_handle, watcher)
             .await
             .is_ok_and(|rows| rows.contains(&subscription))
     })
     .await?;
-    wait_for(POLL_TIMEOUT, || async {
+    wait_for(|| async {
         nodes[1].net.watch_interest_snapshot().matching_nodes(
             realm_id,
             &probe,
@@ -600,7 +595,7 @@ async fn subscription_survives_inbox_holder_rerank() -> Result<(), Box<dyn std::
     )
     .await;
     let expected_id = watch_notification_id(event_id, subscription.watch_id);
-    wait_for(POLL_TIMEOUT, || async {
+    wait_for(|| async {
         list_via(&nodes[0], watcher)
             .await
             .iter()
@@ -609,7 +604,7 @@ async fn subscription_survives_inbox_holder_rerank() -> Result<(), Box<dyn std::
     .await?;
 
     delete_watch_via(&nodes[0], watcher, subscription.watch_id).await?;
-    wait_for(POLL_TIMEOUT, || async {
+    wait_for(|| async {
         list_watches_for_user(nodes[1].context.as_ref(), nodes[1].net.node_id(), watcher)
             .await
             .is_ok_and(|rows| rows.is_empty())
@@ -691,7 +686,7 @@ async fn wait_for_holder(
     holder: NodeId,
     present: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    wait_for(POLL_TIMEOUT, || async {
+    wait_for(|| async {
         node.net
             .watch_interest_snapshot()
             .matching_nodes(realm_id, probe_path, kind)
@@ -964,7 +959,7 @@ async fn bootstrap_watch_interest_topic(
         // next node writes so concurrent outbox drains cannot race topic setup.
         let key = watch_interest_node_key(realm_id, node_id);
         for peer in nodes {
-            wait_for(POLL_TIMEOUT, || async {
+            wait_for(|| async {
                 read_watch_interest_digest(peer, key.clone())
                     .await
                     .is_some()
@@ -994,24 +989,15 @@ async fn read_watch_interest_digest(node: &TestNode, key: Vec<u8>) -> Option<Wat
     }
 }
 
-async fn wait_for<F, Fut>(
-    timeout: Duration,
-    mut condition: F,
-) -> Result<(), Box<dyn std::error::Error>>
+async fn wait_for<F, Fut>(condition: F) -> Result<(), Box<dyn std::error::Error>>
 where
-    F: FnMut() -> Fut,
+    F: Fn() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if condition().await {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("condition not met before deadline".into());
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
+    wait_for_convergence("condition not met before deadline", || async {
+        Ok(usize::from(!condition().await))
+    })
+    .await
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {

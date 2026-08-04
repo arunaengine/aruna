@@ -17,10 +17,12 @@
 
 #![allow(dead_code)]
 
+#[path = "../convergence/mod.rs"]
+mod convergence;
+
 use aruna_core::keys::generate_signing_key;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
 use aruna_core::document::DocumentSyncTarget;
@@ -56,14 +58,11 @@ use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use tempfile::TempDir;
-use tokio::time::{Instant, sleep};
 use ulid::Ulid;
 
-pub type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
+use convergence::{hang_cap, wait_for_convergence};
 
-/// Lost-progress detection, not a speed limit: one queue retry alone backs off
-/// to 30s, and an instrumented run is several times slower than a plain one.
-pub const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
+pub type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 /// Two stable locations, so `distinct_locations` strategies stay satisfiable
 /// and location ranking is exercised rather than degenerate.
@@ -134,13 +133,16 @@ impl Topology {
         mesh(&nodes).await;
 
         for node in &nodes {
-            drive(
-                AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
-                    realm_id,
-                    node_id: node.node_id(),
-                    schedule_refresh: true,
-                }),
-                node.context.as_ref(),
+            hang_cap(
+                "announce realm presence",
+                drive(
+                    AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+                        realm_id,
+                        node_id: node.node_id(),
+                        schedule_refresh: true,
+                    }),
+                    node.context.as_ref(),
+                ),
             )
             .await?;
         }
@@ -225,32 +227,33 @@ impl Topology {
     /// node. The holder of a forwarded write re-runs the caller's permission check
     /// against this group's authorization document, read from its own keyspace.
     pub async fn seed_group(&self) -> TestResult<Ulid> {
-        let (group, _auth) = drive(
-            CreateGroupOperation::new(CreateGroupConfig {
-                actor: self.actor(self.node(0)),
-                display_name: "topology group".to_string(),
-                owner_cap: None,
-            }),
-            self.node(0).context.as_ref(),
+        let (group, _auth) = hang_cap(
+            "seed_group create",
+            drive(
+                CreateGroupOperation::new(CreateGroupConfig {
+                    actor: self.actor(self.node(0)),
+                    display_name: "topology group".to_string(),
+                    owner_cap: None,
+                }),
+                self.node(0).context.as_ref(),
+            ),
         )
         .await?;
 
-        let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-        loop {
-            let mut pending = false;
-            for node in self.nodes.iter().filter(|node| node.is_sync_eligible()) {
-                if read_group_auth(node, group.group_id).await?.is_none() {
-                    pending = true;
+        wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+            "the seeded group never reached every sync-eligible node",
+            || async {
+                let mut pending = 0;
+                for node in self.nodes.iter().filter(|node| node.is_sync_eligible()) {
+                    if read_group_auth(node, group.group_id).await?.is_none() {
+                        pending += 1;
+                    }
                 }
-            }
-            if !pending {
-                return Ok(group.group_id);
-            }
-            if Instant::now() >= deadline {
-                return Err("the seeded group never reached every sync-eligible node".into());
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
+                Ok(pending)
+            },
+        )
+        .await?;
+        Ok(group.group_id)
     }
 
     /// The bucket a create on `origin` stamps (D3): the best-ranked bucket the
@@ -394,7 +397,7 @@ impl Topology {
 
     pub async fn shutdown(self) {
         for node in self.nodes {
-            node.net.shutdown().await;
+            hang_cap("node shutdown", node.net.shutdown()).await;
         }
     }
 }
@@ -550,34 +553,35 @@ async fn install_realm_config(
     // genesis, so without this every write onto a bucket defers forever. A node
     // whose rank-0 co-holder has not minted one yet leaves it for the next pass, so
     // run until the reconciler reports clean rather than a fixed number of passes.
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
-        for node in nodes {
-            aruna_operations::startup::restore_shard_subscriptions(
-                &node.context,
-                node.node_id(),
-                realm_id,
-            )
-            .await;
-        }
-        let mut retry = false;
-        for node in nodes {
-            retry |= aruna_operations::process_placements::process_shard_placements(
-                &node.context,
-                realm_id,
-                node.node_id(),
-            )
-            .await
-            .retry_scheduled;
-        }
-        if !retry {
-            return Ok(config);
-        }
-        if Instant::now() >= deadline {
-            return Err("shard placement reconciliation never reported clean".into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "shard placement reconciliation never reported clean",
+        || async {
+            for node in nodes {
+                aruna_operations::startup::restore_shard_subscriptions(
+                    &node.context,
+                    node.node_id(),
+                    realm_id,
+                )
+                .await;
+            }
+            let mut pending = 0;
+            for node in nodes {
+                if aruna_operations::process_placements::process_shard_placements(
+                    &node.context,
+                    realm_id,
+                    node.node_id(),
+                )
+                .await
+                .retry_scheduled
+                {
+                    pending += 1;
+                }
+            }
+            Ok(pending)
+        },
+    )
+    .await?;
+    Ok(config)
 }
 
 async fn write(node: &TestNode, key_space: &str, key: Vec<u8>, value: Vec<u8>) -> TestResult<()> {
@@ -638,42 +642,26 @@ async fn read_realm_config(node: &TestNode, realm_id: RealmId) -> TestResult<Rea
 
 async fn wait_for_realm_nodes(nodes: &[TestNode], realm_id: RealmId) -> TestResult<()> {
     let expected: HashSet<NodeId> = nodes.iter().map(TestNode::node_id).collect();
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
-        let mut converged = true;
+    wait_for_convergence("realm nodes did not converge", || async {
+        let mut pending = 0;
         for node in nodes {
             match drive(GetRealmNodesOperation::new(realm_id), node.context.as_ref()).await {
                 Ok(realm_nodes) if realm_nodes == expected => {}
-                _ => {
-                    converged = false;
-                    break;
-                }
+                _ => pending += 1,
             }
         }
-        if converged {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("realm nodes did not converge".into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+        Ok(pending)
+    })
+    .await
 }
 
-/// Polls `predicate` until it holds or the convergence budget expires.
+/// Polls `predicate` until it holds, resilient to a slow-but-converging run via
+/// the shared lost-progress wait rather than a fixed wall-clock budget.
 pub async fn wait_until<F, Fut>(label: &str, node_id: NodeId, predicate: F) -> TestResult<()>
 where
     F: Fn() -> Fut,
     Fut: Future<Output = bool>,
 {
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
-        if predicate().await {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(format!("{label} did not converge on node {node_id}").into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+    let context = format!("{label} did not converge on node {node_id}");
+    wait_for_convergence(&context, || async { Ok(usize::from(!predicate().await)) }).await
 }

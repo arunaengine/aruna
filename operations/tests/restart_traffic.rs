@@ -37,12 +37,9 @@ use ulid::Ulid;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-// Realm-node and document convergence poll to a condition; the ceilings only
-// bound a genuine hang. Convergence measures single-digit seconds, but a
-// loaded CI runner can stall consecutive peer syncs for the full 30s peer-sync
-// timeout each, so the backstop is 2-3x that timeout, not the expected latency.
-const SETUP_TIMEOUT: Duration = Duration::from_secs(120);
-const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
+mod convergence;
+use convergence::{HANG_CAP, NO_PROGRESS_TIMEOUT, wait_for_convergence};
+
 const PROJECTION_BATCH: usize = 32;
 const SEED_DOCUMENTS: usize = 500;
 
@@ -117,13 +114,7 @@ async fn restart_traffic_body() -> Result<(), BoxError> {
         .take(40)
         .map(|(group_id, document_id)| (*group_id, *document_id))
         .collect();
-    wait_for_any_visibility(
-        &nodes[2].context,
-        &sample,
-        Duration::from_millis(200),
-        CONVERGENCE_TIMEOUT,
-    )
-    .await?;
+    wait_for_any_visibility(&nodes[2].context, &sample).await?;
     println!(
         "seeded {} docs, node 2 holds replicated state",
         created.len()
@@ -184,13 +175,7 @@ async fn restart_traffic_body() -> Result<(), BoxError> {
     })
     .await?;
     let contexts: Vec<Arc<DriverContext>> = nodes.iter().map(|node| node.context.clone()).collect();
-    wait_for_visibility(
-        &contexts,
-        &fresh,
-        Duration::from_millis(200),
-        CONVERGENCE_TIMEOUT,
-    )
-    .await?;
+    wait_for_visibility(&contexts, &fresh, Duration::from_millis(200)).await?;
     println!("fresh write converged to all nodes after restart");
 
     shutdown_nodes(nodes).await;
@@ -230,7 +215,7 @@ impl AuxRuntime {
     async fn shutdown(mut self) -> Result<(), BoxError> {
         if let Some(runtime) = self.0.take() {
             let shutdown = tokio::task::spawn_blocking(move || drop(runtime));
-            tokio::time::timeout(CONVERGENCE_TIMEOUT, shutdown)
+            tokio::time::timeout(HANG_CAP, shutdown)
                 .await
                 .map_err(|_| "aux runtime shutdown timed out")?
                 .map_err(|error| format!("aux runtime shutdown failed: {error}"))?;
@@ -328,15 +313,17 @@ async fn flush_projection_batches(
     Ok(())
 }
 
+// Keeps per-node pruning, but fails on a lost-progress window rather than a fixed
+// budget so a slow-but-converging run is not flunked.
 async fn wait_for_visibility(
     contexts: &[Arc<DriverContext>],
     pairs: &[(GroupId, Ulid)],
     poll_interval: Duration,
-    timeout: Duration,
 ) -> Result<(), BoxError> {
-    let t0 = Instant::now();
     let mut remaining: Vec<Vec<(GroupId, Ulid)>> =
         contexts.iter().map(|_| pairs.to_vec()).collect();
+    let mut best = usize::MAX;
+    let mut deadline = Instant::now() + NO_PROGRESS_TIMEOUT;
 
     loop {
         for (context, missing) in contexts.iter().zip(remaining.iter_mut()) {
@@ -354,12 +341,17 @@ async fn wait_for_visibility(
             }
             *missing = still_missing;
         }
-        if remaining.iter().all(Vec::is_empty) {
+        let pending: usize = remaining.iter().map(Vec::len).sum();
+        if pending == 0 {
             return Ok(());
         }
-        if t0.elapsed() > timeout {
+        if pending < best {
+            best = pending;
+            deadline = Instant::now() + NO_PROGRESS_TIMEOUT;
+        }
+        if Instant::now() >= deadline {
             let counts: Vec<usize> = remaining.iter().map(Vec::len).collect();
-            return Err(format!("visibility timeout; missing per node: {counts:?}").into());
+            return Err(format!("visibility stalled; missing per node: {counts:?}").into());
         }
         sleep(poll_interval).await;
     }
@@ -368,27 +360,25 @@ async fn wait_for_visibility(
 async fn wait_for_any_visibility(
     context: &Arc<DriverContext>,
     pairs: &[(GroupId, Ulid)],
-    poll_interval: Duration,
-    timeout: Duration,
 ) -> Result<(), BoxError> {
-    let t0 = Instant::now();
-    loop {
-        for &(group_id, document_id) in pairs {
-            if drive(
-                GetMetadataDocumentOperation::new(group_id, document_id),
-                context.as_ref(),
-            )
-            .await
-            .is_ok()
-            {
-                return Ok(());
+    wait_for_convergence(
+        "visibility timeout; no sampled documents visible",
+        || async {
+            for &(group_id, document_id) in pairs {
+                if drive(
+                    GetMetadataDocumentOperation::new(group_id, document_id),
+                    context.as_ref(),
+                )
+                .await
+                .is_ok()
+                {
+                    return Ok(0);
+                }
             }
-        }
-        if t0.elapsed() > timeout {
-            return Err("visibility timeout; no sampled documents visible".into());
-        }
-        sleep(poll_interval).await;
-    }
+            Ok(1)
+        },
+    )
+    .await
 }
 
 async fn spawn_node(realm_id: RealmId) -> Result<TestNode, BoxError> {
@@ -535,10 +525,8 @@ async fn wait_for_realm_node_convergence(
 ) -> Result<(), BoxError> {
     let expected: std::collections::HashSet<_> =
         nodes.iter().map(|node| node.net.node_id()).collect();
-    let deadline = Instant::now() + SETUP_TIMEOUT;
-
-    loop {
-        let mut converged = true;
+    wait_for_convergence("realm nodes did not converge", || async {
+        let mut pending = 0;
         for node in nodes {
             match drive(
                 GetRealmNodesOperation::new(*realm_id),
@@ -547,20 +535,12 @@ async fn wait_for_realm_node_convergence(
             .await
             {
                 Ok(realm_nodes) if realm_nodes == expected => {}
-                _ => {
-                    converged = false;
-                    break;
-                }
+                _ => pending += 1,
             }
         }
-        if converged {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("realm nodes did not converge".into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+        Ok(pending)
+    })
+    .await
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {
