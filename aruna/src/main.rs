@@ -412,6 +412,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         driver_ctx.clone(),
         config.realm_id,
         config.node_id,
+        aruna_core::credential_seal::CredentialSealKey::derive(&config.node_state.net_secret_key),
         config.rocrate_limits.clone(),
         cors,
         metrics.clone(),

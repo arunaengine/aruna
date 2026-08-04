@@ -184,7 +184,10 @@ fn build_s3_service(
 }
 
 impl S3Server {
-    #[tracing::instrument(level = "trace", skip(address, hostname, driver_ctx, metrics))]
+    #[tracing::instrument(
+        level = "trace",
+        skip(address, hostname, driver_ctx, seal_key, metrics)
+    )]
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         address: impl Into<String> + Copy,
@@ -192,6 +195,7 @@ impl S3Server {
         driver_ctx: Arc<DriverContext>,
         realm_id: RealmId,
         node_id: NodeId,
+        seal_key: CredentialSealKey,
         rocrate_limits: RoCrateLimits,
         cors: CorsConfig,
         metrics: Arc<NodeMetrics>,
@@ -200,14 +204,6 @@ impl S3Server {
             .await
             .with_rocrate_limits(rocrate_limits);
         let hostname = hostname.into();
-
-        // Issuer-local sealing key: the node's own secret unseals only what it
-        // sealed. A node without a net handle can never issue usable credentials.
-        let seal_key = driver_ctx
-            .net_handle
-            .as_ref()
-            .map(|net| net.credential_seal_key())
-            .unwrap_or_else(CredentialSealKey::random);
 
         let rate_limits = Arc::new(crate::rate_limit::ApiRateLimits::default());
         let service = build_s3_service(
@@ -647,6 +643,7 @@ mod tests {
             driver_ctx,
             RealmId([9u8; 32]),
             node_id,
+            CredentialSealKey::random(),
             Default::default(),
             crate::cors::CorsConfig::default(),
             Arc::new(NodeMetrics::new()),
