@@ -494,6 +494,11 @@ impl InboundEventHandler for OperationsInboundHandler {
                             self.document_sync_reconcile
                                 .trigger(self.context.clone(), touched_topics);
                         }
+                        Err(err) if err.is_admission_rejection() => {
+                            // Refused before any payload read, so no partial local
+                            // state exists; dropping avoids an all-topic reconcile.
+                            debug!(peer = %node_id, error = ?err, "Dropped inbound document sync stream at admission");
+                        }
                         Err(err) => {
                             error!(error = ?err, "Failed to process inbound document sync stream");
                             self.document_sync_reconcile
