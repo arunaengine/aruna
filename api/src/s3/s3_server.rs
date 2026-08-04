@@ -140,6 +140,9 @@ fn record_s3_request(
 pub struct S3Server {
     address: String,
     s3service: S3Service,
+    aruna_service: ArunaS3Service,
+    realm_id: RealmId,
+    node_id: NodeId,
     cors: CorsConfig,
     domain: String,
     driver_ctx: Arc<DriverContext>,
@@ -165,6 +168,19 @@ pub struct WrappingService {
     request_limit: Arc<Semaphore>,
 }
 
+fn build_s3_service(
+    aruna_service: &ArunaS3Service,
+    domain: &str,
+    auth: AuthProvider,
+) -> Result<S3Service, S3ServerError> {
+    let mut builder = S3ServiceBuilder::new(aruna_service.clone());
+    builder.set_host(SingleDomain::new(domain)?);
+    builder.set_auth(auth.clone());
+    builder.set_access(auth);
+    builder.set_validation(AwsNameValidation::new());
+    Ok(builder.build())
+}
+
 impl S3Server {
     #[tracing::instrument(level = "trace", skip(address, hostname, driver_ctx, metrics))]
     #[allow(clippy::too_many_arguments)]
@@ -178,31 +194,29 @@ impl S3Server {
         cors: CorsConfig,
         metrics: Arc<NodeMetrics>,
     ) -> Result<Self, S3ServerError> {
-        let s3service = ArunaS3Service::new(driver_ctx.clone(), realm_id, node_id)
+        let aruna_service = ArunaS3Service::new(driver_ctx.clone(), realm_id, node_id)
             .await
             .with_rocrate_limits(rocrate_limits);
         let hostname = hostname.into();
 
         let rate_limits = Arc::new(crate::rate_limit::ApiRateLimits::default());
-        let auth = AuthProvider {
-            driver_ctx: driver_ctx.clone(),
-            realm_id,
-            node_id,
-            rate_limits: rate_limits.clone(),
-        };
-
-        let service = {
-            let mut b = S3ServiceBuilder::new(s3service.clone());
-            b.set_host(SingleDomain::new(&hostname)?);
-            b.set_auth(auth.clone());
-            b.set_access(auth);
-            b.set_validation(AwsNameValidation::new());
-            b.build()
-        };
+        let service = build_s3_service(
+            &aruna_service,
+            &hostname,
+            AuthProvider {
+                driver_ctx: driver_ctx.clone(),
+                realm_id,
+                node_id,
+                rate_limits: rate_limits.clone(),
+            },
+        )?;
 
         Ok(Self {
             address: address.into(),
             s3service: service,
+            aruna_service,
+            realm_id,
+            node_id,
             cors,
             domain: hostname,
             driver_ctx,
@@ -219,6 +233,28 @@ impl S3Server {
         self.connection_limit = Arc::new(Semaphore::new(max_connections.max(1)));
         self.request_limit = Arc::new(Semaphore::new(max_requests.max(1)));
         self
+    }
+
+    /// Installs operator-configured token-bucket quotas. Both the per-IP limiter
+    /// on the transport boundary and the per-principal limiter in the access hook
+    /// share the one Arc, so a rebuilt access hook applies the same quotas.
+    pub fn with_rate_limits(
+        mut self,
+        limits: crate::rate_limit::ApiRateLimits,
+    ) -> Result<Self, S3ServerError> {
+        let rate_limits = Arc::new(limits);
+        self.s3service = build_s3_service(
+            &self.aruna_service,
+            &self.domain,
+            AuthProvider {
+                driver_ctx: self.driver_ctx.clone(),
+                realm_id: self.realm_id,
+                node_id: self.node_id,
+                rate_limits: rate_limits.clone(),
+            },
+        )?;
+        self.rate_limits = rate_limits;
+        Ok(self)
     }
 
     pub fn run_with_listener(
@@ -575,5 +611,40 @@ mod tests {
             ),
             Some("bucket-name".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn applies_configured_limits() {
+        // A nondefault burst of one must reject the second request, proving S3
+        // uses the configured quota rather than the default.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let node_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+        let server = S3Server::new(
+            "127.0.0.1:0",
+            "localhost".to_string(),
+            driver_ctx,
+            RealmId([9u8; 32]),
+            node_id,
+            Default::default(),
+            crate::cors::CorsConfig::default(),
+            Arc::new(NodeMetrics::new()),
+        )
+        .await
+        .unwrap()
+        .with_rate_limits(crate::rate_limit::ApiRateLimits::new(60, 1, 60, 1))
+        .unwrap();
+
+        let ip = std::net::IpAddr::from([127, 0, 0, 1]);
+        assert!(server.rate_limits.check_ip(ip).is_ok());
+        assert!(server.rate_limits.check_ip(ip).is_err());
     }
 }

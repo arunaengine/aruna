@@ -421,7 +421,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .with_concurrency_limits(
         config.rate_limits.s3_max_connections as usize,
         config.rate_limits.s3_max_requests as usize,
-    );
+    )
+    .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
+        config.rate_limits.ip_per_minute,
+        config.rate_limits.ip_burst,
+        config.rate_limits.principal_per_minute,
+        config.rate_limits.principal_burst,
+    ))
+    .unwrap();
 
     let s3_listener = TcpListener::bind(&config.s3_address).await.unwrap();
     let s3_bound_addr = s3_listener.local_addr().unwrap();
