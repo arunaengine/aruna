@@ -16,7 +16,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    CurrentVersionPointer, MultipartObjectMetadataKey, RealmId, ReclaimCandidate,
+    CurrentVersionPointer, MultipartObjectMetadataKey, PathRestriction, RealmId, ReclaimCandidate,
     ReclaimCandidateKey, UsageDelta, VersionKey,
 };
 use aruna_core::types::{Effects, GroupId, Key, NodeId, UserId};
@@ -145,6 +145,7 @@ pub struct DeleteObjectOperation {
     live_before_marker: bool,
     usage_update: Option<UsageCounterUpdate>,
     output: Option<Result<DeleteObjectResult, DeleteObjectError>>,
+    restrictions: Option<Vec<PathRestriction>>,
 }
 
 impl DeleteObjectOperation {
@@ -170,7 +171,16 @@ impl DeleteObjectOperation {
             live_before_marker: false,
             usage_update: None,
             output: None,
+            restrictions: None,
         }
+    }
+
+    /// The deleter's credential restrictions. They are persisted on the durable
+    /// replication obligation, so a scoped delete cannot escalate to unscoped
+    /// when the obligation repair path enqueues replication instead.
+    pub fn with_restrictions(mut self, restrictions: Option<Vec<PathRestriction>>) -> Self {
+        self.restrictions = restrictions;
+        self
     }
 
     fn emit_error(&mut self, error: DeleteObjectError) -> Effects {
@@ -743,7 +753,7 @@ impl DeleteObjectOperation {
             AuthContext {
                 user_id: self.input.deleted_by,
                 realm_id: self.input.realm_id,
-                path_restrictions: None,
+                path_restrictions: self.restrictions.clone(),
             },
             self.input.bucket.clone(),
             self.input.key.clone(),

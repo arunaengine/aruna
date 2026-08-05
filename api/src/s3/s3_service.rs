@@ -1612,7 +1612,8 @@ impl S3 for ArunaS3Service {
             routing,
         })
         .with_rocrate_limits(self.rocrate_limits.clone())
-        .with_metadata(metadata);
+        .with_metadata(metadata)
+        .with_restrictions(replication_auth.path_restrictions.clone());
 
         let result = drive(operation, &self.state)
             .await
@@ -1773,6 +1774,7 @@ impl S3 for ArunaS3Service {
                         req.input.content_type.as_deref(),
                     )
                 }),
+                restrictions: replication_auth.path_restrictions.clone(),
             },
         )
         .await
@@ -2169,7 +2171,8 @@ impl S3 for ArunaS3Service {
             created_by: user_access.user_identity,
             quota_ceiling,
         })
-        .with_rocrate_limits(self.rocrate_limits.clone());
+        .with_rocrate_limits(self.rocrate_limits.clone())
+        .with_restrictions(replication_auth.path_restrictions.clone());
 
         let result = drive(operation, &self.state)
             .await
@@ -2988,7 +2991,8 @@ impl S3 for ArunaS3Service {
             realm_id: self.realm_id,
             node_id: self.node_id,
             deleted_by: user_access.user_identity,
-        });
+        })
+        .with_restrictions(replication_auth.path_restrictions.clone());
 
         let result = drive(operation, &self.state)
             .await
@@ -3130,6 +3134,7 @@ impl S3 for ArunaS3Service {
                 realm_id: self.realm_id,
                 node_id: self.node_id,
                 deleted_by: user_access.user_identity,
+                restrictions: replication_auth.path_restrictions.clone(),
             },
         )
         .await;

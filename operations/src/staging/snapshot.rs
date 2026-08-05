@@ -9,8 +9,8 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::structs::{
-    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, RealmId,
-    SourceConnector, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
+    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, PathRestriction,
+    RealmId, SourceConnector, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
 };
 use aruna_core::types::{GroupId, Key, NodeId, UserId, Value};
 use thiserror::Error;
@@ -29,6 +29,7 @@ pub struct MaterializeSnapshotInput {
     pub quota_ceiling: Option<u64>,
     pub retry_key: Option<String>,
     pub expected_bucket: BucketInfo,
+    pub restrictions: Option<Vec<PathRestriction>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -124,7 +125,8 @@ pub async fn materialize_snapshot(
             quota_ceiling: input.quota_ceiling,
             routing,
         })
-        .with_bucket_guard(input.expected_bucket),
+        .with_bucket_guard(input.expected_bucket)
+        .with_restrictions(input.restrictions.clone()),
         context,
     )
     .await
@@ -255,6 +257,7 @@ mod tests {
             quota_ceiling: None,
             retry_key: Some("job-1".to_string()),
             expected_bucket,
+            restrictions: None,
         };
 
         let first = materialize_snapshot(context, input.clone()).await.unwrap();

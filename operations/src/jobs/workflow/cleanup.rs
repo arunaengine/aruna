@@ -109,6 +109,7 @@ async fn cleanup_temporary_workspace(ctx: &JobContext, for_job: JobId) -> Result
                 realm_id: parent.created_by.realm_id,
                 node_id: parent.owner_node_id,
                 deleted_by: parent.created_by,
+                restrictions: None,
             },
         )
         .await;

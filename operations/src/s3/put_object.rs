@@ -19,8 +19,8 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BucketInfo, CurrentVersionPointer, RealmId, RoCrateLimits, RoutingError, RoutingSnapshot,
-    UsageDelta, VersionKey, VersionSourceBinding, WriteOwner, resolve_backend,
+    BucketInfo, CurrentVersionPointer, PathRestriction, RealmId, RoCrateLimits, RoutingError,
+    RoutingSnapshot, UsageDelta, VersionKey, VersionSourceBinding, WriteOwner, resolve_backend,
 };
 use aruna_core::types::{Effects, GroupId, NodeId, UserId};
 use bytes::Bytes;
@@ -159,6 +159,7 @@ pub struct PutObjectOperation {
     expected_bucket: Option<BucketInfo>,
     metadata: HashMap<String, String>,
     rocrate_limits: RoCrateLimits,
+    restrictions: Option<Vec<PathRestriction>>,
 }
 
 impl PutObjectOperation {
@@ -183,11 +184,20 @@ impl PutObjectOperation {
             expected_bucket: None,
             metadata: HashMap::new(),
             rocrate_limits: RoCrateLimits::default(),
+            restrictions: None,
         }
     }
 
     pub fn with_bucket_guard(mut self, bucket: BucketInfo) -> Self {
         self.expected_bucket = Some(bucket);
+        self
+    }
+
+    /// The writer's credential restrictions. They are persisted on the durable
+    /// replication obligation, so a scoped write cannot escalate to unscoped
+    /// when the obligation repair path enqueues replication instead.
+    pub fn with_restrictions(mut self, restrictions: Option<Vec<PathRestriction>>) -> Self {
+        self.restrictions = restrictions;
         self
     }
 
@@ -651,7 +661,7 @@ impl PutObjectOperation {
             AuthContext {
                 user_id: self.config.user_id,
                 realm_id: self.config.realm_id,
-                path_restrictions: None,
+                path_restrictions: self.restrictions.clone(),
             },
             self.config.request.bucket.clone(),
             self.config.request.key.clone(),

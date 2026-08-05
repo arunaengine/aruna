@@ -872,7 +872,8 @@ async fn write_next(
             routing,
         })
         .with_bucket_guard(bucket_info)
-        .with_rocrate_limits(spec.limits.clone()),
+        .with_rocrate_limits(spec.limits.clone())
+        .with_restrictions(spec.auth_context.path_restrictions.clone()),
         &ctx.driver,
     )
     .await
@@ -1124,6 +1125,7 @@ async fn rollback_writes(
             realm_id: spec.auth_context.realm_id,
             node_id: ctx.owner_node_id,
             deleted_by: spec.auth_context.user_id,
+            restrictions: spec.auth_context.path_restrictions.clone(),
         },
     )
     .await;

@@ -24,8 +24,8 @@ use aruna_core::structs::{
     AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
     CurrentVersionPointer, MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
     MultipartObjectSummary, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
-    MultipartUploadStatus, RealmId, ResolvedBackend, RoCrateLimits, UsageDelta, VersionKey,
-    WriteOwner,
+    MultipartUploadStatus, PathRestriction, RealmId, ResolvedBackend, RoCrateLimits, UsageDelta,
+    VersionKey, WriteOwner,
 };
 use aruna_core::types::{Effects, NodeId, TxnId, UserId};
 use smallvec::smallvec;
@@ -183,6 +183,7 @@ pub struct CompleteMultipartUploadOperation {
     pending_error: Option<CompleteMultipartUploadError>,
     output: Option<Result<CompleteMultipartUploadResult, CompleteMultipartUploadError>>,
     rocrate_limits: RoCrateLimits,
+    restrictions: Option<Vec<PathRestriction>>,
 }
 
 impl CompleteMultipartUploadOperation {
@@ -210,11 +211,20 @@ impl CompleteMultipartUploadOperation {
             pending_error: None,
             output: None,
             rocrate_limits: RoCrateLimits::default(),
+            restrictions: None,
         }
     }
 
     pub fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
         self.rocrate_limits = limits;
+        self
+    }
+
+    /// The uploader's credential restrictions. They are persisted on the durable
+    /// replication obligation, so a scoped upload cannot escalate to unscoped
+    /// when the obligation repair path enqueues replication instead.
+    pub fn with_restrictions(mut self, restrictions: Option<Vec<PathRestriction>>) -> Self {
+        self.restrictions = restrictions;
         self
     }
 
@@ -1043,7 +1053,7 @@ impl CompleteMultipartUploadOperation {
             AuthContext {
                 user_id: self.input.created_by,
                 realm_id: self.input.realm_id,
-                path_restrictions: None,
+                path_restrictions: self.restrictions.clone(),
             },
             self.input.bucket.clone(),
             self.input.key.clone(),
