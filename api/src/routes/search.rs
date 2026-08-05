@@ -574,6 +574,7 @@ mod tests {
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USER_KEYSPACE,
     };
+    use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::{
         Actor, BucketInfo, Group, GroupAuthorizationDocument, NodeCapabilities,
         RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, User,
@@ -597,6 +598,7 @@ mod tests {
         _metadata_dir: TempDir,
         state: Arc<ServerState>,
         auth: AuthContext,
+        actor: Actor,
         realm_id: RealmId,
         groups: [Ulid; 2],
         users: [UserId; 2],
@@ -627,10 +629,17 @@ mod tests {
         ));
     }
 
-    async fn seed_group(state: &ServerState, actor: &Actor, group_id: Ulid, name: &str) {
+    async fn seed_group(
+        state: &ServerState,
+        actor: &Actor,
+        group_id: Ulid,
+        name: &str,
+        policies: Vec<RequestPolicy>,
+    ) {
         let realm = actor.realm_id;
-        let auth_doc =
+        let mut auth_doc =
             GroupAuthorizationDocument::new_default_group_doc(actor.user_id, realm, group_id);
+        auth_doc.policies = policies;
         let group = Group {
             display_name: name.to_string(),
             group_id,
@@ -652,6 +661,53 @@ mod tests {
             auth_doc.to_bytes(actor).unwrap(),
         )
         .await;
+    }
+
+    async fn seed_bucket(state: &ServerState, actor: &Actor, bucket: &str, group_id: Ulid) {
+        write_bytes(
+            state,
+            S3_BUCKET_KEYSPACE,
+            bucket.as_bytes().to_vec(),
+            BucketInfo {
+                group_id,
+                created_at: SystemTime::UNIX_EPOCH,
+                created_by: actor.user_id,
+                cors_configuration: None,
+                replication: None,
+                storage_routing: Vec::new(),
+            }
+            .to_bytes()
+            .unwrap(),
+        )
+        .await;
+    }
+
+    /// Rewrites the realm config with the given realm-scoped request policies,
+    /// keeping the placement and node entries the fan-out needs.
+    async fn seed_policies(state: &ServerState, actor: &Actor, policies: Vec<RequestPolicy>) {
+        let realm = actor.realm_id;
+        let mut config = RealmConfigDocument::default_for_realm(realm, Vec::new());
+        config.seed_default_placement();
+        config.ensure_node(actor.node_id, RealmNodeKind::Server);
+        config.request_policies = policies;
+        write_bytes(
+            state,
+            REALM_CONFIG_KEYSPACE,
+            realm.as_bytes().to_vec(),
+            config.to_bytes(actor).unwrap(),
+        )
+        .await;
+    }
+
+    fn deny_policy(expression: &str) -> RequestPolicy {
+        RequestPolicy {
+            policy_id: Ulid::generate(),
+            name: "hide-bucket".to_string(),
+            kind: PolicyKind::Deny,
+            when: None,
+            expression: expression.to_string(),
+            enabled: true,
+        }
     }
 
     async fn seed_user(state: &ServerState, actor: &Actor, user_id: UserId, name: &str) {
@@ -728,36 +784,12 @@ mod tests {
         )
         .await;
 
-        let mut config = RealmConfigDocument::default_for_realm(realm, Vec::new());
-        config.seed_default_placement();
-        config.ensure_node(node_id, RealmNodeKind::Server);
-        write_bytes(
-            &state,
-            REALM_CONFIG_KEYSPACE,
-            realm.as_bytes().to_vec(),
-            config.to_bytes(&actor).unwrap(),
-        )
-        .await;
+        seed_policies(&state, &actor, Vec::new()).await;
 
         let groups = [Ulid::from_bytes([1u8; 16]), Ulid::from_bytes([2u8; 16])];
-        seed_group(&state, &actor, groups[0], "alpha-team").await;
-        seed_group(&state, &actor, groups[1], "alpha-squad").await;
-        write_bytes(
-            &state,
-            S3_BUCKET_KEYSPACE,
-            b"alpha-bucket".to_vec(),
-            BucketInfo {
-                group_id: groups[0],
-                created_at: SystemTime::UNIX_EPOCH,
-                created_by: user_id,
-                cors_configuration: None,
-                replication: None,
-                storage_routing: Vec::new(),
-            }
-            .to_bytes()
-            .unwrap(),
-        )
-        .await;
+        seed_group(&state, &actor, groups[0], "alpha-team", Vec::new()).await;
+        seed_group(&state, &actor, groups[1], "alpha-squad", Vec::new()).await;
+        seed_bucket(&state, &actor, "alpha-bucket", groups[0]).await;
 
         let users = [
             UserId::local(Ulid::from_bytes([1u8; 16]), realm),
@@ -775,6 +807,7 @@ mod tests {
                 realm_id: realm,
                 path_restrictions: None,
             },
+            actor,
             realm_id: realm,
             groups,
             users,
@@ -859,6 +892,87 @@ mod tests {
         assert!(resp.buckets.is_none());
         assert!(resp.groups.is_some());
         assert!(resp.users.is_some());
+    }
+
+    async fn bucket_hits(fx: &Fixture, query: &str, limit: usize) -> Vec<String> {
+        let (_, Json(section)) = bucket_search(
+            State(fx.state.clone()),
+            Extension(Some(fx.auth.clone())),
+            Extension(None),
+            Query(BucketSearchParams {
+                q: query.to_string(),
+                limit: Some(limit),
+            }),
+        )
+        .await
+        .unwrap();
+        section.hits.into_iter().map(|hit| hit.bucket).collect()
+    }
+
+    #[tokio::test]
+    async fn policy_hides_bucket() {
+        // A realm deny policy must hide the bucket from the dedicated route and
+        // from the buckets section of the unified search alike.
+        let fx = setup().await;
+        seed_bucket(&fx.state, &fx.actor, "beta-bucket", fx.groups[1]).await;
+        seed_policies(
+            &fx.state,
+            &fx.actor,
+            vec![deny_policy("path.endsWith('/alpha-bucket')")],
+        )
+        .await;
+
+        assert_eq!(bucket_hits(&fx, "bucket", 10).await, ["beta-bucket"]);
+
+        let unified = search(
+            &fx,
+            SearchParams {
+                types: Some("buckets".to_string()),
+                ..params("bucket")
+            },
+        )
+        .await
+        .unwrap();
+        let hits = unified.buckets.unwrap().hits;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].bucket, "beta-bucket");
+    }
+
+    #[tokio::test]
+    async fn group_hides_bucket() {
+        // A group-scoped deny policy hides that group's bucket only.
+        let fx = setup().await;
+        seed_bucket(&fx.state, &fx.actor, "beta-bucket", fx.groups[1]).await;
+        seed_group(
+            &fx.state,
+            &fx.actor,
+            fx.groups[0],
+            "alpha-team",
+            vec![deny_policy("path.endsWith('/alpha-bucket')")],
+        )
+        .await;
+
+        assert_eq!(bucket_hits(&fx, "bucket", 10).await, ["beta-bucket"]);
+    }
+
+    #[tokio::test]
+    async fn policy_fills_page() {
+        // A hidden first match must not shorten a page that later matches can
+        // still fill.
+        let fx = setup().await;
+        seed_bucket(&fx.state, &fx.actor, "beta-bucket", fx.groups[1]).await;
+        seed_bucket(&fx.state, &fx.actor, "gamma-bucket", fx.groups[1]).await;
+        seed_policies(
+            &fx.state,
+            &fx.actor,
+            vec![deny_policy("path.endsWith('/alpha-bucket')")],
+        )
+        .await;
+
+        assert_eq!(
+            bucket_hits(&fx, "bucket", 2).await,
+            ["beta-bucket", "gamma-bucket"]
+        );
     }
 
     #[tokio::test]
@@ -1051,8 +1165,22 @@ mod tests {
             user_id: viewer,
             realm_id: fx.realm_id,
         };
-        seed_group(&fx.state, &hidden_actor, fx.groups[0], "alpha-hidden").await;
-        seed_group(&fx.state, &viewer_actor, fx.groups[1], "alpha-visible").await;
+        seed_group(
+            &fx.state,
+            &hidden_actor,
+            fx.groups[0],
+            "alpha-hidden",
+            Vec::new(),
+        )
+        .await;
+        seed_group(
+            &fx.state,
+            &viewer_actor,
+            fx.groups[1],
+            "alpha-visible",
+            Vec::new(),
+        )
+        .await;
 
         let viewer_auth = AuthContext {
             user_id: viewer,
@@ -1092,6 +1220,7 @@ mod tests {
                 &hidden_actor,
                 Ulid::from_bytes(bytes),
                 &format!("alpha-hidden-{index}"),
+                Vec::new(),
             )
             .await;
         }

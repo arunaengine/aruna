@@ -190,8 +190,8 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     (
         "search.rs",
         "bucket_search",
-        "realm-wide fan-out with no single permission path; SearchBucketsOperation \
-         checks READ per candidate bucket",
+        "realm-wide fan-out with no single permission path; candidates filtered \
+         by per-bucket READ and policies",
     ),
     (
         "staging.rs",
