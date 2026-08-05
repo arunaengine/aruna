@@ -144,11 +144,6 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "notifications.rs",
-        "create_watch",
-        "watch creation checks READ on the watched path",
-    ),
-    (
-        "notifications.rs",
         "delete_watch",
         "self-scoped: the watch key is prefixed with the owner",
     ),
@@ -195,7 +190,8 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     (
         "search.rs",
         "bucket_search",
-        "SearchBucketsOperation checks READ per candidate bucket",
+        "realm-wide fan-out with no single permission path; SearchBucketsOperation \
+         checks READ per candidate bucket",
     ),
     (
         "staging.rs",

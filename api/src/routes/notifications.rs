@@ -1,5 +1,6 @@
 use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, require_realm_auth, require_unrestricted_realm_auth,
+    ValidatedArunaBearerTokenCarrier, ensure_permission_with, require_realm_auth,
+    require_unrestricted_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
@@ -8,7 +9,7 @@ use aruna_core::UserId;
 use aruna_core::metrics::WatchAuthorizationMetricReason;
 use aruna_core::structs::{
     AuthContext, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NotificationClass, NotificationKind,
-    NotificationRecord, WatchAuthorizationBinding, WatchEventKind, WatchEventMask,
+    NotificationRecord, Permission, WatchAuthorizationBinding, WatchEventKind, WatchEventMask,
     WatchSubscription, data_watch_resource_path, parse_data_watch_resource_path,
 };
 use aruna_operations::dashboard::subscribe_dashboard_changes;
@@ -385,9 +386,31 @@ async fn authorize_watch(
     path_prefix: &str,
     event_mask: WatchEventMask,
 ) -> ServerResult<()> {
-    if watch_permission_path(state.get_realm_id(), path_prefix, event_mask).is_none() {
+    let Some(permission_path) =
+        watch_permission_path(state.get_realm_id(), path_prefix, event_mask)
+    else {
         record_watch_creation_denial(state, WatchAuthorizationMetricReason::InvalidResource);
         return Err(ServerError::BadRequest);
+    };
+    if let Err(error) = ensure_permission_with(
+        state,
+        auth,
+        permission_path,
+        Permission::READ,
+        aruna_operations::request_policy::PolicyRequestExtras::operation(
+            "notifications.create_watch",
+        ),
+    )
+    .await
+    {
+        record_watch_creation_denial(
+            state,
+            match error {
+                ServerError::Forbidden => WatchAuthorizationMetricReason::PermissionDenied,
+                _ => WatchAuthorizationMetricReason::AuthorizationUnavailable,
+            },
+        );
+        return Err(error);
     }
     match evaluate_watch_creation(
         &state.get_ctx(),
