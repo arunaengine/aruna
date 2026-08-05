@@ -381,7 +381,7 @@ fn apply_reducer_policies(
     if !reducer_state
         .conflicts
         .contains_key(REALM_CONFIG_POLICIES_PATH)
-        && let Some(policies) = reducer_state.materialized_realm_config_policies()
+        && let Some(policies) = reducer_state.materialized_realm_policies()
     {
         document.request_policies = policies;
     }

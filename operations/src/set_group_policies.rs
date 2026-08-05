@@ -457,7 +457,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stores_group_policy_set() {
+    async fn stores_group_policies() {
         // The set lands on the group auth doc and a later read returns it.
         let (_dir, context, actor, group_id) = setup_group().await;
         let policies = vec![policy("permission == 'write'")];

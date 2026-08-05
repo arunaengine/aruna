@@ -52,7 +52,7 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
         .merge(users::router())
         .layer(from_fn_with_state(
             state.clone(),
-            crate::rate_limit::rate_limit_principal_middleware,
+            crate::rate_limit::principal_middleware,
         ))
         .layer(from_fn_with_state(state.clone(), auth_middleware))
         .layer(from_fn_with_state(

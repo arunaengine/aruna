@@ -850,7 +850,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_rejects_initial_admin_secret() {
+    async fn bootstrap_rejects_secret() {
         // An initial-administrator secret must not onboard a node or be consumed.
         let (state, realm_id, _seed, _user_id, net_handle, _tempdir) =
             setup_management_state().await;

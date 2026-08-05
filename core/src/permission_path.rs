@@ -28,7 +28,7 @@ pub fn permission_pattern_matches(pattern: &str, path: &str) -> bool {
 }
 
 /// The path subtree a group's roles may grant on.
-pub fn group_role_subtree_root(
+pub fn role_subtree_root(
     realm_id: impl std::fmt::Display,
     group_id: impl std::fmt::Display,
 ) -> String {

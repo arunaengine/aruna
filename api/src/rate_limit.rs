@@ -113,7 +113,7 @@ fn retry_secs(secs: u64) -> u64 {
 /// REST IP limiter. Runs at the outer transport boundary, before CORS, bearer
 /// parsing, or extraction, so an invalid or expensive authentication attempt
 /// still consumes IP capacity.
-pub async fn rate_limit_ip_middleware(
+pub async fn ip_middleware(
     State(state): State<std::sync::Arc<ServerState>>,
     request: Request,
     next: Next,
@@ -134,7 +134,7 @@ pub async fn rate_limit_ip_middleware(
 
 /// REST principal limiter. Runs after authentication so an authenticated caller
 /// is charged once to its principal, on top of the outer IP charge.
-pub async fn rate_limit_principal_middleware(
+pub async fn principal_middleware(
     State(state): State<std::sync::Arc<ServerState>>,
     request: Request,
     next: Next,
@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn ip_and_principal_independent() {
+    fn buckets_stay_independent() {
         // Draining the IP bucket must not spend the principal's, and vice versa.
         let limits = ApiRateLimits::for_test(2);
         let ip = IpAddr::from_str("203.0.113.10").unwrap();

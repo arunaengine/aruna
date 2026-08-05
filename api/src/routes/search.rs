@@ -1023,7 +1023,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hidden_first_group_no_leak() {
+    async fn skips_hidden_group() {
         // A hidden first match at limit 1 must not yield an empty page whose
         // cursor exposes the hidden group's id.
         let fx = setup().await;

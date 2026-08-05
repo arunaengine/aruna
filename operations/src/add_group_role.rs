@@ -198,7 +198,7 @@ impl AddGroupRoleOperation {
             return Err(AddGroupRoleError::InvalidPublicRole);
         }
 
-        let subtree_root = aruna_core::permission_path::group_role_subtree_root(
+        let subtree_root = aruna_core::permission_path::role_subtree_root(
             self.input.realm_id,
             self.input.group_id,
         );

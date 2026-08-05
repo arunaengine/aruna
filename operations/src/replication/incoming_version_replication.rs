@@ -2593,7 +2593,7 @@ mod tests {
     }
 
     #[test]
-    fn version_binds_publisher_node() {
+    fn version_binds_publisher() {
         // A forged manifest cannot forge attribution: the persisted version is
         // bound to the authenticated publisher, never to its self-asserted user.
         let publisher = iroh::SecretKey::from_bytes(&[42u8; 32]).public();

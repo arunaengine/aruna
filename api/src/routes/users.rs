@@ -1592,7 +1592,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_user_denied_by_policy() {
+    async fn policy_denies_update() {
         // A realm deny-writes policy must block a non-self update at the route,
         // even though the admin holds the RBAC write the operation would accept.
         let issuer = "https://issuer.example";

@@ -299,7 +299,7 @@ async fn require_config_admin(state: &ServerState, auth: &AuthContext) -> Server
     .await
 }
 
-async fn require_group_config_admin(
+async fn require_group_admin(
     state: &ServerState,
     auth: &AuthContext,
     group_id: Ulid,
@@ -438,7 +438,7 @@ pub async fn set_group_policies(
 ) -> ServerResult<(StatusCode, Json<PoliciesResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
-    require_group_config_admin(&state, &auth, group_id).await?;
+    require_group_admin(&state, &auth, group_id).await?;
 
     let policies = request
         .policies
@@ -586,7 +586,7 @@ pub async fn dry_run_policy(
         body: request.body.clone(),
     };
 
-    let scopes = collect_dry_run_scopes(&state, &request).await?;
+    let scopes = dry_run_scopes(&state, &request).await?;
 
     let functions = PolicyFunctions::default();
     let mut trace = Vec::new();
@@ -622,7 +622,7 @@ pub async fn dry_run_policy(
 /// Resolves the ordered (scope, policies) list a dry run evaluates: ad hoc
 /// candidates when given, otherwise the requested stored scope. Candidate
 /// expressions are size- and compile-checked before use (S10).
-async fn collect_dry_run_scopes(
+async fn dry_run_scopes(
     state: &ServerState,
     request: &DryRunRequest,
 ) -> ServerResult<Vec<(String, Vec<RequestPolicy>)>> {
@@ -800,7 +800,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_expected_hash_conflicts() {
+    async fn stale_hash_conflicts() {
         let fx = setup().await;
         let mut request = body("permission == 'write'");
         // A well-formed but stale digest must abort the write transaction as 409.
@@ -815,7 +815,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_crud_authz_boundary() {
+    async fn group_authz_boundary() {
         // The owning group's config admin may set the group set; a stranger cannot.
         let fx = setup().await;
         let (group, _) = drive(
@@ -878,7 +878,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dry_run_traces_candidates() {
+    async fn traces_candidates() {
+        // A dry run reports the decision of every candidate path it evaluated.
         let fx = setup().await;
         let (_, Json(run)) = dry_run_policy(
             State(fx.state.clone()),
@@ -911,7 +912,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dry_run_rejects_oversized_expression() {
+    async fn rejects_oversized_expression() {
         // S10: a candidate expression above the policy limit is refused before compile.
         let fx = setup().await;
         let result = dry_run_policy(
@@ -942,7 +943,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realm_write_deny_covers_every_route() {
+    async fn deny_covers_routes() {
         // A realm `permission == "write"` deny must block write, delete, and
         // admin routes the admin could otherwise reach, while reads still pass.
         let fx = setup().await;

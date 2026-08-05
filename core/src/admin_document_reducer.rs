@@ -960,9 +960,7 @@ impl AdminDocumentReducerState {
             .and_then(|version| version.value.clone())
     }
 
-    pub fn materialized_realm_config_policies(
-        &self,
-    ) -> Option<Vec<crate::request_policy::RequestPolicy>> {
+    pub fn materialized_realm_policies(&self) -> Option<Vec<crate::request_policy::RequestPolicy>> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return None;
         }
@@ -3077,7 +3075,7 @@ mod tests {
     }
 
     #[test]
-    fn group_policies_set_materializes() {
+    fn group_policies_materialize() {
         let mut state = group_state();
         let policies = vec![crate::request_policy::RequestPolicy {
             policy_id: Ulid::from_bytes([2; 16]),

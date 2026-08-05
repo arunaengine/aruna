@@ -4612,7 +4612,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_uses_request_context() {
+    async fn delete_uses_context() {
         // The per-object policy must see the real query parameters and allowlisted
         // headers the access hook captured, not an empty operation-only context.
         let storage_dir = tempfile::tempdir().unwrap();

@@ -3427,7 +3427,7 @@ fn overlay_realm_config_reducer_materialization(
     if !reducer_state
         .conflicts
         .contains_key(REALM_CONFIG_POLICIES_PATH)
-        && let Some(request_policies) = reducer_state.materialized_realm_config_policies()
+        && let Some(request_policies) = reducer_state.materialized_realm_policies()
     {
         config.request_policies = request_policies;
     }
@@ -3490,7 +3490,7 @@ fn realm_config_from_reducer_materialization(
             .materialized_realm_config_quota()
             .unwrap_or_default(),
         request_policies: reducer_state
-            .materialized_realm_config_policies()
+            .materialized_realm_policies()
             .unwrap_or_default(),
         description: String::new(),
         placement_map: Vec::new(),
@@ -5484,10 +5484,8 @@ async fn validate_replicated_admin_event(
             let AdminDocumentTarget::Group { group_id } = &event.target else {
                 return reject("group role event target must be a group");
             };
-            let subtree_root = aruna_core::permission_path::group_role_subtree_root(
-                event.actor.realm_id,
-                group_id,
-            );
+            let subtree_root =
+                aruna_core::permission_path::role_subtree_root(event.actor.realm_id, group_id);
             if role.permissions.keys().any(|pattern| {
                 !aruna_core::permission_path::role_path_confined(pattern, &subtree_root)
             }) {
@@ -6751,7 +6749,7 @@ mod tests {
     }
 
     #[test]
-    fn reservation_releases_on_drop() {
+    fn drop_releases_reservation() {
         // A stream's reservation is returned to the budget when it drops.
         let budget = Arc::new(InboundSyncBudget::default());
         {
@@ -6765,7 +6763,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removed_startup_peer_denied() {
+    async fn removed_peer_denied() {
         // A startup peer admits during bootstrap, then loses admission once
         // realm config materializes without it, with no restart.
         let root = TempDir::new().expect("tempdir");
@@ -7883,7 +7881,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realm_policies_replicate_and_apply() {
+    async fn realm_policies_replicate() {
         // S2: a policy event replicated from another node must pass the
         // realm-config storage-apply whitelist and materialize here.
         let (_dir, storage) = test_storage();
@@ -7999,7 +7997,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_policies_replicate_and_apply() {
+    async fn group_policies_replicate() {
         // GroupPoliciesSet must pass the group storage-apply whitelist and land
         // on the receiving node's group authorization document.
         let (_dir, storage) = test_storage();
@@ -8926,7 +8924,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replicated_group_role_confined() {
+    async fn replicated_role_confined() {
         // An allowed publisher cannot replicate a role granting outside its group.
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([71; 32]);

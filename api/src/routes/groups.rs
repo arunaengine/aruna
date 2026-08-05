@@ -1662,7 +1662,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deny_policy_drops_exemption() {
+    async fn policy_drops_exemption() {
         // A realm deny policy on the admin path must grade the caller as an
         // ordinary user, without breaking capped self-service creation.
         let (state, admin, _tempdir) = setup_admin_state().await;

@@ -645,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn peers_share_one_effect() {
+    fn peers_share_effect() {
         // Every peer is asked in one adapter round: with one effect per peer the
         // runner contacts them serially and unreachable nodes add up to a timeout.
         let peers: Vec<aruna_core::types::NodeId> = (1u8..=3)
@@ -685,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn silent_peer_is_missing() {
+    fn silent_peer_missing() {
         // A peer the adapter did not answer for must still be reported missing
         // instead of leaving the page looking complete.
         let peers: Vec<aruna_core::types::NodeId> = (4u8..=5)
@@ -761,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn limit_bounds_the_page() {
+    fn limit_bounds_page() {
         let realm_id = RealmId([9u8; 32]);
         let group = Ulid::from_bytes([3u8; 16]);
         let doc = Ulid::from_bytes([4u8; 16]);
@@ -787,7 +787,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_page_reads_and_pages() {
+    async fn local_page_paging() {
         // Cursor paging walks the group's records; a document filter narrows.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();

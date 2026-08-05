@@ -148,7 +148,7 @@ pub async fn enforce_policies(
     realm_id: RealmId,
     request: &PolicyRequest,
 ) -> Result<(), PolicyEnforcementError> {
-    let group_id = group_id_from_path(&request.path);
+    let group_id = group_from_path(&request.path);
     PolicyEvaluator::load(context, realm_id, group_id)
         .await?
         .evaluate(request)
@@ -156,7 +156,7 @@ pub async fn enforce_policies(
 
 /// Extracts the group id from a canonical `/{realm}/g/{group}/...` path, mirroring
 /// the permission-rule parser. Non-group paths carry no group scope.
-fn group_id_from_path(path: &str) -> Option<GroupId> {
+fn group_from_path(path: &str) -> Option<GroupId> {
     let mut segments = path.split('/');
     segments.next();
     segments.next();
@@ -335,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn caches_by_content_address() {
+    fn caches_by_content() {
         // Identical bytes reuse the same Arc; an edit mints a new entry.
         let policies = [policy("permission == 'write'")];
         let first = compiled_set(&policies).unwrap();
@@ -347,7 +347,8 @@ mod tests {
     }
 
     #[test]
-    fn compile_failure_is_unavailable() {
+    fn compile_failure_unavailable() {
+        // A policy set that will not compile denies as unavailable, not allows.
         let result = compile_scope(&[policy("path.startsWith(")], "realm");
         assert!(matches!(
             result,
@@ -366,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluates_each_member_path() {
+    fn evaluates_member_paths() {
         // The DeleteObjects model: one loaded set, each member path decided
         // separately so a path rule can deny one member and allow another.
         let set = compiled_set(&[policy("path.endsWith('/secret')")]).unwrap();
@@ -385,7 +386,8 @@ mod tests {
     }
 
     #[test]
-    fn extras_thread_operation_and_body() {
+    fn extras_set_operation() {
+        // Extras carry the operation name and body into the policy request.
         let extras = PolicyRequestExtras::operation("s3.PutObject");
         let request = policy_request_with(
             "/r/g/x/data/o",

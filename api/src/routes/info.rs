@@ -2365,7 +2365,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deny_policy_blocks_admin() {
+    async fn policy_blocks_admin() {
         // The config-admin gate must honour realm request policies, not only
         // the RBAC roles the permission check reads.
         let (state, realm_id, admin, _tempdir) = setup_management_state().await;

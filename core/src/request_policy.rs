@@ -614,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn require_denies_unless_true() {
+    fn require_needs_true() {
         // A require policy inverts: false denies, true allows.
         let mut require = policy("permission == 'read'");
         require.kind = PolicyKind::Require;
@@ -638,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn guard_error_stays_applicable() {
+    fn guard_error_applies() {
         // A guard that errors leaves the rule applicable (fail-closed).
         let mut guarded = policy("true");
         guarded.when = Some("missing_var".to_string());
@@ -689,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn exposes_operation_params_headers() {
+    fn exposes_request_attributes() {
         let mut req = request("/p", "write", "u");
         req.operation = "s3.PutObject".to_string();
         req.params.insert("group_id".to_string(), "g1".to_string());
@@ -704,7 +704,8 @@ mod tests {
     }
 
     #[test]
-    fn exposes_body_and_null() {
+    fn exposes_body() {
+        // Expressions see a parsed body, and an absent body reads as CEL null.
         let mut req = request("/p", "write", "u");
         req.body = Some(serde_json::json!({"kind": "Dataset"}));
         assert!(evaluate_policies(&[policy("body.kind == 'Dataset'")], &req).is_denied());
@@ -714,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_body_conversion_when_unreferenced() {
+    fn skips_unused_body() {
         // No enabled policy references body, so the flag stays false.
         let set = CompiledPolicySet::compile(&[policy("permission == 'read'")]).unwrap();
         assert!(!set.needs_body);
@@ -754,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn analysis_reports_compile_error() {
+    fn reports_compile_error() {
         let analysis = analyze_policy_source(None, "path.startsWith(", &PolicyFunctions::default());
         assert!(!analysis.valid);
         assert!(!analysis.errors.is_empty());

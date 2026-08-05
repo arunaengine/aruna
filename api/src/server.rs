@@ -86,7 +86,7 @@ impl Server {
         // invalid or expensive attempt still consumes IP capacity.
         router.layer(from_fn_with_state(
             self.state.clone(),
-            crate::rate_limit::rate_limit_ip_middleware,
+            crate::rate_limit::ip_middleware,
         ))
     }
 
@@ -174,7 +174,7 @@ mod tests {
     use tower::ServiceExt;
 
     #[tokio::test]
-    async fn ip_limiter_runs_before_auth() {
+    async fn limiter_precedes_auth() {
         // An unauthenticated request must consume IP capacity: the gate sits
         // outside auth, so router edits that move it inward break this.
         use crate::rate_limit::ApiRateLimits;
