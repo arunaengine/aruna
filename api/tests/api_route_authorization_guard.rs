@@ -18,11 +18,6 @@ const BOUNDARY: &[&str] = &[
 /// is still authorized. A new route must gain a check or a reviewed entry here.
 const ALLOWLIST: &[(&str, &str, &str)] = &[
     (
-        "blobs.rs",
-        "blob_locations",
-        "LocationSummaryOperation checks READ on the blob object path",
-    ),
-    (
         "credentials.rs",
         "list_s3_credentials",
         "self-scoped: only credentials whose identity is the caller",

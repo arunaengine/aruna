@@ -79,6 +79,20 @@ pub struct ReplicateBlobResponse {
     pub target_node_id: String,
 }
 
+async fn load_bucket(state: &ServerState, bucket: &str) -> ServerResult<BucketInfo> {
+    match drive(
+        GetBucketInfoOperation::new(bucket.to_string()),
+        &state.get_ctx(),
+    )
+    .await
+    .and_then(|result| result.transpose())
+    {
+        Ok(Some(bucket_info)) => Ok(bucket_info),
+        Ok(None) | Err(GetBucketInfoError::NotFound) => Err(ServerError::NotFound),
+        Err(err) => Err(ServerError::InternalError(err.to_string())),
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/blobs/replicate",
@@ -102,19 +116,7 @@ pub async fn replicate_blob(
         return Err(ServerError::Forbidden);
     }
 
-    let bucket_info = match drive(
-        GetBucketInfoOperation::new(request.bucket.clone()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(Some(Ok(bucket_info))) => bucket_info,
-        Ok(Some(Err(GetBucketInfoError::NotFound))) | Err(GetBucketInfoError::NotFound) => {
-            return Err(ServerError::NotFound);
-        }
-        Ok(Some(Err(err))) | Err(err) => return Err(ServerError::InternalError(err.to_string())),
-        Ok(None) => return Err(ServerError::NotFound),
-    };
+    let bucket_info = load_bucket(&state, &request.bucket).await?;
 
     let permission_path = match request.path.as_deref() {
         Some(path) => blob_object_permission_path(
@@ -359,6 +361,19 @@ pub async fn blob_locations(
         .map(ulid::Ulid::from_string)
         .transpose()
         .map_err(|_| ServerError::BadRequest)?;
+    crate::auth::ensure_permission(
+        &state,
+        &auth,
+        blob_object_permission_path(
+            state.get_realm_id(),
+            load_bucket(&state, &query.bucket).await?.group_id,
+            local_node,
+            &query.bucket,
+            &query.path,
+        ),
+        Permission::READ,
+    )
+    .await?;
     let request = LocationSummaryRequest {
         realm_id: state.get_realm_id(),
         bucket: query.bucket.clone(),
