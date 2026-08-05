@@ -1175,9 +1175,19 @@ mod tests {
     }
 
     async fn install_local_holder_config(state: &ServerState, realm_id: RealmId, holder: NodeId) {
+        install_holder_policies(state, realm_id, holder, Vec::new()).await;
+    }
+
+    async fn install_holder_policies(
+        state: &ServerState,
+        realm_id: RealmId,
+        holder: NodeId,
+        policies: Vec<aruna_core::request_policy::RequestPolicy>,
+    ) {
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.seed_default_placement();
         config.ensure_node(holder, RealmNodeKind::Server);
+        config.request_policies = policies;
         let actor = Actor {
             node_id: holder,
             user_id: UserId::nil(realm_id),
@@ -1918,6 +1928,59 @@ mod tests {
             .await
             .expect("list after delete succeeds");
         assert!(empty.watches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn policy_denies_watches() {
+        // The realm request policies must reach watch creation, which only
+        // ordinary RBAC used to gate.
+        let realm_id = realm_id(21);
+        let holder = node(21);
+        let (_dir, state) = build_state(realm_id, holder).await;
+        install_local_holder_config(&state, realm_id, holder).await;
+        let user_id = UserId::new(Ulid::generate(), realm_id);
+        let group_id = Ulid::generate();
+        install_group_authorization(&state, realm_id, group_id, user_id, &[]).await;
+        let path_prefix = data_watch_resource_path(group_id, node(60), "bucket", "prefix");
+        let request = || CreateWatchRequest {
+            path_prefix: path_prefix.clone(),
+            events: vec!["data_uploaded".to_string()],
+        };
+
+        let (status, _) = create_watch(
+            State(state.clone()),
+            Extension(Some(auth_for(user_id, realm_id))),
+            bearer(),
+            Json(request()),
+        )
+        .await
+        .expect("a group reader may create a watch");
+        assert_eq!(status, StatusCode::CREATED);
+
+        install_holder_policies(
+            &state,
+            realm_id,
+            holder,
+            vec![aruna_core::request_policy::RequestPolicy {
+                policy_id: Ulid::generate(),
+                name: "deny-watches".to_string(),
+                kind: aruna_core::request_policy::PolicyKind::Deny,
+                when: None,
+                expression: "operation == 'notifications.create_watch'".to_string(),
+                enabled: true,
+            }],
+        )
+        .await;
+
+        let denied = create_watch(
+            State(state),
+            Extension(Some(auth_for(user_id, realm_id))),
+            bearer(),
+            Json(request()),
+        )
+        .await
+        .expect_err("the realm policy must deny watch creation");
+        assert!(matches!(denied, ServerError::Forbidden));
     }
 
     #[tokio::test]

@@ -1663,33 +1663,7 @@ mod tests {
         .await;
         assert!(matches!(allowed, Ok((StatusCode::OK, _))));
 
-        let mut config = read_realm_config(node.context.as_ref(), &node.realm_id).await;
-        config
-            .request_policies
-            .push(aruna_core::request_policy::RequestPolicy {
-                policy_id: Ulid::generate(),
-                name: "deny-writes".to_string(),
-                kind: aruna_core::request_policy::PolicyKind::Deny,
-                when: None,
-                expression: "permission == 'write'".to_string(),
-                enabled: true,
-            });
-        let actor = Actor {
-            node_id: node.net.node_id(),
-            user_id: node.realm_admin_id,
-            realm_id: node.realm_id,
-        };
-        let bytes = config.to_bytes(&actor).unwrap();
-        let _ = node
-            .context
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::Write {
-                key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                key: ByteView::from(node.realm_id.as_bytes().to_vec()),
-                value: ByteView::from(bytes),
-                txn_id: None,
-            }))
-            .await;
+        install_deny_policy(&node, "permission == 'write'").await;
 
         let denied = super::update_user(
             axum::extract::State(node.state.clone()),
@@ -1708,6 +1682,113 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(fetched.1.0.name, "FirstRename");
+
+        node.server_task.abort();
+        node.net.shutdown().await;
+        oidc_task.abort();
+    }
+
+    async fn install_deny_policy(node: &TestNode, expression: &str) {
+        let mut config = read_realm_config(node.context.as_ref(), &node.realm_id).await;
+        config
+            .request_policies
+            .push(aruna_core::request_policy::RequestPolicy {
+                policy_id: Ulid::generate(),
+                name: "deny".to_string(),
+                kind: aruna_core::request_policy::PolicyKind::Deny,
+                when: None,
+                expression: expression.to_string(),
+                enabled: true,
+            });
+        let actor = Actor {
+            node_id: node.net.node_id(),
+            user_id: node.realm_admin_id,
+            realm_id: node.realm_id,
+        };
+        let bytes = config.to_bytes(&actor).unwrap();
+        let _ = node
+            .context
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: ByteView::from(node.realm_id.as_bytes().to_vec()),
+                value: ByteView::from(bytes),
+                txn_id: None,
+            }))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn policy_denies_reads() {
+        // A realm deny-reads policy must block both admin user reads at the
+        // route, though RBAC alone would let the realm admin through.
+        let issuer = "https://issuer.example";
+        let kid = "main-key";
+        let signing_key = generate_signing_key();
+        let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
+        let node = spawn_test_node(provider, true).await;
+
+        let (target, _target_token) = register_via_oidc(
+            &node,
+            issuer,
+            kid,
+            &signing_key,
+            "subject-read",
+            "Target Bob",
+            None,
+        )
+        .await;
+        let admin = aruna_core::structs::AuthContext {
+            user_id: node.realm_admin_id,
+            realm_id: node.realm_id,
+            path_restrictions: None,
+        };
+        let query = || {
+            axum::extract::Query(super::ListUsersQuery {
+                limit: None,
+                start_after: None,
+            })
+        };
+
+        let fetched = super::get_user(
+            axum::extract::State(node.state.clone()),
+            axum::Extension(Some(admin.clone())),
+            axum::extract::Path(target.id.clone()),
+        )
+        .await
+        .expect("the realm admin may read a user");
+        assert_eq!(fetched.1.0.name, "Target Bob");
+        let listed = super::list_users(
+            axum::extract::State(node.state.clone()),
+            axum::Extension(Some(admin.clone())),
+            query(),
+        )
+        .await
+        .expect("the realm admin may list users");
+        assert!(!listed.1.0.users.is_empty());
+
+        install_deny_policy(&node, "permission == 'read'").await;
+
+        let denied_get = super::get_user(
+            axum::extract::State(node.state.clone()),
+            axum::Extension(Some(admin.clone())),
+            axum::extract::Path(target.id.clone()),
+        )
+        .await;
+        assert!(matches!(
+            denied_get,
+            Err(crate::error::ServerError::Forbidden)
+        ));
+        let denied_list = super::list_users(
+            axum::extract::State(node.state.clone()),
+            axum::Extension(Some(admin)),
+            query(),
+        )
+        .await;
+        assert!(matches!(
+            denied_list,
+            Err(crate::error::ServerError::Forbidden)
+        ));
 
         node.server_task.abort();
         node.net.shutdown().await;

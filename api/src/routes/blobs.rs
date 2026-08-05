@@ -659,13 +659,33 @@ fn add_candidate(candidates: &mut BTreeSet<Destination>, destination: Destinatio
 
 #[cfg(test)]
 mod tests {
-    use super::{BlobCopyState, BlobCopyStorage, configured_targets, copy_response, pending_copy};
-    use crate::openapi::ApiDoc;
-    use aruna_core::structs::{
-        BucketInfo, BucketReplicationConfig, BucketReplicationTarget, RealmId,
+    use super::{
+        BlobCopyState, BlobCopyStorage, BlobLocationsQuery, blob_locations, configured_targets,
+        copy_response, pending_copy,
     };
+    use crate::error::ServerError;
+    use crate::openapi::ApiDoc;
+    use crate::server_state::ServerState;
+    use aruna_core::UserId;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
+    use aruna_core::request_policy::{PolicyKind, RequestPolicy};
+    use aruna_core::structs::{
+        Actor, AuthContext, BucketInfo, BucketReplicationConfig, BucketReplicationTarget,
+        GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmId,
+    };
+    use aruna_operations::driver::DriverContext;
     use aruna_operations::replication::location_summary::LocationSummaryError;
     use aruna_operations::replication::protocol::{LocationCopyStorage, LocationSummary};
+    use aruna_storage::FjallStorage;
+    use axum::Extension;
+    use axum::extract::{Query, State};
+    use byteview::ByteView;
+    use std::sync::Arc;
+    use std::time::SystemTime;
+    use tempfile::TempDir;
     use ulid::Ulid;
 
     fn node_id() -> aruna_core::NodeId {
@@ -911,5 +931,189 @@ mod tests {
                 .get("target_node_id")
                 .is_some()
         );
+    }
+
+    const TEST_BUCKET: &str = "locations-bucket";
+
+    fn realm_for(seed: u8) -> RealmId {
+        RealmId::from_bytes(
+            *ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .as_bytes(),
+        )
+    }
+
+    async fn write_fixture(state: &ServerState, key_space: &str, key: ByteView, value: ByteView) {
+        match state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key,
+                value,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected fixture write event: {other:?}"),
+        }
+    }
+
+    /// A realm holding one group whose owner may read `TEST_BUCKET`.
+    async fn setup_bucket(realm_id: RealmId, owner: UserId) -> (TempDir, Arc<ServerState>) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let state = Arc::new(
+            ServerState::new(
+                Arc::new(DriverContext {
+                    storage_handle: storage,
+                    net_handle: None,
+                    blob_handle: None,
+                    metadata_handle: None,
+                    task_handle: None,
+                    compute_handle: None,
+                }),
+                realm_id,
+                node_id(),
+                NodeCapabilities::local_node(realm_id).expect("capabilities"),
+                false,
+                None,
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
+            )
+            .await,
+        );
+        let group_id = Ulid::from_bytes([11u8; 16]);
+        let actor = Actor {
+            node_id: node_id(),
+            user_id: owner,
+            realm_id,
+        };
+        write_fixture(
+            &state,
+            AUTH_KEYSPACE,
+            ByteView::from(realm_id.as_bytes().to_vec()),
+            ByteView::from(
+                RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+                    .to_bytes(&actor)
+                    .expect("realm auth serializes"),
+            ),
+        )
+        .await;
+        write_fixture(
+            &state,
+            AUTH_KEYSPACE,
+            ByteView::from(group_id.to_bytes().to_vec()),
+            ByteView::from(
+                GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id)
+                    .to_bytes(&actor)
+                    .expect("group auth serializes"),
+            ),
+        )
+        .await;
+        write_fixture(
+            &state,
+            S3_BUCKET_KEYSPACE,
+            ByteView::from(TEST_BUCKET.as_bytes().to_vec()),
+            ByteView::from(
+                BucketInfo {
+                    group_id,
+                    created_at: SystemTime::now(),
+                    created_by: owner,
+                    cors_configuration: None,
+                    replication: None,
+                    storage_routing: Vec::new(),
+                }
+                .to_bytes()
+                .expect("bucket serializes"),
+            ),
+        )
+        .await;
+        (dir, state)
+    }
+
+    async fn install_deny_policy(state: &ServerState, realm_id: RealmId, expression: &str) {
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.request_policies.push(RequestPolicy {
+            policy_id: Ulid::generate(),
+            name: "deny".to_string(),
+            kind: PolicyKind::Deny,
+            when: None,
+            expression: expression.to_string(),
+            enabled: true,
+        });
+        let actor = Actor {
+            node_id: node_id(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        write_fixture(
+            state,
+            REALM_CONFIG_KEYSPACE,
+            ByteView::from(realm_id.as_bytes().to_vec()),
+            ByteView::from(config.to_bytes(&actor).expect("config serializes")),
+        )
+        .await;
+    }
+
+    fn locations_query() -> Query<BlobLocationsQuery> {
+        Query(BlobLocationsQuery {
+            bucket: TEST_BUCKET.to_string(),
+            path: "reports/a.csv".to_string(),
+            version_id: None,
+        })
+    }
+
+    fn auth_for(user_id: UserId, realm_id: RealmId) -> AuthContext {
+        AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn locations_require_read() {
+        // A member of no group must not learn where an object is held; the owner
+        // passes authorization and only then reports the absent object.
+        let realm_id = realm_for(31);
+        let owner = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
+        let stranger = UserId::new(Ulid::from_bytes([2u8; 16]), realm_id);
+        let (_dir, state) = setup_bucket(realm_id, owner).await;
+
+        let denied = blob_locations(
+            State(state.clone()),
+            Extension(Some(auth_for(stranger, realm_id))),
+            locations_query(),
+        )
+        .await;
+        assert!(matches!(denied, Err(ServerError::Forbidden)));
+
+        let allowed = blob_locations(
+            State(state),
+            Extension(Some(auth_for(owner, realm_id))),
+            locations_query(),
+        )
+        .await;
+        assert!(matches!(allowed, Err(ServerError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn policy_denies_locations() {
+        // A realm deny-reads policy must reach the location read, which only
+        // ordinary RBAC used to gate.
+        let realm_id = realm_for(32);
+        let owner = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
+        let (_dir, state) = setup_bucket(realm_id, owner).await;
+        install_deny_policy(&state, realm_id, "permission == 'read'").await;
+
+        let denied = blob_locations(
+            State(state),
+            Extension(Some(auth_for(owner, realm_id))),
+            locations_query(),
+        )
+        .await;
+        assert!(matches!(denied, Err(ServerError::Forbidden)));
     }
 }
