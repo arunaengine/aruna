@@ -5,7 +5,10 @@ use aruna_core::errors::ConversionError;
 use aruna_core::structs::{
     AuthContext, OidcProviderConfig, Permission, TokenClaims, blob_object_permission_path,
 };
-use aruna_operations::auth::{decode_aruna_bearer_token, validate_aruna_bearer_token_claims};
+use aruna_operations::auth::{
+    ArunaBearerTokenError, ArunaBearerTokenValidationState, decode_aruna_bearer_token,
+    validate_aruna_bearer_token_claims,
+};
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
@@ -425,6 +428,38 @@ pub async fn handle_token(state: &ServerState, token: &str) -> Result<TokenClaim
     decode_aruna_bearer_token(state, token)
         .await
         .map_err(Into::into)
+}
+
+/// Fully verified claims of a token that may already be revoked, so revoking it
+/// again is authorized against the same subject as the first time.
+pub(crate) async fn claims_for_revocation(
+    state: &ServerState,
+    token: &str,
+) -> Result<TokenClaims, TokenError> {
+    decode_aruna_bearer_token(&RevocationBlindState(state), token)
+        .await
+        .map_err(Into::into)
+}
+
+/// Reports every token as unrevoked; every other check stays the server's.
+struct RevocationBlindState<'a>(&'a ServerState);
+
+#[async_trait::async_trait]
+impl ArunaBearerTokenValidationState for RevocationBlindState<'_> {
+    async fn is_bearer_token_revoked(&self, _token_hash: &str) -> bool {
+        false
+    }
+
+    async fn is_trusted_realm(&self, realm_id: &aruna_core::structs::RealmId) -> bool {
+        self.0.is_trusted_realm(realm_id).await
+    }
+
+    async fn decoding_key_for_issuer(
+        &self,
+        issuer_pubkey: &str,
+    ) -> Result<DecodingKey, ArunaBearerTokenError> {
+        self.0.decoding_key_for_issuer(issuer_pubkey).await
+    }
 }
 
 pub async fn validate_claims(state: &ServerState, claims: &TokenClaims) -> Result<(), TokenError> {

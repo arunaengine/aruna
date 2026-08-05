@@ -1,8 +1,8 @@
-use crate::auth::{handle_token, require_realm_auth};
-use crate::error::{ErrorResponse, ServerError, ServerResult, TokenError};
+use crate::auth::{claims_for_revocation, ensure_permission, require_realm_auth};
+use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::auth::bearer_token_hash;
-use aruna_core::structs::{Actor, AuthContext};
+use aruna_core::structs::{Actor, AuthContext, Permission};
 use aruna_operations::driver::drive;
 use aruna_operations::revoke_token::{RevokeTokenConfig, RevokeTokenOperation};
 use axum::extract::State;
@@ -48,12 +48,21 @@ pub async fn revoke_token(
     Json(request): Json<RevokeTokenRequest>,
 ) -> ServerResult<StatusCode> {
     let auth = require_realm_auth(&state, auth)?;
-    // Validate the target is a real bearer token of a trusted realm before
-    // recording it, so the revocation set cannot be filled with arbitrary
-    // strings. An already-revoked token is accepted so revocation is idempotent.
-    match handle_token(&state, &request.token).await {
-        Ok(_) | Err(TokenError::TokenBlacklisted) => {}
-        Err(_) => return Err(ServerError::BadRequest),
+    // Only a real bearer token of a trusted realm may enter the revocation set,
+    // and only its own subject or a realm admin may revoke it, so a token holder
+    // cannot invalidate other users' sessions.
+    let claims = claims_for_revocation(&state, &request.token)
+        .await
+        .map_err(|_| ServerError::BadRequest)?;
+    let subject: AuthContext = claims.try_into().map_err(|_| ServerError::BadRequest)?;
+    if auth.user_id != subject.user_id {
+        ensure_permission(
+            &state,
+            &auth,
+            format!("/{}/admin/u/{}", auth.realm_id, subject.user_id),
+            Permission::WRITE,
+        )
+        .await?;
     }
 
     drive(
@@ -76,6 +85,8 @@ pub async fn revoke_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::handle_token;
+    use crate::error::TokenError;
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{Actor, NodeCapabilities, RealmId};
@@ -262,13 +273,38 @@ mod tests {
         config: &aruna_core::structs::RealmConfigDocument,
     ) {
         let target = aruna_core::document::DocumentSyncTarget::RealmConfig { realm_id };
-        let bytes = postcard::to_allocvec(config).unwrap();
+        store_bytes(
+            ctx,
+            target.storage_keyspace(),
+            target.storage_key().to_vec(),
+            postcard::to_allocvec(config).unwrap(),
+        )
+        .await;
+    }
+
+    /// Assigns every realm role, including `realm_admin`, to one user.
+    async fn grant_realm_admin(ctx: &DriverContext, realm_id: RealmId, user_id: UserId) {
+        let mut auth_doc =
+            aruna_core::structs::RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        for role in auth_doc.roles.values_mut() {
+            role.assigned_users.insert(user_id);
+        }
+        store_bytes(
+            ctx,
+            aruna_core::keyspaces::AUTH_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            postcard::to_allocvec(&auth_doc).unwrap(),
+        )
+        .await;
+    }
+
+    async fn store_bytes(ctx: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
         match ctx
             .storage_handle
             .send_storage_effect(aruna_core::effects::StorageEffect::Write {
-                key_space: target.storage_keyspace().to_string(),
-                key: target.storage_key(),
-                value: bytes.into(),
+                key_space: key_space.to_string(),
+                key: key.into(),
+                value: value.into(),
                 txn_id: None,
             })
             .await
@@ -276,8 +312,58 @@ mod tests {
             aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::WriteResult {
                 ..
             }) => {}
-            other => panic!("unexpected realm config write result: {other:?}"),
+            other => panic!("unexpected write result: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn stranger_cannot_revoke() {
+        // A realm user who neither owns the token nor holds the realm admin
+        // write must not be able to invalidate someone else's session.
+        let (state, realm_id, _user, token) = state_with_token().await;
+        let stranger = UserId::local(Ulid::generate(), realm_id);
+        let error = revoke_token(
+            State(state.clone()),
+            Extension(caller(realm_id, stranger)),
+            Json(RevokeTokenRequest {
+                token: token.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ServerError::Forbidden));
+        assert!(!state.is_token_blacklisted(&token).await);
+        assert!(handle_token(&state, &token).await.is_ok());
+        let config = drive(
+            GetRealmConfigOperation::new(realm_id),
+            state.get_ctx().as_ref(),
+        )
+        .await
+        .unwrap();
+        assert!(config.revoked_tokens.is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_can_revoke() {
+        // The realm admin gate that guards non-self user writes also permits
+        // revoking another user's token.
+        let (state, realm_id, _user, token) = state_with_token().await;
+        let admin = UserId::local(Ulid::generate(), realm_id);
+        grant_realm_admin(state.get_ctx().as_ref(), realm_id, admin).await;
+
+        let status = revoke_token(
+            State(state.clone()),
+            Extension(caller(realm_id, admin)),
+            Json(RevokeTokenRequest {
+                token: token.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(state.is_token_blacklisted(&token).await);
     }
 
     #[tokio::test]
