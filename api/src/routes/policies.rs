@@ -258,7 +258,11 @@ fn policies_response(policies: &[RequestPolicy]) -> PoliciesResponse {
     }
 }
 
-async fn realm_policies(state: &ServerState) -> ServerResult<Vec<RequestPolicy>> {
+async fn realm_policies(
+    state: &ServerState,
+    auth: &AuthContext,
+) -> ServerResult<Vec<RequestPolicy>> {
+    require_config_read(state, auth).await?;
     match drive(
         GetRealmConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),
@@ -273,7 +277,12 @@ async fn realm_policies(state: &ServerState) -> ServerResult<Vec<RequestPolicy>>
     }
 }
 
-async fn group_policies(state: &ServerState, group_id: Ulid) -> ServerResult<Vec<RequestPolicy>> {
+async fn group_policies(
+    state: &ServerState,
+    auth: &AuthContext,
+    group_id: Ulid,
+) -> ServerResult<Vec<RequestPolicy>> {
+    require_group_read(state, auth, group_id).await?;
     match drive(
         GetGroupOperation::new(GetGroupConfig { group_id }),
         &state.get_ctx(),
@@ -313,13 +322,38 @@ async fn require_group_admin(
     .await
 }
 
+async fn require_config_read(state: &ServerState, auth: &AuthContext) -> ServerResult<()> {
+    ensure_permission(
+        state,
+        auth,
+        format!("/{}/admin/config", state.get_realm_id()),
+        Permission::READ,
+    )
+    .await
+}
+
+async fn require_group_read(
+    state: &ServerState,
+    auth: &AuthContext,
+    group_id: Ulid,
+) -> ServerResult<()> {
+    ensure_permission(
+        state,
+        auth,
+        format!("/{}/g/{}/admin/config", state.get_realm_id(), group_id),
+        Permission::READ,
+    )
+    .await
+}
+
 #[utoipa::path(
     get,
     path = "/policies/realm",
     tag = "policies",
     responses(
         (status = 200, description = "Stored realm policy set", body = PoliciesResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse)
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -327,8 +361,8 @@ pub async fn get_realm_policies(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<PoliciesResponse>)> {
-    let _auth = require_realm_auth(&state, auth)?;
-    let policies = realm_policies(&state).await?;
+    let auth = require_realm_auth(&state, auth)?;
+    let policies = realm_policies(&state, &auth).await?;
     Ok((StatusCode::OK, Json(policies_response(&policies))))
 }
 
@@ -400,7 +434,8 @@ pub async fn set_realm_policies(
     params(("group_id" = String, Path, description = "Group id")),
     responses(
         (status = 200, description = "Stored group policy set", body = PoliciesResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse)
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -409,9 +444,9 @@ pub async fn get_group_policies(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<PoliciesResponse>)> {
-    let _auth = require_realm_auth(&state, auth)?;
+    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
-    let policies = group_policies(&state, group_id).await?;
+    let policies = group_policies(&state, &auth, group_id).await?;
     Ok((StatusCode::OK, Json(policies_response(&policies))))
 }
 
@@ -485,7 +520,8 @@ pub async fn set_group_policies(
     params(("group_id" = Option<String>, Query, description = "Optional group scope")),
     responses(
         (status = 200, description = "Merged realm and group policy set", body = EffectivePoliciesResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse)
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -494,8 +530,8 @@ pub async fn effective_policies(
     Extension(auth): Extension<Option<AuthContext>>,
     Query(query): Query<EffectiveQuery>,
 ) -> ServerResult<(StatusCode, Json<EffectivePoliciesResponse>)> {
-    let _auth = require_realm_auth(&state, auth)?;
-    let mut policies: Vec<ScopedPolicy> = realm_policies(&state)
+    let auth = require_realm_auth(&state, auth)?;
+    let mut policies: Vec<ScopedPolicy> = realm_policies(&state, &auth)
         .await?
         .iter()
         .map(|policy| ScopedPolicy {
@@ -507,7 +543,7 @@ pub async fn effective_policies(
         let group_id = parse_group_id(group_id)?;
         let label = format!("group({group_id})");
         policies.extend(
-            group_policies(&state, group_id)
+            group_policies(&state, &auth, group_id)
                 .await?
                 .iter()
                 .map(|policy| ScopedPolicy {
@@ -562,7 +598,8 @@ pub async fn validate_policy(
     responses(
         (status = 200, description = "Evaluation result", body = DryRunResponse),
         (status = 400, description = "Invalid candidate policies", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse)
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -571,7 +608,7 @@ pub async fn dry_run_policy(
     Extension(auth): Extension<Option<AuthContext>>,
     Json(request): Json<DryRunRequest>,
 ) -> ServerResult<(StatusCode, Json<DryRunResponse>)> {
-    let _auth = require_realm_auth(&state, auth)?;
+    let auth = require_realm_auth(&state, auth)?;
 
     let policy_request = PolicyRequest {
         path: request.path.clone(),
@@ -586,7 +623,7 @@ pub async fn dry_run_policy(
         body: request.body.clone(),
     };
 
-    let scopes = dry_run_scopes(&state, &request).await?;
+    let scopes = dry_run_scopes(&state, &auth, &request).await?;
 
     let functions = PolicyFunctions::default();
     let mut trace = Vec::new();
@@ -624,6 +661,7 @@ pub async fn dry_run_policy(
 /// expressions are size- and compile-checked before use (S10).
 async fn dry_run_scopes(
     state: &ServerState,
+    auth: &AuthContext,
     request: &DryRunRequest,
 ) -> ServerResult<Vec<(String, Vec<RequestPolicy>)>> {
     if let Some(candidates) = &request.candidate_policies {
@@ -636,7 +674,10 @@ async fn dry_run_scopes(
     }
     let scope = request.scope.as_deref().unwrap_or("realm");
     match scope {
-        "realm" => Ok(vec![("realm".to_string(), realm_policies(state).await?)]),
+        "realm" => Ok(vec![(
+            "realm".to_string(),
+            realm_policies(state, auth).await?,
+        )]),
         "group" => {
             let group_id = request
                 .group_id
@@ -645,16 +686,16 @@ async fn dry_run_scopes(
                 .and_then(parse_group_id)?;
             Ok(vec![(
                 format!("group({group_id})"),
-                group_policies(state, group_id).await?,
+                group_policies(state, auth, group_id).await?,
             )])
         }
         "effective" => {
-            let mut scopes = vec![("realm".to_string(), realm_policies(state).await?)];
+            let mut scopes = vec![("realm".to_string(), realm_policies(state, auth).await?)];
             if let Some(group_id) = request.group_id.as_deref() {
                 let group_id = parse_group_id(group_id)?;
                 scopes.push((
                     format!("group({group_id})"),
-                    group_policies(state, group_id).await?,
+                    group_policies(state, auth, group_id).await?,
                 ));
             }
             Ok(scopes)
