@@ -423,6 +423,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.rate_limits.s3_max_connections as usize,
         config.rate_limits.s3_max_requests as usize,
     )
+    .with_trusted_proxies(config.trusted_proxies.clone())
     .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
         config.rate_limits.ip_per_minute,
         config.rate_limits.ip_burst,

@@ -152,6 +152,7 @@ pub struct S3Server {
     seal_key: CredentialSealKey,
     connection_limit: Arc<Semaphore>,
     request_limit: Arc<Semaphore>,
+    trusted_proxies: Arc<Vec<ipnet::IpNet>>,
 }
 
 #[derive(Clone)]
@@ -168,6 +169,8 @@ pub struct WrappingService {
     rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
     // Held across each request so concurrent expensive processing is bounded.
     request_limit: Arc<Semaphore>,
+    // Proxies whose forwarded client address may be charged instead of the peer.
+    trusted_proxies: Arc<Vec<ipnet::IpNet>>,
 }
 
 fn build_s3_service(
@@ -232,6 +235,7 @@ impl S3Server {
             seal_key,
             connection_limit: Arc::new(Semaphore::new(DEFAULT_S3_MAX_CONNECTIONS)),
             request_limit: Arc::new(Semaphore::new(DEFAULT_S3_MAX_CONCURRENT_REQUESTS)),
+            trusted_proxies: Arc::new(Vec::new()),
         })
     }
 
@@ -266,6 +270,13 @@ impl S3Server {
         Ok(self)
     }
 
+    /// Installs the reverse proxies whose `x-forwarded-for` client address is
+    /// charged instead of the transport peer, matching the REST limiter.
+    pub fn with_trusted_proxies(mut self, proxies: Vec<ipnet::IpNet>) -> Self {
+        self.trusted_proxies = Arc::new(proxies);
+        self
+    }
+
     pub fn run_with_listener(
         self,
         listener: TcpListener,
@@ -281,6 +292,7 @@ impl S3Server {
             peer_ip: None,
             rate_limits: self.rate_limits,
             request_limit: self.request_limit,
+            trusted_proxies: self.trusted_proxies,
         };
         let connection = ConnBuilder::new(TokioExecutor::new());
 
@@ -388,20 +400,24 @@ impl Service<Request<Incoming>> for WrappingService {
         } else {
             body.into()
         };
+        // Resolved before the parts move into the s3s request: behind a trusted
+        // proxy the forwarded client is charged, never the shared proxy address.
+        let charged_ip = self
+            .peer_ip
+            .map(|peer| crate::forwarded::client_ip(&self.trusted_proxies, peer, &parts.headers));
         let s3s_request = s3s::HttpRequest::from_parts(parts, body);
         let shared = self.shared.clone();
         let cors = self.cors.clone();
         let driver_ctx = self.driver_ctx.clone();
         let metrics = self.metrics.clone();
         let rate_limits = self.rate_limits.clone();
-        let peer_ip = self.peer_ip;
         let request_limit = self.request_limit.clone();
         Box::pin(async move {
             // Charge the transport IP before CORS, signature checks, credential
             // reads, or body handling, so unsigned or invalid requests cannot
             // bypass admission.
-            if let Some(peer_ip) = peer_ip
-                && let Err(retry_after) = rate_limits.check_ip(peer_ip)
+            if let Some(charged_ip) = charged_ip
+                && let Err(retry_after) = rate_limits.check_ip(charged_ip)
             {
                 let response = slow_down_response(retry_after);
                 let code = response.status().as_u16();
@@ -577,6 +593,68 @@ async fn load_bucket_cors_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn charges_forwarded_client() {
+        // Behind a trusted proxy every client gets its own bucket; charging the
+        // proxy would let one caller throttle every other caller of that proxy.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap())
+            .expect("storage opens");
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("local addr");
+        let server = S3Server::new(
+            "127.0.0.1:0",
+            format!("localhost:{}", address.port()),
+            driver_ctx,
+            RealmId([5u8; 32]),
+            iroh::SecretKey::generate().public(),
+            CredentialSealKey::random(),
+            RoCrateLimits::default(),
+            CorsConfig::default(),
+            Arc::new(NodeMetrics::new()),
+        )
+        .await
+        .expect("s3 server builds")
+        .with_trusted_proxies(vec!["127.0.0.1/32".parse().expect("valid proxy net")])
+        .with_rate_limits(crate::rate_limit::ApiRateLimits::for_test(1))
+        .expect("rate limits install");
+        let (_bound, task) = server.run_with_listener(listener).expect("server runs");
+
+        let client = reqwest::Client::new();
+        let charge = async |forwarded: &str| {
+            client
+                .get(format!("http://127.0.0.1:{}/bucket/key", address.port()))
+                .header("x-forwarded-for", forwarded)
+                .send()
+                .await
+                .expect("request completes")
+                .status()
+        };
+        assert_ne!(
+            charge("198.51.100.1").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            charge("198.51.100.1").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // A second client behind the same proxy still has its own budget.
+        assert_ne!(
+            charge("198.51.100.2").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        task.abort();
+    }
 
     #[test]
     fn extracts_bucket_name_from_path_style_request() {
