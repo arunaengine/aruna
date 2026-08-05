@@ -62,7 +62,7 @@ use crate::placement::{
     holds_placement, registry_placement, registry_placement_for, registry_strategy,
     resolve_shard_holders,
 };
-use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, SearchBucketsOperation};
+use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, search_local_buckets};
 
 const DEFAULT_LIST_METADATA_LIMIT: usize = 50;
 const MAX_LIST_METADATA_LIMIT: usize = 1_000;
@@ -2606,15 +2606,16 @@ pub async fn search_buckets_distributed(
             limit,
         ),
         |(context, auth, realm_id, query, limit), node_id| async move {
-            drive(
-                SearchBucketsOperation::new(SearchBucketsInput {
+            search_local_buckets(
+                &context,
+                SearchBucketsInput {
                     auth,
                     realm_id,
                     node_id,
                     query,
                     limit,
-                }),
-                &context,
+                    start_after: None,
+                },
             )
             .await
             .map_err(|error| MetadataError::Backend(error.to_string()))

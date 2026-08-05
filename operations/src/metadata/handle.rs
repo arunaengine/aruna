@@ -73,7 +73,7 @@ use crate::request_authorization::{AuthorizeError, authorize};
 use crate::request_policy::PolicyRequestExtras;
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, SearchBucketsOperation};
+use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, search_local_buckets};
 use crate::sync_mirror_repair::RECONCILE_GRACE;
 use crate::sync_relationship::{
     DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, StoreSyncRelationshipOperation,
@@ -1288,15 +1288,16 @@ impl MetadataHandle {
             .await
             {
                 Some(auth) => match self.inner.net_handle.as_ref() {
-                    Some(net_handle) => match drive(
-                        SearchBucketsOperation::new(SearchBucketsInput {
+                    Some(net_handle) => match search_local_buckets(
+                        context.as_ref(),
+                        SearchBucketsInput {
                             auth,
                             realm_id: *net_handle.realm_id(),
                             node_id: net_handle.node_id(),
                             query,
                             limit,
-                        }),
-                        context.as_ref(),
+                            start_after: None,
+                        },
                     )
                     .await
                     {

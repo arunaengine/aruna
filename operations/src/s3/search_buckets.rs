@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::SystemTime;
 
 use aruna_core::NodeId;
@@ -16,6 +16,8 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::driver::{DriverContext, drive};
+use crate::request_policy::{PolicyEvaluator, PolicyRequestExtras, policy_request_with};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchBucketsInput {
@@ -24,6 +26,17 @@ pub struct SearchBucketsInput {
     pub node_id: NodeId,
     pub query: String,
     pub limit: usize,
+    /// Resumes the raw bucket scan after this key so a filtering caller can fill
+    /// one page across several drives.
+    pub start_after: Option<Key>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SearchBucketsOutput {
+    pub hits: Vec<BucketSearchHit>,
+    /// Scan position after the last decided bucket, or `None` once the keyspace
+    /// is exhausted.
+    pub next_start_after: Option<Key>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,7 +89,8 @@ pub struct SearchBucketsOperation {
     current: Option<BucketCandidate>,
     hits: Vec<BucketSearchHit>,
     next_start_after: Option<Key>,
-    output: Option<Result<Vec<BucketSearchHit>, SearchBucketsError>>,
+    last_decided: Option<Key>,
+    output: Option<Result<SearchBucketsOutput, SearchBucketsError>>,
 }
 
 impl SearchBucketsOperation {
@@ -86,13 +100,15 @@ impl SearchBucketsOperation {
     pub fn new(mut input: SearchBucketsInput) -> Self {
         input.limit = input.limit.clamp(1, Self::MAX_LIMIT);
         input.query = input.query.to_lowercase();
+        let next_start_after = input.start_after.clone();
         Self {
             input,
             state: SearchBucketsState::Init,
             candidates: VecDeque::new(),
             current: None,
             hits: Vec::new(),
-            next_start_after: None,
+            next_start_after,
+            last_decided: None,
             output: None,
         }
     }
@@ -157,6 +173,7 @@ impl SearchBucketsOperation {
             return self.finish();
         }
         if let Some(candidate) = self.candidates.pop_front() {
+            self.last_decided = Some(candidate.bucket.as_bytes().into());
             self.current = Some(candidate);
             return self.emit_permission_check();
         }
@@ -243,13 +260,88 @@ impl SearchBucketsOperation {
 
     fn finish(&mut self) -> Effects {
         self.state = SearchBucketsState::Finish;
-        self.output = Some(Ok(std::mem::take(&mut self.hits)));
+        // Candidates left in the queue were scanned past but never decided, so
+        // the continuation is the last decided bucket rather than the batch end.
+        let next_start_after = if self.candidates.is_empty() {
+            self.next_start_after.take()
+        } else {
+            self.last_decided.take()
+        };
+        self.output = Some(Ok(SearchBucketsOutput {
+            hits: std::mem::take(&mut self.hits),
+            next_start_after,
+        }));
         smallvec![]
     }
 }
 
+/// Runs one node's bucket search and drops every hit denied by the realm or
+/// group request policies. Policy state is read once per distinct candidate
+/// group, a group whose policy state cannot be read stays invisible, and the
+/// page is filled across scans so a hidden bucket cannot shorten it.
+pub async fn search_local_buckets(
+    context: &DriverContext,
+    input: SearchBucketsInput,
+) -> Result<Vec<BucketSearchHit>, SearchBucketsError> {
+    let limit = input.limit.clamp(1, SearchBucketsOperation::MAX_LIMIT);
+    let mut evaluators: HashMap<GroupId, PolicyEvaluator> = HashMap::new();
+    let mut visible: Vec<BucketSearchHit> = Vec::with_capacity(limit);
+    let mut start_after = input.start_after.clone();
+    loop {
+        let output = drive(
+            SearchBucketsOperation::new(SearchBucketsInput {
+                start_after,
+                ..input.clone()
+            }),
+            context,
+        )
+        .await?;
+        let pending = output
+            .hits
+            .iter()
+            .map(|hit| hit.group_id)
+            .filter(|group_id| !evaluators.contains_key(group_id))
+            .map(|group_id| (input.realm_id, group_id))
+            .collect::<Vec<_>>();
+        evaluators.extend(PolicyEvaluator::load_bulk(context, pending).await);
+        for hit in output.hits {
+            if !policy_allows(&evaluators, &input, &hit) {
+                continue;
+            }
+            visible.push(hit);
+            if visible.len() >= limit {
+                return Ok(visible);
+            }
+        }
+        match output.next_start_after {
+            Some(key) => start_after = Some(key),
+            None => return Ok(visible),
+        }
+    }
+}
+
+/// Evaluates the loaded policies for one hit on the path the RBAC check used,
+/// under the S3 bucket-read action so one policy covers both read surfaces. A
+/// group with no loaded evaluator fails closed.
+fn policy_allows(
+    evaluators: &HashMap<GroupId, PolicyEvaluator>,
+    input: &SearchBucketsInput,
+    hit: &BucketSearchHit,
+) -> bool {
+    let path = blob_bucket_permission_path(input.realm_id, hit.group_id, hit.node_id, &hit.bucket);
+    let request = policy_request_with(
+        &path,
+        &Permission::READ,
+        Some(&input.auth.user_id),
+        PolicyRequestExtras::operation("s3.ListBuckets"),
+    );
+    evaluators
+        .get(&hit.group_id)
+        .is_some_and(|evaluator| evaluator.evaluate(&request).is_ok())
+}
+
 impl Operation for SearchBucketsOperation {
-    type Output = Vec<BucketSearchHit>;
+    type Output = SearchBucketsOutput;
     type Error = SearchBucketsError;
 
     fn start(&mut self) -> Effects {
@@ -301,7 +393,6 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
-    use crate::driver::{DriverContext, drive};
 
     async fn write_value(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
         let event = context
@@ -420,8 +511,9 @@ mod tests {
             .await;
         }
 
-        let hits = drive(
-            SearchBucketsOperation::new(SearchBucketsInput {
+        let hits = search_local_buckets(
+            &context,
+            SearchBucketsInput {
                 auth: AuthContext {
                     user_id: outsider,
                     realm_id,
@@ -431,8 +523,8 @@ mod tests {
                 node_id,
                 query: "DATA".to_string(),
                 limit: 50,
-            }),
-            &context,
+                start_after: None,
+            },
         )
         .await
         .unwrap();
