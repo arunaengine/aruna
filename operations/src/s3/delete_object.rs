@@ -908,6 +908,37 @@ mod test {
         aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]))
     }
 
+    #[test]
+    fn obligation_keeps_restrictions() {
+        // The durable repair record is what a lost enqueue replays, so a scoped
+        // credential must stay scoped on it.
+        let restrictions = vec![PathRestriction {
+            pattern: "/realm/g/group/data/node/bucket/scoped/**".to_string(),
+            permission: aruna_core::structs::Permission::WRITE,
+        }];
+        let mut operation = DeleteObjectOperation::new(DeleteObjectInput {
+            bucket: "bucket".to_string(),
+            key: "scoped/key".to_string(),
+            version_id: None,
+            group_id: Ulid::generate(),
+            realm_id: RealmId::from_bytes([1u8; 32]),
+            node_id: iroh::SecretKey::generate().public(),
+            deleted_by: test_user_id(),
+        })
+        .with_restrictions(Some(restrictions.clone()));
+        operation.version_id = Some(Ulid::generate());
+
+        let effects = operation.write_live_replication_obligation();
+
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected one obligation write, got {effects:?}")
+        };
+        let record =
+            crate::replication::queue::LiveReplicationObligationRecord::from_bytes(value.as_ref())
+                .expect("obligation decodes");
+        assert_eq!(record.auth_context.path_restrictions, Some(restrictions));
+    }
+
     fn deleted_version_value(user_id: aruna_core::UserId) -> aruna_core::types::Value {
         BlobVersion::deleted(SystemTime::UNIX_EPOCH, user_id)
             .to_bytes()

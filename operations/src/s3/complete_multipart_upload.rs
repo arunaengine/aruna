@@ -1537,6 +1537,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn obligation_keeps_restrictions() {
+        // The durable repair record is what a lost enqueue replays, so a scoped
+        // credential must stay scoped on it.
+        let restrictions = vec![PathRestriction {
+            pattern: "/realm/g/group/data/node/bucket/scoped/**".to_string(),
+            permission: aruna_core::structs::Permission::WRITE,
+        }];
+        let mut operation = CompleteMultipartUploadOperation::new(finalize_input())
+            .with_restrictions(Some(restrictions.clone()));
+        operation.version_id = Some(Ulid::generate());
+
+        let effects = operation.write_live_replication_obligation();
+
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected one obligation write, got {effects:?}")
+        };
+        let record =
+            crate::replication::queue::LiveReplicationObligationRecord::from_bytes(value.as_ref())
+                .expect("obligation decodes");
+        assert_eq!(record.auth_context.path_restrictions, Some(restrictions));
+    }
+
     fn open_upload_record(input: &CompleteMultipartUploadInput) -> MultipartUpload {
         MultipartUpload {
             backend: BackendRef::node_default(),
