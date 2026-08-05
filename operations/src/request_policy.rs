@@ -334,14 +334,24 @@ mod tests {
         }
     }
 
+    /// The compiled-set cache is process-wide and keyed by content, so a test
+    /// that asserts on entry identity must own its policy id: a concurrent test
+    /// compiling the same bytes would otherwise replace the entry.
+    fn owned_policy(expression: &str) -> RequestPolicy {
+        RequestPolicy {
+            policy_id: Ulid::from_bytes([9u8; 16]),
+            ..policy(expression)
+        }
+    }
+
     #[test]
     fn caches_by_content() {
         // Identical bytes reuse the same Arc; an edit mints a new entry.
-        let policies = [policy("permission == 'write'")];
+        let policies = [owned_policy("permission == 'write'")];
         let first = compiled_set(&policies).unwrap();
         let second = compiled_set(&policies).unwrap();
         assert!(Arc::ptr_eq(&first, &second));
-        let edited = [policy("permission == 'read'")];
+        let edited = [owned_policy("permission == 'read'")];
         let third = compiled_set(&edited).unwrap();
         assert!(!Arc::ptr_eq(&first, &third));
     }
