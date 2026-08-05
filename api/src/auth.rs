@@ -570,6 +570,22 @@ pub(crate) async fn ensure_permission_with(
     })
 }
 
+/// Boolean form of [`ensure_permission`] for the routes that grade a caller
+/// instead of rejecting it. Every denial, including one from a request policy,
+/// reads as not authorized; only a failed check stays an internal error.
+pub(crate) async fn permission_granted(
+    state: &ServerState,
+    auth: &AuthContext,
+    path: String,
+    required_permission: Permission,
+) -> ServerResult<bool> {
+    match ensure_permission(state, auth, path, required_permission).await {
+        Ok(()) => Ok(true),
+        Err(ServerError::Forbidden) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn bucket_blob_permission_path(
     state: &ServerState,
     group_id: Ulid,

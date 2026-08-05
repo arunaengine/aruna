@@ -1,4 +1,4 @@
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::{ensure_permission, permission_granted, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::UserId;
@@ -15,7 +15,6 @@ use aruna_operations::add_group_role::{
 use aruna_operations::add_user_to_group::{
     AddUserToGroupError, AddUserToGroupInput, AddUserToGroupOperation,
 };
-use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupError, CreateGroupOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
@@ -376,22 +375,13 @@ pub async fn create_group(
         return Err(ServerError::Forbidden);
     }
 
-    let is_realm_admin = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth.clone(),
-            path: format!("/{realm_id}/admin/groups"),
-            required_permission: Permission::WRITE,
-        }),
-        &state.get_ctx(),
+    let is_realm_admin = permission_granted(
+        &state,
+        &auth,
+        format!("/{realm_id}/admin/groups"),
+        Permission::WRITE,
     )
-    .await
-    .map_err(|err| match err {
-        AuthorizationError::InvalidRealmId
-        | AuthorizationError::InvalidGroupId
-        | AuthorizationError::GroupNotFound
-        | AuthorizationError::AuthDocNotFound => ServerError::Forbidden,
-        _ => ServerError::InternalError(err.to_string()),
-    })?;
+    .await?;
 
     // Self-service path: any unrestricted same-realm token subject may create
     // groups, capped by the realm quota config; realm admins are exempt.
@@ -1405,10 +1395,10 @@ fn encode_object_token(token: ListObjectsV2ContinuationToken) -> ServerResult<St
 #[cfg(test)]
 mod tests {
     use super::{
-        DataPathKind, DataPathsQuery, ListGroupsQuery, get_group, get_group_usage, list_data_paths,
-        list_group_members, list_groups,
+        CreateGroupRequest, DataPathKind, DataPathsQuery, ListGroupsQuery, create_group, get_group,
+        get_group_usage, list_data_paths, list_group_members, list_groups,
     };
-    use crate::error::ServerError;
+    use crate::error::{ServerError, ServerResult};
     use crate::server_state::ServerState;
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
@@ -1426,6 +1416,7 @@ mod tests {
         blob_object_permission_path,
     };
     use aruna_operations::driver::DriverContext;
+    use aruna_operations::driver::drive;
     use aruna_storage::storage;
     use axum::extract::{Path, Query, State};
     use axum::http::StatusCode;
@@ -1570,6 +1561,140 @@ mod tests {
             realm_id,
             path_restrictions: None,
         }
+    }
+
+    /// A realm whose initial admin is claimed, so the realm admin path grants.
+    async fn setup_admin_state() -> (Arc<ServerState>, UserId, TempDir) {
+        let tempdir = tempdir().unwrap();
+        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(aruna_tasks::TaskHandle::new()),
+            compute_handle: None,
+        });
+        let realm_signing_key = generate_signing_key();
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+        let node_id = iroh::SecretKey::generate().public();
+        let admin = UserId::local(Ulid::generate(), realm_id);
+        let actor = Actor {
+            node_id,
+            user_id: admin,
+            realm_id,
+        };
+        drive(
+            aruna_operations::create_realm::CreateRealmOperation::new(
+                aruna_operations::create_realm::CreateRealmConfig {
+                    actor: actor.clone(),
+                    realm_description: "groups".to_string(),
+                    oidc_providers: Vec::new(),
+                    node_location: None,
+                    node_weight: None,
+                    node_labels: Default::default(),
+                },
+            ),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
+        drive(
+            aruna_operations::claim_initial_realm_admin::ClaimInitialRealmAdminOperation::new(
+                aruna_operations::claim_initial_realm_admin::ClaimInitialRealmAdminInput { actor },
+            ),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
+        let state = Arc::new(
+            ServerState::new(
+                driver_ctx,
+                realm_id,
+                node_id,
+                NodeCapabilities::local_node(realm_id).unwrap(),
+                false,
+                None,
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
+            )
+            .await,
+        );
+
+        (state, admin, tempdir)
+    }
+
+    async fn update_config(
+        state: &ServerState,
+        mutate: impl FnOnce(&mut aruna_core::structs::RealmConfigDocument),
+    ) {
+        let realm_id = state.get_realm_id();
+        let mut config = drive(
+            aruna_operations::get_realm_config::GetRealmConfigOperation::new(realm_id),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap();
+        mutate(&mut config);
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        store_bytes(
+            state,
+            aruna_core::keyspaces::REALM_CONFIG_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            config.to_bytes(&actor).unwrap(),
+        )
+        .await;
+    }
+
+    async fn new_group(state: &Arc<ServerState>, user_id: UserId, name: &str) -> ServerResult<()> {
+        create_group(
+            State(state.clone()),
+            Extension(Some(member_auth(user_id))),
+            Json(CreateGroupRequest {
+                name: name.to_string(),
+            }),
+        )
+        .await
+        .map(|(status, _)| assert_eq!(status, StatusCode::CREATED))
+    }
+
+    #[tokio::test]
+    async fn deny_policy_drops_exemption() {
+        // A realm deny policy on the admin path must grade the caller as an
+        // ordinary user, without breaking capped self-service creation.
+        let (state, admin, _tempdir) = setup_admin_state().await;
+        let realm_id = state.get_realm_id();
+        update_config(&state, |config| {
+            config.quota.max_groups_per_user = Some(1);
+        })
+        .await;
+
+        new_group(&state, admin, "first").await.unwrap();
+        new_group(&state, admin, "second").await.unwrap();
+
+        let denied = format!("/{realm_id}/admin/groups");
+        update_config(&state, |config| {
+            config
+                .request_policies
+                .push(aruna_core::request_policy::RequestPolicy {
+                    policy_id: Ulid::generate(),
+                    name: "deny-group-admin".to_string(),
+                    kind: aruna_core::request_policy::PolicyKind::Deny,
+                    when: None,
+                    expression: format!("path == '{denied}'"),
+                    enabled: true,
+                });
+        })
+        .await;
+
+        let error = new_group(&state, admin, "third").await.unwrap_err();
+        assert!(matches!(error, ServerError::Conflict(_)));
+
+        let member = UserId::local(Ulid::generate(), realm_id);
+        new_group(&state, member, "mine").await.unwrap();
     }
 
     /// Anonymous callers get 401, foreign-realm tokens 403: neither may

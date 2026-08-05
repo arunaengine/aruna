@@ -1,4 +1,4 @@
-use crate::auth::require_realm_auth;
+use crate::auth::{permission_granted, require_realm_auth};
 use crate::error::{ServerError, ServerResult};
 pub use crate::server_state::PortalStatus;
 use crate::server_state::ServerState;
@@ -13,7 +13,6 @@ use aruna_core::structs::{BackendRef, USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
 use aruna_core::structs::{RealmConfigDocument, RealmNodeKind};
 use aruna_operations::allocate_handle::{HandleAllocationError, provision_metadata_binding};
-use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{backend_used_bytes, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::get_realm_nodes::{GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT};
@@ -971,16 +970,13 @@ fn map_node_info_document(
 
 async fn is_realm_config_admin(state: &ServerState, auth: &AuthContext) -> ServerResult<bool> {
     let realm_id = state.get_realm_id();
-    drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth.clone(),
-            path: format!("/{realm_id}/admin/config"),
-            required_permission: Permission::WRITE,
-        }),
-        &state.get_ctx(),
+    permission_granted(
+        state,
+        auth,
+        format!("/{realm_id}/admin/config"),
+        Permission::WRITE,
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))
 }
 
 async fn authorize_realm_config_admin(
@@ -2330,6 +2326,60 @@ mod tests {
             realm_id,
             path_restrictions: None,
         }
+    }
+
+    /// Installs a realm deny policy for one permission path.
+    async fn deny_path(state: &ServerState, path: &str) {
+        let realm_id = state.get_realm_id();
+        let mut config = drive(
+            aruna_operations::get_realm_config::GetRealmConfigOperation::new(realm_id),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap();
+        config
+            .request_policies
+            .push(aruna_core::request_policy::RequestPolicy {
+                policy_id: Ulid::generate(),
+                name: "deny-path".to_string(),
+                kind: aruna_core::request_policy::PolicyKind::Deny,
+                when: None,
+                expression: format!("path == '{path}'"),
+                enabled: true,
+            });
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
+                key: realm_id.as_bytes().to_vec().into(),
+                value: config.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn deny_policy_blocks_admin() {
+        // The config-admin gate must honour realm request policies, not only
+        // the RBAC roles the permission check reads.
+        let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+        let auth = admin_auth(realm_id, admin);
+        let _ = get_realm_placement(State(state.clone()), Extension(Some(auth.clone())))
+            .await
+            .expect("the realm admin sees the placement config");
+
+        deny_path(&state, &format!("/{realm_id}/admin/config")).await;
+
+        assert!(matches!(
+            get_realm_placement(State(state.clone()), Extension(Some(auth))).await,
+            Err(ServerError::Forbidden)
+        ));
     }
 
     fn placement_strategy(strategy_id: Ulid) -> RealmPlacementStrategy {
