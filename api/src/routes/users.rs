@@ -741,6 +741,14 @@ async fn list_users(
         .limit
         .unwrap_or(DEFAULT_LIST_USERS_LIMIT)
         .clamp(1, MAX_LIST_USERS_LIMIT);
+    ensure_permission(
+        &state,
+        &auth,
+        format!("/{realm_id}/admin/u/**"),
+        Permission::READ,
+    )
+    .await?;
+
     let output = drive(
         ListUsersOperation::new(ListUsersInput {
             auth_context: auth,
@@ -930,6 +938,14 @@ async fn get_user(
         // TODO: Forwarding for foreign realm users
         return Err(ServerError::Unimplemented);
     }
+    ensure_permission(
+        &state,
+        &auth,
+        format!("/{realm_id}/admin/u/{user_id}"),
+        Permission::READ,
+    )
+    .await?;
+
     let user = drive(
         GetUserOperation::new(GetUserInput {
             auth_context: auth,

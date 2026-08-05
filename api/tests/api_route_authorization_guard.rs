@@ -254,18 +254,8 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "users.rs",
-        "get_user",
-        "GetUserOperation checks READ on the admin user path",
-    ),
-    (
-        "users.rs",
         "get_user_info",
         "self-scoped: every read is keyed by the caller's user id",
-    ),
-    (
-        "users.rs",
-        "list_users",
-        "ListUsersOperation checks READ on the admin user directory",
     ),
     (
         "users.rs",
