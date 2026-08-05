@@ -781,7 +781,8 @@ async fn list_users(
     responses(
         (status = 200, description = "Matching users", body = SearchUsersResponse),
         (status = 400, description = "Query too short", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse)
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -806,6 +807,13 @@ async fn search_users(
     if let Some(start_after) = &query.start_after {
         UserId::from_string(start_after).map_err(|_| ServerError::BadRequest)?;
     }
+    ensure_permission(
+        &state,
+        &auth,
+        format!("/{realm_id}/admin/u/**"),
+        Permission::READ,
+    )
+    .await?;
 
     let output = drive(
         SearchUsersOperation::new(SearchUsersInput {
@@ -866,6 +874,13 @@ async fn resolve_users(
         .iter()
         .map(|user_id| UserId::from_string(user_id).map_err(|_| ServerError::BadRequest))
         .collect::<ServerResult<Vec<_>>>()?;
+    ensure_permission(
+        &state,
+        &auth,
+        format!("/{realm_id}/admin/u/**"),
+        Permission::READ,
+    )
+    .await?;
 
     let output = drive(
         ResolveUsersOperation::new(ResolveUsersInput { realm_id, user_ids }),
@@ -1980,6 +1995,20 @@ mod resolve_tests {
         )
         .await;
         assert!(matches!(result, Err(ServerError::Unauthorized)));
+    }
+
+    #[tokio::test]
+    async fn requires_directory_read() {
+        // A realm member without the admin user directory grant may not resolve.
+        let (state, _tempdir) = setup_state().await;
+        let realm_id = state.get_realm_id();
+        let result = resolve_users(
+            State(state),
+            Extension(Some(realm_auth(realm_id))),
+            Json(ResolveUsersRequest { user_ids: vec![] }),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::Forbidden)));
     }
 
     #[tokio::test]

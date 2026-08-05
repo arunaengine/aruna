@@ -326,7 +326,7 @@ pub async fn unified_search(
             limit,
             params.cursor.clone()
         ),
-        run_users(&state, types.users, &q, limit, params.cursor.clone()),
+        run_users(&state, &auth, types.users, &q, limit, params.cursor.clone()),
     );
 
     Ok((
@@ -520,12 +520,19 @@ const MAX_GROUP_SCAN_ROUNDS: usize = 64;
 
 async fn run_users(
     state: &ServerState,
+    auth: &AuthContext,
     requested: bool,
     query: &str,
     limit: usize,
     cursor: Option<String>,
 ) -> ServerResult<Option<UsersSection>> {
     if !requested {
+        return Ok(None);
+    }
+    // The user directory is an admin-scoped read, so a caller without it gets no
+    // user section instead of a failed search.
+    let path = format!("/{}/admin/u/**", state.get_realm_id());
+    if !crate::auth::permission_granted(state, auth, path, Permission::READ).await? {
         return Ok(None);
     }
     let output = drive(
@@ -707,13 +714,17 @@ mod tests {
             .await,
         );
 
+        // The fixture user holds every realm role so the user directory section
+        // of a unified search is authorized.
+        let mut realm_doc = RealmAuthorizationDocument::new_default_realm_doc(realm);
+        for role in realm_doc.roles.values_mut() {
+            role.assigned_users.insert(user_id);
+        }
         write_bytes(
             &state,
             AUTH_KEYSPACE,
             realm.as_bytes().to_vec(),
-            RealmAuthorizationDocument::new_default_realm_doc(realm)
-                .to_bytes(&actor)
-                .unwrap(),
+            realm_doc.to_bytes(&actor).unwrap(),
         )
         .await;
 
