@@ -36,10 +36,16 @@ pub async fn handle_net_effect(
         NetEffect::JobControl(_) => NetEvent::JobControl(JobControlEvent::Unavailable(
             "job-control effect must be dispatched by the operations runner".to_string(),
         )),
-        NetEffect::AuditPage(audit) => NetEvent::AuditPage(AuditPageEvent::Unavailable {
-            node: audit.node,
-            message: "audit effect must be dispatched by the operations runner".to_string(),
-        }),
+        NetEffect::AuditPage(audit) => NetEvent::AuditPages(
+            audit
+                .nodes
+                .iter()
+                .map(|node| AuditPageEvent::Unavailable {
+                    node: *node,
+                    message: "audit effect must be dispatched by the operations runner".to_string(),
+                })
+                .collect(),
+        ),
     }
 }
 

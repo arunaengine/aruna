@@ -253,11 +253,12 @@ pub struct JobControlEffect {
     pub request: JobRequest,
 }
 
-/// One realm node's local audit page request. The adapter performs the frame
-/// round-trip; the aggregating operation only emits this.
+/// The audit fan-out: one page request asked of every listed node. The adapter
+/// performs the frame round-trips concurrently and answers with one aggregated
+/// event, so an unreachable node cannot delay the others.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuditPageEffect {
-    pub node: NodeId,
+    pub nodes: Vec<NodeId>,
     pub request: AuditPageRequest,
 }
 

@@ -26,6 +26,8 @@ const MANAGEMENT_NODES: usize = 5;
 const USER_NODES: usize = 1;
 const REPLICATION_FACTOR: u32 = 3;
 const DOCUMENTS: usize = 5;
+/// Lost-progress bound for the peer fan-out, far under the API request timeout.
+const FAN_OUT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[tokio::test]
 async fn nonholder_audit_trail() -> TestResult<()> {
@@ -114,26 +116,36 @@ async fn nonholder_audit_trail() -> TestResult<()> {
         .filter(|node| node.is_sync_eligible() && node.node_id() != reader.node_id())
         .map(TestNode::node_id)
         .collect();
-    let dead = iroh::SecretKey::from_bytes(&[200u8; 32]).public();
-    peers.push(dead);
-    let partial = drive(
-        ListAuditOperation::new(
-            group_id,
-            None,
-            peers,
-            None,
-            MAX_AUDIT_PAGE_SIZE,
-            Some(realm.bearer_token()),
-            realm.config.digest()?,
+    let dead: Vec<aruna_core::NodeId> = (200u8..=204)
+        .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
+        .collect();
+    peers.extend(dead.iter().copied());
+    // Unreachable peers are asked in one concurrent round, so the fan-out still
+    // answers well inside the request deadline instead of summing their waits.
+    let partial = tokio::time::timeout(
+        FAN_OUT_DEADLINE,
+        drive(
+            ListAuditOperation::new(
+                group_id,
+                None,
+                peers,
+                None,
+                MAX_AUDIT_PAGE_SIZE,
+                Some(realm.bearer_token()),
+                realm.config.digest()?,
+            ),
+            reader.context.as_ref(),
         ),
-        reader.context.as_ref(),
     )
-    .await?;
+    .await
+    .map_err(|_| "the audit fan-out exceeded the request deadline")??;
     assert!(partial.partial, "a dead node must mark the page partial");
-    assert!(
-        partial.missing_nodes.contains(&dead),
-        "the dead node must be named in missing_nodes"
-    );
+    for node in &dead {
+        assert!(
+            partial.missing_nodes.contains(node),
+            "every dead node must be named in missing_nodes"
+        );
+    }
     assert_eq!(
         unique_documents(&partial.records),
         DOCUMENTS,

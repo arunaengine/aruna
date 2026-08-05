@@ -181,7 +181,7 @@ pub enum NetEvent {
     DocumentSync(DocumentSyncNetEvent),
     Stream(StreamEvent),
     JobControl(JobControlEvent),
-    AuditPage(AuditPageEvent),
+    AuditPages(Vec<AuditPageEvent>),
     Error(NetError),
 }
 
@@ -193,8 +193,8 @@ pub enum JobControlEvent {
     Unavailable(String),
 }
 
-/// Reply to an [`crate::effects::AuditPageEffect`]: one node's local page, or an
-/// unreachable or denied node the aggregator records as missing.
+/// One node's part of an [`crate::effects::AuditPageEffect`] reply: its local
+/// page, or an unreachable or denied node the aggregator records as missing.
 #[derive(Debug, PartialEq)]
 pub enum AuditPageEvent {
     Page {

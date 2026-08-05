@@ -325,22 +325,25 @@ impl Operation for ListAuditOperation {
             self.limit
         )];
         self.pending = 1;
-        for &node in &self.peers {
-            effects.push(Effect::Net(NetEffect::AuditPage(Box::new(
-                AuditPageEffect {
-                    node,
-                    request: AuditPageRequest {
-                        auth_token: self.auth_token.clone(),
-                        config_digest: self.config_digest,
-                        group_id: self.group_id,
-                        document_id: self.document_id,
-                        start_after: self.start_after.clone(),
-                        limit: self.limit,
-                    },
-                },
-            ))));
-            self.pending += 1;
+        if self.peers.is_empty() {
+            return effects;
         }
+        // One fan-out effect: the adapter asks every peer concurrently, so an
+        // unreachable node costs its own timeout, not the sum of them.
+        effects.push(Effect::Net(NetEffect::AuditPage(Box::new(
+            AuditPageEffect {
+                nodes: self.peers.clone(),
+                request: AuditPageRequest {
+                    auth_token: self.auth_token.clone(),
+                    config_digest: self.config_digest,
+                    group_id: self.group_id,
+                    document_id: self.document_id,
+                    start_after: self.start_after.clone(),
+                    limit: self.limit,
+                },
+            },
+        ))));
+        self.pending += 1;
         effects
     }
 
@@ -372,18 +375,35 @@ impl Operation for ListAuditOperation {
                 self.state = FanState::Done;
                 return smallvec![];
             }
-            Event::Net(NetEvent::AuditPage(AuditPageEvent::Page { node, response })) => {
-                if !self.accept_peer(node) {
-                    return self.fail("unexpected audit peer response");
+            Event::Net(NetEvent::AuditPages(pages)) => {
+                for page in pages {
+                    match page {
+                        AuditPageEvent::Page { node, response } => {
+                            if !self.accept_peer(node) {
+                                return self.fail("unexpected audit peer response");
+                            }
+                            self.pages.push(*response);
+                        }
+                        AuditPageEvent::Unavailable { node, .. } => {
+                            if !self.accept_peer(node) {
+                                return self.fail("unexpected audit peer response");
+                            }
+                            self.missing.push(node);
+                        }
+                    }
                 }
-                self.pages.push(*response);
-                self.pending -= 1;
-            }
-            Event::Net(NetEvent::AuditPage(AuditPageEvent::Unavailable { node, .. })) => {
-                if !self.accept_peer(node) {
-                    return self.fail("unexpected audit peer response");
+                // Every configured peer must be accounted for before the merge
+                // can claim completeness.
+                let unanswered: Vec<NodeId> = self
+                    .peers
+                    .iter()
+                    .copied()
+                    .filter(|node| !self.responded.contains(node))
+                    .collect();
+                for node in unanswered {
+                    self.responded.insert(node);
+                    self.missing.push(node);
                 }
-                self.missing.push(node);
                 self.pending -= 1;
             }
             other => return self.fail(&format!("unexpected audit event {other:?}")),
@@ -584,8 +604,9 @@ pub(crate) async fn send_audit_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditPageEntry, AuditPageResponse, LocalAuditPageOperation, decode_cursor, encode_cursor,
-        merge_pages,
+        AuditPageEntry, AuditPageEvent, AuditPageResponse, Effect, Event, ListAuditOperation,
+        LocalAuditPageOperation, NetEffect, NetEvent, Operation, StorageEvent, decode_cursor,
+        encode_cursor, merge_pages,
     };
     use crate::driver::DriverContext;
     use crate::metadata::repository::{metadata_audit_key, write_audit_effect};
@@ -621,6 +642,83 @@ mod tests {
             key: metadata_audit_key(group_id, document_id, audit_id).to_vec(),
             record: record(group_id, document_id, realm_id),
         }
+    }
+
+    #[test]
+    fn peers_share_one_effect() {
+        // Every peer is asked in one adapter round: with one effect per peer the
+        // runner contacts them serially and unreachable nodes add up to a timeout.
+        let peers: Vec<aruna_core::types::NodeId> = (1u8..=3)
+            .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
+            .collect();
+        let group_id = Ulid::from_bytes([3u8; 16]);
+        let mut operation =
+            ListAuditOperation::new(group_id, None, peers.clone(), None, 10, None, [0u8; 32]);
+
+        let effects = operation.start();
+        assert_eq!(effects.len(), 2);
+        let Effect::Net(NetEffect::AuditPage(fan_out)) = &effects[1] else {
+            panic!("the peer fan-out must be a single net effect");
+        };
+        assert_eq!(fan_out.nodes, peers);
+
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+        assert!(!operation.is_complete());
+        operation.step(Event::Net(NetEvent::AuditPages(
+            peers
+                .iter()
+                .map(|node| AuditPageEvent::Unavailable {
+                    node: *node,
+                    message: "unreachable".to_string(),
+                })
+                .collect(),
+        )));
+
+        assert!(operation.is_complete());
+        let aggregate = operation.finalize().unwrap();
+        assert!(aggregate.partial);
+        assert_eq!(aggregate.missing_nodes.len(), peers.len());
+        assert!(aggregate.records.is_empty());
+    }
+
+    #[test]
+    fn silent_peer_is_missing() {
+        // A peer the adapter did not answer for must still be reported missing
+        // instead of leaving the page looking complete.
+        let peers: Vec<aruna_core::types::NodeId> = (4u8..=5)
+            .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
+            .collect();
+        let mut operation = ListAuditOperation::new(
+            Ulid::from_bytes([3u8; 16]),
+            None,
+            peers.clone(),
+            None,
+            10,
+            None,
+            [0u8; 32],
+        );
+
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+        operation.step(Event::Net(NetEvent::AuditPages(vec![
+            AuditPageEvent::Page {
+                node: peers[0],
+                response: Box::new(AuditPageResponse {
+                    records: Vec::new(),
+                    next_start_after: None,
+                }),
+            },
+        ])));
+
+        let aggregate = operation.finalize().unwrap();
+        assert!(aggregate.partial);
+        assert_eq!(aggregate.missing_nodes, vec![peers[1]]);
     }
 
     #[test]

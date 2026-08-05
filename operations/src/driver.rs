@@ -429,21 +429,28 @@ async fn dispatch_job_control(effect: JobControlEffect, context: &DriverContext)
     Event::Net(NetEvent::JobControl(event))
 }
 
-/// Requests one node's local audit page over the metadata control transport; an
-/// unreachable or denied node is reported so the aggregator records it as missing.
+/// Requests every node's local audit page over the metadata control transport,
+/// concurrently so one unreachable node cannot spend the whole request deadline.
+/// An unreachable or denied node is reported so the aggregator records it missing.
 async fn dispatch_audit_page(effect: AuditPageEffect, context: &DriverContext) -> Event {
-    let AuditPageEffect { node, request } = effect;
-    let event = match crate::metadata::audit::send_audit_request(context, node, request).await {
-        Ok(response) => AuditPageEvent::Page {
-            node,
-            response: Box::new(response),
-        },
-        Err(error) => AuditPageEvent::Unavailable {
-            node,
-            message: format!("{error:?}"),
-        },
-    };
-    Event::Net(NetEvent::AuditPage(event))
+    let AuditPageEffect { nodes, request } = effect;
+    let pages = futures_util::future::join_all(nodes.into_iter().map(|node| {
+        let request = request.clone();
+        async move {
+            match crate::metadata::audit::send_audit_request(context, node, request).await {
+                Ok(response) => AuditPageEvent::Page {
+                    node,
+                    response: Box::new(response),
+                },
+                Err(error) => AuditPageEvent::Unavailable {
+                    node,
+                    message: format!("{error:?}"),
+                },
+            }
+        }
+    }))
+    .await;
+    Event::Net(NetEvent::AuditPages(pages))
 }
 
 /// Reserves every tenant backend an effect names for the rest of the operation.
