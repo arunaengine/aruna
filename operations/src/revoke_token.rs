@@ -28,6 +28,10 @@ pub struct RevokeTokenConfig {
     pub actor: Actor,
     /// Hash of the revoked bearer token; the raw token never leaves the caller.
     pub token_hash: String,
+    /// The revoked token's own expiry, which bounds how long the entry is kept.
+    pub expires_at: u64,
+    /// Current unix seconds, used to prune revocations that expired.
+    pub now: u64,
 }
 
 /// Appends one bearer token hash to the realm's revocation set. Rides the admin
@@ -168,9 +172,10 @@ impl RevokeTokenOperation {
             &self.config.actor,
             AdminDocumentOperation::RealmConfigTokenRevoked {
                 token_hash: self.config.token_hash.clone(),
+                expires_at: self.config.expires_at,
             },
         )?;
-        apply_reducer_revocations(&mut document, &reducer_state);
+        document.merge_revocations(&reducer_state, self.config.now);
 
         let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
             previous_reducer_state.as_ref(),
@@ -353,18 +358,6 @@ impl Operation for RevokeTokenOperation {
     }
 }
 
-/// Overlays the reducer's materialized revocations onto the config document,
-/// mirroring the replicated materialization in `net::irokle`.
-fn apply_reducer_revocations(
-    document: &mut RealmConfigDocument,
-    reducer_state: &AdminDocumentReducerState,
-) {
-    let mut revoked: std::collections::BTreeSet<String> =
-        document.revoked_tokens.drain(..).collect();
-    revoked.extend(reducer_state.materialized_revoked_tokens());
-    document.revoked_tokens = revoked.into_iter().collect();
-}
-
 #[cfg(test)]
 mod tests {
     use super::{RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation};
@@ -412,26 +405,32 @@ mod tests {
         (dir, context, actor)
     }
 
+    fn revocation(actor: &Actor, token_hash: &str, expires_at: u64, now: u64) -> RevokeTokenConfig {
+        RevokeTokenConfig {
+            actor: actor.clone(),
+            token_hash: token_hash.to_string(),
+            expires_at,
+            now,
+        }
+    }
+
     #[tokio::test]
     async fn stores_revocation() {
         // The hash lands on the stored realm config and a later read returns it.
         let (_dir, context, actor) = setup_realm().await;
         let token_hash = bearer_token_hash("revoked-token");
         let document = drive(
-            RevokeTokenOperation::new(RevokeTokenConfig {
-                actor: actor.clone(),
-                token_hash: token_hash.clone(),
-            }),
+            RevokeTokenOperation::new(revocation(&actor, &token_hash, 2_000, 1_000)),
             &context,
         )
         .await
         .unwrap();
-        assert!(document.token_revoked(&token_hash));
+        assert!(document.token_revoked(&token_hash, 1_000));
 
         let read = drive(GetRealmConfigOperation::new(actor.realm_id), &context)
             .await
             .unwrap();
-        assert!(read.token_revoked(&token_hash));
+        assert!(read.token_revoked(&token_hash, 1_000));
     }
 
     #[tokio::test]
@@ -442,10 +441,7 @@ mod tests {
         let second = bearer_token_hash("second-token");
         for hash in [&first, &first, &second] {
             drive(
-                RevokeTokenOperation::new(RevokeTokenConfig {
-                    actor: actor.clone(),
-                    token_hash: hash.clone(),
-                }),
+                RevokeTokenOperation::new(revocation(&actor, hash, 2_000, 1_000)),
                 &context,
             )
             .await
@@ -456,18 +452,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read.revoked_tokens.len(), 2);
-        assert!(read.token_revoked(&first));
-        assert!(read.token_revoked(&second));
+        assert!(read.token_revoked(&first, 1_000));
+        assert!(read.token_revoked(&second, 1_000));
+    }
+
+    #[tokio::test]
+    async fn prunes_expired_revocations() {
+        // Once the revoked token can no longer validate its entry is dropped,
+        // so the replicated set stays bounded and is not scanned forever.
+        let (_dir, context, actor) = setup_realm().await;
+        let stale = bearer_token_hash("stale-token");
+        let fresh = bearer_token_hash("fresh-token");
+        drive(
+            RevokeTokenOperation::new(revocation(&actor, &stale, 2_000, 1_000)),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        let document = drive(
+            RevokeTokenOperation::new(revocation(&actor, &fresh, 4_000, 3_000)),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(document.revoked_tokens.len(), 1);
+        assert!(!document.token_revoked(&stale, 3_000));
+        assert!(document.token_revoked(&fresh, 3_000));
+
+        let read = drive(GetRealmConfigOperation::new(actor.realm_id), &context)
+            .await
+            .unwrap();
+        assert_eq!(read.revoked_tokens.len(), 1);
     }
 
     #[tokio::test]
     async fn rejects_malformed_hash() {
         let (_dir, context, actor) = setup_realm().await;
         let result = drive(
-            RevokeTokenOperation::new(RevokeTokenConfig {
-                actor,
-                token_hash: "not-a-hash".to_string(),
-            }),
+            RevokeTokenOperation::new(revocation(&actor, "not-a-hash", 2_000, 1_000)),
             &context,
         )
         .await;

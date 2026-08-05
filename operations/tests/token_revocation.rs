@@ -72,7 +72,7 @@ async fn peer_denies_token() -> TestResult<()> {
     let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
     let nodes = build_realm_nodes(realm_id, 2).await?;
     let user_id = UserId::local(Ulid::generate(), realm_id);
-    let token = mint_token(&signing_key, realm_id, user_id);
+    let (token, expires_at) = mint_token(&signing_key, realm_id, user_id);
     let token_hash = bearer_token_hash(&token);
 
     let peer = peer_auth(&nodes[1], realm_id);
@@ -88,6 +88,8 @@ async fn peer_denies_token() -> TestResult<()> {
                 realm_id,
             },
             token_hash: token_hash.clone(),
+            expires_at,
+            now: aruna_core::util::unix_timestamp_secs(),
         }),
         nodes[0].context.as_ref(),
     )
@@ -117,7 +119,7 @@ async fn peer_denies_token() -> TestResult<()> {
     ));
 
     // Only the revoked token is denied; the realm stays usable.
-    let other = mint_token(&signing_key, realm_id, user_id);
+    let (other, _) = mint_token(&signing_key, realm_id, user_id);
     decode_aruna_bearer_token(&peer, &other)
         .await
         .expect("peer still accepts a token that was never revoked");
@@ -133,13 +135,15 @@ fn peer_auth(node: &TestNode, realm_id: RealmId) -> PeerAuthState {
     }
 }
 
-fn mint_token(signing_key: &SigningKey, realm_id: RealmId, user_id: UserId) -> String {
+/// Returns the signed token and its expiry, which bounds the revocation entry.
+fn mint_token(signing_key: &SigningKey, realm_id: RealmId, user_id: UserId) -> (String, u64) {
     let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let expires_at = now + 600;
     let claims = TokenClaims {
         sub: user_id.to_string(),
         iss: realm_id.to_string(),
         iat: now,
-        exp: now + 600,
+        exp: expires_at,
         jti: Ulid::generate().to_string(),
         restrictions: None,
         issuer_pubkey: None,
@@ -148,12 +152,13 @@ fn mint_token(signing_key: &SigningKey, realm_id: RealmId, user_id: UserId) -> S
     let key_pem = signing_key
         .to_pkcs8_pem(LineEnding::LF)
         .expect("realm key encodes");
-    encode(
+    let token = encode(
         &Header::new(Algorithm::EdDSA),
         &claims,
         &EncodingKey::from_ed_pem(key_pem.as_bytes()).expect("realm key is an ed25519 key"),
     )
-    .expect("token signs")
+    .expect("token signs");
+    (token, expires_at)
 }
 
 async fn build_realm_nodes(realm_id: RealmId, count: usize) -> TestResult<Vec<TestNode>> {

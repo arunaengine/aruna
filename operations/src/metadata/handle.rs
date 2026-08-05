@@ -6262,7 +6262,7 @@ mod tests {
     use aruna_core::keyspaces::{API_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::{
         ArunaArn, PathRestriction, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
-        SyncMode, SyncState, SyncStatusSnapshot, TokenClaims,
+        SyncMode, SyncState, SyncStatusSnapshot, TokenClaims, TokenRevocation,
     };
     use aruna_storage::{FjallStorage, StorageHandle};
     use byteview::ByteView;
@@ -6851,7 +6851,10 @@ mod tests {
 
     async fn persist_revoked_config(storage: &StorageHandle, realm_id: RealmId, token: &str) {
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        config.revoked_tokens.push(bearer_token_hash(token));
+        config.revoked_tokens.push(TokenRevocation {
+            token_hash: bearer_token_hash(token),
+            expires_at: aruna_core::util::unix_timestamp_secs() + 600,
+        });
         write_realm_config(storage, realm_id, &config).await;
     }
 

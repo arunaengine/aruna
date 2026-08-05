@@ -434,7 +434,14 @@ impl DoctorTokenValidationState {
         // list only carries revocations this node accepted itself.
         for realm_id in &trusted_realms {
             if let Ok(config) = drive(GetRealmConfigOperation::new(*realm_id), driver_ctx).await {
-                revoked_token_hashes.extend(config.revoked_tokens);
+                let now = aruna_core::util::unix_timestamp_secs();
+                revoked_token_hashes.extend(
+                    config
+                        .revoked_tokens
+                        .into_iter()
+                        .filter(|entry| entry.expires_at >= now)
+                        .map(|entry| entry.token_hash),
+                );
             }
         }
 

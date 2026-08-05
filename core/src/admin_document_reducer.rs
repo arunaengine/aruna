@@ -564,15 +564,18 @@ impl AdminDocumentReducerState {
             }
             (
                 AdminDocumentTarget::RealmConfig { .. },
-                AdminDocumentOperation::RealmConfigTokenRevoked { token_hash },
+                AdminDocumentOperation::RealmConfigTokenRevoked {
+                    token_hash,
+                    expires_at,
+                },
             ) => {
                 if !valid_token_hash(token_hash) {
                     return Err(AdminDocumentReducerError::InvalidTokenHash);
                 }
                 self.apply_immutable_value(
                     event,
-                    revoked_token_path(token_hash),
-                    token_hash.clone(),
+                    revoked_token_path(token_hash, *expires_at),
+                    expires_at.to_string(),
                 );
             }
             (
@@ -1107,20 +1110,28 @@ impl AdminDocumentReducerState {
             .collect()
     }
 
-    /// Realm-wide bearer token revocations, keyed by hash. Append-only, so a
-    /// materialized entry is never removed by a later event.
-    pub fn materialized_revoked_tokens(&self) -> BTreeSet<String> {
+    /// Realm-wide bearer token revocations as hash to expiry. Both come from
+    /// the path, so a divergent entry can never erase a revocation; the longest
+    /// expiry of a hash wins.
+    pub fn materialized_revoked_tokens(&self) -> BTreeMap<String, u64> {
+        let mut revoked = BTreeMap::new();
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
-            return BTreeSet::new();
+            return revoked;
         }
 
-        self.user_subject_ids
-            .iter()
-            .filter_map(|(path, version)| {
-                let hash = revoked_token_hash(path)?;
-                (version.value.as_deref() == Some(hash)).then(|| hash.to_string())
-            })
-            .collect()
+        for (path, version) in &self.user_subject_ids {
+            let Some((hash, expires_at)) = revoked_token_entry(path) else {
+                continue;
+            };
+            if version.value.as_deref() != Some(expires_at.to_string().as_str()) {
+                continue;
+            }
+            revoked
+                .entry(hash.to_string())
+                .and_modify(|current| *current = expires_at.max(*current))
+                .or_insert(expires_at);
+        }
+        revoked
     }
 
     pub fn materialized_band_pools(&self) -> BTreeMap<Ulid, BandPool> {
@@ -1703,8 +1714,11 @@ fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         AdminDocumentOperation::RealmConfigBandPoolAssigned { pool } => {
             vec![band_pool_path(pool.pool_id)]
         }
-        AdminDocumentOperation::RealmConfigTokenRevoked { token_hash } => {
-            vec![revoked_token_path(token_hash)]
+        AdminDocumentOperation::RealmConfigTokenRevoked {
+            token_hash,
+            expires_at,
+        } => {
+            vec![revoked_token_path(token_hash, *expires_at)]
         }
     }
 }
@@ -1776,14 +1790,14 @@ pub fn band_pool_path(pool_id: Ulid) -> String {
     format!("realm_config.placement.band_pools.{pool_id}")
 }
 
-pub fn revoked_token_path(token_hash: &str) -> String {
-    format!("{REALM_CONFIG_REVOKED_TOKENS_PATH}.{token_hash}")
+pub fn revoked_token_path(token_hash: &str, expires_at: u64) -> String {
+    format!("{REALM_CONFIG_REVOKED_TOKENS_PATH}.{token_hash}.{expires_at}")
 }
 
-pub fn revoked_token_hash(path: &str) -> Option<&str> {
-    let hash = path.strip_prefix(REALM_CONFIG_REVOKED_TOKENS_PATH)?;
-    let hash = hash.strip_prefix('.')?;
-    valid_token_hash(hash).then_some(hash)
+pub fn revoked_token_entry(path: &str) -> Option<(&str, u64)> {
+    let rest = path.strip_prefix(REALM_CONFIG_REVOKED_TOKENS_PATH)?;
+    let (hash, expires_at) = rest.strip_prefix('.')?.split_once('.')?;
+    valid_token_hash(hash).then_some((hash, expires_at.parse().ok()?))
 }
 
 pub fn binding_scope_key(scope: &BindingScope) -> String {
@@ -5460,14 +5474,15 @@ mod tests {
             AdminDocumentClock::default(),
             AdminDocumentOperation::RealmConfigTokenRevoked {
                 token_hash: crate::auth::bearer_token_hash(token),
+                expires_at: 2_000,
             },
         )
     }
 
     #[test]
     fn revocations_accumulate() {
-        // Append-only: two origins revoking different tokens both survive, and a
-        // repeat of one revocation is not a conflict.
+        // Two origins revoking different tokens both survive, and a repeat of
+        // one revocation is not a conflict.
         let mut state = realm_config_state();
         state.apply(&revoke_token(1, 1, "first")).unwrap();
         state.apply(&revoke_token(2, 2, "second")).unwrap();
@@ -5476,10 +5491,30 @@ mod tests {
         assert!(state.conflicts.is_empty());
         assert_eq!(
             state.materialized_revoked_tokens(),
-            BTreeSet::from([
-                crate::auth::bearer_token_hash("first"),
-                crate::auth::bearer_token_hash("second"),
+            BTreeMap::from([
+                (crate::auth::bearer_token_hash("first"), 2_000),
+                (crate::auth::bearer_token_hash("second"), 2_000),
             ])
+        );
+    }
+
+    #[test]
+    fn divergent_expiry_keeps() {
+        // A second expiry for one hash must never erase the revocation; the
+        // longest expiry wins so the token stays denied.
+        let mut state = realm_config_state();
+        state.apply(&revoke_token(1, 1, "token")).unwrap();
+        let mut longer = revoke_token(2, 2, "token");
+        longer.op = AdminDocumentOperation::RealmConfigTokenRevoked {
+            token_hash: crate::auth::bearer_token_hash("token"),
+            expires_at: 5_000,
+        };
+        state.apply(&longer).unwrap();
+
+        assert!(state.conflicts.is_empty());
+        assert_eq!(
+            state.materialized_revoked_tokens(),
+            BTreeMap::from([(crate::auth::bearer_token_hash("token"), 5_000)])
         );
     }
 
@@ -5496,7 +5531,7 @@ mod tests {
         assert!(
             state
                 .materialized_revoked_tokens()
-                .contains(&crate::auth::bearer_token_hash("behind"))
+                .contains_key(&crate::auth::bearer_token_hash("behind"))
         );
     }
 
@@ -5510,6 +5545,7 @@ mod tests {
             AdminDocumentClock::default(),
             AdminDocumentOperation::RealmConfigTokenRevoked {
                 token_hash: "not-a-hash".to_string(),
+                expires_at: 2_000,
             },
         );
 

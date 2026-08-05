@@ -201,10 +201,12 @@ pub enum AdminDocumentOperation {
     RealmConfigPoliciesSet {
         policies: Vec<crate::request_policy::RequestPolicy>,
     },
-    /// Revokes one bearer token realm-wide. Append-only and deny-only; the raw
-    /// token never leaves the node that accepted the revocation.
+    /// Revokes one bearer token realm-wide until `expires_at`, the revoked
+    /// token's own expiry. Deny-only; the raw token never leaves the node that
+    /// accepted the revocation.
     RealmConfigTokenRevoked {
         token_hash: String,
+        expires_at: u64,
     },
     GroupPoliciesSet {
         policies: Vec<crate::request_policy::RequestPolicy>,
@@ -414,6 +416,7 @@ mod tests {
             },
             AdminDocumentOperation::RealmConfigTokenRevoked {
                 token_hash: blake3::hash(b"bearer-token").to_string(),
+                expires_at: 1_900_000_000,
             },
             AdminDocumentOperation::GroupPoliciesSet {
                 policies: vec![request_policy("anonymous")],

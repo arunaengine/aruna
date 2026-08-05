@@ -62,7 +62,7 @@ use aruna_core::structs::{
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::{RoleId, TxnId, UserId, Value};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::util::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use byteview::ByteView;
 use globset::Glob;
@@ -3432,11 +3432,9 @@ fn overlay_realm_config_reducer_materialization(
         config.request_policies = request_policies;
     }
 
-    // Append-only union: a locally accepted revocation is never dropped because
-    // the replicated set has not carried it yet.
-    let mut revoked: BTreeSet<String> = config.revoked_tokens.drain(..).collect();
-    revoked.extend(reducer_state.materialized_revoked_tokens());
-    config.revoked_tokens = revoked.into_iter().collect();
+    // Union, so a locally accepted revocation is never dropped because the
+    // replicated set has not carried it yet.
+    config.merge_revocations(reducer_state, unix_timestamp_secs());
 
     for path in reducer_state.conflicts.keys() {
         if let Some(node_id) = realm_config_node_id_from_path(path) {
@@ -5540,7 +5538,7 @@ async fn validate_replicated_admin_event(
                 return reject(&format!("invalid policy set: {error}"));
             }
         }
-        AdminDocumentOperation::RealmConfigTokenRevoked { token_hash } => {
+        AdminDocumentOperation::RealmConfigTokenRevoked { token_hash, .. } => {
             if !aruna_core::auth::valid_token_hash(token_hash) {
                 return reject("revoked bearer token hash is malformed");
             }
@@ -7975,6 +7973,7 @@ mod tests {
         .expect("settings bootstrap the config doc");
 
         let token_hash = aruna_core::auth::bearer_token_hash("replicated-token");
+        let expires_at = unix_timestamp_secs() + 600;
         for (index, seq) in [(1_632u64, 2u64), (1_633, 3)] {
             apply_admin_document_operation_to_storage(
                 &storage,
@@ -7986,6 +7985,7 @@ mod tests {
                     seq,
                     AdminDocumentOperation::RealmConfigTokenRevoked {
                         token_hash: token_hash.clone(),
+                        expires_at,
                     },
                 ),
             )
@@ -7994,7 +7994,7 @@ mod tests {
         }
 
         let config = read_realm_config_doc(&storage, realm_id).await;
-        assert!(config.token_revoked(&token_hash));
+        assert!(config.token_revoked(&token_hash, unix_timestamp_secs()));
         assert_eq!(config.revoked_tokens.len(), 1);
     }
 

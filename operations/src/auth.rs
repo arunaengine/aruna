@@ -4,6 +4,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::{AuthContext, RealmConfigDocument, RealmId, TokenClaims};
+use aruna_core::util::unix_timestamp_secs;
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
 use base64::Engine;
@@ -80,7 +81,7 @@ pub async fn realm_token_revoked(
         Event::Storage(StorageEvent::ReadResult {
             value: Some(bytes), ..
         }) => match RealmConfigDocument::from_bytes(&bytes) {
-            Ok(config) => config.token_revoked(token_hash),
+            Ok(config) => config.token_revoked(token_hash, unix_timestamp_secs()),
             Err(error) => {
                 warn!(error = %error, "Failed to decode realm config for token revocation");
                 true

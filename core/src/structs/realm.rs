@@ -1,4 +1,5 @@
 use crate::NodeId;
+use crate::admin_document_reducer::AdminDocumentReducerState;
 use crate::errors::ConversionError;
 use crate::structs::structs::{Permission, Role};
 use crate::structs::{
@@ -14,7 +15,7 @@ use ed25519_dalek::VerifyingKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use thiserror::Error;
 use ulid::Ulid;
@@ -174,10 +175,19 @@ pub struct RealmConfigDocument {
     /// evaluation is local on every node).
     #[serde(default)]
     pub request_policies: Vec<crate::request_policy::RequestPolicy>,
-    /// Hashes of bearer tokens revoked realm-wide. Append-only and Class-1
-    /// replicated, so every node rejects a token revoked on any other node.
+    /// Bearer tokens revoked realm-wide. Class-1 replicated, so every node
+    /// rejects a token revoked on any other node.
     #[serde(default)]
-    pub revoked_tokens: Vec<String>,
+    pub revoked_tokens: Vec<TokenRevocation>,
+}
+
+/// One realm-wide bearer token revocation. The expiry is the revoked token's
+/// own `exp`: past it the token no longer validates, so the entry is pruned and
+/// the replicated set stays bounded by one token lifetime of revocations.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct TokenRevocation {
+    pub token_hash: String,
+    pub expires_at: u64,
 }
 
 /// Realm-wide quota policy. Lives in the realm config (Class-1, replicated
@@ -503,8 +513,36 @@ impl RealmConfigDocument {
     }
 
     /// Whether the realm-wide revocation set denies this bearer token hash.
-    pub fn token_revoked(&self, token_hash: &str) -> bool {
-        self.revoked_tokens.iter().any(|entry| entry == token_hash)
+    /// Entries past their expiry are ignored: the token they name is expired.
+    pub fn token_revoked(&self, token_hash: &str, now: u64) -> bool {
+        self.revoked_tokens
+            .iter()
+            .any(|entry| entry.token_hash == token_hash && entry.expires_at >= now)
+    }
+
+    /// Unions the locally accepted revocations with the reducer's materialized
+    /// set and drops entries whose token has expired. Shared by the revoking
+    /// node and by replicated apply, so both converge on the same bounded set.
+    pub fn merge_revocations(&mut self, reducer_state: &AdminDocumentReducerState, now: u64) {
+        let mut merged: BTreeMap<String, u64> = self
+            .revoked_tokens
+            .drain(..)
+            .map(|entry| (entry.token_hash, entry.expires_at))
+            .collect();
+        for (token_hash, expires_at) in reducer_state.materialized_revoked_tokens() {
+            merged
+                .entry(token_hash)
+                .and_modify(|current| *current = (*current).max(expires_at))
+                .or_insert(expires_at);
+        }
+        self.revoked_tokens = merged
+            .into_iter()
+            .filter(|(_, expires_at)| *expires_at >= now)
+            .map(|(token_hash, expires_at)| TokenRevocation {
+                token_hash,
+                expires_at,
+            })
+            .collect();
     }
 
     pub fn has_node(&self, node_id: NodeId) -> bool {
@@ -730,10 +768,11 @@ fn normalize_replication_factor(replication_factor: u32) -> usize {
 #[cfg(test)]
 mod test {
     use crate::NodeId;
+    use crate::admin_document_reducer::AdminDocumentReducerState;
     use crate::structs::{
         Actor, DynamicDiscoveryMethod, MetadataGroupReplicationOverride,
         MetadataPathReplicationOverride, OidcProviderConfig, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind,
+        RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, TokenRevocation,
         default_realm_discovery_config,
     };
     use ulid::Ulid;
@@ -824,12 +863,35 @@ mod test {
         // requests would be rejected between nodes until it replicated.
         let config = RealmConfigDocument::new(RealmId([5u8; 32]), Vec::new(), 3);
         let mut revoked = config.clone();
-        revoked
-            .revoked_tokens
-            .push(crate::auth::bearer_token_hash("token"));
+        revoked.revoked_tokens.push(TokenRevocation {
+            token_hash: crate::auth::bearer_token_hash("token"),
+            expires_at: 2_000,
+        });
 
-        assert!(revoked.token_revoked(&crate::auth::bearer_token_hash("token")));
+        assert!(revoked.token_revoked(&crate::auth::bearer_token_hash("token"), 1_000));
         assert_eq!(config.digest().unwrap(), revoked.digest().unwrap());
+    }
+
+    #[test]
+    fn expired_revocation_ignored() {
+        // Past its token's expiry an entry denies nothing and is pruned, so the
+        // replicated set cannot grow without bound.
+        let realm_id = RealmId([6u8; 32]);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        let token_hash = crate::auth::bearer_token_hash("token");
+        config.revoked_tokens.push(TokenRevocation {
+            token_hash: token_hash.clone(),
+            expires_at: 1_000,
+        });
+
+        assert!(config.token_revoked(&token_hash, 1_000));
+        assert!(!config.token_revoked(&token_hash, 1_001));
+
+        let reducer_state = AdminDocumentReducerState::new(
+            crate::admin_documents::AdminDocumentTarget::RealmConfig { realm_id },
+        );
+        config.merge_revocations(&reducer_state, 1_001);
+        assert!(config.revoked_tokens.is_empty());
     }
 
     #[test]

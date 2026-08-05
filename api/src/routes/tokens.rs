@@ -3,6 +3,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::structs::{Actor, AuthContext, Permission};
+use aruna_core::util::unix_timestamp_secs;
 use aruna_operations::driver::drive;
 use aruna_operations::revoke_token::{RevokeTokenConfig, RevokeTokenOperation};
 use axum::extract::State;
@@ -54,6 +55,7 @@ pub async fn revoke_token(
     let claims = claims_for_revocation(&state, &request.token)
         .await
         .map_err(|_| ServerError::BadRequest)?;
+    let expires_at = claims.exp;
     let subject: AuthContext = claims.try_into().map_err(|_| ServerError::BadRequest)?;
     if auth.user_id != subject.user_id {
         ensure_permission(
@@ -73,6 +75,8 @@ pub async fn revoke_token(
                 realm_id: auth.realm_id,
             },
             token_hash: bearer_token_hash(&request.token),
+            expires_at,
+            now: unix_timestamp_secs(),
         }),
         state.get_ctx().as_ref(),
     )
@@ -89,7 +93,7 @@ mod tests {
     use crate::error::TokenError;
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
-    use aruna_core::structs::{Actor, NodeCapabilities, RealmId};
+    use aruna_core::structs::{Actor, NodeCapabilities, RealmId, TokenRevocation};
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
     use aruna_operations::driver::DriverContext;
@@ -227,7 +231,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(config.token_revoked(&bearer_token_hash(&token)));
+        assert!(config.token_revoked(&bearer_token_hash(&token), unix_timestamp_secs()));
     }
 
     #[tokio::test]
@@ -242,7 +246,10 @@ mod tests {
         let mut config = drive(GetRealmConfigOperation::new(realm_id), ctx.as_ref())
             .await
             .unwrap();
-        config.revoked_tokens.push(bearer_token_hash(&token));
+        config.revoked_tokens.push(TokenRevocation {
+            token_hash: bearer_token_hash(&token),
+            expires_at: unix_timestamp_secs() + 600,
+        });
         write_realm_config(ctx.as_ref(), realm_id, &config).await;
 
         assert!(!state.is_token_blacklisted(&token).await);
