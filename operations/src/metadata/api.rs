@@ -415,7 +415,7 @@ pub async fn list_visible_metadata_documents(
             .map(|record| (record.realm_id, record.group_id)),
     )
     .await;
-    let policy_user = auth.map(|auth| auth.user_id);
+    let policy_user = request.auth.as_ref().map(|auth| auth.user_id);
     let record_visible = |record: &MetadataRegistryRecord| {
         permissions.record_visible(record)
             && evaluators.get(&record.group_id).is_some_and(|evaluator| {
@@ -879,9 +879,7 @@ pub(crate) async fn local_path_candidates(
             .map(|record| (record.realm_id, record.group_id)),
     )
     .await;
-    let policy_user = auth
-        .filter(|auth| auth.realm_id == realm_id)
-        .map(|auth| auth.user_id);
+    let policy_user = auth.map(|auth| auth.user_id);
     let mut candidates = records
         .into_iter()
         .map(|record| {
@@ -3950,6 +3948,59 @@ mod tests {
         .expect("listing succeeds");
         assert_eq!(signed.total_returned, 2);
         assert_eq!(signed.total_estimate, Some(2));
+    }
+
+    #[tokio::test]
+    async fn foreign_policy_identity() {
+        let test = metadata_test();
+        let group_id = Ulid::generate();
+        let foreign_realm = RealmId([8u8; 32]);
+        let foreign_user = UserId::local(Ulid::generate(), foreign_realm);
+        let record = public_record(group_id, Ulid::generate());
+        write_policy_docs(
+            &test,
+            group_id,
+            HashMap::new(),
+            vec![aruna_core::request_policy::RequestPolicy {
+                policy_id: Ulid::generate(),
+                name: "foreign-user".to_string(),
+                kind: aruna_core::request_policy::PolicyKind::Require,
+                when: None,
+                expression: format!("user == '{foreign_user}'"),
+                enabled: true,
+            }],
+        )
+        .await;
+        seed_registry_cache(&test, &record).await;
+        let auth = AuthContext {
+            user_id: foreign_user,
+            realm_id: foreign_realm,
+            path_restrictions: None,
+        };
+
+        let listed = list_visible_metadata_documents(
+            &test.context,
+            TEST_REALM_ID,
+            ListVisibleMetadataDocumentsRequest {
+                auth: Some(auth.clone()),
+                ..summary_request(group_id, false)
+            },
+        )
+        .await
+        .expect("listing succeeds");
+        assert_eq!(listed_ids(&listed), vec![record.document_id]);
+
+        let candidates = local_path_candidates(
+            &test.context,
+            TEST_REALM_ID,
+            group_id,
+            &record.document_path,
+            Some(&auth),
+        )
+        .await
+        .expect("path lookup succeeds");
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].record.is_some());
     }
 
     // A per-document DENY inside a group-wide grant: the estimate must decide
