@@ -94,6 +94,10 @@ pub async fn revoke_token(
         return Ok(StatusCode::NO_CONTENT);
     }
 
+    if subject.realm_id != state.get_realm_id() {
+        return Err(ServerError::BadRequest);
+    }
+
     drive(
         RevokeTokenOperation::new(RevokeTokenConfig {
             actor: Actor {
@@ -402,6 +406,53 @@ mod tests {
             handle_token(&state, &token).await,
             Err(TokenError::TokenBlacklisted)
         ));
+    }
+
+    #[tokio::test]
+    async fn foreign_token_rejected() {
+        // A trusted foreign token must not enter this realm's revocation log.
+        let (state, realm_id, _user, _token) = state_with_token().await;
+        let foreign_signing_key = generate_signing_key();
+        let foreign_realm_id = RealmId::from_bytes(foreign_signing_key.verifying_key().to_bytes());
+        let foreign_user = UserId::local(Ulid::generate(), foreign_realm_id);
+        let foreign_capabilities = NodeCapabilities::management_node(foreign_signing_key).unwrap();
+        let foreign_token = drive(
+            CreateTokenOperation::new(CreateTokenConfig {
+                time: chrono::Utc::now().timestamp() as u64,
+                expiry: None,
+                user_id: foreign_user,
+                realm_id: foreign_realm_id,
+                node_capabilities: foreign_capabilities,
+            })
+            .unwrap(),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap();
+        state.add_trusted_realm(foreign_realm_id).await;
+
+        let admin = UserId::local(Ulid::generate(), realm_id);
+        grant_realm_admin(state.get_ctx().as_ref(), realm_id, admin).await;
+        let error = revoke_token(
+            State(state.clone()),
+            Extension(caller(realm_id, admin)),
+            Extension(None),
+            Json(RevokeTokenRequest {
+                token: foreign_token.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ServerError::BadRequest));
+        assert!(handle_token(&state, &foreign_token).await.is_ok());
+        let config = drive(
+            GetRealmConfigOperation::new(realm_id),
+            state.get_ctx().as_ref(),
+        )
+        .await
+        .unwrap();
+        assert!(config.revoked_tokens.is_empty());
     }
 
     #[tokio::test]
