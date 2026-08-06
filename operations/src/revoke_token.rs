@@ -13,7 +13,7 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::{Actor, RealmConfigDocument};
 use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
+use aruna_core::types::{Effects, Key, KeySpace, TxnId, UserId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
@@ -26,10 +26,12 @@ use crate::placement::placement_ref_for_target;
 #[derive(Debug, Clone, PartialEq)]
 pub struct RevokeTokenConfig {
     pub actor: Actor,
-    /// Hash of the revoked bearer token; the raw token never leaves the caller.
+    /// Hash of the revoked bearer token; the token never enters replicated state.
     pub token_hash: String,
     /// The revoked token's own expiry, which bounds how long the entry is kept.
     pub expires_at: u64,
+    /// Verified subject of the revoked bearer token.
+    pub token_owner: UserId,
     /// Current unix seconds, used to prune revocations that expired.
     pub now: u64,
 }
@@ -173,6 +175,7 @@ impl RevokeTokenOperation {
             AdminDocumentOperation::RealmConfigTokenRevoked {
                 token_hash: self.config.token_hash.clone(),
                 expires_at: self.config.expires_at,
+                token_owner: self.config.token_owner,
             },
         )?;
         reducer_state.compact_revocations(self.config.now);
@@ -415,6 +418,7 @@ mod tests {
             actor: actor.clone(),
             token_hash: token_hash.to_string(),
             expires_at,
+            token_owner: actor.user_id,
             now,
         }
     }

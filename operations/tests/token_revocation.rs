@@ -89,6 +89,7 @@ async fn peer_denies_token() -> TestResult<()> {
             },
             token_hash: token_hash.clone(),
             expires_at,
+            token_owner: user_id,
             now: aruna_core::util::unix_timestamp_secs(),
         }),
         nodes[0].context.as_ref(),

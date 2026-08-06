@@ -882,11 +882,13 @@ mod test {
 
     async fn revoke(driver_ctx: &Arc<DriverContext>, actor: Actor, token: &str) {
         let now = aruna_core::util::unix_timestamp_secs();
+        let token_owner = actor.user_id;
         drive(
             RevokeTokenOperation::new(RevokeTokenConfig {
                 actor,
                 token_hash: bearer_token_hash(token),
                 expires_at: now + 600,
+                token_owner,
                 now,
             }),
             driver_ctx,

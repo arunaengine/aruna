@@ -76,6 +76,7 @@ pub async fn revoke_token(
             },
             token_hash: bearer_token_hash(&request.token),
             expires_at,
+            token_owner: subject.user_id,
             now: unix_timestamp_secs(),
         }),
         state.get_ctx().as_ref(),

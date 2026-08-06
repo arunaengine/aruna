@@ -1,5 +1,9 @@
 pub const TRUSTED_REALMS_LIST_KEY: &[u8] = b"trusted_realms_list";
 
+/// Maximum bearer-token lifetime accepted by replicated revocation admission.
+/// 366 days covers every 12-calendar-month token, including leap years.
+pub const MAX_BEARER_TOKEN_LIFETIME_SECS: u64 = 366 * 24 * 60 * 60;
+
 pub fn credential_hash(value: impl AsRef<[u8]>) -> String {
     blake3::hash(value.as_ref()).to_string()
 }

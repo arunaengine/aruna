@@ -20,6 +20,7 @@ use aruna_core::admin_document_reducer::{
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
+use aruna_core::auth::MAX_BEARER_TOKEN_LIFETIME_SECS;
 use aruna_core::document::{
     DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent, DocumentSyncEvictedDocument,
     DocumentSyncNetEvent, DocumentSyncOutboxEvent, DocumentSyncPublish,
@@ -82,6 +83,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 use ulid::Ulid;
 
+use crate::dht::constants::MAX_CLOCK_SKEW_SECS;
 use crate::error::{NetError, Result};
 use crate::streams::BiStream;
 
@@ -5537,9 +5539,20 @@ async fn validate_replicated_admin_event(
                 return reject(&format!("invalid policy set: {error}"));
             }
         }
-        AdminDocumentOperation::RealmConfigTokenRevoked { token_hash, .. } => {
+        AdminDocumentOperation::RealmConfigTokenRevoked {
+            token_hash,
+            expires_at,
+            token_owner,
+            ..
+        } => {
             if !aruna_core::auth::valid_token_hash(token_hash) {
                 return reject("revoked bearer token hash is malformed");
+            }
+            if !valid_revocation_expiry(*expires_at, unix_timestamp_secs()) {
+                return reject("revoked bearer token expiry exceeds the admission window");
+            }
+            if token_owner.is_nil() || token_owner.realm_id != event.actor.realm_id {
+                return reject("revoked bearer token owner is malformed");
             }
         }
     }
@@ -5656,6 +5669,46 @@ async fn validate_realm_config_admin_authority(
             "stored realm config has the wrong realm".to_string(),
         ));
     }
+    if let AdminDocumentOperation::RealmConfigTokenRevoked { token_owner, .. } = &event.op {
+        let Some(config) = current_config.as_ref() else {
+            return Ok(AdminEventValidation::Deferred {
+                dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
+                reason: "current realm config is unavailable".to_string(),
+            });
+        };
+        if !matches!(
+            configured_node_kind(config, &event.origin_node_id),
+            Some(RealmNodeKind::Management) | Some(RealmNodeKind::Server)
+        ) {
+            return Ok(AdminEventValidation::Rejected(
+                "revocation event origin is not a current management or server node".to_string(),
+            ));
+        }
+        if event.actor.user_id == *token_owner {
+            return Ok(AdminEventValidation::Accepted);
+        }
+        let Some(auth) = read_admin_realm_authorization(storage, realm_id).await? else {
+            return Ok(AdminEventValidation::Deferred {
+                dependency: Some(DocumentSyncDependency::RealmAuthorization(realm_id)),
+                reason: "realm authorization state is unavailable".to_string(),
+            });
+        };
+        if auth.realm_id != realm_id {
+            return Ok(AdminEventValidation::Rejected(
+                "stored realm authorization has the wrong realm".to_string(),
+            ));
+        }
+        let path = format!("/{realm_id}/admin/u/{token_owner}");
+        return Ok(
+            if has_current_write_permission(event.actor.user_id, &path, auth.roles.values()) {
+                AdminEventValidation::Accepted
+            } else {
+                AdminEventValidation::Rejected(
+                    "actor lacks current token revocation authority".to_string(),
+                )
+            },
+        );
+    }
     // Placement reducer state precedes full config materialization at bootstrap.
     let mut placement_config = current_config
         .clone()
@@ -5723,19 +5776,6 @@ async fn validate_realm_config_admin_authority(
             }
             _ => false,
         };
-        // Revocation is deny-only and append-only, so any configured realm node
-        // may broadcast one; requiring Management would strand revocations
-        // accepted by the server node that serves the caller.
-        let server_revocation = matches!(
-            (
-                configured_node_kind(config, &event.origin_node_id),
-                &event.op,
-            ),
-            (
-                Some(RealmNodeKind::Server),
-                AdminDocumentOperation::RealmConfigTokenRevoked { .. },
-            )
-        );
         if matches!(
             configured_node_kind(config, &event.origin_node_id),
             Some(RealmNodeKind::Management)
@@ -5756,7 +5796,6 @@ async fn validate_realm_config_admin_authority(
                 configured_node_kind(config, &event.origin_node_id),
                 Some(RealmNodeKind::Management)
             ) || server_binding
-                || server_revocation
             {
                 AdminEventValidation::Accepted
             } else {
@@ -6638,6 +6677,11 @@ fn peer_id_to_endpoint_addr(peer_id: PeerId) -> Result<iroh::EndpointAddr> {
     Ok(iroh::EndpointAddr::from(endpoint_id))
 }
 
+fn valid_revocation_expiry(expires_at: u64, now: u64) -> bool {
+    expires_at.saturating_sub(now)
+        <= MAX_BEARER_TOKEN_LIFETIME_SECS.saturating_add(MAX_CLOCK_SKEW_SECS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6709,6 +6753,17 @@ mod tests {
         assert!(budget.acquire(peer(3)).is_none());
         fill.clear();
         assert!(budget.acquire(peer(3)).is_some());
+    }
+
+    #[test]
+    fn revocation_expiry_bound() {
+        // The shared admission window bounds replicated reducer retention.
+        let now = 1_000;
+        let bound = now + MAX_BEARER_TOKEN_LIFETIME_SECS + MAX_CLOCK_SKEW_SECS;
+
+        assert!(valid_revocation_expiry(bound, now));
+        assert!(!valid_revocation_expiry(bound + 1, now));
+        assert!(!valid_revocation_expiry(u64::MAX, now));
     }
 
     #[tokio::test]
@@ -7985,6 +8040,7 @@ mod tests {
                     AdminDocumentOperation::RealmConfigTokenRevoked {
                         token_hash: token_hash.clone(),
                         expires_at,
+                        token_owner: actor.user_id,
                     },
                 ),
             )
@@ -7995,6 +8051,106 @@ mod tests {
         let config = read_realm_config_doc(&storage, realm_id).await;
         assert!(config.token_revoked(&token_hash, unix_timestamp_secs()));
         assert_eq!(config.revoked_tokens.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_unauthorized_revocation() {
+        // A configured node must not revoke another user's bearer token by
+        // publishing a direct admin event without owner or admin authority.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([61; 32]);
+        let attacker = test_actor(
+            13,
+            UserId::local(Ulid::from_parts(1_650, 1), realm_id),
+            realm_id,
+        );
+        let token_owner = UserId::local(Ulid::from_parts(1_651, 1), realm_id);
+        let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let admin_target = AdminDocumentTarget::RealmConfig { realm_id };
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(attacker.node_id, RealmNodeKind::Server);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                config_target.clone(),
+                config
+                    .to_bytes(&attacker)
+                    .expect("config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("config writes");
+
+        let auth = RealmAuthorizationDocument {
+            realm_id,
+            roles: Default::default(),
+            operation_restrictions: Default::default(),
+        };
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                DocumentSyncTarget::RealmAuthorization { realm_id },
+                auth.to_bytes(&attacker).expect("auth serializes").into(),
+            )],
+        )
+        .await
+        .expect("auth writes");
+
+        let topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        let event = test_admin_event(
+            Ulid::from_parts(1_652, 1),
+            admin_target,
+            &attacker,
+            1,
+            AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: aruna_core::auth::bearer_token_hash("observed-token"),
+                expires_at: unix_timestamp_secs() + 600,
+                token_owner,
+            },
+        );
+        let publisher = irokle_crate::actor_id_for(topic, node_id_to_peer_id(&attacker.node_id));
+
+        assert!(matches!(
+            validate_replicated_admin_event(
+                &storage,
+                topic,
+                publisher,
+                &config_target,
+                &event,
+                realm_id,
+                &PlacementRef::NIL,
+            )
+            .await
+            .expect("validation runs"),
+            AdminEventValidation::Rejected(_)
+        ));
+
+        let owned_event = test_admin_event(
+            Ulid::from_parts(1_653, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &attacker,
+            1,
+            AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: aruna_core::auth::bearer_token_hash("owned-token"),
+                expires_at: unix_timestamp_secs() + 600,
+                token_owner: attacker.user_id,
+            },
+        );
+        assert_eq!(
+            validate_replicated_admin_event(
+                &storage,
+                topic,
+                publisher,
+                &config_target,
+                &owned_event,
+                realm_id,
+                &PlacementRef::NIL,
+            )
+            .await
+            .expect("owner validation runs"),
+            AdminEventValidation::Accepted
+        );
     }
 
     #[tokio::test]
@@ -8046,6 +8202,7 @@ mod tests {
                     AdminDocumentOperation::RealmConfigTokenRevoked {
                         token_hash,
                         expires_at,
+                        token_owner: actor.user_id,
                     },
                 ),
             )

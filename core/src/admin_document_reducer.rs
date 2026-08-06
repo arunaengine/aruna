@@ -567,6 +567,7 @@ impl AdminDocumentReducerState {
                 AdminDocumentOperation::RealmConfigTokenRevoked {
                     token_hash,
                     expires_at,
+                    ..
                 },
             ) => {
                 if !valid_token_hash(token_hash) {
@@ -1761,6 +1762,7 @@ fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         AdminDocumentOperation::RealmConfigTokenRevoked {
             token_hash,
             expires_at,
+            ..
         } => {
             vec![revoked_token_path(token_hash, *expires_at)]
         }
@@ -5519,6 +5521,7 @@ mod tests {
             AdminDocumentOperation::RealmConfigTokenRevoked {
                 token_hash: crate::auth::bearer_token_hash(token),
                 expires_at: 2_000,
+                token_owner: user_id(),
             },
         )
     }
@@ -5552,6 +5555,7 @@ mod tests {
         longer.op = AdminDocumentOperation::RealmConfigTokenRevoked {
             token_hash: crate::auth::bearer_token_hash("token"),
             expires_at: 5_000,
+            token_owner: user_id(),
         };
         state.apply(&longer).unwrap();
 
@@ -5594,6 +5598,7 @@ mod tests {
             AdminDocumentOperation::RealmConfigTokenRevoked {
                 token_hash: crate::auth::bearer_token_hash("live"),
                 expires_at: 9_000,
+                token_owner: user_id(),
             },
         );
         for event in [&expired, &echoed, &live] {
@@ -5628,7 +5633,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_spares_other_paths() {
+    fn compaction_spares_paths() {
         let mut state = realm_config_state();
         state
             .apply(&set_realm_config_description(1, 1, "realm"))
@@ -5655,6 +5660,7 @@ mod tests {
             AdminDocumentOperation::RealmConfigTokenRevoked {
                 token_hash: "not-a-hash".to_string(),
                 expires_at: 2_000,
+                token_owner: user_id(),
             },
         );
 
