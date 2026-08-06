@@ -41,6 +41,7 @@ use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
     MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord,
 };
+use aruna_core::permission_path::compile_permission_matcher;
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, document_sync_revision_key,
@@ -66,7 +67,6 @@ use aruna_core::types::{RoleId, TxnId, UserId, Value};
 use aruna_core::util::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use byteview::ByteView;
-use globset::Glob;
 use irokle_crate::Event as _;
 use irokle_crate::Storage as _;
 use irokle_crate::TopicControl;
@@ -6120,10 +6120,10 @@ fn has_current_write_permission<'a>(
             continue;
         }
         for (pattern, permission) in &role.permissions {
-            let Ok(glob) = Glob::new(pattern) else {
+            let Ok(glob) = compile_permission_matcher(pattern) else {
                 return false;
             };
-            if !glob.compile_matcher().is_match(path) {
+            if !glob.is_match(path) {
                 continue;
             }
             match permission {
@@ -6753,6 +6753,33 @@ mod tests {
         assert!(budget.acquire(peer(3)).is_none());
         fill.clear();
         assert!(budget.acquire(peer(3)).is_some());
+    }
+
+    #[test]
+    fn write_permission_scope() {
+        let realm_id = RealmId::from_bytes([74; 32]);
+        let group_id = Ulid::from_parts(1_700, 1);
+        let user_id = UserId::local(Ulid::from_parts(1_701, 1), realm_id);
+        let role = Role {
+            role_id: Ulid::from_parts(1_702, 1),
+            name: "group-admin".to_string(),
+            permissions: HashMap::from([(
+                format!("/{realm_id}/g/{group_id}/*"),
+                Permission::WRITE,
+            )]),
+            assigned_users: HashSet::from([user_id]),
+        };
+
+        assert!(has_current_write_permission(
+            user_id,
+            &format!("/{realm_id}/g/{group_id}/admin"),
+            [&role],
+        ));
+        assert!(!has_current_write_permission(
+            user_id,
+            &format!("/{realm_id}/g/{group_id}/admin/config"),
+            [&role],
+        ));
     }
 
     #[test]
