@@ -16,14 +16,14 @@ use aruna_operations::claim_initial_realm_admin::{
 use aruna_operations::consume_onboarding_secret::{
     ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
 };
-use aruna_operations::create_onboarding_secret::{
-    CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
-};
 use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::inspect_onboarding_secret::{
     InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
+};
+use aruna_operations::recover_initial_admin::{
+    RecoverInitialAdminInput, RecoverInitialAdminOperation,
 };
 use aruna_operations::register_or_get_oidc_user::{
     RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
@@ -233,7 +233,7 @@ pub async fn recover_initial_admin() -> Result<String, CliError> {
         claimed_node_id: None,
     };
     drive(
-        CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput { record }),
+        RecoverInitialAdminOperation::new(RecoverInitialAdminInput { record }),
         &driver_ctx,
     )
     .await
