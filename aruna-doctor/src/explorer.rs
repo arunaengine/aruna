@@ -1,7 +1,7 @@
 use crate::error::CliError;
 use aruna::config::PersistedNodeState;
 use aruna_api::server_state::INITIAL_REALM_ADMIN_CLAIMED_KEY;
-use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY};
+use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
 use aruna_core::document::{PendingShardPlacement, shard_topic_id};
 use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{
@@ -207,9 +207,6 @@ enum DecodedValue {
     },
     MultipartObjectPart {
         data: MultipartObjectPart,
-    },
-    ApiTokenRevocationList {
-        data: HashSet<String>,
     },
     ApiTrustedRealmsList {
         data: Vec<String>,
@@ -1362,9 +1359,6 @@ fn decode_auth_value(value: &[u8]) -> DecodedValue {
 
 fn decode_api_state_value(key: &[u8], value: &[u8]) -> DecodedValue {
     match key {
-        TOKEN_REVOCATION_LIST_KEY => postcard::from_bytes::<HashSet<String>>(value)
-            .map(|data| DecodedValue::ApiTokenRevocationList { data })
-            .unwrap_or_else(|error| raw_value(value, Some(error.to_string()))),
         TRUSTED_REALMS_LIST_KEY => postcard::from_bytes::<HashSet<RealmId>>(value)
             .map(|data| {
                 let mut data = data

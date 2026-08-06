@@ -82,7 +82,6 @@ pub async fn revoke_token(
     )
     .await
     .map_err(|error| ServerError::InternalError(error.to_string()))?;
-    state.add_token_to_blacklist(&request.token).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -185,7 +184,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, ServerError::Unauthorized));
-        assert!(!state.is_token_blacklisted(&token).await);
+        assert!(handle_token(&state, &token).await.is_ok());
     }
 
     #[tokio::test]
@@ -203,7 +202,6 @@ mod tests {
             .unwrap();
             assert_eq!(status, StatusCode::NO_CONTENT);
         }
-        assert!(state.is_token_blacklisted(&token).await);
         assert!(matches!(
             handle_token(&state, &token).await,
             Err(TokenError::TokenBlacklisted)
@@ -236,9 +234,8 @@ mod tests {
 
     #[tokio::test]
     async fn replicated_revocation_rejects() {
-        // A revocation that only arrived through the replicated realm config,
-        // with an empty node-local list, must still deny the token here and
-        // after a restart that rebuilds the in-memory state.
+        // A revocation that only arrived through the replicated realm config
+        // must deny the token here and after a restart that rebuilds state.
         let (state, realm_id, _user, token) = state_with_token().await;
         assert!(handle_token(&state, &token).await.is_ok());
 
@@ -252,7 +249,6 @@ mod tests {
         });
         write_realm_config(ctx.as_ref(), realm_id, &config).await;
 
-        assert!(!state.is_token_blacklisted(&token).await);
         assert!(matches!(
             handle_token(&state, &token).await,
             Err(TokenError::TokenBlacklisted)
@@ -340,7 +336,6 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, ServerError::Forbidden));
-        assert!(!state.is_token_blacklisted(&token).await);
         assert!(handle_token(&state, &token).await.is_ok());
         let config = drive(
             GetRealmConfigOperation::new(realm_id),
@@ -370,7 +365,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(status, StatusCode::NO_CONTENT);
-        assert!(state.is_token_blacklisted(&token).await);
+        assert!(matches!(
+            handle_token(&state, &token).await,
+            Err(TokenError::TokenBlacklisted)
+        ));
     }
 
     #[tokio::test]
@@ -386,7 +384,7 @@ mod tests {
         .await
         .unwrap();
 
-        // A fresh state over the same storage loads the persisted revocation.
+        // A fresh state over the same storage still denies the revoked token.
         let restarted = ServerState::new(
             state.get_ctx(),
             realm_id,
@@ -397,6 +395,9 @@ mod tests {
             JobsRuntime::new(),
         )
         .await;
-        assert!(restarted.is_token_blacklisted(&token).await);
+        assert!(matches!(
+            handle_token(&restarted, &token).await,
+            Err(TokenError::TokenBlacklisted)
+        ));
     }
 }

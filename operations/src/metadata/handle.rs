@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
-use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY};
+use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
 use aruna_core::effects::{Effect, IterStart, StorageEffect, StoragePriority};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -280,7 +280,7 @@ struct MetadataInner {
 struct MetadataAuthValidationState {
     storage_handle: StorageHandle,
     /// Realm this node serves; without one there is no replicated revocation
-    /// set to consult and only the node-local list applies.
+    /// set to consult, and this node serves no remote metadata peers either.
     realm_id: Option<RealmId>,
     issuer_keys: Arc<IssuerKeyCache>,
 }
@@ -298,22 +298,9 @@ impl MetadataAuthValidationState {
 #[async_trait]
 impl ArunaBearerTokenValidationState for MetadataAuthValidationState {
     async fn is_bearer_token_revoked(&self, token_hash: &str) -> bool {
-        if let Some(realm_id) = self.realm_id
-            && realm_token_revoked(&self.storage_handle, realm_id, token_hash).await
-        {
-            return true;
-        }
-        match load_metadata_auth_state::<HashSet<String>>(
-            &self.storage_handle,
-            TOKEN_REVOCATION_LIST_KEY,
-        )
-        .await
-        {
-            Ok(revoked) => revoked.contains(token_hash),
-            Err(error) => {
-                warn!(error = %error, "Failed to read metadata token revocation state");
-                true
-            }
+        match self.realm_id {
+            Some(realm_id) => realm_token_revoked(&self.storage_handle, realm_id, token_hash).await,
+            None => false,
         }
     }
 
@@ -6258,7 +6245,7 @@ async fn drain_request_stream(stream: &mut BiStream) -> Result<(), MetadataError
 mod tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
+    use aruna_core::auth::{TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
     use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::{API_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::{
@@ -6757,12 +6744,7 @@ mod tests {
             &HashSet::from([realm_id]),
         )
         .await;
-        persist_auth_state(
-            &revoked_storage,
-            TOKEN_REVOCATION_LIST_KEY,
-            &HashSet::from([bearer_token_hash(&token)]),
-        )
-        .await;
+        persist_revoked_config(&revoked_storage, realm_id, &token).await;
         let revoked_state = MetadataAuthValidationState::new(revoked_storage, Some(realm_id));
         assert_metadata_auth_rejected(&revoked_state, &token, "Token is revoked").await;
 
@@ -6778,8 +6760,8 @@ mod tests {
 
     #[tokio::test]
     async fn replicated_revocation_rejects() {
-        // A revocation that arrived only through the replicated realm config,
-        // with an empty node-local list, must still deny the token here.
+        // A revocation that arrived through the replicated realm config must
+        // deny the token on this node too.
         let (realm_signing_key, realm_id, user_id) = realm_fixture();
         let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
         let (_dir, storage) = auth_storage();

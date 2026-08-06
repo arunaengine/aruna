@@ -610,6 +610,7 @@ mod test {
     use crate::error::TokenError;
     use crate::server::ServerState;
     use aruna_core::UserId;
+    use aruna_core::auth::bearer_token_hash;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
@@ -626,6 +627,7 @@ mod test {
     use aruna_operations::register_or_get_oidc_user::{
         RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
     };
+    use aruna_operations::revoke_token::{RevokeTokenConfig, RevokeTokenOperation};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use axum::Json;
@@ -878,6 +880,21 @@ mod test {
         }
     }
 
+    async fn revoke(driver_ctx: &Arc<DriverContext>, actor: Actor, token: &str) {
+        let now = aruna_core::util::unix_timestamp_secs();
+        drive(
+            RevokeTokenOperation::new(RevokeTokenConfig {
+                actor,
+                token_hash: bearer_token_hash(token),
+                expires_at: now + 600,
+                now,
+            }),
+            driver_ctx,
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn bearer_token_carrier_requires_valid_aruna_token() {
         let storage_dir = tempfile::tempdir().unwrap();
@@ -950,7 +967,16 @@ mod test {
         assert_eq!(auth.unwrap().user_id, user_id);
         assert_eq!(carrier.unwrap().as_str(), token);
 
-        state.add_token_to_blacklist(&token).await;
+        revoke(
+            &driver_ctx,
+            Actor {
+                node_id,
+                user_id,
+                realm_id,
+            },
+            &token,
+        )
+        .await;
         let (auth, carrier) =
             extract_auth_context_and_bearer_token(&state, &headers_for(&token)).await;
         assert!(auth.is_none());
@@ -1686,7 +1712,16 @@ mod test {
         assert_eq!(ctx.realm_id, realm_id);
         assert_eq!(ctx.user_id, token_config.user_id);
 
-        state.add_token_to_blacklist(&management_token).await;
+        revoke(
+            &driver_ctx,
+            Actor {
+                node_id,
+                user_id,
+                realm_id,
+            },
+            &management_token,
+        )
+        .await;
         assert!(matches!(
             handle_token(&state, &management_token).await,
             Err(TokenError::TokenBlacklisted)

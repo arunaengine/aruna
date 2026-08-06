@@ -731,21 +731,18 @@ mod tests {
     use crate::notifications::watch::subscriptions::{
         WATCH_SUBSCRIPTION_UNAUTHORIZED, create_watch_subscription, list_watch_subscriptions,
     };
-    use aruna_core::auth::TOKEN_REVOCATION_LIST_KEY;
     use aruna_core::keyspaces::{
-        API_STATE_KEYSPACE, AUTH_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
-        NOTIFICATION_WATCH_INTEREST_KEYSPACE,
+        AUTH_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
     };
     use aruna_core::structs::{
         Actor, GroupAuthorizationDocument, NotificationClass, NotificationKind, NotificationRecord,
-        PathRestriction, Permission, RealmAuthorizationDocument, RealmNodeKind,
+        PathRestriction, Permission, RealmAuthorizationDocument, RealmNodeKind, TokenRevocation,
         WatchAuthorizationBinding, WatchEvent, WatchEventDetail, WatchEventKind, WatchEventMask,
         blob_object_permission_path, data_watch_resource_path, watch_interest_dirty_key,
     };
     use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::FjallStorage;
-    use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -807,6 +804,25 @@ mod tests {
         data_watch_resource_path(data_group_id(), data_node_id(), "bucket", key)
     }
 
+    /// Adds the record's creating token to the holder's replicated revocation set.
+    async fn revoke_watch_token(
+        node: &Node,
+        config: &RealmConfigDocument,
+        record: &NotificationRecord,
+    ) {
+        let mut config = config.clone();
+        config.revoked_tokens.push(TokenRevocation {
+            token_hash: record
+                .watch_authorization
+                .as_ref()
+                .expect("watch binding")
+                .token_hash
+                .clone(),
+            expires_at: aruna_core::util::unix_timestamp_secs() + 600,
+        });
+        write_config(node, config.realm_id, &config).await;
+    }
+
     async fn install_config(
         node: &Node,
         realm_id: RealmId,
@@ -816,6 +832,11 @@ mod tests {
         for (node_id, kind) in members {
             config.ensure_node(*node_id, kind.clone());
         }
+        write_config(node, realm_id, &config).await;
+        config
+    }
+
+    async fn write_config(node: &Node, realm_id: RealmId, config: &RealmConfigDocument) {
         let actor = Actor {
             node_id: node.net.node_id(),
             user_id: UserId::nil(realm_id),
@@ -836,7 +857,6 @@ mod tests {
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => panic!("unexpected realm config write event: {other:?}"),
         }
-        config
     }
 
     async fn install_watch_authorization(
@@ -1461,24 +1481,7 @@ mod tests {
         let watch = watch_record(recipient, 2);
         seed_inbox(&b, &[direct.clone(), watch.clone()]).await;
 
-        let revoked = HashSet::from([watch
-            .watch_authorization
-            .as_ref()
-            .expect("watch binding")
-            .token_hash
-            .clone()]);
-        assert!(matches!(
-            b.context
-                .storage_handle
-                .send_storage_effect(StorageEffect::Write {
-                    key_space: API_STATE_KEYSPACE.to_string(),
-                    key: TOKEN_REVOCATION_LIST_KEY.into(),
-                    value: postcard::to_allocvec(&revoked).unwrap().into(),
-                    txn_id: None,
-                })
-                .await,
-            Event::Storage(StorageEvent::WriteResult { .. })
-        ));
+        revoke_watch_token(&b, &config, &watch).await;
 
         let listed = list_remote(&a.net, b.net.node_id(), recipient, None, 10)
             .await

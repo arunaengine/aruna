@@ -1,4 +1,3 @@
-pub const TOKEN_REVOCATION_LIST_KEY: &[u8] = b"token_revocation_list";
 pub const TRUSTED_REALMS_LIST_KEY: &[u8] = b"trusted_realms_list";
 
 pub fn credential_hash(value: impl AsRef<[u8]>) -> String {
@@ -20,9 +19,7 @@ pub fn valid_token_hash(hash: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash, credential_hash,
-    };
+    use super::{TRUSTED_REALMS_LIST_KEY, bearer_token_hash, credential_hash};
 
     #[test]
     fn bearer_token_hash_matches_existing_blake3_hex() {
@@ -41,7 +38,6 @@ mod tests {
 
     #[test]
     fn auth_state_keys_preserve_persisted_names() {
-        assert_eq!(TOKEN_REVOCATION_LIST_KEY, b"token_revocation_list");
         assert_eq!(TRUSTED_REALMS_LIST_KEY, b"trusted_realms_list");
     }
 }

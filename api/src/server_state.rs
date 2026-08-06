@@ -2,7 +2,7 @@ use crate::auth::{OidcTokenSelector, OidcValidator};
 use crate::error::OidcError;
 use crate::openapi::ApiDoc;
 use aruna_core::NodeId;
-use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
+use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
 use aruna_core::credential_seal::CredentialSealKey;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
@@ -56,8 +56,6 @@ pub struct ServerState {
     node_capabilities: NodeCapabilities,
     // Bounded TTL + LRU cache of trusted issuer decoding keys
     issuer_keys: Arc<IssuerKeyCache>,
-    // Contains token id as a string, so also invalid ids get banned
-    token_revocation_list: Arc<RwLock<HashSet<String, ahash::RandomState>>>,
     // Contains trusted realms
     trusted_realms_list: Arc<RwLock<HashSet<RealmId, ahash::RandomState>>>,
     initial_admin_claim: Option<Arc<AtomicBool>>,
@@ -147,12 +145,6 @@ impl ServerState {
         oidc_validator: Option<Arc<OidcValidator>>,
         jobs_runtime: Arc<JobsRuntime>,
     ) -> Self {
-        let token_revocation_list = load_persisted_state::<HashSet<String, ahash::RandomState>>(
-            driver_ctx.as_ref(),
-            TOKEN_REVOCATION_LIST_KEY,
-        )
-        .await
-        .unwrap_or_default();
         let mut trusted_realms = load_persisted_state::<HashSet<RealmId, ahash::RandomState>>(
             driver_ctx.as_ref(),
             TRUSTED_REALMS_LIST_KEY,
@@ -182,7 +174,6 @@ impl ServerState {
             oidc_validator,
             jobs_runtime,
             node_capabilities,
-            token_revocation_list: Arc::new(RwLock::new(token_revocation_list)),
             trusted_realms_list: Arc::new(RwLock::new(trusted_realms)),
             issuer_keys: Arc::new(IssuerKeyCache::new()),
             initial_admin_claim,
@@ -436,19 +427,9 @@ impl ServerState {
         self.issuer_keys.len().await
     }
 
-    pub async fn add_token_to_blacklist(&self, token: &str) {
-        let hash = bearer_token_hash(token);
-        self.token_revocation_list.write().await.insert(hash);
-        self.persist_token_revocation_list().await;
-    }
     pub async fn add_trusted_realm(&self, realm_id: RealmId) {
         self.trusted_realms_list.write().await.insert(realm_id);
         self.persist_trusted_realms().await;
-    }
-
-    pub async fn is_token_blacklisted(&self, token: &str) -> bool {
-        let hash = bearer_token_hash(token);
-        self.token_revocation_list.read().await.get(&hash).is_some()
     }
 
     pub async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
@@ -529,16 +510,6 @@ impl ServerState {
         ))
     }
 
-    async fn persist_token_revocation_list(&self) {
-        let blacklist = self.token_revocation_list.read().await.clone();
-        persist_state(
-            self.driver_ctx.as_ref(),
-            TOKEN_REVOCATION_LIST_KEY,
-            &blacklist,
-        )
-        .await;
-    }
-
     async fn persist_trusted_realms(&self) {
         let trusted_realms = self.trusted_realms_list.read().await.clone();
         persist_state(
@@ -566,10 +537,9 @@ impl ServerState {
 #[async_trait]
 impl ArunaBearerTokenValidationState for ServerState {
     async fn is_bearer_token_revoked(&self, token_hash: &str) -> bool {
-        // Node-local list first as a fast path; the replicated realm config is
-        // what makes a revocation from any other node binding here.
-        self.token_revocation_list.read().await.contains(token_hash)
-            || realm_token_revoked(&self.driver_ctx.storage_handle, self.realm_id, token_hash).await
+        // The replicated realm config is the only revocation authority; it is
+        // expiry-bounded, so revoking cannot grow a durable set without limit.
+        realm_token_revoked(&self.driver_ctx.storage_handle, self.realm_id, token_hash).await
     }
 
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
