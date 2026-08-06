@@ -1,10 +1,15 @@
-use crate::auth::{claims_for_revocation, ensure_permission, require_realm_auth};
+use crate::auth::{
+    ValidatedArunaBearerTokenCarrier, claims_for_revocation, ensure_permission, require_realm_auth,
+};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::metadata::map_metadata_api_error;
 use crate::server_state::ServerState;
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::structs::{Actor, AuthContext, Permission};
 use aruna_core::util::unix_timestamp_secs;
 use aruna_operations::driver::drive;
+use aruna_operations::metadata::api::forwarded_bearer;
+use aruna_operations::metadata::forward::{forward_token_revoke, is_user_origin};
 use aruna_operations::revoke_token::{RevokeTokenConfig, RevokeTokenOperation};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -39,16 +44,22 @@ pub struct RevokeTokenRequest {
         (status = 204, description = "Token revoked"),
         (status = 400, description = "Not a valid bearer token of this realm", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 503, description = "No eligible revocation peer available", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn revoke_token(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<RevokeTokenRequest>,
 ) -> ServerResult<StatusCode> {
     let auth = require_realm_auth(&state, auth)?;
+    let ctx = state.get_ctx();
+    let user_origin = is_user_origin(&ctx, state.get_realm_id(), state.get_node_id())
+        .await
+        .map_err(map_metadata_api_error)?;
     // Only a real bearer token of a trusted realm may enter the revocation set,
     // and only its own subject or a realm admin may revoke it, so a token holder
     // cannot invalidate other users' sessions.
@@ -57,7 +68,7 @@ pub async fn revoke_token(
         .map_err(|_| ServerError::BadRequest)?;
     let expires_at = claims.exp;
     let subject: AuthContext = claims.try_into().map_err(|_| ServerError::BadRequest)?;
-    if auth.user_id != subject.user_id {
+    if auth.user_id != subject.user_id && !user_origin {
         ensure_permission(
             &state,
             &auth,
@@ -65,6 +76,22 @@ pub async fn revoke_token(
             Permission::WRITE,
         )
         .await?;
+    }
+
+    if user_origin {
+        let caller_token = bearer_token.as_ref().ok_or(ServerError::Unauthorized)?;
+        let auth_token = forwarded_bearer(Some(caller_token.as_str()))
+            .map_err(map_metadata_api_error)?
+            .ok_or(ServerError::Unauthorized)?;
+        forward_token_revoke(
+            &ctx,
+            state.get_realm_id(),
+            auth_token,
+            request.token.clone(),
+        )
+        .await
+        .map_err(map_metadata_api_error)?;
+        return Ok(StatusCode::NO_CONTENT);
     }
 
     drive(
@@ -79,7 +106,7 @@ pub async fn revoke_token(
             token_owner: subject.user_id,
             now: unix_timestamp_secs(),
         }),
-        state.get_ctx().as_ref(),
+        ctx.as_ref(),
     )
     .await
     .map_err(|error| ServerError::InternalError(error.to_string()))?;
@@ -178,6 +205,7 @@ mod tests {
         let error = revoke_token(
             State(state.clone()),
             Extension(None),
+            Extension(None),
             Json(RevokeTokenRequest {
                 token: token.clone(),
             }),
@@ -195,6 +223,7 @@ mod tests {
             let status = revoke_token(
                 State(state.clone()),
                 Extension(caller(realm_id, user_id)),
+                Extension(None),
                 Json(RevokeTokenRequest {
                     token: token.clone(),
                 }),
@@ -217,6 +246,7 @@ mod tests {
         revoke_token(
             State(state.clone()),
             Extension(caller(realm_id, user_id)),
+            Extension(None),
             Json(RevokeTokenRequest {
                 token: token.clone(),
             }),
@@ -329,6 +359,7 @@ mod tests {
         let error = revoke_token(
             State(state.clone()),
             Extension(caller(realm_id, stranger)),
+            Extension(None),
             Json(RevokeTokenRequest {
                 token: token.clone(),
             }),
@@ -358,6 +389,7 @@ mod tests {
         let status = revoke_token(
             State(state.clone()),
             Extension(caller(realm_id, admin)),
+            Extension(None),
             Json(RevokeTokenRequest {
                 token: token.clone(),
             }),
@@ -378,6 +410,7 @@ mod tests {
         revoke_token(
             State(state.clone()),
             Extension(caller(realm_id, user_id)),
+            Extension(None),
             Json(RevokeTokenRequest {
                 token: token.clone(),
             }),

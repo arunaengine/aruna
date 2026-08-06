@@ -23,7 +23,7 @@ use aruna_core::metadata::{
 use aruna_core::storage_entries::metadata_graph_lifecycle_key;
 use aruna_core::structs::{
     AuthContext, BucketInfo, MetadataRegistryRecord, Permission, RealmConfigDocument, RealmId,
-    SyncRelationship, blob_bucket_permission_path,
+    SyncRelationship, TokenClaims, blob_bucket_permission_path,
 };
 use aruna_core::telemetry::{duration_ms, record_duration_ms, record_elapsed_ms};
 use aruna_core::types::{GroupId, UserId};
@@ -63,8 +63,8 @@ use super::search_cursor::{METADATA_SEARCH_MAX_PAGINATION_DEPTH, compare_hits};
 use super::search_enrichment::{hit_snippet, hit_title};
 use super::summary_cache::summary_cache;
 use crate::auth::{
-    ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache, realm_token_revoked,
-    validate_aruna_bearer_token,
+    ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache,
+    decode_aruna_bearer_token, realm_token_revoked, validate_aruna_bearer_token,
 };
 use crate::driver::{DriverContext, drive};
 use crate::permission_rules::GroupPermissionRules;
@@ -324,6 +324,26 @@ impl ArunaBearerTokenValidationState for MetadataAuthValidationState {
         issuer_pubkey: &str,
     ) -> Result<DecodingKey, ArunaBearerTokenError> {
         self.issuer_keys.get_or_insert(issuer_pubkey).await
+    }
+}
+
+struct RevocationBlindValidation<'a>(&'a MetadataAuthValidationState);
+
+#[async_trait]
+impl ArunaBearerTokenValidationState for RevocationBlindValidation<'_> {
+    async fn is_bearer_token_revoked(&self, _token_hash: &str) -> bool {
+        false
+    }
+
+    async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
+        self.0.is_trusted_realm(realm_id).await
+    }
+
+    async fn decoding_key_for_issuer(
+        &self,
+        issuer_pubkey: &str,
+    ) -> Result<DecodingKey, ArunaBearerTokenError> {
+        self.0.decoding_key_for_issuer(issuer_pubkey).await
     }
 }
 
@@ -1453,6 +1473,9 @@ impl MetadataHandle {
             MetadataTransportMessage::ForwardAuditPage { request } => {
                 super::audit::serve_local_audit(context, peer, request).await
             }
+            forward @ MetadataTransportMessage::ForwardTokenRevocation { .. } => {
+                super::forward::apply_token_revoke(context, peer, forward).await
+            }
             MetadataTransportMessage::QueryResults { .. }
             | MetadataTransportMessage::SearchResults { .. }
             | MetadataTransportMessage::BucketSearchResults { .. }
@@ -1470,6 +1493,7 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardedExport { .. }
             | MetadataTransportMessage::DocumentQueryResults { .. }
             | MetadataTransportMessage::ForwardedAuditPage { .. }
+            | MetadataTransportMessage::ForwardedTokenRevoked
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -1791,6 +1815,17 @@ impl MetadataHandle {
             .map_err(MetadataWritePeerError::Unavailable)?;
         }
         Ok(auth)
+    }
+
+    pub(crate) async fn claims_for_revocation(
+        &self,
+        token: &str,
+    ) -> Result<TokenClaims, ArunaBearerTokenError> {
+        decode_aruna_bearer_token(
+            &RevocationBlindValidation(&self.inner.auth_validation),
+            token,
+        )
+        .await
     }
 
     #[tracing::instrument(
@@ -4155,6 +4190,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         }
         MetadataTransportMessage::ForwardAuditPage { .. } => "forward_audit_page",
         MetadataTransportMessage::ForwardedAuditPage { .. } => "forwarded_audit_page",
+        MetadataTransportMessage::ForwardTokenRevocation { .. } => "forward_token_revocation",
+        MetadataTransportMessage::ForwardedTokenRevoked => "forwarded_token_revoked",
     }
 }
 

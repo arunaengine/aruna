@@ -192,6 +192,13 @@ pub enum MetadataTransportMessage {
     ForwardedAuditPage {
         result: Result<AuditPageResponse, MetadataReadError>,
     },
+    /// A User-kind node forwards a bearer-token revocation to a node that may
+    /// publish realm administration events.
+    ForwardTokenRevocation {
+        auth_token: MetadataAuthToken,
+        token: String,
+    },
+    ForwardedTokenRevoked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,6 +347,10 @@ mod tests {
             limit: None,
             offset: None,
             after: None,
+        });
+        assert_has_auth_token_field(MetadataTransportMessage::ForwardTokenRevocation {
+            auth_token: MetadataAuthToken::bearer("revoke-token").unwrap(),
+            token: "target-token".to_string(),
         });
     }
 

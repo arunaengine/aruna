@@ -1,8 +1,9 @@
+use std::str::FromStr;
 use std::sync::Arc;
 
 use aruna_core::NodeId;
+use aruna_core::auth::bearer_token_hash;
 use aruna_core::effects::StorageEffect;
-use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::METADATA_CREATE_ACCEPTANCE_KEYSPACE;
 use aruna_core::metadata::{MetadataCreateEventRecord, MetadataError, MetadataQueryResults};
@@ -11,12 +12,12 @@ use aruna_core::structs::{
     Actor, AuthContext, MetadataRegistryRecord, Permission, PlacementRef, RealmConfigDocument,
     RealmId, RealmNodeKind,
 };
+use aruna_core::util::unix_timestamp_secs;
 use aruna_core::{MetaResourceId, StructuredId};
 use thiserror::Error;
 use tracing::{error, warn};
 use ulid::Ulid;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentResult, accepted_create_matches, create_metadata_document,
@@ -37,6 +38,9 @@ use crate::metadata::protocol::{
 };
 use crate::placement::{holds_placement, resolve_shard_holders};
 use crate::process_placements::load_realm_config;
+use crate::request_authorization::{AuthorizeError, authorize};
+use crate::request_policy::PolicyRequestExtras;
+use crate::revoke_token::{RevokeTokenConfig, RevokeTokenOperation};
 use crate::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
     UpdateMetadataDocumentOperation, update_metadata_document,
@@ -119,6 +123,75 @@ pub async fn is_user_origin(
         .find(|node| node.node_id == local_node_id.to_string())
         .ok_or(MetadataApiError::ServiceUnavailable)?;
     Ok(node.kind == RealmNodeKind::User)
+}
+
+pub async fn forward_token_revoke(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    auth_token: MetadataAuthToken,
+    token: String,
+) -> Result<(), MetadataApiError> {
+    let Some(config) = load_realm_config(context, realm_id).await else {
+        return Err(MetadataApiError::ServiceUnavailable);
+    };
+    let Some(metadata) = context.metadata_handle.as_ref() else {
+        return Err(MetadataApiError::ServiceUnavailable);
+    };
+    let local_node_id = context.net_handle.as_ref().map(|net| net.node_id());
+    let mut peers = config
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                &node.kind,
+                RealmNodeKind::Management | RealmNodeKind::Server
+            )
+        })
+        .map(|node| NodeId::from_str(&node.node_id))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    peers.retain(|peer| Some(*peer) != local_node_id);
+    if peers.is_empty() {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+
+    let digest = blake3::hash(token.as_bytes());
+    let start = usize::from(u16::from_be_bytes([
+        digest.as_bytes()[0],
+        digest.as_bytes()[1],
+    ])) % peers.len();
+    peers.rotate_left(start);
+    let message = MetadataTransportMessage::ForwardTokenRevocation { auth_token, token };
+    for peer in peers {
+        match metadata
+            .request_forwarded_write(peer, message.clone())
+            .await
+        {
+            Ok(MetadataTransportMessage::ForwardedTokenRevoked) => return Ok(()),
+            Ok(MetadataTransportMessage::ForwardedWriteDenied {
+                error: MetadataWriteAuthError::Unauthorized,
+            }) => return Err(MetadataApiError::Unauthorized),
+            Ok(MetadataTransportMessage::ForwardedWriteDenied {
+                error: MetadataWriteAuthError::Forbidden,
+            }) => return Err(MetadataApiError::Forbidden),
+            Ok(MetadataTransportMessage::ForwardedWriteUnavailable) => continue,
+            Ok(MetadataTransportMessage::Reject(error)) => {
+                warn!(%peer, %error, "Peer rejected a forwarded token revocation");
+                return Err(MetadataApiError::ServiceUnavailable);
+            }
+            Ok(response) => {
+                warn!(%peer, response = ?super::handle::transport_message_kind(&response), "Peer returned an unexpected token revocation response");
+                return Err(MetadataApiError::ServiceUnavailable);
+            }
+            Err(error) => {
+                warn!(%peer, %error, "Failed to forward a token revocation");
+                if retry_disposition(error.delivery()) == RetryDisposition::Stop {
+                    return Err(MetadataApiError::ServiceUnavailable);
+                }
+            }
+        }
+    }
+    Err(MetadataApiError::ServiceUnavailable)
 }
 
 /// Whether the origin currently holds a structured metadata document's bucket.
@@ -882,6 +955,93 @@ pub(crate) async fn apply_forwarded_write(
     }
 }
 
+pub(crate) async fn apply_token_revoke(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    };
+    let realm_id = *net_handle.realm_id();
+    let Some(config) = load_realm_config(context, realm_id).await else {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    };
+    let local_node = config
+        .nodes
+        .iter()
+        .find(|node| node.node_id == net_handle.node_id().to_string());
+    if !local_node.is_some_and(|node| {
+        matches!(
+            &node.kind,
+            RealmNodeKind::Management | RealmNodeKind::Server
+        )
+    }) {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    }
+    let Some(metadata) = context.metadata_handle.as_ref() else {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    };
+    let MetadataTransportMessage::ForwardTokenRevocation { auth_token, .. } = &message else {
+        return reject("unexpected token revocation message");
+    };
+    if !matches!(auth_token, MetadataAuthToken::Bearer(_)) {
+        return MetadataTransportMessage::ForwardedWriteDenied {
+            error: MetadataWriteAuthError::Unauthorized,
+        };
+    }
+    let auth = match authorize_forwarded_caller(context, peer, realm_id, &message).await {
+        Ok(auth) => auth,
+        Err(error) => return forward_auth_error(error),
+    };
+    let MetadataTransportMessage::ForwardTokenRevocation { token, .. } = message else {
+        return reject("unexpected token revocation message");
+    };
+    let claims = match metadata.claims_for_revocation(&token).await {
+        Ok(claims) => claims,
+        Err(error) => return reject(format!("invalid token revocation target: {error}")),
+    };
+    let expires_at = claims.exp;
+    let subject: AuthContext = match claims.try_into() {
+        Ok(subject) => subject,
+        Err(error) => return reject(format!("invalid token revocation subject: {error}")),
+    };
+    if subject.realm_id != realm_id {
+        return MetadataTransportMessage::ForwardedWriteDenied {
+            error: MetadataWriteAuthError::Forbidden,
+        };
+    }
+    if auth.user_id != subject.user_id
+        && let Err(error) = authorize_write(
+            context,
+            auth.clone(),
+            format!("/{realm_id}/admin/u/{}", subject.user_id),
+        )
+        .await
+    {
+        return forward_auth_error(error);
+    }
+    match drive(
+        RevokeTokenOperation::new(RevokeTokenConfig {
+            actor: Actor {
+                node_id: net_handle.node_id(),
+                user_id: auth.user_id,
+                realm_id,
+            },
+            token_hash: bearer_token_hash(&token),
+            expires_at,
+            token_owner: subject.user_id,
+            now: unix_timestamp_secs(),
+        }),
+        context.as_ref(),
+    )
+    .await
+    {
+        Ok(_) => MetadataTransportMessage::ForwardedTokenRevoked,
+        Err(error) => reject(format!("token revocation failed: {error}")),
+    }
+}
+
 fn routed_record_matches(
     config: &RealmConfigDocument,
     realm_id: RealmId,
@@ -1072,6 +1232,9 @@ async fn authorize_forwarded_caller(
         MetadataTransportMessage::ForwardCreateDocument { auth_token, .. }
         | MetadataTransportMessage::ForwardUpdateDocument { auth_token, .. }
         | MetadataTransportMessage::ForwardDeleteDocument { auth_token, .. } => auth_token.clone(),
+        MetadataTransportMessage::ForwardTokenRevocation { auth_token, .. } => {
+            Some(auth_token.clone())
+        }
         _ => None,
     };
     let auth = metadata_handle
@@ -1094,25 +1257,21 @@ async fn authorize_write(
     auth_context: AuthContext,
     path: String,
 ) -> Result<(), ForwardAuthError> {
-    match drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context,
-            path: path.clone(),
-            required_permission: Permission::WRITE,
-        }),
+    match authorize(
         context.as_ref(),
+        auth_context.realm_id,
+        &auth_context,
+        &path,
+        &Permission::WRITE,
+        PolicyRequestExtras::rest(),
     )
     .await
     {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(ForwardAuthError::Forbidden),
-        Err(
-            AuthorizationError::InvalidRealmId
-            | AuthorizationError::InvalidGroupId
-            | AuthorizationError::GroupNotFound
-            | AuthorizationError::AuthDocNotFound,
-        ) => Err(ForwardAuthError::Forbidden),
-        Err(error) => Err(ForwardAuthError::Unavailable(error.to_string())),
+        Ok(()) => Ok(()),
+        Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => {
+            Err(ForwardAuthError::Forbidden)
+        }
+        Err(AuthorizeError::CheckFailed(error)) => Err(ForwardAuthError::Unavailable(error)),
     }
 }
 
