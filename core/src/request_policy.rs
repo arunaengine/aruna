@@ -85,7 +85,7 @@ pub struct RequestPolicy {
     #[serde(default)]
     pub kind: PolicyKind,
     /// Optional applicability guard; the rule applies when it is absent or
-    /// evaluates to `true`, and a guard that errors leaves the rule applicable.
+    /// evaluates to `true`, and a guard that errors denies the request.
     #[serde(default)]
     pub when: Option<String>,
     /// CEL expression over the request variables.
@@ -236,10 +236,17 @@ pub struct TracedDecision {
 }
 
 impl CompiledPolicy {
-    fn is_applicable(&self, context: &Context) -> bool {
+    fn is_applicable(&self, context: &Context) -> Result<bool, String> {
         match &self.when {
-            None => true,
-            Some(program) => !matches!(program.execute(context), Ok(Value::Bool(false))),
+            None => Ok(true),
+            Some(program) => match program.execute(context) {
+                Ok(Value::Bool(value)) => Ok(value),
+                Ok(other) => Err(format!(
+                    "guard returned {:?} instead of a boolean",
+                    other.type_of()
+                )),
+                Err(error) => Err(format!("guard evaluation error: {error}")),
+            },
         }
     }
 
@@ -356,8 +363,13 @@ impl CompiledPolicySet {
     pub fn evaluate(&self, request: &PolicyRequest, functions: &PolicyFunctions) -> PolicyDecision {
         let context = self.build_context(request, functions);
         for policy in &self.policies {
-            if !policy.enabled || !policy.is_applicable(&context) {
+            if !policy.enabled {
                 continue;
+            }
+            match policy.is_applicable(&context) {
+                Ok(false) => continue,
+                Err(reason) => return policy.denied(reason),
+                Ok(true) => {}
             }
             match policy.outcome(&context) {
                 Outcome::Pass => {}
@@ -387,9 +399,22 @@ impl CompiledPolicySet {
                 ));
                 continue;
             }
-            if !policy.is_applicable(&context) {
-                trace.push(trace_entry(policy, false, PolicyResult::Passed, None));
-                continue;
+            match policy.is_applicable(&context) {
+                Ok(false) => {
+                    trace.push(trace_entry(policy, false, PolicyResult::Passed, None));
+                    continue;
+                }
+                Err(reason) => {
+                    trace.push(trace_entry(
+                        policy,
+                        true,
+                        PolicyResult::Error,
+                        Some(reason.clone()),
+                    ));
+                    decision = policy.denied(reason);
+                    break;
+                }
+                Ok(true) => {}
             }
             match policy.outcome(&context) {
                 Outcome::Pass => {
@@ -638,11 +663,28 @@ mod tests {
     }
 
     #[test]
-    fn guard_error_applies() {
-        // A guard that errors leaves the rule applicable (fail-closed).
-        let mut guarded = policy("true");
+    fn guard_failures_deny() {
+        for (kind, expression, guard) in [
+            (PolicyKind::Deny, "false", "missing_var"),
+            (PolicyKind::Require, "true", "missing_var"),
+            (PolicyKind::Deny, "false", "'enabled'"),
+            (PolicyKind::Require, "true", "'enabled'"),
+        ] {
+            let mut guarded = policy(expression);
+            guarded.kind = kind;
+            guarded.when = Some(guard.to_string());
+            assert!(
+                evaluate_policies(&[guarded], &request("/p", "read", "u")).is_denied(),
+                "{kind:?} {guard}"
+            );
+        }
+
+        let mut guarded = policy("false");
         guarded.when = Some("missing_var".to_string());
-        assert!(evaluate_policies(&[guarded], &request("/p", "read", "u")).is_denied());
+        let set = CompiledPolicySet::compile(&[guarded]).unwrap();
+        let traced = set.evaluate_traced(&request("/p", "read", "u"), &PolicyFunctions::default());
+        assert!(traced.decision.is_denied());
+        assert_eq!(traced.trace[0].result, PolicyResult::Error);
     }
 
     #[test]
