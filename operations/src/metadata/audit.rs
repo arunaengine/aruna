@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use aruna_core::audit::{AuditPageEntry, AuditPageRequest, AuditPageResponse};
 use aruna_core::effects::{AuditPageEffect, Effect, IterStart, NetEffect, StorageEffect};
-use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{AuditPageEvent, Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::METADATA_AUDIT_KEYSPACE;
 use aruna_core::metadata::MetadataAuthToken;
@@ -22,8 +21,9 @@ use ulid::Ulid;
 
 use super::api::load_realm_config;
 use super::protocol::{MetadataReadError, MetadataTransportMessage};
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
+use crate::request_authorization::{AuthorizeError, authorize};
+use crate::request_policy::PolicyRequestExtras;
 
 pub const MAX_AUDIT_PAGE_SIZE: usize = 200;
 pub const DEFAULT_AUDIT_PAGE_SIZE: usize = 50;
@@ -425,10 +425,15 @@ impl Operation for ListAuditOperation {
         let (records, cutoff) = merge_pages(&self.pages, self.limit);
         let mut missing = self.missing;
         missing.sort_by_key(|node| node.to_string());
+        let partial = !missing.is_empty();
         Ok(AuditAggregate {
             records,
-            next_cursor: cutoff.map(encode_cursor),
-            partial: !missing.is_empty(),
+            next_cursor: if partial {
+                None
+            } else {
+                cutoff.map(encode_cursor)
+            },
+            partial,
             missing_nodes: missing,
         })
     }
@@ -501,6 +506,9 @@ pub async fn list_audit(
     );
     let mut aggregate = drive(operation, context).await?;
     aggregate.partial |= partial;
+    if aggregate.partial {
+        aggregate.next_cursor = None;
+    }
     Ok(aggregate)
 }
 
@@ -559,25 +567,21 @@ async fn authorize_admin(
     auth_context: AuthContext,
     path: String,
 ) -> Result<(), MetadataReadError> {
-    match drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context,
-            path,
-            required_permission: Permission::WRITE,
-        }),
+    match authorize(
         context.as_ref(),
+        auth_context.realm_id,
+        &auth_context,
+        &path,
+        &Permission::WRITE,
+        PolicyRequestExtras::rest(),
     )
     .await
     {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(MetadataReadError::Forbidden),
-        Err(
-            AuthorizationError::InvalidRealmId
-            | AuthorizationError::InvalidGroupId
-            | AuthorizationError::GroupNotFound
-            | AuthorizationError::AuthDocNotFound,
-        ) => Err(MetadataReadError::Forbidden),
-        Err(_) => Err(MetadataReadError::Unavailable),
+        Ok(()) => Ok(()),
+        Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => {
+            Err(MetadataReadError::Forbidden)
+        }
+        Err(AuthorizeError::CheckFailed(_)) => Err(MetadataReadError::Unavailable),
     }
 }
 
@@ -605,13 +609,19 @@ pub(crate) async fn send_audit_request(
 mod tests {
     use super::{
         AuditPageEntry, AuditPageEvent, AuditPageResponse, Effect, Event, ListAuditOperation,
-        LocalAuditPageOperation, NetEffect, NetEvent, Operation, StorageEvent, decode_cursor,
-        encode_cursor, merge_pages,
+        LocalAuditPageOperation, MetadataReadError, NetEffect, NetEvent, Operation, StorageEvent,
+        authorize_admin, decode_cursor, encode_cursor, merge_pages,
     };
     use crate::driver::DriverContext;
     use crate::metadata::repository::{metadata_audit_key, write_audit_effect};
     use aruna_core::UserId;
+    use aruna_core::effects::StorageEffect;
     use aruna_core::handle::Handle;
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
+    use aruna_core::request_policy::{PolicyKind, RequestPolicy};
+    use aruna_core::structs::{
+        Actor, AuthContext, Group, GroupAuthorizationDocument, RealmAuthorizationDocument,
+    };
     use aruna_core::structs::{MetadataAuditOperation, MetadataAuditRecord, RealmId};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
@@ -722,11 +732,183 @@ mod tests {
     }
 
     #[test]
+    fn partial_page_retries() {
+        let realm_id = RealmId([9u8; 32]);
+        let group = Ulid::from_bytes([3u8; 16]);
+        let doc = Ulid::from_bytes([4u8; 16]);
+        let first = Ulid::from_bytes([1u8; 16]);
+        let second = Ulid::from_bytes([2u8; 16]);
+        let third = Ulid::from_bytes([3u8; 16]);
+        let live = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
+        let missing = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+
+        let mut first_entry = entry(group, doc, first, realm_id);
+        first_entry.record.occurred_at_ms = 1;
+        let mut second_entry = entry(group, doc, second, realm_id);
+        second_entry.record.occurred_at_ms = 2;
+        let mut third_entry = entry(group, doc, third, realm_id);
+        third_entry.record.occurred_at_ms = 3;
+        let live_page = AuditPageResponse {
+            records: vec![second_entry, third_entry],
+            next_start_after: Some(metadata_audit_key(group, doc, third).to_vec()),
+        };
+
+        let mut operation = ListAuditOperation::new(
+            group,
+            Some(doc),
+            vec![live, missing],
+            None,
+            2,
+            None,
+            [0u8; 32],
+        );
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+        operation.step(Event::Net(NetEvent::AuditPages(vec![
+            AuditPageEvent::Page {
+                node: live,
+                response: Box::new(live_page.clone()),
+            },
+            AuditPageEvent::Unavailable {
+                node: missing,
+                message: "unreachable".to_string(),
+            },
+        ])));
+
+        let partial = operation.finalize().unwrap();
+        assert!(partial.partial);
+        assert!(partial.next_cursor.is_none());
+
+        let mut retry = ListAuditOperation::new(
+            group,
+            Some(doc),
+            vec![live, missing],
+            None,
+            2,
+            None,
+            [0u8; 32],
+        );
+        retry.start();
+        retry.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+        retry.step(Event::Net(NetEvent::AuditPages(vec![
+            AuditPageEvent::Page {
+                node: live,
+                response: Box::new(live_page),
+            },
+            AuditPageEvent::Page {
+                node: missing,
+                response: Box::new(AuditPageResponse {
+                    records: vec![first_entry],
+                    next_start_after: None,
+                }),
+            },
+        ])));
+
+        let recovered = retry.finalize().unwrap();
+        assert_eq!(
+            recovered
+                .records
+                .iter()
+                .map(|record| record.occurred_at_ms)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
     fn cursor_round_trips() {
         let key = vec![7u8, 9, 11];
         let encoded = encode_cursor(key.clone());
         assert_eq!(decode_cursor(&encoded).unwrap(), key);
         assert!(decode_cursor("!!not-base64!!").is_err());
+    }
+
+    #[tokio::test]
+    async fn forwarded_policy_deny() {
+        // A serving peer must apply the same policy context as the REST gate.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = std::sync::Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
+        });
+        let realm_id = RealmId([8u8; 32]);
+        let group_id = Ulid::from_bytes([9u8; 16]);
+        let user_id = UserId::local(Ulid::from_bytes([10u8; 16]), realm_id);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[11u8; 32]).public(),
+            user_id,
+            realm_id,
+        };
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let mut group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
+        group_auth.policies.push(RequestPolicy {
+            policy_id: Ulid::from_bytes([12u8; 16]),
+            name: "deny-audit".to_string(),
+            kind: PolicyKind::Deny,
+            when: None,
+            expression: "operation == 'rest'".to_string(),
+            enabled: true,
+        });
+        let group = Group {
+            display_name: "audit".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner: user_id,
+        };
+        for (key_space, key, value) in [
+            (
+                AUTH_KEYSPACE,
+                realm_id.as_bytes().to_vec(),
+                realm_auth.to_bytes(&actor).unwrap(),
+            ),
+            (
+                AUTH_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+                group_auth.to_bytes(&actor).unwrap(),
+            ),
+            (
+                GROUP_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+                group.to_bytes(&actor).unwrap(),
+            ),
+        ] {
+            assert!(matches!(
+                storage
+                    .send_storage_effect(StorageEffect::Write {
+                        key_space: key_space.to_string(),
+                        key: key.into(),
+                        value: value.into(),
+                        txn_id: None,
+                    })
+                    .await,
+                Event::Storage(StorageEvent::WriteResult { .. })
+            ));
+        }
+
+        let result = authorize_admin(
+            &context,
+            AuthContext {
+                user_id,
+                realm_id,
+                path_restrictions: None,
+            },
+            format!("/{realm_id}/g/{group_id}/admin"),
+        )
+        .await;
+        assert!(matches!(result, Err(MetadataReadError::Forbidden)));
     }
 
     #[test]
