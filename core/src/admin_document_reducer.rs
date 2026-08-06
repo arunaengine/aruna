@@ -1132,6 +1132,52 @@ impl AdminDocumentReducerState {
         revoked
     }
 
+    /// Drops revocation entries whose token has expired, so the reducer state
+    /// stays bounded like the materialized set. The clock is the compacting
+    /// node's own; a replicated event must never carry one.
+    pub fn compact_revocations(&mut self, now: u64) {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return;
+        }
+
+        let expired: Vec<String> = self
+            .user_subject_ids
+            .keys()
+            .chain(self.conflicts.keys())
+            .filter(|path| {
+                revoked_token_entry(path).is_some_and(|(_, expires_at)| expires_at < now)
+            })
+            .cloned()
+            .collect();
+        for path in expired {
+            // A redelivered event for a compacted entry is applied and compacted
+            // again; an expired revocation never reaches the materialized set.
+            for event_id in self.path_event_ids(&path) {
+                self.applied_event_ids.remove(&event_id);
+            }
+            self.user_subject_ids.remove(&path);
+            self.equivalent_value_dots.remove(&path);
+            self.conflicts.remove(&path);
+        }
+    }
+
+    /// Every event id that contributed to a path's value or to its conflict.
+    fn path_event_ids(&self, path: &str) -> Vec<Ulid> {
+        let mut event_ids: Vec<Ulid> = self
+            .user_subject_ids
+            .get(path)
+            .map(|version| version.dot.event_id)
+            .into_iter()
+            .collect();
+        if let Some(dots) = self.equivalent_value_dots.get(path) {
+            event_ids.extend(dots.iter().map(|dot| dot.event_id));
+        }
+        if let Some(conflict) = self.conflicts.get(path) {
+            event_ids.extend(conflict.values.iter().map(|value| value.dot.event_id));
+        }
+        event_ids
+    }
+
     pub fn materialized_band_pools(&self) -> BTreeMap<Ulid, BandPool> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return BTreeMap::new();
@@ -5530,6 +5576,71 @@ mod tests {
             state
                 .materialized_revoked_tokens()
                 .contains_key(&crate::auth::bearer_token_hash("behind"))
+        );
+    }
+
+    #[test]
+    fn compaction_drops_expired() {
+        // Expired revocations must leave no reducer residue, so a user revoking
+        // token after token cannot grow the persisted state without bound.
+        let mut state = realm_config_state();
+        let expired = revoke_token(1, 1, "expired");
+        let echoed = revoke_token(3, 2, "expired");
+        let live = realm_config_event(
+            2,
+            node(1),
+            2,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: crate::auth::bearer_token_hash("live"),
+                expires_at: 9_000,
+            },
+        );
+        for event in [&expired, &echoed, &live] {
+            state.apply(event).unwrap();
+        }
+
+        state.compact_revocations(3_000);
+
+        assert_eq!(
+            state.materialized_revoked_tokens(),
+            BTreeMap::from([(crate::auth::bearer_token_hash("live"), 9_000)])
+        );
+        assert!(!state.applied_event_ids.contains(&expired.event_id));
+        assert!(!state.applied_event_ids.contains(&echoed.event_id));
+        assert!(state.applied_event_ids.contains(&live.event_id));
+        assert!(state.equivalent_value_dots.is_empty());
+    }
+
+    #[test]
+    fn compaction_keeps_unexpired() {
+        // The expiry boundary matches the materialized set, which keeps an
+        // entry while `expires_at >= now`.
+        let mut state = realm_config_state();
+        state.apply(&revoke_token(1, 1, "token")).unwrap();
+
+        state.compact_revocations(2_000);
+
+        assert_eq!(
+            state.materialized_revoked_tokens(),
+            BTreeMap::from([(crate::auth::bearer_token_hash("token"), 2_000)])
+        );
+    }
+
+    #[test]
+    fn compaction_spares_other_paths() {
+        let mut state = realm_config_state();
+        state
+            .apply(&set_realm_config_description(1, 1, "realm"))
+            .unwrap();
+        state.apply(&revoke_token(2, 1, "token")).unwrap();
+
+        state.compact_revocations(9_000);
+
+        assert!(state.materialized_revoked_tokens().is_empty());
+        assert_eq!(
+            state.materialized_realm_config_description(),
+            Some("realm".to_string())
         );
     }
 

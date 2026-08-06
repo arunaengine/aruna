@@ -4336,6 +4336,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
     let apply_status = reducer_state
         .apply(&event)
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    reducer_state.compact_revocations(unix_timestamp_secs());
     if persist_stale_admin_document_event(storage, apply_status, &reducer_state).await? {
         return Ok(());
     }
@@ -7993,6 +7994,77 @@ mod tests {
 
         let config = read_realm_config_doc(&storage, realm_id).await;
         assert!(config.token_revoked(&token_hash, unix_timestamp_secs()));
+        assert_eq!(config.revoked_tokens.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn replicated_revocation_compacts() {
+        // A replicated revocation whose token has expired must leave no entry
+        // behind in the receiving node's reducer state.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([60; 32]);
+        let actor = test_actor(
+            12,
+            UserId::local(Ulid::from_parts(1_640, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_641, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication: MetadataReplicationConfig::new(3),
+                    discovery: test_discovery(26, "https://compaction.example:443"),
+                },
+            ),
+        )
+        .await
+        .expect("settings bootstrap the config doc");
+
+        let expired = aruna_core::auth::bearer_token_hash("expired-token");
+        let live = aruna_core::auth::bearer_token_hash("live-token");
+        let now = unix_timestamp_secs();
+        for (index, seq, token_hash, expires_at) in [
+            (1_642u64, 2u64, expired.clone(), now - 1),
+            (1_643, 3, live.clone(), now + 600),
+        ] {
+            apply_admin_document_operation_to_storage(
+                &storage,
+                document_target.clone(),
+                test_admin_event(
+                    Ulid::from_parts(index, 1),
+                    target.clone(),
+                    &actor,
+                    seq,
+                    AdminDocumentOperation::RealmConfigTokenRevoked {
+                        token_hash,
+                        expires_at,
+                    },
+                ),
+            )
+            .await
+            .expect("revocation replicates and applies");
+        }
+
+        let state = read_admin_reducer_state(&storage, &target)
+            .await
+            .expect("reducer state reads")
+            .expect("reducer state exists");
+        assert!(state.materialized_revoked_tokens().contains_key(&live));
+        assert!(
+            !state
+                .user_subject_ids
+                .keys()
+                .any(|path| path.contains(&expired))
+        );
+        let config = read_realm_config_doc(&storage, realm_id).await;
         assert_eq!(config.revoked_tokens.len(), 1);
     }
 

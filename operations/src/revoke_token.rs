@@ -175,6 +175,7 @@ impl RevokeTokenOperation {
                 expires_at: self.config.expires_at,
             },
         )?;
+        reducer_state.compact_revocations(self.config.now);
         document.merge_revocations(&reducer_state, self.config.now);
 
         let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
@@ -360,7 +361,11 @@ impl Operation for RevokeTokenOperation {
 
 #[cfg(test)]
 mod tests {
-    use super::{RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation};
+    use super::{
+        ADMIN_DOCUMENT_STATE_KEYSPACE, AdminDocumentReducerState, AdminDocumentTarget, Event,
+        RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation, StorageEffect, StorageEvent,
+        admin_document_reducer_state_key,
+    };
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive};
     use crate::get_realm_config::GetRealmConfigOperation;
@@ -484,6 +489,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read.revoked_tokens.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn compacts_reducer_state() {
+        // The reducer state behind the replicated set must shed expired entries
+        // too, so repeated revocations cannot grow the stored state for good.
+        let (_dir, context, actor) = setup_realm().await;
+        let stale = bearer_token_hash("stale-token");
+        let fresh = bearer_token_hash("fresh-token");
+        for config in [
+            revocation(&actor, &stale, 2_000, 1_000),
+            revocation(&actor, &fresh, 4_000, 3_000),
+        ] {
+            drive(RevokeTokenOperation::new(config), &context)
+                .await
+                .unwrap();
+        }
+
+        let state = reducer_state(&context, actor.realm_id).await;
+        assert_eq!(
+            state.materialized_revoked_tokens(),
+            std::collections::BTreeMap::from([(fresh, 4_000)])
+        );
+        assert!(
+            !state
+                .user_subject_ids
+                .keys()
+                .any(|path| path.contains(&stale))
+        );
+    }
+
+    async fn reducer_state(
+        context: &DriverContext,
+        realm_id: RealmId,
+    ) -> AdminDocumentReducerState {
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                key: admin_document_reducer_state_key(&target),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult {
+                value: Some(bytes), ..
+            }) => aruna_core::admin_document_reducer::decode_admin_document_reducer_state(&bytes)
+                .expect("reducer state decodes"),
+            other => panic!("unexpected reducer state read: {other:?}"),
+        }
     }
 
     #[tokio::test]
