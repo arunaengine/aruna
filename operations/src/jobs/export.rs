@@ -610,30 +610,25 @@ async fn extend_hash_candidates(
     resolved_aliases: &mut BTreeMap<[u8; 32], (Vec<ExportCandidate>, bool)>,
     authorized_aliases: &mut BTreeMap<(GroupId, String), bool>,
 ) -> Result<bool, ExportFailure> {
-    let aliases = if let Some(aliases) = alias_cache.get(&hash) {
-        aliases.clone()
-    } else {
-        let aliases = drive(ResolveBlobPermissionPathsOperation::new(hash), &ctx.driver)
-            .await
-            .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
-        if aliases.len() > MAX_HASH_ALIASES {
-            return Err(ExportFailure::Retryable(
-                "hash alias limit exceeded".to_string(),
-            ));
-        }
-        alias_cache.insert(hash, aliases.clone());
-        aliases
-    };
-    let distinct = collect_aliases(
-        &aliases,
-        spec.auth_context.realm_id,
-        alias_paths,
-        alias_keys,
-    )?;
     if let Some((cached, cached_denied)) = resolved_aliases.get(&hash) {
         merge_candidates(candidates, cached);
         *denied |= *cached_denied;
     } else {
+        if !alias_cache.contains_key(&hash) {
+            let aliases = drive(ResolveBlobPermissionPathsOperation::new(hash), &ctx.driver)
+                .await
+                .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+            cache_aliases(alias_cache, hash, aliases)?;
+        }
+        let aliases = alias_cache
+            .get(&hash)
+            .ok_or_else(|| ExportFailure::Retryable("alias cache unavailable".to_string()))?;
+        let distinct = collect_aliases(
+            aliases,
+            spec.auth_context.realm_id,
+            alias_paths,
+            alias_keys,
+        )?;
         let groups = distinct
             .keys()
             .map(|(group_id, _)| *group_id)
@@ -690,6 +685,33 @@ async fn extend_hash_candidates(
     }
     merge_candidates(candidates, &holder_candidates);
     Ok(false)
+}
+
+fn cache_aliases(
+    alias_cache: &mut BTreeMap<[u8; 32], Vec<HashPathIndexKey>>,
+    hash: [u8; 32],
+    aliases: Vec<HashPathIndexKey>,
+) -> Result<(), ExportFailure> {
+    if aliases.len() > MAX_HASH_ALIASES {
+        return Err(ExportFailure::Retryable(
+            "hash alias limit exceeded".to_string(),
+        ));
+    }
+    let cached = alias_cache
+        .values()
+        .try_fold(0usize, |total, aliases| total.checked_add(aliases.len().max(1)))
+        .ok_or_else(|| ExportFailure::Retryable("export alias limit exceeded".to_string()))?;
+    let cost = aliases.len().max(1);
+    if cached
+        .checked_add(cost)
+        .is_none_or(|total| total > MAX_HASH_ALIASES)
+    {
+        return Err(ExportFailure::Retryable(
+            "export alias limit exceeded".to_string(),
+        ));
+    }
+    alias_cache.insert(hash, aliases);
+    Ok(())
 }
 
 fn collect_aliases(
@@ -3433,6 +3455,54 @@ mod tests {
         assert_eq!(keys.len(), 1);
         let repeated = collect_aliases(&aliases, realm_id, &mut paths, &mut keys).unwrap();
         assert!(repeated.is_empty());
+    }
+
+    #[test]
+    fn bounds_alias_cache() {
+        let realm_id = RealmId::from_bytes([11; 32]);
+        let alias = HashPathIndexKey::new(
+            [12; 32],
+            Ulid::from_bytes([13; 16]),
+            realm_id,
+            Ulid::from_bytes([14; 16]),
+            iroh::SecretKey::from_bytes(&[15; 32]).public(),
+            "bucket",
+            "key",
+        );
+        let mut cache = BTreeMap::new();
+        cache_aliases(
+            &mut cache,
+            [16; 32],
+            vec![alias; MAX_HASH_ALIASES],
+        )
+        .unwrap();
+
+        let mut cross_realm = HashPathIndexKey::new(
+            [17; 32],
+            Ulid::from_bytes([18; 16]),
+            RealmId::from_bytes([19; 32]),
+            Ulid::from_bytes([20; 16]),
+            iroh::SecretKey::from_bytes(&[21; 32]).public(),
+            "bucket",
+            "key",
+        );
+        cross_realm.realm_id = RealmId::from_bytes([22; 32]);
+        assert!(matches!(
+            cache_aliases(&mut cache, [23; 32], vec![cross_realm]),
+            Err(ExportFailure::Retryable(message)) if message == "export alias limit exceeded"
+        ));
+    }
+
+    #[test]
+    fn bounds_empty_cache() {
+        let mut cache = BTreeMap::new();
+        for index in 0..MAX_HASH_ALIASES {
+            let mut hash = [0; 32];
+            hash[..2].copy_from_slice(&(index as u16).to_be_bytes());
+            cache_aliases(&mut cache, hash, Vec::new()).unwrap();
+        }
+        assert_eq!(cache.len(), MAX_HASH_ALIASES);
+        assert!(cache_aliases(&mut cache, [255; 32], Vec::new()).is_err());
     }
 
     #[test]
