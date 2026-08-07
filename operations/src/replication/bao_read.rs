@@ -1,14 +1,14 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    BackendLocation, BlobLocationKey, BlobVersion, BucketInfo, HashPathIndexKey, Permission,
+    BackendLocation, BlobLocationKey, BlobVersion, BucketInfo, HashPathIndexKey,
     RealmConfigDocument, RealmId, VersionKey, VersionedObjectArn, blob_object_permission_path,
 };
 use aruna_core::types::Effects;
@@ -20,7 +20,6 @@ use ulid::Ulid;
 
 use super::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget, VersionReplicationMessage};
 use crate::blob::blob_keyspace_helper::{blob_location_read, iter_hash_path_index_effect};
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::realm_peer::ensure_realm_peer;
 
 #[derive(Debug, PartialEq)]
@@ -301,6 +300,7 @@ pub struct IncomingBaoReadOperation {
     had_denial: bool,
     refusal: Option<BaoReadRefusal>,
     output: Option<Result<IncomingBaoReadResult, BaoReadError>>,
+    policy_paths: HashSet<String>,
 }
 
 impl IncomingBaoReadOperation {
@@ -326,7 +326,13 @@ impl IncomingBaoReadOperation {
             had_denial: false,
             refusal: None,
             output: None,
+            policy_paths: HashSet::new(),
         }
+    }
+
+    pub fn with_policy_paths(mut self, paths: HashSet<String>) -> Self {
+        self.policy_paths = paths;
+        self
     }
 
     fn exact_target(&self) -> Option<&VersionedObjectArn> {
@@ -394,12 +400,18 @@ impl IncomingBaoReadOperation {
     }
 
     fn next_candidate(&mut self) -> Effects {
-        let Some(candidate) = self.candidates.pop_front() else {
-            return self.send_refusal(if self.had_denial {
-                BaoReadRefusal::ReadDenied
-            } else {
-                BaoReadRefusal::NotFound
-            });
+        let candidate = loop {
+            let Some(candidate) = self.candidates.pop_front() else {
+                return self.send_refusal(if self.had_denial {
+                    BaoReadRefusal::ReadDenied
+                } else {
+                    BaoReadRefusal::NotFound
+                });
+            };
+            if self.policy_paths.contains(&candidate.permission_path()) {
+                break candidate;
+            }
+            self.had_denial = true;
         };
         let version_key = VersionKey::new(&candidate.bucket, &candidate.key, candidate.version_id);
         let key = match version_key.to_bytes() {
@@ -413,18 +425,6 @@ impl IncomingBaoReadOperation {
             key: key.into(),
             txn_id: None,
         })]
-    }
-
-    fn check_permission(&mut self, path: String) -> Effects {
-        self.state = IncomingBaoReadState::CheckPermission;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.request.auth_context.clone(),
-                path,
-                required_permission: Permission::READ,
-            }),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
     }
 
     fn read_location(&mut self) -> Effects {
@@ -580,13 +580,18 @@ impl IncomingBaoReadOperation {
         let target = self
             .exact_target()
             .expect("exact target required after exact bucket read");
-        self.check_permission(blob_object_permission_path(
+        let path = blob_object_permission_path(
             self.request.realm_id,
             bucket.group_id,
             self.local_node,
             &target.bucket,
             &target.key,
-        ))
+        );
+        if self.policy_paths.contains(&path) {
+            self.read_exact_version()
+        } else {
+            self.send_refusal(BaoReadRefusal::ReadDenied)
+        }
     }
 
     fn handle_hash_aliases(&mut self, event: Event) -> Effects {
@@ -639,7 +644,12 @@ impl IncomingBaoReadOperation {
             .as_ref()
             .expect("hash candidate required after version read")
             .permission_path();
-        self.check_permission(path)
+        if self.policy_paths.contains(&path) {
+            self.read_location()
+        } else {
+            self.had_denial = true;
+            self.next_candidate()
+        }
     }
 
     fn handle_permission(&mut self, event: Event) -> Effects {
@@ -804,12 +814,12 @@ impl Operation for IncomingBaoReadOperation {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::time::SystemTime;
 
     use aruna_core::UserId;
     use aruna_core::effects::{BlobEffect, Effect};
-    use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
+    use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::{
@@ -854,6 +864,16 @@ mod tests {
             expected_blake3: Some(hash),
             metadata_only: false,
         }
+    }
+
+    fn read_path(local_node: aruna_core::NodeId) -> String {
+        aruna_core::structs::blob_object_permission_path(
+            test_realm(),
+            Ulid::from(5u128),
+            local_node,
+            "bucket",
+            "path/file.txt",
+        )
     }
 
     fn realm_value(peer: aruna_core::NodeId) -> byteview::ByteView {
@@ -1027,11 +1047,6 @@ mod tests {
             key: Vec::<u8>::new().into(),
             value: Some(bucket_value()),
         }));
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-
-        let effects = operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
-        ));
         assert_eq!(refusal_from(&effects), BaoReadRefusal::ReadDenied);
     }
 
@@ -1044,7 +1059,8 @@ mod tests {
         let mut request = read_request(local_node, hash);
         request.expected_blake3 = None;
         let mut operation =
-            IncomingBaoReadOperation::new(peer, local_node, test_realm(), stream_id, request);
+            IncomingBaoReadOperation::new(peer, local_node, test_realm(), stream_id, request)
+                .with_policy_paths(HashSet::from([read_path(local_node)]));
 
         operation.start();
         operation.step(Event::Storage(StorageEvent::ReadResult {
@@ -1055,9 +1071,6 @@ mod tests {
             key: Vec::<u8>::new().into(),
             value: Some(bucket_value()),
         }));
-        operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ));
         operation.step(Event::Storage(StorageEvent::ReadResult {
             key: Vec::<u8>::new().into(),
             value: Some(version_value(hash)),
@@ -1105,7 +1118,8 @@ mod tests {
             test_realm(),
             Ulid::from(9u128),
             read_request(local_node, [4u8; 32]),
-        );
+        )
+        .with_policy_paths(HashSet::from([read_path(local_node)]));
 
         operation.start();
         operation.step(Event::Storage(StorageEvent::ReadResult {
@@ -1116,9 +1130,6 @@ mod tests {
             key: Vec::<u8>::new().into(),
             value: Some(bucket_value()),
         }));
-        operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ));
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: Vec::<u8>::new().into(),
             value: Some(version_value([5u8; 32])),

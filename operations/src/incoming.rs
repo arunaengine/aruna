@@ -1,7 +1,8 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use crate::blob::blob_keyspace_helper::iter_hash_path_index_effect;
 use crate::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, schedule_outbox_drain_effect, write_outbox_effect,
@@ -25,18 +26,22 @@ use crate::replication::incoming_version_replication::{
 };
 use crate::replication::location_summary::LocationSummaryOperation;
 use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
+use crate::request_authorization::{AuthorizeError, authorize};
+use crate::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
+use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::usage_stats::refresh_realm_usage_summary_for_targets;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{
     DocumentSyncEvictedDocument, DocumentSyncReconcileResult, DocumentSyncTarget,
 };
-use aruna_core::effects::BlobEffect;
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::structs::{
-    RealmId, ReplicationItemKind, RoCrateLimits, WatchEvent, WatchEventDetail, WatchEventKind,
-    data_watch_resource_path,
+    AuthContext, HashPathIndexKey, Permission, RealmId, ReplicationItemKind, RoCrateLimits,
+    WatchEvent, WatchEventDetail, WatchEventKind, blob_bucket_permission_path,
+    blob_object_permission_path, data_watch_resource_path,
 };
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
@@ -135,6 +140,154 @@ async fn emit_replication_watch(
         },
     )
     .await;
+}
+
+async fn allow_policy(
+    context: &DriverContext,
+    auth: &AuthContext,
+    path: &str,
+    permission: &Permission,
+    operation: &str,
+) -> Result<bool, String> {
+    match authorize(
+        context,
+        auth.realm_id,
+        auth,
+        path,
+        permission,
+        PolicyRequestExtras::operation(operation),
+    )
+    .await
+    {
+        Ok(()) => Ok(true),
+        Err(AuthorizeError::PermissionDenied)
+        | Err(AuthorizeError::Policy(PolicyEnforcementError::Denied { .. })) => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+async fn writer_policy(
+    context: &DriverContext,
+    local_realm: RealmId,
+    local_node: NodeId,
+    manifest: &VersionReplicationManifest,
+) -> Result<Option<String>, String> {
+    let Some(auth) = manifest.writer_auth_context.as_ref() else {
+        return Ok(None);
+    };
+    if auth.realm_id != local_realm {
+        return Ok(None);
+    }
+    let group_id = match drive(
+        GetBucketInfoOperation::new(manifest.bucket.clone()),
+        context,
+    )
+    .await
+    {
+        Ok(Some(Ok(info))) => info.group_id,
+        Ok(None) | Ok(Some(Err(GetBucketInfoError::NotFound))) => manifest.group_id,
+        Ok(Some(Err(error))) => return Err(error.to_string()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let path = if manifest.key.is_empty() {
+        blob_bucket_permission_path(local_realm, group_id, local_node, &manifest.bucket)
+    } else {
+        blob_object_permission_path(
+            local_realm,
+            group_id,
+            local_node,
+            &manifest.bucket,
+            &manifest.key,
+        )
+    };
+    let operation = if manifest.kind == ReplicationItemKind::DeleteMarker {
+        "s3.DeleteObject"
+    } else {
+        "s3.PutObject"
+    };
+    if allow_policy(context, auth, &path, &Permission::WRITE, operation).await? {
+        Ok(Some(path))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn bao_policy(
+    context: &DriverContext,
+    local_realm: RealmId,
+    local_node: NodeId,
+    request: &crate::replication::protocol::BaoReadRequest,
+) -> Result<HashSet<String>, String> {
+    let mut paths = HashSet::new();
+    if request.realm_id != local_realm || request.auth_context.realm_id != request.realm_id {
+        return Ok(paths);
+    }
+    match &request.target {
+        crate::replication::protocol::BaoReadTarget::ExactVersion(target) => {
+            if target.realm_id != request.realm_id || target.node_id != local_node {
+                return Ok(paths);
+            }
+            let group_id =
+                match drive(GetBucketInfoOperation::new(target.bucket.clone()), context).await {
+                    Ok(Some(Ok(info))) => info.group_id,
+                    Ok(None) | Ok(Some(Err(GetBucketInfoError::NotFound))) => return Ok(paths),
+                    Ok(Some(Err(error))) => return Err(error.to_string()),
+                    Err(error) => return Err(error.to_string()),
+                };
+            let path = blob_object_permission_path(
+                request.realm_id,
+                group_id,
+                local_node,
+                &target.bucket,
+                &target.key,
+            );
+            if allow_policy(
+                context,
+                &request.auth_context,
+                &path,
+                &Permission::READ,
+                "s3.GetObject",
+            )
+            .await?
+            {
+                paths.insert(path);
+            }
+        }
+        crate::replication::protocol::BaoReadTarget::Blake3(hash) => {
+            let effect =
+                iter_hash_path_index_effect(hash, None, None).map_err(|error| error.to_string())?;
+            let Effect::Storage(effect) = effect else {
+                return Err("hash policy lookup emitted a non-storage effect".to_string());
+            };
+            let event = context.storage_handle.send_storage_effect(effect).await;
+            let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+                return Err(format!("hash policy lookup returned {event:?}"));
+            };
+            for (key, _) in values {
+                let candidate = HashPathIndexKey::from_bytes(key.as_ref())
+                    .map_err(|error| error.to_string())?;
+                if candidate.realm_id != request.realm_id
+                    || candidate.node_id != local_node
+                    || candidate.blake3_hash != *hash
+                {
+                    continue;
+                }
+                let path = candidate.permission_path();
+                if allow_policy(
+                    context,
+                    &request.auth_context,
+                    &path,
+                    &Permission::READ,
+                    "s3.GetObject",
+                )
+                .await?
+                {
+                    paths.insert(path);
+                }
+            }
+        }
+    }
+    Ok(paths)
 }
 
 // Coalesces concurrent inbound reconcile triggers: one run in flight, all
@@ -401,6 +554,21 @@ impl InboundEventHandler for OperationsInboundHandler {
                                         } else {
                                             node_routing(self.context.as_ref())
                                         };
+                                        let writer_path = match writer_policy(
+                                            self.context.as_ref(),
+                                            *net_handle.realm_id(),
+                                            net_handle.node_id(),
+                                            &manifest,
+                                        )
+                                        .await
+                                        {
+                                            Ok(path) => path,
+                                            Err(error) => {
+                                                error!(peer = %node_id, stream_id = %stream_id, error = %error, "Refusing inbound replication with unavailable request policy");
+                                                close_failed_bao(&blob_handle, stream_id).await;
+                                                return;
+                                            }
+                                        };
                                         let op = IncomingVersionReplicationOperation::new(
                                             stream_id,
                                             net_handle.node_id(),
@@ -409,7 +577,8 @@ impl InboundEventHandler for OperationsInboundHandler {
                                         )
                                         .with_routing(routing)
                                         .with_rocrate_limits(self.rocrate_limits.clone())
-                                        .with_publisher_node(node_id);
+                                        .with_publisher_node(node_id)
+                                        .with_writer_policy(writer_path);
                                         match drive(op, self.context.as_ref()).await {
                                             Ok(Ok(result)) => {
                                                 emit_replication_watch(
@@ -426,13 +595,29 @@ impl InboundEventHandler for OperationsInboundHandler {
                                         }
                                     }
                                     Ok(VersionReplicationMessage::BaoReadRequest(request)) => {
+                                        let policy_paths = match bao_policy(
+                                            self.context.as_ref(),
+                                            *net_handle.realm_id(),
+                                            net_handle.node_id(),
+                                            &request,
+                                        )
+                                        .await
+                                        {
+                                            Ok(paths) => paths,
+                                            Err(error) => {
+                                                error!(peer = %node_id, stream_id = %stream_id, error = %error, "Refusing inbound bao read with unavailable request policy");
+                                                close_failed_bao(&blob_handle, stream_id).await;
+                                                return;
+                                            }
+                                        };
                                         let op = IncomingBaoReadOperation::new(
                                             node_id,
                                             net_handle.node_id(),
                                             *net_handle.realm_id(),
                                             stream_id,
                                             request,
-                                        );
+                                        )
+                                        .with_policy_paths(policy_paths);
                                         if let Err(error) =
                                             drive(op, self.context.as_ref()).await
                                         {

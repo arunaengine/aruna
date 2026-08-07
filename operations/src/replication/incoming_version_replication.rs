@@ -2,7 +2,6 @@ use crate::blob::blob_keyspace_helper::{
     HeadAliasContext, add_hash_path_index_effect, blob_location_read,
     build_head_transition_effects, write_blob_location_effect, write_blob_version_effect,
 };
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::group_backends::{BackendFenceError, check_fence, fence_backend};
 use crate::group_routing::load_group_inputs;
 use crate::replication::error::ReplicationError;
@@ -27,7 +26,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
-    CurrentVersionPointer, GroupRoutingInputs, MultipartObjectMetadataKey, NodeRouting, Permission,
+    CurrentVersionPointer, GroupRoutingInputs, MultipartObjectMetadataKey, NodeRouting,
     RealmConfigDocument, RealmId, ReclaimCandidate, ReclaimCandidateKey, ReplicationItemKind,
     ReplicationNegotiationResult, ResolvedBackend, RoCrateLimits, RoutingError, StorageRoutingRule,
     UsageDelta, VersionKey, blob_bucket_permission_path, blob_object_permission_path,
@@ -193,6 +192,7 @@ pub struct IncomingVersionReplicationOperation {
     /// Set when the destination backend is over its cap, which only refuses a
     /// negotiation that asks for the bytes.
     destination_full: Option<RoutingError>,
+    writer_policy: Option<String>,
 }
 
 impl IncomingVersionReplicationOperation {
@@ -237,6 +237,7 @@ impl IncomingVersionReplicationOperation {
             rocrate_limits: RoCrateLimits::default(),
             routing: NodeRouting::default(),
             destination_full: None,
+            writer_policy: None,
         }
     }
 
@@ -255,6 +256,11 @@ impl IncomingVersionReplicationOperation {
     /// accountable publisher of every version this stream writes.
     pub fn with_publisher_node(mut self, publisher_node_id: NodeId) -> Self {
         self.publisher_node_id = publisher_node_id;
+        self
+    }
+
+    pub fn with_writer_policy(mut self, path: Option<String>) -> Self {
+        self.writer_policy = path;
         self
     }
 
@@ -536,20 +542,14 @@ impl IncomingVersionReplicationOperation {
     /// the ingress gate, never by the forgeable manifest auth context. The
     /// original writer's context can only narrow, so it stays as a deny check.
     fn check_writer_permission(&mut self, group_id: Ulid) -> Effects {
-        let Some(auth_context) = self.manifest.writer_auth_context.clone() else {
+        if self.manifest.writer_auth_context.is_none() {
             return self.read_existing_version();
-        };
-        self.state = IncomingVersionReplicationState::CheckWriterPermissions;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context,
-                path: self.target_authorization_path(group_id),
-                required_permission: Permission::WRITE,
-            }),
-            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                allowed: result
-            }),
-        ))]
+        }
+        let path = self.target_authorization_path(group_id);
+        match self.writer_policy.as_deref() {
+            Some(allowed) if allowed == path.as_str() => self.read_existing_version(),
+            _ => self.reject_negotiation(IncomingVersionReplicationError::WriterPermissionDenied),
+        }
     }
 
     fn read_existing_version(&mut self) -> Effects {
@@ -2201,7 +2201,7 @@ mod tests {
     use crate::replication::queue::LiveReplicationObligationRecord;
     use aruna_core::UserId;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-    use aruna_core::errors::{AuthorizationError, StorageError};
+    use aruna_core::errors::StorageError;
     use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
@@ -3805,7 +3805,8 @@ mod tests {
             iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
-        );
+        )
+        .with_writer_policy(None);
 
         op.start();
         op.step(Event::Storage(StorageEvent::ReadResult {
@@ -3818,15 +3819,6 @@ mod tests {
             ),
         }));
         let effects = load_routing(&mut op, GroupRoutingInputs::default());
-        assert_eq!(
-            op.state,
-            IncomingVersionReplicationState::CheckWriterPermissions
-        );
-        assert!(matches!(effects[0], Effect::SubOperation(_)));
-
-        let effects = op.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
-        ));
         assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
         expect_rejected_negotiation(
             &effects[0],
@@ -3844,7 +3836,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_authorization_errors() {
+    fn rejects_missing_policy() {
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         manifest.writer_auth_context = Some(manifest.auth_context.clone());
         let mut op = IncomingVersionReplicationOperation::new(
@@ -3864,17 +3856,34 @@ mod tests {
                     .into(),
             ),
         }));
-        load_routing(&mut op, GroupRoutingInputs::default());
-
-        let effects = op.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult {
-                allowed: Err(AuthorizationError::AuthDocNotFound),
-            },
-        ));
+        let effects = load_routing(&mut op, GroupRoutingInputs::default());
         assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
         expect_rejected_negotiation(
             &effects[0],
-            AuthorizationError::AuthDocNotFound.to_string().as_str(),
+            IncomingVersionReplicationError::WriterPermissionDenied
+                .to_string()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn allows_writer_policy() {
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.writer_auth_context = Some(manifest.auth_context.clone());
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest,
+        );
+        let group_id = Ulid::generate();
+        let path = op.target_authorization_path(group_id);
+        op = op.with_writer_policy(Some(path));
+
+        let _effects = advance_to_version_lookup(&mut op, group_id);
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::ReadExistingVersion
         );
     }
 
