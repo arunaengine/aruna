@@ -28,6 +28,9 @@ pub enum CreateUserAccessState {
     ReadCredentials {
         index: std::collections::BTreeSet<String>,
     },
+    DeleteStale {
+        index: std::collections::BTreeSet<String>,
+    },
     WriteCredentials,
     CommitTransaction,
     Finish,
@@ -231,6 +234,7 @@ impl CreateUserAccessOperation {
         };
         let now = SystemTime::now();
         let mut active = std::collections::BTreeSet::new();
+        let mut stale = Vec::new();
         for (key, value) in values {
             if key.as_ref() == new_access.access_key.as_bytes() {
                 if value.is_some() {
@@ -253,6 +257,8 @@ impl CreateUserAccessOperation {
             }
             if !access.is_revoked() && !access.is_expired(now) {
                 active.insert(access.access_key);
+            } else {
+                stale.push(access.access_key);
             }
         }
         if active.len() >= MAX_ACTIVE_CREDENTIALS {
@@ -262,7 +268,40 @@ impl CreateUserAccessOperation {
             return self.handle_error(CreateUserAccessError::IndexInconsistent);
         }
         active.insert(new_access.access_key.clone());
+        if !stale.is_empty() {
+            let Some(txn_id) = self.txn_id else {
+                return self.handle_error(CreateUserAccessError::CreateUserAccessFailed);
+            };
+            self.state = CreateUserAccessState::DeleteStale { index: active };
+            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                deletes: stale
+                    .into_iter()
+                    .map(|access_key| {
+                        (
+                            USER_ACCESS_KEYSPACE.to_string(),
+                            access_key.as_bytes().into(),
+                        )
+                    })
+                    .collect(),
+                txn_id: Some(txn_id),
+            })];
+        }
         self.write_credentials(active)
+    }
+
+    fn handle_stale_deleted(
+        &mut self,
+        event: Event,
+        index: std::collections::BTreeSet<String>,
+    ) -> Effects {
+        let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
+            return self.handle_error(CreateUserAccessError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
+                received: event,
+            });
+        };
+        self.write_credentials(index)
     }
 
     fn write_credentials(&mut self, index: std::collections::BTreeSet<String>) -> Effects {
@@ -364,6 +403,9 @@ impl Operation for CreateUserAccessOperation {
             CreateUserAccessState::ReadOwnerIndex => self.handle_index(event),
             CreateUserAccessState::ReadCredentials { ref index } => {
                 self.handle_credentials(event, index.clone())
+            }
+            CreateUserAccessState::DeleteStale { ref index } => {
+                self.handle_stale_deleted(event, index.clone())
             }
             CreateUserAccessState::WriteCredentials => self.handle_written(event),
             CreateUserAccessState::CommitTransaction => self.handle_committed(event),
@@ -498,6 +540,59 @@ mod tests {
             returned_access.open_secret(&test_seal_key()).unwrap(),
             plaintext.expose()
         );
+    }
+
+    #[test]
+    fn deletes_stale() {
+        let user_identity = make_user_identity();
+        let stale_key = "stalekey".to_string();
+        let mut op = CreateUserAccessOperation::new_with_key(
+            make_config(user_identity, Ulid::generate()),
+            "newkey".to_string(),
+            test_seal_key(),
+        );
+        op.start();
+        let txn_id = Ulid::generate();
+        op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: owner_key(user_identity),
+            value: Some(
+                encode_index(&std::collections::BTreeSet::from([stale_key.clone()])).unwrap(),
+            ),
+        }));
+        let stale = UserAccess {
+            access_key: stale_key.clone(),
+            user_identity,
+            group_id: Ulid::generate(),
+            secret: SealedS3Secret::empty(),
+            expiry: SystemTime::UNIX_EPOCH,
+            path_restrictions: None,
+            issued_by: test_issuer(),
+            revoked_at: None,
+        };
+        let new_key = op.access.as_ref().unwrap().access_key.clone();
+        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    stale_key.clone().into(),
+                    Some(stale.to_bytes().unwrap().into()),
+                ),
+                (new_key.into(), None),
+            ],
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id: Some(id) })]
+                if *id == txn_id && deletes.len() == 1
+        ));
+        let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchWrite { txn_id: Some(id), .. })]
+                if *id == txn_id
+        ));
     }
 
     #[test]
