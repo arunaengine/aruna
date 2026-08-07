@@ -585,7 +585,7 @@ pub async fn run_sync(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<SyncRunResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
     let id = parse_id(&id)?;
     let mut relationship =
         get_relationship(&state, id, SyncRelationshipDirection::Outgoing).await?;
@@ -782,7 +782,7 @@ async fn create_mirror(
             .bucket()
             .ok_or(ServerError::BadRequest)?;
         let bucket_info = load_bucket(state, bucket).await?;
-        ensure_permission(
+        ensure_permission_with(
             state,
             auth,
             blob_bucket_permission_path(
@@ -792,6 +792,7 @@ async fn create_mirror(
                 bucket,
             ),
             Permission::WRITE,
+            PolicyRequestExtras::operation("s3.PutBucketReplication"),
         )
         .await?;
         return store_relationship(state, relationship, SyncRelationshipDirection::Incoming)
@@ -807,7 +808,7 @@ async fn create_mirror(
         auth_token,
         source_group_id,
         relationship,
-        PolicyRequestExtras::rest(),
+        PolicyRequestExtras::operation("s3.PutBucketReplication"),
     )
     .await
     .map_err(map_mirror_error)
@@ -1312,6 +1313,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_restricted_run() {
+        for restrictions in [
+            Some(vec![PathRestriction {
+                pattern: "/restricted/**".to_string(),
+                permission: Permission::READ,
+            }]),
+            Some(Vec::new()),
+        ] {
+            let (_storage_dir, state, mut auth, relationship) = test_state().await;
+            auth.path_restrictions = restrictions;
+            let error = run_sync(
+                State(state),
+                Extension(Some(auth)),
+                Path(relationship.id.to_string()),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(error, ServerError::Forbidden));
+        }
+    }
+
+    #[tokio::test]
     async fn rejects_restricted_create() {
         for restrictions in [
             Some(vec![PathRestriction {
@@ -1348,6 +1371,53 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(status, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn mirror_policy_denies_create() {
+        let (_storage_dir, state, auth, _) = test_state().await;
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: auth.user_id,
+            realm_id: auth.realm_id,
+        };
+        let mut group_auth = GroupAuthorizationDocument::new_default_group_doc(
+            auth.user_id,
+            auth.realm_id,
+            test_group(),
+        );
+        group_auth
+            .policies
+            .push(aruna_core::request_policy::RequestPolicy {
+                policy_id: Ulid::generate(),
+                name: "deny-sync-create".to_string(),
+                kind: aruna_core::request_policy::PolicyKind::Deny,
+                when: None,
+                expression: "operation == 's3.PutBucketReplication'".to_string(),
+                enabled: true,
+            });
+        state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: AUTH_KEYSPACE.to_string(),
+                key: test_group().to_bytes().to_vec().into(),
+                value: group_auth.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+
+        let error = create_sync(
+            State(state),
+            Extension(Some(auth)),
+            Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+                "sync-test-token",
+            ))),
+            Json(create_request(test_node(3))),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ServerError::Forbidden));
     }
 
     #[tokio::test]

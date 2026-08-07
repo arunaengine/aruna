@@ -187,6 +187,7 @@ pub async fn read_outbox_record(
 pub struct OutboxReadBatch {
     pub records: Vec<(Vec<u8>, DocumentSyncOutboxRecord)>,
     pub has_more: bool,
+    pub next_start_after: Option<Vec<u8>>,
 }
 
 pub async fn read_outbox_records(
@@ -208,8 +209,10 @@ pub async fn read_outbox_records(
     {
         Event::Storage(StorageEvent::IterResult { values, .. }) => {
             let has_more = values.len() > limit;
-            let mut records = Vec::with_capacity(values.len().min(limit));
-            for (key, value) in values.into_iter().take(limit) {
+            let page: Vec<_> = values.into_iter().take(limit).collect();
+            let next_start_after = page.last().map(|(key, _)| key.to_vec());
+            let mut records = Vec::with_capacity(page.len());
+            for (key, value) in page {
                 match postcard::from_bytes::<DocumentSyncOutboxRecord>(&value) {
                     Ok(record) => records.push((key.to_vec(), record)),
                     Err(error) => {
@@ -219,7 +222,11 @@ pub async fn read_outbox_records(
                     }
                 }
             }
-            Ok(OutboxReadBatch { records, has_more })
+            Ok(OutboxReadBatch {
+                records,
+                has_more,
+                next_start_after,
+            })
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected storage event: {other:?}")),
@@ -493,6 +500,7 @@ mod tests {
 
         assert!(batch.records.is_empty());
         assert!(!batch.has_more);
+        assert_eq!(batch.next_start_after, Some(corrupt_key.clone()));
         assert_eq!(
             read_outbox_record(&storage, &corrupt_key)
                 .await
@@ -527,11 +535,18 @@ mod tests {
             other => panic!("unexpected valid outbox write event: {other:?}"),
         }
 
-        let batch = read_outbox_records(&storage, &[], None, OUTBOX_DRAIN_BATCH_SIZE)
+        let batch = read_outbox_records(&storage, &[], None, 1)
             .await
             .expect("outbox read succeeds");
 
-        assert_eq!(batch.records, vec![(outbox_key(&valid).to_vec(), valid)]);
+        assert!(batch.records.is_empty());
+        assert!(batch.has_more);
+        assert_eq!(batch.next_start_after, Some(corrupt_key.clone()));
+        let next = read_outbox_records(&storage, batch.next_start_after, 1)
+            .await
+            .expect("outbox read after malformed page succeeds");
+        assert_eq!(next.records, vec![(outbox_key(&valid).to_vec(), valid)]);
+        assert!(!next.has_more);
         assert_eq!(
             read_outbox_record(&storage, &corrupt_key)
                 .await

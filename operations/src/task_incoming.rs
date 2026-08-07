@@ -638,12 +638,15 @@ impl OperationsTaskHandler {
                 }
             };
             scan_elapsed += scan_started.elapsed();
+            let has_more = batch.has_more;
+            start_after = batch.next_start_after;
             if batch.records.is_empty() {
+                if has_more && start_after.is_some() {
+                    continue;
+                }
                 break;
             }
             pages += 1;
-            let has_more = batch.has_more;
-            start_after = batch.records.last().map(|(key, _)| key.clone());
             record_count += batch.records.len();
             if let Some(page_oldest) = batch
                 .records
