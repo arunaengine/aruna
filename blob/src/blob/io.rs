@@ -789,15 +789,47 @@ impl BlobHandler {
             blob_size: 0,
             hashes: HashMap::new(),
         };
+        let Some(mut reservation) = self.hold_reservation(location.ulid) else {
+            return BlobEvent::Error(BlobError::WriteError(
+                "too many active blob reservations".to_string(),
+            ));
+        };
+        if let Err(error) = self.finalize_reservation(&location).await {
+            return BlobEvent::Error(error);
+        }
         let operator =
             match self
                 .registry
                 .bucket_operator(&resolved.backend, &multipart_bucket, &self.egress)
             {
                 Ok(op) => op,
-                Err(err) => return BlobEvent::Error(err),
+                Err(err) => {
+                    _ = self.release_reservation(&location).await;
+                    return BlobEvent::Error(err);
+                }
             };
-        Box::pin(self.write_stream_to_location(location, operator, blob)).await
+        let result =
+            Box::pin(self.write_stream_to_location(location.clone(), operator, blob)).await;
+        match result {
+            BlobEvent::WriteFinished { location } => {
+                reservation.retain();
+                BlobEvent::WriteFinished { location }
+            }
+            BlobEvent::Error(BlobError::WriteCleanup { location, message }) => {
+                reservation.retain();
+                BlobEvent::Error(BlobError::WriteCleanup { location, message })
+            }
+            other => match self.release_reservation(&location).await {
+                Ok(()) => other,
+                Err(cleanup) => {
+                    reservation.retain();
+                    BlobEvent::Error(BlobError::WriteCleanup {
+                        location,
+                        message: format!("{other:?}; {cleanup}"),
+                    })
+                }
+            },
+        }
     }
 
     pub async fn compose_blob(
