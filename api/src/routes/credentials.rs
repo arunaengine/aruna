@@ -249,7 +249,8 @@ pub async fn list_s3_credentials(
         (status = 201, description = "Credentials created", body = CreateS3CredentialsResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 409, description = "Credential limit reached", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
