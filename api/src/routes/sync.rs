@@ -1429,7 +1429,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mirror_policy_denies_create() {
+    async fn mirror_denies_create() {
         let (_storage_dir, state, auth, _) = test_state().await;
         let actor = Actor {
             node_id: state.get_node_id(),
