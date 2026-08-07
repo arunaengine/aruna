@@ -53,6 +53,7 @@ use tokio::time::{sleep, timeout, timeout_at};
 use tracing::{Instrument, Span, debug, debug_span, field, warn};
 use ulid::Ulid;
 
+use super::materialization_queue::metadata_graph_fence;
 use super::protocol::{
     MetadataAuthToken, MetadataReadError, MetadataTransportMessage, encode_message, frame_class,
     read_message, read_message_budget, read_message_cap, response_cap, write_encoded_message,
@@ -993,6 +994,22 @@ impl MetadataHandle {
     async fn send_metadata_effect_inner(&self, effect: MetadataEffect) -> Event {
         let effect_name = metadata_effect_kind(&effect);
         let graph_iri = effect_graph_iri(&effect);
+        let _graph_fence = match graph_iri.as_deref() {
+            Some(graph_iri) if metadata_effect_mutates_graph(&effect) => {
+                match metadata_graph_fence(graph_iri).acquire().await {
+                    Ok(permit) => Some(permit),
+                    Err(error) => {
+                        return Event::Metadata(MetadataEvent::Error {
+                            graph_iri: Some(graph_iri.to_string()),
+                            error: MetadataError::Backend(format!(
+                                "metadata graph fence unavailable: {error}"
+                            )),
+                        });
+                    }
+                }
+            }
+            _ => None,
+        };
         if let MetadataEffect::DeleteGraph { graph_iri } = &effect {
             self.inner
                 .visibility_cache
@@ -1141,9 +1158,8 @@ impl MetadataHandle {
                 };
                 record_elapsed_ms(&span, "elapsed_ms", started);
                 span.record("result", metadata_event_kind(&metadata_event));
-                // WAL-replayed applies skip the lifecycle read and never touch
-                // the visibility generation, so cached results are only
-                // invalidated by this counter.
+                // Successful mutations invalidate query results through this
+                // counter; lifecycle cache changes use their own generation.
                 if mutates_graph && !matches!(metadata_event, MetadataEvent::Error { .. }) {
                     self.inner.query_cache.bump_apply();
                 }
@@ -1171,6 +1187,12 @@ impl MetadataHandle {
     }
 
     pub async fn prune_graph_if_deleted(&self, graph_iri: String) -> Result<bool, MetadataError> {
+        let _graph_fence = metadata_graph_fence(&graph_iri)
+            .acquire()
+            .await
+            .map_err(|error| {
+                MetadataError::Backend(format!("metadata graph fence unavailable: {error}"))
+            })?;
         if !graph_lifecycle_deleted(self.lifecycle_storage(), &graph_iri).await? {
             return Ok(false);
         }
@@ -3537,16 +3559,6 @@ fn metadata_effect_defers_persist(effect: &MetadataEffect) -> bool {
 fn metadata_effect_skips_lifecycle_read(effect: &MetadataEffect) -> bool {
     match effect {
         MetadataEffect::ValidateCreateCrate { .. } | MetadataEffect::ValidateRoCrate { .. } => true,
-        MetadataEffect::CreateCrate { request } => {
-            request.durability == MetadataRequestDurability::WalAlreadyDurable
-        }
-        MetadataEffect::ApplyRoCrate { request } => {
-            request.durability == MetadataRequestDurability::WalAlreadyDurable
-        }
-        MetadataEffect::UpsertDataEntity { request }
-        | MetadataEffect::UpsertContextualEntity { request } => {
-            request.durability == MetadataRequestDurability::WalAlreadyDurable
-        }
         _ => false,
     }
 }
@@ -6825,6 +6837,87 @@ mod tests {
             .flush_persistence()
             .await
             .expect("metadata persistence flushes");
+    }
+
+    #[tokio::test]
+    async fn tombstone_blocks_apply() {
+        let (_storage_dir, storage) = auth_storage();
+        let metadata_dir = tempdir().expect("metadata dir");
+        let metadata_handle = MetadataHandle::new_with_options(
+            metadata_dir.path(),
+            node_id_from_seed(3),
+            storage.clone(),
+            None,
+            None,
+            None,
+            MetadataHandleOptions::default().with_search_storage(MetadataSearchStorage::Memory),
+        )
+        .expect("metadata handle opens");
+        let record = registry_record("datasets/fenced");
+        let held = metadata_graph_fence(&record.graph_iri)
+            .acquire()
+            .await
+            .expect("graph fence remains open");
+        let graph_iri = record.graph_iri.clone();
+        let task_handle = metadata_handle.clone();
+        let task = tokio::spawn(async move {
+            task_handle
+                .send_metadata_effect(MetadataEffect::CreateCrate {
+                    request: MetadataCreateCrateRequest {
+                        graph_iri,
+                        name: "fenced".to_string(),
+                        description: "fenced".to_string(),
+                        date_published: "2026-01-01".to_string(),
+                        license: None,
+                        policy: MetadataGraphPolicy {
+                            public: true,
+                            permission_paths: Vec::new(),
+                        },
+                        durability: MetadataRequestDurability::WalAlreadyDurable,
+                        deterministic_actor: None,
+                    },
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let tombstone = MetadataGraphLifecycleRecord::deleted(
+            record.graph_iri.clone(),
+            record.realm_id,
+            record.group_id,
+            record.document_id,
+            2,
+        );
+        let bytes = postcard::to_allocvec(&tombstone).expect("tombstone serializes");
+        match storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+                key: metadata_graph_lifecycle_key(&record.graph_iri),
+                value: ByteView::from(bytes),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected lifecycle write result: {other:?}"),
+        }
+        drop(held);
+
+        let event = task.await.expect("materialization task joins");
+        assert!(matches!(
+            event,
+            Event::Metadata(MetadataEvent::Error {
+                error: MetadataError::InvalidInput(message),
+                ..
+            }) if message.contains("deleted")
+        ));
+        assert!(
+            !metadata_handle
+                .inner
+                .node
+                .contains_graph(&GraphId::new(&record.graph_iri))
+                .expect("graph probe succeeds")
+        );
     }
 
     #[tokio::test]

@@ -1,9 +1,7 @@
 use aruna_core::NodeId;
-use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncOutboxRecord,
-    DocumentSyncRevision, DocumentSyncTarget,
-};
+use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::metadata::{
@@ -11,7 +9,9 @@ use aruna_core::metadata::{
     MetadataEvent, MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord,
 };
 use aruna_core::operation::Operation;
-use aruna_core::storage_entries::metadata_document_lifecycle_revision_change;
+use aruna_core::storage_entries::{
+    graph_revision_change, metadata_document_lifecycle_revision_change,
+};
 use aruna_core::structs::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord, PlacementRef,
     RealmConfigDocument,
@@ -21,6 +21,7 @@ use aruna_core::types::Effects;
 use aruna_core::util::unix_timestamp_millis;
 use byteview::ByteView;
 use smallvec::smallvec;
+use std::time::Duration;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -127,6 +128,10 @@ impl DeleteMetadataDocumentOperation {
         }
     }
 
+    fn fresh_copy(&self) -> Self {
+        Self::new(self.actor.clone(), self.group_id, self.document_id)
+    }
+
     /// Live holders of the document's bucket; the event-time stamp on the
     /// record is only the fallback for a realm without a readable config.
     fn peers(&self, record: &MetadataRegistryRecord) -> Vec<NodeId> {
@@ -231,17 +236,12 @@ impl DeleteMetadataDocumentOperation {
         let bytes = postcard::to_allocvec(lifecycle_record)
             .map_err(|error| DeleteMetadataDocumentError::ConversionError(error.into()))?;
         let outbox_id = Ulid::generate();
-        let change = DocumentSyncChange {
-            base: None,
-            current: DocumentSyncRevision {
-                generation: lifecycle_record.updated_at_ms,
-                event_id: outbox_id,
-                actor: self.actor.node_id,
-                updated_at_ms: lifecycle_record.updated_at_ms,
-            },
-            kind: DocumentSyncChangeKind::Upsert,
-            placement: self.graph_lifecycle_placement_ref,
-        };
+        let change = graph_revision_change(
+            lifecycle_record,
+            outbox_id,
+            self.actor.node_id,
+            self.graph_lifecycle_placement_ref,
+        );
         let outbox = new_outbox_record_with_id(
             outbox_id,
             self.actor.node_id,
@@ -320,12 +320,34 @@ impl DeleteMetadataDocumentOperation {
     }
 }
 
+const DELETE_CONFLICT_RETRIES: usize = 3;
+
+fn delete_retry_backoff(attempt: usize, document_id: Ulid) -> Duration {
+    let base = crate::queue_backoff::retry_after_ms(attempt as u32, 25, 250);
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&document_id.to_bytes()[..8]);
+    let jitter = u64::from_le_bytes(head) % base;
+    Duration::from_millis(base.saturating_add(jitter))
+}
+
 pub async fn delete_metadata_document(
     operation: DeleteMetadataDocumentOperation,
     context: &DriverContext,
     document_id: Ulid,
 ) -> Result<(), DeleteMetadataDocumentError> {
-    drive(operation, context).await?;
+    let mut attempt = 0usize;
+    loop {
+        match drive(operation.fresh_copy(), context).await {
+            Ok(()) => break,
+            Err(DeleteMetadataDocumentError::StorageError(StorageError::TransactionConflict))
+                if attempt < DELETE_CONFLICT_RETRIES =>
+            {
+                tokio::time::sleep(delete_retry_backoff(attempt, document_id)).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
     if let Some(metadata_handle) = context.metadata_handle.as_ref() {
         metadata_handle.remove_cached_registry_record(document_id);
     }

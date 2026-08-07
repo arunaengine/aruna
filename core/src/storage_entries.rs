@@ -454,6 +454,28 @@ pub fn metadata_document_lifecycle_revision_change(
     }
 }
 
+/// Build the revision carried by a graph lifecycle outbox event. Graph
+/// lifecycle records do not own an event id, so the sync event id is supplied
+/// by the outbox publisher and becomes the deterministic tie-breaker.
+pub fn graph_revision_change(
+    record: &MetadataGraphLifecycleRecord,
+    event_id: Ulid,
+    actor: NodeId,
+    placement: PlacementRef,
+) -> DocumentSyncChange {
+    DocumentSyncChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: record.updated_at_ms,
+            event_id,
+            actor,
+            updated_at_ms: record.updated_at_ms,
+        },
+        kind: DocumentSyncChangeKind::Upsert,
+        placement,
+    }
+}
+
 pub fn metadata_document_lifecycle_revision_write_entry(
     record: &MetadataDocumentLifecycleRecord,
     delete_actor: NodeId,
@@ -758,7 +780,7 @@ mod tests {
         admin_document_reducer_conflict_prefix, admin_document_reducer_state_key,
         admin_document_reducer_state_write_entry, document_sync_conflict_key,
         document_sync_conflict_write_entry, document_sync_revision_key,
-        document_sync_revision_write_entry, metadata_iri_reference_key,
+        document_sync_revision_write_entry, graph_revision_change, metadata_iri_reference_key,
         metadata_iri_reference_prefix, metadata_iri_reference_write_entry, shard_manifest_key,
         shard_manifest_prefix, shard_manifest_write_entry,
         stale_admin_document_conflict_delete_entries,
@@ -778,7 +800,7 @@ mod tests {
         DOCUMENT_SYNC_CONFLICT_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,
         METADATA_IRI_REFERENCE_INDEX_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
     };
-    use crate::metadata::MetadataIriReferenceIndexRecord;
+    use crate::metadata::{MetadataGraphLifecycleRecord, MetadataIriReferenceIndexRecord};
     use crate::structs::{PlacementRef, RealmId};
     use crate::{NodeId, UserId};
 
@@ -971,6 +993,38 @@ mod tests {
         assert_eq!(keyspace, DOCUMENT_SYNC_REVISION_KEYSPACE);
         assert_eq!(key, document_sync_revision_key(&target));
         assert_eq!(decoded, change);
+    }
+
+    #[test]
+    fn graph_revision_order() {
+        let graph_iri = "urn:graph:revision".to_string();
+        let target = DocumentSyncTarget::MetadataGraphLifecycle {
+            graph_iri: graph_iri.clone(),
+        };
+        let record = MetadataGraphLifecycleRecord::deleted(
+            graph_iri,
+            realm_id(2),
+            Ulid::from_bytes([3; 16]),
+            Ulid::from_bytes([4; 16]),
+            7,
+        );
+        let placement = shard_placement(3);
+        let older = graph_revision_change(&record, Ulid::from_bytes([5; 16]), node(5), placement);
+        let newer = graph_revision_change(&record, Ulid::from_bytes([6; 16]), node(6), placement);
+
+        assert!(older.current < newer.current);
+        let (keyspace, key, value) = document_sync_revision_write_entry(&target, &newer).unwrap();
+        let decoded: DocumentSyncChange = postcard::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(keyspace, DOCUMENT_SYNC_REVISION_KEYSPACE);
+        assert_eq!(key, document_sync_revision_key(&target));
+        assert_eq!(decoded, newer);
+
+        let (_, manifest_key, manifest_value) = shard_manifest_write_entry(&target, &newer)
+            .unwrap()
+            .unwrap();
+        let manifest: ShardManifestEntry = postcard::from_bytes(manifest_value.as_ref()).unwrap();
+        assert_eq!(manifest_key, shard_manifest_key(&placement, &target));
+        assert_eq!(manifest.revision, newer.current);
     }
 
     fn shard_placement(shard: u32) -> PlacementRef {

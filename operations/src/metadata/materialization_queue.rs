@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
@@ -35,6 +36,7 @@ use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 use ulid::Ulid;
@@ -63,6 +65,20 @@ const DEAD_LETTER_REQUEUE_PAGE_SIZE: usize = 256;
 // Jobs per finish transaction. Small enough that a failed commit costs little,
 // large enough that a full batch commits in a handful of transactions.
 const MATERIALIZATION_FINISH_CHUNK: usize = 256;
+const METADATA_GRAPH_FENCE_SHARDS: usize = 32;
+
+// Craqle already serializes same-graph writes internally. This bounded fence
+// extends that ordering over the lifecycle read performed by the Aruna handle.
+static METADATA_GRAPH_FENCES: LazyLock<[Semaphore; METADATA_GRAPH_FENCE_SHARDS]> =
+    LazyLock::new(|| std::array::from_fn(|_| Semaphore::new(1)));
+
+pub(crate) fn metadata_graph_fence(graph_iri: &str) -> &'static Semaphore {
+    let hash = blake3::hash(graph_iri.as_bytes());
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&hash.as_bytes()[..8]);
+    let shard = u64::from_be_bytes(prefix) as usize;
+    &METADATA_GRAPH_FENCES[shard % METADATA_GRAPH_FENCE_SHARDS]
+}
 
 pub const METADATA_MATERIALIZATION_POLL_AFTER: Duration = Duration::from_secs(5);
 pub const METADATA_MATERIALIZATION_RETRY_AFTER: Duration = Duration::from_secs(1);
@@ -2360,6 +2376,34 @@ mod tests {
     use std::collections::BTreeSet;
     use std::thread;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn delete_waits_fence() {
+        let graph_iri = "urn:test:graph-fence";
+        let held = metadata_graph_fence(graph_iri)
+            .acquire()
+            .await
+            .expect("graph fence remains open");
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = ready_tx.send(());
+            let _permit = metadata_graph_fence(graph_iri)
+                .acquire()
+                .await
+                .expect("graph fence remains open");
+            let _ = done_tx.send(());
+        });
+
+        ready_rx.await.expect("delete task started");
+        assert!(matches!(
+            done_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        drop(held);
+        done_rx.await.expect("delete task completed");
+        task.await.expect("delete task joined");
+    }
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
