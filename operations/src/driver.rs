@@ -604,16 +604,6 @@ impl TransactionTracker {
             && self.states.len() >= MAX_TRACKED_TRANSACTIONS
     }
 
-    fn begin(&mut self, effect: Option<TransactionEffect>) {
-        if let Some(TransactionEffect::Commit(txn_id)) = effect
-            && self.states.contains_key(&txn_id)
-        {
-            // Once a commit request is handed to storage, cancellation must not
-            // turn its unknown outcome into an abort.
-            self.states.insert(txn_id, TransactionState::CommitUnknown);
-        }
-    }
-
     fn observe(&mut self, effect: Option<TransactionEffect>, event: &Event) {
         match (effect, event) {
             (
@@ -687,9 +677,8 @@ impl TransactionTracker {
     fn pending(&self) -> Vec<(TxnId, TransactionState)> {
         self.states
             .iter()
-            .filter_map(|(txn_id, state)| match state {
-                TransactionState::CommitUnknown => None,
-                state => Some((*txn_id, *state)),
+            .filter_map(|(txn_id, state)| {
+                (!self.blocked_abort(*txn_id)).then_some((*txn_id, *state))
             })
             .collect()
     }
@@ -698,7 +687,20 @@ impl TransactionTracker {
         matches!(
             self.states.get(&txn_id),
             Some(TransactionState::CommitUnknown)
-        )
+        ) || self
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.commit_unknown(txn_id))
+    }
+
+    fn commit_timeout(&mut self, txn_id: TxnId) {
+        let storage_unknown = self
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.commit_unknown(txn_id));
+        if self.states.contains_key(&txn_id) && !storage_unknown {
+            self.states.insert(txn_id, TransactionState::Open);
+        }
     }
 
     fn retain(&self, txn_id: TxnId, state: TransactionState) {
@@ -813,8 +815,8 @@ fn drive_suboperation<'a>(
                         }
                         continue;
                     }
-                    tracker.begin(transaction);
                     hold_backends(context, &effect, &mut holds);
+                    let commit = matches!(transaction, Some(TransactionEffect::Commit(_)));
                     let event = if tracker.reject_start(transaction) {
                         warn!("Transaction tracker capacity reached");
                         Event::Storage(StorageEvent::Error {
@@ -835,7 +837,6 @@ fn drive_suboperation<'a>(
                         };
                         event
                     } else if let Some(deadline) = deadline {
-                        let commit = matches!(transaction, Some(TransactionEffect::Commit(_)));
                         let managed = managed_effect(&effect);
                         let dispatch = Box::pin(dispatch_effect_until(
                             effect,
@@ -878,6 +879,9 @@ fn drive_suboperation<'a>(
                         dispatch_effect(effect, context, depth).await
                     };
                     tracker.observe(transaction, &event);
+                    if commit && let Some(TransactionEffect::Commit(txn_id)) = transaction {
+                        tracker.commit_timeout(txn_id);
+                    }
                     committed |= commit_done(transaction, &event);
                     if !operation.is_complete() {
                         queue.extend(operation.step(event).into_iter().filter(|effect| {
@@ -965,8 +969,8 @@ pub async fn drive_until<O: Operation>(
                 }
                 continue;
             }
-            tracker.begin(transaction);
             hold_backends(context, &effect, &mut holds);
+            let commit = matches!(transaction, Some(TransactionEffect::Commit(_)));
             let event = if tracker.reject_start(transaction) {
                 warn!("Transaction tracker capacity reached");
                 Event::Storage(StorageEvent::Error {
@@ -985,7 +989,6 @@ pub async fn drive_until<O: Operation>(
                 };
                 event
             } else {
-                let commit = matches!(transaction, Some(TransactionEffect::Commit(_)));
                 let managed = managed_effect(&effect);
                 // The blob adapter owns the writer abort at its deadline.
                 let dispatch = Box::pin(dispatch_effect_until(effect, context, 0, Some(deadline)));
@@ -1024,6 +1027,9 @@ pub async fn drive_until<O: Operation>(
                 }
             };
             tracker.observe(transaction, &event);
+            if commit && let Some(TransactionEffect::Commit(txn_id)) = transaction {
+                tracker.commit_timeout(txn_id);
+            }
             committed |= commit_done(transaction, &event);
             if !operation.is_complete() {
                 queue.extend(operation.step(event).into_iter().filter(|effect| {
@@ -1092,7 +1098,6 @@ pub async fn drive<O: Operation>(
                 warn!(%txn_id, "Skipping abort after an unknown commit outcome");
                 continue;
             }
-            tracker.begin(transaction);
             hold_backends(context, &effect, &mut holds);
             let event = if tracker.reject_start(transaction) {
                 warn!("Transaction tracker capacity reached");
@@ -1739,6 +1744,26 @@ mod test {
             Some(&TransactionState::CommitUnknown)
         );
         assert!(tracker.pending().is_empty());
+    }
+
+    #[test]
+    fn unpolled_commit_open() {
+        let (handle, _receivers) = storage::StorageHandle::new();
+        let id = ulid::Ulid::generate();
+        let mut tracker = TransactionTracker::new(handle.clone());
+        tracker.observe(
+            Some(TransactionEffect::Start),
+            &Event::Storage(StorageEvent::TransactionStarted { txn_id: id }),
+        );
+        tracker.observe(
+            Some(TransactionEffect::Commit(id)),
+            &Event::Storage(StorageEvent::Error {
+                error: StorageError::CommitFailed,
+            }),
+        );
+        tracker.commit_timeout(id);
+        assert_eq!(tracker.states.get(&id), Some(&TransactionState::Open));
+        assert!(!handle.commit_unknown(id));
     }
 
     #[test]
