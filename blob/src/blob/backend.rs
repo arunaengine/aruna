@@ -5,10 +5,12 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{BLOB_HIDDEN_RESERVATION_KEYSPACE, BUCKET_STATS_DB};
+use aruna_core::keyspaces::{
+    BLOB_CLEANUP_KEYSPACE, BLOB_HIDDEN_RESERVATION_KEYSPACE, BUCKET_STATS_DB,
+};
 use aruna_core::structs::{
-    Backend, BackendBucket, BackendLocation, BackendRef, HIDDEN_BLOB_PREFIX, HiddenBlobKey,
-    MULTIPART_PART_PREFIX, ensure_confined_relative_path,
+    Backend, BackendBucket, BackendLocation, BackendRef, BlobCleanupWork, HIDDEN_BLOB_PREFIX,
+    HiddenBlobKey, MULTIPART_PART_PREFIX, ensure_confined_relative_path,
 };
 use aruna_core::types::TxnId;
 use aruna_storage::storage::TransactionOwner;
@@ -25,12 +27,44 @@ const BUCKET_STATS_BACKOFF_CAP: Duration = Duration::from_millis(50);
 // A fresh bucket is private to the reserving writer, so a second round only
 // happens when another writer filled the bucket we picked.
 const BUCKET_RESERVE_ROUNDS: usize = 8;
+const ACTIVE_RESERVATION_LIMIT: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LoadUpdate {
     Applied,
     Conflict,
     Full,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReleaseUpdate {
+    Applied,
+    Missing,
+    Conflict,
+    Unknown,
+}
+
+#[derive(Debug)]
+pub(super) struct ReservationGuard {
+    active: Arc<StdMutex<std::collections::HashSet<Ulid>>>,
+    id: Ulid,
+    remove_on_drop: bool,
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            if let Ok(mut active) = self.active.lock() {
+                active.remove(&self.id);
+            }
+        }
+    }
+}
+
+impl ReservationGuard {
+    pub(super) fn retain(&mut self) {
+        self.remove_on_drop = false;
+    }
 }
 
 // Ulid randomness spreads retry storms without pulling in an rng dependency.
@@ -47,6 +81,19 @@ fn reservation_key(key: &HiddenBlobKey) -> Result<ByteView, BlobError> {
     postcard::to_allocvec(key)
         .map(ByteView::from)
         .map_err(|error| BlobError::ConversionError(error.into()))
+}
+
+pub(super) fn intent_key(location: &BackendLocation) -> ByteView {
+    ByteView::from(location.ulid.to_bytes().to_vec())
+}
+
+pub(super) fn intent_value(location: &BackendLocation) -> Result<ByteView, BlobError> {
+    BlobCleanupWork::ReconcileReservation {
+        location: location.clone(),
+    }
+    .to_bytes()
+    .map(ByteView::from)
+    .map_err(BlobError::ConversionError)
 }
 
 impl BlobHandler {
@@ -117,28 +164,36 @@ impl BlobHandler {
         Ok(bucket_name)
     }
 
-    // Reserves one slot before any bytes exist, so a stats failure cannot orphan
-    // a written object and concurrent writers cannot overshoot max_bucket_size.
-    pub(super) async fn reserve_bucket(&self, backend: &BackendRef) -> Result<String, BlobError> {
+    // Reserves a slot and records the physical object before any bytes exist.
+    pub(super) async fn reserve_bucket(
+        &self,
+        backend: &BackendRef,
+        template: &BackendLocation,
+    ) -> Result<BackendLocation, BlobError> {
         let config = self.registry.config_for(backend)?.clone();
         let Some(max_bucket_size) = config.max_bucket_size else {
             let bucket = Box::pin(self.eval_backend_bucket(backend)).await?;
-            self.increment_bucket_load(backend, &bucket).await?;
-            return Ok(bucket);
+            let location = location_bucket(template, &bucket);
+            self.reserve_load(backend, &bucket, None, Some(&location))
+                .await?;
+            return Ok(location);
         };
         if let Some(bucket) = config.service_config.get("bucket") {
-            self.increment_bucket_load(backend, bucket).await?;
-            return Ok(bucket.clone());
+            let location = location_bucket(template, bucket);
+            self.reserve_load(backend, bucket, None, Some(&location))
+                .await?;
+            return Ok(location);
         }
 
         let mut full = Vec::new();
         for _ in 0..BUCKET_RESERVE_ROUNDS {
             let bucket = Box::pin(self.select_backend_bucket(backend, &full)).await?;
+            let location = location_bucket(template, &bucket);
             if self
-                .try_reserve_slot(backend, &bucket, max_bucket_size)
+                .reserve_load(backend, &bucket, Some(max_bucket_size), Some(&location))
                 .await?
             {
-                return Ok(bucket);
+                return Ok(location);
             }
             full.push(bucket);
         }
@@ -147,10 +202,32 @@ impl BlobHandler {
         ))
     }
 
-    pub(super) async fn release_bucket(&self, backend: &BackendRef, bucket: &str) {
-        if let Err(error) = self.decrement_bucket_load(backend, bucket).await {
-            tracing::warn!(%backend, bucket, %error, "failed to release bucket reservation");
+    pub(super) fn hold_reservation(&self, id: Ulid) -> Option<ReservationGuard> {
+        if let Ok(mut active) = self.reservation_active.lock() {
+            if active.len() >= ACTIVE_RESERVATION_LIMIT && !active.contains(&id) {
+                return None;
+            }
+            active.insert(id);
+        } else {
+            return None;
         }
+        Some(ReservationGuard {
+            active: Arc::clone(&self.reservation_active),
+            id,
+            remove_on_drop: true,
+        })
+    }
+
+    pub(super) fn clear_active(&self, id: Ulid) {
+        if let Ok(mut active) = self.reservation_active.lock() {
+            active.remove(&id);
+        }
+    }
+
+    pub(super) fn reservation_active(&self, id: Ulid) -> bool {
+        self.reservation_active
+            .lock()
+            .is_ok_and(|active| active.contains(&id))
     }
 
     pub(super) async fn reserve_hidden_key(
@@ -592,49 +669,257 @@ impl BlobHandler {
             != Some(bucket)
     }
 
-    pub(super) async fn increment_bucket_load(
+    pub(super) async fn release_reservation(
         &self,
-        backend: &BackendRef,
-        bucket: &str,
+        location: &BackendLocation,
     ) -> Result<(), BlobError> {
-        self.adjust_bucket_load(backend, bucket, 1).await
-    }
-
-    pub(super) async fn decrement_bucket_load(
-        &self,
-        backend: &BackendRef,
-        bucket: &str,
-    ) -> Result<(), BlobError> {
-        self.adjust_bucket_load(backend, bucket, -1).await
-    }
-
-    // Lock-free read-modify-write: a storage transaction detects racing
-    // updates from concurrent effects and the conflicting side retries.
-    async fn adjust_bucket_load(
-        &self,
-        backend: &BackendRef,
-        bucket: &str,
-        delta: i64,
-    ) -> Result<(), BlobError> {
-        matches!(
-            self.retry_load_update(backend, bucket, delta, None).await?,
-            LoadUpdate::Applied
+        if !self.stats_managed(&location.backend, &location.storage_bucket) {
+            return self.clear_marker(location).await;
+        }
+        let mut last_error = None;
+        for attempt in 0..BUCKET_STATS_RETRIES {
+            match self.release_marker(location).await {
+                Ok(ReleaseUpdate::Applied) => return Ok(()),
+                Ok(ReleaseUpdate::Missing) => {
+                    self.clear_active(location.ulid);
+                    return Ok(());
+                }
+                Ok(ReleaseUpdate::Conflict) if attempt + 1 < BUCKET_STATS_RETRIES => {
+                    tokio::time::sleep(conflict_backoff(attempt)).await;
+                }
+                Ok(ReleaseUpdate::Conflict) => break,
+                Ok(ReleaseUpdate::Unknown) => {
+                    return Err(BlobError::ReadError(
+                        "bucket reservation release outcome is unknown".to_string(),
+                    ));
+                }
+                Err(error) if attempt + 1 < BUCKET_STATS_RETRIES => {
+                    last_error = Some(error);
+                    tokio::time::sleep(conflict_backoff(attempt)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        last_error.map_or_else(
+            || {
+                Err(BlobError::ReadError(
+                    "bucket reservation release kept conflicting".to_string(),
+                ))
+            },
+            Err,
         )
-        .then_some(())
-        .ok_or_else(|| {
-            BlobError::ReadError(format!("bucket stats update for {bucket} kept conflicting"))
-        })
     }
 
-    // Increments one slot unless the bucket already sits at its capacity.
-    async fn try_reserve_slot(
+    pub(super) async fn clear_marker(&self, location: &BackendLocation) -> Result<(), BlobError> {
+        let mut owner = self.storage.start_transaction(false).await.map_err(|_| {
+            BlobError::ReadError("failed to start bucket reservation cleanup".to_string())
+        })?;
+        let Some(txn_id) = owner.id() else {
+            return Err(BlobError::ReadError(
+                "bucket reservation cleanup owner missing transaction".to_string(),
+            ));
+        };
+        let marker = match self.marker_exists(location, txn_id).await {
+            Ok(marker) => marker,
+            Err(error) => {
+                self.abort_stats_txn(&mut owner).await;
+                return Err(error);
+            }
+        };
+        if !marker {
+            self.abort_stats_txn(&mut owner).await;
+            self.clear_active(location.ulid);
+            return Ok(());
+        }
+        let event = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::Delete {
+                key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+                key: intent_key(location),
+                txn_id: Some(txn_id),
+            }))
+            .await;
+        if !matches!(event, Event::Storage(StorageEvent::DeleteResult { .. })) {
+            self.abort_stats_txn(&mut owner).await;
+            return Err(BlobError::ReadError(
+                "failed to clear bucket reservation".to_string(),
+            ));
+        }
+        match self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
+                if committed == txn_id =>
+            {
+                owner.finish();
+                self.clear_active(location.ulid);
+                Ok(())
+            }
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            }) => {
+                owner.finish();
+                Err(BlobError::ReadError(
+                    "bucket reservation cleanup conflicted".to_string(),
+                ))
+            }
+            Event::Storage(StorageEvent::Error { error }) => {
+                owner.unknown();
+                Err(BlobError::ReadError(format!(
+                    "failed to clear bucket reservation: {error}"
+                )))
+            }
+            other => {
+                owner.unknown();
+                Err(BlobError::ReadError(format!(
+                    "unexpected bucket reservation cleanup event: {other:?}"
+                )))
+            }
+        }
+    }
+
+    async fn release_marker(&self, location: &BackendLocation) -> Result<ReleaseUpdate, BlobError> {
+        let mut owner = self.storage.start_transaction(false).await.map_err(|_| {
+            BlobError::ReadError("failed to start bucket reservation release".to_string())
+        })?;
+        let Some(txn_id) = owner.id() else {
+            return Err(BlobError::ReadError(
+                "bucket reservation release owner missing transaction".to_string(),
+            ));
+        };
+        if !self.marker_exists(location, txn_id).await? {
+            self.abort_stats_txn(&mut owner).await;
+            return Ok(ReleaseUpdate::Missing);
+        }
+        let load = match self
+            .bucket_load_txn(&location.backend, &location.storage_bucket, txn_id)
+            .await
+        {
+            Ok(load) => load,
+            Err(error) => {
+                self.abort_stats_txn(&mut owner).await;
+                return Err(error);
+            }
+        };
+        let event = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: BUCKET_STATS_DB.to_string(),
+                key: stats_key(&location.backend, &location.storage_bucket).into(),
+                value: load.saturating_sub(1).to_le_bytes().to_vec().into(),
+                txn_id: Some(txn_id),
+            }))
+            .await;
+        if !matches!(event, Event::Storage(StorageEvent::WriteResult { .. })) {
+            self.abort_stats_txn(&mut owner).await;
+            return Err(BlobError::ReadError(
+                "failed to release bucket capacity".to_string(),
+            ));
+        }
+        let event = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::Delete {
+                key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+                key: intent_key(location),
+                txn_id: Some(txn_id),
+            }))
+            .await;
+        if !matches!(event, Event::Storage(StorageEvent::DeleteResult { .. })) {
+            self.abort_stats_txn(&mut owner).await;
+            return Err(BlobError::ReadError(
+                "failed to delete bucket reservation".to_string(),
+            ));
+        }
+        match self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
+                if committed == txn_id =>
+            {
+                owner.finish();
+                self.clear_active(location.ulid);
+                Ok(ReleaseUpdate::Applied)
+            }
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            }) => {
+                owner.finish();
+                Ok(ReleaseUpdate::Conflict)
+            }
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionNotFound,
+            }) => {
+                owner.finish();
+                Err(BlobError::ReadError(
+                    "bucket reservation release transaction was not found".to_string(),
+                ))
+            }
+            Event::Storage(StorageEvent::Error { error: _ }) => {
+                owner.unknown();
+                Ok(ReleaseUpdate::Unknown)
+            }
+            other => {
+                owner.unknown();
+                tracing::warn!(event = ?other, "bucket reservation release outcome is unknown");
+                Ok(ReleaseUpdate::Unknown)
+            }
+        }
+    }
+
+    async fn marker_exists(
+        &self,
+        location: &BackendLocation,
+        txn_id: TxnId,
+    ) -> Result<bool, BlobError> {
+        let event = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+                key: intent_key(location),
+                txn_id: Some(txn_id),
+            }))
+            .await;
+        match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
+            _ => Err(BlobError::ReadError(
+                "failed to read bucket reservation".to_string(),
+            )),
+        }
+    }
+
+    pub(super) async fn marker_present(
+        &self,
+        location: &BackendLocation,
+    ) -> Result<bool, BlobError> {
+        let event = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+                key: intent_key(location),
+                txn_id: None,
+            }))
+            .await;
+        match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
+            _ => Err(BlobError::ReadError(
+                "failed to read bucket reservation".to_string(),
+            )),
+        }
+    }
+
+    async fn reserve_load(
         &self,
         backend: &BackendRef,
         bucket: &str,
-        capacity: u64,
+        capacity: Option<u64>,
+        location: Option<&BackendLocation>,
     ) -> Result<bool, BlobError> {
         match self
-            .retry_load_update(backend, bucket, 1, Some(capacity))
+            .retry_load_update(backend, bucket, 1, capacity, location)
             .await?
         {
             LoadUpdate::Applied => Ok(true),
@@ -651,14 +936,18 @@ impl BlobHandler {
         bucket: &str,
         delta: i64,
         capacity: Option<u64>,
+        location: Option<&BackendLocation>,
     ) -> Result<LoadUpdate, BlobError> {
         if !self.stats_managed(backend, bucket) {
+            if let Some(location) = location {
+                self.finalize_reservation(location).await?;
+            }
             return Ok(LoadUpdate::Applied);
         }
 
         for attempt in 0..BUCKET_STATS_RETRIES {
             match self
-                .try_adjust_load(backend, bucket, delta, capacity)
+                .try_adjust_load(backend, bucket, delta, capacity, location)
                 .await?
             {
                 LoadUpdate::Conflict => {}
@@ -677,6 +966,7 @@ impl BlobHandler {
         bucket: &str,
         delta: i64,
         capacity: Option<u64>,
+        location: Option<&BackendLocation>,
     ) -> Result<LoadUpdate, BlobError> {
         let mut owner = self.storage.start_transaction(false).await.map_err(|_| {
             BlobError::ReadError("failed to start bucket stats transaction".to_string())
@@ -721,6 +1011,31 @@ impl BlobHandler {
             return Err(BlobError::ReadError(
                 "failed to write bucket stats".to_string(),
             ));
+        }
+
+        if let Some(location) = location {
+            let value = match intent_value(location) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.abort_stats_txn(&mut owner).await;
+                    return Err(error);
+                }
+            };
+            let event = self
+                .storage
+                .send_effect(Effect::Storage(StorageEffect::Write {
+                    key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+                    key: intent_key(location),
+                    value,
+                    txn_id: Some(txn_id),
+                }))
+                .await;
+            if !matches!(event, Event::Storage(StorageEvent::WriteResult { .. })) {
+                self.abort_stats_txn(&mut owner).await;
+                return Err(BlobError::ReadError(
+                    "failed to persist bucket reservation".to_string(),
+                ));
+            }
         }
 
         let event = self
@@ -891,6 +1206,12 @@ fn stats_prefix(backend: &BackendRef, bucket_prefix: Option<&str>) -> Vec<u8> {
         prefix.extend_from_slice(bucket_prefix.as_bytes());
     }
     prefix
+}
+
+fn location_bucket(template: &BackendLocation, bucket: &str) -> BackendLocation {
+    let mut location = template.clone();
+    location.storage_bucket = bucket.to_string();
+    location
 }
 
 pub(super) fn generate_bucket_name(prefix: Option<&str>) -> String {

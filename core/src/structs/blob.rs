@@ -223,13 +223,25 @@ pub enum BlobCleanupWork {
         location: BackendLocation,
         owner: WriteOwner,
     },
+    /// A bucket slot reserved before the external write finished. The marker
+    /// is cleared only after the physical copy is proven owned or released.
+    ReconcileReservation {
+        location: BackendLocation,
+    },
 }
 
 /// The record a write's commit would have made the owner of its bytes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum WriteOwner {
-    Blob { blake3: [u8; 32] },
-    UploadPart { upload_id: Ulid, part_number: u16 },
+    Blob {
+        blake3: [u8; 32],
+        realm_id: RealmId,
+        ttl_ms: u64,
+    },
+    UploadPart {
+        upload_id: Ulid,
+        part_number: u16,
+    },
 }
 
 impl BlobCleanupWork {
@@ -244,7 +256,9 @@ impl BlobCleanupWork {
     /// The physical object this row is about, for the variants that name one.
     pub fn location(&self) -> Option<&BackendLocation> {
         match self {
-            Self::DeleteBlob { location } | Self::ReconcileWrite { location, .. } => Some(location),
+            Self::DeleteBlob { location }
+            | Self::ReconcileWrite { location, .. }
+            | Self::ReconcileReservation { location } => Some(location),
             Self::RegisterDht { .. } => None,
         }
     }

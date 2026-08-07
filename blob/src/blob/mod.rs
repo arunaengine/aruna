@@ -4,7 +4,7 @@ use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use aruna_storage::storage::StorageHandle;
 use bao_tree::BlockSize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, Semaphore};
@@ -61,6 +61,7 @@ pub struct BlobHandler {
     /// Holds and removal claims on tenant backends. Erasing credentials an
     /// operation still holds would leave that work unable to roll back.
     group_effects: Arc<StdMutex<HashMap<Ulid, group::GroupBackendUse>>>,
+    reservation_active: Arc<StdMutex<HashSet<Ulid>>>,
 }
 
 #[derive(Clone, Debug)]
