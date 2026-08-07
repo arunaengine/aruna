@@ -45,6 +45,7 @@ use tracing::{Instrument, error, info, trace};
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const STREAM_LIFETIME_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const STREAM_PROGRESS_BYTES: usize = 1024;
 const DELETE_OBJECTS_MAX_BODY: usize = 2 * 1024 * 1024;
 const DELETE_CAPTURE_LIMIT: usize = 16;
 const EGRESS_LIMIT: usize = 256;
@@ -59,7 +60,9 @@ pub const DEFAULT_S3_MAX_CONNECTIONS: usize = 1_024;
 pub const DEFAULT_S3_MAX_CONCURRENT_REQUESTS: usize = 512;
 
 fn touch_frame(activity: &ConnectionActivity, frame: &hyper::body::Frame<hyper::body::Bytes>) {
-    if frame.data_ref().is_some_and(|data| !data.is_empty()) || frame.is_trailers() {
+    if let Some(data) = frame.data_ref().filter(|data| !data.is_empty()) {
+        activity.record_progress(data.len());
+    } else if frame.is_trailers() {
         activity.touch();
     }
 }
@@ -345,21 +348,53 @@ fn is_bulk_request(
     let bucket = parsed_path
         .as_ref()
         .is_some_and(|path| path.as_bucket().is_some());
+    let root = parsed_path.as_ref().is_some_and(s3s::path::S3Path::is_root);
     match method.as_str() {
         "GET" => {
-            object
-                && !query_has_any(
-                    uri,
-                    &[
-                        "attributes",
-                        "acl",
-                        "legal-hold",
-                        "retention",
-                        "tagging",
-                        "torrent",
-                        "uploadId",
-                    ],
-                )
+            root
+                || (bucket
+                    && !query_has_any(
+                        uri,
+                        &[
+                            "analytics",
+                            "intelligent-tiering",
+                            "inventory",
+                            "metrics",
+                            "session",
+                            "accelerate",
+                            "acl",
+                            "cors",
+                            "encryption",
+                            "lifecycle",
+                            "location",
+                            "logging",
+                            "metadataTable",
+                            "notification",
+                            "ownershipControls",
+                            "policy",
+                            "policyStatus",
+                            "replication",
+                            "requestPayment",
+                            "tagging",
+                            "versioning",
+                            "website",
+                            "object-lock",
+                            "publicAccessBlock",
+                        ],
+                    ))
+                || (object
+                    && !query_has_any(
+                        uri,
+                        &[
+                            "attributes",
+                            "acl",
+                            "legal-hold",
+                            "retention",
+                            "tagging",
+                            "torrent",
+                            "uploadId",
+                        ],
+                    ))
         }
         "PUT" => object && !query_has_any(uri, &["acl", "legal-hold", "retention", "tagging"]),
         "DELETE" => object && !query_has_any(uri, &["tagging"]),
@@ -407,6 +442,7 @@ pub struct S3Server {
 #[derive(Default)]
 struct ConnectionActivity {
     generation: AtomicU64,
+    progress: AtomicUsize,
     cancelled: AtomicBool,
     stopped: AtomicBool,
     requested: AtomicBool,
@@ -419,6 +455,39 @@ impl ConnectionActivity {
         if !self.cancelled.load(Ordering::Acquire) && !self.stopped.load(Ordering::Acquire) {
             self.generation.fetch_add(1, Ordering::AcqRel);
             self.notify.notify_waiters();
+        }
+    }
+
+    fn record_progress(&self, bytes: usize) {
+        if bytes == 0
+            || self.cancelled.load(Ordering::Acquire)
+            || self.stopped.load(Ordering::Acquire)
+        {
+            return;
+        }
+
+        let mut progress = self.progress.load(Ordering::Acquire);
+        loop {
+            let total = progress.saturating_add(bytes);
+            let next = if total >= STREAM_PROGRESS_BYTES {
+                0
+            } else {
+                total
+            };
+            match self.progress.compare_exchange_weak(
+                progress,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if total >= STREAM_PROGRESS_BYTES {
+                        self.touch();
+                    }
+                    return;
+                }
+                Err(updated) => progress = updated,
+            }
         }
     }
 
@@ -1553,6 +1622,53 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn byte_trickle_closes() {
+        let activity = Arc::new(ConnectionActivity::default());
+        let watcher = tokio::spawn(activity.clone().wait_idle());
+        tokio::task::yield_now().await;
+        tokio::time::advance(CONNECTION_IDLE_TIMEOUT - Duration::from_secs(1)).await;
+        activity.record_progress(1);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(activity.is_cancelled());
+        watcher.await.expect("stream task joins");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn small_frames_progress() {
+        let activity = Arc::new(ConnectionActivity::default());
+        let watcher = tokio::spawn(activity.clone().wait_idle());
+        tokio::task::yield_now().await;
+        let half = STREAM_PROGRESS_BYTES / 2;
+        activity.record_progress(half);
+        tokio::time::advance(CONNECTION_IDLE_TIMEOUT / 2).await;
+        activity.record_progress(STREAM_PROGRESS_BYTES - half);
+        tokio::task::yield_now().await;
+        assert!(!activity.is_cancelled());
+        tokio::time::advance(CONNECTION_IDLE_TIMEOUT - Duration::from_secs(1)).await;
+        assert!(!activity.is_cancelled());
+        activity.stop();
+        watcher.await.expect("stream task joins");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn large_frame_bound() {
+        let activity = Arc::new(ConnectionActivity::default());
+        let watcher = tokio::spawn(activity.clone().wait_idle());
+        tokio::task::yield_now().await;
+        activity.record_progress(STREAM_PROGRESS_BYTES * 2);
+        tokio::task::yield_now().await;
+        tokio::time::advance(CONNECTION_IDLE_TIMEOUT - Duration::from_secs(1)).await;
+        activity.record_progress(1);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(activity.is_cancelled());
+        watcher.await.expect("stream task joins");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn handler_survives_idle() {
         let activity = Arc::new(ConnectionActivity::default());
         activity.mark_request();
@@ -1887,6 +2003,44 @@ mod tests {
     fn classifies_bulk_routes() {
         let headers = http::HeaderMap::new();
         assert!(is_bulk_request(
+            &Method::GET,
+            None,
+            "/",
+            "s3.example",
+            &http::Uri::from_static("/"),
+            &headers,
+        ));
+        assert!(is_bulk_request(
+            &Method::GET,
+            None,
+            "/bucket",
+            "s3.example",
+            &http::Uri::from_static("/bucket"),
+            &headers,
+        ));
+        for query in ["list-type=2", "versions", "uploads"] {
+            let uri = format!("/bucket?{query}").parse().expect("list URI");
+            assert!(is_bulk_request(
+                &Method::GET,
+                None,
+                "/bucket",
+                "s3.example",
+                &uri,
+                &headers,
+            ));
+        }
+        for query in ["location", "replication", "versioning"] {
+            let uri = format!("/bucket?{query}").parse().expect("config URI");
+            assert!(!is_bulk_request(
+                &Method::GET,
+                None,
+                "/bucket",
+                "s3.example",
+                &uri,
+                &headers,
+            ));
+        }
+        assert!(is_bulk_request(
             &Method::PUT,
             None,
             "/bucket/key",
@@ -1987,7 +2141,7 @@ mod tests {
             &http::Uri::from_static("/bucket/key?tagging"),
             &headers,
         ));
-        assert!(!is_bulk_request(
+        assert!(is_bulk_request(
             &Method::GET,
             None,
             "/bucket",
