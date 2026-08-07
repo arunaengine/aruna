@@ -366,7 +366,9 @@ where
                 .map_err(|err| err.to_string())?;
             prefix_len += 1;
         }
-        if len > audit_frame_cap() && is_audit_variant(&variant[..prefix_len]) {
+        let variant = parse_variant(&variant[..prefix_len])
+            .map_err(|_| "metadata frame variant is invalid".to_string())?;
+        if len > audit_frame_cap() && variant.is_some_and(is_audit_variant) {
             return Err("metadata audit frame exceeds maximum size".to_string());
         }
     }
@@ -392,10 +394,20 @@ fn audit_frame_cap() -> usize {
     MAX_AUDIT_PAGE_BYTES.saturating_add(AUDIT_FRAME_OVERHEAD)
 }
 
-fn is_audit_variant(prefix: &[u8]) -> bool {
+fn parse_variant(prefix: &[u8]) -> Result<Option<u32>, ()> {
+    let Some(&last) = prefix.last() else {
+        return Ok(None);
+    };
+    if last & 0x80 != 0 || (prefix.len() == POSTCARD_VARIANT_BYTES && last > 0x0f) {
+        return Err(());
+    }
     postcard::from_bytes::<u32>(prefix)
-        .map(|variant| variant == AUDIT_REQUEST_VARIANT || variant == AUDIT_RESPONSE_VARIANT)
-        .unwrap_or(false)
+        .map(Some)
+        .map_err(|_| ())
+}
+
+fn is_audit_variant(variant: u32) -> bool {
+    variant == AUDIT_REQUEST_VARIANT || variant == AUDIT_RESPONSE_VARIANT
 }
 
 pub(crate) fn response_cap(message: &MetadataTransportMessage) -> usize {
@@ -721,6 +733,27 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, "metadata audit frame exceeds maximum size");
         assert_eq!(budget.available_permits(), METADATA_INBOUND_FRAME_BYTES);
+    }
+
+    #[tokio::test]
+    async fn audit_variant_limit() {
+        for prefix in [
+            vec![0x80; POSTCARD_VARIANT_BYTES],
+            vec![0x9f, 0x80, 0x80, 0x80, 0x80, 0],
+        ] {
+            let (mut writer, mut reader) = tokio::io::duplex(16);
+            let length = (audit_frame_cap() + 1) as u32;
+            writer.write_all(&[STANDARD_FRAME]).await.unwrap();
+            writer.write_all(&length.to_be_bytes()).await.unwrap();
+            writer.write_all(&prefix).await.unwrap();
+            let budget = Arc::new(Semaphore::new(METADATA_INBOUND_FRAME_BYTES));
+
+            let error = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
+                .await
+                .unwrap_err();
+            assert_eq!(error, "metadata frame variant is invalid");
+            assert_eq!(budget.available_permits(), METADATA_INBOUND_FRAME_BYTES);
+        }
     }
 
     #[tokio::test]
