@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
@@ -87,6 +88,34 @@ pub struct AdminDocumentReducerState {
     pub user_subject_ids: BTreeMap<String, AdminDocumentAttributeVersion>,
     #[serde(default)]
     pub equivalent_value_dots: BTreeMap<String, BTreeSet<AdminDocumentDot>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RevocationPath {
+    hash: String,
+    expires_at: u64,
+    token_owner: UserId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RevocationCandidate {
+    path: String,
+    expires_at: u64,
+    token_owner: UserId,
+    dot: AdminDocumentDot,
+}
+
+#[derive(Default)]
+struct RevocationGroup {
+    paths: BTreeSet<String>,
+    candidates: Vec<RevocationCandidate>,
+}
+
+fn candidate_cmp(left: &RevocationCandidate, right: &RevocationCandidate) -> Ordering {
+    left.expires_at
+        .cmp(&right.expires_at)
+        .then_with(|| right.dot.cmp(&left.dot))
+        .then_with(|| right.token_owner.cmp(&left.token_owner))
 }
 
 pub fn decode_admin_document_reducer_state(
@@ -569,13 +598,13 @@ impl AdminDocumentReducerState {
                 AdminDocumentOperation::RealmConfigTokenRevoked {
                     token_hash,
                     expires_at,
-                    ..
+                    token_owner,
                 },
             ) => {
                 if !valid_token_hash(token_hash) {
                     return Err(AdminDocumentReducerError::InvalidTokenHash);
                 }
-                apply_status = self.apply_revocation(event, token_hash, *expires_at);
+                apply_status = self.apply_revocation(event, token_hash, *expires_at, *token_owner);
             }
             (
                 AdminDocumentTarget::RealmConfig { .. },
@@ -1119,7 +1148,7 @@ impl AdminDocumentReducerState {
         }
 
         for (path, version) in &self.user_subject_ids {
-            let Some((hash, expires_at)) = revoked_token_entry(path) else {
+            let Some((hash, expires_at, _)) = revoked_token_entry(path) else {
                 continue;
             };
             if version.value.as_deref() != Some(expires_at.to_string().as_str()) {
@@ -1141,46 +1170,84 @@ impl AdminDocumentReducerState {
             return;
         }
 
-        let expired: BTreeSet<String> = self
-            .user_subject_ids
-            .keys()
-            .chain(self.equivalent_value_dots.keys())
-            .chain(self.conflicts.keys())
-            .filter(|path| {
-                revoked_token_entry(path).is_some_and(|(_, expires_at)| expires_at < now)
-            })
-            .cloned()
-            .collect();
-        for path in expired {
-            self.remove_revocation_path(&path);
-        }
+        for (_hash, group) in self.revocation_groups(Some(now)) {
+            let winner = group
+                .candidates
+                .iter()
+                .max_by(|left, right| candidate_cmp(left, right));
+            let Some(winner) = winner else {
+                for path in &group.paths {
+                    self.remove_revocation_path(path);
+                }
+                continue;
+            };
 
-        let hashes: BTreeSet<String> = self
-            .user_subject_ids
-            .keys()
-            .chain(self.equivalent_value_dots.keys())
-            .chain(self.conflicts.keys())
-            .filter_map(|path| revoked_token_entry(path).map(|(hash, _)| hash.to_string()))
-            .collect();
-        for hash in hashes {
-            self.canonicalize_revocation(&hash, None);
+            let unchanged = group.paths.len() == 1
+                && group.paths.contains(&winner.path)
+                && self
+                    .user_subject_ids
+                    .get(&winner.path)
+                    .is_some_and(|version| {
+                        version.value.as_deref() == Some(winner.expires_at.to_string().as_str())
+                            && version.dot == winner.dot
+                    })
+                && !self.equivalent_value_dots.contains_key(&winner.path)
+                && !self.conflicts.contains_key(&winner.path);
+
+            if !unchanged {
+                for path in &group.paths {
+                    self.remove_revocation_path(path);
+                }
+                self.user_subject_ids.insert(
+                    winner.path.clone(),
+                    AdminDocumentAttributeVersion {
+                        value: Some(winner.expires_at.to_string()),
+                        dot: winner.dot,
+                    },
+                );
+            }
+            self.applied_event_ids.insert(winner.dot.event_id);
         }
     }
 
-    pub fn live_revocation_count(&self, origin_node_id: &NodeId) -> usize {
+    pub fn live_revocation_count(&self, origin_node_id: &NodeId, now: u64) -> usize {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return 0;
         }
 
-        self.user_subject_ids
-            .iter()
-            .filter(|(path, version)| {
-                let Some((_, expires_at)) = revoked_token_entry(path) else {
-                    return false;
-                };
-                let expected = expires_at.to_string();
-                version.value.as_deref() == Some(expected.as_str())
-                    && version.dot.origin_node_id == *origin_node_id
+        self.revocation_groups(Some(now))
+            .values()
+            .filter_map(|group| {
+                group
+                    .candidates
+                    .iter()
+                    .max_by(|left, right| candidate_cmp(left, right))
+            })
+            .filter(|candidate| candidate.dot.origin_node_id == *origin_node_id)
+            .count()
+    }
+
+    pub fn live_owner_count(
+        &self,
+        origin_node_id: &NodeId,
+        token_owner: &UserId,
+        now: u64,
+    ) -> usize {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return 0;
+        }
+
+        self.revocation_groups(Some(now))
+            .values()
+            .filter_map(|group| {
+                group
+                    .candidates
+                    .iter()
+                    .max_by(|left, right| candidate_cmp(left, right))
+            })
+            .filter(|candidate| {
+                candidate.dot.origin_node_id == *origin_node_id
+                    && candidate.token_owner == *token_owner
             })
             .count()
     }
@@ -1190,12 +1257,15 @@ impl AdminDocumentReducerState {
             return None;
         }
 
-        self.user_subject_ids.iter().find_map(|(path, version)| {
-            let (hash, expires_at) = revoked_token_entry(path)?;
-            let expected = expires_at.to_string();
-            (hash == token_hash && version.value.as_deref() == Some(expected.as_str()))
-                .then_some(version.dot.origin_node_id)
-        })
+        self.revocation_groups(None)
+            .get(token_hash)
+            .and_then(|group| {
+                group
+                    .candidates
+                    .iter()
+                    .max_by(|left, right| candidate_cmp(left, right))
+            })
+            .map(|candidate| candidate.dot.origin_node_id)
     }
 
     fn apply_revocation(
@@ -1203,8 +1273,10 @@ impl AdminDocumentReducerState {
         event: &AdminDocumentEvent,
         token_hash: &str,
         expires_at: u64,
+        token_owner: UserId,
     ) -> AdminDocumentApplyStatus {
-        let retained = self.canonicalize_revocation(token_hash, Some((expires_at, event.dot())));
+        let retained =
+            self.canonicalize_revocation(token_hash, Some((expires_at, token_owner, event.dot())));
         if retained == Some(event.dot()) {
             AdminDocumentApplyStatus::Applied
         } else {
@@ -1215,69 +1287,140 @@ impl AdminDocumentReducerState {
     fn canonicalize_revocation(
         &mut self,
         token_hash: &str,
-        candidate: Option<(u64, AdminDocumentDot)>,
+        candidate: Option<(u64, UserId, AdminDocumentDot)>,
     ) -> Option<AdminDocumentDot> {
-        let paths: BTreeSet<String> = self
-            .user_subject_ids
-            .keys()
-            .chain(self.equivalent_value_dots.keys())
-            .chain(self.conflicts.keys())
-            .filter(|path| revoked_token_entry(path).is_some_and(|(hash, _)| hash == token_hash))
-            .cloned()
-            .collect();
+        let mut group = self
+            .revocation_groups(None)
+            .remove(token_hash)
+            .unwrap_or_default();
+        if let Some((expires_at, token_owner, dot)) = candidate {
+            let path = revoked_token_path(token_hash, expires_at, &token_owner);
+            group.candidates.push(RevocationCandidate {
+                path,
+                expires_at,
+                token_owner,
+                dot,
+            });
+        }
 
-        let mut retained = candidate;
-        for path in &paths {
-            let Some((_, expires_at)) = revoked_token_entry(path) else {
+        let winner = group
+            .candidates
+            .iter()
+            .max_by(|left, right| candidate_cmp(left, right))
+            .cloned();
+        let Some(winner) = winner else {
+            for path in &group.paths {
+                self.remove_revocation_path(path);
+            }
+            return None;
+        };
+
+        let unchanged = group.paths.len() == 1
+            && group.paths.contains(&winner.path)
+            && self
+                .user_subject_ids
+                .get(&winner.path)
+                .is_some_and(|version| {
+                    version.value.as_deref() == Some(winner.expires_at.to_string().as_str())
+                        && version.dot == winner.dot
+                })
+            && !self.equivalent_value_dots.contains_key(&winner.path)
+            && !self.conflicts.contains_key(&winner.path);
+
+        if !unchanged {
+            for path in &group.paths {
+                self.remove_revocation_path(path);
+            }
+            let path = revoked_token_path(token_hash, winner.expires_at, &winner.token_owner);
+            self.user_subject_ids.insert(
+                path,
+                AdminDocumentAttributeVersion {
+                    value: Some(winner.expires_at.to_string()),
+                    dot: winner.dot,
+                },
+            );
+        }
+        self.applied_event_ids.insert(winner.dot.event_id);
+        Some(winner.dot)
+    }
+
+    fn revocation_groups(&self, now: Option<u64>) -> BTreeMap<String, RevocationGroup> {
+        let mut indexed = BTreeMap::new();
+        let mut index = |path: &String| {
+            indexed.entry(path.clone()).or_insert_with(|| {
+                revoked_token_entry(path).map(|(hash, expires_at, token_owner)| RevocationPath {
+                    hash: hash.to_string(),
+                    expires_at,
+                    token_owner,
+                })
+            });
+        };
+        for path in self.user_subject_ids.keys() {
+            index(path);
+        }
+        for path in self.equivalent_value_dots.keys() {
+            index(path);
+        }
+        for path in self.conflicts.keys() {
+            index(path);
+        }
+
+        let mut groups = BTreeMap::new();
+        for (path, entry) in indexed {
+            let Some(entry) = entry else {
                 continue;
             };
-            let expected = expires_at.to_string();
-            let Some(version) = self.user_subject_ids.get(path) else {
+            let group = groups
+                .entry(entry.hash.clone())
+                .or_insert_with(|| RevocationGroup {
+                    paths: BTreeSet::new(),
+                    candidates: Vec::new(),
+                });
+            group.paths.insert(path.clone());
+
+            let Some(version) = self.user_subject_ids.get(&path) else {
                 continue;
             };
-            if version.value.as_deref() != Some(expected.as_str()) {
+            if version.value.as_deref() != Some(entry.expires_at.to_string().as_str())
+                || now.is_some_and(|current| entry.expires_at < current)
+            {
                 continue;
             }
 
-            let mut dots = BTreeSet::from([version.dot]);
-            if let Some(equivalent) = self.equivalent_value_dots.get(path) {
-                dots.extend(equivalent.iter().copied());
+            group.candidates.push(RevocationCandidate {
+                path: path.clone(),
+                expires_at: entry.expires_at,
+                token_owner: entry.token_owner,
+                dot: version.dot,
+            });
+            if let Some(dots) = self.equivalent_value_dots.get(&path) {
+                group
+                    .candidates
+                    .extend(dots.iter().copied().map(|dot| RevocationCandidate {
+                        path: path.clone(),
+                        expires_at: entry.expires_at,
+                        token_owner: entry.token_owner,
+                        dot,
+                    }));
             }
-            if let Some(conflict) = self.conflicts.get(path) {
-                dots.extend(
+            if let Some(conflict) = self.conflicts.get(&path) {
+                group.candidates.extend(
                     conflict
                         .values
                         .iter()
-                        .filter(|value| value.value.as_deref() == Some(expected.as_str()))
-                        .map(|value| value.dot),
+                        .filter(|value| {
+                            value.value.as_deref() == Some(entry.expires_at.to_string().as_str())
+                        })
+                        .map(|value| RevocationCandidate {
+                            path: path.clone(),
+                            expires_at: entry.expires_at,
+                            token_owner: entry.token_owner,
+                            dot: value.dot,
+                        }),
                 );
             }
-            for dot in dots {
-                let should_retain = retained.is_none_or(|(current_expiry, current_dot)| {
-                    expires_at > current_expiry
-                        || (expires_at == current_expiry && dot < current_dot)
-                });
-                if should_retain {
-                    retained = Some((expires_at, dot));
-                }
-            }
         }
-
-        for path in &paths {
-            self.remove_revocation_path(path);
-        }
-
-        let (expires_at, dot) = retained?;
-        let path = revoked_token_path(token_hash, expires_at);
-        self.user_subject_ids.insert(
-            path,
-            AdminDocumentAttributeVersion {
-                value: Some(expires_at.to_string()),
-                dot,
-            },
-        );
-        self.applied_event_ids.insert(dot.event_id);
-        Some(dot)
+        groups
     }
 
     fn remove_revocation_path(&mut self, path: &str) {
@@ -1890,9 +2033,9 @@ fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         AdminDocumentOperation::RealmConfigTokenRevoked {
             token_hash,
             expires_at,
-            ..
+            token_owner,
         } => {
-            vec![revoked_token_path(token_hash, *expires_at)]
+            vec![revoked_token_path(token_hash, *expires_at, token_owner)]
         }
     }
 }
@@ -1964,14 +2107,17 @@ pub fn band_pool_path(pool_id: Ulid) -> String {
     format!("realm_config.placement.band_pools.{pool_id}")
 }
 
-pub fn revoked_token_path(token_hash: &str, expires_at: u64) -> String {
-    format!("{REALM_CONFIG_REVOKED_TOKENS_PATH}.{token_hash}.{expires_at}")
+pub fn revoked_token_path(token_hash: &str, expires_at: u64, token_owner: &UserId) -> String {
+    format!("{REALM_CONFIG_REVOKED_TOKENS_PATH}.{token_hash}.{expires_at}.{token_owner}")
 }
 
-pub fn revoked_token_entry(path: &str) -> Option<(&str, u64)> {
+pub fn revoked_token_entry(path: &str) -> Option<(&str, u64, UserId)> {
     let rest = path.strip_prefix(REALM_CONFIG_REVOKED_TOKENS_PATH)?;
-    let (hash, expires_at) = rest.strip_prefix('.')?.split_once('.')?;
-    valid_token_hash(hash).then_some((hash, expires_at.parse().ok()?))
+    let mut parts = rest.strip_prefix('.')?.split('.');
+    let hash = parts.next()?;
+    let expires_at = parts.next()?.parse().ok()?;
+    let token_owner = UserId::from_string(parts.next()?).ok()?;
+    (parts.next().is_none() && valid_token_hash(hash)).then_some((hash, expires_at, token_owner))
 }
 
 pub fn binding_scope_key(scope: &BindingScope) -> String {
@@ -2239,13 +2385,14 @@ fn realm_node_kind_from_value(value: &str) -> Option<RealmNodeKind> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdminDocumentApplyStatus, AdminDocumentAttributeVersion, AdminDocumentReducerError,
-        AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH, GROUP_REALM_ID_PATH,
-        REALM_CONFIG_DEFAULT_STRATEGY_PATH, REALM_CONFIG_DESCRIPTION_PATH,
-        REALM_CONFIG_DISCOVERY_PATH, REALM_CONFIG_METADATA_REPLICATION_PATH,
-        REALM_CONFIG_QUOTA_PATH, USER_NAME_PATH, binding_scope_key, group_role_id_from_path,
-        group_role_path, group_role_user_assignment_from_path, group_role_user_assignment_path,
-        handle_range_path, metadata_replication_value, oidc_provider_value,
+        AdminDocumentApplyStatus, AdminDocumentAttributeVersion, AdminDocumentConflict,
+        AdminDocumentConflictValue, AdminDocumentReducerError, AdminDocumentReducerState,
+        GROUP_DISPLAY_NAME_PATH, GROUP_REALM_ID_PATH, REALM_CONFIG_DEFAULT_STRATEGY_PATH,
+        REALM_CONFIG_DESCRIPTION_PATH, REALM_CONFIG_DISCOVERY_PATH,
+        REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_QUOTA_PATH, USER_NAME_PATH,
+        binding_scope_key, group_role_id_from_path, group_role_path,
+        group_role_user_assignment_from_path, group_role_user_assignment_path, handle_range_path,
+        metadata_replication_value, oidc_provider_value,
         overlay_realm_config_placement_reducer_materialization, placement_binding_handle,
         placement_binding_path, realm_config_node_id_from_path, realm_config_node_path,
         realm_config_oidc_provider_id_from_path, realm_config_oidc_provider_path,
@@ -5673,6 +5820,26 @@ mod tests {
         )
     }
 
+    fn revoke_token_owned(
+        event_seed: u8,
+        origin_seed: u8,
+        token: &str,
+        expires_at: u64,
+        token_owner: UserId,
+    ) -> AdminDocumentEvent {
+        realm_config_event(
+            event_seed,
+            node(origin_seed),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: crate::auth::bearer_token_hash(token),
+                expires_at,
+                token_owner,
+            },
+        )
+    }
+
     #[test]
     fn revocations_accumulate() {
         // Two origins revoking different tokens both survive, and a repeat of
@@ -5708,7 +5875,8 @@ mod tests {
             assert_eq!(state.apply(event), Ok(expected));
         }
 
-        let path = super::revoked_token_path(&crate::auth::bearer_token_hash("repeat"), 2_000);
+        let path =
+            super::revoked_token_path(&crate::auth::bearer_token_hash("repeat"), 2_000, &user_id());
         assert_eq!(state.user_subject_ids.len(), 1);
         assert_eq!(state.user_subject_ids[&path].dot, events[0].dot());
         assert!(state.equivalent_value_dots.is_empty());
@@ -5731,7 +5899,8 @@ mod tests {
         equal_right.apply(&equal_first).unwrap();
 
         assert_eq!(equal_left, equal_right);
-        let equal_path = super::revoked_token_path(&crate::auth::bearer_token_hash("equal"), 4_000);
+        let equal_path =
+            super::revoked_token_path(&crate::auth::bearer_token_hash("equal"), 4_000, &user_id());
         assert_eq!(
             equal_left.user_subject_ids[&equal_path].dot,
             equal_first.dot()
@@ -5747,8 +5916,11 @@ mod tests {
         different_right.apply(&shorter).unwrap();
 
         assert_eq!(different_left, different_right);
-        let longer_path =
-            super::revoked_token_path(&crate::auth::bearer_token_hash("different"), 5_000);
+        let longer_path = super::revoked_token_path(
+            &crate::auth::bearer_token_hash("different"),
+            5_000,
+            &user_id(),
+        );
         assert_eq!(different_left.user_subject_ids.len(), 1);
         assert_eq!(
             different_left.user_subject_ids[&longer_path].dot,
@@ -5762,8 +5934,8 @@ mod tests {
         let longer = revoke_token_at(20, 1, "legacy", 5_000);
         let equal = revoke_token_at(21, 2, "legacy", 5_000);
         let shorter = revoke_token_at(22, 3, "legacy", 3_000);
-        let longer_path = super::revoked_token_path(&hash, 5_000);
-        let shorter_path = super::revoked_token_path(&hash, 3_000);
+        let longer_path = super::revoked_token_path(&hash, 5_000, &user_id());
+        let shorter_path = super::revoked_token_path(&hash, 3_000, &user_id());
         let mut state = realm_config_state();
         state.user_subject_ids.insert(
             longer_path.clone(),
@@ -5824,9 +5996,9 @@ mod tests {
             .unwrap();
         state.compact_revocations(1_000);
 
-        assert_eq!(state.live_revocation_count(&node(1)), 2);
-        assert_eq!(state.live_revocation_count(&node(2)), 1);
-        assert_eq!(state.live_revocation_count(&node(3)), 0);
+        assert_eq!(state.live_revocation_count(&node(1), 1_000), 2);
+        assert_eq!(state.live_revocation_count(&node(2), 1_000), 1);
+        assert_eq!(state.live_revocation_count(&node(3), 1_000), 0);
         assert_eq!(
             state.revocation_origin(&crate::auth::bearer_token_hash("one")),
             Some(node(1))
@@ -5837,6 +6009,104 @@ mod tests {
         );
         assert_eq!(state.revocation_origin("missing"), None);
         assert_eq!(user_state().revocation_origin("missing"), None);
+    }
+
+    #[test]
+    fn owner_conflict_order() {
+        let owner_a = user_id_with_seed(1);
+        let owner_b = user_id_with_seed(2);
+        let first = revoke_token_owned(40, 1, "owned", 5_000, owner_a);
+        let second = revoke_token_owned(41, 2, "owned", 5_000, owner_b);
+        let mut left = realm_config_state();
+        left.apply(&first).unwrap();
+        left.apply(&second).unwrap();
+        let mut right = realm_config_state();
+        right.apply(&second).unwrap();
+        right.apply(&first).unwrap();
+
+        assert_eq!(left, right);
+        let hash = crate::auth::bearer_token_hash("owned");
+        let path = super::revoked_token_path(&hash, 5_000, &owner_a);
+        assert_eq!(left.user_subject_ids.len(), 1);
+        assert!(left.user_subject_ids.contains_key(&path));
+    }
+
+    #[test]
+    fn stale_conflict_removed() {
+        let owner = user_id();
+        let canonical = revoke_token_owned(42, 1, "stale", 5_000, owner);
+        let stale = revoke_token_owned(43, 2, "stale", 5_000, owner);
+        let path =
+            super::revoked_token_path(&crate::auth::bearer_token_hash("stale"), 5_000, &owner);
+        let mut state = realm_config_state();
+        state.user_subject_ids.insert(
+            path.clone(),
+            AdminDocumentAttributeVersion {
+                value: Some("5000".to_string()),
+                dot: canonical.dot(),
+            },
+        );
+        state.conflicts.insert(
+            path.clone(),
+            AdminDocumentConflict {
+                path: path.clone(),
+                values: vec![AdminDocumentConflictValue {
+                    value: Some("4000".to_string()),
+                    dot: stale.dot(),
+                }],
+            },
+        );
+        state
+            .applied_event_ids
+            .extend([canonical.event_id, stale.event_id]);
+
+        state.compact_revocations(1_000);
+
+        assert!(state.conflicts.is_empty());
+        assert_eq!(state.user_subject_ids[&path].dot, canonical.dot());
+        assert!(state.applied_event_ids.contains(&canonical.event_id));
+        assert!(!state.applied_event_ids.contains(&stale.event_id));
+    }
+
+    #[test]
+    fn expired_count() {
+        let mut state = realm_config_state();
+        state
+            .apply(&revoke_token_at(44, 1, "expired-count", 1_000))
+            .unwrap();
+        state
+            .apply(&revoke_token_at(45, 1, "live-count", 2_000))
+            .unwrap();
+
+        assert_eq!(state.live_revocation_count(&node(1), 1_000), 2);
+        assert_eq!(state.live_revocation_count(&node(1), 1_001), 1);
+        state.compact_revocations(1_001);
+        assert_eq!(state.live_revocation_count(&node(1), 1_001), 1);
+    }
+
+    #[test]
+    fn owner_count() {
+        let owner_a = user_id_with_seed(3);
+        let owner_b = user_id_with_seed(4);
+        let mut state = realm_config_state();
+        for (seed, token, owner) in [
+            (46u8, "owner-a-one", owner_a),
+            (47u8, "owner-a-two", owner_a),
+            (48u8, "owner-b-one", owner_b),
+        ] {
+            state
+                .apply(&revoke_token_owned(seed, 1, token, 2_000, owner))
+                .unwrap();
+        }
+        state
+            .apply(&revoke_token_owned(49, 2, "owner-a-three", 2_000, owner_a))
+            .unwrap();
+        state.compact_revocations(1_000);
+
+        assert_eq!(state.live_revocation_count(&node(1), 1_000), 3);
+        assert_eq!(state.live_owner_count(&node(1), &owner_a, 1_000), 2);
+        assert_eq!(state.live_owner_count(&node(1), &owner_b, 1_000), 1);
+        assert_eq!(state.live_owner_count(&node(2), &owner_a, 1_000), 1);
     }
 
     #[test]
