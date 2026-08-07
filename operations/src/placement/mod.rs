@@ -180,6 +180,31 @@ pub fn resolve_shard_holders(
     resolve_shard_holders_with(config, strategy, placement)
 }
 
+pub(crate) const MAX_READ_HOLDERS: usize = 32;
+
+/// Resolves a shard's canonical holder order with a bounded replica target.
+pub(crate) fn resolve_holders_limit(
+    config: &RealmConfigDocument,
+    placement: &PlacementRef,
+    limit: usize,
+) -> Vec<NodeId> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let Some(strategy) = config.strategy(&placement.strategy_id) else {
+        return Vec::new();
+    };
+    let target = limit.min(u32::MAX as usize) as u32;
+    let mut bounded = strategy.clone();
+    bounded.replica_count = Some(
+        strategy
+            .replica_count
+            .map_or(target, |replicas| replicas.min(target)),
+    );
+    let view = build_view(config);
+    resolve_shard_holders_from_view(config, &view, &bounded, placement)
+}
+
 /// First `(strategy, shard)` whose holder set is non-empty both before and after
 /// a config change yet shares no holder: a disjoint transition that would strand
 /// the shard's history and let a new holder mint a rival genesis. Interim
@@ -689,5 +714,33 @@ mod tests {
         }];
 
         assert_eq!(resolve_shard_holders(&config, &placement), baseline);
+    }
+
+    #[test]
+    fn holders_limit_order() {
+        let mut config = RealmConfigDocument::new(RealmId::from_bytes([3u8; 32]), Vec::new(), 3);
+        let strategy = PlacementStrategy {
+            strategy_id: Ulid::from_bytes([5u8; 16]),
+            name: "default".to_string(),
+            replica_count: None,
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 1,
+        };
+        config.default_strategy_id = Some(strategy.strategy_id);
+        config.strategies = vec![strategy];
+        for seed in 1..=64u8 {
+            config.ensure_node(node(seed), RealmNodeKind::Server);
+        }
+        let placement = PlacementRef {
+            strategy_id: config.default_strategy_id.expect("default strategy"),
+            epoch: 0,
+            shard: 0,
+        };
+        let full = resolve_shard_holders(&config, &placement);
+        let bounded = resolve_holders_limit(&config, &placement, MAX_READ_HOLDERS);
+
+        assert_eq!(full.len(), 64);
+        assert_eq!(bounded, full[..MAX_READ_HOLDERS].to_vec());
     }
 }

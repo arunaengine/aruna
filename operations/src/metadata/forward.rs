@@ -44,7 +44,9 @@ use crate::metadata::protocol::{
     MetadataAuthToken, MetadataReadError, MetadataTransportMessage, MetadataWriteAuthError,
 };
 use crate::placement::selector::{ROLE_NODE, neg_log2_q48, selector_hash};
-use crate::placement::{holds_placement, resolve_shard_holders};
+use crate::placement::{
+    MAX_READ_HOLDERS, holds_placement, resolve_holders_limit, resolve_shard_holders,
+};
 use crate::process_placements::load_realm_config;
 use crate::request_authorization::{AuthorizeError, authorize};
 use crate::request_policy::PolicyRequestExtras;
@@ -94,7 +96,6 @@ const TOKEN_REVOKE_PEER_LIMIT: usize = 4;
 const TOKEN_REVOKE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 const TOKEN_REVOKE_DEADLINE: Duration = Duration::from_secs(15);
 const METADATA_READ_FANOUT_LIMIT: usize = 8;
-const METADATA_READ_HOLDER_LIMIT: usize = 32;
 const METADATA_READ_PEER_TIMEOUT: Duration = Duration::from_secs(2);
 const METADATA_READ_DEADLINE: Duration = Duration::from_secs(12);
 
@@ -319,26 +320,6 @@ where
     }
 }
 
-fn select_read_holders(holders: Vec<NodeId>, local_node: Option<NodeId>) -> (Vec<NodeId>, bool) {
-    let truncated = holders.len() > METADATA_READ_HOLDER_LIMIT;
-    let local = local_node.filter(|local| {
-        !holders
-            .iter()
-            .take(METADATA_READ_HOLDER_LIMIT)
-            .any(|holder| holder == local)
-            && holders.iter().any(|holder| holder == local)
-    });
-    let mut selected = holders
-        .into_iter()
-        .take(METADATA_READ_HOLDER_LIMIT)
-        .collect::<Vec<_>>();
-    if let Some(local) = local {
-        selected.pop();
-        selected.push(local);
-    }
-    (selected, truncated)
-}
-
 pub async fn get_metadata_routed(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
@@ -356,10 +337,7 @@ pub async fn get_metadata_routed(
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     let placement = resolve_metadata_id(&config, realm_id, None, request.document_id)
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let (holders, truncated) = select_read_holders(
-        resolve_shard_holders(&config, &placement),
-        context.net_handle.as_ref().map(|net| net.node_id()),
-    );
+    let holders = resolve_holders_limit(&config, &placement, MAX_READ_HOLDERS);
     let holder_count = holders.len();
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     let context = Arc::clone(context);
@@ -443,9 +421,6 @@ pub async fn get_metadata_routed(
     if success.is_some() && not_found > 0 {
         return Err(MetadataApiError::ServiceUnavailable);
     }
-    if success.is_some() && truncated {
-        return Err(MetadataApiError::ServiceUnavailable);
-    }
     if let Some(record) = success {
         return Ok(record);
     }
@@ -478,10 +453,7 @@ pub async fn export_rocrate_routed(
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     let placement = resolve_metadata_id(&config, realm_id, None, request.document_id)
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let (holders, truncated) = select_read_holders(
-        resolve_shard_holders(&config, &placement),
-        context.net_handle.as_ref().map(|net| net.node_id()),
-    );
+    let holders = resolve_holders_limit(&config, &placement, MAX_READ_HOLDERS);
     let holder_count = holders.len();
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     let context = Arc::clone(context);
@@ -548,9 +520,6 @@ pub async fn export_rocrate_routed(
         return Err(error);
     }
     if success.is_some() && not_found > 0 {
-        return Err(MetadataApiError::ServiceUnavailable);
-    }
-    if success.is_some() && truncated {
         return Err(MetadataApiError::ServiceUnavailable);
     }
     if let Some(export) = success {
