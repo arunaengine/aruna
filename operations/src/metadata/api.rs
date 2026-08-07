@@ -61,9 +61,10 @@ use crate::metadata::repository::{
 };
 use crate::permission_rules::GroupPermissionRules;
 use crate::placement::{
-    holds_placement, registry_placement, registry_placement_for, registry_strategy,
-    resolve_shard_holders,
+    holds_placement, meta_bucket_subject, registry_placement, registry_placement_for,
+    registry_strategy, resolve_shard_holders,
 };
+use crate::placement::selector::{ROLE_NODE, rank_weighted};
 use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, search_local_buckets};
 
 const DEFAULT_LIST_METADATA_LIMIT: usize = 50;
@@ -695,8 +696,18 @@ async fn forward_path_resolution(
     peers.retain(|node| *node != local_node);
     let mut seen = HashSet::new();
     peers.retain(|peer| seen.insert(*peer));
-    peers.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-    peers.truncate(METADATA_DISTRIBUTED_QUERY_MAX_NODES);
+    let normalized = MetadataRegistryRecord::normalize_document_path(&request.document_path);
+    let mut subject = meta_bucket_subject(realm_id, request.group_id, &normalized);
+    subject.extend_from_slice(local_node.as_bytes());
+    let candidates = peers
+        .iter()
+        .map(|peer| (*peer.as_bytes(), 1u64))
+        .collect::<Vec<_>>();
+    peers = rank_weighted(ROLE_NODE, &subject, &candidates)
+        .into_iter()
+        .take(METADATA_DISTRIBUTED_QUERY_MAX_NODES)
+        .map(|index| peers[index])
+        .collect();
     if peers.is_empty() {
         return Err(MetadataApiError::ServiceUnavailable);
     }
@@ -711,8 +722,9 @@ async fn forward_path_resolution(
         let auth_token = auth_token.clone();
         let document_path = request.document_path.clone();
         async move {
-            let response = metadata
-                .request_forwarded_write(
+            let response = tokio::time::timeout(
+                METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT,
+                metadata.request_forwarded_write(
                     peer,
                     MetadataTransportMessage::ForwardPathResolution {
                         auth_token,
@@ -720,8 +732,9 @@ async fn forward_path_resolution(
                         document_path,
                         config_digest,
                     },
-                )
-                .await;
+                ),
+            )
+            .await;
             (response, peer)
         }
     }))
