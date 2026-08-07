@@ -15,13 +15,13 @@ use aruna_core::storage_entries::{
     watch_subscription_write_entry,
 };
 use aruna_core::structs::{
-    AuthContext, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NOTIFICATION_WATCH_PER_USER_CAP, PlacementRef,
-    RealmId, WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
-    parse_watch_subscription_key, watch_subscription_prefix,
+    AuthContext, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NOTIFICATION_WATCH_PER_USER_CAP,
+    NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP, PlacementRef, RealmId, WatchAuthorizationBinding,
+    WatchEventMask, WatchSubscription, decode_watch_count, parse_watch_subscription_key,
+    watch_count_key, watch_count_value, watch_subscription_prefix,
 };
-use aruna_core::types::{Key, TxnId, UserId, Value};
+use aruna_core::types::{TxnId, UserId};
 use aruna_storage::StorageHandle;
-use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -29,7 +29,6 @@ use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
 use crate::driver::DriverContext;
-use crate::notifications::protocol::NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP;
 use crate::notifications::watch::authorization::{WatchAuthorization, evaluate_watch_creation};
 use crate::notifications::watch::interest::watch_interest_dirty_marker_write;
 
@@ -37,7 +36,6 @@ use crate::notifications::watch::interest::watch_interest_dirty_marker_write;
 /// always covers a subscription set with a wide safety margin.
 const WATCH_SUBSCRIPTION_LIST_LIMIT: usize = 256;
 const WATCH_SUBSCRIPTION_PAGE_LIMIT: usize = 256;
-const WATCH_SUBSCRIPTION_COUNT_PREFIX: &[u8] = b"count/";
 
 /// Stable reject reason for a cap-exceeded create; matched verbatim by the
 /// holder proxy to surface a 409 to the API layer.
@@ -200,24 +198,6 @@ fn validate_subscription_fields(
     Ok(())
 }
 
-fn watch_count_key(realm_id: RealmId) -> Key {
-    let mut key = WATCH_SUBSCRIPTION_COUNT_PREFIX.to_vec();
-    key.extend_from_slice(realm_id.as_bytes());
-    ByteView::from(key)
-}
-
-fn count_value(count: usize) -> Value {
-    Value::from((count as u64).to_be_bytes().to_vec())
-}
-
-fn decode_count(value: &[u8]) -> Result<usize, String> {
-    let bytes: [u8; 8] = value
-        .try_into()
-        .map_err(|_| "invalid watch subscription count".to_string())?;
-    usize::try_from(u64::from_be_bytes(bytes))
-        .map_err(|_| "watch subscription count does not fit usize".to_string())
-}
-
 async fn create_subscription(
     storage: &StorageHandle,
     subscription: WatchSubscription,
@@ -268,7 +248,7 @@ async fn create_once(
     {
         Event::Storage(StorageEvent::ReadResult {
             value: Some(value), ..
-        }) => match decode_count(&value) {
+        }) => match decode_watch_count(&value) {
             Ok(count) => count,
             Err(error) => {
                 abort_txn(storage, txn_id).await;
@@ -352,7 +332,7 @@ async fn create_once(
         (
             NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
             watch_count_key(subscription.owner.realm_id),
-            count_value(realm_count + 1),
+            watch_count_value(realm_count + 1),
         ),
     ];
     writes.push(watch_interest_dirty_marker_write(
@@ -524,7 +504,7 @@ async fn delete_once(
     {
         Event::Storage(StorageEvent::ReadResult {
             value: Some(value), ..
-        }) => match decode_count(&value) {
+        }) => match decode_watch_count(&value) {
             Ok(count) if count > 0 => count,
             Ok(_) => {
                 abort_txn(storage, txn_id).await;
@@ -580,7 +560,7 @@ async fn delete_once(
         (
             NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
             watch_count_key(owner.realm_id),
-            count_value(realm_count - 1),
+            watch_count_value(realm_count - 1),
         ),
     ];
     if let Some(replication) = replication {
@@ -1044,7 +1024,7 @@ mod tests {
                 .send_storage_effect(StorageEffect::Write {
                     key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
                     key: watch_count_key(realm),
-                    value: count_value(NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP),
+                    value: watch_count_value(NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP),
                     txn_id: None,
                 })
                 .await,
@@ -1070,7 +1050,7 @@ mod tests {
                 .send_storage_effect(StorageEffect::Write {
                     key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
                     key: watch_count_key(realm),
-                    value: count_value(NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP),
+                    value: watch_count_value(NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP),
                     txn_id: None,
                 })
                 .await,

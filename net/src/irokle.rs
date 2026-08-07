@@ -35,8 +35,9 @@ use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
     DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, GROUP_OWNER_INDEX_KEYSPACE,
     METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-    METADATA_GRAPH_LIFECYCLE_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
+    METADATA_GRAPH_LIFECYCLE_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
+    NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE,
+    USER_SUBJECT_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
@@ -56,12 +57,13 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::{
     BindingError, DocumentClass, FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument,
-    HANDLE_RANGE_SIZE, MetadataRegistryRecord, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument,
-    NodeUsageSnapshot, PlacementRef, PlacementScope, PoolAdmission, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId, RealmNodeKind, Role, User, WatchEventMask, WatchInterestDigest,
-    WatchSubscription, admit_band_pool, coordinator_spans, group_owner_index_key,
-    node_usage_key_node_id, reserved_label, watch_interest_dirty_key, watch_interest_key_node_id,
-    watch_interest_key_realm_id,
+    HANDLE_RANGE_SIZE, MetadataRegistryRecord, NOTIFICATION_WATCH_MAX_PREFIX_LEN,
+    NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP, NodeInfoDocument, NodeUsageSnapshot, PlacementRef,
+    PlacementScope, PoolAdmission, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+    RealmNodeKind, Role, User, WatchEventMask, WatchInterestDigest, WatchSubscription,
+    admit_band_pool, coordinator_spans, decode_watch_count, group_owner_index_key,
+    node_usage_key_node_id, reserved_label, watch_count_key, watch_count_value,
+    watch_interest_dirty_key, watch_interest_key_node_id, watch_interest_key_realm_id,
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::{RoleId, TxnId, UserId, Value};
@@ -5524,6 +5526,53 @@ async fn start_storage_transaction(storage: &StorageHandle) -> Result<TxnId> {
     }
 }
 
+async fn load_watch_count(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+    txn_id: TxnId,
+    force_scan: bool,
+) -> Result<(Option<usize>, bool)> {
+    let stored = storage_read_from_transaction(
+        storage,
+        NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+        watch_count_key(realm_id),
+        Some(txn_id),
+    )
+    .await?;
+    if let Some(value) = stored {
+        if let Ok(count) = decode_watch_count(&value)
+            && (!force_scan || count > 0)
+        {
+            return Ok((Some(count), false));
+        }
+    }
+
+    let values = match storage
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
+            prefix: Some(UserId::storage_prefix(realm_id)),
+            start: None,
+            limit: NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP.saturating_add(1),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+        Event::Storage(StorageEvent::Error { error }) => {
+            return Err(NetError::Dht(error.to_string()));
+        }
+        other => {
+            return Err(NetError::Dht(format!(
+                "unexpected watch subscription count scan event: {other:?}"
+            )));
+        }
+    };
+    if values.len() > NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP {
+        return Ok((None, true));
+    }
+    Ok((Some(values.len()), true))
+}
+
 async fn apply_watch_subscription_change_to_storage(
     storage: &StorageHandle,
     target: DocumentSyncTarget,
@@ -5601,6 +5650,93 @@ async fn apply_watch_subscription_change_to_storage(
             DocumentSyncTarget::WatchSubscription { owner, .. } => owner.realm_id,
             _ => unreachable!("watch subscription apply requires a subscription target"),
         };
+        let row_present = match storage_read_from_transaction(
+            storage,
+            NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
+            target.storage_key(),
+            Some(txn_id),
+        )
+        .await
+        {
+            Ok(value) => value.is_some(),
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        };
+        let count_state = match change.kind {
+            DocumentSyncChangeKind::Upsert => {
+                match load_watch_count(storage, realm_id, txn_id, row_present).await {
+                    Ok(state) => Some(state),
+                    Err(error) => {
+                        let _ = storage
+                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                            .await;
+                        return Err(error);
+                    }
+                }
+            }
+            DocumentSyncChangeKind::Delete if row_present => {
+                match load_watch_count(storage, realm_id, txn_id, true).await {
+                    Ok(state) => Some(state),
+                    Err(error) => {
+                        let _ = storage
+                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                            .await;
+                        return Err(error);
+                    }
+                }
+            }
+            DocumentSyncChangeKind::Delete => None,
+        };
+        let mut count_write = None;
+        if let Some((count, repaired)) = count_state {
+            match change.kind {
+                DocumentSyncChangeKind::Upsert => {
+                    let Some(count) = count else {
+                        let _ = storage
+                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                            .await;
+                        return Ok(false);
+                    };
+                    if !row_present && count >= NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP {
+                        let _ = storage
+                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                            .await;
+                        return Ok(false);
+                    }
+                    let next = if row_present {
+                        count
+                    } else {
+                        count.saturating_add(1)
+                    };
+                    if repaired || !row_present {
+                        count_write = Some(watch_count_value(next));
+                    }
+                }
+                DocumentSyncChangeKind::Delete => {
+                    let Some(count) = count else {
+                        let _ = storage
+                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                            .await;
+                        return Err(NetError::AdmissionRejected(
+                            "watch subscription count exceeds cap".to_string(),
+                        ));
+                    };
+                    if count == 0 {
+                        let _ = storage
+                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                            .await;
+                        return Err(NetError::Bootstrap(
+                            "watch subscription count is zero for a stored row".to_string(),
+                        ));
+                    }
+                    count_write = Some(watch_count_value(count - 1));
+                }
+            }
+        }
         let revision_entry = match document_sync_revision_write_entry(&target, &change) {
             Ok(entry) => entry,
             Err(error) => {
@@ -5618,6 +5754,13 @@ async fn apply_watch_subscription_change_to_storage(
                 ByteView::from(Ulid::generate().to_bytes().to_vec()),
             ),
         ];
+        if let Some(value) = count_write {
+            writes.push((
+                NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                watch_count_key(realm_id),
+                value,
+            ));
+        }
         let deletes = if let Some(bytes) = bytes.as_ref() {
             writes.push((
                 target.storage_keyspace().to_string(),

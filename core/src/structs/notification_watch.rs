@@ -8,9 +8,10 @@ use ulid::Ulid;
 use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::{NotificationKind, PathRestriction, RealmId};
-use crate::types::{GroupId, Key, UserId};
+use crate::types::{GroupId, Key, UserId, Value};
 
 pub const NOTIFICATION_WATCH_PER_USER_CAP: usize = 50;
+pub const NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP: usize = 1024;
 pub const NOTIFICATION_WATCH_MAX_PREFIX_LEN: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -412,6 +413,27 @@ pub fn watch_subscription_prefix(owner: UserId) -> Key {
     ByteView::from(owner.to_storage_key())
 }
 
+const WATCH_SUBSCRIPTION_COUNT_PREFIX: &[u8] = b"count/";
+
+pub fn watch_count_key(realm_id: RealmId) -> Key {
+    let mut key = WATCH_SUBSCRIPTION_COUNT_PREFIX.to_vec();
+    key.extend_from_slice(realm_id.as_bytes());
+    ByteView::from(key)
+}
+
+pub fn watch_count_value(count: usize) -> Value {
+    Value::from((count as u64).to_be_bytes().to_vec())
+}
+
+pub fn decode_watch_count(value: &[u8]) -> Result<usize, ConversionError> {
+    let bytes: [u8; 8] = value.try_into().map_err(|_| {
+        ConversionError::InvalidLength("invalid watch subscription count".to_string())
+    })?;
+    usize::try_from(u64::from_be_bytes(bytes)).map_err(|_| {
+        ConversionError::InvalidLength("watch subscription count does not fit usize".to_string())
+    })
+}
+
 pub fn parse_watch_subscription_key(key: &[u8]) -> Result<(UserId, Ulid), ConversionError> {
     if key.len() != 64 {
         return Err(ConversionError::InvalidLength(format!(
@@ -739,6 +761,16 @@ mod tests {
             parse_watch_subscription_key(&long),
             Err(ConversionError::InvalidLength(_))
         ));
+    }
+
+    #[test]
+    fn count_roundtrips() {
+        let realm = RealmId([7; 32]);
+        let key = watch_count_key(realm);
+        assert!(key.starts_with(b"count/"));
+        assert_eq!(key.len(), 38);
+        assert_eq!(decode_watch_count(&watch_count_value(17)).unwrap(), 17);
+        assert!(decode_watch_count(&[0; 7]).is_err());
     }
 
     #[test]

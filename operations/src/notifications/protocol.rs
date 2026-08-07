@@ -1,3 +1,4 @@
+pub use aruna_core::structs::NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP;
 use aruna_core::structs::{
     NotificationRecord, WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
 };
@@ -9,7 +10,6 @@ use ulid::Ulid;
 
 pub const NOTIFICATION_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 pub const NOTIFICATION_WATCH_EVENT_BATCH_SIZE: usize = 128;
-pub const NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP: usize = 1024;
 pub const NOTIFICATION_WATCH_EXPANSION_WORK_CAP: usize = 4096;
 pub const NOTIFICATION_WATCH_EXPANSION_CANDIDATE_CAP: usize = 1024;
 pub const NOTIFICATION_WATCH_EXPANSION_RECORD_CAP: usize = 1024;
