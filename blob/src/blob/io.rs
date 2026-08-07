@@ -20,6 +20,7 @@ use std::future::Future;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
+use tokio::runtime::Handle;
 use tokio::time::{Instant, timeout, timeout_at};
 use ulid::Ulid;
 
@@ -48,6 +49,122 @@ where
     }
 }
 
+struct HiddenReservation {
+    handler: BlobHandler,
+    key: Option<HiddenBlobKey>,
+    operator: Option<Operator>,
+    storage_path: Option<String>,
+    writer: Option<opendal::Writer>,
+}
+
+impl HiddenReservation {
+    fn new(handler: BlobHandler, key: Option<HiddenBlobKey>) -> Self {
+        Self {
+            handler,
+            key,
+            operator: None,
+            storage_path: None,
+            writer: None,
+        }
+    }
+
+    fn set_operator(&mut self, operator: Operator, storage_path: String) {
+        self.operator = Some(operator);
+        self.storage_path = Some(storage_path);
+    }
+
+    fn set_writer(&mut self, writer: opendal::Writer) {
+        self.writer = Some(writer);
+    }
+
+    fn writer_mut(&mut self) -> Option<&mut opendal::Writer> {
+        self.writer.as_mut()
+    }
+
+    fn commit(&mut self) {
+        self.writer = None;
+        self.key = None;
+    }
+
+    async fn fail(&mut self, error: BlobError) -> BlobEvent {
+        match self.abort().await {
+            Ok(()) => BlobEvent::Error(error),
+            Err(cleanup) => BlobEvent::Error(cleanup),
+        }
+    }
+
+    async fn abort(&mut self) -> Result<(), BlobError> {
+        let cleanup = if let Some(mut writer) = self.writer.take() {
+            let operator = self.operator.as_ref().ok_or_else(|| {
+                BlobError::DeleteError("hidden writer operator is missing".to_string())
+            })?;
+            let storage_path = self.storage_path.as_deref().ok_or_else(|| {
+                BlobError::DeleteError("hidden writer path is missing".to_string())
+            })?;
+            self.handler
+                .abort_writer(&mut writer, operator, storage_path)
+                .await
+        } else if let (Some(operator), Some(storage_path)) =
+            (self.operator.as_ref(), self.storage_path.as_deref())
+        {
+            self.handler.delete_path(operator, storage_path).await
+        } else {
+            Ok(())
+        };
+        cleanup?;
+        let Some(key) = self.key.as_ref() else {
+            return Ok(());
+        };
+        self.handler.release_hidden(key).await?;
+        self.key = None;
+        Ok(())
+    }
+}
+
+impl Drop for HiddenReservation {
+    fn drop(&mut self) {
+        if self.key.is_none() && self.writer.is_none() {
+            return;
+        }
+        let key = self.key.take();
+        let handler = self.handler.clone();
+        let operator = self.operator.take();
+        let storage_path = self.storage_path.take();
+        let writer = self.writer.take();
+        let Ok(permit) = handler.spool_slots.clone().try_acquire_owned() else {
+            tracing::warn!("hidden blob cleanup deferred to the orphan sweep");
+            return;
+        };
+        let Ok(runtime) = Handle::try_current() else {
+            tracing::error!("cannot schedule hidden blob cleanup without a runtime");
+            return;
+        };
+        runtime.spawn(async move {
+            let cleanup = match (writer, operator.as_ref(), storage_path.as_deref()) {
+                (Some(mut writer), Some(operator), Some(storage_path)) => {
+                    handler
+                        .abort_writer(&mut writer, operator, storage_path)
+                        .await
+                }
+                (None, Some(operator), Some(storage_path)) => {
+                    handler.delete_path(operator, storage_path).await
+                }
+                _ => Ok(()),
+            };
+            if let Err(error) = cleanup {
+                tracing::error!(%error, "failed to clean cancelled hidden blob");
+                return;
+            }
+            if let Some(key) = key
+                && let Err(error) = handler.release_hidden(&key).await
+            {
+                tracing::error!(%error, "failed to release cancelled hidden blob");
+            }
+            drop(permit);
+        });
+    }
+}
+
 impl BlobHandler {
     pub(super) async fn write_stream_to_location(
         &self,
@@ -55,7 +172,7 @@ impl BlobHandler {
         operator: Operator,
         blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
-        Box::pin(self.write_stream_limit(location, operator, blob, None, None)).await
+        Box::pin(self.write_stream_limit(location, operator, blob, None, None, None)).await
     }
 
     async fn write_stream_limit(
@@ -65,30 +182,37 @@ impl BlobHandler {
         mut blob: BackendStream<Result<Bytes, StreamError>>,
         max_bytes: Option<u64>,
         deadline: Option<StdInstant>,
+        reservation: Option<&mut HiddenReservation>,
     ) -> BlobEvent {
+        let mut plain = HiddenReservation::new(self.clone(), None);
+        let reservation = reservation.unwrap_or(&mut plain);
         let storage_path = match location.get_storage_path() {
             Ok(storage_path) => storage_path,
-            Err(e) => return BlobEvent::Error(e),
+            Err(e) => return reservation.fail(e).await,
         };
-        let mut writer = match with_deadline(
+        reservation.set_operator(operator.clone(), storage_path.clone());
+        match with_deadline(
             deadline,
             open_writer(&operator, &storage_path, &location.backend),
         )
         .await
         {
-            Ok(Ok(writer)) => writer,
+            Ok(Ok(writer)) => reservation.set_writer(writer),
             Ok(Err(_)) => {
-                return BlobEvent::Error(BlobError::OperatorCreationFailed(
-                    "Failed to create writer from operator".to_string(),
-                ));
+                return reservation
+                    .fail(BlobError::OperatorCreationFailed(
+                        "Failed to create writer from operator".to_string(),
+                    ))
+                    .await;
             }
             Err(()) => {
-                self.delete_path(&operator, &storage_path).await;
-                return BlobEvent::Error(BlobError::WriteError(
-                    "blob write deadline expired".to_string(),
-                ));
+                return reservation
+                    .fail(BlobError::WriteError(
+                        "blob write deadline expired".to_string(),
+                    ))
+                    .await;
             }
-        };
+        }
 
         let mut hasher = Hasher::new();
         let mut bytes_written = 0u64;
@@ -97,69 +221,90 @@ impl BlobHandler {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
                 Err(()) => {
-                    self.abort_writer(&mut writer, &operator, &storage_path)
+                    return reservation
+                        .fail(BlobError::WriteError(
+                            "blob write deadline expired".to_string(),
+                        ))
                         .await;
-                    return BlobEvent::Error(BlobError::WriteError(
-                        "blob write deadline expired".to_string(),
-                    ));
                 }
             };
             let bytes = match chunk {
                 Ok(bytes) => bytes,
                 Err(err) => {
-                    self.abort_writer(&mut writer, &operator, &storage_path)
+                    return reservation
+                        .fail(BlobError::StreamFailed(err.to_string()))
                         .await;
-                    return BlobEvent::Error(BlobError::StreamFailed(err.to_string()));
                 }
             };
             let Some(next_size) = bytes_written.checked_add(bytes.len() as u64) else {
-                self.abort_writer(&mut writer, &operator, &storage_path)
+                return reservation
+                    .fail(BlobError::SizeLimitExceeded {
+                        limit: max_bytes.unwrap_or(u64::MAX),
+                    })
                     .await;
-                return BlobEvent::Error(BlobError::SizeLimitExceeded {
-                    limit: max_bytes.unwrap_or(u64::MAX),
-                });
             };
             if let Some(limit) = max_bytes
                 && next_size > limit
             {
-                self.abort_writer(&mut writer, &operator, &storage_path)
+                return reservation
+                    .fail(BlobError::SizeLimitExceeded { limit })
                     .await;
-                return BlobEvent::Error(BlobError::SizeLimitExceeded { limit });
             }
             hasher.update(&bytes);
-            match with_deadline(deadline, writer.write(bytes.to_vec())).await {
+            let write = match reservation.writer_mut() {
+                Some(writer) => with_deadline(deadline, writer.write(bytes.to_vec())).await,
+                None => {
+                    return reservation
+                        .fail(BlobError::WriteError(
+                            "hidden writer is missing".to_string(),
+                        ))
+                        .await;
+                }
+            };
+            match write {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
-                    self.abort_writer(&mut writer, &operator, &storage_path)
+                    return reservation
+                        .fail(BlobError::WriteError(err.to_string()))
                         .await;
-                    return BlobEvent::Error(BlobError::WriteError(err.to_string()));
                 }
                 Err(()) => {
-                    self.abort_writer(&mut writer, &operator, &storage_path)
+                    return reservation
+                        .fail(BlobError::WriteError(
+                            "blob write deadline expired".to_string(),
+                        ))
                         .await;
-                    return BlobEvent::Error(BlobError::WriteError(
-                        "blob write deadline expired".to_string(),
-                    ));
                 }
             }
             bytes_written = next_size;
         }
 
-        match with_deadline(deadline, writer.close()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                self.abort_writer(&mut writer, &operator, &storage_path)
+        let close = match reservation.writer_mut() {
+            Some(writer) => with_deadline(deadline, writer.close()).await,
+            None => {
+                return reservation
+                    .fail(BlobError::WriteError(
+                        "hidden writer is missing".to_string(),
+                    ))
                     .await;
-                return BlobEvent::Error(BlobError::WriteError(err.to_string()));
+            }
+        };
+        match close {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                return reservation
+                    .fail(BlobError::WriteError(err.to_string()))
+                    .await;
             }
             Err(()) => {
-                self.abort_writer(&mut writer, &operator, &storage_path)
+                return reservation
+                    .fail(BlobError::WriteError(
+                        "blob write deadline expired".to_string(),
+                    ))
                     .await;
-                return BlobEvent::Error(BlobError::WriteError(
-                    "blob write deadline expired".to_string(),
-                ));
             }
         }
+        reservation.commit();
         location.blob_size = bytes_written;
         location.hashes = hasher.to_map();
         BlobEvent::WriteFinished { location }
@@ -180,21 +325,26 @@ impl BlobHandler {
             Ok(config) => config.root.clone(),
             Err(err) => return BlobEvent::Error(err),
         };
-        let backend_bucket =
-            match with_deadline(deadline, self.eval_backend_bucket(&resolved.backend)).await {
-                Ok(Ok(bucket)) => bucket,
-                Ok(Err(err)) => return BlobEvent::Error(err),
-                Err(()) => {
-                    return BlobEvent::Error(BlobError::WriteError(
-                        "blob write deadline expired".to_string(),
-                    ));
-                }
-            };
         let ulid = Ulid::generate();
         let backend_path = match build_hidden_path(namespace, name, ulid) {
             Ok(path) => path,
             Err(err) => return BlobEvent::Error(BlobError::ConversionError(err)),
         };
+        let key = match with_deadline(
+            deadline,
+            self.reserve_hidden_key(&resolved.backend, &root, &backend_path),
+        )
+        .await
+        {
+            Ok(Ok(key)) => key,
+            Ok(Err(err)) => return BlobEvent::Error(err),
+            Err(()) => {
+                return BlobEvent::Error(BlobError::WriteError(
+                    "blob write deadline expired".to_string(),
+                ));
+            }
+        };
+        let backend_bucket = key.storage_bucket.clone();
         let location = BackendLocation {
             backend: resolved.backend.clone(),
             storage_class: resolved.storage_class.clone(),
@@ -217,65 +367,48 @@ impl BlobHandler {
                 .bucket_operator(&resolved.backend, &backend_bucket, &self.egress)
             {
                 Ok(operator) => operator,
-                Err(err) => return BlobEvent::Error(err),
+                Err(err) => {
+                    let mut reservation = HiddenReservation::new(self.clone(), Some(key));
+                    return reservation.fail(err).await;
+                }
             };
+        let mut reservation = HiddenReservation::new(self.clone(), Some(key.clone()));
         let location = match self
-            .write_stream_limit(location, operator, blob, max_bytes, deadline)
+            .write_stream_limit(
+                location,
+                operator,
+                blob,
+                max_bytes,
+                deadline,
+                Some(&mut reservation),
+            )
             .await
         {
             BlobEvent::WriteFinished { location } => location,
             other => return other,
         };
         let Some(hash) = location.get_blake3() else {
-            let _ = self.discard_hidden(&location).await;
-            return BlobEvent::Error(BlobError::IntegrityCheckFailed(
-                "hidden blob hash is missing".to_string(),
-            ));
+            let error = BlobError::IntegrityCheckFailed("hidden blob hash is missing".to_string());
+            return match self.discard_hidden(&location).await {
+                Ok(()) => match self.release_hidden(&key).await {
+                    Ok(()) => BlobEvent::Error(error),
+                    Err(cleanup) => BlobEvent::Error(cleanup),
+                },
+                Err(cleanup) => BlobEvent::Error(cleanup),
+            };
         };
         let Ok(blake3) = hash.try_into() else {
-            let _ = self.discard_hidden(&location).await;
-            return BlobEvent::Error(BlobError::IntegrityCheckFailed(
+            let error = BlobError::IntegrityCheckFailed(
                 "hidden blob hash has an invalid length".to_string(),
-            ));
+            );
+            return match self.discard_hidden(&location).await {
+                Ok(()) => match self.release_hidden(&key).await {
+                    Ok(()) => BlobEvent::Error(error),
+                    Err(cleanup) => BlobEvent::Error(cleanup),
+                },
+                Err(cleanup) => BlobEvent::Error(cleanup),
+            };
         };
-        match with_deadline(
-            deadline,
-            self.increment_bucket_load(&location.backend, &location.storage_bucket),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                let cleanup = timeout(
-                    self.control_plane_io_timeout(),
-                    self.discard_hidden(&location),
-                )
-                .await;
-                if !matches!(&cleanup, Ok(Ok(())))
-                    && let (Ok(operator), Ok(storage_path)) = (
-                        self.operator_from_location(&location),
-                        location.get_storage_path(),
-                    )
-                {
-                    self.delete_path(&operator, &storage_path).await;
-                }
-                if let Ok(Err(cleanup)) = cleanup {
-                    return BlobEvent::Error(cleanup);
-                }
-                return BlobEvent::Error(err);
-            }
-            Err(()) => {
-                if let (Ok(operator), Ok(storage_path)) = (
-                    self.operator_from_location(&location),
-                    location.get_storage_path(),
-                ) {
-                    self.delete_path(&operator, &storage_path).await;
-                }
-                return BlobEvent::Error(BlobError::WriteError(
-                    "blob write deadline expired".to_string(),
-                ));
-            }
-        }
         BlobEvent::HiddenSpooled {
             size: location.blob_size,
             location,
@@ -288,42 +421,53 @@ impl BlobHandler {
         writer: &mut opendal::Writer,
         operator: &Operator,
         storage_path: &str,
-    ) {
-        if timeout(
-            self.control_plane_io_timeout(),
-            abort_partial_writer(writer, operator, storage_path),
-        )
-        .await
-        .is_err()
-        {
-            self.delete_path(operator, storage_path).await;
+    ) -> Result<(), BlobError> {
+        match timeout(self.control_plane_io_timeout(), writer.abort()).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => self
+                .delete_path(operator, storage_path)
+                .await
+                .map_err(|delete| {
+                    BlobError::DeleteError(format!("{error}; cleanup failed: {delete}"))
+                }),
+            Err(_) => self.delete_path(operator, storage_path).await,
         }
     }
 
-    async fn delete_path(&self, operator: &Operator, storage_path: &str) {
+    async fn delete_path(&self, operator: &Operator, storage_path: &str) -> Result<(), BlobError> {
         match timeout(
             self.control_plane_io_timeout(),
             operator.delete(storage_path),
         )
         .await
         {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(%error, storage_path, "failed to delete partial blob output");
-            }
-            Err(_) => {
-                tracing::warn!(storage_path, "timed out deleting partial blob output");
-            }
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Ok(Err(error)) => Err(BlobError::DeleteError(error.to_string())),
+            Err(_) => Err(BlobError::DeleteError(
+                "timed out deleting partial blob output".to_string(),
+            )),
         }
     }
 
     async fn discard_hidden(&self, location: &BackendLocation) -> Result<(), BlobError> {
         let operator = self.operator_from_location(location)?;
         let storage_path = location.get_storage_path()?;
-        operator
-            .delete(&storage_path)
-            .await
-            .map_err(|error| BlobError::DeleteError(error.to_string()))
+        self.delete_path(&operator, &storage_path).await
+    }
+
+    async fn release_hidden(&self, key: &HiddenBlobKey) -> Result<(), BlobError> {
+        match timeout(
+            self.control_plane_io_timeout(),
+            self.release_hidden_key(key),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(BlobError::DeleteError(
+                "timed out releasing hidden blob reservation".to_string(),
+            )),
+        }
     }
 
     pub async fn write_blob(
@@ -696,20 +840,10 @@ impl BlobHandler {
             Ok(path) => path,
             Err(error) => return BlobEvent::Error(BlobError::ConversionError(error)),
         };
-        match operator.stat(&storage_path).await {
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return BlobEvent::HiddenDeleted;
-            }
-            Err(error) => return BlobEvent::Error(BlobError::DeleteError(error.to_string())),
-        }
-        if let Err(error) = operator.delete(&storage_path).await {
+        if let Err(error) = self.delete_path(&operator, &storage_path).await {
             return BlobEvent::Error(BlobError::DeleteError(error.to_string()));
         }
-        if let Err(error) = self
-            .decrement_bucket_load(&key.backend, &key.storage_bucket)
-            .await
-        {
+        if let Err(error) = self.release_hidden(&key).await {
             return BlobEvent::Error(error);
         }
         BlobEvent::HiddenDeleted
