@@ -109,6 +109,19 @@ impl S3Access for AuthProvider {
 
         // Fetch user access -> GetUserAccess state machine
         let user_access = self.query_user_access(&access_key_id).await?;
+        let Some(permit) = self
+            .rate_limits
+            .try_acquire_local(LocalKey::User(user_access.user_identity))
+        else {
+            return Err(s3_error!(SlowDown, "Reduce your request rate"));
+        };
+        let lease = cx
+            .extensions_mut()
+            .get::<LocalLease>()
+            .cloned()
+            .unwrap_or_default();
+        lease.replace(permit);
+        cx.extensions_mut().insert(lease);
 
         // Credentials are issuer-local and sealed at rest: s3s only had a secret
         // to verify this signature because `get_secret_key` unsealed it on the
@@ -157,22 +170,6 @@ impl S3Access for AuthProvider {
             .await
             .map_err(map_authorize_error)?;
         }
-
-        let Some(permit) = self
-            .rate_limits
-            .try_acquire_local(LocalKey::User(user_access.user_identity))
-        else {
-            return Err(s3_error!(SlowDown, "Reduce your request rate"));
-        };
-        let lease = cx
-            .extensions_mut()
-            .get::<LocalLease>()
-            .cloned()
-            .unwrap_or_default();
-        if !lease.hold(permit) {
-            return Err(s3_error!(SlowDown, "Reduce your request rate"));
-        }
-        cx.extensions_mut().insert(lease);
 
         cx.extensions_mut().insert(extras);
         cx.extensions_mut().insert(user_access);

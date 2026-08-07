@@ -5,8 +5,8 @@
 use crate::error::ErrorResponse;
 use crate::forwarded::client_ip;
 use crate::server_state::ServerState;
-use aruna_core::structs::AuthContext;
 use aruna_core::UserId;
+use aruna_core::structs::AuthContext;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -42,23 +42,59 @@ pub(crate) enum LocalKey {
 
 #[derive(Default)]
 struct LocalTable {
-    entries: HashMap<LocalKey, Weak<Semaphore>>,
+    entries: HashMap<LocalKey, Arc<Semaphore>>,
 }
 
 impl LocalTable {
-    fn try_acquire(&mut self, key: LocalKey) -> Option<OwnedSemaphorePermit> {
-        if let Some(semaphore) = self.entries.get(&key).and_then(Weak::upgrade) {
-            return semaphore.try_acquire_owned().ok();
-        }
-        if self.entries.len() >= LOCAL_TABLE_LIMIT {
-            self.entries.retain(|_, entry| entry.strong_count() != 0);
-            if self.entries.len() >= LOCAL_TABLE_LIMIT {
-                return None;
+    fn try_acquire(&mut self, key: LocalKey, table: &Arc<Mutex<Self>>) -> Option<LocalPermit> {
+        let semaphore = match self.entries.get(&key) {
+            Some(semaphore) => Arc::clone(semaphore),
+            None => {
+                if self.entries.len() >= LOCAL_TABLE_LIMIT {
+                    return None;
+                }
+                let semaphore = Arc::new(Semaphore::new(LOCAL_PERMITS));
+                self.entries.insert(key, Arc::clone(&semaphore));
+                semaphore
             }
+        };
+        let permit = semaphore.clone().try_acquire_owned().ok()?;
+        Some(LocalPermit {
+            permit: Some(permit),
+            table: Arc::downgrade(table),
+            key,
+            semaphore,
+        })
+    }
+}
+
+pub(crate) struct LocalPermit {
+    permit: Option<OwnedSemaphorePermit>,
+    table: Weak<Mutex<LocalTable>>,
+    key: LocalKey,
+    semaphore: Arc<Semaphore>,
+}
+
+impl Drop for LocalPermit {
+    fn drop(&mut self) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        drop(permit);
+        let Some(table) = self.table.upgrade() else {
+            return;
+        };
+        let mut table = table
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.semaphore.available_permits() == LOCAL_PERMITS
+            && table
+                .entries
+                .get(&self.key)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &self.semaphore))
+        {
+            table.entries.remove(&self.key);
         }
-        let semaphore = Arc::new(Semaphore::new(LOCAL_PERMITS));
-        self.entries.insert(key, Arc::downgrade(&semaphore));
-        semaphore.try_acquire_owned().ok()
     }
 }
 
@@ -66,10 +102,10 @@ impl LocalTable {
 /// response body. The server may clone this slot before handing the request to
 /// s3s and move its clone into the response wrapper.
 #[derive(Clone, Default)]
-pub(crate) struct LocalLease(Arc<Mutex<Vec<OwnedSemaphorePermit>>>);
+pub(crate) struct LocalLease(Arc<Mutex<Vec<LocalPermit>>>);
 
 impl LocalLease {
-    pub(crate) fn hold(&self, permit: OwnedSemaphorePermit) -> bool {
+    pub(crate) fn hold(&self, permit: LocalPermit) -> bool {
         let mut slot = self
             .0
             .lock()
@@ -79,6 +115,16 @@ impl LocalLease {
         }
         slot.push(permit);
         true
+    }
+
+    pub(crate) fn replace(&self, permit: LocalPermit) {
+        let mut slot = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::mem::replace(&mut *slot, vec![permit]);
+        drop(slot);
+        drop(previous);
     }
 }
 
@@ -93,7 +139,7 @@ pub struct ApiRateLimits {
     per_principal: Keyed<String>,
     clock: DefaultClock,
     checks: AtomicU64,
-    local: Mutex<LocalTable>,
+    local: Arc<Mutex<LocalTable>>,
 }
 
 impl Default for ApiRateLimits {
@@ -121,15 +167,16 @@ impl ApiRateLimits {
             per_principal: RateLimiter::keyed(quota(principal_per_minute, burst)),
             clock: DefaultClock::default(),
             checks: AtomicU64::new(0),
-            local: Mutex::new(LocalTable::default()),
+            local: Arc::new(Mutex::new(LocalTable::default())),
         }
     }
 
-    pub(crate) fn try_acquire_local(&self, key: LocalKey) -> Option<OwnedSemaphorePermit> {
-        self.local
+    pub(crate) fn try_acquire_local(&self, key: LocalKey) -> Option<LocalPermit> {
+        let local = Arc::clone(&self.local);
+        local
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .try_acquire(key)
+            .try_acquire(key, &local)
     }
 
     /// Tight quotas for tests that must observe a denial quickly.
@@ -240,9 +287,9 @@ fn too_many_requests(retry_after: u64) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiRateLimits, LocalKey, LocalLease, LOCAL_PERMITS, LOCAL_TABLE_LIMIT};
-    use aruna_core::structs::RealmId;
+    use super::{ApiRateLimits, LOCAL_PERMITS, LOCAL_TABLE_LIMIT, LocalKey, LocalLease};
     use aruna_core::UserId;
+    use aruna_core::structs::RealmId;
     use std::net::IpAddr;
     use std::str::FromStr;
     use ulid::Ulid;
@@ -309,16 +356,12 @@ mod tests {
     #[test]
     fn permits_distinct_users() {
         let limits = ApiRateLimits::default();
-        assert!(limits
-            .try_acquire_local(LocalKey::User(user(1)))
-            .is_some());
-        assert!(limits
-            .try_acquire_local(LocalKey::User(user(2)))
-            .is_some());
+        assert!(limits.try_acquire_local(LocalKey::User(user(1))).is_some());
+        assert!(limits.try_acquire_local(LocalKey::User(user(2))).is_some());
     }
 
     #[test]
-    fn prunes_dead_local() {
+    fn reclaims_local() {
         let limits = ApiRateLimits::default();
         let mut permits = Vec::with_capacity(LOCAL_TABLE_LIMIT);
         for number in 0..LOCAL_TABLE_LIMIT as u128 {
@@ -328,13 +371,17 @@ mod tests {
                     .expect("table entry permit"),
             );
         }
-        assert!(limits
-            .try_acquire_local(LocalKey::User(user(LOCAL_TABLE_LIMIT as u128)))
-            .is_none());
+        assert!(
+            limits
+                .try_acquire_local(LocalKey::User(user(LOCAL_TABLE_LIMIT as u128)))
+                .is_none()
+        );
         drop(permits);
-        assert!(limits
-            .try_acquire_local(LocalKey::User(user(LOCAL_TABLE_LIMIT as u128)))
-            .is_some());
+        assert!(
+            limits
+                .try_acquire_local(LocalKey::User(user(LOCAL_TABLE_LIMIT as u128)))
+                .is_some()
+        );
     }
 
     #[test]
@@ -352,6 +399,26 @@ mod tests {
         assert!(limits.try_acquire_local(key).is_none());
         drop(clone);
         assert!(limits.try_acquire_local(key).is_some());
+        drop(permits);
+    }
+
+    #[test]
+    fn replaces_lease() {
+        let limits = ApiRateLimits::default();
+        let ip = LocalKey::Ip(IpAddr::from_str("203.0.113.11").unwrap());
+        let user_key = LocalKey::User(user(4));
+        let lease = LocalLease::default();
+        assert!(lease.hold(limits.try_acquire_local(ip).expect("ip permit")));
+        lease.replace(limits.try_acquire_local(user_key).expect("user permit"));
+        assert!(limits.try_acquire_local(ip).is_some());
+
+        let mut permits = Vec::new();
+        for _ in 0..LOCAL_PERMITS - 1 {
+            permits.push(limits.try_acquire_local(user_key).expect("user permit"));
+        }
+        assert!(limits.try_acquire_local(user_key).is_none());
+        drop(lease);
+        assert!(limits.try_acquire_local(user_key).is_some());
         drop(permits);
     }
 }
