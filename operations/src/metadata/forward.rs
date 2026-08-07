@@ -302,6 +302,8 @@ pub async fn get_metadata_routed(
     let holders = resolve_shard_holders(&config, &placement);
     let holder_count = holders.len();
     let mut not_found = 0usize;
+    let mut success = None;
+    let mut auth_error = None;
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     if local_node.is_some_and(|node| holders.contains(&node)) {
         match get_visible_metadata_document(context.as_ref(), realm_id, request.clone()).await {
@@ -314,63 +316,76 @@ pub async fn get_metadata_routed(
                     &record,
                 ) =>
             {
-                return Ok(record);
+                success = Some(record);
             }
             Ok(_) => {}
             Err(MetadataApiError::NotFound) => not_found += 1,
             Err(MetadataApiError::ServiceUnavailable) => {}
+            Err(error @ (MetadataApiError::Unauthorized | MetadataApiError::Forbidden)) => {
+                auth_error.get_or_insert(error);
+            }
             Err(error) => return Err(error),
         }
     }
-    if holder_count > 0 && not_found == holder_count {
-        return Err(MetadataApiError::NotFound);
-    }
-    let metadata = context
-        .metadata_handle
-        .as_ref()
-        .ok_or(MetadataApiError::ServiceUnavailable)?;
-    for holder in holders
-        .into_iter()
-        .filter(|holder| Some(*holder) != local_node)
-    {
-        let response = metadata
-            .request_forwarded_write(
-                holder,
-                MetadataTransportMessage::ForwardReadDocument {
-                    auth_token: auth_token.clone(),
-                    config_digest,
-                    document_id: request.document_id,
-                },
-            )
-            .await;
-        match response {
-            Ok(MetadataTransportMessage::ForwardedRead { result: Ok(record) }) => {
-                if routed_record_matches(
-                    &config,
-                    realm_id,
-                    request.document_id,
-                    &placement,
-                    &record,
-                ) {
-                    return Ok(*record);
+    if let Some(metadata) = context.metadata_handle.as_ref() {
+        for holder in holders
+            .into_iter()
+            .filter(|holder| Some(*holder) != local_node)
+        {
+            let response = metadata
+                .request_forwarded_write(
+                    holder,
+                    MetadataTransportMessage::ForwardReadDocument {
+                        auth_token: auth_token.clone(),
+                        config_digest,
+                        document_id: request.document_id,
+                    },
+                )
+                .await;
+            match response {
+                Ok(MetadataTransportMessage::ForwardedRead { result: Ok(record) }) => {
+                    if success.is_none()
+                        && routed_record_matches(
+                            &config,
+                            realm_id,
+                            request.document_id,
+                            &placement,
+                            &record,
+                        )
+                    {
+                        success = Some(*record);
+                    }
                 }
+                Ok(MetadataTransportMessage::ForwardedRead {
+                    result: Err(MetadataReadError::Unauthorized),
+                }) => {
+                    auth_error.get_or_insert(MetadataApiError::Unauthorized);
+                }
+                Ok(MetadataTransportMessage::ForwardedRead {
+                    result: Err(MetadataReadError::Forbidden),
+                }) => {
+                    auth_error.get_or_insert(MetadataApiError::Forbidden);
+                }
+                Ok(MetadataTransportMessage::ForwardedRead {
+                    result: Err(MetadataReadError::NotFound),
+                }) => not_found += 1,
+                Ok(MetadataTransportMessage::ForwardedRead {
+                    result: Err(MetadataReadError::Unavailable),
+                })
+                | Ok(MetadataTransportMessage::Reject(_))
+                | Err(_) => {}
+                Ok(_) => {}
             }
-            Ok(MetadataTransportMessage::ForwardedRead {
-                result: Err(MetadataReadError::Unauthorized),
-            }) => return Err(MetadataApiError::Unauthorized),
-            Ok(MetadataTransportMessage::ForwardedRead {
-                result: Err(MetadataReadError::Forbidden),
-            }) => return Err(MetadataApiError::Forbidden),
-            Ok(MetadataTransportMessage::ForwardedRead {
-                result: Err(MetadataReadError::NotFound),
-            }) => not_found += 1,
-            Ok(MetadataTransportMessage::ForwardedRead {
-                result: Err(MetadataReadError::Unavailable),
-            })
-            | Ok(MetadataTransportMessage::Reject(_))
-            | Err(_) => {}
-            Ok(_) => {}
         }
+    }
+    if let Some(error) = auth_error {
+        return Err(error);
+    }
+    if success.is_some() && not_found > 0 {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    if let Some(record) = success {
+        return Ok(record);
     }
     if holder_count > 0 && not_found == holder_count {
         Err(MetadataApiError::NotFound)
@@ -404,53 +419,66 @@ pub async fn export_rocrate_routed(
     let holders = resolve_shard_holders(&config, &placement);
     let holder_count = holders.len();
     let mut not_found = 0usize;
+    let mut success = None;
+    let mut auth_error = None;
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     if local_node.is_some_and(|node| holders.contains(&node)) {
         match export_metadata_rocrate(context.as_ref(), realm_id, request.clone()).await {
             Ok(result) => {
                 ensure_export_limit(&result, metadata_bytes)?;
-                return Ok(result);
+                success = Some(result);
             }
             Err(MetadataApiError::NotFound) => not_found += 1,
             Err(MetadataApiError::ServiceUnavailable) => {}
+            Err(error @ (MetadataApiError::Unauthorized | MetadataApiError::Forbidden)) => {
+                auth_error.get_or_insert(error);
+            }
             Err(error) => return Err(error),
         }
     }
-    if holder_count > 0 && not_found == holder_count {
-        return Err(MetadataApiError::NotFound);
-    }
-    let metadata = context
-        .metadata_handle
-        .as_ref()
-        .ok_or(MetadataApiError::ServiceUnavailable)?;
-    for holder in holders
-        .into_iter()
-        .filter(|holder| Some(*holder) != local_node)
-    {
-        let response = metadata
-            .request_export(
-                holder,
-                MetadataTransportMessage::ForwardExportDocument {
-                    auth_token: forward_token.clone(),
-                    config_digest,
-                    document_id: request.document_id,
-                    view: request.view,
-                    metadata_bytes,
-                    limit: request.limit,
-                    offset: request.offset,
-                    after: request.after.clone(),
-                },
-            )
-            .await;
-        match response {
-            Ok(Ok(export)) => return Ok(export),
-            Ok(Err(MetadataReadError::Unauthorized)) => {
-                return Err(MetadataApiError::Unauthorized);
+    if let Some(metadata) = context.metadata_handle.as_ref() {
+        for holder in holders
+            .into_iter()
+            .filter(|holder| Some(*holder) != local_node)
+        {
+            let response = metadata
+                .request_export(
+                    holder,
+                    MetadataTransportMessage::ForwardExportDocument {
+                        auth_token: forward_token.clone(),
+                        config_digest,
+                        document_id: request.document_id,
+                        view: request.view,
+                        metadata_bytes,
+                        limit: request.limit,
+                        offset: request.offset,
+                        after: request.after.clone(),
+                    },
+                )
+                .await;
+            match response {
+                Ok(Ok(export)) => {
+                    success.get_or_insert(export);
+                }
+                Ok(Err(MetadataReadError::Unauthorized)) => {
+                    auth_error.get_or_insert(MetadataApiError::Unauthorized);
+                }
+                Ok(Err(MetadataReadError::Forbidden)) => {
+                    auth_error.get_or_insert(MetadataApiError::Forbidden);
+                }
+                Ok(Err(MetadataReadError::NotFound)) => not_found += 1,
+                Ok(Err(MetadataReadError::Unavailable)) | Err(_) => {}
             }
-            Ok(Err(MetadataReadError::Forbidden)) => return Err(MetadataApiError::Forbidden),
-            Ok(Err(MetadataReadError::NotFound)) => not_found += 1,
-            Ok(Err(MetadataReadError::Unavailable)) | Err(_) => {}
         }
+    }
+    if let Some(error) = auth_error {
+        return Err(error);
+    }
+    if success.is_some() && not_found > 0 {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    if let Some(export) = success {
+        return Ok(export);
     }
     if holder_count > 0 && not_found == holder_count {
         Err(MetadataApiError::NotFound)
