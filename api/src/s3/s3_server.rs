@@ -48,11 +48,6 @@ const DELETE_OBJECTS_MAX_BODY: usize = 2 * 1024 * 1024;
 const DELETE_CAPTURE_LIMIT: usize = 16;
 const EGRESS_LIMIT: usize = 256;
 const CONTROL_EGRESS_LIMIT: usize = 64;
-const MAX_H2_STREAMS: u32 = 32;
-
-fn h2_stream_limit(max_requests: usize) -> u32 {
-    max_requests.clamp(1, MAX_H2_STREAMS as usize) as u32
-}
 
 /// Concurrent S3 connections served at once; connections at capacity are
 /// dropped so a flood cannot spawn unbounded connection tasks.
@@ -303,7 +298,6 @@ pub struct S3Server {
     read_limit: Arc<Semaphore>,
     mutation_limit: Arc<Semaphore>,
     capture_limit: Arc<Semaphore>,
-    max_requests: usize,
     trusted_proxies: Arc<Vec<ipnet::IpNet>>,
 }
 
@@ -652,7 +646,6 @@ impl S3Server {
             read_limit: Arc::new(Semaphore::new(EGRESS_LIMIT)),
             mutation_limit: Arc::new(Semaphore::new(CONTROL_EGRESS_LIMIT)),
             capture_limit: Arc::new(Semaphore::new(DELETE_CAPTURE_LIMIT)),
-            max_requests: DEFAULT_S3_MAX_CONCURRENT_REQUESTS,
             trusted_proxies: Arc::new(Vec::new()),
         })
     }
@@ -665,7 +658,6 @@ impl S3Server {
         self.read_limit = Arc::new(Semaphore::new(max_requests.clamp(1, EGRESS_LIMIT)));
         self.mutation_limit = Arc::new(Semaphore::new(max_requests.clamp(1, CONTROL_EGRESS_LIMIT)));
         self.capture_limit = Arc::new(Semaphore::new(max_requests.clamp(1, DELETE_CAPTURE_LIMIT)));
-        self.max_requests = max_requests.max(1);
         self
     }
 
@@ -705,7 +697,6 @@ impl S3Server {
     ) -> Result<(SocketAddr, JoinHandle<()>), S3ServerError> {
         let local_addr = listener.local_addr()?;
         let connection_limit = self.connection_limit.clone();
-        let max_streams = h2_stream_limit(self.max_requests);
         let service = WrappingService {
             shared: self.s3service,
             cors: self.cors,
@@ -721,15 +712,11 @@ impl S3Server {
             activity: None,
             trusted_proxies: self.trusted_proxies,
         };
-        let mut connection = ConnBuilder::new(TokioExecutor::new());
+        let mut connection = ConnBuilder::new(TokioExecutor::new()).http1_only();
         connection
             .http1()
             .timer(hyper_util::rt::TokioTimer::new())
             .header_read_timeout(INITIAL_REQUEST_TIMEOUT);
-        connection
-            .http2()
-            .max_concurrent_streams(max_streams)
-            .keep_alive_interval(None);
 
         let server = async move {
             loop {
@@ -907,8 +894,8 @@ impl Service<Request<Incoming>> for WrappingService {
             let request_permit = match request_limit.try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => {
-                    // Dropping the request lets hyper drain or close HTTP/1
-                    // bodies and reset HTTP/2 streams without desynchronizing.
+                    // Dropping the request lets the transport drain or close
+                    // bodies without desynchronizing the next request.
                     drop(s3s_request);
                     let response = slow_down_response(1);
                     let code = response.status().as_u16();
@@ -1744,9 +1731,10 @@ mod tests {
     }
 
     #[test]
-    fn caps_h2_streams() {
-        assert_eq!(h2_stream_limit(1), 1);
-        assert_eq!(h2_stream_limit(512), MAX_H2_STREAMS);
+    fn accepts_http1_only() {
+        let builder = ConnBuilder::new(TokioExecutor::new()).http1_only();
+        assert!(builder.is_http1_available());
+        assert!(!builder.is_http2_available());
     }
 
     #[tokio::test]
