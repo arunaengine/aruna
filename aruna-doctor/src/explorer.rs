@@ -15,6 +15,7 @@ use aruna_core::keyspaces::{
     S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
     S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
     SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
+    USER_ACCESS_OWNER_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
@@ -962,7 +963,7 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
     })
 }
 
-fn defined_keyspaces() -> [&'static str; 31] {
+fn defined_keyspaces() -> [&'static str; 32] {
     [
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
         ADMIN_DOCUMENT_STATE_KEYSPACE,
@@ -995,6 +996,7 @@ fn defined_keyspaces() -> [&'static str; 31] {
         SOURCE_CONNECTOR_SECRET_KEYSPACE,
         SYNC_PLACEMENT_KEYSPACE,
         USER_ACCESS_KEYSPACE,
+        USER_ACCESS_OWNER_KEYSPACE,
     ]
 }
 
@@ -1489,6 +1491,7 @@ mod tests {
         S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
         S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
         SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
+        USER_ACCESS_OWNER_KEYSPACE,
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_core::structs::{
@@ -1666,6 +1669,7 @@ mod tests {
             SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
             SYNC_PLACEMENT_KEYSPACE.to_string(),
             USER_ACCESS_KEYSPACE.to_string(),
+            USER_ACCESS_OWNER_KEYSPACE.to_string(),
         ];
         expected_missing.sort();
         assert_eq!(missing, expected_missing);
