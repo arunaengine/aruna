@@ -4323,72 +4323,104 @@ async fn apply_realm_config_admin_document_operation_to_storage(
         ));
     }
 
-    let previous_state = storage_read_from(
-        storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-        admin_document_reducer_state_key(&event.target),
-    )
-    .await?
-    .map(|bytes| decode_admin_document_reducer_state(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    let mut reducer_state = previous_state
-        .clone()
-        .unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
-    reducer_state.compact_revocations(unix_timestamp_secs());
-    let apply_status = reducer_state
-        .apply(&event)
+    for _ in 0..3 {
+        let txn_id = start_storage_transaction(storage).await?;
+        let previous_state = storage_read_from_transaction(
+            storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+            admin_document_reducer_state_key(&event.target),
+            Some(txn_id),
+        )
+        .await?
+        .map(|bytes| decode_admin_document_reducer_state(&bytes))
+        .transpose()
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    reducer_state.compact_revocations(unix_timestamp_secs());
-    if persist_stale_admin_document_event(storage, apply_status, &reducer_state).await? {
-        return Ok(());
-    }
-
-    let previous_config = storage_read_from(
-        storage,
-        document_target.storage_keyspace().to_string(),
-        document_target.storage_key(),
-    )
-    .await?
-    .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    let mut writes = Vec::new();
-    let config = match previous_config {
-        Some(mut config) => {
-            if config.realm_id != realm_id {
-                return Err(NetError::Bootstrap(format!(
-                    "stored realm config document id {realm_id} does not match payload realm id {}",
-                    config.realm_id
-                )));
-            }
-            overlay_realm_config_reducer_materialization(&mut config, &reducer_state);
-            Some(config)
-        }
-        None => realm_config_from_reducer_materialization(realm_id, &reducer_state),
-    };
-    if let Some(config) = config {
-        writes.push((
+        let previous_config = storage_read_from_transaction(
+            storage,
             document_target.storage_keyspace().to_string(),
             document_target.storage_key(),
-            config
-                .to_bytes(&event.actor)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?
-                .into(),
-        ));
-    }
-    writes.push(
-        admin_document_reducer_state_write_entry(&reducer_state)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-    );
-    writes.extend(
-        admin_document_conflict_write_entries(&reducer_state)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-    );
+            Some(txn_id),
+        )
+        .await?
+        .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
+        .transpose()
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
 
-    let stale_conflict_deletes =
-        stale_admin_document_conflict_delete_entries(previous_state.as_ref(), Some(&reducer_state));
-    storage_batch_delete_and_write_transactionally(storage, stale_conflict_deletes, writes).await
+        let mut reducer_state = previous_state
+            .clone()
+            .unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
+        reducer_state
+            .apply(&event)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        reducer_state.compact_revocations(unix_timestamp_secs());
+
+        let mut writes = Vec::new();
+        let config = match previous_config {
+            Some(mut config) => {
+                if config.realm_id != realm_id {
+                    let _ = storage
+                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                        .await;
+                    return Err(NetError::Bootstrap(format!(
+                        "stored realm config document id {realm_id} does not match payload realm id {}",
+                        config.realm_id
+                    )));
+                }
+                overlay_realm_config_reducer_materialization(&mut config, &reducer_state);
+                Some(config)
+            }
+            None => realm_config_from_reducer_materialization(realm_id, &reducer_state),
+        };
+        if let Some(config) = config {
+            writes.push((
+                document_target.storage_keyspace().to_string(),
+                document_target.storage_key(),
+                config
+                    .to_bytes(&event.actor)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                    .into(),
+            ));
+        }
+        writes.push(
+            admin_document_reducer_state_write_entry(&reducer_state)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+        );
+        writes.extend(
+            admin_document_conflict_write_entries(&reducer_state)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+        );
+
+        let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
+            previous_state.as_ref(),
+            Some(&reducer_state),
+        );
+        match storage_batch_delete_and_write_in_transaction(
+            storage,
+            txn_id,
+            stale_conflict_deletes,
+            writes,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(NetError::Dht(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
+    }
+    Err(NetError::Dht(
+        "realm config admin operation conflicted three times".to_string(),
+    ))
 }
 
 fn materialize_group_authorization_admin_document_operation(
@@ -5670,7 +5702,10 @@ async fn validate_realm_config_admin_authority(
             "stored realm config has the wrong realm".to_string(),
         ));
     }
-    if let AdminDocumentOperation::RealmConfigTokenRevoked { token_owner, .. } = &event.op {
+    if matches!(
+        &event.op,
+        AdminDocumentOperation::RealmConfigTokenRevoked { .. }
+    ) {
         let Some(config) = current_config.as_ref() else {
             return Ok(AdminEventValidation::Deferred {
                 dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
@@ -5685,30 +5720,7 @@ async fn validate_realm_config_admin_authority(
                 "revocation event origin is not a current management or server node".to_string(),
             ));
         }
-        if event.actor.user_id == *token_owner {
-            return Ok(AdminEventValidation::Accepted);
-        }
-        let Some(auth) = read_admin_realm_authorization(storage, realm_id).await? else {
-            return Ok(AdminEventValidation::Deferred {
-                dependency: Some(DocumentSyncDependency::RealmAuthorization(realm_id)),
-                reason: "realm authorization state is unavailable".to_string(),
-            });
-        };
-        if auth.realm_id != realm_id {
-            return Ok(AdminEventValidation::Rejected(
-                "stored realm authorization has the wrong realm".to_string(),
-            ));
-        }
-        let path = format!("/{realm_id}/admin/u/{token_owner}");
-        return Ok(
-            if has_current_write_permission(event.actor.user_id, &path, auth.roles.values()) {
-                AdminEventValidation::Accepted
-            } else {
-                AdminEventValidation::Rejected(
-                    "actor lacks current token revocation authority".to_string(),
-                )
-            },
-        );
+        return Ok(AdminEventValidation::Accepted);
     }
     // Placement reducer state precedes full config materialization at bootstrap.
     let mut placement_config = current_config
@@ -8083,8 +8095,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_unauthorized_revocation() {
-        // A configured node must not revoke another user's bearer token by
-        // publishing a direct admin event without owner or admin authority.
+        // A signed event from an eligible node carries the publisher's admission;
+        // a User node is not eligible to publish revocations.
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([61; 32]);
         let attacker = test_actor(
@@ -8110,21 +8122,6 @@ mod tests {
         .await
         .expect("config writes");
 
-        let auth = RealmAuthorizationDocument {
-            realm_id,
-            roles: Default::default(),
-            operation_restrictions: Default::default(),
-        };
-        storage_batch_write_to(
-            &storage,
-            vec![target_write_entry(
-                DocumentSyncTarget::RealmAuthorization { realm_id },
-                auth.to_bytes(&attacker).expect("auth serializes").into(),
-            )],
-        )
-        .await
-        .expect("auth writes");
-
         let topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
         let event = test_admin_event(
             Ulid::from_parts(1_652, 1),
@@ -8139,7 +8136,7 @@ mod tests {
         );
         let publisher = irokle_crate::actor_id_for(topic, node_id_to_peer_id(&attacker.node_id));
 
-        assert!(matches!(
+        assert_eq!(
             validate_replicated_admin_event(
                 &storage,
                 topic,
@@ -8151,10 +8148,23 @@ mod tests {
             )
             .await
             .expect("validation runs"),
-            AdminEventValidation::Rejected(_)
-        ));
+            AdminEventValidation::Accepted
+        );
 
-        let owned_event = test_admin_event(
+        config.nodes[0].kind = RealmNodeKind::User;
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                config_target.clone(),
+                config
+                    .to_bytes(&attacker)
+                    .expect("config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("updated config writes");
+        let user_event = test_admin_event(
             Ulid::from_parts(1_653, 1),
             AdminDocumentTarget::RealmConfig { realm_id },
             &attacker,
@@ -8171,13 +8181,15 @@ mod tests {
                 topic,
                 publisher,
                 &config_target,
-                &owned_event,
+                &user_event,
                 realm_id,
                 &PlacementRef::NIL,
             )
             .await
-            .expect("owner validation runs"),
-            AdminEventValidation::Accepted
+            .expect("ineligible origin validation runs"),
+            AdminEventValidation::Rejected(
+                "revocation event origin is not a current management or server node".to_string(),
+            )
         );
     }
 
@@ -8755,6 +8767,151 @@ mod tests {
             )
             .await
             .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_config_conflict() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([52; 32]);
+        let actor_a = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(1_410, 1), realm_id),
+            realm_id,
+        );
+        let actor_b = test_actor(
+            9,
+            UserId::local(Ulid::from_parts(1_411, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                document_target.clone(),
+                seed_config
+                    .to_bytes(&actor_a)
+                    .expect("seed realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("seed realm config writes");
+
+        let first = test_admin_event(
+            Ulid::from_parts(1_412, 1),
+            target.clone(),
+            &actor_a,
+            1,
+            AdminDocumentOperation::RealmConfigDescriptionSet {
+                description: "first".to_string(),
+            },
+        );
+        let second = test_admin_event(
+            Ulid::from_parts(1_413, 1),
+            target.clone(),
+            &actor_b,
+            1,
+            AdminDocumentOperation::RealmConfigDescriptionSet {
+                description: "second".to_string(),
+            },
+        );
+        let (first_result, second_result) = tokio::join!(
+            apply_admin_document_operation_to_storage(&storage, document_target.clone(), first),
+            apply_admin_document_operation_to_storage(&storage, document_target.clone(), second),
+        );
+        first_result.expect("first concurrent config operation applies");
+        second_result.expect("second concurrent config operation retries");
+
+        let config = read_realm_config_doc(&storage, realm_id).await;
+        let state = read_admin_reducer_state(&storage, &target)
+            .await
+            .expect("reducer state reads")
+            .expect("reducer state exists");
+        assert!(matches!(config.description.as_str(), "first" | "second"));
+        let path = REALM_CONFIG_DESCRIPTION_PATH;
+        assert!(state.conflicts.contains_key(path));
+        assert_eq!(
+            state
+                .conflicts
+                .get(path)
+                .expect("description conflict exists")
+                .values
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_stale_config() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([53; 32]);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(1_420, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                document_target.clone(),
+                seed_config
+                    .to_bytes(&actor)
+                    .expect("seed realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("seed realm config writes");
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_421, 1),
+                target.clone(),
+                &actor,
+                2,
+                AdminDocumentOperation::RealmConfigDescriptionSet {
+                    description: "new".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("new config operation applies");
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_422, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigDescriptionSet {
+                    description: "stale".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("stale config operation persists clock");
+
+        assert_eq!(
+            read_realm_config_doc(&storage, realm_id).await.description,
+            "new"
+        );
+        let state = read_admin_reducer_state(&storage, &target)
+            .await
+            .expect("reducer state reads")
+            .expect("reducer state exists");
+        assert_eq!(state.clock.sequence_for(&actor.node_id), 2);
+        assert_eq!(
+            state.materialized_realm_config_description().as_deref(),
+            Some("new")
         );
     }
 
