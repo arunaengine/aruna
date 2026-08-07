@@ -51,12 +51,13 @@ use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
 use async_trait::async_trait;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use ulid::Ulid;
 
 const METADATA_DOCUMENT_SYNC_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const METADATA_DOCUMENT_SYNC_MAINTENANCE_JITTER_SECS: u64 = 15;
+const INBOUND_BAO_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct OperationsInboundHandler {
@@ -588,23 +589,43 @@ impl InboundEventHandler for OperationsInboundHandler {
                         };
                         // #332: only an authenticated sync-eligible realm peer
                         // may open the blob replication plane at all.
-                        if !self
-                            .peer_sync_eligible(*net_handle.realm_id(), node_id)
-                            .await
+                        let stream_id = match timeout(
+                            INBOUND_BAO_TIMEOUT,
+                            blob_handle.store_connection(node_id, stream),
+                        )
+                        .await
                         {
-                            warn!(peer = %node_id, "Rejecting bao stream from non-sync-eligible peer");
-                            return;
-                        }
-                        let stream_id = match blob_handle.store_connection(node_id, stream).await {
-                            Ok(stream_id) => stream_id,
-                            Err(err) => {
+                            Ok(Ok(stream_id)) => stream_id,
+                            Ok(Err(err)) => {
                                 error!(peer = %node_id, error = ?err, "Failed to register inbound bao stream");
                                 return;
                             }
+                            Err(_) => {
+                                warn!(peer = %node_id, "Timed out registering inbound bao stream");
+                                return;
+                            }
                         };
+                        let eligible = timeout(
+                            INBOUND_BAO_TIMEOUT,
+                            self.peer_sync_eligible(*net_handle.realm_id(), node_id),
+                        )
+                        .await
+                        .unwrap_or(false);
+                        if !eligible {
+                            warn!(peer = %node_id, "Rejecting bao stream from non-sync-eligible peer");
+                            close_failed_bao(&blob_handle, stream_id).await;
+                            return;
+                        }
                         let first_event = blob_handle
-                            .send_blob_effect(BlobEffect::ReadMessage { stream_id })
-                            .await;
+                            .send_blob_effect(BlobEffect::ReadMessage { stream_id });
+                        let first_event = match timeout(INBOUND_BAO_TIMEOUT, first_event).await {
+                            Ok(event) => event,
+                            Err(_) => {
+                                warn!(peer = %node_id, stream_id = %stream_id, "Timed out reading inbound bao control message");
+                                close_failed_bao(&blob_handle, stream_id).await;
+                                return;
+                            }
+                        };
 
                         match first_event {
                             Event::Blob(BlobEvent::MessageReceived { payload, .. }) => {
@@ -675,6 +696,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                                             }
                                             Ok(Err(err)) | Err(err) => {
                                                 error!(error = ?err, "Failed to process inbound version replication stream");
+                                                close_failed_bao(&blob_handle, stream_id).await;
                                             }
                                         }
                                     }
@@ -713,6 +735,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                                                 error = ?error,
                                                 "Failed to process inbound bao read"
                                             );
+                                            close_failed_bao(&blob_handle, stream_id).await;
                                         }
                                     }
                                     Ok(VersionReplicationMessage::LocationSummaryRequest(
@@ -747,6 +770,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                                                 error = ?error,
                                                 "Failed to answer inbound location summary"
                                             );
+                                            close_failed_bao(&blob_handle, stream_id).await;
                                         }
                                     }
                                     _ => {

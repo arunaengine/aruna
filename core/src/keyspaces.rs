@@ -44,6 +44,7 @@ pub const BLOB_HEAD_KEYSPACE: &str = "blob_heads";
 pub const BLOB_VERSIONS_KEYSPACE: &str = "blob_versions";
 pub const HASH_PATHS_INDEX_KEYSPACE: &str = "hash_paths_index";
 pub const USER_ACCESS_KEYSPACE: &str = "user_access";
+pub const USER_ACCESS_OWNER_KEYSPACE: &str = "user_access_owner";
 pub const S3_BUCKET_KEYSPACE: &str = "s3_buckets";
 pub const SYNC_RELATIONSHIP_OUT_KEYSPACE: &str = "sync_relationship_out";
 pub const SYNC_RELATIONSHIP_IN_KEYSPACE: &str = "sync_relationship_in";

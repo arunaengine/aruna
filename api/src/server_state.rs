@@ -80,6 +80,7 @@ pub struct ServerState {
     // Peers allowed to set `x-forwarded-*`; empty means no proxy is trusted.
     trusted_proxies: Vec<ipnet::IpNet>,
     rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
+    rocrate_upload_slots: Arc<Semaphore>,
     download_slots: Arc<Semaphore>,
 }
 
@@ -186,6 +187,7 @@ impl ServerState {
             rocrate_limits: RoCrateLimits::default(),
             trusted_proxies: Vec::new(),
             rate_limits: Arc::new(crate::rate_limit::ApiRateLimits::default()),
+            rocrate_upload_slots: Arc::new(Semaphore::new(ROCRATE_UPLOAD_SLOTS)),
             download_slots: Arc::new(Semaphore::new(DOWNLOAD_SLOTS)),
         };
         state.persist_trusted_realms().await;
@@ -244,6 +246,10 @@ impl ServerState {
 
     pub fn rate_limits(&self) -> &crate::rate_limit::ApiRateLimits {
         &self.rate_limits
+    }
+
+    pub(crate) fn try_rocrate_slot(&self) -> Option<OwnedSemaphorePermit> {
+        self.rocrate_upload_slots.clone().try_acquire_owned().ok()
     }
 
 

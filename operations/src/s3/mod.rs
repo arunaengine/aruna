@@ -1,4 +1,5 @@
 pub mod abort_multipart_upload;
+mod access_index;
 pub mod bucket_cors;
 pub mod bucket_routing;
 pub mod complete_multipart_upload;
