@@ -368,12 +368,20 @@ impl PermissionRulesOperation {
         let got = format!("{event:?}");
         if let (
             PermissionRulesState::CollectRules,
-            Event::Storage(StorageEvent::TransactionCommitted { .. }),
+            Event::Storage(StorageEvent::TransactionCommitted { txn_id }),
         ) = (self.state, event)
         {
-            match self.emit_rules() {
-                Ok(effects) => effects,
-                Err(err) => self.fail(err),
+            if self.txn_id == Some(txn_id) {
+                match self.emit_rules() {
+                    Ok(effects) => effects,
+                    Err(err) => self.fail(err),
+                }
+            } else {
+                self.unexpected_event(
+                    self.state,
+                    "Event::Storage(StorageEvent::TransactionCommitted)",
+                    got,
+                )
             }
         } else {
             self.unexpected_event(
@@ -538,7 +546,18 @@ impl PermissionRulesOperation {
 
     fn fail_on_storage(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
-            return Err(self.fail(error.into()));
+            let cleanup = if matches!(self.state, PermissionRulesState::CollectRules)
+                && !matches!(
+                    &error,
+                    aruna_core::errors::StorageError::TransactionConflict
+                        | aruna_core::errors::StorageError::QueueFull
+                        | aruna_core::errors::StorageError::TransactionNotFound
+                ) {
+                smallvec![]
+            } else {
+                self.abort()
+            };
+            return Err(self.fail_with_cleanup(error.into(), cleanup));
         }
 
         Ok(event)
@@ -565,6 +584,9 @@ impl Operation for PermissionRulesOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if self.is_complete() {
+            return smallvec![];
+        }
         let event = match self.fail_on_storage(event) {
             Ok(event) => event,
             Err(effects) => return effects,

@@ -445,7 +445,9 @@ async fn dispatch_job_control(effect: JobControlEffect, context: &DriverContext)
 
 fn audit_nodes(nodes: Vec<NodeId>, batch: &mut AuditPageBatch) -> Option<BTreeSet<NodeId>> {
     if nodes.len() > MAX_AUDIT_PEERS {
-        batch.missing_overflow = batch.missing_overflow.max(1);
+        batch.missing_overflow = batch
+            .missing_overflow
+            .saturating_add(nodes.len().saturating_sub(MAX_AUDIT_PEERS));
         return None;
     }
     Some(nodes.into_iter().collect())
@@ -586,12 +588,30 @@ fn managed_effect(effect: &Effect) -> bool {
 #[derive(Default)]
 struct TransactionTracker {
     states: BTreeMap<TxnId, TransactionState>,
+    owner: Option<storage::StorageHandle>,
 }
 
 impl TransactionTracker {
+    fn new(owner: storage::StorageHandle) -> Self {
+        Self {
+            states: BTreeMap::new(),
+            owner: Some(owner),
+        }
+    }
+
     fn reject_start(&self, effect: Option<TransactionEffect>) -> bool {
         matches!(effect, Some(TransactionEffect::Start))
             && self.states.len() >= MAX_TRACKED_TRANSACTIONS
+    }
+
+    fn begin(&mut self, effect: Option<TransactionEffect>) {
+        if let Some(TransactionEffect::Commit(txn_id)) = effect
+            && self.states.contains_key(&txn_id)
+        {
+            // Once a commit request is handed to storage, cancellation must not
+            // turn its unknown outcome into an abort.
+            self.states.insert(txn_id, TransactionState::CommitUnknown);
+        }
     }
 
     fn observe(&mut self, effect: Option<TransactionEffect>, event: &Event) {
@@ -673,6 +693,31 @@ impl TransactionTracker {
             })
             .collect()
     }
+
+    fn blocked_abort(&self, txn_id: TxnId) -> bool {
+        matches!(
+            self.states.get(&txn_id),
+            Some(TransactionState::CommitUnknown)
+        )
+    }
+
+    fn retain(&self, txn_id: TxnId, state: TransactionState) {
+        let Some(owner) = self.owner.as_ref() else {
+            return;
+        };
+        let commit_unknown = matches!(state, TransactionState::CommitUnknown);
+        if !owner.retain_transaction(txn_id, commit_unknown) {
+            error!(%txn_id, commit_unknown, "Transaction cleanup handoff capacity reached");
+        }
+    }
+}
+
+impl Drop for TransactionTracker {
+    fn drop(&mut self) {
+        for (txn_id, state) in self.states.iter() {
+            self.retain(*txn_id, *state);
+        }
+    }
 }
 
 async fn abort_leaked_transaction(
@@ -681,6 +726,8 @@ async fn abort_leaked_transaction(
     depth: usize,
     deadline: Option<tokio::time::Instant>,
 ) {
+    let cleanup_deadline =
+        deadline.unwrap_or_else(|| tokio::time::Instant::now() + SUBOP_CLEANUP_TIMEOUT);
     for (txn_id, state) in tracker.pending() {
         let attempts = match state {
             TransactionState::Open => 2,
@@ -688,19 +735,17 @@ async fn abort_leaked_transaction(
             TransactionState::CommitUnknown => 0,
         };
         for attempt in 0..attempts {
+            if tokio::time::Instant::now() >= cleanup_deadline {
+                warn!(%txn_id, "Transaction cleanup deadline expired");
+                break;
+            }
             let effect = Effect::Storage(StorageEffect::AbortTransaction { txn_id });
-            let event = match deadline {
-                Some(deadline) => {
-                    let Ok(event) =
-                        tokio::time::timeout_at(deadline, dispatch_effect(effect, context, depth))
-                            .await
-                    else {
-                        warn!(%txn_id, "Transaction cleanup deadline expired");
-                        break;
-                    };
-                    event
-                }
-                None => dispatch_effect(effect, context, depth).await,
+            let Ok(event) =
+                tokio::time::timeout_at(cleanup_deadline, dispatch_effect(effect, context, depth))
+                    .await
+            else {
+                warn!(%txn_id, "Transaction cleanup deadline expired");
+                break;
             };
             tracker.observe(Some(TransactionEffect::Abort(txn_id)), &event);
             if !tracker.states.contains_key(&txn_id) {
@@ -710,8 +755,9 @@ async fn abort_leaked_transaction(
                 warn!(%txn_id, "Retrying failed transaction cleanup");
             }
         }
-        if tracker.states.remove(&txn_id).is_some() {
-            warn!(%txn_id, "Transaction cleanup failed");
+        if let Some(state) = tracker.states.get(&txn_id).copied() {
+            warn!(%txn_id, ?state, "Transaction cleanup handed off");
+            tracker.retain(txn_id, state);
         }
     }
 }
@@ -734,7 +780,7 @@ fn drive_suboperation<'a>(
             );
             let mut queue: VecDeque<_> = operation.start().into_iter().collect();
             let mut holds = Vec::new();
-            let mut tracker = TransactionTracker::default();
+            let mut tracker = TransactionTracker::new(context.storage_handle.clone());
             let mut expired = false;
             let mut committed = false;
             let mut cleanup_deadline = None;
@@ -742,6 +788,13 @@ fn drive_suboperation<'a>(
             while !operation.is_complete() {
                 while let Some(effect) = queue.pop_front() {
                     let transaction = transaction_effect(&effect);
+                    if let Some(TransactionEffect::Abort(txn_id)) = transaction
+                        && tracker.blocked_abort(txn_id)
+                    {
+                        warn!(%txn_id, "Skipping abort after an unknown commit outcome");
+                        continue;
+                    }
+                    tracker.begin(transaction);
                     hold_backends(context, &effect, &mut holds);
                     let event = if tracker.reject_start(transaction) {
                         warn!("Transaction tracker capacity reached");
@@ -763,7 +816,6 @@ fn drive_suboperation<'a>(
                         };
                         event
                     } else if let Some(deadline) = deadline {
-                        let nested = matches!(&effect, Effect::SubOperation(_));
                         let commit = matches!(transaction, Some(TransactionEffect::Commit(_)));
                         let managed = managed_effect(&effect);
                         let dispatch = Box::pin(dispatch_effect_until(
@@ -772,35 +824,64 @@ fn drive_suboperation<'a>(
                             depth,
                             Some(deadline),
                         ));
-                        if nested || managed || commit {
+                        if managed {
                             dispatch.await
                         } else {
-                            let Ok(event) = tokio::time::timeout_at(deadline, dispatch).await
-                            else {
-                                expired = true;
-                                cleanup_deadline =
-                                    Some(tokio::time::Instant::now() + SUBOP_CLEANUP_TIMEOUT);
-                                queue.clear();
-                                if !committed {
-                                    queue.extend(operation.abort());
+                            match tokio::time::timeout_at(deadline, dispatch).await {
+                                Ok(event) => event,
+                                Err(_) => {
+                                    expired = true;
+                                    cleanup_deadline =
+                                        Some(tokio::time::Instant::now() + SUBOP_CLEANUP_TIMEOUT);
+                                    queue.clear();
+                                    if commit {
+                                        Event::Storage(StorageEvent::Error {
+                                            error: StorageError::CommitFailed,
+                                        })
+                                    } else {
+                                        if !committed {
+                                            queue.extend(operation.abort().into_iter().filter(
+                                                |effect| {
+                                                    !matches!(
+                                                        transaction_effect(effect),
+                                                        Some(TransactionEffect::Abort(txn_id))
+                                                            if tracker.blocked_abort(txn_id)
+                                                    )
+                                                },
+                                            ));
+                                        }
+                                        continue;
+                                    }
                                 }
-                                continue;
-                            };
-                            event
+                            }
                         }
                     } else {
                         dispatch_effect(effect, context, depth).await
                     };
                     tracker.observe(transaction, &event);
                     committed |= commit_done(transaction, &event);
-                    queue.extend(operation.step(event));
+                    if !operation.is_complete() {
+                        queue.extend(operation.step(event).into_iter().filter(|effect| {
+                            !matches!(
+                                transaction_effect(effect),
+                                Some(TransactionEffect::Abort(txn_id))
+                                    if tracker.blocked_abort(txn_id)
+                            )
+                        }));
+                    }
                 }
 
                 if queue.is_empty() && !operation.is_complete() {
                     if expired {
                         break;
                     }
-                    queue.extend(operation.abort());
+                    queue.extend(operation.abort().into_iter().filter(|effect| {
+                        !matches!(
+                            transaction_effect(effect),
+                            Some(TransactionEffect::Abort(txn_id))
+                                if tracker.blocked_abort(txn_id)
+                        )
+                    }));
                     if queue.is_empty() {
                         break;
                     }
@@ -821,9 +902,8 @@ fn drive_suboperation<'a>(
     })
 }
 
-/// Drives an operation under one wall-clock deadline. On expiry the operation's
-/// own `abort` runs and its cleanup effects are dispatched unbounded; racing a
-/// timeout against `drive` instead drops the future and strands what it holds.
+/// Drives an operation under one wall-clock deadline. Cleanup after expiry is
+/// bounded and unresolved transaction ownership is handed to storage.
 #[tracing::instrument(
     name = "operation",
     level = "debug",
@@ -838,12 +918,20 @@ pub async fn drive_until<O: Operation>(
     let mut queue: VecDeque<_> = operation.start().into_iter().collect();
     let mut expired = false;
     let mut committed = false;
+    let mut cleanup_deadline = None;
     let mut holds = Vec::new();
-    let mut tracker = TransactionTracker::default();
+    let mut tracker = TransactionTracker::new(context.storage_handle.clone());
 
     while !operation.is_complete() {
         while let Some(effect) = queue.pop_front() {
             let transaction = transaction_effect(&effect);
+            if let Some(TransactionEffect::Abort(txn_id)) = transaction
+                && tracker.blocked_abort(txn_id)
+            {
+                warn!(%txn_id, "Skipping abort after an unknown commit outcome");
+                continue;
+            }
+            tracker.begin(transaction);
             hold_backends(context, &effect, &mut holds);
             let event = if tracker.reject_start(transaction) {
                 warn!("Transaction tracker capacity reached");
@@ -851,14 +939,23 @@ pub async fn drive_until<O: Operation>(
                     error: StorageError::TransactionConflict,
                 })
             } else if expired {
-                dispatch_effect(effect, context, 0).await
+                let Some(cleanup_deadline) = cleanup_deadline else {
+                    break;
+                };
+                let Ok(event) =
+                    tokio::time::timeout_at(cleanup_deadline, dispatch_effect(effect, context, 0))
+                        .await
+                else {
+                    queue.clear();
+                    break;
+                };
+                event
             } else {
-                let nested = matches!(&effect, Effect::SubOperation(_));
                 let commit = matches!(transaction, Some(TransactionEffect::Commit(_)));
                 let managed = managed_effect(&effect);
                 // The blob adapter owns the writer abort at its deadline.
                 let dispatch = Box::pin(dispatch_effect_until(effect, context, 0, Some(deadline)));
-                match if nested || managed || commit {
+                match if managed {
                     Ok(dispatch.await)
                 } else {
                     tokio::time::timeout_at(deadline, dispatch).await
@@ -870,30 +967,63 @@ pub async fn drive_until<O: Operation>(
                             operation = %type_name::<O>(),
                             "Operation deadline expired; running its abort path"
                         );
+                        cleanup_deadline =
+                            Some(tokio::time::Instant::now() + SUBOP_CLEANUP_TIMEOUT);
                         queue.clear();
-                        if !committed {
-                            queue.extend(operation.abort());
+                        if commit {
+                            Event::Storage(StorageEvent::Error {
+                                error: StorageError::CommitFailed,
+                            })
+                        } else {
+                            if !committed {
+                                queue.extend(operation.abort().into_iter().filter(|effect| {
+                                    !matches!(
+                                        transaction_effect(effect),
+                                        Some(TransactionEffect::Abort(txn_id))
+                                            if tracker.blocked_abort(txn_id)
+                                    )
+                                }));
+                            }
+                            continue;
                         }
-                        continue;
                     }
                 }
             };
             tracker.observe(transaction, &event);
             committed |= commit_done(transaction, &event);
-            queue.extend(operation.step(event));
+            if !operation.is_complete() {
+                queue.extend(operation.step(event).into_iter().filter(|effect| {
+                    !matches!(
+                        transaction_effect(effect),
+                        Some(TransactionEffect::Abort(txn_id))
+                            if tracker.blocked_abort(txn_id)
+                    )
+                }));
+            }
         }
 
         if queue.is_empty() && !operation.is_complete() {
             if expired {
                 break;
             }
-            queue.extend(operation.abort());
+            queue.extend(operation.abort().into_iter().filter(|effect| {
+                !matches!(
+                    transaction_effect(effect),
+                    Some(TransactionEffect::Abort(txn_id)) if tracker.blocked_abort(txn_id)
+                )
+            }));
             if queue.is_empty() {
                 break;
             }
         }
     }
-    abort_leaked_transaction(&mut tracker, context, 0, None).await;
+    abort_leaked_transaction(
+        &mut tracker,
+        context,
+        0,
+        Some(cleanup_deadline.unwrap_or(deadline)),
+    )
+    .await;
     operation.finalize()
 }
 
@@ -917,11 +1047,18 @@ pub async fn drive<O: Operation>(
 
     let mut queue: VecDeque<_> = operation.start().into_iter().collect();
     let mut holds = Vec::new();
-    let mut tracker = TransactionTracker::default();
+    let mut tracker = TransactionTracker::new(context.storage_handle.clone());
 
     while !operation.is_complete() {
         while let Some(effect) = queue.pop_front() {
             let transaction = transaction_effect(&effect);
+            if let Some(TransactionEffect::Abort(txn_id)) = transaction
+                && tracker.blocked_abort(txn_id)
+            {
+                warn!(%txn_id, "Skipping abort after an unknown commit outcome");
+                continue;
+            }
+            tracker.begin(transaction);
             hold_backends(context, &effect, &mut holds);
             let event = if tracker.reject_start(transaction) {
                 warn!("Transaction tracker capacity reached");
@@ -932,11 +1069,24 @@ pub async fn drive<O: Operation>(
                 Box::pin(dispatch_effect(effect, context, 0)).await
             };
             tracker.observe(transaction, &event);
-            queue.extend(operation.step(event));
+            if !operation.is_complete() {
+                queue.extend(operation.step(event).into_iter().filter(|effect| {
+                    !matches!(
+                        transaction_effect(effect),
+                        Some(TransactionEffect::Abort(txn_id))
+                            if tracker.blocked_abort(txn_id)
+                    )
+                }));
+            }
         }
 
         if queue.is_empty() && !operation.is_complete() {
-            queue.extend(operation.abort());
+            queue.extend(operation.abort().into_iter().filter(|effect| {
+                !matches!(
+                    transaction_effect(effect),
+                    Some(TransactionEffect::Abort(txn_id)) if tracker.blocked_abort(txn_id)
+                )
+            }));
             if queue.is_empty() {
                 break;
             }
@@ -1015,7 +1165,7 @@ mod test {
 
     #[test]
     fn rejects_audit_overflow() {
-        let nodes = (1..=(MAX_AUDIT_PEERS as u8 + 1))
+        let nodes = (1..=(MAX_AUDIT_PEERS as u8 + 2))
             .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
             .collect::<Vec<_>>();
         let mut batch = AuditPageBatch::new();
@@ -1024,7 +1174,7 @@ mod test {
 
         assert!(nodes.is_none());
         assert_eq!(batch.missing_nodes.len(), 0);
-        assert_eq!(batch.missing_overflow, 1);
+        assert_eq!(batch.missing_overflow, 2);
         assert!(batch.completed_nodes.is_empty());
     }
 
@@ -1686,6 +1836,34 @@ mod test {
             staged_value(&context).await,
             Some(ByteView::from(*b"staged"))
         );
+        assert!(transaction_reopens(&context).await);
+    }
+
+    #[tokio::test]
+    async fn dropped_drive_aborts() {
+        let (_directory, context) = blob_context().await;
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let task_ready = ready.clone();
+        let task_context = context.clone();
+        let task = tokio::spawn(async move {
+            drive(
+                DeadlineOperation {
+                    state: 0,
+                    txn_id: None,
+                    ready: task_ready,
+                },
+                &task_context,
+            )
+            .await
+        });
+
+        // The transaction is open while the blob effect is waiting.
+        // Cancellation must transfer it to storage rather than strand it.
+        ready.notified().await;
+        task.abort();
+        let _ = task.await;
+
+        assert_eq!(staged_value(&context).await, None);
         assert!(transaction_reopens(&context).await);
     }
 
