@@ -1,10 +1,6 @@
-//! CEL request policies narrow already-authorized requests: `Deny` denies on a
-//! match, `Require` denies without one, and `when` guards applicability; compile,
-//! evaluation, and non-boolean failures deny (fail-closed).
-//!
-//! Evaluation is pure: it performs no I/O and never reads, buffers, or delays a
-//! streaming body; body-content policies run only after the handler holds the
-//! full parsed body.
+//! CEL policies narrow authorized requests: `Deny` rejects matches, `Require`
+//! rejects non-matches, and `when` guards applicability; compile/evaluation/
+//! non-boolean failures deny (fail-closed), and pure evaluation reads no streaming body.
 
 use cel_interpreter::{Context, Program, Value};
 use serde::{Deserialize, Serialize};
