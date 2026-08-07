@@ -1,9 +1,10 @@
 use aruna_blob::blob::{BlobHandle, GroupHold};
 use aruna_compute::ExecutorRegistry;
+use aruna_core::audit::{AuditPageBatch, MAX_AUDIT_PEERS};
 use aruna_core::effects::{AuditPageEffect, Effect, JobControlEffect, NetEffect, StorageEffect};
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{
-    AuditPageEvent, BlobEvent, Event, JobControlEvent, NetEvent, StorageEvent, SubOperationEvent,
+    BlobEvent, Event, JobControlEvent, NetEvent, StorageEvent, SubOperationEvent,
 };
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE};
@@ -12,7 +13,7 @@ use aruna_core::structs::{
     BackendCatalog, BackendRef, BucketInfo, GroupRoutingInputs, NodeRouting, RoutingSnapshot,
     StorageRoutingRule, UsageCounters, usage_backend_keys,
 };
-use aruna_core::types::{GroupId, TxnId};
+use aruna_core::types::{GroupId, NodeId, TxnId};
 use aruna_net::NetHandle;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
@@ -21,8 +22,10 @@ use std::any::{type_name, type_name_of_val};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tracing::{Instrument, debug, debug_span, error, trace, warn};
 
 use crate::group_backends::{RecordReadError, parse_read};
@@ -231,7 +234,11 @@ impl std::fmt::Debug for DriverContext {
 
 const MAX_SUBOP_DEPTH: usize = 32;
 const AUDIT_FANOUT_CONCURRENCY: usize = 8;
+const AUDIT_ADMISSION_LIMIT: usize = 16;
+const AUDIT_PEER_DEADLINE: Duration = Duration::from_secs(3);
 const AUDIT_FANOUT_DEADLINE: Duration = Duration::from_secs(30);
+static AUDIT_ADMISSION: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(AUDIT_ADMISSION_LIMIT)));
 
 #[tracing::instrument(
     name = "operation.effect",
@@ -429,6 +436,15 @@ async fn dispatch_job_control(effect: JobControlEffect, context: &DriverContext)
     Event::Net(NetEvent::JobControl(event))
 }
 
+fn cap_audit_nodes(nodes: &mut Vec<NodeId>, batch: &mut AuditPageBatch) {
+    nodes.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    nodes.dedup();
+    for node in nodes.iter().skip(MAX_AUDIT_PEERS) {
+        batch.mark_missing(*node);
+    }
+    nodes.truncate(MAX_AUDIT_PEERS);
+}
+
 /// Requests every node's local audit page over the metadata control transport,
 /// concurrently so one unreachable node cannot spend the whole request deadline.
 /// An unreachable or denied node is reported so the aggregator records it missing.
@@ -437,55 +453,63 @@ async fn dispatch_audit_page(effect: AuditPageEffect, context: &DriverContext) -
         nodes: input_nodes,
         request,
     } = effect;
-    let mut remaining = BTreeSet::new();
-    let nodes = input_nodes
-        .into_iter()
-        .filter(|node| remaining.insert(*node))
-        .collect::<Vec<_>>();
-    let mut pages = Vec::new();
-    {
-        let requests = stream::iter(nodes.into_iter().map(|node| {
-            let request = request.clone();
-            async move {
-                let page = match crate::metadata::audit::send_audit_request(context, node, request)
-                    .await
-                {
-                    Ok(response) => AuditPageEvent::Page {
-                        node,
-                        response: Box::new(response),
-                    },
-                    Err(error) => AuditPageEvent::Unavailable {
-                        node,
-                        message: format!("{error:?}"),
-                    },
-                };
-                (node, page)
+    let mut batch = AuditPageBatch::with_limit(request.limit);
+    let mut nodes = input_nodes;
+    cap_audit_nodes(&mut nodes, &mut batch);
+    let mut remaining = nodes.iter().copied().collect::<BTreeSet<_>>();
+    if remaining.is_empty() {
+        return Event::Net(NetEvent::AuditPages(batch));
+    }
+    let Some(_admission) = AUDIT_ADMISSION.clone().try_acquire_owned().ok() else {
+        for node in remaining {
+            batch.mark_missing(node);
+        }
+        return Event::Net(NetEvent::AuditPages(batch));
+    };
+
+    let requests = stream::iter(nodes.into_iter().map(|node| {
+        let request = request.clone();
+        async move {
+            let result = tokio::time::timeout(
+                AUDIT_PEER_DEADLINE,
+                crate::metadata::audit::send_audit_request(context, node, request),
+            )
+            .await;
+            (node, result)
+        }
+    }))
+    .buffer_unordered(AUDIT_FANOUT_CONCURRENCY);
+    futures_util::pin_mut!(requests);
+    let deadline = tokio::time::Instant::now() + AUDIT_FANOUT_DEADLINE;
+    loop {
+        let next = match tokio::time::timeout_at(deadline, requests.next()).await {
+            Ok(next) => next,
+            Err(_) => break,
+        };
+        let Some((node, result)) = next else {
+            break;
+        };
+        remaining.remove(&node);
+        match result {
+            Ok(Ok(response)) => {
+                if let Err(error) = batch.add_page(node, response, &request) {
+                    trace!(?node, ?error, "Rejected audit page");
+                }
             }
-        }))
-        .buffer_unordered(AUDIT_FANOUT_CONCURRENCY);
-        futures_util::pin_mut!(requests);
-        let deadline = tokio::time::Instant::now() + AUDIT_FANOUT_DEADLINE;
-        loop {
-            let next = match tokio::time::timeout_at(deadline, requests.next()).await {
-                Ok(next) => next,
-                Err(_) => break,
-            };
-            let Some((node, page)) = next else {
-                break;
-            };
-            remaining.remove(&node);
-            pages.push(page);
+            Ok(Err(error)) => {
+                trace!(?node, ?error, "Audit page unavailable");
+                batch.mark_missing(node);
+            }
+            Err(_) => {
+                trace!(?node, "Audit page request timed out");
+                batch.mark_missing(node);
+            }
         }
     }
-    pages.extend(
-        remaining
-            .into_iter()
-            .map(|node| AuditPageEvent::Unavailable {
-                node,
-                message: "audit fan-out deadline exceeded".to_string(),
-            }),
-    );
-    Event::Net(NetEvent::AuditPages(pages))
+    for node in remaining {
+        batch.mark_missing(node);
+    }
+    Event::Net(NetEvent::AuditPages(batch))
 }
 
 /// Reserves every tenant backend an effect names for the rest of the operation.
@@ -856,8 +880,9 @@ fn event_kind(event: &Event) -> &'static str {
 
 #[cfg(test)]
 mod test {
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::{DriverContext, cap_audit_nodes, drive};
     use aruna_core::{
+        audit::{AuditPageBatch, MAX_AUDIT_PEERS},
         effects::{Effect, StagingSourceEffect, StorageEffect},
         errors::StorageError,
         events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent},
@@ -870,6 +895,27 @@ mod test {
     use byteview::ByteView;
     use std::convert::Infallible;
     use tempfile::tempdir;
+
+    #[test]
+    fn caps_audit_nodes() {
+        let mut nodes = (1..=(MAX_AUDIT_PEERS as u8 + 1))
+            .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
+            .collect::<Vec<_>>();
+        let duplicate = nodes[0];
+        nodes.push(duplicate);
+        let mut batch = AuditPageBatch::new();
+
+        cap_audit_nodes(&mut nodes, &mut batch);
+
+        assert_eq!(nodes.len(), MAX_AUDIT_PEERS);
+        assert_eq!(batch.missing_nodes.len(), 1);
+        assert!(batch.completed_nodes.is_empty());
+        assert!(
+            nodes
+                .windows(2)
+                .all(|pair| pair[0].as_bytes() < pair[1].as_bytes())
+        );
+    }
 
     #[tokio::test]
     async fn snapshot_reads_rules() {
