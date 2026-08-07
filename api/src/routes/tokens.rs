@@ -10,7 +10,7 @@ use aruna_core::util::unix_timestamp_secs;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::forwarded_bearer;
 use aruna_operations::metadata::forward::{forward_token_revoke, is_user_origin};
-use aruna_operations::revoke_token::{RevokeTokenConfig, RevokeTokenOperation};
+use aruna_operations::revoke_token::{RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::post;
@@ -45,7 +45,7 @@ pub struct RevokeTokenRequest {
         (status = 400, description = "Not a valid bearer token of this realm", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 503, description = "No eligible revocation peer available", body = ErrorResponse)
+        (status = 503, description = "No eligible revocation peer available or token revocation capacity exhausted", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -113,8 +113,17 @@ pub async fn revoke_token(
         ctx.as_ref(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(map_revoke_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn map_revoke_error(error: RevokeTokenError) -> ServerError {
+    match error {
+        RevokeTokenError::CapacityReached => {
+            ServerError::ServiceUnavailableReason("token_revocation_capacity_reached".to_string())
+        }
+        error => ServerError::InternalError(error.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -131,10 +140,18 @@ mod tests {
     use aruna_operations::get_realm_config::GetRealmConfigOperation;
     use aruna_operations::jobs::runtime::JobsRuntime;
     use aruna_storage::storage::FjallStorage;
+    use axum::response::IntoResponse;
     use ed25519_dalek::SigningKey;
     use ulid::Ulid;
 
-    async fn state_with_token() -> (Arc<ServerState>, RealmId, UserId, String) {
+    #[test]
+    fn capacity_maps_503() {
+        let response = map_revoke_error(RevokeTokenError::CapacityReached).into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    async fn state_with_token() -> (tempfile::TempDir, Arc<ServerState>, RealmId, UserId, String) {
         let dir = tempfile::tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = Arc::new(DriverContext {
@@ -192,7 +209,7 @@ mod tests {
         )
         .await
         .unwrap();
-        (state, realm_id, user_id, token)
+        (dir, state, realm_id, user_id, token)
     }
 
     fn caller(realm_id: RealmId, user_id: UserId) -> Option<AuthContext> {
@@ -205,7 +222,7 @@ mod tests {
 
     #[tokio::test]
     async fn unauthorized_cannot_revoke() {
-        let (state, _realm, _user, token) = state_with_token().await;
+        let (_dir, state, _realm, _user, token) = state_with_token().await;
         let error = revoke_token(
             State(state.clone()),
             Extension(None),
@@ -222,7 +239,7 @@ mod tests {
 
     #[tokio::test]
     async fn revocation_is_idempotent() {
-        let (state, realm_id, user_id, token) = state_with_token().await;
+        let (_dir, state, realm_id, user_id, token) = state_with_token().await;
         for _ in 0..2 {
             let status = revoke_token(
                 State(state.clone()),
@@ -246,7 +263,7 @@ mod tests {
     async fn revocation_reaches_config() {
         // The route must record the revocation in the replicated realm config,
         // which is what carries it to the other nodes of the realm.
-        let (state, realm_id, user_id, token) = state_with_token().await;
+        let (_dir, state, realm_id, user_id, token) = state_with_token().await;
         revoke_token(
             State(state.clone()),
             Extension(caller(realm_id, user_id)),
@@ -271,7 +288,7 @@ mod tests {
     async fn replicated_revocation_rejects() {
         // A revocation that only arrived through the replicated realm config
         // must deny the token here and after a restart that rebuilds state.
-        let (state, realm_id, _user, token) = state_with_token().await;
+        let (_dir, state, realm_id, _user, token) = state_with_token().await;
         assert!(handle_token(&state, &token).await.is_ok());
 
         let ctx = state.get_ctx();
@@ -358,7 +375,7 @@ mod tests {
     async fn stranger_cannot_revoke() {
         // A realm user who neither owns the token nor holds the realm admin
         // write must not be able to invalidate someone else's session.
-        let (state, realm_id, _user, token) = state_with_token().await;
+        let (_dir, state, realm_id, _user, token) = state_with_token().await;
         let stranger = UserId::local(Ulid::generate(), realm_id);
         let error = revoke_token(
             State(state.clone()),
@@ -386,7 +403,7 @@ mod tests {
     async fn admin_can_revoke() {
         // The realm admin gate that guards non-self user writes also permits
         // revoking another user's token.
-        let (state, realm_id, _user, token) = state_with_token().await;
+        let (_dir, state, realm_id, _user, token) = state_with_token().await;
         let admin = UserId::local(Ulid::generate(), realm_id);
         grant_realm_admin(state.get_ctx().as_ref(), realm_id, admin).await;
 
@@ -411,7 +428,7 @@ mod tests {
     #[tokio::test]
     async fn foreign_token_rejected() {
         // A trusted foreign token must not enter this realm's revocation log.
-        let (state, realm_id, _user, _token) = state_with_token().await;
+        let (_dir, state, realm_id, _user, _token) = state_with_token().await;
         let foreign_signing_key = generate_signing_key();
         let foreign_realm_id = RealmId::from_bytes(foreign_signing_key.verifying_key().to_bytes());
         let foreign_user = UserId::local(Ulid::generate(), foreign_realm_id);
@@ -457,7 +474,7 @@ mod tests {
 
     #[tokio::test]
     async fn revocation_survives_restart() {
-        let (state, realm_id, user_id, token) = state_with_token().await;
+        let (_dir, state, realm_id, user_id, token) = state_with_token().await;
         revoke_token(
             State(state.clone()),
             Extension(caller(realm_id, user_id)),
