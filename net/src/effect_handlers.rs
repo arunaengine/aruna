@@ -40,7 +40,7 @@ pub async fn handle_net_effect(
         NetEffect::AuditPage(audit) => {
             let mut batch = AuditPageBatch::with_limit(audit.request.limit);
             if audit.nodes.len() > MAX_AUDIT_PEERS {
-                batch.missing_overflow = 1;
+                batch.missing_overflow = audit.nodes.len().saturating_sub(MAX_AUDIT_PEERS);
                 return NetEvent::AuditPages(batch);
             }
             for node in audit.nodes {
