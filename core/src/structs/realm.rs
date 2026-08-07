@@ -521,8 +521,8 @@ impl RealmConfigDocument {
     }
 
     /// Unions the locally accepted revocations with the reducer's materialized
-    /// set and drops entries whose token has expired. Shared by the revoking
-    /// node and by replicated apply, so both converge on the same bounded set.
+    /// set and drops entries whose token has expired. Ownership stays in the
+    /// reducer path; the deny overlay only needs one hash and expiry per token.
     pub fn merge_revocations(&mut self, reducer_state: &AdminDocumentReducerState, now: u64) {
         let mut merged: BTreeMap<String, u64> = self
             .revoked_tokens
@@ -769,6 +769,7 @@ fn normalize_replication_factor(replication_factor: u32) -> usize {
 mod test {
     use crate::NodeId;
     use crate::admin_document_reducer::AdminDocumentReducerState;
+    use crate::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use crate::structs::{
         Actor, DynamicDiscoveryMethod, MetadataGroupReplicationOverride,
         MetadataPathReplicationOverride, OidcProviderConfig, RealmAuthorizationDocument,
@@ -892,6 +893,57 @@ mod test {
         );
         config.merge_revocations(&reducer_state, 1_001);
         assert!(config.revoked_tokens.is_empty());
+    }
+
+    #[test]
+    fn owner_overlay_deduplicates() {
+        let realm_id = RealmId([7u8; 32]);
+        let owner_a = crate::UserId::local(Ulid::from_bytes([1u8; 16]), realm_id);
+        let owner_b = crate::UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
+        let actor_a = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
+            user_id: owner_a,
+            realm_id,
+        };
+        let actor_b = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[2u8; 32]).public(),
+            user_id: owner_b,
+            realm_id,
+        };
+        let mut reducer =
+            AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
+        let token_hash = crate::auth::bearer_token_hash("owner-overlay");
+        reducer
+            .apply_operation(
+                &actor_a,
+                AdminDocumentOperation::RealmConfigTokenRevoked {
+                    token_hash: token_hash.clone(),
+                    expires_at: 2_000,
+                    token_owner: owner_a,
+                },
+            )
+            .unwrap();
+        reducer
+            .apply_operation(
+                &actor_b,
+                AdminDocumentOperation::RealmConfigTokenRevoked {
+                    token_hash: token_hash.clone(),
+                    expires_at: 2_000,
+                    token_owner: owner_b,
+                },
+            )
+            .unwrap();
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.merge_revocations(&reducer, 1_000);
+
+        assert_eq!(
+            config.revoked_tokens,
+            vec![TokenRevocation {
+                token_hash,
+                expires_at: 2_000,
+            }]
+        );
     }
 
     #[test]
