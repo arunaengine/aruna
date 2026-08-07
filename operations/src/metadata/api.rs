@@ -8,15 +8,16 @@ use aruna_core::errors::{AuthorizationError, ConversionError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::short_display_id;
 use aruna_core::keyspaces::{
-    METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
-    METADATA_PENDING_PROJECTION_KEYSPACE,
+    METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
+    METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
-    MetadataCreateEventRecord, MetadataError, MetadataGraphLifecycleRecord, MetadataQueryResults,
-    MetadataRoCratePage, MetadataSearchHit,
+    MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataError,
+    MetadataGraphLifecycleRecord, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
 use aruna_core::storage_entries::{
-    metadata_event_log_key, metadata_graph_lifecycle_key, metadata_pending_projection_target,
+    metadata_document_lifecycle_key, metadata_event_log_key, metadata_graph_lifecycle_key,
+    metadata_pending_projection_target,
 };
 use aruna_core::structs::{
     AuthContext, MetadataRegistryRecord, PathClaimRecord, Permission, PlacementRef,
@@ -1923,37 +1924,39 @@ async fn load_group_records(
     group_id: GroupId,
     limit: usize,
 ) -> Result<Vec<MetadataRegistryRecord>, MetadataApiError> {
-    // Listing remains eventually consistent: the handle-owned visibility cache
-    // serves stale snapshots while one refill updates the operation-owned read path.
-    if let Some(metadata_handle) = context.metadata_handle.as_ref() {
-        let group_records = metadata_handle
+    let records = if let Some(metadata_handle) = context.metadata_handle.as_ref() {
+        // Listing remains eventually consistent: the handle-owned visibility
+        // cache serves stale snapshots while one refill updates the read path.
+        metadata_handle
             .list_group_records(group_id, limit)
             .await
-            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-        return Ok(group_records.as_ref().clone());
-    }
-
-    let mut records = Vec::new();
-    let mut start_after = None;
-    loop {
-        let event = context
-            .storage_handle
-            .send_effect(iter_registry_effect(group_id, start_after, None))
-            .await;
-        let (page, next_start_after) =
-            parse_registry_iter(event).map_err(|_| MetadataApiError::ServiceUnavailable)?;
-        if records.len().saturating_add(page.len()) > limit {
-            return Err(MetadataApiError::ServiceUnavailable);
+            .map_err(|_| MetadataApiError::ServiceUnavailable)?
+            .as_ref()
+            .clone()
+    } else {
+        let mut records = Vec::new();
+        let mut start_after = None;
+        loop {
+            let event = context
+                .storage_handle
+                .send_effect(iter_registry_effect(group_id, start_after, None))
+                .await;
+            let (page, next_start_after) =
+                parse_registry_iter(event).map_err(|_| MetadataApiError::ServiceUnavailable)?;
+            if records.len().saturating_add(page.len()) > limit {
+                return Err(MetadataApiError::ServiceUnavailable);
+            }
+            records.extend(page);
+            match next_start_after {
+                Some(cursor) => start_after = Some(cursor),
+                None => break,
+            }
         }
-        records.extend(page);
-        match next_start_after {
-            Some(cursor) => start_after = Some(cursor),
-            None => break,
-        }
-    }
+        records
+    };
     let mut visible = Vec::with_capacity(records.len());
     for record in records {
-        if !metadata_graph_is_deleted(context, &record.graph_iri).await? {
+        if !record_deleted(context, &record).await? {
             visible.push(record);
         }
     }
@@ -2167,7 +2170,7 @@ async fn load_pending_records(
             })
             .transpose()?
             .unwrap_or(false);
-        if deleted {
+        if deleted || document_deleted(context, record.document_id).await? {
             continue;
         }
         if count >= limit {
@@ -2237,12 +2240,57 @@ async fn load_record_by_document(
     document_id: Ulid,
 ) -> Result<MetadataRegistryRecord, MetadataApiError> {
     match load_metadata_record_by_document(context, document_id).await {
-        Ok(Some(record)) => Ok(record),
+        Ok(Some(record)) => {
+            if record_deleted(context, &record).await? {
+                Err(MetadataApiError::NotFound)
+            } else {
+                Ok(record)
+            }
+        }
         Ok(None) => Err(MetadataApiError::NotFound),
         Err(StorageReadError::Storage(error)) => Err(MetadataApiError::Internal(error.to_string())),
         Err(StorageReadError::Conversion(error)) => {
             Err(MetadataApiError::Internal(error.to_string()))
         }
+    }
+}
+
+async fn record_deleted(
+    context: &DriverContext,
+    record: &MetadataRegistryRecord,
+) -> Result<bool, MetadataApiError> {
+    Ok(metadata_graph_is_deleted(context, &record.graph_iri).await?
+        || document_deleted(context, record.document_id).await?)
+}
+
+async fn document_deleted(
+    context: &DriverContext,
+    document_id: Ulid,
+) -> Result<bool, MetadataApiError> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
+            key: metadata_document_lifecycle_key(document_id),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => {
+            let record: MetadataDocumentLifecycleRecord = postcard::from_bytes(&value)
+                .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+            Ok(matches!(
+                record,
+                MetadataDocumentLifecycleRecord::Delete { .. }
+            ))
+        }
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(false),
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(MetadataApiError::Internal(error.to_string()))
+        }
+        other => Err(MetadataApiError::Internal(format!("{other:?}"))),
     }
 }
 

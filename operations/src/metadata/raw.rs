@@ -2,14 +2,20 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{METADATA_EVENT_LOG_KEYSPACE, METADATA_RAW_REVISION_KEYSPACE};
+use aruna_core::keyspaces::{
+    METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
+    METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_RAW_REVISION_KEYSPACE,
+};
 use aruna_core::metadata::{
-    MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataError,
-    MetadataMaterializationState, MetadataRawRevision, apply_raw_upsert, resolve_raw_revision,
+    MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataDocumentLifecycleRecord,
+    MetadataError, MetadataGraphLifecycleRecord, MetadataMaterializationState, MetadataRawRevision,
+    apply_raw_upsert, resolve_raw_revision,
 };
 use aruna_core::storage_entries::{
-    metadata_event_log_key, metadata_event_log_prefix, raw_revision_key,
+    metadata_document_lifecycle_key, metadata_event_log_key, metadata_event_log_prefix,
+    metadata_graph_lifecycle_key, raw_revision_key,
 };
+use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::types::Key;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
@@ -124,8 +130,60 @@ pub async fn load_raw_revision(
     document_id: Ulid,
     event_cursor: Option<Ulid>,
 ) -> Result<Option<MetadataRawRevision>, MetadataRawReadError> {
+    if raw_deleted(context, document_id).await? {
+        return Ok(None);
+    }
     let events = load_raw_events(context, document_id, None, event_cursor).await?;
     resolve_raw_revision(&events).map_err(Into::into)
+}
+
+async fn raw_deleted(
+    context: &DriverContext,
+    document_id: Ulid,
+) -> Result<bool, MetadataRawReadError> {
+    let document = match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
+            key: metadata_document_lifecycle_key(document_id),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|value| {
+                postcard::from_bytes::<MetadataDocumentLifecycleRecord>(&value)
+                    .map(|record| matches!(record, MetadataDocumentLifecycleRecord::Delete { .. }))
+                    .map_err(ConversionError::from)
+            })
+            .transpose()?
+            .unwrap_or(false),
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => return Err(MetadataRawReadError::UnexpectedEvent(format!("{other:?}"))),
+    };
+    if document {
+        return Ok(true);
+    }
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+            key: metadata_graph_lifecycle_key(&MetadataRegistryRecord::graph_iri_for(document_id)),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|value| {
+                postcard::from_bytes::<MetadataGraphLifecycleRecord>(&value)
+                    .map(|record| record.is_deleted())
+                    .map_err(ConversionError::from)
+            })
+            .transpose()
+            .map(|deleted| deleted.unwrap_or(false)),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataRawReadError::UnexpectedEvent(format!("{other:?}"))),
+    }
 }
 
 pub(crate) async fn prepare_raw_event(
