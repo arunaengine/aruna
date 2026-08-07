@@ -187,11 +187,20 @@ pub fn iter_hash_path_index_effect(
     start_after: Option<Key>,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
+    iter_hash_page(blake3_hash, start_after, txn_id, usize::MAX)
+}
+
+pub fn iter_hash_page(
+    blake3_hash: &[u8],
+    start_after: Option<Key>,
+    txn_id: Option<TxnId>,
+    limit: usize,
+) -> Result<Effect, ConversionError> {
     Ok(Effect::Storage(StorageEffect::Iter {
         key_space: HASH_PATHS_INDEX_KEYSPACE.to_string(),
         prefix: Some(HashPathIndexKey::hash_prefix(blake3_hash)?.into()),
         start: start_after.map(IterStart::After),
-        limit: usize::MAX,
+        limit,
         txn_id,
     }))
 }
@@ -227,7 +236,7 @@ pub fn build_head_transition_effects(
 mod tests {
     use super::{
         HeadAliasContext, add_hash_path_index_effect, build_head_transition_effects,
-        iter_hash_path_index_effect,
+        iter_hash_page, iter_hash_path_index_effect,
     };
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::structs::{CurrentVersionPointer, HashPathIndexKey, RealmId};
@@ -270,6 +279,16 @@ mod tests {
         let prefix = prefix.expect("expected prefix");
         let expected = aruna_core::structs::HashPathIndexKey::hash_prefix(&[7u8; 32]).unwrap();
         assert_eq!(prefix.as_ref(), expected.as_slice());
+    }
+
+    #[test]
+    fn iter_hash_page_sets_limit() {
+        let Effect::Storage(StorageEffect::Iter { limit, .. }) =
+            iter_hash_page(&[7u8; 32], None, None, 1024).unwrap()
+        else {
+            panic!("expected storage iter effect");
+        };
+        assert_eq!(limit, 1024);
     }
 
     #[test]
