@@ -235,15 +235,16 @@ pub async fn write_message(
 }
 
 pub(crate) fn encode_message(message: &MetadataTransportMessage) -> Result<Vec<u8>, String> {
-    let bytes = postcard::to_allocvec(message).map_err(|err| err.to_string())?;
     let max_size = if frame_class(message) == AUDIT_FRAME {
         audit_frame_cap()
     } else {
         MAX_MESSAGE_SIZE
     };
-    if bytes.len() > max_size {
+    let size = postcard::serialized_size(message).map_err(|err| err.to_string())?;
+    if size > max_size {
         return Err("metadata message exceeds maximum size".to_string());
     }
+    let bytes = postcard::to_allocvec(message).map_err(|err| err.to_string())?;
 
     Ok(bytes)
 }
@@ -971,6 +972,31 @@ mod tests {
         .unwrap();
 
         assert!(postcard::from_bytes::<MetadataTransportMessage>(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_large_audit() {
+        let message = MetadataTransportMessage::ForwardedAuditPage {
+            result: Ok(AuditPageResponse {
+                records: vec![AuditPageEntry {
+                    key: vec![0u8; aruna_core::audit::AUDIT_KEY_BYTES],
+                    record: MetadataAuditRecord {
+                        realm_id: RealmId([1u8; 32]),
+                        group_id: Ulid::from_bytes([2u8; 16]),
+                        document_id: Ulid::from_bytes([3u8; 16]),
+                        graph_iri: "x".repeat(MAX_AUDIT_PAGE_BYTES),
+                        user_id: UserId::local(Ulid::from_bytes([4u8; 16]), RealmId([1u8; 32])),
+                        node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
+                        operation: MetadataAuditOperation::Create,
+                        occurred_at_ms: 0,
+                        details: None,
+                    },
+                }],
+                next_start_after: None,
+            }),
+        };
+
+        assert!(encode_message(&message).is_err());
     }
 
     fn assert_has_auth_token_field(message: MetadataTransportMessage) {
