@@ -7,8 +7,8 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_REPLICATION_JOB_KEYSPACE, S3_BUCKET_KEYSPACE,
-    SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
+    BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_REPLICATION_JOB_KEYSPACE, NODE_STATE_KEYSPACE,
+    S3_BUCKET_KEYSPACE, SYNC_RELATIONSHIP_IN_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
@@ -46,7 +46,7 @@ const RELATIONSHIP_STATS_PAGE_SIZE: usize = 256;
 const LIVE_REPLICATION_OBLIGATION_BATCH_SIZE: usize = 64;
 const LIVE_REPLICATION_JOB_LIMIT: usize = 64;
 const LIVE_REPLICATION_RELATIONSHIP_LIMIT: usize = 1024;
-const REPLICATION_CURSOR_KEY: &[u8] = b"\xffaruna-blob-replication-cursor";
+const REPLICATION_CURSOR_KEY: &[u8] = b"blob_replication_cursor";
 
 pub const BLOB_REPLICATION_POLL_AFTER: Duration = Duration::from_secs(5);
 pub const BLOB_REPLICATION_RETRY_AFTER: Duration = Duration::from_secs(1);
@@ -127,10 +127,12 @@ struct BlobReplicationJobScan {
     jobs: Vec<(Vec<u8>, BlobReplicationJobRecord)>,
     has_more_due: bool,
     next_due_at_ms: Option<u64>,
+    next_cursor: ReplicationScanCursor,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct ReplicationScanCursor {
+    generation: u64,
     after: Option<Vec<u8>>,
     next_due_at_ms: Option<u64>,
 }
@@ -1072,14 +1074,12 @@ pub async fn blob_replication_jobs_exist(
             key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
             prefix: None,
             start: None,
-            limit: 2,
+            limit: 1,
             txn_id: None,
         })
         .await
     {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(values
-            .iter()
-            .any(|(key, _)| !is_replication_cursor(key.as_ref()))),
+        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(!values.is_empty()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
             "{other:?}"
@@ -1112,10 +1112,7 @@ pub async fn relationship_job_stats(
                 values,
                 next_start_after,
             }) => {
-                for (key, value) in values {
-                    if is_replication_cursor(key.as_ref()) {
-                        continue;
-                    }
+                for (_, value) in values {
                     let record = BlobReplicationJobRecord::from_bytes(value.as_ref())?;
                     if record.relationship_id == Some(relationship_id) {
                         pending = pending.saturating_add(1);
@@ -1149,8 +1146,13 @@ pub async fn next_blob_replication_timer_after(
     let now_ms = unix_timestamp_millis();
     let scan = scan_due_blob_replication_jobs(storage, now_ms, 1).await?;
     if !scan.jobs.is_empty() || scan.has_more_due {
+        if scan.jobs.is_empty() {
+            advance_replication_cursor(storage, scan.next_cursor).await?;
+        }
         return Ok(Some(Duration::ZERO));
     }
+
+    advance_replication_cursor(storage, scan.next_cursor.clone()).await?;
 
     Ok(scan
         .next_due_at_ms
@@ -1225,6 +1227,8 @@ pub async fn process_blob_replication_batch(
             }
         }
     }
+
+    advance_replication_cursor(&context.storage_handle, scan.next_cursor).await?;
 
     if job_count > 0 || repair.processed > 0 {
         info!(
@@ -2074,25 +2078,23 @@ async fn delete_live_obligation(
     }
 }
 
-fn is_replication_cursor(key: &[u8]) -> bool {
-    key == REPLICATION_CURSOR_KEY
-}
-
 async fn read_replication_cursor(
     storage: &StorageHandle,
-) -> Result<Option<ReplicationScanCursor>, BlobReplicationQueueError> {
+) -> Result<ReplicationScanCursor, BlobReplicationQueueError> {
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
+            key_space: NODE_STATE_KEYSPACE.to_string(),
             key: ByteView::from(REPLICATION_CURSOR_KEY.to_vec()),
             txn_id: None,
         })
         .await
     {
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+            Ok(ReplicationScanCursor::default())
+        }
         Event::Storage(StorageEvent::ReadResult {
             value: Some(value), ..
-        }) => Ok(Some(postcard::from_bytes(value.as_ref())?)),
+        }) => Ok(postcard::from_bytes(value.as_ref()).unwrap_or_default()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
             "{other:?}"
@@ -2100,30 +2102,132 @@ async fn read_replication_cursor(
     }
 }
 
-async fn store_replication_cursor(
+fn cursor_newer(candidate: &ReplicationScanCursor, current: &ReplicationScanCursor) -> bool {
+    if candidate.generation != current.generation {
+        return candidate.generation > current.generation;
+    }
+    match (&candidate.after, &current.after) {
+        (Some(candidate), Some(current)) => candidate > current,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => false,
+    }
+}
+
+fn cursor_merge(
+    candidate: ReplicationScanCursor,
+    current: ReplicationScanCursor,
+) -> ReplicationScanCursor {
+    if cursor_newer(&candidate, &current) {
+        candidate
+    } else {
+        ReplicationScanCursor {
+            next_due_at_ms: match (candidate.next_due_at_ms, current.next_due_at_ms) {
+                (Some(candidate), Some(current)) => Some(candidate.min(current)),
+                (Some(candidate), None) => Some(candidate),
+                (None, Some(current)) => Some(current),
+                (None, None) => None,
+            },
+            ..current
+        }
+    }
+}
+
+async fn abort_cursor(storage: &StorageHandle, txn_id: Ulid) {
+    let _ = storage
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        .await;
+}
+
+async fn advance_replication_cursor(
     storage: &StorageHandle,
-    cursor: Option<ReplicationScanCursor>,
+    candidate: ReplicationScanCursor,
 ) -> Result<(), BlobReplicationQueueError> {
-    let effect = match cursor {
-        Some(cursor) => StorageEffect::Write {
-            key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
-            key: ByteView::from(REPLICATION_CURSOR_KEY.to_vec()),
-            value: ByteView::from(postcard::to_allocvec(&cursor)?),
-            txn_id: None,
-        },
-        None => StorageEffect::Delete {
-            key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
-            key: ByteView::from(REPLICATION_CURSOR_KEY.to_vec()),
-            txn_id: None,
-        },
+    let txn_id = match storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => {
+            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
+                "{other:?}"
+            )));
+        }
     };
-    match storage.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::WriteResult { .. })
-        | Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+    let (current, valid) = match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: NODE_STATE_KEYSPACE.to_string(),
+            key: ByteView::from(REPLICATION_CURSOR_KEY.to_vec()),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+            (ReplicationScanCursor::default(), true)
+        }
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => match postcard::from_bytes(value.as_ref()) {
+            Ok(cursor) => (cursor, true),
+            Err(_) => (ReplicationScanCursor::default(), false),
+        },
+        Event::Storage(StorageEvent::Error { error }) => {
+            abort_cursor(storage, txn_id).await;
+            return Err(error.into());
+        }
+        other => {
+            abort_cursor(storage, txn_id).await;
+            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
+                "{other:?}"
+            )));
+        }
+    };
+    let merged = cursor_merge(candidate, current.clone());
+    if valid && merged == current {
+        match storage
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionAborted { .. }) => Ok(()),
+            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+            other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
+                "{other:?}"
+            ))),
+        }
+    } else {
+        let value = postcard::to_allocvec(&merged)?;
+        match storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: NODE_STATE_KEYSPACE.to_string(),
+                key: ByteView::from(REPLICATION_CURSOR_KEY.to_vec()),
+                value: ByteView::from(value),
+                txn_id: Some(txn_id),
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            Event::Storage(StorageEvent::Error { error }) => {
+                abort_cursor(storage, txn_id).await;
+                return Err(error.into());
+            }
+            other => {
+                abort_cursor(storage, txn_id).await;
+                return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
+                    "{other:?}"
+                )));
+            }
+        }
+        match storage
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+            other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
+                "{other:?}"
+            ))),
+        }
     }
 }
 
@@ -2133,9 +2237,9 @@ async fn scan_due_blob_replication_jobs(
     limit: usize,
 ) -> Result<BlobReplicationJobScan, BlobReplicationQueueError> {
     let cursor = read_replication_cursor(storage).await?;
-    let start_after = cursor.as_ref().and_then(|cursor| cursor.after.clone());
+    let start_after = cursor.after.clone();
     let mut jobs = Vec::new();
-    let mut next_due_at_ms = cursor.and_then(|cursor| cursor.next_due_at_ms);
+    let mut next_due_at_ms = cursor.next_due_at_ms;
     let mut canonical_changed = false;
     let event = storage
         .send_storage_effect(StorageEffect::Iter {
@@ -2159,11 +2263,9 @@ async fn scan_due_blob_replication_jobs(
         }
     };
     let mut last_key = None;
+    let page_empty = values.is_empty();
 
     for (key, value) in values {
-        if is_replication_cursor(key.as_ref()) {
-            continue;
-        }
         let mut key = key.to_vec();
         last_key = Some(key.clone());
         let mut job = match BlobReplicationJobRecord::from_bytes(&value) {
@@ -2202,15 +2304,12 @@ async fn scan_due_blob_replication_jobs(
             continue;
         }
         if merge_due_job(&mut jobs, key, job, limit) {
-            store_replication_cursor(
-                storage,
-                Some(ReplicationScanCursor {
+            return Ok(BlobReplicationJobScan {
+                next_cursor: ReplicationScanCursor {
+                    generation: cursor.generation,
                     after: last_key,
                     next_due_at_ms,
-                }),
-            )
-            .await?;
-            return Ok(BlobReplicationJobScan {
+                },
                 jobs,
                 has_more_due: true,
                 next_due_at_ms,
@@ -2219,23 +2318,28 @@ async fn scan_due_blob_replication_jobs(
     }
 
     if let Some(next) = next_start_after {
-        store_replication_cursor(
-            storage,
-            Some(ReplicationScanCursor {
+        return Ok(BlobReplicationJobScan {
+            next_cursor: ReplicationScanCursor {
+                generation: cursor.generation,
                 after: Some(next.to_vec()),
                 next_due_at_ms,
-            }),
-        )
-        .await?;
-        return Ok(BlobReplicationJobScan {
+            },
             jobs,
             has_more_due: true,
             next_due_at_ms,
         });
     }
 
-    store_replication_cursor(storage, None).await?;
     Ok(BlobReplicationJobScan {
+        next_cursor: ReplicationScanCursor {
+            generation: if page_empty && cursor.after.is_none() {
+                cursor.generation
+            } else {
+                cursor.generation.saturating_add(1)
+            },
+            after: None,
+            next_due_at_ms,
+        },
         jobs,
         has_more_due: false,
         next_due_at_ms,
@@ -2433,7 +2537,6 @@ mod tests {
         {
             Event::Storage(StorageEvent::IterResult { values, .. }) => values
                 .into_iter()
-                .filter(|(key, _)| !is_replication_cursor(key.as_ref()))
                 .map(|(key, value)| {
                     (
                         key.to_vec(),
@@ -3684,8 +3787,8 @@ mod tests {
         assert_eq!(scan.jobs.len(), 1);
         assert_eq!(
             storage.snapshot_metrics().requests_total - before,
-            3,
-            "canonical jobs need one iteration and cursor persistence"
+            2,
+            "canonical jobs need one bounded iteration"
         );
     }
 
@@ -3710,14 +3813,20 @@ mod tests {
         let first_scan = scan_due_blob_replication_jobs(&storage, unix_timestamp_millis(), 1)
             .await
             .expect("first cursor scan succeeds");
+        advance_replication_cursor(&storage, first_scan.next_cursor.clone())
+            .await
+            .expect("first cursor persists");
         let before = storage.snapshot_metrics().requests_total;
         let second_scan = scan_due_blob_replication_jobs(&storage, unix_timestamp_millis(), 1)
             .await
             .expect("second cursor scan succeeds");
+        advance_replication_cursor(&storage, second_scan.next_cursor.clone())
+            .await
+            .expect("second cursor persists");
         assert_eq!(
             storage.snapshot_metrics().requests_total - before,
-            3,
-            "resumed scans use one page instead of restarting the keyspace"
+            6,
+            "resumed scans use one page and one monotonic cursor commit"
         );
         assert_eq!(first_scan.jobs.len(), 1);
         assert_eq!(second_scan.jobs.len(), 1);
@@ -3728,6 +3837,9 @@ mod tests {
             .expect("cursor wrap succeeds");
         assert!(wrapped.jobs.is_empty());
         assert!(!wrapped.has_more_due);
+        advance_replication_cursor(&storage, wrapped.next_cursor)
+            .await
+            .expect("wrapped cursor persists");
         let restarted = scan_due_blob_replication_jobs(&storage, unix_timestamp_millis(), 1)
             .await
             .expect("wrapped scan restarts");
