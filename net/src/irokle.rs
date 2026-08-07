@@ -3257,13 +3257,21 @@ impl DocumentSyncService {
                 create_acceptances
                     .entry(document_id)
                     .or_insert_with(|| apply.record.clone());
-            } else if accepted_create.as_ref().is_none_or(|accepted| {
+            } else if accepted_create.is_none() {
+                warn!(
+                    topic_id = %apply.topic_id,
+                    %document_id,
+                    "Deferring replicated metadata update until its create is accepted"
+                );
+                deferred_cursor_topics.insert(apply.topic_id);
+                continue;
+            } else if accepted_create.as_ref().is_some_and(|accepted| {
                 !registry_identity_matches(&accepted.record, &apply.record.record)
             }) {
                 warn!(
                     topic_id = %apply.topic_id,
                     %document_id,
-                    "Rejecting replicated metadata update without a matching accepted create"
+                    "Rejecting replicated metadata update with mismatched accepted create"
                 );
                 continue;
             }
@@ -13347,6 +13355,19 @@ mod tests {
             document_id,
             event_id: create_event_id,
         };
+        let update_event_id = Ulid::from_parts(2_118, 1);
+        let mut update = create.clone();
+        update.event_id = update_event_id;
+        update.record.updated_at_ms = 200;
+        update.record.last_event_id = update_event_id;
+        update.payload = MetadataCreateEventPayload::ReplaceRoCrate {
+            jsonld: "{}".to_string(),
+        };
+        update.occurred_at_ms = 200;
+        let update_target = DocumentSyncTarget::MetadataCreateEvent {
+            document_id,
+            event_id: update_event_id,
+        };
         let metadata_topic = registry_target.sync_topic_id(realm_id, &placement);
         service
             .ensure_document_sync_topics(&[metadata_topic], Vec::new())
@@ -13370,6 +13391,13 @@ mod tests {
                         target: registry_target.clone(),
                         bytes: postcard::to_allocvec(&record).expect("registry serializes"),
                         change: change(Ulid::from_parts(2_115, 1)),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::Upsert {
+                        event_id: Ulid::from_parts(2_117, 1),
+                        target: update_target.clone(),
+                        bytes: postcard::to_allocvec(&update).expect("update serializes"),
+                        change: change(Ulid::from_parts(2_117, 1)),
                         allow_genesis: true,
                     },
                     DocumentSyncPublish::Upsert {
@@ -13460,7 +13488,7 @@ mod tests {
 
         let config_topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
         let strategy_event = test_admin_event(
-            Ulid::from_parts(2_117, 1),
+            Ulid::from_parts(2_120, 1),
             AdminDocumentTarget::RealmConfig { realm_id },
             &actor,
             1,
@@ -13536,49 +13564,24 @@ mod tests {
             .expect("applied cursor is stored"),
         )
         .expect("cursor decodes");
-        assert!(applied_cursor.dominates(&metadata_clock));
-        assert!(
-            service
-                .reconcile_document_topics([metadata_topic])
-                .await
-                .expect("accepted metadata is idempotent")
-                .metadata_create_events
-                .is_empty()
-        );
-
-        let update_event_id = Ulid::from_parts(2_118, 1);
-        let mut update = create.clone();
-        update.event_id = update_event_id;
-        update.record.updated_at_ms = 200;
-        update.record.last_event_id = update_event_id;
-        update.payload = MetadataCreateEventPayload::ReplaceRoCrate {
-            jsonld: "{}".to_string(),
-        };
-        update.occurred_at_ms = 200;
-        let update_target = DocumentSyncTarget::MetadataCreateEvent {
-            document_id,
-            event_id: update_event_id,
-        };
-        let published = service
-            .publish_documents(
-                vec![DocumentSyncPublish::Upsert {
-                    event_id: update_event_id,
-                    target: update_target,
-                    bytes: postcard::to_allocvec(&update).expect("update serializes"),
-                    change: change(update_event_id),
-                    allow_genesis: true,
-                }],
-                Vec::new(),
-            )
-            .await;
-        assert!(matches!(
-            published,
-            DocumentSyncNetEvent::DocumentsPublished { .. }
-        ));
-        service
+        assert!(!applied_cursor.dominates(&metadata_clock));
+        let replayed = service
             .reconcile_document_topics([metadata_topic])
             .await
             .expect("metadata update reconciles");
+        assert!(replayed.targets.contains(&update_target));
+        assert!(replayed.metadata_create_events.contains(&update));
+        let applied_cursor: irokle_crate::ActorClock = postcard::from_bytes(
+            &read_storage_value(
+                &storage,
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+                topic_cursor_key(metadata_topic),
+            )
+            .await
+            .expect("replayed cursor is stored"),
+        )
+        .expect("cursor decodes");
+        assert!(applied_cursor.dominates(&metadata_clock));
         let acceptance = read_storage_value(
             &storage,
             METADATA_CREATE_ACCEPTANCE_KEYSPACE,
