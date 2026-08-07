@@ -13,7 +13,7 @@ use aruna_core::metadata::{
 };
 use aruna_core::storage_entries::{
     metadata_document_lifecycle_key, metadata_event_log_key, metadata_event_log_prefix,
-    metadata_graph_lifecycle_key, raw_revision_key,
+    metadata_graph_lifecycle_key, metadata_pending_projection_target, raw_revision_key,
 };
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::types::{Key, TxnId};
@@ -23,11 +23,53 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
+use crate::metadata::handle::METADATA_REGISTRY_CANDIDATE_LIMIT;
+use crate::metadata::protocol::MAX_MESSAGE_SIZE;
 use crate::metadata::repository::{
     parse_materialization_status_read, read_materialization_status_effect,
 };
 
-const RAW_PAGE_SIZE: usize = 1_024;
+const RAW_PAGE_SIZE: usize = 1;
+const RAW_EVENT_LIMIT: usize = METADATA_REGISTRY_CANDIDATE_LIMIT;
+const RAW_ENCODED_LIMIT: usize = MAX_MESSAGE_SIZE;
+
+#[derive(Debug, Default)]
+struct RawLoadBudget {
+    events: usize,
+    encoded_bytes: usize,
+}
+
+impl RawLoadBudget {
+    fn inspect(&mut self, encoded_bytes: usize) -> Result<(), MetadataRawReadError> {
+        self.encoded_bytes = self
+            .encoded_bytes
+            .checked_add(encoded_bytes)
+            .ok_or_else(|| budget_error("encoded bytes overflow"))?;
+        if self.encoded_bytes > RAW_ENCODED_LIMIT {
+            return Err(budget_error("encoded byte limit exceeded"));
+        }
+        Ok(())
+    }
+
+    fn accept(&mut self) -> Result<(), MetadataRawReadError> {
+        self.events = self
+            .events
+            .checked_add(1)
+            .ok_or_else(|| budget_error("event count overflow"))?;
+        if self.events > RAW_EVENT_LIMIT {
+            return Err(budget_error("event count limit exceeded"));
+        }
+        Ok(())
+    }
+}
+
+fn budget_error(message: &str) -> MetadataRawReadError {
+    MetadataRawReadError::LimitExceeded(message.to_string())
+}
+
+fn event_size(event: &MetadataCreateEventRecord) -> Result<usize, MetadataRawReadError> {
+    postcard::serialized_size(event).map_err(ConversionError::from)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct RawBaseIdentity {
@@ -79,6 +121,8 @@ pub enum MetadataRawReadError {
     Metadata(#[from] MetadataError),
     #[error("unexpected metadata raw-read event: {0}")]
     UnexpectedEvent(String),
+    #[error("metadata raw-read limit exceeded: {0}")]
+    LimitExceeded(String),
     /// The event log itself is inconsistent, so retrying the same read cannot
     /// help. Kept apart from [`Self::UnexpectedEvent`], which is adapter noise.
     #[error("inconsistent metadata raw event log: {0}")]
@@ -135,7 +179,15 @@ pub async fn load_raw_revision(
     if raw_deleted(context, document_id, txn_id).await? {
         return Ok(None);
     }
-    let events = load_raw_events(context, document_id, None, event_cursor, txn_id).await?;
+    let events = load_raw_events(
+        context,
+        document_id,
+        None,
+        event_cursor,
+        txn_id,
+        RawLoadBudget::default(),
+    )
+    .await?;
     resolve_raw_revision(&events).map_err(Into::into)
 }
 
@@ -206,6 +258,7 @@ pub(crate) async fn prepare_raw_event(
                 Some(state.last_event_id),
                 Some(event.event_id),
                 None,
+                RawLoadBudget::default(),
             )
             .await?;
             if !events
@@ -252,7 +305,12 @@ async fn initial_raw_state(
 ) -> Result<(RawRevisionState, bool), MetadataRawReadError> {
     let events = match &event.payload {
         MetadataCreateEventPayload::Scaffold { .. }
-        | MetadataCreateEventPayload::RoCrate { .. } => vec![event.clone()],
+        | MetadataCreateEventPayload::RoCrate { .. } => {
+            let mut budget = RawLoadBudget::default();
+            budget.inspect(event_size(event)?)?;
+            budget.accept()?;
+            vec![event.clone()]
+        }
         _ => {
             load_raw_events(
                 context,
@@ -260,6 +318,7 @@ async fn initial_raw_state(
                 None,
                 Some(event.event_id),
                 None,
+                RawLoadBudget::default(),
             )
             .await?
         }
@@ -291,6 +350,9 @@ async fn rebuild_raw_state(
     };
     let end_event_id = state.last_event_id.max(event.event_id);
     let first = read_raw_event(context, event.record.document_id, start_event_id).await?;
+    let mut budget = RawLoadBudget::default();
+    budget.inspect(event_size(&first)?)?;
+    budget.accept()?;
     let mut events = vec![first];
     events.extend(
         load_raw_events(
@@ -299,6 +361,7 @@ async fn rebuild_raw_state(
             Some(start_event_id),
             Some(end_event_id),
             None,
+            budget,
         )
         .await?,
     );
@@ -438,14 +501,16 @@ async fn read_raw_event(
         Event::Storage(StorageEvent::ReadResult {
             value: Some(value), ..
         }) => {
+            if value.len() > RAW_ENCODED_LIMIT {
+                return Err(budget_error("encoded byte limit exceeded"));
+            }
             let event: MetadataCreateEventRecord =
                 postcard::from_bytes(&value).map_err(ConversionError::from)?;
-            validate_raw_event(document_id, &event)?;
-            if event.event_id != event_id {
-                return Err(MetadataRawReadError::InconsistentLog(format!(
-                    "raw event key mismatch for {document_id}/{event_id}"
-                )));
-            }
+            validate_raw_entry(
+                document_id,
+                &metadata_event_log_key(document_id, event_id),
+                &event,
+            )?;
             Ok(event)
         }
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Err(
@@ -462,19 +527,25 @@ async fn load_raw_events(
     start_after: Option<Ulid>,
     event_cursor: Option<Ulid>,
     txn_id: Option<TxnId>,
+    mut budget: RawLoadBudget,
 ) -> Result<Vec<MetadataCreateEventRecord>, MetadataRawReadError> {
     let prefix = metadata_event_log_prefix(document_id);
     let mut start: Option<Key> =
         start_after.map(|event_id| metadata_event_log_key(document_id, event_id));
     let mut events = Vec::new();
     loop {
+        let remaining = RAW_EVENT_LIMIT.saturating_sub(budget.events);
+        if remaining == 0 {
+            return Err(budget_error("event count limit exceeded"));
+        }
+        let page_limit = remaining.min(RAW_PAGE_SIZE);
         let event = context
             .storage_handle
             .send_storage_effect(StorageEffect::Iter {
                 key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
                 prefix: Some(prefix.clone()),
                 start: start.take().map(IterStart::After),
-                limit: RAW_PAGE_SIZE,
+                limit: page_limit,
                 txn_id,
             })
             .await;
@@ -488,15 +559,23 @@ async fn load_raw_events(
                 return Err(MetadataRawReadError::UnexpectedEvent(format!("{other:?}")));
             }
         };
+        if values.len() > page_limit {
+            return Err(budget_error("page size limit exceeded"));
+        }
+        if values.is_empty() && next_start_after.is_some() {
+            return Err(budget_error("empty page has continuation"));
+        }
         let mut reached_cursor = false;
-        for (_, value) in values {
+        for (key, value) in values {
+            budget.inspect(value.len())?;
             let event: MetadataCreateEventRecord =
                 postcard::from_bytes(&value).map_err(ConversionError::from)?;
-            validate_raw_event(document_id, &event)?;
+            validate_raw_entry(document_id, &key, &event)?;
             if event_cursor.is_some_and(|cursor| event.event_id > cursor) {
                 reached_cursor = true;
                 break;
             }
+            budget.accept()?;
             events.push(event);
         }
         if reached_cursor {
@@ -510,14 +589,30 @@ async fn load_raw_events(
     Ok(events)
 }
 
-fn validate_raw_event(
+fn validate_raw_entry(
     document_id: Ulid,
+    key: &[u8],
     event: &MetadataCreateEventRecord,
 ) -> Result<(), MetadataRawReadError> {
+    let Some((key_document_id, key_event_id)) = metadata_pending_projection_target(key) else {
+        return Err(MetadataRawReadError::InconsistentLog(
+            "raw event key has invalid identity".to_string(),
+        ));
+    };
+    if key_document_id != document_id {
+        return Err(MetadataRawReadError::InconsistentLog(format!(
+            "raw event key belongs to document {key_document_id}"
+        )));
+    }
     if event.record.document_id != document_id {
         return Err(MetadataRawReadError::InconsistentLog(format!(
             "raw event belongs to document {}",
             event.record.document_id
+        )));
+    }
+    if event.event_id != key_event_id {
+        return Err(MetadataRawReadError::InconsistentLog(format!(
+            "raw event key mismatch for {document_id}/{key_event_id}"
         )));
     }
     Ok(())
@@ -649,6 +744,36 @@ mod tests {
         assert_eq!(state.last_event_id, update.event_id);
         assert!(state.base.is_none());
         assert!(state.revision.is_none());
+    }
+
+    #[test]
+    fn rejects_raw_budget() {
+        assert_eq!(RAW_PAGE_SIZE, 1);
+
+        let mut bytes = RawLoadBudget::default();
+        bytes.inspect(RAW_ENCODED_LIMIT).unwrap();
+        assert!(matches!(
+            bytes.inspect(1),
+            Err(MetadataRawReadError::LimitExceeded(_))
+        ));
+
+        let mut events = RawLoadBudget::default();
+        for _ in 0..RAW_EVENT_LIMIT {
+            events.accept().unwrap();
+        }
+        assert!(events.accept().is_err());
+    }
+
+    #[test]
+    fn rejects_raw_key() {
+        let event_id = Ulid::from_parts(1, 10);
+        let event = test_event(event_id, 1);
+        let key = metadata_event_log_key(event.record.document_id, Ulid::from_parts(2, 10));
+
+        assert!(matches!(
+            validate_raw_entry(event.record.document_id, &key, &event),
+            Err(MetadataRawReadError::InconsistentLog(_))
+        ));
     }
 
     #[tokio::test]

@@ -1412,6 +1412,14 @@ async fn export_raw(
     }
 }
 
+fn raw_identity_matches(
+    record: &MetadataRegistryRecord,
+    realm_id: RealmId,
+    document_id: Ulid,
+) -> bool {
+    record.realm_id == realm_id && record.document_id == document_id
+}
+
 async fn export_raw_txn(
     context: &DriverContext,
     realm_id: RealmId,
@@ -1419,6 +1427,9 @@ async fn export_raw_txn(
     txn_id: TxnId,
 ) -> Result<ExportMetadataRoCrateResult, MetadataApiError> {
     let record = load_record_txn(context, request.document_id, txn_id).await?;
+    if !raw_identity_matches(&record, realm_id, request.document_id) {
+        return Err(MetadataApiError::NotFound);
+    }
     ensure_record_readable(
         context,
         realm_id,
@@ -1429,7 +1440,12 @@ async fn export_raw_txn(
     .await?;
     let raw = crate::metadata::raw::load_raw_view(context, record.document_id, Some(txn_id))
         .await
-        .map_err(|error| MetadataApiError::Internal(error.to_string()))?
+        .map_err(|error| match error {
+            crate::metadata::raw::MetadataRawReadError::LimitExceeded(_) => {
+                MetadataApiError::ServiceUnavailable
+            }
+            error => MetadataApiError::Internal(error.to_string()),
+        })?
         .ok_or(MetadataApiError::NotFound)?;
     let dataset_digest = raw.revision.dataset_digest;
     Ok(ExportMetadataRoCrateResult::Raw {
@@ -4261,6 +4277,26 @@ mod tests {
     fn metadata_read_operation() {
         let request = metadata_read_request("/realm/g/group/meta/document", None);
         assert_eq!(request.operation, "metadata.read");
+    }
+
+    #[test]
+    fn raw_identity_fence() {
+        let record = public_record(Ulid::generate(), Ulid::generate());
+        assert!(raw_identity_matches(
+            &record,
+            TEST_REALM_ID,
+            record.document_id
+        ));
+        assert!(!raw_identity_matches(
+            &record,
+            RealmId::from_bytes([8; 32]),
+            record.document_id
+        ));
+        assert!(!raw_identity_matches(
+            &record,
+            TEST_REALM_ID,
+            Ulid::generate()
+        ));
     }
 
     // The record lives only in the registry cache and the graph was never

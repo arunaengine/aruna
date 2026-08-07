@@ -168,6 +168,7 @@ impl From<MetadataRawReadError> for MetadataMaterializationQueueError {
             MetadataRawReadError::Conversion(error) => Self::Conversion(error),
             MetadataRawReadError::Metadata(error) => Self::Metadata(error),
             MetadataRawReadError::UnexpectedEvent(event) => Self::UnexpectedEvent(event),
+            MetadataRawReadError::LimitExceeded(message) => Self::UnexpectedEvent(message),
             MetadataRawReadError::InconsistentLog(message) => Self::InconsistentLog(message),
         }
     }
