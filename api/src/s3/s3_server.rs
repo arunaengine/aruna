@@ -48,6 +48,7 @@ const DELETE_OBJECTS_MAX_BODY: usize = 2 * 1024 * 1024;
 const DELETE_CAPTURE_LIMIT: usize = 16;
 const EGRESS_LIMIT: usize = 256;
 const CONTROL_EGRESS_LIMIT: usize = 64;
+const CONTROL_REQUEST_LIMIT: usize = 64;
 
 /// Concurrent S3 connections served at once; connections at capacity are
 /// dropped so a flood cannot spawn unbounded connection tasks.
@@ -281,6 +282,70 @@ fn record_s3_request(
         .observe(elapsed.as_secs_f64());
 }
 
+fn control_capacity(max_requests: usize) -> usize {
+    let max_requests = max_requests.max(1);
+    (max_requests / 4).max(1).min(CONTROL_REQUEST_LIMIT)
+}
+
+fn bulk_capacity(max_requests: usize) -> usize {
+    let max_requests = max_requests.max(1);
+    max_requests - control_capacity(max_requests)
+}
+
+fn query_has_any(uri: &http::Uri, names: &[&str]) -> bool {
+    uri.query().is_some_and(|query| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .any(|(key, _)| names.iter().any(|name| key.as_ref() == *name))
+    })
+}
+
+fn is_object_path(host: Option<&str>, path: &str, domain: &str) -> bool {
+    if host.is_some_and(|host| virtual_hosted_bucket(host, domain).is_some()) {
+        return !path.trim_matches('/').is_empty();
+    }
+
+    path.trim_start_matches('/').split('/').nth(1).is_some()
+}
+
+fn is_bulk_request(
+    method: &Method,
+    host: Option<&str>,
+    path: &str,
+    domain: &str,
+    uri: &http::Uri,
+    headers: &http::HeaderMap,
+) -> bool {
+    // s3s resolves the operation later, so admission mirrors only data-heavy routes.
+    let object = is_object_path(host, path, domain);
+    match method.as_str() {
+        "GET" => {
+            object
+                && !query_has_any(
+                    uri,
+                    &[
+                        "attributes",
+                        "acl",
+                        "legal-hold",
+                        "retention",
+                        "tagging",
+                        "torrent",
+                        "uploadId",
+                    ],
+                )
+        }
+        "PUT" => object && !query_has_any(uri, &["acl", "legal-hold", "retention", "tagging"]),
+        "DELETE" => object && !query_has_any(uri, &["tagging", "uploadId"]),
+        "POST" => {
+            query_has_any(uri, &["delete", "select"])
+                || headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.starts_with("multipart/form-data"))
+        }
+        _ => false,
+    }
+}
+
 pub struct S3Server {
     address: String,
     s3service: S3Service,
@@ -294,7 +359,8 @@ pub struct S3Server {
     rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
     seal_key: CredentialSealKey,
     connection_limit: Arc<Semaphore>,
-    request_limit: Arc<Semaphore>,
+    control_limit: Arc<Semaphore>,
+    bulk_limit: Arc<Semaphore>,
     read_limit: Arc<Semaphore>,
     mutation_limit: Arc<Semaphore>,
     capture_limit: Arc<Semaphore>,
@@ -568,8 +634,10 @@ pub struct WrappingService {
     // Shared with the access hook: the IP bucket is charged here, the
     // per-principal bucket after authentication.
     rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
-    // Held while request parsing and handler work are in progress.
-    request_limit: Arc<Semaphore>,
+    // Held while control request parsing and handler work are in progress.
+    control_limit: Arc<Semaphore>,
+    // Held while bulk request parsing and handler work are in progress.
+    bulk_limit: Arc<Semaphore>,
     // Read responses use an independent lane from mutations and controls.
     read_limit: Arc<Semaphore>,
     mutation_limit: Arc<Semaphore>,
@@ -642,7 +710,12 @@ impl S3Server {
             rate_limits,
             seal_key,
             connection_limit: Arc::new(Semaphore::new(DEFAULT_S3_MAX_CONNECTIONS)),
-            request_limit: Arc::new(Semaphore::new(DEFAULT_S3_MAX_CONCURRENT_REQUESTS)),
+            control_limit: Arc::new(Semaphore::new(control_capacity(
+                DEFAULT_S3_MAX_CONCURRENT_REQUESTS,
+            ))),
+            bulk_limit: Arc::new(Semaphore::new(bulk_capacity(
+                DEFAULT_S3_MAX_CONCURRENT_REQUESTS,
+            ))),
             read_limit: Arc::new(Semaphore::new(EGRESS_LIMIT)),
             mutation_limit: Arc::new(Semaphore::new(CONTROL_EGRESS_LIMIT)),
             capture_limit: Arc::new(Semaphore::new(DELETE_CAPTURE_LIMIT)),
@@ -650,11 +723,13 @@ impl S3Server {
         })
     }
 
-    /// Installs operator-configured concurrency ceilings; each floors at one so
-    /// a permit is always available.
+    /// Installs operator-configured concurrency ceilings; the control lane
+    /// floors at one and the bulk lane receives the remaining capacity. A
+    /// one-request budget therefore admits controls but not bulk data.
     pub fn with_concurrency_limits(mut self, max_connections: usize, max_requests: usize) -> Self {
         self.connection_limit = Arc::new(Semaphore::new(max_connections.max(1)));
-        self.request_limit = Arc::new(Semaphore::new(max_requests.max(1)));
+        self.control_limit = Arc::new(Semaphore::new(control_capacity(max_requests)));
+        self.bulk_limit = Arc::new(Semaphore::new(bulk_capacity(max_requests)));
         self.read_limit = Arc::new(Semaphore::new(max_requests.clamp(1, EGRESS_LIMIT)));
         self.mutation_limit = Arc::new(Semaphore::new(max_requests.clamp(1, CONTROL_EGRESS_LIMIT)));
         self.capture_limit = Arc::new(Semaphore::new(max_requests.clamp(1, DELETE_CAPTURE_LIMIT)));
@@ -705,7 +780,8 @@ impl S3Server {
             metrics: self.metrics,
             peer_ip: None,
             rate_limits: self.rate_limits,
-            request_limit: self.request_limit,
+            control_limit: self.control_limit,
+            bulk_limit: self.bulk_limit,
             read_limit: self.read_limit,
             mutation_limit: self.mutation_limit,
             capture_limit: self.capture_limit,
@@ -828,6 +904,14 @@ impl Service<Request<Incoming>> for WrappingService {
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u64>().ok())
                 .is_some_and(|length| length > DELETE_OBJECTS_MAX_BODY as u64);
+        let bulk_request = is_bulk_request(
+            &method,
+            host,
+            &path,
+            &self.domain,
+            &parts.uri,
+            &parts.headers,
+        );
         let captured = (!oversized_delete && delete_objects).then(DeleteObjectsBody::default);
         let stream_activity = Arc::new(ConnectionActivity::default());
         let connection_activity = self
@@ -867,7 +951,11 @@ impl Service<Request<Incoming>> for WrappingService {
         let driver_ctx = self.driver_ctx.clone();
         let metrics = self.metrics.clone();
         let rate_limits = self.rate_limits.clone();
-        let request_limit = self.request_limit.clone();
+        let admission_limit = if bulk_request {
+            self.bulk_limit.clone()
+        } else {
+            self.control_limit.clone()
+        };
         // GET and HEAD are read streams; mutations and controls retain capacity.
         let egress_limit = if method == Method::GET || method == Method::HEAD {
             self.read_limit.clone()
@@ -891,7 +979,7 @@ impl Service<Request<Incoming>> for WrappingService {
             }
             // Bound concurrent request processing before the expensive s3s
             // parse, body handling, and storage work.
-            let request_permit = match request_limit.try_acquire_owned() {
+            let request_permit = match admission_limit.try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => {
                     // Dropping the request lets the transport drain or close
@@ -1497,11 +1585,11 @@ mod tests {
         let idle = tokio::spawn(async move {
             idle_activity.wait_idle().await;
         });
-        let request_limit = Arc::new(Semaphore::new(1));
-        let request_permit = request_limit
+        let control_limit = Arc::new(Semaphore::new(1));
+        let control_permit = control_limit
             .clone()
             .try_acquire_owned()
-            .expect("request permit");
+            .expect("control permit");
         let egress_limit = Arc::new(Semaphore::new(1));
         let egress_permit = egress_limit
             .clone()
@@ -1512,7 +1600,7 @@ mod tests {
         let request_deadline = deadline_activity.clone();
         let request = tokio::spawn(async move {
             let _active = active;
-            let _request_permit = request_permit;
+            let _control_permit = control_permit;
             let _egress_permit = egress_permit;
             tokio::select! {
                 _ = request_activity.wait_cancelled() => {}
@@ -1534,7 +1622,7 @@ mod tests {
         request.await.expect("request task joins");
         assert!(deadline_activity.is_cancelled());
         assert!(stream_activity.stopped.load(Ordering::Acquire));
-        assert_eq!(request_limit.available_permits(), 1);
+        assert_eq!(control_limit.available_permits(), 1);
         assert_eq!(egress_limit.available_permits(), 1);
         assert_eq!(activity.active.load(Ordering::Acquire), 0);
     }
@@ -1699,10 +1787,90 @@ mod tests {
 
     #[test]
     fn reserves_control_lane() {
-        let read = Arc::new(Semaphore::new(1));
-        let control = Arc::new(Semaphore::new(1));
-        let _read_permit = read.clone().try_acquire_owned().expect("read permit");
-        assert!(control.clone().try_acquire_owned().is_ok());
+        for max_requests in [0, 1, 2, 128] {
+            let normalized = max_requests.max(1);
+            assert_eq!(
+                control_capacity(max_requests) + bulk_capacity(max_requests),
+                normalized
+            );
+            assert!(control_capacity(max_requests) >= 1);
+        }
+        assert_eq!(bulk_capacity(1), 0);
+        assert_eq!(bulk_capacity(2), 1);
+
+        let control = Arc::new(Semaphore::new(control_capacity(4)));
+        let bulk = Arc::new(Semaphore::new(bulk_capacity(4)));
+        let bulk_permits = (0..bulk_capacity(4))
+            .map(|_| bulk.clone().try_acquire_owned().expect("bulk permit"))
+            .collect::<Vec<_>>();
+        assert!(bulk.clone().try_acquire_owned().is_err());
+        let control_permit = control.clone().try_acquire_owned().expect("control permit");
+        assert_eq!(control.available_permits(), control_capacity(4) - 1);
+        drop(control_permit);
+        assert_eq!(control.available_permits(), control_capacity(4));
+        drop(bulk_permits);
+        assert_eq!(bulk.available_permits(), bulk_capacity(4));
+    }
+
+    #[test]
+    fn classifies_bulk_routes() {
+        let headers = http::HeaderMap::new();
+        assert!(is_bulk_request(
+            &Method::PUT,
+            None,
+            "/bucket/key",
+            "s3.example",
+            &http::Uri::from_static("/bucket/key"),
+            &headers,
+        ));
+        assert!(is_bulk_request(
+            &Method::PUT,
+            Some("bucket.s3.example"),
+            "/key",
+            "s3.example",
+            &http::Uri::from_static("/key?partNumber=1&uploadId=upload"),
+            &headers,
+        ));
+        assert!(!is_bulk_request(
+            &Method::POST,
+            None,
+            "/bucket/key",
+            "s3.example",
+            &http::Uri::from_static("/bucket/key?uploadId=upload"),
+            &headers,
+        ));
+        assert!(!is_bulk_request(
+            &Method::PUT,
+            None,
+            "/bucket/key",
+            "s3.example",
+            &http::Uri::from_static("/bucket/key?tagging"),
+            &headers,
+        ));
+        assert!(!is_bulk_request(
+            &Method::GET,
+            None,
+            "/bucket",
+            "s3.example",
+            &http::Uri::from_static("/bucket"),
+            &headers,
+        ));
+        assert!(is_bulk_request(
+            &Method::DELETE,
+            None,
+            "/bucket/key",
+            "s3.example",
+            &http::Uri::from_static("/bucket/key"),
+            &headers,
+        ));
+        assert!(!is_bulk_request(
+            &Method::DELETE,
+            None,
+            "/bucket",
+            "s3.example",
+            &http::Uri::from_static("/bucket"),
+            &headers,
+        ));
     }
 
     #[tokio::test(start_paused = true)]
