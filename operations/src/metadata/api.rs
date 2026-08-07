@@ -82,10 +82,9 @@ const METADATA_REFERENCES_DEFAULT_LIMIT: usize = 25;
 const METADATA_REFERENCES_MAX_LIMIT: usize = 100;
 const METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT: usize = 8;
 const METADATA_DISTRIBUTED_QUERY_MAX_NODES: usize = 32;
-const METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT: Duration = Duration::from_secs(10);
 const METADATA_DISTRIBUTED_QUERY_DEADLINE: Duration = Duration::from_secs(12);
 // Four bounded fanout waves must finish before the request deadline.
-const METADATA_PATH_PEER_TIMEOUT: Duration = Duration::from_secs(2);
+const METADATA_PEER_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Error)]
 pub enum MetadataApiError {
@@ -319,6 +318,7 @@ struct MetadataFanoutScope {
     target_nodes: Option<Vec<NodeId>>,
     allow_partial: bool,
     discovery_failed: bool,
+    subject: Option<[u8; 32]>,
 }
 
 impl MetadataFanoutScope {
@@ -332,11 +332,17 @@ impl MetadataFanoutScope {
             target_nodes,
             allow_partial,
             discovery_failed: false,
+            subject: None,
         }
     }
 
     fn with_discovery_failed(mut self, discovery_failed: bool) -> Self {
         self.discovery_failed = discovery_failed;
+        self
+    }
+
+    fn with_subject(mut self, subject: [u8; 32]) -> Self {
+        self.subject = Some(subject);
         self
     }
 }
@@ -760,7 +766,7 @@ async fn forward_path_resolution(
         let document_path = request.document_path.clone();
         async move {
             let response = tokio::time::timeout(
-                METADATA_PATH_PEER_TIMEOUT,
+                METADATA_PEER_TIMEOUT,
                 metadata.request_forwarded_write(
                     peer,
                     MetadataTransportMessage::ForwardPathResolution {
@@ -833,10 +839,20 @@ async fn forward_path_resolution(
             _ => unavailable = true,
         }
     }
+    reduce_path_response(success, auth_error, divergent, not_found, unavailable)
+}
+
+fn reduce_path_response(
+    success: Option<MetadataPathLookupResult>,
+    auth_error: Option<MetadataApiError>,
+    divergent: bool,
+    not_found: bool,
+    unavailable: bool,
+) -> Result<MetadataPathLookupResult, MetadataApiError> {
     if let Some(error) = auth_error {
         return Err(error);
     }
-    if divergent {
+    if divergent || (success.is_some() && not_found) {
         return Err(MetadataApiError::ServiceUnavailable);
     }
     if let Some(result) = success {
@@ -946,7 +962,7 @@ async fn load_path_holder(
         .as_ref()
         .ok_or(MetadataApiError::ServiceUnavailable)?;
     match tokio::time::timeout(
-        METADATA_PATH_PEER_TIMEOUT,
+        METADATA_PEER_TIMEOUT,
         metadata.request_forwarded_write(
             holder,
             MetadataTransportMessage::ForwardPathLookup {
@@ -1308,6 +1324,13 @@ pub async fn query_metadata(
     request: MetadataQueryRequest,
 ) -> Result<MetadataQueryExecution, MetadataApiError> {
     ensure_supported_query_form(&request.query)?;
+    let subject = query_fingerprint(
+        &request.query,
+        request.graph_iris.as_deref(),
+        request.mode,
+        None,
+        None,
+    );
     let (results, fanout_stats) = run_query_distributed(
         context,
         realm_id,
@@ -1316,7 +1339,8 @@ pub async fn query_metadata(
         request.bearer_token,
         request.graph_iris,
         request.query,
-        MetadataFanoutScope::new(request.mode, request.target_nodes, request.allow_partial),
+        MetadataFanoutScope::new(request.mode, request.target_nodes, request.allow_partial)
+            .with_subject(subject),
     )
     .await?;
     Ok(MetadataQueryExecution {
@@ -1424,6 +1448,7 @@ pub async fn search_metadata(
         watermark,
         page_size,
         MetadataFanoutScope::new(request.mode, target_nodes, true)
+            .with_subject(fingerprint)
             .with_discovery_failed(discovery_failed),
     )
     .await?;
@@ -2499,6 +2524,58 @@ pub fn deduplicate_fanout_nodes(nodes: Vec<NodeId>) -> Vec<NodeId> {
         .collect()
 }
 
+fn select_fanout_nodes(nodes: &[NodeId], local_node_id: NodeId, subject: &[u8]) -> Vec<NodeId> {
+    let mut ranked = Vec::with_capacity(METADATA_DISTRIBUTED_QUERY_MAX_NODES);
+    let mut local_score = None;
+    for &node_id in nodes {
+        let score = neg_log2_q48(selector_hash(ROLE_NODE, subject, node_id.as_bytes()));
+        if node_id == local_node_id {
+            local_score = Some(score);
+            continue;
+        }
+        if ranked.iter().any(|(candidate, _)| *candidate == node_id) {
+            continue;
+        }
+        if ranked.len() < METADATA_DISTRIBUTED_QUERY_MAX_NODES {
+            ranked.push((node_id, score));
+            continue;
+        }
+        let Some((worst_index, (worst_node, worst_score))) =
+            ranked.iter().enumerate().max_by(|(_, left), (_, right)| {
+                left.1
+                    .cmp(&right.1)
+                    .then_with(|| left.0.as_bytes().cmp(right.0.as_bytes()))
+            })
+        else {
+            continue;
+        };
+        if score < *worst_score
+            || (score == *worst_score && node_id.as_bytes() < worst_node.as_bytes())
+        {
+            ranked[worst_index] = (node_id, score);
+        }
+    }
+    if let Some(score) = local_score {
+        if ranked.len() < METADATA_DISTRIBUTED_QUERY_MAX_NODES {
+            ranked.push((local_node_id, score));
+        } else if let Some((worst_index, _)) =
+            ranked.iter().enumerate().max_by(|(_, left), (_, right)| {
+                left.1
+                    .cmp(&right.1)
+                    .then_with(|| left.0.as_bytes().cmp(right.0.as_bytes()))
+            })
+        {
+            ranked[worst_index] = (local_node_id, score);
+        }
+    }
+    ranked.sort_unstable_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| left.0.as_bytes().cmp(right.0.as_bytes()))
+    });
+    ranked.into_iter().map(|(node_id, _)| node_id).collect()
+}
+
 fn fanout_nodes_with_local(mut nodes: Vec<NodeId>, local_node_id: NodeId) -> Vec<NodeId> {
     if !nodes.contains(&local_node_id) {
         nodes.push(local_node_id);
@@ -2555,7 +2632,7 @@ impl MetadataFanoutOperation {
         MetadataError::Backend(format!(
             "distributed metadata {} node timed out after {}ms",
             self.label(),
-            METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT.as_millis()
+            METADATA_PEER_TIMEOUT.as_millis()
         ))
     }
 }
@@ -2607,7 +2684,7 @@ async fn run_metadata_fanout_node<T>(
         local_call(node_id).instrument(node_span.clone()).await
     } else {
         match tokio::time::timeout(
-            METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT,
+            METADATA_PEER_TIMEOUT,
             remote_call(node_id).instrument(node_span.clone()),
         )
         .await
@@ -2677,6 +2754,7 @@ where
         target_nodes,
         allow_partial,
         discovery_failed: scope_discovery_failed,
+        subject: request_subject,
     } = scope;
     ensure_supported_query_mode(&mode);
     match mode.unwrap_or(MetadataApiQueryMode::Distributed) {
@@ -2712,19 +2790,22 @@ where
             }
             let all_nodes = nodes.clone();
             let mut failed_partitions = Vec::new();
-            if matches!(
-                operation,
-                MetadataFanoutOperation::Query | MetadataFanoutOperation::BucketSearch
-            ) && nodes.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES
-            {
-                if let Some(local_index) = nodes
-                    .iter()
-                    .position(|node_id| *node_id == local_node_id)
-                    .filter(|index| *index >= METADATA_DISTRIBUTED_QUERY_MAX_NODES)
-                {
-                    nodes.swap(local_index, METADATA_DISTRIBUTED_QUERY_MAX_NODES - 1);
+            if nodes.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES {
+                let mut subject = Vec::with_capacity(32 + operation.label().len() + 32 + 1);
+                subject.extend_from_slice(realm_id.as_bytes());
+                subject.extend_from_slice(operation.label().as_bytes());
+                if let Some(request_subject) = request_subject {
+                    subject.extend_from_slice(&request_subject);
                 }
-                failed_partitions.extend(nodes.drain(METADATA_DISTRIBUTED_QUERY_MAX_NODES..));
+                subject.extend_from_slice(local_node_id.as_bytes());
+                let selected = select_fanout_nodes(&nodes, local_node_id, &subject);
+                failed_partitions.extend(
+                    all_nodes
+                        .iter()
+                        .copied()
+                        .filter(|node_id| !selected.contains(node_id)),
+                );
+                nodes = selected;
                 if !allow_partial {
                     return Err(MetadataApiError::ServiceUnavailable);
                 }
@@ -2834,6 +2915,13 @@ pub async fn search_buckets_distributed(
     request: BucketSearchRequest,
 ) -> Result<BucketSearchExecution, MetadataApiError> {
     let limit = request.limit.clamp(1, 50);
+    let subject = query_fingerprint(
+        &request.query,
+        None,
+        Some(MetadataApiQueryMode::Distributed),
+        None,
+        None,
+    );
     let handle = context
         .metadata_handle
         .clone()
@@ -2879,7 +2967,8 @@ pub async fn search_buckets_distributed(
             Some(MetadataApiQueryMode::Distributed),
             request.target_nodes,
             true,
-        ),
+        )
+        .with_subject(subject),
         MetadataFanoutOperation::BucketSearch,
         local_call,
         remote_call,
@@ -3545,12 +3634,54 @@ mod tests {
     }
 
     #[test]
+    fn fanout_nodes_bounded() {
+        let local = iroh::SecretKey::from_bytes(&[255u8; 32]).public();
+        let mut nodes = (1u8..=64)
+            .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
+            .collect::<Vec<_>>();
+        nodes.push(local);
+        let mut reversed = nodes.clone();
+        reversed.reverse();
+        let first = select_fanout_nodes(&nodes, local, b"metadata-query");
+        let second = select_fanout_nodes(&reversed, local, b"metadata-query");
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), METADATA_DISTRIBUTED_QUERY_MAX_NODES);
+        assert!(first.contains(&local));
+        assert_eq!(first.iter().collect::<HashSet<_>>().len(), first.len());
+    }
+
+    #[test]
+    fn path_denial_wins() {
+        let record = public_record(Ulid::generate(), Ulid::generate());
+        let result = MetadataPathLookupResult {
+            winner: sanitize_path_winner(record).expect("valid path winner"),
+            conflicts: Vec::new(),
+        };
+
+        assert!(matches!(
+            reduce_path_response(
+                Some(result.clone()),
+                Some(MetadataApiError::Forbidden),
+                false,
+                false,
+                false,
+            ),
+            Err(MetadataApiError::Forbidden)
+        ));
+        assert!(matches!(
+            reduce_path_response(Some(result), None, false, true, false),
+            Err(MetadataApiError::ServiceUnavailable)
+        ));
+    }
+
+    #[test]
     fn peer_timeout_fits() {
         let waves =
             (METADATA_DISTRIBUTED_QUERY_MAX_NODES + METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT - 1)
                 / METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT;
         assert!(
-            METADATA_PATH_PEER_TIMEOUT.as_secs() * waves as u64
+            METADATA_PEER_TIMEOUT.as_secs() * waves as u64
                 <= METADATA_DISTRIBUTED_QUERY_DEADLINE.as_secs()
         );
     }
