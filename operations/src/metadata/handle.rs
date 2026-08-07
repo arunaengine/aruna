@@ -1270,6 +1270,8 @@ impl MetadataHandle {
         metadata_bytes: u64,
     ) -> Result<(), MetadataError> {
         let total_started = Instant::now();
+        let audit_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(super::audit::AUDIT_DEADLINE_SECS);
         let read_started = Instant::now();
         let message = read_transport_message(&mut stream).await?;
         let span = Span::current();
@@ -1540,7 +1542,7 @@ impl MetadataHandle {
                 super::forward::apply_forwarded_write(context, peer, forward).await
             }
             MetadataTransportMessage::ForwardAuditPage { request } => {
-                super::audit::serve_local_audit(context, peer, request).await
+                super::audit::serve_local_audit(context, peer, request, audit_deadline).await
             }
             forward @ MetadataTransportMessage::ForwardTokenRevocation { .. } => {
                 super::forward::apply_token_revoke(context, peer, forward).await

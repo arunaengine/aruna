@@ -229,7 +229,12 @@ pub async fn write_message(
 
 pub(crate) fn encode_message(message: &MetadataTransportMessage) -> Result<Vec<u8>, String> {
     let bytes = postcard::to_allocvec(message).map_err(|err| err.to_string())?;
-    if bytes.len() > MAX_MESSAGE_SIZE {
+    let max_size = if frame_class(message) == AUDIT_FRAME {
+        audit_frame_cap()
+    } else {
+        MAX_MESSAGE_SIZE
+    };
+    if bytes.len() > max_size {
         return Err("metadata message exceeds maximum size".to_string());
     }
 
@@ -280,11 +285,9 @@ where
         .await
         .map_err(|err| err.to_string())?;
     let class = class_buf[0];
-    let class_size = match class {
-        STANDARD_FRAME => MAX_MESSAGE_SIZE,
-        AUDIT_FRAME => audit_frame_cap(),
-        _ => return Err("invalid metadata frame class".to_string()),
-    };
+    if class != STANDARD_FRAME && class != AUDIT_FRAME {
+        return Err("invalid metadata frame class".to_string());
+    }
 
     let mut len_buf = [0u8; 4];
     reader
@@ -292,7 +295,7 @@ where
         .await
         .map_err(|err| err.to_string())?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > class_size.min(max_size) {
+    if len > max_size.min(MAX_MESSAGE_SIZE) {
         return Err("metadata frame exceeds maximum size".to_string());
     }
 
@@ -302,8 +305,12 @@ where
         .await
         .map_err(|err| err.to_string())?;
     let message = postcard::from_bytes(&bytes).map_err(|err| err.to_string())?;
-    if frame_class(&message) != class {
+    let decoded_class = frame_class(&message);
+    if decoded_class != class {
         return Err("metadata frame class does not match message".to_string());
+    }
+    if decoded_class == AUDIT_FRAME && len > audit_frame_cap() {
+        return Err("metadata audit frame exceeds maximum size".to_string());
     }
     Ok(message)
 }
@@ -330,8 +337,12 @@ pub(crate) fn frame_class(message: &MetadataTransportMessage) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::audit::AuditPageEntry;
     use aruna_core::metadata::MAX_METADATA_BEARER_TOKEN_LEN;
-    use aruna_core::structs::{AuthContext, PathRestriction, Permission, RealmId};
+    use aruna_core::structs::{
+        AuthContext, MetadataAuditOperation, MetadataAuditRecord, PathRestriction, Permission,
+        RealmId,
+    };
     use aruna_core::types::UserId;
 
     #[test]
@@ -482,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn read_results_preserve_errors() {
+    fn read_errors_roundtrip() {
         for error in [
             MetadataReadError::Unauthorized,
             MetadataReadError::Forbidden,
@@ -566,6 +577,46 @@ mod tests {
                 .await
                 .unwrap(),
             message
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_cap_decoded() {
+        let realm_id = RealmId([1u8; 32]);
+        let message = MetadataTransportMessage::ForwardedAuditPage {
+            result: Ok(AuditPageResponse {
+                records: vec![AuditPageEntry {
+                    key: vec![0u8; aruna_core::audit::AUDIT_KEY_BYTES],
+                    record: MetadataAuditRecord {
+                        realm_id,
+                        group_id: Ulid::from_bytes([2u8; 16]),
+                        document_id: Ulid::from_bytes([3u8; 16]),
+                        graph_iri: "x".repeat(MAX_AUDIT_PAGE_BYTES),
+                        user_id: UserId::local(Ulid::from_bytes([4u8; 16]), realm_id),
+                        node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
+                        operation: MetadataAuditOperation::Create,
+                        occurred_at_ms: 0,
+                        details: None,
+                    },
+                }],
+                next_start_after: None,
+            }),
+        };
+        let bytes = postcard::to_allocvec(&message).unwrap();
+        assert!(bytes.len() > audit_frame_cap());
+        let (mut writer, mut reader) = tokio::io::duplex(bytes.len() + 5);
+        writer.write_all(&[STANDARD_FRAME]).await.unwrap();
+        writer
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        writer.write_all(&bytes).await.unwrap();
+
+        assert_eq!(
+            read_message_cap(&mut reader, MAX_MESSAGE_SIZE)
+                .await
+                .unwrap_err(),
+            "metadata audit frame exceeds maximum size"
         );
     }
 

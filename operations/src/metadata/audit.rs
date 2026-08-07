@@ -4,7 +4,6 @@
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
 
 use aruna_core::audit::{
     AUDIT_KEY_BYTES, AuditPageBatch, AuditPageEntry, AuditPageRequest, AuditPageResponse,
@@ -785,8 +784,8 @@ pub(crate) async fn serve_local_audit(
     context: &Arc<DriverContext>,
     peer: NodeId,
     request: AuditPageRequest,
+    deadline: tokio::time::Instant,
 ) -> MetadataTransportMessage {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(AUDIT_DEADLINE_SECS);
     MetadataTransportMessage::ForwardedAuditPage {
         result: local_audit_result(context, peer, request, deadline).await,
     }

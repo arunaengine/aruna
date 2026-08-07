@@ -3,7 +3,6 @@ use aruna_core::effects::{DhtEffect, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{DhtEvent, JobControlEvent, NetEvent, StreamEvent};
 use aruna_core::id::hex_prefix;
-use std::collections::BTreeSet;
 use tracing::{trace, warn};
 
 use crate::{DhtHandle, DocumentSyncService};
@@ -40,34 +39,12 @@ pub async fn handle_net_effect(
         )),
         NetEffect::AuditPage(audit) => {
             let mut batch = AuditPageBatch::with_limit(audit.request.limit);
-            let mut selected = BTreeSet::new();
-            let mut overflow = false;
+            if audit.nodes.len() > MAX_AUDIT_PEERS {
+                batch.missing_overflow = 1;
+                return NetEvent::AuditPages(batch);
+            }
             for node in audit.nodes {
-                if selected.contains(&node) {
-                    continue;
-                }
-                if selected.len() < MAX_AUDIT_PEERS {
-                    selected.insert(node);
-                    continue;
-                }
-                overflow = true;
-                let Some(largest) = selected
-                    .iter()
-                    .max_by(|left, right| left.as_bytes().cmp(right.as_bytes()))
-                    .copied()
-                else {
-                    continue;
-                };
-                if node.as_bytes() < largest.as_bytes() {
-                    selected.remove(&largest);
-                    selected.insert(node);
-                }
-            }
-            for node in selected {
                 batch.mark_missing(node);
-            }
-            if overflow {
-                batch.missing_overflow = batch.missing_overflow.max(1);
             }
             NetEvent::AuditPages(batch)
         }
