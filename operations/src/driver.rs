@@ -794,6 +794,25 @@ fn drive_suboperation<'a>(
                         warn!(%txn_id, "Skipping abort after an unknown commit outcome");
                         continue;
                     }
+                    if let Some(deadline) = deadline
+                        && deadline <= tokio::time::Instant::now()
+                        && !managed_effect(&effect)
+                    {
+                        expired = true;
+                        cleanup_deadline =
+                            Some(tokio::time::Instant::now() + SUBOP_CLEANUP_TIMEOUT);
+                        queue.clear();
+                        if !committed {
+                            queue.extend(operation.abort().into_iter().filter(|effect| {
+                                !matches!(
+                                    transaction_effect(effect),
+                                    Some(TransactionEffect::Abort(txn_id))
+                                        if tracker.blocked_abort(txn_id)
+                                )
+                            }));
+                        }
+                        continue;
+                    }
                     tracker.begin(transaction);
                     hold_backends(context, &effect, &mut holds);
                     let event = if tracker.reject_start(transaction) {
@@ -929,6 +948,21 @@ pub async fn drive_until<O: Operation>(
                 && tracker.blocked_abort(txn_id)
             {
                 warn!(%txn_id, "Skipping abort after an unknown commit outcome");
+                continue;
+            }
+            if !expired && deadline <= tokio::time::Instant::now() && !managed_effect(&effect) {
+                expired = true;
+                cleanup_deadline = Some(tokio::time::Instant::now() + SUBOP_CLEANUP_TIMEOUT);
+                queue.clear();
+                if !committed {
+                    queue.extend(operation.abort().into_iter().filter(|effect| {
+                        !matches!(
+                            transaction_effect(effect),
+                            Some(TransactionEffect::Abort(txn_id))
+                                if tracker.blocked_abort(txn_id)
+                        )
+                    }));
+                }
                 continue;
             }
             tracker.begin(transaction);
