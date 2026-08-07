@@ -3437,6 +3437,7 @@ fn overlay_realm_config_reducer_materialization(
 
     // Union, so a locally accepted revocation is never dropped because the
     // replicated set has not carried it yet.
+    config.revocation_floor = config.revocation_floor.max(reducer_state.revocation_floor);
     config.merge_revocation_index(revocation_index, now);
 
     for path in reducer_state.conflicts.keys() {
@@ -3507,6 +3508,7 @@ fn realm_config_from_reducer_materialization(
         placement_handle_ranges: Vec::new(),
         band_pools: Vec::new(),
         revoked_tokens: Vec::new(),
+        revocation_floor: reducer_state.revocation_floor,
     };
     overlay_realm_config_reducer_materialization(&mut config, reducer_state, now, revocation_index);
     Some(config)

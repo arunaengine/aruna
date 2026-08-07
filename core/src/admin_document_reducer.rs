@@ -301,6 +301,10 @@ impl RevocationIndex {
             .collect()
     }
 
+    pub(crate) fn watermark(&self) -> u64 {
+        self.now
+    }
+
     fn clear_hash(&mut self, hash: &str) {
         if let Some(candidate) = self.retained.remove(hash) {
             let origin = candidate.dot.origin_node_id;
