@@ -396,13 +396,29 @@ impl ConnectionActivity {
     }
 }
 
+struct ActiveRequestGuard {
+    activity: Arc<ConnectionActivity>,
+}
+
+impl ActiveRequestGuard {
+    fn new(activity: Arc<ConnectionActivity>) -> Self {
+        Self { activity }
+    }
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.activity.end_request();
+    }
+}
+
 struct ResponseBody {
     inner: Pin<Box<s3s::Body>>,
     permit: Option<OwnedSemaphorePermit>,
     activity: Arc<ConnectionActivity>,
     response_activity: Arc<ConnectionActivity>,
     cancellation: BoxFuture<'static, ()>,
-    active: bool,
+    active: Option<ActiveRequestGuard>,
     ended: bool,
 }
 
@@ -412,6 +428,7 @@ impl ResponseBody {
         permit: OwnedSemaphorePermit,
         activity: Arc<ConnectionActivity>,
         response_activity: Arc<ConnectionActivity>,
+        active: ActiveRequestGuard,
     ) -> Self {
         let connection_activity = activity.clone();
         let body_activity = response_activity.clone();
@@ -427,7 +444,7 @@ impl ResponseBody {
             activity,
             response_activity,
             cancellation,
-            active: true,
+            active: Some(active),
             ended: false,
         }
     }
@@ -438,10 +455,7 @@ impl hyper::body::Body for ResponseBody {
     type Error = s3s::StdError;
 
     fn finish(&mut self) {
-        if self.active {
-            self.active = false;
-            self.activity.end_request();
-        }
+        self.active.take();
     }
 
     fn poll_frame(
@@ -898,11 +912,11 @@ impl Service<Request<Incoming>> for WrappingService {
                 return Ok(response);
             }
             activity.begin_request();
+            let active_guard = ActiveRequestGuard::new(activity.clone());
             let bucket_cors = if origin_header.is_some() {
                 match load_bucket_cors_config(driver_ctx, bucket).await {
                     Ok(bucket_cors) => bucket_cors,
                     Err(error) => {
-                        activity.end_request();
                         span.record("status_code", 500);
                         record_s3_request(&metrics, &method, 500, "unknown", started.elapsed());
                         let _guard = span.enter();
@@ -960,7 +974,6 @@ impl Service<Request<Incoming>> for WrappingService {
                         .body(s3s::Body::empty())
                         .expect("static response must build")
                 };
-                activity.end_request();
                 let code = response.status().as_u16();
                 emit_request_completed(&span, "s3", code, started);
                 record_s3_request(&metrics, &method, code, "cors_preflight", started.elapsed());
@@ -972,7 +985,6 @@ impl Service<Request<Incoming>> for WrappingService {
                 Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => {
                     drop(request_permit);
                     drop(s3s_request);
-                    activity.end_request();
                     let response = slow_down_response(1);
                     let code = response.status().as_u16();
                     emit_request_completed(&span, "s3", code, started);
@@ -987,7 +999,6 @@ impl Service<Request<Incoming>> for WrappingService {
                         drop(egress_permit);
                         drop(request_permit);
                         drop(s3s_request);
-                        activity.end_request();
                         let response = slow_down_response(1);
                         let code = response.status().as_u16();
                         emit_request_completed(&span, "s3", code, started);
@@ -1020,7 +1031,6 @@ impl Service<Request<Incoming>> for WrappingService {
                     drop(request_permit);
                     drop(capture_permit.take());
                     drop(egress_permit);
-                    activity.end_request();
                     stream_activity.stop();
                     return Err(connection_error());
                 }
@@ -1028,7 +1038,6 @@ impl Service<Request<Incoming>> for WrappingService {
                     drop(request_permit);
                     drop(capture_permit.take());
                     drop(egress_permit);
-                    activity.end_request();
                     stream_activity.stop();
                     return stream_timeout_response();
                 }
@@ -1037,7 +1046,6 @@ impl Service<Request<Incoming>> for WrappingService {
                 drop(request_permit);
                 drop(capture_permit.take());
                 drop(egress_permit);
-                activity.end_request();
                 stream_activity.stop();
                 return stream_timeout_response();
             }
@@ -1059,6 +1067,7 @@ impl Service<Request<Incoming>> for WrappingService {
                             egress_permit,
                             activity.clone(),
                             response_activity,
+                            active_guard,
                         ))
                     }))
                 }
@@ -1066,7 +1075,6 @@ impl Service<Request<Incoming>> for WrappingService {
                     drop(request_permit);
                     drop(capture_permit.take());
                     drop(egress_permit);
-                    activity.end_request();
                     stream_activity.stop();
                     Err(error)
                 }
@@ -1336,11 +1344,39 @@ mod tests {
         let limit = Arc::new(Semaphore::new(1));
         let permit = limit.clone().try_acquire_owned().expect("permit");
         let activity = Arc::new(ConnectionActivity::default());
+        activity.begin_request();
+        let active = ActiveRequestGuard::new(activity.clone());
         let stream_activity = Arc::new(ConnectionActivity::default());
-        let body = ResponseBody::new(s3s::Body::empty(), permit, activity, stream_activity);
+        let body = ResponseBody::new(
+            s3s::Body::empty(),
+            permit,
+            activity.clone(),
+            stream_activity,
+            active,
+        );
         assert_eq!(limit.available_permits(), 0);
+        assert_eq!(activity.active.load(Ordering::Acquire), 1);
         drop(body);
         assert_eq!(limit.available_permits(), 1);
+        assert_eq!(activity.active.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn drops_pending_guard() {
+        let activity = Arc::new(ConnectionActivity::default());
+        activity.begin_request();
+        let ready = Arc::new(Notify::new());
+        let task_activity = activity.clone();
+        let task_ready = ready.clone();
+        let task = tokio::spawn(async move {
+            let _guard = ActiveRequestGuard::new(task_activity);
+            task_ready.notify_one();
+            std::future::pending::<()>().await;
+        });
+        ready.notified().await;
+        task.abort();
+        let _ = task.await;
+        assert_eq!(activity.active.load(Ordering::Acquire), 0);
     }
 
     #[test]
