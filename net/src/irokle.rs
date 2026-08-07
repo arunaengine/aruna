@@ -3473,8 +3473,7 @@ impl DocumentSyncService {
             document_id,
         } = target
         {
-            return apply_metadata_registry_delete_to_storage(&self.storage, group_id, document_id)
-                .await;
+            return delete_registry_record(&self.storage, group_id, document_id).await;
         }
         if admin_document_target_for_reduced_document(&target).is_some() {
             return Err(NetError::Bootstrap(
@@ -4287,7 +4286,7 @@ async fn apply_metadata_document_lifecycle_to_storage(
     ))
 }
 
-async fn apply_metadata_registry_delete_to_storage(
+async fn delete_registry_record(
     storage: &StorageHandle,
     group_id: Ulid,
     document_id: Ulid,
@@ -4756,7 +4755,7 @@ async fn apply_group_authorization_admin_document_operation_to_storage(
         roles: Default::default(),
         policies: Default::default(),
     });
-    materialize_group_authorization_admin_document_operation(&mut auth_doc, &reducer_state, &event);
+    materialize_group_authorization(&mut auth_doc, &reducer_state, &event);
     let group_writes = group_write_entries_from_reducer(storage, group_id, &reducer_state).await?;
 
     let mut writes = vec![
@@ -5177,7 +5176,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
     ))
 }
 
-fn materialize_group_authorization_admin_document_operation(
+fn materialize_group_authorization(
     auth_doc: &mut GroupAuthorizationDocument,
     reducer_state: &AdminDocumentReducerState,
     event: &AdminDocumentEvent,
@@ -5194,7 +5193,7 @@ fn materialize_group_authorization_admin_document_operation(
     }
 
     if let AdminDocumentOperation::GroupRoleCreated { role } = &event.op {
-        materialize_group_authorization_role(auth_doc, reducer_state, role);
+        materialize_group_role(auth_doc, reducer_state, role);
         return;
     }
 
@@ -5233,7 +5232,7 @@ fn materialize_group_authorization_admin_document_operation(
     }
 }
 
-fn materialize_group_authorization_role(
+fn materialize_group_role(
     auth_doc: &mut GroupAuthorizationDocument,
     reducer_state: &AdminDocumentReducerState,
     role: &AdminDocumentRoleDefinition,
@@ -10059,7 +10058,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quota_survives_reducer_materialization_without_existing_config_doc() {
+    async fn quota_survives_materialization() {
+        // Quota remains when the reducer materializes without a stored config.
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([61; 32]);
         let actor = test_actor(
@@ -13643,7 +13643,7 @@ mod tests {
         );
         write_document_lifecycle_record(&storage, &stale_delete).await;
 
-        apply_metadata_registry_delete_to_storage(&storage, group_id, document_id)
+        delete_registry_record(&storage, group_id, document_id)
             .await
             .expect("stale registry delete is fenced");
 
@@ -13888,7 +13888,7 @@ mod tests {
         );
         write_registry_record(&storage, &record).await;
 
-        apply_metadata_registry_delete_to_storage(&storage, group_id, document_id)
+        delete_registry_record(&storage, group_id, document_id)
             .await
             .expect("registry delete skips without tombstone");
 
