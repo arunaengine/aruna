@@ -64,6 +64,32 @@ pub struct AuditPageBatch {
     pub bytes: usize,
 }
 
+enum PageDecision {
+    Insert,
+    Replace,
+    UpdateSource,
+    Ignore,
+}
+
+struct AuditPagePlan {
+    decisions: Vec<PageDecision>,
+    bytes: usize,
+    horizon: Option<Vec<u8>>,
+    conflict: bool,
+}
+
+struct AuditEntryPlan {
+    decision: PageDecision,
+    bytes: usize,
+    conflict: bool,
+}
+
+struct AuditMergePlan {
+    decisions: Vec<PageDecision>,
+    bytes: usize,
+    conflict: bool,
+}
+
 impl AuditPageBatch {
     pub fn new() -> Self {
         Self::with_limit(MAX_AUDIT_RECORDS)
@@ -117,88 +143,150 @@ impl AuditPageBatch {
             self.mark_missing(node);
             return Err(error);
         }
-        // Page validation bounds the owned input before this bounded batch clone.
-        let mut staged = self.clone();
-        if let Err(error) = staged.merge_page(node, page) {
-            self.mark_missing(node);
-            return Err(error);
-        }
-        *self = staged;
+        let plan = match self.preflight_page(node, &page) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.mark_missing(node);
+                return Err(error);
+            }
+        };
+        self.apply_page(node, page, plan);
         Ok(())
     }
 
-    fn merge_page(&mut self, node: NodeId, page: AuditPageResponse) -> Result<(), AuditPageError> {
-        if !self.mark_complete(node) {
+    fn preflight_page(
+        &self,
+        node: NodeId,
+        page: &AuditPageResponse,
+    ) -> Result<AuditPagePlan, AuditPageError> {
+        if !self.completed_nodes.contains(&node) && self.completed_nodes.len() == MAX_AUDIT_PEERS {
             return Err(AuditPageError::TooManyPeers);
         }
-        if page.next_start_after.is_some() {
-            let marker = page
-                .records
-                .last()
-                .map(|entry| entry.key.clone())
-                .ok_or(AuditPageError::InvalidMarker)?;
-            self.horizon = Some(match self.horizon.take() {
-                Some(current) => current.min(marker),
-                None => marker,
+        let horizon = page.next_start_after.as_ref().and_then(|marker| {
+            if self
+                .horizon
+                .as_ref()
+                .is_none_or(|current| marker.as_slice() < current.as_slice())
+            {
+                Some(marker.clone())
+            } else {
+                None
+            }
+        });
+        let mut bytes = self.bytes;
+        let mut conflict = false;
+        let mut decisions = Vec::with_capacity(page.records.len());
+        for entry in &page.records {
+            let plan = self.plan_entry(node, entry, bytes)?;
+            bytes = plan.bytes;
+            conflict |= plan.conflict;
+            decisions.push(plan.decision);
+        }
+        Ok(AuditPagePlan {
+            decisions,
+            bytes,
+            horizon,
+            conflict,
+        })
+    }
+
+    fn plan_entry(
+        &self,
+        node: NodeId,
+        entry: &AuditPageEntry,
+        bytes: usize,
+    ) -> Result<AuditEntryPlan, AuditPageError> {
+        let record_bytes =
+            postcard::to_allocvec(&entry.record).map_err(|_| AuditPageError::TooLarge)?;
+        let entry_bytes = entry.key.len() + record_bytes.len();
+        if bytes.saturating_add(entry_bytes) > MAX_AUDIT_BATCH_BYTES {
+            return Err(AuditPageError::TooLarge);
+        }
+        let Some(current) = self.records.get(&entry.key) else {
+            return Ok(AuditEntryPlan {
+                decision: PageDecision::Insert,
+                bytes: bytes + entry_bytes,
+                conflict: false,
+            });
+        };
+        if current.entry.record == entry.record {
+            return Ok(AuditEntryPlan {
+                decision: if node.as_bytes() < current.source.as_bytes() {
+                    PageDecision::UpdateSource
+                } else {
+                    PageDecision::Ignore
+                },
+                bytes,
+                conflict: false,
             });
         }
+        let current_bytes =
+            postcard::to_allocvec(&current.entry.record).map_err(|_| AuditPageError::TooLarge)?;
+        let replace = record_bytes.as_slice() < current_bytes.as_slice()
+            || (record_bytes.as_slice() == current_bytes.as_slice()
+                && node.as_bytes() < current.source.as_bytes());
+        if !replace {
+            return Ok(AuditEntryPlan {
+                decision: PageDecision::Ignore,
+                bytes,
+                conflict: true,
+            });
+        }
+        let current_size = current.entry.key.len() + current_bytes.len();
+        if entry_bytes > current_size
+            && bytes.saturating_add(entry_bytes - current_size) > MAX_AUDIT_BATCH_BYTES
+        {
+            return Err(AuditPageError::TooLarge);
+        }
+        Ok(AuditEntryPlan {
+            decision: PageDecision::Replace,
+            bytes: bytes.saturating_sub(current_size) + entry_bytes,
+            conflict: true,
+        })
+    }
 
-        for entry in page.records {
-            let entry_bytes = entry.key.len()
-                + postcard::to_allocvec(&entry.record)
-                    .map_err(|_| AuditPageError::TooLarge)?
-                    .len();
-            if self.bytes.saturating_add(entry_bytes) > MAX_AUDIT_BATCH_BYTES {
-                return Err(AuditPageError::TooLarge);
-            }
-            match self.records.entry(entry.key.clone()) {
-                std::collections::btree_map::Entry::Vacant(slot) => {
-                    self.bytes += entry_bytes;
-                    slot.insert(AuditBatchEntry {
+    fn apply_page(&mut self, node: NodeId, page: AuditPageResponse, plan: AuditPagePlan) {
+        self.missing_nodes.remove(&node);
+        self.completed_nodes.insert(node);
+        if let Some(horizon) = plan.horizon {
+            self.horizon = Some(horizon);
+        }
+        self.conflict |= plan.conflict;
+        for (entry, decision) in page.records.into_iter().zip(plan.decisions) {
+            self.apply_entry(node, entry, decision);
+        }
+        self.bytes = plan.bytes;
+        self.prune();
+    }
+
+    fn apply_entry(&mut self, node: NodeId, entry: AuditPageEntry, decision: PageDecision) {
+        match decision {
+            PageDecision::Insert | PageDecision::Replace => {
+                self.records.insert(
+                    entry.key.clone(),
+                    AuditBatchEntry {
                         source: node,
                         entry,
-                    });
-                }
-                std::collections::btree_map::Entry::Occupied(mut slot) => {
-                    if slot.get().entry.record == entry.record {
-                        if node.as_bytes() < slot.get().source.as_bytes() {
-                            slot.get_mut().source = node;
-                        }
-                    } else {
-                        self.conflict = true;
-                        let candidate = postcard::to_allocvec(&entry.record)
-                            .map_err(|_| AuditPageError::TooLarge)?;
-                        let current = postcard::to_allocvec(&slot.get().entry.record)
-                            .map_err(|_| AuditPageError::TooLarge)?;
-                        let replace = (candidate, node.as_bytes().to_vec())
-                            < (current, slot.get().source.as_bytes().to_vec());
-                        if replace {
-                            let current_bytes = slot.get().entry.key.len()
-                                + postcard::to_allocvec(&slot.get().entry.record)
-                                    .map_err(|_| AuditPageError::TooLarge)?
-                                    .len();
-                            if entry_bytes > current_bytes
-                                && self.bytes.saturating_add(entry_bytes - current_bytes)
-                                    > MAX_AUDIT_BATCH_BYTES
-                            {
-                                return Err(AuditPageError::TooLarge);
-                            }
-                            self.bytes = self.bytes.saturating_sub(current_bytes);
-                            self.bytes = self.bytes.saturating_add(entry_bytes);
-                            slot.insert(AuditBatchEntry {
-                                source: node,
-                                entry,
-                            });
-                        }
-                    }
+                    },
+                );
+            }
+            PageDecision::UpdateSource => {
+                if let Some(current) = self.records.get_mut(&entry.key) {
+                    current.source = node;
                 }
             }
+            PageDecision::Ignore => {}
         }
-        self.prune();
-        Ok(())
     }
 
     pub fn merge(&mut self, other: AuditPageBatch) {
+        let plan = match self.preflight_merge(&other) {
+            Ok(plan) => plan,
+            Err(_) => {
+                self.fail_merge(other);
+                return;
+            }
+        };
         self.missing_overflow = self.missing_overflow.saturating_add(other.missing_overflow);
         for node in other.completed_nodes {
             self.mark_complete(node);
@@ -206,61 +294,62 @@ impl AuditPageBatch {
         for node in other.missing_nodes {
             self.mark_missing(node);
         }
-        self.conflict |= other.conflict;
         if let Some(horizon) = other.horizon {
             self.horizon = Some(match self.horizon.take() {
                 Some(current) => current.min(horizon),
                 None => horizon,
             });
         }
-        for (key, candidate) in other.records {
-            let entry_bytes = candidate.entry.key.len()
-                + postcard::to_allocvec(&candidate.entry.record)
-                    .map(|bytes| bytes.len())
-                    .unwrap_or(usize::MAX);
-            if self.bytes.saturating_add(entry_bytes) > MAX_AUDIT_BATCH_BYTES {
-                self.mark_missing(candidate.source);
-                continue;
-            }
-            match self.records.entry(key) {
-                std::collections::btree_map::Entry::Vacant(slot) => {
-                    self.bytes += entry_bytes;
-                    slot.insert(candidate);
+        self.conflict |= other.conflict || plan.conflict;
+        for (candidate, decision) in other
+            .records
+            .into_iter()
+            .map(|(_, candidate)| candidate)
+            .zip(plan.decisions)
+        {
+            self.apply_entry(candidate.source, candidate.entry, decision);
+        }
+        self.bytes = plan.bytes;
+        self.prune();
+    }
+
+    fn preflight_merge(&self, other: &AuditPageBatch) -> Result<AuditMergePlan, AuditPageError> {
+        let mut completed = self.completed_nodes.len();
+        for node in &other.completed_nodes {
+            if !self.completed_nodes.contains(node) {
+                if completed == MAX_AUDIT_PEERS {
+                    return Err(AuditPageError::TooManyPeers);
                 }
-                std::collections::btree_map::Entry::Occupied(mut slot) => {
-                    if slot.get().entry.record == candidate.entry.record {
-                        if candidate.source.as_bytes() < slot.get().source.as_bytes() {
-                            slot.get_mut().source = candidate.source;
-                        }
-                    } else {
-                        self.conflict = true;
-                        let replace = postcard::to_allocvec(&candidate.entry.record)
-                            .unwrap_or_default()
-                            .cmp(
-                                &postcard::to_allocvec(&slot.get().entry.record)
-                                    .unwrap_or_default(),
-                            )
-                            .then_with(|| {
-                                candidate
-                                    .source
-                                    .as_bytes()
-                                    .cmp(slot.get().source.as_bytes())
-                            })
-                            .is_lt();
-                        if replace {
-                            let current_bytes = slot.get().entry.key.len()
-                                + postcard::to_allocvec(&slot.get().entry.record)
-                                    .map(|bytes| bytes.len())
-                                    .unwrap_or(usize::MAX);
-                            self.bytes = self.bytes.saturating_sub(current_bytes);
-                            self.bytes = self.bytes.saturating_add(entry_bytes);
-                            slot.insert(candidate);
-                        }
-                    }
-                }
+                completed += 1;
             }
         }
-        self.prune();
+        let mut bytes = self.bytes;
+        let mut conflict = false;
+        let mut decisions = Vec::with_capacity(other.records.len());
+        for candidate in other.records.values() {
+            let plan = self.plan_entry(candidate.source, &candidate.entry, bytes)?;
+            bytes = plan.bytes;
+            conflict |= plan.conflict;
+            decisions.push(plan.decision);
+        }
+        Ok(AuditMergePlan {
+            decisions,
+            bytes,
+            conflict,
+        })
+    }
+
+    fn fail_merge(&mut self, other: AuditPageBatch) {
+        self.missing_overflow = self.missing_overflow.saturating_add(other.missing_overflow);
+        for node in other.completed_nodes {
+            self.mark_missing(node);
+        }
+        for node in other.missing_nodes {
+            self.mark_missing(node);
+        }
+        for candidate in other.records.into_values() {
+            self.mark_missing(candidate.source);
+        }
     }
 
     fn prune(&mut self) {
@@ -510,5 +599,55 @@ mod tests {
         assert!(batch.horizon.is_none());
         assert!(!batch.completed_nodes.contains(&node));
         assert!(batch.missing_nodes.contains(&node));
+    }
+
+    #[test]
+    fn chunk_overflow_atomic() {
+        let realm_id = RealmId([1u8; 32]);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let document_id = Ulid::from_bytes([3u8; 16]);
+        let node = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+        let request = request(realm_id, group_id, document_id);
+        let first = entry(
+            group_id,
+            document_id,
+            Ulid::from_bytes([1u8; 16]),
+            realm_id,
+            node,
+        );
+        let second = entry(
+            group_id,
+            document_id,
+            Ulid::from_bytes([2u8; 16]),
+            realm_id,
+            node,
+        );
+        let first_bytes = first.key.len() + postcard::to_allocvec(&first.record).unwrap().len();
+        let mut batch = AuditPageBatch::new();
+        // Seed accounting just below the cap so the second chunk entry overflows.
+        batch.bytes = MAX_AUDIT_BATCH_BYTES - first_bytes;
+        let bytes = batch.bytes;
+        let existing = iroh::SecretKey::from_bytes(&[5u8; 32]).public();
+        batch.mark_missing(existing);
+        let mut chunk = AuditPageBatch::new();
+        chunk
+            .add_page(
+                node,
+                AuditPageResponse {
+                    records: vec![first, second.clone()],
+                    next_start_after: Some(second.key),
+                },
+                &request,
+            )
+            .unwrap();
+
+        batch.merge(chunk);
+
+        assert!(batch.records.is_empty());
+        assert_eq!(batch.bytes, bytes);
+        assert!(batch.horizon.is_none());
+        assert!(!batch.completed_nodes.contains(&node));
+        assert!(batch.missing_nodes.contains(&node));
+        assert!(batch.missing_nodes.contains(&existing));
     }
 }
