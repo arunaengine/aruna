@@ -1128,6 +1128,48 @@ fn live_replication_jobs_from_config(
         .collect()
 }
 
+fn config_jobs_page(
+    local_node_id: NodeId,
+    auth_context: &AuthContext,
+    bucket: &str,
+    key: &str,
+    version_id: Ulid,
+    delete_marker: bool,
+    config: BucketReplicationConfig,
+    start: usize,
+    limit: usize,
+) -> (Vec<BlobReplicationJobRecord>, Option<usize>) {
+    let now_ms = unix_timestamp_millis();
+    let mut jobs = Vec::with_capacity(limit);
+    for (index, target) in config.targets.into_iter().enumerate().skip(start) {
+        if target.node_id == local_node_id || (delete_marker && !target.replicate_delete_markers) {
+            continue;
+        }
+        if jobs.len() == limit {
+            return (jobs, Some(index));
+        }
+        jobs.push(
+            BlobReplicationJobRecord::new(
+                ReplicateScopeInput {
+                    bucket: bucket.to_string(),
+                    target: ReplicateScopeTarget::Version {
+                        key: key.to_string(),
+                        version_id,
+                    },
+                    target_node_id: target.node_id,
+                    auth_context: auth_context.clone(),
+                    replicate_delete_markers: target.replicate_delete_markers,
+                    mode: ReplicationMode::Live,
+                },
+                Some(delete_marker),
+                now_ms,
+            )
+            .with_writer_auth(auth_context.clone()),
+        );
+    }
+    (jobs, None)
+}
+
 pub async fn restore_blob_replication_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
     match next_blob_replication_timer_after(storage).await {
         Ok(None) => {}
