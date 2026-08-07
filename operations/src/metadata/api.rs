@@ -60,11 +60,11 @@ use crate::metadata::repository::{
     LIST_METADATA_PAGE_SIZE, StorageReadError, iter_registry_effect, parse_registry_iter,
 };
 use crate::permission_rules::GroupPermissionRules;
+use crate::placement::selector::{ROLE_NODE, neg_log2_q48, selector_hash};
 use crate::placement::{
     holds_placement, meta_bucket_subject, registry_placement, registry_placement_for,
     registry_strategy, resolve_shard_holders,
 };
-use crate::placement::selector::{ROLE_NODE, rank_weighted};
 use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, search_local_buckets};
 
 const DEFAULT_LIST_METADATA_LIMIT: usize = 50;
@@ -84,6 +84,8 @@ const METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT: usize = 8;
 const METADATA_DISTRIBUTED_QUERY_MAX_NODES: usize = 32;
 const METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT: Duration = Duration::from_secs(10);
 const METADATA_DISTRIBUTED_QUERY_DEADLINE: Duration = Duration::from_secs(12);
+// Four bounded fanout waves must finish before the request deadline.
+const METADATA_PATH_PEER_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Error)]
 pub enum MetadataApiError {
@@ -544,9 +546,6 @@ pub async fn lookup_metadata_path(
     let config = load_realm_config(context, realm_id)
         .await
         .ok_or(MetadataApiError::ServiceUnavailable)?;
-    let config_digest = config
-        .digest()
-        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     let local_node = context
         .net_handle
         .as_ref()
@@ -557,12 +556,26 @@ pub async fn lookup_metadata_path(
             && matches!(node.kind, RealmNodeKind::Management | RealmNodeKind::Server)
     });
     if !trusted_origin {
-        return forward_path_resolution(context, realm_id, &config, request, auth_token).await;
+        let config_digest = config
+            .digest()
+            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+        return forward_path_resolution(
+            context,
+            realm_id,
+            &config,
+            request,
+            auth_token,
+            config_digest,
+        )
+        .await;
     }
     let strategy = registry_strategy(&config).ok_or(MetadataApiError::ServiceUnavailable)?;
     if strategy.shard_count == 0 {
         return Err(MetadataApiError::ServiceUnavailable);
     }
+    let config_digest = config
+        .digest()
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     let shard_count = strategy.shard_count;
     let auth_token = auth_token.or_else(|| request.auth.clone().map(MetadataAuthToken::internal));
     let group_id = request.group_id;
@@ -668,12 +681,63 @@ pub async fn lookup_metadata_path(
     reduce_path_candidates(candidates)
 }
 
+fn select_forward_peers(
+    config: &RealmConfigDocument,
+    realm_id: RealmId,
+    group_id: GroupId,
+    normalized: &str,
+    local_node: NodeId,
+) -> Result<Vec<NodeId>, MetadataApiError> {
+    let mut subject = meta_bucket_subject(realm_id, group_id, normalized);
+    subject.extend_from_slice(local_node.as_bytes());
+    let mut ranked = Vec::with_capacity(METADATA_DISTRIBUTED_QUERY_MAX_NODES);
+    for node in config
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.kind, RealmNodeKind::Management | RealmNodeKind::Server))
+    {
+        let peer = node
+            .node_id
+            .parse::<NodeId>()
+            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+        if peer == local_node || ranked.iter().any(|(candidate, _)| *candidate == peer) {
+            continue;
+        }
+        let score = neg_log2_q48(selector_hash(ROLE_NODE, &subject, peer.as_bytes()));
+        if ranked.len() < METADATA_DISTRIBUTED_QUERY_MAX_NODES {
+            ranked.push((peer, score));
+            continue;
+        }
+        let Some((worst_index, (worst_peer, worst_score))) =
+            ranked.iter().enumerate().max_by(|(_, left), (_, right)| {
+                left.1
+                    .cmp(&right.1)
+                    .then_with(|| left.0.as_bytes().cmp(right.0.as_bytes()))
+            })
+        else {
+            continue;
+        };
+        if score < *worst_score
+            || (score == *worst_score && peer.as_bytes() < worst_peer.as_bytes())
+        {
+            ranked[worst_index] = (peer, score);
+        }
+    }
+    ranked.sort_unstable_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| left.0.as_bytes().cmp(right.0.as_bytes()))
+    });
+    Ok(ranked.into_iter().map(|(peer, _)| peer).collect())
+}
+
 async fn forward_path_resolution(
     context: &DriverContext,
     realm_id: RealmId,
     config: &RealmConfigDocument,
     request: MetadataPathLookupRequest,
     auth_token: Option<MetadataAuthToken>,
+    config_digest: [u8; 32],
 ) -> Result<MetadataPathLookupResult, MetadataApiError> {
     if request.auth.is_some() && auth_token.is_none() {
         return Err(MetadataApiError::Unauthorized);
@@ -683,31 +747,8 @@ async fn forward_path_resolution(
         .as_ref()
         .map(|net| net.node_id())
         .ok_or(MetadataApiError::ServiceUnavailable)?;
-    let mut peers = config
-        .nodes
-        .iter()
-        .filter(|node| matches!(node.kind, RealmNodeKind::Management | RealmNodeKind::Server))
-        .map(|node| {
-            node.node_id
-                .parse::<NodeId>()
-                .map_err(|_| MetadataApiError::ServiceUnavailable)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    peers.retain(|node| *node != local_node);
-    let mut seen = HashSet::new();
-    peers.retain(|peer| seen.insert(*peer));
     let normalized = MetadataRegistryRecord::normalize_document_path(&request.document_path);
-    let mut subject = meta_bucket_subject(realm_id, request.group_id, &normalized);
-    subject.extend_from_slice(local_node.as_bytes());
-    let candidates = peers
-        .iter()
-        .map(|peer| (*peer.as_bytes(), 1u64))
-        .collect::<Vec<_>>();
-    peers = rank_weighted(ROLE_NODE, &subject, &candidates)
-        .into_iter()
-        .take(METADATA_DISTRIBUTED_QUERY_MAX_NODES)
-        .map(|index| peers[index])
-        .collect();
+    let peers = select_forward_peers(config, realm_id, request.group_id, &normalized, local_node)?;
     if peers.is_empty() {
         return Err(MetadataApiError::ServiceUnavailable);
     }
@@ -715,15 +756,12 @@ async fn forward_path_resolution(
         .metadata_handle
         .as_ref()
         .ok_or(MetadataApiError::ServiceUnavailable)?;
-    let config_digest = config
-        .digest()
-        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     let requests = stream::iter(peers.into_iter().map(|peer| {
         let auth_token = auth_token.clone();
         let document_path = request.document_path.clone();
         async move {
             let response = tokio::time::timeout(
-                METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT,
+                METADATA_PATH_PEER_TIMEOUT,
                 metadata.request_forwarded_write(
                     peer,
                     MetadataTransportMessage::ForwardPathResolution {
@@ -741,8 +779,10 @@ async fn forward_path_resolution(
     .buffer_unordered(METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT);
     futures_util::pin_mut!(requests);
     let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
+    let mut auth_error = None;
     let mut not_found = false;
     let mut unavailable = false;
+    let mut success = None;
     loop {
         let response = match tokio::time::timeout_at(deadline, requests.next()).await {
             Ok(response) => response,
@@ -752,9 +792,7 @@ async fn forward_path_resolution(
             break;
         };
         match response {
-            Ok(Ok(MetadataTransportMessage::ForwardedPathResolution {
-                result: Ok(result),
-            })) => {
+            Ok(Ok(MetadataTransportMessage::ForwardedPathResolution { result: Ok(result) })) => {
                 if validate_path_resolution(
                     realm_id,
                     request.group_id,
@@ -763,26 +801,40 @@ async fn forward_path_resolution(
                 )
                 .is_ok()
                 {
-                    return Ok(MetadataPathLookupResult {
+                    success.get_or_insert(MetadataPathLookupResult {
                         winner: result.winner,
                         conflicts: result.conflicts,
                     });
+                } else {
+                    unavailable = true;
                 }
-                unavailable = true;
             }
             Ok(Ok(MetadataTransportMessage::ForwardedPathResolution {
                 result: Err(MetadataReadError::Unauthorized),
-            })) => return Err(MetadataApiError::Unauthorized),
+            })) => {
+                auth_error.get_or_insert(MetadataApiError::Unauthorized);
+            }
             Ok(Ok(MetadataTransportMessage::ForwardedPathResolution {
                 result: Err(MetadataReadError::Forbidden),
-            })) => return Err(MetadataApiError::Forbidden),
+            })) => {
+                auth_error.get_or_insert(MetadataApiError::Forbidden);
+            }
             Ok(Ok(MetadataTransportMessage::ForwardedPathResolution {
                 result: Err(MetadataReadError::NotFound),
             })) => not_found = true,
             _ => unavailable = true,
         }
     }
-    if not_found && !unavailable {
+    if let Some(error) = auth_error {
+        return Err(error);
+    }
+    if unavailable {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    if let Some(result) = success {
+        return Ok(result);
+    }
+    if not_found {
         Err(MetadataApiError::NotFound)
     } else {
         Err(MetadataApiError::ServiceUnavailable)
@@ -1706,12 +1758,8 @@ async fn load_claim_records(
         .map(|group| group.group_id)
         .collect(),
     })?;
-    let mut pending = load_pending_records(
-        context,
-        group_id,
-        METADATA_REGISTRY_CANDIDATE_LIMIT,
-    )
-    .await?;
+    let mut pending =
+        load_pending_records(context, group_id, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
     let mut records = Vec::new();
     for group_id in group_ids {
         let remaining = METADATA_REGISTRY_CANDIDATE_LIMIT.saturating_sub(records.len());
@@ -3371,6 +3419,50 @@ mod tests {
             check_policy_limit(over),
             Err(MetadataApiError::ServiceUnavailable)
         ));
+    }
+
+    #[test]
+    fn peers_are_bounded() {
+        let local = iroh::SecretKey::from_bytes(&[255u8; 32]).public();
+        let mut config = RealmConfigDocument::new(TEST_REALM_ID, Vec::new(), 2);
+        config.ensure_node(local, aruna_core::structs::RealmNodeKind::Server);
+        for seed in 1u8..=40 {
+            config.ensure_node(
+                iroh::SecretKey::from_bytes(&[seed; 32]).public(),
+                aruna_core::structs::RealmNodeKind::Server,
+            );
+        }
+        let mut reversed = config.clone();
+        reversed.nodes.reverse();
+        let first = select_forward_peers(
+            &config,
+            TEST_REALM_ID,
+            Ulid::from_parts(0, 1),
+            "datasets/lookup",
+            local,
+        )
+        .expect("peer selection succeeds");
+        let second = select_forward_peers(
+            &reversed,
+            TEST_REALM_ID,
+            Ulid::from_parts(0, 1),
+            "datasets/lookup",
+            local,
+        )
+        .expect("peer selection succeeds");
+        assert_eq!(first.len(), METADATA_DISTRIBUTED_QUERY_MAX_NODES);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn peer_timeout_fits() {
+        let waves =
+            (METADATA_DISTRIBUTED_QUERY_MAX_NODES + METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT - 1)
+                / METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT;
+        assert!(
+            METADATA_PATH_PEER_TIMEOUT.as_secs() * waves as u64
+                <= METADATA_DISTRIBUTED_QUERY_DEADLINE.as_secs()
+        );
     }
 
     #[test]
