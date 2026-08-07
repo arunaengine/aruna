@@ -647,8 +647,9 @@ impl Operation for ListAuditOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        if self.include_local && !self.local_done {
+        if self.include_local && !self.local_done && !self.local_failed {
             self.local_failed = true;
+            self.batch.mark_missing(self.local_node);
         }
         let pending: Vec<NodeId> = self
             .peers
@@ -1211,9 +1212,11 @@ mod tests {
         );
         operation.start();
         operation.abort();
+        operation.abort();
         let result = operation.finalize().unwrap();
         assert!(result.partial);
         assert!(result.next_cursor.is_none());
+        assert_eq!(result.missing_nodes, vec![node]);
     }
 
     #[tokio::test]
@@ -1313,6 +1316,7 @@ mod tests {
         .unwrap();
         assert!(result.partial);
         assert!(result.next_cursor.is_none());
+        assert_eq!(result.missing_nodes, vec![node]);
     }
 
     #[test]
