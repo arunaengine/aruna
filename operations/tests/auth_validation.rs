@@ -14,17 +14,20 @@ use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::{Signer, SigningKey};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode, errors::ErrorKind};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use ulid::Ulid;
 
 #[derive(Default)]
 struct TestAuthState {
     revoked_hashes: HashSet<String>,
     trusted_realms: HashSet<RealmId>,
+    revocation_reads: AtomicUsize,
 }
 
 #[async_trait]
 impl ArunaBearerTokenValidationState for TestAuthState {
     async fn is_bearer_token_revoked(&self, token_hash: &str) -> bool {
+        self.revocation_reads.fetch_add(1, Ordering::Relaxed);
         self.revoked_hashes.contains(token_hash)
     }
 
@@ -59,6 +62,29 @@ async fn rejects_revoked_token_by_shared_hash() {
         .unwrap_err();
 
     assert!(matches!(error, ArunaBearerTokenError::TokenRevoked));
+}
+
+#[tokio::test]
+async fn rejects_bad_signature() {
+    let (realm_signing_key, realm_id, user_id) = realm_fixture();
+    let claims = token_claims(realm_id, user_id);
+    let token = sign_token(&realm_signing_key, &claims);
+    let mut invalid = token.clone();
+    let signature = invalid.rfind('.').unwrap() + 1;
+    let replacement = if invalid.as_bytes()[signature] == b'A' {
+        "B"
+    } else {
+        "A"
+    };
+    invalid.replace_range(signature..signature + 1, replacement);
+    let state = trusted_state(realm_id);
+
+    let error = validate_aruna_bearer_token(&state, &invalid)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ArunaBearerTokenError::JwtError(_)));
+    assert_eq!(state.revocation_reads.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]

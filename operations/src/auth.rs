@@ -63,7 +63,7 @@ pub enum ArunaBearerTokenError {
 
 /// Whether the realm's replicated revocation set denies this token hash. This
 /// is the realm-wide authority; a node-local list is only a fast path. Storage
-/// and decode failures fail closed, a realm without a config document does not.
+/// and decode failures fail closed, a realm without a config document does too.
 pub async fn realm_token_revoked(
     storage: &StorageHandle,
     realm_id: RealmId,
@@ -87,7 +87,7 @@ pub async fn realm_token_revoked(
                 true
             }
         },
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => false,
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => true,
         other => {
             warn!(event = ?other, "Failed to read realm config for token revocation");
             true
@@ -115,11 +115,6 @@ where
 {
     let unvalidated_claims = insecure_decode::<TokenClaims>(token)?;
 
-    let token_hash = bearer_token_hash(token);
-    if state.is_bearer_token_revoked(&token_hash).await {
-        return Err(ArunaBearerTokenError::TokenRevoked);
-    }
-
     let issuer = match (
         unvalidated_claims.claims.issuer_pubkey.as_deref(),
         unvalidated_claims.claims.delegation_signature.is_some(),
@@ -140,6 +135,12 @@ where
     let claims = decode::<TokenClaims>(token, &decoding_key, &Validation::new(Algorithm::EdDSA))?;
 
     validate_aruna_bearer_token_claims(state, &claims.claims).await?;
+
+    let token_hash = bearer_token_hash(token);
+    if state.is_bearer_token_revoked(&token_hash).await {
+        return Err(ArunaBearerTokenError::TokenRevoked);
+    }
+
     Ok(claims.claims)
 }
 
@@ -280,6 +281,8 @@ impl IssuerKeyCache {
 mod tests {
     use super::*;
     use aruna_core::keys::generate_signing_key;
+    use aruna_core::structs::Actor;
+    use aruna_core::UserId;
     use base64::Engine;
     use ed25519_dalek::SigningKey;
 
@@ -338,5 +341,52 @@ mod tests {
         let cache = IssuerKeyCache::new();
         assert!(cache.get_or_insert("not-base64!!").await.is_err());
         assert!(cache.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn missing_config_denies() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(
+            directory.path().to_str().expect("valid storage path"),
+        )
+        .unwrap();
+        let realm_id = RealmId::from_bytes([7; 32]);
+
+        assert!(realm_token_revoked(&storage, realm_id, "token-hash").await);
+    }
+
+    #[tokio::test]
+    async fn config_recovery_allows() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(
+            directory.path().to_str().expect("valid storage path"),
+        )
+        .unwrap();
+        let realm_id = RealmId::from_bytes([8; 32]);
+        assert!(realm_token_revoked(&storage, realm_id, "token-hash").await);
+
+        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        let signing_key = SigningKey::from_bytes(&[9; 32]);
+        let actor = Actor {
+            node_id: iroh::PublicKey::from_bytes(signing_key.verifying_key().as_bytes()).unwrap(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        let value = RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+            .to_bytes(&actor)
+            .unwrap();
+        assert!(matches!(
+            storage
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: target.storage_keyspace().to_string(),
+                    key: target.storage_key(),
+                    value: value.into(),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        assert!(!realm_token_revoked(&storage, realm_id, "token-hash").await);
     }
 }
