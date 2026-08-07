@@ -1787,7 +1787,8 @@ async fn load_pending_records(
     group_filter: Option<GroupId>,
     limit: usize,
 ) -> Result<HashMap<GroupId, Vec<MetadataRegistryRecord>>, MetadataApiError> {
-    let mut records: HashMap<GroupId, Vec<MetadataRegistryRecord>> = HashMap::new();
+    let limit = limit.min(METADATA_REGISTRY_CANDIDATE_LIMIT);
+    let mut targets = Vec::with_capacity(limit);
     let mut start_after = None;
     let mut scanned = 0usize;
 
@@ -1817,28 +1818,11 @@ async fn load_pending_records(
             return Err(MetadataApiError::ServiceUnavailable);
         }
 
-        for (key, _) in values {
-            let Some((document_id, event_id)) = metadata_pending_projection_target(key.as_ref())
-            else {
-                continue;
-            };
-            let Some(event) = read_metadata_create_event(context, document_id, event_id).await?
-            else {
-                continue;
-            };
-            let record = event.record;
-            if group_filter.is_some_and(|group_id| record.group_id != group_id) {
-                continue;
-            }
-            if metadata_graph_is_deleted(context, &record.graph_iri).await? {
-                continue;
-            }
-            let count = records.values().map(Vec::len).sum::<usize>();
-            if count >= limit {
-                return Err(MetadataApiError::ServiceUnavailable);
-            }
-            records.entry(record.group_id).or_default().push(record);
-        }
+        targets.extend(
+            values
+                .into_iter()
+                .filter_map(|(key, _)| metadata_pending_projection_target(key.as_ref())),
+        );
 
         if next_start_after.is_none() {
             break;
@@ -1846,42 +1830,133 @@ async fn load_pending_records(
         start_after = next_start_after;
     }
 
-    Ok(records)
-}
+    if targets.is_empty() {
+        return Ok(HashMap::new());
+    }
 
-async fn read_metadata_create_event(
-    context: &DriverContext,
-    document_id: Ulid,
-    event_id: Ulid,
-) -> Result<Option<MetadataCreateEventRecord>, MetadataApiError> {
-    let value = match context
+    let event_reads = targets
+        .iter()
+        .map(|(document_id, event_id)| {
+            (
+                METADATA_EVENT_LOG_KEYSPACE.to_string(),
+                metadata_event_log_key(*document_id, *event_id),
+            )
+        })
+        .collect::<Vec<_>>();
+    let event_values = match context
         .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
-            key: metadata_event_log_key(document_id, event_id),
+        .send_storage_effect(StorageEffect::BatchRead {
+            reads: event_reads,
             txn_id: None,
         })
         .await
     {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+        Event::Storage(StorageEvent::BatchReadResult { values })
+            if values.len() == targets.len() =>
+        {
+            values
+        }
+        Event::Storage(StorageEvent::BatchReadResult { values }) => {
+            return Err(MetadataApiError::Internal(format!(
+                "metadata pending event batch returned {} values for {} targets",
+                values.len(),
+                targets.len()
+            )));
+        }
         Event::Storage(StorageEvent::Error { error }) => {
             return Err(MetadataApiError::Internal(error.to_string()));
         }
         other => return Err(MetadataApiError::Internal(format!("{other:?}"))),
     };
-    let Some(value) = value else {
-        return Ok(None);
+
+    let mut pending = Vec::with_capacity(event_values.len());
+    for ((document_id, event_id), (key, value)) in targets.into_iter().zip(event_values) {
+        if key != metadata_event_log_key(document_id, event_id) {
+            return Err(MetadataApiError::Internal(
+                "metadata pending event batch key mismatch".to_string(),
+            ));
+        }
+        let Some(value) = value else {
+            continue;
+        };
+        let event: MetadataCreateEventRecord = postcard::from_bytes(&value)
+            .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+        if event.record.document_id != document_id || event.event_id != event_id {
+            return Err(MetadataApiError::Internal(format!(
+                "metadata create event log target {document_id}/{event_id} did not match payload {}/{}",
+                event.record.document_id, event.event_id
+            )));
+        }
+        if group_filter.is_none_or(|group_id| event.record.group_id == group_id) {
+            pending.push(event.record);
+        }
+    }
+
+    if pending.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let lifecycle_reads = pending
+        .iter()
+        .map(|record| {
+            (
+                METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+                metadata_graph_lifecycle_key(&record.graph_iri),
+            )
+        })
+        .collect::<Vec<_>>();
+    let lifecycle_values = match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::BatchRead {
+            reads: lifecycle_reads,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchReadResult { values })
+            if values.len() == pending.len() =>
+        {
+            values
+        }
+        Event::Storage(StorageEvent::BatchReadResult { values }) => {
+            return Err(MetadataApiError::Internal(format!(
+                "metadata pending lifecycle batch returned {} values for {} records",
+                values.len(),
+                pending.len()
+            )));
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            return Err(MetadataApiError::Internal(error.to_string()));
+        }
+        other => return Err(MetadataApiError::Internal(format!("{other:?}"))),
     };
 
-    let event: MetadataCreateEventRecord = postcard::from_bytes(&value)
-        .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-    if event.record.document_id != document_id || event.event_id != event_id {
-        return Err(MetadataApiError::Internal(format!(
-            "metadata create event log target {document_id}/{event_id} did not match payload {}/{}",
-            event.record.document_id, event.event_id
-        )));
+    let mut records: HashMap<GroupId, Vec<MetadataRegistryRecord>> = HashMap::new();
+    let mut count = 0usize;
+    for (record, (key, value)) in pending.into_iter().zip(lifecycle_values) {
+        if key != metadata_graph_lifecycle_key(&record.graph_iri) {
+            return Err(MetadataApiError::Internal(
+                "metadata pending lifecycle batch key mismatch".to_string(),
+            ));
+        }
+        let deleted = value
+            .map(|value| {
+                postcard::from_bytes::<MetadataGraphLifecycleRecord>(&value)
+                    .map(|record| record.is_deleted())
+                    .map_err(|error| MetadataApiError::Internal(error.to_string()))
+            })
+            .transpose()?
+            .unwrap_or(false);
+        if deleted {
+            continue;
+        }
+        if count >= limit {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
+        count += 1;
+        records.entry(record.group_id).or_default().push(record);
     }
-    Ok(Some(event))
+    Ok(records)
 }
 
 async fn metadata_graph_is_deleted(
