@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -12,6 +14,7 @@ use aruna_core::util::unix_timestamp_millis;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use byteview::ByteView;
+use tokio::time::{Instant, timeout_at};
 use tracing::{debug, warn};
 
 use crate::driver::DriverContext;
@@ -41,6 +44,7 @@ use crate::notifications::watch::subscriptions::{
 };
 
 const NOTIFICATION_MAX_FUTURE_SKEW_MS: u64 = 5 * 60 * 1000;
+const NOTIFICATION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tracing::instrument(
     name = "notifications.incoming.stream",
@@ -67,11 +71,13 @@ pub async fn handle_notification_stream(
     };
     debug!(peer = %peer, message = notification_message_kind(&message), "Received notification message");
 
-    let response = build_response(context, net_handle, peer, message).await;
-
     if let Err(error) = drain_request_stream(&mut stream).await {
         warn!(peer = %peer, error = %error, "Failed to drain notification request stream");
+        close_stream(&mut stream).await;
+        return;
     }
+    let response = build_response(context, net_handle, peer, message).await;
+
     if let Err(error) = write_message(&mut stream, &response).await {
         warn!(peer = %peer, error = %error, "Failed to write notification response");
     }
@@ -296,17 +302,15 @@ async fn build_response(
 }
 
 fn validate_inbound_batch(records: &[NotificationRecord], now_ms: u64) -> Result<(), String> {
-    let mut direct_count = 0usize;
+    if records.len() > NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE {
+        return Err(format!(
+            "notification batch count {} exceeds cap {}",
+            records.len(),
+            NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE
+        ));
+    }
     for record in records {
         validate_inbound_record(record, now_ms)?;
-        if record.class == NotificationClass::Direct {
-            direct_count = direct_count.saturating_add(1);
-            if direct_count > NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE {
-                return Err(format!(
-                    "direct notification batch count {direct_count} exceeds cap {NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE}"
-                ));
-            }
-        }
     }
     Ok(())
 }
@@ -742,15 +746,20 @@ async fn read_realm_config(
     context: &DriverContext,
     realm_id: RealmId,
 ) -> Result<Option<RealmConfigDocument>, String> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: ByteView::from(realm_id.as_bytes().to_vec()),
-            txn_id: None,
-        })
-        .await
-    {
+    let deadline = Instant::now() + NOTIFICATION_AUTH_TIMEOUT;
+    let event = timeout_at(
+        deadline,
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: ByteView::from(realm_id.as_bytes().to_vec()),
+                txn_id: None,
+            }),
+    )
+    .await
+    .map_err(|_| "timed out reading notification realm config".to_string())?;
+    match event {
         Event::Storage(StorageEvent::ReadResult {
             value: Some(bytes), ..
         }) => RealmConfigDocument::from_bytes(&bytes)
@@ -1288,6 +1297,25 @@ mod tests {
             "unexpected reject reason: {error}"
         );
         assert!(read_inbox(&b).await.is_empty());
+    }
+
+    #[test]
+    fn transient_batch_cap() {
+        let realm_id = RealmId::from_bytes([75u8; 32]);
+        let recipient = UserId::new(Ulid::generate(), realm_id);
+        let mut records: Vec<_> = (0..=NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE)
+            .map(|index| {
+                let mut record = record(recipient, (index % 255 + 1) as u8);
+                record.class = NotificationClass::Transient;
+                record
+            })
+            .collect();
+
+        let error = validate_inbound_batch(&records, unix_timestamp_millis())
+            .expect_err("transient-only batch must use the total cap");
+        assert!(error.contains("notification batch count"));
+        records.truncate(NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE);
+        assert!(validate_inbound_batch(&records, unix_timestamp_millis()).is_ok());
     }
 
     #[tokio::test]

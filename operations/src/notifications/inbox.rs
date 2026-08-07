@@ -1,9 +1,15 @@
+use std::collections::BTreeMap;
+
+use aruna_core::effects::IterStart;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
 use aruna_core::storage_entries::notification_inbox_write_entries;
-use aruna_core::structs::{NotificationRecord, notification_inbox_key};
+use aruna_core::structs::{
+    NOTIFICATION_TRANSIENT_PER_USER_CAP, NotificationClass, NotificationRecord,
+    notification_inbox_key, notification_inbox_prefix,
+};
 use aruna_core::types::{Key, KeySpace, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
 
@@ -136,6 +142,7 @@ pub(crate) async fn upsert_inbox_records_in_transaction(
 
     let mut writes: Vec<(KeySpace, Key, Value)> = Vec::new();
     let mut outcome = InboxWriteOutcome::default();
+    let mut transient_counts = BTreeMap::new();
     for (record, (_, existing_value)) in records.iter().zip(existing) {
         if existing_value.is_some() {
             continue;
@@ -147,10 +154,22 @@ pub(crate) async fn upsert_inbox_records_in_transaction(
                 if !outcome.recipients.contains(&record.recipient) {
                     outcome.recipients.push(record.recipient);
                 }
+                if record.class == NotificationClass::Transient {
+                    *transient_counts.entry(record.recipient).or_insert(0) += 1;
+                }
             }
             Err(error) => {
                 return Err(UpsertFailure::Fatal(error.to_string()));
             }
+        }
+    }
+
+    for (recipient, added) in transient_counts {
+        let existing = count_transient(storage, recipient, txn_id).await?;
+        if existing.saturating_add(added) > NOTIFICATION_TRANSIENT_PER_USER_CAP {
+            return Err(UpsertFailure::Fatal(format!(
+                "notification transient count for recipient {recipient} exceeds cap {NOTIFICATION_TRANSIENT_PER_USER_CAP}"
+            )));
         }
     }
 
@@ -175,6 +194,56 @@ pub(crate) async fn upsert_inbox_records_in_transaction(
     }
 
     Ok(outcome)
+}
+
+async fn count_transient(
+    storage: &StorageHandle,
+    recipient: UserId,
+    txn_id: TxnId,
+) -> Result<usize, UpsertFailure> {
+    let mut count = 0usize;
+    let mut start_after = None;
+    let prefix = notification_inbox_prefix(recipient);
+
+    loop {
+        let event = storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
+                prefix: Some(prefix.clone()),
+                start: start_after.take().map(IterStart::After),
+                limit: NOTIFICATION_TRANSIENT_PER_USER_CAP.saturating_add(1),
+                txn_id: Some(txn_id),
+            })
+            .await;
+        let (values, next_start_after) = match event {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            Event::Storage(StorageEvent::Error { error }) => return Err(classify(error)),
+            other => {
+                return Err(UpsertFailure::Fatal(format!(
+                    "unexpected storage event: {other:?}"
+                )));
+            }
+        };
+
+        for (_, value) in values {
+            let record = NotificationRecord::from_bytes(&value)
+                .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;
+            if record.class == NotificationClass::Transient {
+                count = count.saturating_add(1);
+                if count >= NOTIFICATION_TRANSIENT_PER_USER_CAP {
+                    return Ok(count);
+                }
+            }
+        }
+
+        match next_start_after {
+            Some(next) => start_after = Some(next),
+            None => return Ok(count),
+        }
+    }
 }
 
 fn classify(error: StorageError) -> UpsertFailure {
@@ -221,6 +290,12 @@ mod tests {
             },
             1_000,
         )
+    }
+
+    fn transient_record() -> NotificationRecord {
+        let mut record = make_record();
+        record.class = NotificationClass::Transient;
+        record
     }
 
     async fn read_primary(storage: &StorageHandle, record: &NotificationRecord) -> Option<Vec<u8>> {
@@ -367,6 +442,64 @@ mod tests {
                 .expect("decodes")
                 .read_at_ms,
             Some(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_cap_exact() {
+        let (_dir, storage) = temp_storage();
+        let records: Vec<_> = (0..NOTIFICATION_TRANSIENT_PER_USER_CAP)
+            .map(|_| transient_record())
+            .collect();
+
+        assert_eq!(
+            upsert_inbox_records(&storage, &records).await,
+            Ok(NOTIFICATION_TRANSIENT_PER_USER_CAP)
+        );
+        assert_eq!(
+            count_keyspace(&storage, NOTIFICATION_INBOX_KEYSPACE).await,
+            NOTIFICATION_TRANSIENT_PER_USER_CAP
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_cap_rejects() {
+        let (_dir, storage) = temp_storage();
+        let records: Vec<_> = (0..NOTIFICATION_TRANSIENT_PER_USER_CAP)
+            .map(|_| transient_record())
+            .collect();
+        upsert_inbox_records(&storage, &records)
+            .await
+            .expect("cap-sized transient batch succeeds");
+
+        let error = upsert_inbox_records(&storage, &[transient_record()])
+            .await
+            .expect_err("transient cap must reject extra records");
+        assert!(error.contains("exceeds cap"));
+        assert_eq!(
+            count_keyspace(&storage, NOTIFICATION_INBOX_KEYSPACE).await,
+            NOTIFICATION_TRANSIENT_PER_USER_CAP
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_cap_holds() {
+        let (_dir, storage) = temp_storage();
+        let records: Vec<_> = (0..NOTIFICATION_TRANSIENT_PER_USER_CAP - 1)
+            .map(|_| transient_record())
+            .collect();
+        upsert_inbox_records(&storage, &records)
+            .await
+            .expect("initial transient records succeed");
+
+        let (first, second) = tokio::join!(
+            upsert_inbox_records(&storage, &[transient_record()]),
+            upsert_inbox_records(&storage, &[transient_record()]),
+        );
+        assert!(first.is_ok() ^ second.is_ok());
+        assert_eq!(
+            count_keyspace(&storage, NOTIFICATION_INBOX_KEYSPACE).await,
+            NOTIFICATION_TRANSIENT_PER_USER_CAP
         );
     }
 }
