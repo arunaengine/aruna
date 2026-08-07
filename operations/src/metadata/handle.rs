@@ -492,7 +492,9 @@ impl MetadataVisibilityCache {
         lifecycle_entries: Vec<(String, bool)>,
         fill_generation: u64,
     ) -> bool {
-        if records.len() > METADATA_REGISTRY_CANDIDATE_LIMIT {
+        if records.len() > METADATA_REGISTRY_CANDIDATE_LIMIT
+            || lifecycle_entries.len() > METADATA_REGISTRY_CANDIDATE_LIMIT
+        {
             return false;
         }
         if self.current_generation() != fill_generation {
@@ -515,6 +517,11 @@ impl MetadataVisibilityCache {
         if self.current_generation() != fill_generation {
             return false;
         }
+        let protected = lifecycle_entries
+            .iter()
+            .map(|(graph_iri, _)| graph_iri.clone())
+            .collect::<HashSet<_>>();
+        Self::trim_lifecycle_deleted(&mut lifecycle, &protected, now);
         for (graph_iri, deleted) in lifecycle_entries {
             lifecycle.insert(
                 graph_iri,
@@ -559,11 +566,14 @@ impl MetadataVisibilityCache {
             .lock()
             .unwrap_or_else(|lock| lock.into_inner());
         self.advance_generation();
+        let now = Instant::now();
+        let protected = HashSet::from([graph_iri.clone()]);
+        Self::trim_lifecycle_deleted(&mut lifecycle, &protected, now);
         lifecycle.insert(
             graph_iri,
             LifecycleDeletedCacheEntry {
                 deleted,
-                expires_at: Instant::now() + METADATA_VISIBILITY_CACHE_TTL,
+                expires_at: now + METADATA_VISIBILITY_CACHE_TTL,
             },
         );
     }
@@ -573,12 +583,21 @@ impl MetadataVisibilityCache {
     // stays bounded.
     #[cfg(test)]
     fn refresh_lifecycle_deleted(&self, entries: impl IntoIterator<Item = (String, bool)>) {
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        if entries.len() > METADATA_REGISTRY_CANDIDATE_LIMIT {
+            return;
+        }
         let now = Instant::now();
         let expires_at = now + METADATA_VISIBILITY_CACHE_TTL;
         let mut lifecycle = self
             .lifecycle_deleted
             .lock()
             .unwrap_or_else(|lock| lock.into_inner());
+        let protected = entries
+            .iter()
+            .map(|(graph_iri, _)| graph_iri.clone())
+            .collect::<HashSet<_>>();
+        Self::trim_lifecycle_deleted(&mut lifecycle, &protected, now);
         for (graph_iri, deleted) in entries {
             lifecycle.insert(
                 graph_iri,
@@ -591,6 +610,32 @@ impl MetadataVisibilityCache {
         lifecycle.retain(|_, entry| entry.expires_at > now);
     }
 
+    fn trim_lifecycle_deleted(
+        lifecycle: &mut HashMap<String, LifecycleDeletedCacheEntry>,
+        protected: &HashSet<String>,
+        now: Instant,
+    ) {
+        lifecycle.retain(|_, entry| entry.expires_at > now);
+        let protected_count = lifecycle
+            .keys()
+            .filter(|graph_iri| protected.contains(*graph_iri))
+            .count();
+        let available = METADATA_REGISTRY_CANDIDATE_LIMIT.saturating_sub(protected.len());
+        let remove_count = lifecycle
+            .len()
+            .saturating_sub(protected_count)
+            .saturating_sub(available);
+        let evicted = lifecycle
+            .keys()
+            .filter(|graph_iri| !protected.contains(*graph_iri))
+            .take(remove_count)
+            .cloned()
+            .collect::<Vec<_>>();
+        for graph_iri in evicted {
+            lifecycle.remove(&graph_iri);
+        }
+    }
+
     fn refresh_lifecycle_deleted_if_current(
         &self,
         entries: impl IntoIterator<Item = (String, bool)>,
@@ -600,6 +645,9 @@ impl MetadataVisibilityCache {
             return false;
         }
         let entries = entries.into_iter().collect::<Vec<_>>();
+        if entries.len() > METADATA_REGISTRY_CANDIDATE_LIMIT {
+            return false;
+        }
         let now = Instant::now();
         let expires_at = now + METADATA_VISIBILITY_CACHE_TTL;
         let mut lifecycle = self
@@ -609,6 +657,11 @@ impl MetadataVisibilityCache {
         if self.current_generation() != fill_generation {
             return false;
         }
+        let protected = entries
+            .iter()
+            .map(|(graph_iri, _)| graph_iri.clone())
+            .collect::<HashSet<_>>();
+        Self::trim_lifecycle_deleted(&mut lifecycle, &protected, now);
         for (graph_iri, deleted) in entries {
             lifecycle.insert(
                 graph_iri,
@@ -7289,6 +7342,36 @@ mod tests {
 
         cache.remove_lifecycle_entry("urn:graph:a");
         assert_eq!(cache.lifecycle_deleted("urn:graph:a"), None);
+    }
+
+    #[test]
+    fn store_prunes_expired() {
+        let cache = MetadataVisibilityCache::new();
+        cache.store_lifecycle_deleted("urn:graph:old".to_string(), false);
+        cache.expire_now();
+
+        cache.store_lifecycle_deleted("urn:graph:new".to_string(), false);
+
+        assert_eq!(cache.lifecycle_deleted_any("urn:graph:old"), None);
+        assert_eq!(cache.lifecycle_deleted("urn:graph:new"), Some(false));
+    }
+
+    #[test]
+    fn refresh_keeps_tombstone() {
+        let cache = MetadataVisibilityCache::new();
+        cache.refresh_lifecycle_deleted(
+            (0..METADATA_REGISTRY_CANDIDATE_LIMIT)
+                .map(|index| (format!("urn:graph:old:{index}"), false))
+                .collect::<Vec<_>>(),
+        );
+
+        cache.refresh_lifecycle_deleted(vec![("urn:graph:deleted".to_string(), true)]);
+
+        assert_eq!(cache.lifecycle_deleted("urn:graph:deleted"), Some(true));
+        assert_eq!(
+            cache.lifecycle_deleted.lock().unwrap().len(),
+            METADATA_REGISTRY_CANDIDATE_LIMIT
+        );
     }
 
     #[test]
