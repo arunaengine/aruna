@@ -16,7 +16,7 @@ use aruna_core::structs::{
     Permission, RealmId, ReasonCode, RoCrateCheckpointRefs, VersionKey, VersionedObjectArn,
     W3idDataIdentifier, blob_object_permission_path, ensure_confined_relative_path,
 };
-use aruna_core::types::{GroupId, Key, NodeId, Value};
+use aruna_core::types::{GroupId, Key, NodeId, TxnId, Value};
 use aruna_core::util::unix_timestamp_millis;
 use async_zip::{Compression, ZipEntryBuilder};
 #[cfg(test)]
@@ -149,6 +149,9 @@ enum CandidateSource {
         location: BackendLocation,
         group_id: GroupId,
         permission_path: String,
+        node_id: NodeId,
+        bucket: String,
+        key: String,
     },
     RemoteExact {
         node_id: NodeId,
@@ -505,7 +508,7 @@ async fn resolve_entries(
             .filter(|exact| exact.realm_id == spec.auth_context.realm_id)
         {
             if exact.node_id == ctx.owner_node_id {
-                match resolve_exact(ctx, spec, exact, policies).await? {
+                match resolve_exact(ctx, spec, exact).await? {
                     ResolveResult::Candidate(candidate) => {
                         if hash.is_some_and(|hash| Some(hash) != candidate.expected_blake3) {
                             mismatched = true;
@@ -646,7 +649,7 @@ async fn extend_hash_candidates(
         }
         for aliases in distinct.values() {
             for alias in aliases {
-                match resolve_alias(ctx, alias, authorized_aliases).await? {
+                match resolve_alias(ctx, spec, alias, authorized_aliases).await? {
                     ResolveResult::Candidate(candidate) => {
                         if resolved.len() < MAX_LOCAL_CANDIDATES {
                             resolved.push(candidate);
@@ -798,12 +801,32 @@ async fn resolve_exact(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
     exact: &VersionedObjectArn,
-    policies: &mut BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
+) -> Result<ResolveResult, ExportFailure> {
+    let txn_id = start_read_txn(&ctx.driver).await?;
+    let result = resolve_exact_txn(ctx, spec, exact, txn_id).await;
+    match result {
+        Ok(result) => {
+            commit_read_txn(&ctx.driver, txn_id).await?;
+            Ok(result)
+        }
+        Err(error) => {
+            abort_read_txn(&ctx.driver, txn_id).await;
+            Err(error)
+        }
+    }
+}
+
+async fn resolve_exact_txn(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    exact: &VersionedObjectArn,
+    txn_id: TxnId,
 ) -> Result<ResolveResult, ExportFailure> {
     let Some(bucket) = storage_value(
-        ctx,
+        &ctx.driver,
         S3_BUCKET_KEYSPACE,
         exact.bucket.as_bytes().to_vec().into(),
+        Some(txn_id),
     )
     .await?
     else {
@@ -818,14 +841,21 @@ async fn resolve_exact(
         &exact.bucket,
         &exact.key,
     );
-    let evaluator = load_policy(ctx, spec, policies, bucket.group_id).await?;
-    if !check_read(&ctx.driver, spec, &permission_path, evaluator).await? {
+    let evaluator = load_policy_txn(&ctx.driver, spec, bucket.group_id, txn_id).await?;
+    if !check_read_txn(&ctx.driver, spec, &permission_path, &evaluator, txn_id).await? {
         return Ok(ResolveResult::Denied);
     }
     let key = VersionKey::new(exact.bucket.clone(), exact.key.clone(), exact.version)
         .to_bytes()
         .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
-    let Some(value) = storage_value(ctx, BLOB_VERSIONS_KEYSPACE, key.into()).await? else {
+    let Some(value) = storage_value(
+        &ctx.driver,
+        BLOB_VERSIONS_KEYSPACE,
+        key.into(),
+        Some(txn_id),
+    )
+    .await?
+    else {
         return Ok(ResolveResult::Missing { hash: None });
     };
     let version = BlobVersion::from_bytes(value.as_ref())
@@ -836,8 +866,13 @@ async fn resolve_exact(
     let Some(location_key) = version.location_key() else {
         return Ok(ResolveResult::Missing { hash: Some(hash) });
     };
-    let Some(location) =
-        storage_value(ctx, BLOB_LOCATIONS_KEYSPACE, location_key.to_bytes().into()).await?
+    let Some(location) = storage_value(
+        &ctx.driver,
+        BLOB_LOCATIONS_KEYSPACE,
+        location_key.to_bytes().into(),
+        Some(txn_id),
+    )
+    .await?
     else {
         return Ok(ResolveResult::Missing { hash: Some(hash) });
     };
@@ -851,6 +886,9 @@ async fn resolve_exact(
             location,
             group_id: bucket.group_id,
             permission_path,
+            node_id: exact.node_id,
+            bucket: exact.bucket.clone(),
+            key: exact.key.clone(),
         },
         report_source: ExportReportSource::Local,
         resolved_version: Some(exact.version),
@@ -860,6 +898,7 @@ async fn resolve_exact(
 
 async fn resolve_alias(
     ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
     alias: &HashPathIndexKey,
     allowed: &BTreeMap<(GroupId, String), bool>,
 ) -> Result<ResolveResult, ExportFailure> {
@@ -872,10 +911,42 @@ async fn resolve_alias(
     if !is_allowed {
         return Ok(ResolveResult::Denied);
     }
+    let txn_id = start_read_txn(&ctx.driver).await?;
+    let result = resolve_alias_txn(ctx, spec, alias, txn_id, &permission_path).await;
+    match result {
+        Ok(result) => {
+            commit_read_txn(&ctx.driver, txn_id).await?;
+            Ok(result)
+        }
+        Err(error) => {
+            abort_read_txn(&ctx.driver, txn_id).await;
+            Err(error)
+        }
+    }
+}
+
+async fn resolve_alias_txn(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    alias: &HashPathIndexKey,
+    txn_id: TxnId,
+    permission_path: &str,
+) -> Result<ResolveResult, ExportFailure> {
+    let evaluator = load_policy_txn(&ctx.driver, spec, alias.group_id, txn_id).await?;
+    if !check_read_txn(&ctx.driver, spec, permission_path, &evaluator, txn_id).await? {
+        return Ok(ResolveResult::Denied);
+    }
     let key = VersionKey::new(alias.bucket.clone(), alias.key.clone(), alias.version_id)
         .to_bytes()
         .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
-    let Some(value) = storage_value(ctx, BLOB_VERSIONS_KEYSPACE, key.into()).await? else {
+    let Some(value) = storage_value(
+        &ctx.driver,
+        BLOB_VERSIONS_KEYSPACE,
+        key.into(),
+        Some(txn_id),
+    )
+    .await?
+    else {
         return Ok(ResolveResult::Missing { hash: None });
     };
     let version = BlobVersion::from_bytes(value.as_ref())
@@ -886,8 +957,13 @@ async fn resolve_alias(
     let Some(location_key) = version.location_key() else {
         return Ok(ResolveResult::Missing { hash: None });
     };
-    let Some(location) =
-        storage_value(ctx, BLOB_LOCATIONS_KEYSPACE, location_key.to_bytes().into()).await?
+    let Some(location) = storage_value(
+        &ctx.driver,
+        BLOB_LOCATIONS_KEYSPACE,
+        location_key.to_bytes().into(),
+        Some(txn_id),
+    )
+    .await?
     else {
         return Ok(ResolveResult::Missing { hash: None });
     };
@@ -901,6 +977,9 @@ async fn resolve_alias(
             location,
             group_id: alias.group_id,
             permission_path,
+            node_id: alias.node_id,
+            bucket: alias.bucket.clone(),
+            key: alias.key.clone(),
         },
         report_source: ExportReportSource::Hash,
         resolved_version: Some(alias.version_id),
@@ -928,18 +1007,22 @@ fn snapshot_read_failure(error: MetadataApiError) -> ExportFailure {
     }
 }
 
-async fn check_read(
+async fn check_read_txn(
     ctx: &DriverContext,
     spec: &ExportRoCrateSpec,
     path: &str,
     evaluator: &PolicyEvaluator,
+    txn_id: TxnId,
 ) -> Result<bool, ExportFailure> {
     let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: spec.auth_context.clone(),
-            path: path.to_string(),
-            required_permission: Permission::READ,
-        }),
+        CheckPermissionsOperation::new_with_txn(
+            CheckPermissionsConfig {
+                auth_context: spec.auth_context.clone(),
+                path: path.to_string(),
+                required_permission: Permission::READ,
+            },
+            txn_id,
+        ),
         ctx,
     )
     .await
@@ -962,16 +1045,58 @@ async fn check_read(
     }
 }
 
-async fn load_policy(
-    ctx: &JobContext,
+async fn load_policy_txn(
+    ctx: &DriverContext,
     spec: &ExportRoCrateSpec,
-    policies: &mut BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
     group_id: GroupId,
-) -> Result<&PolicyEvaluator, ExportFailure> {
-    load_policies(ctx, spec, policies, [group_id]).await?;
-    policies
-        .get(&group_id)
-        .ok_or_else(|| ExportFailure::Retryable("object policy unavailable".to_string()))
+    txn_id: TxnId,
+) -> Result<PolicyEvaluator, ExportFailure> {
+    PolicyEvaluator::load_with_txn(ctx, spec.auth_context.realm_id, group_id, txn_id)
+        .await
+        .map_err(|error| ExportFailure::Retryable(error.to_string()))
+}
+
+async fn start_read_txn(ctx: &DriverContext) -> Result<TxnId, ExportFailure> {
+    match ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::StartTransaction { read: true })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(ExportFailure::Retryable(error.to_string()))
+        }
+        event => Err(ExportFailure::Retryable(format!(
+            "unexpected storage transaction event: {event:?}"
+        ))),
+    }
+}
+
+async fn commit_read_txn(ctx: &DriverContext, txn_id: TxnId) -> Result<(), ExportFailure> {
+    match ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => {
+            abort_read_txn(ctx, txn_id).await;
+            Err(ExportFailure::Retryable(error.to_string()))
+        }
+        event => {
+            abort_read_txn(ctx, txn_id).await;
+            Err(ExportFailure::Retryable(format!(
+                "unexpected storage commit event: {event:?}"
+            )))
+        }
+    }
+}
+
+async fn abort_read_txn(ctx: &DriverContext, txn_id: TxnId) {
+    let _ = ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        .await;
 }
 
 async fn load_policies(
@@ -1075,17 +1200,17 @@ async fn load_candidate_policies(
 }
 
 async fn storage_value(
-    ctx: &JobContext,
+    ctx: &DriverContext,
     key_space: &str,
     key: Key,
+    txn_id: Option<TxnId>,
 ) -> Result<Option<Value>, ExportFailure> {
     match ctx
-        .driver
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: key_space.to_string(),
             key,
-            txn_id: None,
+            txn_id,
         })
         .await
     {
@@ -1298,20 +1423,14 @@ async fn open_candidate(
     candidate: &ExportCandidate,
     metadata_only: bool,
 ) -> Result<CandidateOpen, ExportFailure> {
-    let mut policies = BTreeMap::new();
-    if let CandidateSource::Local { group_id, .. } = &candidate.source {
-        let evaluator = PolicyEvaluator::load(driver, spec.auth_context.realm_id, Some(*group_id))
-            .await
-            .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
-        policies.insert(*group_id, std::sync::Arc::new(evaluator));
-    }
+    let policies = BTreeMap::new();
     open_candidate_checked(driver, spec, &policies, candidate, metadata_only).await
 }
 
 async fn open_candidate_checked(
     driver: &DriverContext,
     spec: &ExportRoCrateSpec,
-    policies: &BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
+    _policies: &BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
     candidate: &ExportCandidate,
     metadata_only: bool,
 ) -> Result<CandidateOpen, ExportFailure> {
@@ -1320,52 +1439,40 @@ async fn open_candidate_checked(
             location,
             group_id,
             permission_path,
+            node_id,
+            bucket,
+            key,
         } => {
             let Some(blake3) = candidate.expected_blake3 else {
                 return Err(ExportFailure::Permanent(
                     "local export candidate has no BLAKE3 hash".to_string(),
                 ));
             };
-            let Some(evaluator) = policies.get(group_id) else {
-                return Err(ExportFailure::Retryable(
-                    "object policy unavailable".to_string(),
-                ));
-            };
-            if !check_read(driver, spec, permission_path, evaluator).await? {
-                return Ok(CandidateOpen::Status(OpenStatus::Denied));
-            }
-            let Some(blob_handle) = driver.blob_handle.as_ref() else {
-                return Err(ExportFailure::Retryable(
-                    "blob handle unavailable".to_string(),
-                ));
-            };
-            match blob_handle
-                .send_blob_effect(BlobEffect::Read {
-                    location: location.clone(),
-                })
-                .await
-            {
-                Event::Blob(BlobEvent::ReadFinished { blob, stream_size }) => {
-                    Ok(CandidateOpen::Opened(if metadata_only {
-                        BaoReadOutput::Metadata {
-                            size: stream_size,
-                            blake3,
-                        }
-                    } else {
-                        BaoReadOutput::Stream {
-                            blob,
-                            size: stream_size,
-                            blake3,
-                        }
-                    }))
+            let txn_id = start_read_txn(driver).await?;
+            let result = open_local_txn(
+                driver,
+                spec,
+                candidate,
+                location,
+                *group_id,
+                permission_path,
+                *node_id,
+                bucket,
+                key,
+                blake3,
+                metadata_only,
+                txn_id,
+            )
+            .await;
+            match result {
+                Ok(result) => {
+                    commit_read_txn(driver, txn_id).await?;
+                    Ok(result)
                 }
-                Event::Blob(BlobEvent::Error(BlobError::IntegrityCheckFailed(_))) => {
-                    Ok(CandidateOpen::Status(OpenStatus::Corrupt))
+                Err(error) => {
+                    abort_read_txn(driver, txn_id).await;
+                    Err(error)
                 }
-                Event::Blob(BlobEvent::Error(_)) => Ok(CandidateOpen::Status(OpenStatus::Offline)),
-                event => Err(ExportFailure::Retryable(format!(
-                    "unexpected local blob read event: {event:?}"
-                ))),
             }
         }
         CandidateSource::RemoteExact { node_id, target } => {
@@ -1390,6 +1497,124 @@ async fn open_candidate_checked(
             )
             .await
         }
+    }
+}
+
+async fn open_local_txn(
+    driver: &DriverContext,
+    spec: &ExportRoCrateSpec,
+    candidate: &ExportCandidate,
+    location: &BackendLocation,
+    group_id: GroupId,
+    permission_path: &str,
+    node_id: NodeId,
+    bucket: &str,
+    key: &str,
+    blake3: [u8; 32],
+    metadata_only: bool,
+    txn_id: TxnId,
+) -> Result<CandidateOpen, ExportFailure> {
+    let Some(bucket_value) = storage_value(
+        driver,
+        S3_BUCKET_KEYSPACE,
+        bucket.as_bytes().to_vec().into(),
+        Some(txn_id),
+    )
+    .await?
+    else {
+        return Ok(CandidateOpen::Status(OpenStatus::Missing));
+    };
+    let bucket_info = BucketInfo::from_bytes(bucket_value.as_ref())
+        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    if bucket_info.group_id != group_id
+        || permission_path
+            != blob_object_permission_path(
+                spec.auth_context.realm_id,
+                group_id,
+                node_id,
+                bucket,
+                key,
+            )
+    {
+        return Ok(CandidateOpen::Status(OpenStatus::Missing));
+    }
+    let Some(version) = candidate.resolved_version else {
+        return Ok(CandidateOpen::Status(OpenStatus::Missing));
+    };
+    let version_key = VersionKey::new(bucket.to_string(), key.to_string(), version)
+        .to_bytes()
+        .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
+    let Some(version_value) = storage_value(
+        driver,
+        BLOB_VERSIONS_KEYSPACE,
+        version_key.into(),
+        Some(txn_id),
+    )
+    .await?
+    else {
+        return Ok(CandidateOpen::Status(OpenStatus::Missing));
+    };
+    let version = BlobVersion::from_bytes(version_value.as_ref())
+        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    if version.blob_hash() != Some(&blake3) || version.location_key().is_none() {
+        return Ok(CandidateOpen::Status(OpenStatus::Missing));
+    }
+    let location_key = version
+        .location_key()
+        .ok_or_else(|| ExportFailure::Retryable("blob location is missing".to_string()))?;
+    let Some(location_value) = storage_value(
+        driver,
+        BLOB_LOCATIONS_KEYSPACE,
+        location_key.to_bytes().into(),
+        Some(txn_id),
+    )
+    .await?
+    else {
+        return Ok(CandidateOpen::Status(OpenStatus::Missing));
+    };
+    let current_location = BackendLocation::from_bytes(location_value.as_ref())
+        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    if current_location.get_blake3() != Some(blake3.as_slice())
+        || !current_location.same_object(location)
+    {
+        return Ok(CandidateOpen::Status(OpenStatus::Missing));
+    }
+    let evaluator = load_policy_txn(driver, spec, group_id, txn_id).await?;
+    if !check_read_txn(driver, spec, permission_path, &evaluator, txn_id).await? {
+        return Ok(CandidateOpen::Status(OpenStatus::Denied));
+    }
+    let Some(blob_handle) = driver.blob_handle.as_ref() else {
+        return Err(ExportFailure::Retryable(
+            "blob handle unavailable".to_string(),
+        ));
+    };
+    match blob_handle
+        .send_blob_effect(BlobEffect::Read {
+            location: location.clone(),
+        })
+        .await
+    {
+        Event::Blob(BlobEvent::ReadFinished { blob, stream_size }) => {
+            Ok(CandidateOpen::Opened(if metadata_only {
+                BaoReadOutput::Metadata {
+                    size: stream_size,
+                    blake3,
+                }
+            } else {
+                BaoReadOutput::Stream {
+                    blob,
+                    size: stream_size,
+                    blake3,
+                }
+            }))
+        }
+        Event::Blob(BlobEvent::Error(BlobError::IntegrityCheckFailed(_))) => {
+            Ok(CandidateOpen::Status(OpenStatus::Corrupt))
+        }
+        Event::Blob(BlobEvent::Error(_)) => Ok(CandidateOpen::Status(OpenStatus::Offline)),
+        event => Err(ExportFailure::Retryable(format!(
+            "unexpected local blob read event: {event:?}"
+        ))),
     }
 }
 
@@ -3489,12 +3714,7 @@ mod tests {
             "key",
         );
         let mut cache = BTreeMap::new();
-        cache_aliases(
-            &mut cache,
-            [16; 32],
-            vec![alias; MAX_HASH_ALIASES],
-        )
-        .unwrap();
+        cache_aliases(&mut cache, [16; 32], vec![alias; MAX_HASH_ALIASES]).unwrap();
 
         let mut cross_realm = HashPathIndexKey::new(
             [17; 32],
@@ -3551,6 +3771,9 @@ mod tests {
                     location: location.clone(),
                     group_id,
                     permission_path: format!("/alias/{index}"),
+                    node_id: iroh::SecretKey::from_bytes(&[28; 32]).public(),
+                    bucket: "bucket".to_string(),
+                    key: format!("key-{index}"),
                 },
                 report_source: ExportReportSource::Hash,
                 resolved_version: Some(Ulid::from_bytes([index as u8; 16])),
