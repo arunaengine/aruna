@@ -663,9 +663,8 @@ mod tests {
         let stored = drive(GetUserAccessOperation::new(access.access_key), &ctx.driver)
             .await
             .unwrap()
-            .unwrap()
             .unwrap();
-        assert_eq!(stored.revoked_at, Some(revoked_at));
+        assert!(stored.is_none());
     }
 
     #[tokio::test]
