@@ -23,6 +23,9 @@ const AUDIT_FRAME_OVERHEAD: usize = 256;
 pub(crate) const METADATA_INBOUND_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const STANDARD_FRAME: u8 = 0;
 const AUDIT_FRAME: u8 = 1;
+const POSTCARD_VARIANT_BYTES: usize = 5;
+const AUDIT_REQUEST_VARIANT: u32 = 31;
+const AUDIT_RESPONSE_VARIANT: u32 = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataPathCandidate {
@@ -347,9 +350,31 @@ where
         None => None,
     };
 
+    let mut variant = [0u8; POSTCARD_VARIANT_BYTES];
+    let variant_len = len.min(POSTCARD_VARIANT_BYTES);
+    let mut prefix_len = 0;
+    if variant_len > 0 {
+        reader
+            .read_exact(&mut variant[..1])
+            .await
+            .map_err(|err| err.to_string())?;
+        prefix_len = 1;
+        while prefix_len < variant_len && variant[prefix_len - 1] & 0x80 != 0 {
+            reader
+                .read_exact(&mut variant[prefix_len..prefix_len + 1])
+                .await
+                .map_err(|err| err.to_string())?;
+            prefix_len += 1;
+        }
+        if len > audit_frame_cap() && is_audit_variant(&variant[..prefix_len]) {
+            return Err("metadata audit frame exceeds maximum size".to_string());
+        }
+    }
+
     let mut bytes = vec![0u8; len];
+    bytes[..prefix_len].copy_from_slice(&variant[..prefix_len]);
     reader
-        .read_exact(&mut bytes)
+        .read_exact(&mut bytes[prefix_len..])
         .await
         .map_err(|err| err.to_string())?;
     let message = postcard::from_bytes(&bytes).map_err(|err| err.to_string())?;
@@ -365,6 +390,12 @@ where
 
 fn audit_frame_cap() -> usize {
     MAX_AUDIT_PAGE_BYTES.saturating_add(AUDIT_FRAME_OVERHEAD)
+}
+
+fn is_audit_variant(prefix: &[u8]) -> bool {
+    postcard::from_bytes::<u32>(prefix)
+        .map(|variant| variant == AUDIT_REQUEST_VARIANT || variant == AUDIT_RESPONSE_VARIANT)
+        .unwrap_or(false)
 }
 
 pub(crate) fn response_cap(message: &MetadataTransportMessage) -> usize {
@@ -620,6 +651,25 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, "metadata audit frame exceeds maximum size");
         assert_eq!(budget.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn audit_wire_cap() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        let length = (audit_frame_cap() + 1) as u32;
+        writer.write_all(&[STANDARD_FRAME]).await.unwrap();
+        writer.write_all(&length.to_be_bytes()).await.unwrap();
+        writer
+            .write_all(&[AUDIT_REQUEST_VARIANT as u8])
+            .await
+            .unwrap();
+        let budget = Arc::new(Semaphore::new(METADATA_INBOUND_FRAME_BYTES));
+
+        let error = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "metadata audit frame exceeds maximum size");
+        assert_eq!(budget.available_permits(), METADATA_INBOUND_FRAME_BYTES);
     }
 
     #[tokio::test]
