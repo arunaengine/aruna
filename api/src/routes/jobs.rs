@@ -36,6 +36,7 @@ use utoipa::{OpenApi, ToSchema};
 use crate::auth::{
     ValidatedArunaBearerTokenCarrier, ensure_permission, require_unrestricted_realm_auth,
 };
+use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_operations::driver::drive;
@@ -1011,6 +1012,21 @@ async fn artifact_response(
         );
     }
     let body = if download && content_length > 0 {
+        let permit = match download::admit(state.as_ref(), Some(auth.user_id)) {
+            Ok(permit) => permit,
+            Err(AdmissionError::Total) => {
+                return Err(ServerError::ServiceUnavailableReason(
+                    "download_capacity".to_string(),
+                ));
+            }
+            Err(AdmissionError::User) => {
+                return Ok(coded_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "download capacity exhausted",
+                    "download_capacity",
+                ));
+            }
+        };
         let (lookup, read) = read_artifact_routed(
             &state.get_ctx(),
             auth.user_id,
@@ -1059,7 +1075,7 @@ async fn artifact_response(
                 "artifact reader returned an unexpected range size".to_string(),
             ));
         }
-        Body::from_stream(read.blob)
+        download::body(read.blob, permit)
     } else {
         Body::empty()
     };

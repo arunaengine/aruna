@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod cors;
 pub mod csp;
+mod download;
 pub mod error;
 pub mod forwarded;
 pub mod openapi;

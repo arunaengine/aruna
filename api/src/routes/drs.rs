@@ -1,4 +1,5 @@
 use crate::auth::{ensure_permission, require_realm_auth};
+use crate::download::{self, AdmissionError};
 use crate::error::ServerError;
 use crate::forwarded::external_base_url;
 use crate::server_state::ServerState;
@@ -365,6 +366,19 @@ pub async fn download_object(
         Err(error) => return error.into_response(),
     };
 
+    let permit = match download::admit(state.as_ref(), (!anonymous).then_some(auth.user_id)) {
+        Ok(permit) => permit,
+        Err(AdmissionError::Total) => {
+            return drs_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "download capacity exhausted",
+            );
+        }
+        Err(AdmissionError::User) => {
+            return drs_error(StatusCode::TOO_MANY_REQUESTS, "download capacity exhausted");
+        }
+    };
+
     let result = match drive(
         GetObjectOperation::new(GetObjectInput {
             bucket: resolved.bucket.clone(),
@@ -399,7 +413,7 @@ pub async fn download_object(
 
     let location = result.location.unwrap_or_else(|| resolved.location.clone());
 
-    let mut response = Response::new(Body::from_stream(result.blob));
+    let mut response = Response::new(download::body(result.blob, permit));
     *response.status_mut() = StatusCode::OK;
     if let Ok(value) = http::HeaderValue::from_str(&location.blob_size.to_string()) {
         response
