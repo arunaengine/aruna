@@ -36,6 +36,7 @@ use ulid::Ulid;
 use super::MetadataAuthToken;
 use super::handle::{
     METADATA_QUERY_MAX_BYTES, METADATA_QUERY_MAX_RESULT_BYTES, METADATA_QUERY_MAX_ROWS,
+    METADATA_REGISTRY_CANDIDATE_LIMIT,
 };
 use super::protocol::{
     MetadataPathCandidate, MetadataPathResolution, MetadataPathWinner, MetadataReadError,
@@ -55,8 +56,9 @@ use crate::get_metadata_document::{
 use crate::get_realm_config::GetRealmConfigOperation;
 use crate::get_realm_nodes::{GetRealmNodesOperation, REALM_DISCOVERY_TIMEOUT};
 use crate::list_groups::ListGroupOperation;
-use crate::list_metadata_documents::ListMetadataDocumentsOperation;
-use crate::metadata::repository::{LIST_METADATA_PAGE_SIZE, StorageReadError};
+use crate::metadata::repository::{
+    LIST_METADATA_PAGE_SIZE, StorageReadError, iter_registry_effect, parse_registry_iter,
+};
 use crate::permission_rules::GroupPermissionRules;
 use crate::placement::{
     holds_placement, registry_placement, registry_placement_for, registry_strategy,
@@ -77,7 +79,6 @@ const METADATA_ESTIMATE_MIN_LIMIT: usize = 24;
 const METADATA_SUMMARY_FANOUT_LIMIT: usize = 8;
 const METADATA_REFERENCES_DEFAULT_LIMIT: usize = 25;
 const METADATA_REFERENCES_MAX_LIMIT: usize = 100;
-const MAX_POLICY_CANDIDATES: usize = 1024;
 const METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT: usize = 8;
 const METADATA_DISTRIBUTED_QUERY_MAX_NODES: usize = 32;
 const METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -368,16 +369,20 @@ pub async fn list_visible_metadata_documents(
     // never once per group.
     let recent = request.order == MetadataListOrder::Recent;
     let mut pending = if request.include_summary || recent {
-        load_pending_records(context, request.group_id).await?
+        load_pending_records(context, request.group_id, MAX_POLICY_CANDIDATES).await?
     } else {
         HashMap::new()
     };
 
     let mut records = Vec::new();
     for group_id in group_ids {
-        let mut group_records = load_group_records(context, group_id).await?;
+        let remaining = MAX_POLICY_CANDIDATES.saturating_sub(records.len());
+        let mut group_records = load_group_records(context, group_id, remaining).await?;
         if let Some(pending_records) = pending.remove(&group_id) {
             merge_pending_metadata_records(&mut group_records, pending_records);
+            if group_records.len() > remaining {
+                return Err(MetadataApiError::ServiceUnavailable);
+            }
             group_records.sort_by_key(|record| record.document_id);
         }
         records.extend(group_records);
@@ -612,9 +617,14 @@ pub async fn lookup_metadata_path(
     let mut auth_error = None;
     let mut failed = false;
     let mut only_auth = true;
+    let mut candidate_count = 0usize;
     for (_holder, shards, response) in responses {
         match response {
             Ok(returned) => {
+                candidate_count = candidate_count.saturating_add(returned.len());
+                if candidate_count > MAX_POLICY_CANDIDATES {
+                    return Err(MetadataApiError::ServiceUnavailable);
+                }
                 only_auth = false;
                 let mut partitions = shards.iter().map(|_| Vec::new()).collect::<Vec<_>>();
                 for candidate in returned {
@@ -1598,27 +1608,43 @@ fn check_policy_limit(group_ids: Vec<GroupId>) -> Result<Vec<GroupId>, MetadataA
 async fn load_group_records(
     context: &DriverContext,
     group_id: GroupId,
+    limit: usize,
 ) -> Result<Vec<MetadataRegistryRecord>, MetadataApiError> {
     // Listing remains eventually consistent: the handle-owned visibility cache
     // serves stale snapshots while one refill updates the operation-owned read path.
     if let Some(metadata_handle) = context.metadata_handle.as_ref() {
-        match metadata_handle
-            .list_cached_registry_records_for_group(group_id)
+        let group_records = metadata_handle
+            .list_group_records(group_id, limit)
             .await
-        {
-            Ok(group_records) => return Ok(group_records.as_ref().clone()),
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "metadata registry cache fill failed, falling back to registry scan"
-                );
-            }
-        }
+            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+        return Ok(group_records.as_ref().clone());
     }
 
-    drive(ListMetadataDocumentsOperation::new(group_id), context)
-        .await
-        .map_err(|err| MetadataApiError::Internal(err.to_string()))
+    let mut records = Vec::new();
+    let mut start_after = None;
+    loop {
+        let event = context
+            .storage_handle
+            .send_effect(iter_registry_effect(group_id, start_after, None))
+            .await;
+        let (page, next_start_after) =
+            parse_registry_iter(event).map_err(|_| MetadataApiError::ServiceUnavailable)?;
+        if records.len().saturating_add(page.len()) > limit {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
+        records.extend(page);
+        match next_start_after {
+            Some(cursor) => start_after = Some(cursor),
+            None => break,
+        }
+    }
+    let mut visible = Vec::with_capacity(records.len());
+    for record in records {
+        if !metadata_graph_is_deleted(context, &record.graph_iri).await? {
+            visible.push(record);
+        }
+    }
+    Ok(visible)
 }
 
 async fn load_claim_records(
@@ -1638,17 +1664,24 @@ async fn load_claim_records(
         .map(|group| group.group_id)
         .collect(),
     })?;
-    let mut pending = load_pending_records(context, group_id).await?;
+    let mut pending = load_pending_records(context, group_id, MAX_POLICY_CANDIDATES).await?;
     let mut records = Vec::new();
     for group_id in group_ids {
-        let mut group_records = load_group_records(context, group_id).await?;
+        let remaining = MAX_POLICY_CANDIDATES.saturating_sub(records.len());
+        let mut group_records = load_group_records(context, group_id, remaining).await?;
         if let Some(pending_records) = pending.remove(&group_id) {
             merge_pending_metadata_records(&mut group_records, pending_records);
+            if group_records.len() > remaining {
+                return Err(MetadataApiError::ServiceUnavailable);
+            }
         }
         group_records.sort_by_key(|record| record.document_id);
         records.extend(group_records);
     }
     for pending_records in pending.into_values() {
+        if records.len().saturating_add(pending_records.len()) > MAX_POLICY_CANDIDATES {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
         records.extend(pending_records);
     }
     records.retain(|record| record.realm_id == realm_id);
@@ -1658,9 +1691,11 @@ async fn load_claim_records(
 async fn load_pending_records(
     context: &DriverContext,
     group_filter: Option<GroupId>,
+    limit: usize,
 ) -> Result<HashMap<GroupId, Vec<MetadataRegistryRecord>>, MetadataApiError> {
     let mut records: HashMap<GroupId, Vec<MetadataRegistryRecord>> = HashMap::new();
     let mut start_after = None;
+    let mut scanned = 0usize;
 
     loop {
         let page = context
@@ -1683,6 +1718,10 @@ async fn load_pending_records(
             }
             other => return Err(MetadataApiError::Internal(format!("{other:?}"))),
         };
+        scanned = scanned.saturating_add(values.len());
+        if scanned > limit {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
 
         for (key, _) in values {
             let Some((document_id, event_id)) = metadata_pending_projection_target(key.as_ref())
@@ -1699,6 +1738,10 @@ async fn load_pending_records(
             }
             if metadata_graph_is_deleted(context, &record.graph_iri).await? {
                 continue;
+            }
+            let count = records.values().map(Vec::len).sum::<usize>();
+            if count >= limit {
+                return Err(MetadataApiError::ServiceUnavailable);
             }
             records.entry(record.group_id).or_default().push(record);
         }

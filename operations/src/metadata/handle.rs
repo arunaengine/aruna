@@ -12,7 +12,8 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect, StoragePriority};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    API_STATE_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    API_STATE_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataBatch, MetadataCreateCrateRequest, MetadataDot, MetadataEffect, MetadataError,
@@ -58,7 +59,7 @@ use super::protocol::{
 use super::query_cache::{
     CachedQuery, LocalScopeKind, MetadataQueryCache, ScopeDigest, graphs_digest, local_key,
 };
-use super::repository::{REGISTRY_FILL_PAGE_SIZE, iter_all_registry_effect, parse_registry_iter};
+use super::repository::{iter_registry_effect, parse_registry_iter};
 use super::search_cursor::{METADATA_SEARCH_MAX_PAGINATION_DEPTH, compare_hits};
 use super::search_enrichment::{hit_snippet, hit_title};
 use super::summary_cache::summary_cache;
@@ -107,6 +108,7 @@ PREFIX fts: <urn:craqle:fts:>\n";
 static CRAQLE_LATENCY: LazyLock<aruna_core::telemetry::LatencyAggregator> =
     LazyLock::new(|| aruna_core::telemetry::LatencyAggregator::new("craqle"));
 const METADATA_VISIBILITY_CACHE_TTL: Duration = Duration::from_secs(30);
+pub(crate) const METADATA_REGISTRY_CANDIDATE_LIMIT: usize = 1024;
 
 fn sync_identity_matches(left: &SyncRelationship, right: &SyncRelationship) -> bool {
     left.id == right.id
@@ -362,25 +364,35 @@ struct RegistryCacheEntry {
 }
 
 impl RegistryCacheEntry {
-    fn snapshot(&mut self) -> Arc<Vec<MetadataRegistryRecord>> {
-        self.snapshot
-            .get_or_insert_with(|| Arc::new(self.records.values().cloned().collect()))
-            .clone()
+    fn snapshot(&mut self) -> Option<Arc<Vec<MetadataRegistryRecord>>> {
+        if self.records.len() > METADATA_REGISTRY_CANDIDATE_LIMIT {
+            return None;
+        }
+        Some(
+            self.snapshot
+                .get_or_insert_with(|| Arc::new(self.records.values().cloned().collect()))
+                .clone(),
+        )
     }
 
-    fn group_snapshot(&mut self, group_id: GroupId) -> Arc<Vec<MetadataRegistryRecord>> {
+    fn group_snapshot(&mut self, group_id: GroupId) -> Option<Arc<Vec<MetadataRegistryRecord>>> {
         if let Some(records) = self.group_snapshots.get(&group_id) {
-            return records.clone();
+            return (records.len() <= METADATA_REGISTRY_CANDIDATE_LIMIT).then(|| records.clone());
         }
-        let records = Arc::new(
-            self.records
-                .values()
-                .filter(|record| record.group_id == group_id)
-                .cloned()
-                .collect::<Vec<_>>(),
-        );
+        let mut group_records = Vec::new();
+        for record in self
+            .records
+            .values()
+            .filter(|record| record.group_id == group_id)
+        {
+            if group_records.len() == METADATA_REGISTRY_CANDIDATE_LIMIT {
+                return None;
+            }
+            group_records.push(record.clone());
+        }
+        let records = Arc::new(group_records);
         self.group_snapshots.insert(group_id, records.clone());
-        records
+        Some(records)
     }
 }
 
@@ -433,9 +445,11 @@ impl MetadataVisibilityCache {
             .registry
             .lock()
             .unwrap_or_else(|lock| lock.into_inner());
-        registry
-            .as_mut()
-            .map(|entry| (entry.snapshot(), entry.expires_at > now))
+        registry.as_mut().and_then(|entry| {
+            entry
+                .snapshot()
+                .map(|records| (records, entry.expires_at > now))
+        })
     }
 
     fn registry_records_for_group_any(
@@ -447,9 +461,11 @@ impl MetadataVisibilityCache {
             .registry
             .lock()
             .unwrap_or_else(|lock| lock.into_inner());
-        registry
-            .as_mut()
-            .map(|entry| (entry.group_snapshot(group_id), entry.expires_at > now))
+        registry.as_mut().and_then(|entry| {
+            entry
+                .group_snapshot(group_id)
+                .map(|records| (records, entry.expires_at > now))
+        })
     }
 
     #[cfg(test)]
@@ -476,6 +492,9 @@ impl MetadataVisibilityCache {
         lifecycle_entries: Vec<(String, bool)>,
         fill_generation: u64,
     ) -> bool {
+        if records.len() > METADATA_REGISTRY_CANDIDATE_LIMIT {
+            return false;
+        }
         if self.current_generation() != fill_generation {
             return false;
         }
@@ -618,6 +637,14 @@ impl MetadataVisibilityCache {
         let Some(entry) = registry.as_mut() else {
             return;
         };
+        let new_records = updates
+            .iter()
+            .filter(|update| !entry.records.contains_key(&update.document_id))
+            .count();
+        if entry.records.len().saturating_add(new_records) > METADATA_REGISTRY_CANDIDATE_LIMIT {
+            *registry = None;
+            return;
+        }
         let mut touched_groups = HashSet::new();
         for update in updates {
             entry.records.insert(update.document_id, update.clone());
@@ -821,6 +848,14 @@ impl MetadataHandle {
         group_id: GroupId,
     ) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
         list_local_registry_records_for_group(self.inner.clone(), group_id).await
+    }
+
+    pub async fn list_group_records(
+        &self,
+        group_id: GroupId,
+        limit: usize,
+    ) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
+        list_local_group_records(self.inner.clone(), group_id, limit).await
     }
 
     pub(crate) async fn snapshot_iri_references(
@@ -4498,6 +4533,76 @@ fn registry_records_for_group(
     )
 }
 
+async fn list_local_group_records(
+    inner: Arc<MetadataInner>,
+    group_id: GroupId,
+    limit: usize,
+) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
+    let limit = limit.min(METADATA_REGISTRY_CANDIDATE_LIMIT);
+    if let Some((records, _)) = inner
+        .visibility_cache
+        .registry_records_for_group_any(group_id)
+    {
+        if records.len() <= limit {
+            return Ok(records);
+        }
+    }
+
+    let mut records = Vec::new();
+    let mut start_after = None;
+    loop {
+        let event = inner
+            .storage_handle
+            .send_effect(iter_registry_effect(group_id, start_after, None))
+            .await;
+        let (page, next_start_after) = parse_registry_iter(event).map_err(|error| {
+            MetadataError::Backend(format!("metadata group iteration failed: {error:?}"))
+        })?;
+        if records.len().saturating_add(page.len()) > limit {
+            return Err(MetadataError::Backend(
+                "metadata candidate limit exceeded".to_string(),
+            ));
+        }
+        records.extend(page);
+        match next_start_after {
+            Some(cursor) => start_after = Some(cursor),
+            None => break,
+        }
+    }
+
+    let mut visible = Vec::with_capacity(records.len());
+    for record in records {
+        let event = inner
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+                key: metadata_graph_lifecycle_key(&record.graph_iri),
+                txn_id: None,
+            }))
+            .await;
+        let deleted = match event {
+            Event::Storage(StorageEvent::ReadResult {
+                value: Some(value), ..
+            }) => postcard::from_bytes::<MetadataGraphLifecycleRecord>(&value)
+                .map_err(|error| MetadataError::Backend(error.to_string()))?
+                .is_deleted(),
+            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => false,
+            Event::Storage(StorageEvent::Error { error }) => {
+                return Err(MetadataError::Storage(error));
+            }
+            other => {
+                return Err(MetadataError::Backend(format!(
+                    "unexpected metadata lifecycle read result: {other:?}"
+                )));
+            }
+        };
+        if !deleted {
+            visible.push(record);
+        }
+    }
+    Ok(Arc::new(visible))
+}
+
 // Single-flight background refill; readers keep being served the stale entry
 // until the new Arc is swapped in.
 fn spawn_visibility_cache_refill(inner: Arc<MetadataInner>) {
@@ -4550,12 +4655,25 @@ async fn fill_visibility_caches(
     loop {
         let event = inner
             .storage_handle
-            .send_effect(iter_all_registry_effect(start_after, None))
+            .send_effect(Effect::Storage(StorageEffect::Iter {
+                key_space: METADATA_INDEX_KEYSPACE.to_string(),
+                prefix: None,
+                start: start_after.map(IterStart::After),
+                limit: METADATA_REGISTRY_CANDIDATE_LIMIT
+                    .saturating_sub(records.len())
+                    .saturating_add(1),
+                txn_id: None,
+            }))
             .await;
         let (mut page, next_start_after) = parse_registry_iter(event).map_err(|error| {
             MetadataError::Backend(format!("metadata registry iteration failed: {error:?}"))
         })?;
         registry_pages += 1;
+        if records.len().saturating_add(page.len()) > METADATA_REGISTRY_CANDIDATE_LIMIT {
+            return Err(MetadataError::Backend(
+                "metadata candidate limit exceeded".to_string(),
+            ));
+        }
         records.append(&mut page);
         match next_start_after {
             Some(cursor) => start_after = Some(cursor),
@@ -4571,7 +4689,8 @@ async fn fill_visibility_caches(
     // Lifecycle records are deletion tombstones, so one keyspace sweep
     // refreshes the deleted-state of every registry graph without per-graph
     // point reads.
-    let (deleted_graphs, lifecycle_pages) = list_deleted_graph_iris(inner).await?;
+    let (deleted_graphs, lifecycle_pages) =
+        list_deleted_graph_iris(inner, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
     span.record("lifecycle_pages", lifecycle_pages as u64);
     span.record("deleted_count", deleted_graphs.len() as u64);
 
@@ -4602,6 +4721,7 @@ async fn fill_visibility_caches(
 
 async fn list_deleted_graph_iris(
     inner: &Arc<MetadataInner>,
+    limit: usize,
 ) -> Result<(HashSet<String>, usize), MetadataError> {
     let mut deleted = HashSet::new();
     let mut start_after = None;
@@ -4613,7 +4733,7 @@ async fn list_deleted_graph_iris(
                 key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
                 prefix: None,
                 start: start_after.map(IterStart::After),
-                limit: REGISTRY_FILL_PAGE_SIZE,
+                limit: limit.saturating_add(1),
                 txn_id: None,
             }))
             .await;
@@ -4632,6 +4752,11 @@ async fn list_deleted_graph_iris(
             }
         };
         pages += 1;
+        if deleted.len().saturating_add(values.len()) > limit {
+            return Err(MetadataError::Backend(
+                "metadata lifecycle candidate limit exceeded".to_string(),
+            ));
+        }
         for (_, value) in values {
             let record: MetadataGraphLifecycleRecord = postcard::from_bytes(&value)
                 .map_err(|error| MetadataError::Backend(error.to_string()))?;
@@ -4760,6 +4885,14 @@ async fn query_local_graphs(
     let span = Span::current();
     let total_started = Instant::now();
     let query = parse_metadata_query(&sparql)?;
+    if graph_iris
+        .as_ref()
+        .is_some_and(|graphs| graphs.len() > METADATA_REGISTRY_CANDIDATE_LIMIT)
+    {
+        return Err(MetadataError::Backend(
+            "metadata candidate limit exceeded".to_string(),
+        ));
+    }
     // Stamped before any read so a mutation racing this query invalidates the
     // entry it stores.
     let cache_stamp = inner
@@ -5250,6 +5383,15 @@ async fn search_local_graphs(
 ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
     let span = Span::current();
     let total_started = Instant::now();
+
+    if graph_iris
+        .as_ref()
+        .is_some_and(|graphs| graphs.len() > METADATA_REGISTRY_CANDIDATE_LIMIT)
+    {
+        return Err(MetadataError::Backend(
+            "metadata candidate limit exceeded".to_string(),
+        ));
+    }
 
     let records = list_registry_records_for_local_read(inner.clone(), &span).await?;
     // Without a candidate filter the request spans the realm, so craqle
@@ -6061,7 +6203,8 @@ async fn refresh_lifecycle_visibility_for_records(
     records: &[MetadataRegistryRecord],
 ) -> Result<LifecycleVisibilityRefresh, MetadataError> {
     let fill_generation = inner.visibility_cache.current_generation();
-    let (deleted_graphs, _) = list_deleted_graph_iris(inner).await?;
+    let (deleted_graphs, _) =
+        list_deleted_graph_iris(inner, METADATA_REGISTRY_CANDIDATE_LIMIT).await?;
     let store_accepted = inner.visibility_cache.refresh_lifecycle_deleted_if_current(
         records.iter().map(|record| {
             (
@@ -7054,6 +7197,18 @@ mod tests {
                 .iter()
                 .any(|record| record.document_id == added.document_id)
         );
+    }
+
+    #[test]
+    fn upsert_over_limit_discards_cache() {
+        let records = (0..METADATA_REGISTRY_CANDIDATE_LIMIT)
+            .map(|index| registry_record(&format!("datasets/{index}")))
+            .collect();
+        let cache = filled_cache(records);
+
+        cache.upsert_registry_records(&[registry_record("datasets/overflow")]);
+
+        assert!(cache.registry_records().is_none());
     }
 
     #[test]
