@@ -1382,43 +1382,47 @@ async fn process_blob_replication_job(
             realm_id: relationship.created_by.realm_id,
             path_restrictions: None,
         };
-        let source_authorization =
-            match load_source_authorization(context, creator, relationship.source.node_id, bucket)
-                .await
-            {
-                Ok(authorization) => {
-                    watch_group_id = Some(authorization.group_id());
-                    authorization
+        let source_authorization = match load_source_authorization(
+            context,
+            creator.clone(),
+            relationship.source.node_id,
+            bucket,
+        )
+        .await
+        {
+            Ok(authorization) => {
+                watch_group_id = Some(authorization.group_id());
+                authorization
+            }
+            Err((SourceAuthorizationError::Denied, group_id)) => {
+                let mut relationship = relationship;
+                relationship.state = SyncState::Failed {
+                    reason: "access_denied".to_string(),
+                };
+                mark_failure(&mut relationship, "access_denied");
+                if store_relationship(context, relationship.clone()).await? {
+                    emit_sync_watch(context, &relationship, group_id, 0, Some("access_denied"))
+                        .await;
                 }
-                Err((SourceAuthorizationError::Denied, group_id)) => {
-                    let mut relationship = relationship;
-                    relationship.state = SyncState::Failed {
-                        reason: "access_denied".to_string(),
-                    };
-                    mark_failure(&mut relationship, "access_denied");
-                    if store_relationship(context, relationship.clone()).await? {
-                        emit_sync_watch(context, &relationship, group_id, 0, Some("access_denied"))
-                            .await;
-                    }
-                    return Ok(BlobReplicationJobOutcome::TerminalFailure);
+                return Ok(BlobReplicationJobOutcome::TerminalFailure);
+            }
+            Err((SourceAuthorizationError::Unavailable(error), group_id)) => {
+                let mut relationship = relationship;
+                mark_failure(&mut relationship, &error);
+                if store_relationship(context, relationship.clone()).await?
+                    && let Some(group_id) = group_id
+                {
+                    emit_sync_watch(context, &relationship, group_id, 0, Some(&error)).await;
                 }
-                Err((SourceAuthorizationError::Unavailable(error), group_id)) => {
-                    let mut relationship = relationship;
-                    mark_failure(&mut relationship, &error);
-                    if store_relationship(context, relationship.clone()).await?
-                        && let Some(group_id) = group_id
-                    {
-                        emit_sync_watch(context, &relationship, group_id, 0, Some(&error)).await;
-                    }
-                    return Err(error);
-                }
-            };
+                return Err(error);
+            }
+        };
         operation = operation
             .with_relationship(
                 relationship.clone(),
                 job.origin.clone(),
                 job.upstream_sources.clone(),
-                job.writer_auth_context.clone(),
+                Some(creator),
             )
             .with_source_authorization(source_authorization);
         Some(relationship)
@@ -2697,6 +2701,7 @@ mod tests {
 
     #[tokio::test]
     async fn success_updates_status() {
+        // Queue actor must not replace the relationship creator.
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
@@ -2707,6 +2712,11 @@ mod tests {
         relationship.status.last_error = Some("old error".to_string());
         relationship.status.counters.consecutive_failures = 2;
         write_relationship(&storage, &relationship).await;
+        let queued_by = AuthContext {
+            user_id: UserId::local(Ulid::from_parts(9, 9), realm()),
+            realm_id: realm(),
+            path_restrictions: None,
+        };
         let context = DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
@@ -2719,6 +2729,7 @@ mod tests {
             QueueBlobReplicationOperation::new_relationship(
                 ReplicateScopeInput {
                     target: ReplicateScopeTarget::Bucket,
+                    auth_context: queued_by,
                     ..on_demand_input()
                 },
                 None,
