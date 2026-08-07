@@ -608,7 +608,7 @@ impl Service<Request<Incoming>> for WrappingService {
 
 async fn run_connection<F>(first_request: Arc<FirstRequest>, connection: F)
 where
-    F: Future<Output = hyper::Result<()>> + Send,
+    F: Future + Send,
 {
     let mut connection = Box::pin(connection);
     let initial = tokio::time::timeout(INITIAL_REQUEST_TIMEOUT, first_request.wait());
