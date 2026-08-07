@@ -338,7 +338,7 @@ async fn dispatch_effect_until(
         }
         // Audit fan-out runs its frame I/O here for the same reason.
         Effect::Net(NetEffect::AuditPage(audit)) => {
-            Box::pin(dispatch_audit_page(*audit, context)).await
+            Box::pin(dispatch_audit_page(*audit, context, deadline)).await
         }
         Effect::Net(net_effect) => {
             if let Some(net_handle) = &context.net_handle {
@@ -456,7 +456,11 @@ fn audit_nodes(nodes: Vec<NodeId>, batch: &mut AuditPageBatch) -> Option<BTreeSe
 /// Requests every node's local audit page over the metadata control transport,
 /// concurrently so one unreachable node cannot spend the whole request deadline.
 /// An unreachable or denied node is reported so the aggregator records it missing.
-async fn dispatch_audit_page(effect: AuditPageEffect, context: &DriverContext) -> Event {
+async fn dispatch_audit_page(
+    effect: AuditPageEffect,
+    context: &DriverContext,
+    operation_deadline: Option<tokio::time::Instant>,
+) -> Event {
     let AuditPageEffect {
         nodes: input_nodes,
         request,
@@ -470,11 +474,20 @@ async fn dispatch_audit_page(effect: AuditPageEffect, context: &DriverContext) -
         return Event::Net(NetEvent::AuditPages(batch));
     }
 
+    let deadline =
+        operation_deadline.unwrap_or_else(|| tokio::time::Instant::now() + AUDIT_FANOUT_DEADLINE);
     let requests = stream::iter(nodes.into_iter().map(|node| {
         let request = request.clone();
+        let deadline = deadline;
         async move {
-            let result = tokio::time::timeout(
-                AUDIT_PEER_DEADLINE,
+            let peer_deadline = tokio::time::Instant::now() + AUDIT_PEER_DEADLINE;
+            let peer_deadline = if peer_deadline < deadline {
+                peer_deadline
+            } else {
+                deadline
+            };
+            let result = tokio::time::timeout_at(
+                peer_deadline,
                 crate::metadata::audit::send_audit_request(context, node, request),
             )
             .await;
@@ -483,7 +496,6 @@ async fn dispatch_audit_page(effect: AuditPageEffect, context: &DriverContext) -
     }))
     .buffer_unordered(AUDIT_FANOUT_CONCURRENCY);
     futures_util::pin_mut!(requests);
-    let deadline = tokio::time::Instant::now() + AUDIT_FANOUT_DEADLINE;
     loop {
         let next = match tokio::time::timeout_at(deadline, requests.next()).await {
             Ok(next) => next,
