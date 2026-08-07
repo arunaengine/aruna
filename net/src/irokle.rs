@@ -4406,9 +4406,12 @@ async fn apply_realm_config_admin_document_operation_to_storage(
         };
 
         if is_revocation {
-            let valid = previous_config.as_ref().is_some_and(|config| {
-                config.realm_id == realm_id && config.has_node(event.origin_node_id)
-            });
+            let valid = revocation_origin_known(
+                previous_config.as_ref(),
+                previous_state.as_ref(),
+                &event,
+                realm_id,
+            );
             if !valid {
                 return Err(
                     abort_error(
@@ -5840,6 +5843,34 @@ async fn read_admin_realm_authorization(
     .map_err(|error| NetError::Bootstrap(error.to_string()))
 }
 
+fn revocation_origin_known(
+    config: Option<&RealmConfigDocument>,
+    state: Option<&AdminDocumentReducerState>,
+    event: &AdminDocumentEvent,
+    realm_id: RealmId,
+) -> bool {
+    if config.is_some_and(|config| {
+        config.realm_id == realm_id && config.has_node(event.origin_node_id)
+    }) {
+        return true;
+    }
+
+    let Some(state) = state else {
+        return false;
+    };
+    let path = realm_config_node_path(&event.origin_node_id);
+    state
+        .user_subject_ids
+        .get(&path)
+        .is_some_and(|version| event.observed.observes(&version.dot))
+        || state.conflicts.get(&path).is_some_and(|conflict| {
+            conflict
+                .values
+                .iter()
+                .any(|value| event.observed.observes(&value.dot))
+        })
+}
+
 fn configured_node_kind<'a>(
     config: &'a RealmConfigDocument,
     node_id: &NodeId,
@@ -5875,16 +5906,15 @@ async fn validate_realm_config_admin_authority(
         &event.op,
         AdminDocumentOperation::RealmConfigTokenRevoked { .. }
     ) {
-        let Some(config) = current_config.as_ref() else {
+        if !revocation_origin_known(current_config.as_ref(), previous_state, event, realm_id) {
             return Ok(AdminEventValidation::Deferred {
                 dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
-                reason: "current realm config is unavailable".to_string(),
-            });
-        };
-        if !config.has_node(event.origin_node_id) {
-            return Ok(AdminEventValidation::Deferred {
-                dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
-                reason: "revocation event origin onboarding is not yet materialized".to_string(),
+                reason: if current_config.is_some() {
+                    "revocation event origin onboarding is not yet materialized"
+                } else {
+                    "current realm config is unavailable"
+                }
+                .to_string(),
             });
         }
         return Ok(AdminEventValidation::Accepted);
@@ -8546,6 +8576,61 @@ mod tests {
             &aruna_core::auth::bearer_token_hash("owned-token"),
             unix_timestamp_secs()
         ));
+    }
+
+    #[test]
+    fn accepts_historical_origin() {
+        let realm_id = RealmId::from_bytes([62; 32]);
+        let origin = test_actor(
+            14,
+            UserId::local(Ulid::from_parts(1_660, 1), realm_id),
+            realm_id,
+        );
+        let other = test_actor(
+            15,
+            UserId::local(Ulid::from_parts(1_661, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let ensure = test_admin_event(
+            Ulid::from_parts(1_662, 1),
+            target.clone(),
+            &origin,
+            1,
+            AdminDocumentOperation::RealmConfigNodeEnsured {
+                node_id: origin.node_id,
+                kind: RealmNodeKind::Server,
+            },
+        );
+        let conflict = test_admin_event(
+            Ulid::from_parts(1_663, 1),
+            target.clone(),
+            &other,
+            1,
+            AdminDocumentOperation::RealmConfigNodeEnsured {
+                node_id: origin.node_id,
+                kind: RealmNodeKind::User,
+            },
+        );
+        let mut state = AdminDocumentReducerState::new(target.clone());
+        state.apply(&ensure).expect("onboarding applies");
+        state.apply(&conflict).expect("conflicting onboarding applies");
+        assert!(state.conflicts.contains_key(&realm_config_node_path(&origin.node_id)));
+
+        let event = AdminDocumentEvent {
+            event_id: Ulid::from_parts(1_664, 1),
+            target,
+            origin_node_id: origin.node_id,
+            origin_seq: 2,
+            observed: AdminDocumentClock::default().with_observed(origin.node_id, 1),
+            actor: origin,
+            op: AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: aruna_core::auth::bearer_token_hash("historical-token"),
+                expires_at: unix_timestamp_secs() + 600,
+                token_owner: other.user_id,
+            },
+        };
+        assert!(revocation_origin_known(None, Some(&state), &event, realm_id));
     }
 
     #[tokio::test]
