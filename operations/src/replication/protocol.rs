@@ -221,59 +221,7 @@ impl VersionReplicationMessage {
                     "invalid version replication message prefix".to_string(),
                 )
             })?;
-        match postcard::from_bytes(payload) {
-            Ok(message) => Ok(message),
-            Err(postcard::Error::DeserializeUnexpectedEnd) => {
-                let empty_metadata = postcard::to_allocvec(&HashMap::<String, String>::new())?;
-                let mut current = payload.to_vec();
-                current.extend_from_slice(&empty_metadata);
-                if let Ok(message) = postcard::from_bytes(&current) {
-                    return Ok(message);
-                }
-                let reference_none = postcard::to_allocvec(&Option::<SourceMetadata>::None)?;
-                let mut current = payload.to_vec();
-                current.extend_from_slice(&reference_none);
-                current.extend_from_slice(&empty_metadata);
-                if let Ok(message) = postcard::from_bytes(&current) {
-                    return Ok(message);
-                }
-                let writer_none = postcard::to_allocvec(&Option::<AuthContext>::None)?;
-                let mut current = payload.to_vec();
-                current.extend_from_slice(&writer_none);
-                current.extend_from_slice(&reference_none);
-                current.extend_from_slice(&empty_metadata);
-                if let Ok(message) = postcard::from_bytes(&current) {
-                    return Ok(message);
-                }
-                let empty_sources = postcard::to_allocvec(&Vec::<ArunaArn>::new())?;
-                let mut origin_only = payload.to_vec();
-                origin_only.extend_from_slice(&empty_sources);
-                origin_only.extend_from_slice(&writer_none);
-                origin_only.extend_from_slice(&reference_none);
-                origin_only.extend_from_slice(&empty_metadata);
-                if let Ok(message) = postcard::from_bytes(&origin_only) {
-                    return Ok(message);
-                }
-                let mut previous = payload.to_vec();
-                previous.extend(postcard::to_allocvec(&Option::<SyncOrigin>::None)?);
-                previous.extend_from_slice(&empty_sources);
-                previous.extend_from_slice(&writer_none);
-                previous.extend_from_slice(&reference_none);
-                previous.extend_from_slice(&empty_metadata);
-                if let Ok(message) = postcard::from_bytes(&previous) {
-                    return Ok(message);
-                }
-                let mut legacy = payload.to_vec();
-                legacy.extend(postcard::to_allocvec(&false)?);
-                legacy.extend(postcard::to_allocvec(&Option::<SyncOrigin>::None)?);
-                legacy.extend_from_slice(&empty_sources);
-                legacy.extend_from_slice(&writer_none);
-                legacy.extend_from_slice(&reference_none);
-                legacy.extend_from_slice(&empty_metadata);
-                Ok(postcard::from_bytes(&legacy)?)
-            }
-            Err(error) => Err(error.into()),
-        }
+        Ok(postcard::from_bytes(payload)?)
     }
 }
 
@@ -309,45 +257,9 @@ mod tests {
         ArunaArn, AuthContext, MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary,
         RealmId, ReplicationItemKind, VersionSourceBinding,
     };
-    use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;
-
-    #[derive(Serialize, Deserialize)]
-    enum LegacyVersionReplicationMessage {
-        VersionManifest(LegacyVersionReplicationManifest),
-    }
-
-    #[derive(Serialize, Deserialize)]
-    struct LegacyVersionReplicationManifest {
-        bucket: String,
-        key: String,
-        version_id: Ulid,
-        group_id: aruna_core::types::GroupId,
-        kind: ReplicationItemKind,
-        created_at: SystemTime,
-        created_by: UserId,
-        current_version: bool,
-        current_version_generation: Option<u64>,
-        auth_context: AuthContext,
-        blob: Option<MaterializedBlobInfo>,
-        source: Option<VersionSourceBinding>,
-        multipart: Option<LegacyMultipartObjectReplicationMetadata>,
-    }
-
-    #[derive(Serialize, Deserialize)]
-    struct LegacyMultipartObjectReplicationMetadata {
-        summary: LegacyMultipartObjectSummary,
-        parts: Vec<MultipartObjectPart>,
-        checksum_type: MultipartChecksumType,
-    }
-
-    #[derive(Serialize, Deserialize)]
-    struct LegacyMultipartObjectSummary {
-        checksum_type: MultipartChecksumType,
-        part_count: usize,
-    }
 
     fn test_realm_id() -> RealmId {
         RealmId::from_bytes([7u8; 32])
@@ -459,37 +371,12 @@ mod tests {
     }
 
     #[test]
-    fn decodes_previous_manifest() {
-        let mut manifest = make_manifest();
-        manifest.reference_intent = true;
-        manifest.origin = Some(SyncOrigin {
-            relationship_id: Ulid::from(8u128),
-            hop_count: 2,
-        });
-        let mut bytes = VersionReplicationMessage::VersionManifest(manifest.clone())
+    fn rejects_truncated_manifest() {
+        let mut bytes = VersionReplicationMessage::VersionManifest(make_manifest())
             .to_bytes()
             .unwrap();
-        assert_eq!(bytes.pop(), Some(0));
-
-        let decoded = VersionReplicationMessage::from_bytes(&bytes).unwrap();
-
-        assert_eq!(
-            decoded,
-            VersionReplicationMessage::VersionManifest(manifest)
-        );
-
-        let mut intermediate = make_manifest();
-        intermediate.reference_intent = true;
-        let mut bytes = VersionReplicationMessage::VersionManifest(intermediate.clone())
-            .to_bytes()
-            .unwrap();
-        assert_eq!(bytes.pop(), Some(0));
-        assert_eq!(bytes.pop(), Some(0));
-        assert_eq!(bytes.pop(), Some(0));
-        assert_eq!(
-            VersionReplicationMessage::from_bytes(&bytes).unwrap(),
-            VersionReplicationMessage::VersionManifest(intermediate)
-        );
+        bytes.pop();
+        assert!(VersionReplicationMessage::from_bytes(&bytes).is_err());
     }
 
     #[test]
@@ -523,17 +410,8 @@ mod tests {
         let bytes = VersionReplicationMessage::VersionManifest(manifest)
             .to_bytes()
             .unwrap();
-        let legacy: LegacyVersionReplicationMessage =
-            postcard::from_bytes(bytes.strip_prefix(VERSION_REPLICATION_MAGIC).unwrap()).unwrap();
-        let LegacyVersionReplicationMessage::VersionManifest(legacy_manifest) = &legacy;
-        let legacy_multipart = legacy_manifest.multipart.as_ref().unwrap();
-        assert_eq!(legacy_multipart.summary.part_count, 2);
-        assert_eq!(legacy_multipart.parts.len(), 2);
-
-        let mut legacy_bytes = VERSION_REPLICATION_MAGIC.to_vec();
-        legacy_bytes.extend(postcard::to_allocvec(&legacy).unwrap());
         let VersionReplicationMessage::VersionManifest(decoded) =
-            VersionReplicationMessage::from_bytes(&legacy_bytes).unwrap()
+            VersionReplicationMessage::from_bytes(&bytes).unwrap()
         else {
             panic!("expected version manifest")
         };
@@ -547,7 +425,5 @@ mod tests {
             Some(&composite_sha256)
         );
         assert!(!decoded.reference_intent);
-        assert!(decoded.origin.is_none());
-        assert!(decoded.upstream_sources.is_empty());
     }
 }
