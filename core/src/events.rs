@@ -1,4 +1,4 @@
-use crate::audit::AuditPageResponse;
+use crate::audit::AuditPageBatch;
 use crate::errors::{BlobError, SourceConnectorResolutionError, StagingSourceError};
 use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
@@ -181,7 +181,7 @@ pub enum NetEvent {
     DocumentSync(DocumentSyncNetEvent),
     Stream(StreamEvent),
     JobControl(JobControlEvent),
-    AuditPages(Vec<AuditPageEvent>),
+    AuditPages(AuditPageBatch),
     Error(NetError),
 }
 
@@ -191,20 +191,6 @@ pub enum NetEvent {
 pub enum JobControlEvent {
     Response(Box<JobResponse>),
     Unavailable(String),
-}
-
-/// One node's part of an [`crate::effects::AuditPageEffect`] reply: its local
-/// page, or an unreachable or denied node the aggregator records as missing.
-#[derive(Debug, PartialEq)]
-pub enum AuditPageEvent {
-    Page {
-        node: NodeId,
-        response: Box<AuditPageResponse>,
-    },
-    Unavailable {
-        node: NodeId,
-        message: String,
-    },
 }
 
 #[derive(Debug, PartialEq)]
