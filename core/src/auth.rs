@@ -65,7 +65,7 @@ mod tests {
     }
 
     #[test]
-    fn revocation_window_is_bounded() {
+    fn bounded_revocation_window() {
         let now = 1_000;
         assert!(revocation_live(now, now));
         assert!(!revocation_live(now - 1, now));
