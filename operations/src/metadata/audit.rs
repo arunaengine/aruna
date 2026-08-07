@@ -27,6 +27,7 @@ use ulid::Ulid;
 use super::api::load_realm_config;
 use super::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::driver::{DriverContext, drive_until};
+use crate::placement::selector::{ROLE_NODE, neg_log2_q48, selector_hash};
 use crate::request_authorization::{AuthorizeError, authorize};
 use crate::request_policy::PolicyRequestExtras;
 
@@ -35,10 +36,13 @@ pub const DEFAULT_AUDIT_PAGE_SIZE: usize = 50;
 const AUDIT_CURSOR_VERSION: u8 = 1;
 const MAX_AUDIT_CURSOR_BYTES: usize = 256;
 const MAX_AUDIT_CURSOR_CHARS: usize = 384;
-const AUDIT_ADMISSION_LIMIT: usize = 16;
+const AUDIT_INBOUND_LIMIT: usize = 16;
+const AUDIT_OUTBOUND_LIMIT: usize = 16;
 pub const AUDIT_DEADLINE_SECS: u64 = 30;
-static AUDIT_ADMISSION: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(AUDIT_ADMISSION_LIMIT)));
+static AUDIT_INBOUND_ADMISSION: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(AUDIT_INBOUND_LIMIT)));
+static AUDIT_OUTBOUND_ADMISSION: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(AUDIT_OUTBOUND_LIMIT)));
 
 #[derive(Debug, Clone)]
 pub struct ListAuditRequest {
@@ -291,37 +295,82 @@ fn remember_peer(peers: &mut BTreeSet<NodeId>, node: NodeId) {
     }
 }
 
-fn select_peers(peers: Vec<NodeId>, limit: usize) -> (Vec<NodeId>, BTreeSet<NodeId>, usize) {
-    let mut selected = Vec::with_capacity(limit.min(MAX_AUDIT_PEERS));
+#[derive(Default)]
+struct PeerSelection {
+    selected: Vec<NodeId>,
+    omitted: BTreeSet<NodeId>,
+    missing_count: usize,
+}
+
+fn audit_scope(
+    realm_id: RealmId,
+    local_node: NodeId,
+    group_id: GroupId,
+    document_id: Option<Ulid>,
+    start_after: Option<&[u8]>,
+    limit: usize,
+    config_digest: [u8; 32],
+) -> Vec<u8> {
+    let mut scope = Vec::with_capacity(32 + 32 + 16 + 1 + 16 + 1 + 48 + 8 + 32);
+    scope.extend_from_slice(realm_id.as_bytes());
+    scope.extend_from_slice(local_node.as_bytes());
+    scope.extend_from_slice(&group_id.to_bytes());
+    match document_id {
+        Some(document_id) => {
+            scope.push(1);
+            scope.extend_from_slice(&document_id.to_bytes());
+        }
+        None => scope.push(0),
+    }
+    match start_after {
+        Some(start_after) => {
+            scope.push(1);
+            scope.extend_from_slice(start_after);
+        }
+        None => scope.push(0),
+    }
+    scope.extend_from_slice(&limit.to_be_bytes());
+    scope.extend_from_slice(&config_digest);
+    scope
+}
+
+fn select_peers<I>(peers: I, limit: usize, scope: &[u8]) -> PeerSelection
+where
+    I: IntoIterator<Item = NodeId>,
+{
+    let limit = limit.min(MAX_AUDIT_PEERS);
+    let mut selected = BTreeSet::new();
     let mut omitted = BTreeSet::new();
-    let mut candidates = 0usize;
+    let mut missing_count = 0usize;
     for node in peers {
-        if selected.contains(&node) || omitted.contains(&node) {
+        if selected.iter().any(|(_, candidate)| *candidate == node) {
             continue;
         }
-        candidates = candidates.saturating_add(1);
+        let score = neg_log2_q48(selector_hash(ROLE_NODE, scope, node.as_bytes()));
         if selected.len() < limit {
-            selected.push(node);
+            selected.insert((score, node));
             continue;
         }
-        let Some((index, last)) = selected
-            .iter()
-            .enumerate()
-            .max_by(|(_, left), (_, right)| left.as_bytes().cmp(right.as_bytes()))
-        else {
+        let Some(worst) = selected.last().copied() else {
             remember_peer(&mut omitted, node);
+            missing_count = missing_count.saturating_add(1);
             continue;
         };
-        if node.as_bytes() < last.as_bytes() {
-            let evicted = selected.swap_remove(index);
-            remember_peer(&mut omitted, evicted);
-            selected.push(node);
+        if (score, node) < worst {
+            selected.remove(&worst);
+            remember_peer(&mut omitted, worst.1);
+            missing_count = missing_count.saturating_add(1);
+            selected.insert((score, node));
         } else {
             remember_peer(&mut omitted, node);
+            missing_count = missing_count.saturating_add(1);
         }
     }
-    selected.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-    (selected, omitted, candidates.saturating_sub(selected.len()))
+    PeerSelection {
+        selected: selected.into_iter().map(|(_, node)| node).collect(),
+        omitted,
+        missing_count,
+    }
 }
 
 /// Gathers a group's audit trail across realm nodes as a sans-I/O operation: it
@@ -351,20 +400,36 @@ pub struct ListAuditOperation {
 
 impl ListAuditOperation {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub fn new<I>(
         realm_id: RealmId,
         local_node: NodeId,
         include_local: bool,
         group_id: GroupId,
         document_id: Option<Ulid>,
-        peers: Vec<NodeId>,
+        peers: I,
         start_after: Option<Vec<u8>>,
         limit: usize,
         auth_token: Option<MetadataAuthToken>,
         config_digest: [u8; 32],
-    ) -> Self {
+    ) -> Self
+    where
+        I: IntoIterator<Item = NodeId>,
+    {
         let limit = limit.clamp(1, MAX_AUDIT_PAGE_SIZE);
-        let (selected, omitted, missing_count) = select_peers(peers, MAX_AUDIT_PEERS);
+        let scope = audit_scope(
+            realm_id,
+            local_node,
+            group_id,
+            document_id,
+            start_after.as_deref(),
+            limit,
+            config_digest,
+        );
+        let PeerSelection {
+            selected,
+            omitted,
+            missing_count,
+        } = select_peers(peers, MAX_AUDIT_PEERS, &scope);
         let mut batch = AuditPageBatch::with_limit(limit);
         for node in omitted {
             batch.mark_missing(node);
@@ -611,7 +676,7 @@ pub async fn list_audit(
     request: ListAuditRequest,
     deadline: tokio::time::Instant,
 ) -> Result<AuditAggregate, ListAuditError> {
-    let _admission = AUDIT_ADMISSION
+    let _admission = AUDIT_OUTBOUND_ADMISSION
         .clone()
         .try_acquire_owned()
         .map_err(|_| ListAuditError::Unavailable)?;
@@ -622,7 +687,7 @@ pub async fn list_audit(
 
     // Membership and its digest are eventual candidates; each peer revalidates them.
     let mut partial = false;
-    let mut peers: Vec<NodeId> = Vec::new();
+    let mut config_document = None;
     let mut config_digest = [0u8; 32];
     let mut digest_ready = false;
     let mut include_local = false;
@@ -637,15 +702,6 @@ pub async fn list_audit(
                 Ok(digest) => {
                     config_digest = digest;
                     digest_ready = true;
-                }
-                Err(_) => partial = true,
-            }
-            match config.sync_eligible_node_ids() {
-                Ok(nodes) => {
-                    peers = nodes
-                        .into_iter()
-                        .filter(|node| *node != local_node)
-                        .collect();
                 }
                 Err(_) => partial = true,
             }
@@ -665,9 +721,7 @@ pub async fn list_audit(
                 }
                 None => partial = true,
             }
-            if !digest_ready {
-                peers.clear();
-            }
+            config_document = Some(config);
         }
     }
     if request.cursor.is_some() && !digest_ready {
@@ -690,18 +744,33 @@ pub async fn list_audit(
         })
         .transpose()?;
 
+    let mut invalid_peer = false;
+    let peer_nodes = config_document
+        .as_ref()
+        .into_iter()
+        .flat_map(|config| config.nodes.iter())
+        .filter(|node| node.kind.is_sync_eligible())
+        .filter_map(|node| match node.node_id.parse::<NodeId>() {
+            Ok(node) if node != local_node && digest_ready => Some(node),
+            Ok(_) => None,
+            Err(_) => {
+                invalid_peer = true;
+                None
+            }
+        });
     let operation = ListAuditOperation::new(
         realm_id,
         local_node,
         include_local,
         request.group_id,
         request.document_id,
-        peers,
+        peer_nodes,
         start_after,
         limit,
         auth_token,
         config_digest,
     );
+    partial |= invalid_peer;
     let mut aggregate = drive_until(operation, context, deadline).await?;
     aggregate.partial |= partial;
     if aggregate.partial {
@@ -729,7 +798,7 @@ async fn local_audit_result(
     request: AuditPageRequest,
     deadline: tokio::time::Instant,
 ) -> Result<AuditPageResponse, MetadataReadError> {
-    let _admission = AUDIT_ADMISSION
+    let _admission = AUDIT_INBOUND_ADMISSION
         .clone()
         .try_acquire_owned()
         .map_err(|_| MetadataReadError::Unavailable)?;
@@ -832,11 +901,12 @@ pub(crate) async fn send_audit_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        AUDIT_ADMISSION, AUDIT_ADMISSION_LIMIT, AuditPageEntry, AuditPageResponse, Effect, Event,
-        ListAuditError, ListAuditOperation, ListAuditRequest, LocalAuditPageOperation,
-        MAX_AUDIT_CURSOR_CHARS, MAX_AUDIT_PAGE_SIZE, MAX_AUDIT_PEERS, MetadataReadError, NetEffect,
-        NetEvent, Operation, StorageEvent, authorize_admin, decode_cursor, drive_until,
-        encode_cursor, list_audit,
+        AUDIT_INBOUND_ADMISSION, AUDIT_INBOUND_LIMIT, AUDIT_OUTBOUND_ADMISSION,
+        AUDIT_OUTBOUND_LIMIT, AuditPageEntry, AuditPageResponse, Effect, Event, ListAuditError,
+        ListAuditOperation, ListAuditRequest, LocalAuditPageOperation, MAX_AUDIT_CURSOR_CHARS,
+        MAX_AUDIT_PAGE_SIZE, MAX_AUDIT_PEERS, MetadataReadError, NetEffect, NetEvent, Operation,
+        StorageEvent, audit_scope, authorize_admin, decode_cursor, drive_until, encode_cursor,
+        list_audit, select_peers,
     };
     use crate::driver::DriverContext;
     use crate::metadata::repository::{metadata_audit_key, write_audit_effect};
@@ -853,6 +923,7 @@ mod tests {
     use aruna_core::structs::{MetadataAuditOperation, MetadataAuditRecord, RealmId};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
+    use std::collections::BTreeSet;
     use std::time::Duration;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -942,7 +1013,10 @@ mod tests {
         let Effect::Net(NetEffect::AuditPage(fan_out)) = &effects[0] else {
             panic!("the peer fan-out must be a single net effect");
         };
-        assert_eq!(fan_out.nodes, unique);
+        assert_eq!(
+            fan_out.nodes.iter().copied().collect::<BTreeSet<_>>(),
+            unique.iter().copied().collect::<BTreeSet<_>>()
+        );
         assert!(!operation.is_complete());
         let mut batch = AuditPageBatch::new();
         for node in &unique {
@@ -955,6 +1029,61 @@ mod tests {
         assert!(aggregate.partial);
         assert_eq!(aggregate.missing_nodes.len(), unique.len());
         assert!(aggregate.records.is_empty());
+    }
+
+    #[test]
+    fn selection_ignores_order() {
+        let peers: Vec<_> = (1u8..=130)
+            .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
+            .collect();
+        let scope = audit_scope(
+            RealmId([1u8; 32]),
+            peers[0],
+            Ulid::from_bytes([2u8; 16]),
+            None,
+            None,
+            10,
+            [3u8; 32],
+        );
+        let first = select_peers(peers.clone(), MAX_AUDIT_PEERS, &scope);
+        let mut reversed = peers;
+        reversed.reverse();
+        let second = select_peers(reversed, MAX_AUDIT_PEERS, &scope);
+        assert_eq!(first.selected, second.selected);
+        assert_eq!(first.missing_count, second.missing_count);
+        assert!(first.missing_count > 0);
+    }
+
+    #[test]
+    fn selection_local_seed() {
+        let peers: Vec<_> = (1u8..=130)
+            .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
+            .collect();
+        let first = ListAuditOperation::new(
+            RealmId([1u8; 32]),
+            peers[0],
+            false,
+            Ulid::from_bytes([2u8; 16]),
+            None,
+            peers.clone(),
+            None,
+            10,
+            None,
+            [3u8; 32],
+        );
+        let second = ListAuditOperation::new(
+            RealmId([1u8; 32]),
+            peers[1],
+            false,
+            Ulid::from_bytes([2u8; 16]),
+            None,
+            peers,
+            None,
+            10,
+            None,
+            [3u8; 32],
+        );
+        assert_ne!(first.peers, second.peers);
     }
 
     #[test]
@@ -1089,9 +1218,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admission_fails() {
-        let permits: Vec<_> = (0..AUDIT_ADMISSION_LIMIT)
-            .map(|_| AUDIT_ADMISSION.clone().try_acquire_owned().unwrap())
+    async fn outbound_admission() {
+        let permits: Vec<_> = (0..AUDIT_OUTBOUND_LIMIT)
+            .map(|_| {
+                AUDIT_OUTBOUND_ADMISSION
+                    .clone()
+                    .try_acquire_owned()
+                    .unwrap()
+            })
             .collect();
         let directory = tempdir().unwrap();
         let context = DriverContext {
@@ -1120,6 +1254,31 @@ mod tests {
         .await;
         assert!(matches!(result, Err(ListAuditError::Unavailable)));
         drop(permits);
+    }
+
+    #[test]
+    fn admissions_independent() {
+        let outbound: Vec<_> = (0..AUDIT_OUTBOUND_LIMIT)
+            .map(|_| {
+                AUDIT_OUTBOUND_ADMISSION
+                    .clone()
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect();
+        assert!(AUDIT_INBOUND_ADMISSION.clone().try_acquire_owned().is_ok());
+        let inbound: Vec<_> = (0..AUDIT_INBOUND_LIMIT)
+            .map(|_| AUDIT_INBOUND_ADMISSION.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert!(
+            AUDIT_OUTBOUND_ADMISSION
+                .clone()
+                .try_acquire_owned()
+                .is_err()
+        );
+        assert!(AUDIT_INBOUND_ADMISSION.clone().try_acquire_owned().is_err());
+        drop(inbound);
+        drop(outbound);
     }
 
     #[tokio::test]

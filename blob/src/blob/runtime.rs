@@ -1,5 +1,5 @@
 use super::group::{BackendClaim, GroupHold};
-use super::{BackendRegistry, BlobHandle, BlobHandler};
+use super::{BackendRegistry, BlobHandle, BlobHandler, CONNECTION_SLOTS, PEER_CONNECTIONS};
 use crate::egress::EgressGuard;
 use crate::error::BlobLibError;
 use crate::opendal::init_operator;
@@ -325,6 +325,7 @@ impl BlobHandler {
             storage,
             net,
             connections: Arc::new(Mutex::new(HashMap::new())),
+            connection_slots: Arc::new(Semaphore::new(CONNECTION_SLOTS)),
             transfer_slots: Arc::new(Semaphore::new(TRANSFER_SLOTS)),
             read_slots: Arc::new(Semaphore::new(READ_SLOTS)),
             spool_slots: Arc::new(Semaphore::new(SPOOL_SLOTS)),
@@ -527,7 +528,24 @@ impl BlobHandler {
         peer: NodeId,
         stream: BiStream,
     ) -> Result<Ulid, BlobError> {
+        let slot = self
+            .connection_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                BlobError::ConnectionFailed("blob connection limit reached".to_string())
+            })?;
         let mut connections = self.connections.lock().await;
+        if connections
+            .values()
+            .filter(|connection| connection.peer == peer)
+            .count()
+            >= PEER_CONNECTIONS
+        {
+            return Err(BlobError::ConnectionFailed(
+                "peer blob connection limit reached".to_string(),
+            ));
+        }
         let stream_id = match stream_id {
             Some(stream_id) => {
                 if stream_id.is_nil() {
@@ -555,6 +573,7 @@ impl BlobHandler {
             super::Connection {
                 peer,
                 stream: Arc::new(Mutex::new(stream)),
+                _slot: slot,
             },
         );
         Ok(stream_id)

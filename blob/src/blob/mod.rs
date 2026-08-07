@@ -29,10 +29,14 @@ pub const BAO_BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(16); // 2^16 byt
 
 type SharedBiStream = Arc<Mutex<BiStream>>;
 
-#[derive(Clone, Debug)]
+pub(super) const CONNECTION_SLOTS: usize = 256;
+pub(super) const PEER_CONNECTIONS: usize = 32;
+
+#[derive(Debug)]
 struct Connection {
     peer: NodeId,
     stream: SharedBiStream,
+    _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,6 +53,7 @@ pub struct BlobHandler {
     storage: StorageHandle,
     net: NetHandle,
     connections: Arc<Mutex<HashMap<Ulid, Connection>>>,
+    connection_slots: Arc<Semaphore>,
     transfer_slots: Arc<Semaphore>,
     read_slots: Arc<Semaphore>,
     spool_slots: Arc<Semaphore>,

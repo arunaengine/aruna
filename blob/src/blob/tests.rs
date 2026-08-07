@@ -1383,6 +1383,7 @@ async fn concurrent_connections_receive_distinct_non_nil_ids() {
     let handler = context.blob_handle.handler.clone();
     let (net_a, _dir_a, net_b, _dir_b) = connected_stream_pair().await;
     let peer_id = net_b.node_id();
+    let available = handler.connection_slots.available_permits();
 
     let stream_a = net_a.open_stream(peer_id, Alpn::Bao).await.unwrap();
     let stream_b = net_a.open_stream(peer_id, Alpn::Bao).await.unwrap();
@@ -1399,11 +1400,66 @@ async fn concurrent_connections_receive_distinct_non_nil_ids() {
     assert!(!id_a.is_nil());
     assert!(!id_b.is_nil());
     assert_ne!(id_a, id_b);
+    assert_eq!(handler.connection_slots.available_permits(), available - 2);
 
     handler.close_connection(id_a).await;
     assert!(handler.connection_handle(id_a).await.is_err());
     assert!(handler.connection_handle(id_b).await.is_ok());
+    assert_eq!(handler.connection_slots.available_permits(), available - 1);
+    handler.close_connection(id_b).await;
+    assert_eq!(handler.connection_slots.available_permits(), available);
 
+    net_a.shutdown().await;
+    net_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn peer_connection_limit() {
+    let context = setup_blob_handle(1).await;
+    let handler = context.blob_handle.handler.clone();
+    let (net_a, _dir_a, net_b, _dir_b) = connected_stream_pair().await;
+    let peer_id = net_b.node_id();
+    let mut stream_ids = Vec::new();
+
+    for _ in 0..super::PEER_CONNECTIONS {
+        let stream = net_a.open_stream(peer_id, Alpn::Bao).await.unwrap();
+        stream_ids.push(handler.add_connection(None, peer_id, stream).await.unwrap());
+    }
+    let stream = net_a.open_stream(peer_id, Alpn::Bao).await.unwrap();
+    assert!(matches!(
+        handler.add_connection(None, peer_id, stream).await,
+        Err(BlobError::ConnectionFailed(message)) if message.contains("peer blob connection limit")
+    ));
+
+    for stream_id in stream_ids {
+        handler.close_connection(stream_id).await;
+    }
+    net_a.shutdown().await;
+    net_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn connection_limit() {
+    let context = setup_blob_handle(1).await;
+    let handler = context.blob_handle.handler.clone();
+    let (net_a, _dir_a, net_b, _dir_b) = connected_stream_pair().await;
+    let peer_id = net_b.node_id();
+    let held = (0..super::CONNECTION_SLOTS)
+        .map(|_| {
+            handler
+                .connection_slots
+                .clone()
+                .try_acquire_owned()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    let stream = net_a.open_stream(peer_id, Alpn::Bao).await.unwrap();
+    assert!(matches!(
+        handler.add_connection(None, peer_id, stream).await,
+        Err(BlobError::ConnectionFailed(message)) if message.contains("blob connection limit")
+    ));
+    drop(held);
     net_a.shutdown().await;
     net_b.shutdown().await;
 }

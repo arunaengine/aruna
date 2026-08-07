@@ -431,37 +431,12 @@ async fn dispatch_job_control(effect: JobControlEffect, context: &DriverContext)
     Event::Net(NetEvent::JobControl(event))
 }
 
-fn cap_audit_nodes(
-    nodes: impl IntoIterator<Item = NodeId>,
-    batch: &mut AuditPageBatch,
-) -> BTreeSet<NodeId> {
-    let mut selected = BTreeSet::new();
-    let mut overflow = false;
-    for node in nodes {
-        if selected.contains(&node) {
-            continue;
-        }
-        if selected.len() < MAX_AUDIT_PEERS {
-            selected.insert(node);
-            continue;
-        }
-        overflow = true;
-        let Some(largest) = selected
-            .iter()
-            .max_by(|left, right| left.as_bytes().cmp(right.as_bytes()))
-            .copied()
-        else {
-            continue;
-        };
-        if node.as_bytes() < largest.as_bytes() {
-            selected.remove(&largest);
-            selected.insert(node);
-        }
-    }
-    if overflow {
+fn audit_nodes(nodes: Vec<NodeId>, batch: &mut AuditPageBatch) -> Option<BTreeSet<NodeId>> {
+    if nodes.len() > MAX_AUDIT_PEERS {
         batch.missing_overflow = batch.missing_overflow.max(1);
+        return None;
     }
-    selected
+    Some(nodes.into_iter().collect())
 }
 
 /// Requests every node's local audit page over the metadata control transport,
@@ -473,7 +448,9 @@ async fn dispatch_audit_page(effect: AuditPageEffect, context: &DriverContext) -
         request,
     } = effect;
     let mut batch = AuditPageBatch::with_limit(request.limit);
-    let nodes = cap_audit_nodes(input_nodes, &mut batch);
+    let Some(nodes) = audit_nodes(input_nodes, &mut batch) else {
+        return Event::Net(NetEvent::AuditPages(batch));
+    };
     let mut remaining = nodes.clone();
     if remaining.is_empty() {
         return Event::Net(NetEvent::AuditPages(batch));
@@ -911,7 +888,7 @@ fn event_kind(event: &Event) -> &'static str {
 
 #[cfg(test)]
 mod test {
-    use crate::driver::{DriverContext, cap_audit_nodes, drive};
+    use crate::driver::{DriverContext, audit_nodes, drive};
     use aruna_core::{
         audit::{AuditPageBatch, MAX_AUDIT_PEERS},
         effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect},
@@ -929,30 +906,18 @@ mod test {
     use tempfile::tempdir;
 
     #[test]
-    fn caps_audit_nodes() {
-        let mut nodes = (1..=(MAX_AUDIT_PEERS as u8 + 1))
+    fn rejects_audit_overflow() {
+        let nodes = (1..=(MAX_AUDIT_PEERS as u8 + 1))
             .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
             .collect::<Vec<_>>();
-        let duplicate = nodes[0];
-        nodes.push(duplicate);
-        let mut expected = nodes.clone();
-        expected.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-        expected.dedup();
-        expected.truncate(MAX_AUDIT_PEERS);
         let mut batch = AuditPageBatch::new();
 
-        let nodes = cap_audit_nodes(nodes, &mut batch);
+        let nodes = audit_nodes(nodes, &mut batch);
 
-        assert_eq!(nodes.len(), MAX_AUDIT_PEERS);
+        assert!(nodes.is_none());
         assert_eq!(batch.missing_nodes.len(), 0);
         assert_eq!(batch.missing_overflow, 1);
         assert!(batch.completed_nodes.is_empty());
-        assert_eq!(
-            nodes,
-            expected
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>()
-        );
     }
 
     #[tokio::test]
