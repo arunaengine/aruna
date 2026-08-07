@@ -5,12 +5,13 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::BUCKET_STATS_DB;
+use aruna_core::keyspaces::{BLOB_HIDDEN_RESERVATION_KEYSPACE, BUCKET_STATS_DB};
 use aruna_core::structs::{
     Backend, BackendBucket, BackendLocation, BackendRef, HIDDEN_BLOB_PREFIX, HiddenBlobKey,
     MULTIPART_PART_PREFIX, ensure_confined_relative_path,
 };
 use aruna_core::types::TxnId;
+use byteview::ByteView;
 use opendal::Operator;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -38,6 +39,12 @@ fn conflict_backoff(attempt: u32) -> Duration {
     let micros = base.as_micros() as u64;
     let spread = u64::from(Ulid::generate().to_bytes()[15]);
     Duration::from_micros(micros / 2 + micros * spread / 510)
+}
+
+fn reservation_key(key: &HiddenBlobKey) -> Result<ByteView, BlobError> {
+    postcard::to_allocvec(key)
+        .map(ByteView::from)
+        .map_err(|error| BlobError::ConversionError(error.into()))
 }
 
 impl BlobHandler {
@@ -141,6 +148,320 @@ impl BlobHandler {
     pub(super) async fn release_bucket(&self, backend: &BackendRef, bucket: &str) {
         if let Err(error) = self.decrement_bucket_load(backend, bucket).await {
             tracing::warn!(%backend, bucket, %error, "failed to release bucket reservation");
+        }
+    }
+
+    pub(super) async fn reserve_hidden_key(
+        &self,
+        backend: &BackendRef,
+        root: &str,
+        backend_path: &str,
+    ) -> Result<HiddenBlobKey, BlobError> {
+        let config = self.registry.config_for(backend)?.clone();
+        let rounds = if config.max_bucket_size.is_some() {
+            BUCKET_RESERVE_ROUNDS
+        } else {
+            1
+        };
+        let mut full = Vec::new();
+        for _ in 0..rounds {
+            let bucket = Box::pin(self.select_backend_bucket(backend, &full)).await?;
+            let key = HiddenBlobKey::new(
+                backend.clone(),
+                root.to_string(),
+                bucket.clone(),
+                backend_path.to_string(),
+            )
+            .map_err(BlobError::ConversionError)?;
+            let outcome = match self
+                .try_reserve_key(backend, &bucket, &key, config.max_bucket_size)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    if let Err(cleanup) = self.release_hidden_key(&key).await {
+                        return Err(BlobError::ReadError(format!(
+                            "{error}; reservation cleanup failed: {cleanup}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            };
+            match outcome {
+                LoadUpdate::Applied => return Ok(key),
+                LoadUpdate::Full => full.push(bucket),
+                LoadUpdate::Conflict => {
+                    return Err(BlobError::ReadError(
+                        "hidden bucket reservation kept conflicting".to_string(),
+                    ));
+                }
+            }
+        }
+        Err(BlobError::WriteError(
+            "no backend bucket had free capacity".to_string(),
+        ))
+    }
+
+    pub(super) async fn release_hidden_key(&self, key: &HiddenBlobKey) -> Result<(), BlobError> {
+        if !self.stats_managed(&key.backend, &key.storage_bucket) {
+            return Ok(());
+        }
+        let marker = reservation_key(key)?;
+        let mut last_error = None;
+        for attempt in 0..BUCKET_STATS_RETRIES {
+            match self.release_key_txn(key, &marker).await {
+                Ok(LoadUpdate::Applied) => return Ok(()),
+                Ok(LoadUpdate::Conflict) if attempt + 1 < BUCKET_STATS_RETRIES => {
+                    tokio::time::sleep(conflict_backoff(attempt)).await;
+                }
+                Ok(LoadUpdate::Conflict) => break,
+                Ok(LoadUpdate::Full) => unreachable!("release cannot fill a bucket"),
+                Err(error) if attempt + 1 < BUCKET_STATS_RETRIES => {
+                    last_error = Some(error);
+                    tokio::time::sleep(conflict_backoff(attempt)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(error) = last_error {
+            return Err(error);
+        }
+        Err(BlobError::ReadError(
+            "hidden bucket release kept conflicting".to_string(),
+        ))
+    }
+
+    async fn try_reserve_key(
+        &self,
+        backend: &BackendRef,
+        bucket: &str,
+        key: &HiddenBlobKey,
+        capacity: Option<u64>,
+    ) -> Result<LoadUpdate, BlobError> {
+        if !self.stats_managed(backend, bucket) {
+            return Ok(LoadUpdate::Applied);
+        }
+        let marker = reservation_key(key)?;
+        let mut last_error = None;
+        for attempt in 0..BUCKET_STATS_RETRIES {
+            match self
+                .reserve_key_txn(backend, bucket, &marker, capacity)
+                .await
+            {
+                Ok(LoadUpdate::Conflict) if attempt + 1 < BUCKET_STATS_RETRIES => {
+                    tokio::time::sleep(conflict_backoff(attempt)).await;
+                }
+                Ok(outcome) => return Ok(outcome),
+                Err(error) if attempt + 1 < BUCKET_STATS_RETRIES => {
+                    last_error = Some(error);
+                    tokio::time::sleep(conflict_backoff(attempt)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(error) = last_error {
+            return Err(error);
+        }
+        Ok(LoadUpdate::Conflict)
+    }
+
+    async fn reserve_key_txn(
+        &self,
+        backend: &BackendRef,
+        bucket: &str,
+        marker: &ByteView,
+        capacity: Option<u64>,
+    ) -> Result<LoadUpdate, BlobError> {
+        let txn_id = match self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::StartTransaction {
+                read: false,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            _ => {
+                return Err(BlobError::ReadError(
+                    "failed to start hidden bucket transaction".to_string(),
+                ));
+            }
+        };
+        let marker_exists = match self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: BLOB_HIDDEN_RESERVATION_KEYSPACE.to_string(),
+                key: marker.clone(),
+                txn_id: Some(txn_id),
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value.is_some(),
+            _ => {
+                self.abort_stats_txn(txn_id).await;
+                return Err(BlobError::ReadError(
+                    "failed to read hidden bucket reservation".to_string(),
+                ));
+            }
+        };
+        if marker_exists {
+            self.abort_stats_txn(txn_id).await;
+            return Ok(LoadUpdate::Applied);
+        }
+        let load = match self.bucket_load_txn(backend, bucket, txn_id).await {
+            Ok(load) => load,
+            Err(error) => {
+                self.abort_stats_txn(txn_id).await;
+                return Err(error);
+            }
+        };
+        if capacity.is_some_and(|capacity| load >= capacity) {
+            self.abort_stats_txn(txn_id).await;
+            return Ok(LoadUpdate::Full);
+        }
+        let adjusted = load.saturating_add(1);
+        let stats_key = stats_key(backend, bucket).into();
+        let event = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: BUCKET_STATS_DB.to_string(),
+                key: stats_key,
+                value: adjusted.to_le_bytes().to_vec().into(),
+                txn_id: Some(txn_id),
+            }))
+            .await;
+        if !matches!(event, Event::Storage(StorageEvent::WriteResult { .. })) {
+            self.abort_stats_txn(txn_id).await;
+            return Err(BlobError::ReadError(
+                "failed to reserve hidden bucket capacity".to_string(),
+            ));
+        }
+        let event = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: BLOB_HIDDEN_RESERVATION_KEYSPACE.to_string(),
+                key: marker.clone(),
+                value: ByteView::from(vec![1]),
+                txn_id: Some(txn_id),
+            }))
+            .await;
+        if !matches!(event, Event::Storage(StorageEvent::WriteResult { .. })) {
+            self.abort_stats_txn(txn_id).await;
+            return Err(BlobError::ReadError(
+                "failed to persist hidden bucket reservation".to_string(),
+            ));
+        }
+        match self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(LoadUpdate::Applied),
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            }) => Ok(LoadUpdate::Conflict),
+            Event::Storage(StorageEvent::Error { error }) => Err(BlobError::ReadError(format!(
+                "failed to reserve hidden bucket: {error}"
+            ))),
+            _ => Err(BlobError::ReadError(
+                "unexpected hidden bucket reservation event".to_string(),
+            )),
+        }
+    }
+
+    async fn release_key_txn(
+        &self,
+        key: &HiddenBlobKey,
+        marker: &ByteView,
+    ) -> Result<LoadUpdate, BlobError> {
+        let txn_id = match self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::StartTransaction {
+                read: false,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            _ => {
+                return Err(BlobError::ReadError(
+                    "failed to start hidden bucket release".to_string(),
+                ));
+            }
+        };
+        let marker_exists = match self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: BLOB_HIDDEN_RESERVATION_KEYSPACE.to_string(),
+                key: marker.clone(),
+                txn_id: Some(txn_id),
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value.is_some(),
+            _ => {
+                self.abort_stats_txn(txn_id).await;
+                return Err(BlobError::ReadError(
+                    "failed to read hidden bucket release".to_string(),
+                ));
+            }
+        };
+        if !marker_exists {
+            self.abort_stats_txn(txn_id).await;
+            return Ok(LoadUpdate::Applied);
+        }
+        let load = match self
+            .bucket_load_txn(&key.backend, &key.storage_bucket, txn_id)
+            .await
+        {
+            Ok(load) => load,
+            Err(error) => {
+                self.abort_stats_txn(txn_id).await;
+                return Err(error);
+            }
+        };
+        let event = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: BUCKET_STATS_DB.to_string(),
+                key: stats_key(&key.backend, &key.storage_bucket).into(),
+                value: load.saturating_sub(1).to_le_bytes().to_vec().into(),
+                txn_id: Some(txn_id),
+            }))
+            .await;
+        if !matches!(event, Event::Storage(StorageEvent::WriteResult { .. })) {
+            self.abort_stats_txn(txn_id).await;
+            return Err(BlobError::ReadError(
+                "failed to release hidden bucket capacity".to_string(),
+            ));
+        }
+        let event = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::Delete {
+                key_space: BLOB_HIDDEN_RESERVATION_KEYSPACE.to_string(),
+                key: marker.clone(),
+                txn_id: Some(txn_id),
+            }))
+            .await;
+        if !matches!(event, Event::Storage(StorageEvent::DeleteResult { .. })) {
+            self.abort_stats_txn(txn_id).await;
+            return Err(BlobError::ReadError(
+                "failed to delete hidden bucket reservation".to_string(),
+            ));
+        }
+        match self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(LoadUpdate::Applied),
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            }) => Ok(LoadUpdate::Conflict),
+            Event::Storage(StorageEvent::Error { error }) => Err(BlobError::ReadError(format!(
+                "failed to release hidden bucket: {error}"
+            ))),
+            _ => Err(BlobError::ReadError(
+                "unexpected hidden bucket release event".to_string(),
+            )),
         }
     }
 
