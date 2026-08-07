@@ -7,6 +7,7 @@ use super::control_plane::{
 use crate::bao_tree::{
     BaoReadWriter, OpenDalReader, OpenDalWriter, RecvStreamWrapper, SendStreamWrapper,
 };
+use crate::error::BlobLibError;
 use crate::messages::{MessageType, ReplicationMessage};
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
@@ -339,10 +340,20 @@ impl BlobHandler {
             &operator,
             &storage_path,
             self.transfer_idle_timeout(),
+            self.control_plane_io_timeout(),
         )
         .await
         {
             Ok(writer) => writer,
+            Err(BlobLibError::IoError(error))
+                if error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                reservation.retain();
+                return BlobEvent::Error(BlobError::WriteCleanup {
+                    location,
+                    message: error.to_string(),
+                });
+            }
             Err(err) => {
                 _ = self.release_reservation(&location).await;
                 return BlobEvent::Error(BlobError::OperatorCreationFailed(err.to_string()));
@@ -362,31 +373,50 @@ impl BlobHandler {
 
         let event = match decode_result {
             Err(err) => {
-                writer.abort().await;
-                _ = self.release_reservation(&location).await;
-                BlobEvent::Error(BlobError::ReplicationFailed(err.to_string()))
+                match writer.abort().await {
+                    Ok(()) => {
+                        _ = self.release_reservation(&location).await;
+                        BlobEvent::Error(BlobError::ReplicationFailed(err.to_string()))
+                    }
+                    Err(cleanup) => {
+                        reservation.retain();
+                        BlobEvent::Error(BlobError::WriteCleanup {
+                            location,
+                            message: format!("{err}; {cleanup}"),
+                        })
+                    }
+                }
             }
             Ok(()) => {
                 let hashes = writer.hasher.to_map();
                 let actual_blake3 = writer.hasher.finalize().blake3;
                 match writer.finalize().await {
-                    Err(err) => {
-                        _ = self.release_reservation(&location).await;
-                        BlobEvent::Error(BlobError::ReplicationFailed(err.to_string()))
+                    Err(error) => {
+                        reservation.retain();
+                        BlobEvent::Error(BlobError::WriteCleanup {
+                            location,
+                            message: error.to_string(),
+                        })
                     }
                     Ok(()) => {
                         debug!("Decoded all chunks and wrote them into the backend");
                         if actual_blake3 != root {
-                            if let Err(err) = operator.delete(&storage_path).await {
-                                tracing::warn!(
-                                    error = %err,
-                                    "failed to delete hash-mismatched replicated blob"
-                                );
+                            let mismatch = "replicated content hash mismatch";
+                            match self.delete_path(&operator, &storage_path).await {
+                                Ok(()) => {
+                                    _ = self.release_reservation(&location).await;
+                                    BlobEvent::Error(BlobError::IntegrityCheckFailed(
+                                        mismatch.to_string(),
+                                    ))
+                                }
+                                Err(error) => {
+                                    reservation.retain();
+                                    BlobEvent::Error(BlobError::WriteCleanup {
+                                        location,
+                                        message: format!("{mismatch}; {error}"),
+                                    })
+                                }
                             }
-                            _ = self.release_reservation(&location).await;
-                            BlobEvent::Error(BlobError::IntegrityCheckFailed(
-                                "replicated content hash mismatch".to_string(),
-                            ))
                         } else {
                             location.hashes = hashes;
                             reservation.retain();
