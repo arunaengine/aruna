@@ -63,7 +63,7 @@ use crate::permission_rules::GroupPermissionRules;
 use crate::placement::selector::{ROLE_NODE, neg_log2_q48, selector_hash};
 use crate::placement::{
     holds_placement, meta_bucket_subject, registry_placement, registry_placement_for,
-    registry_strategy, resolve_shard_holders,
+    registry_strategy, resolve_holders_limit, resolve_shard_holders,
 };
 use crate::s3::search_buckets::{BucketSearchHit, SearchBucketsInput, search_local_buckets};
 
@@ -83,9 +83,6 @@ const METADATA_REFERENCES_MAX_LIMIT: usize = 100;
 const METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT: usize = 8;
 const METADATA_DISTRIBUTED_QUERY_MAX_NODES: usize = 32;
 const METADATA_DISTRIBUTED_QUERY_DEADLINE: Duration = Duration::from_secs(12);
-// Four bounded fanout waves must finish before the request deadline.
-const METADATA_PEER_TIMEOUT: Duration = Duration::from_secs(2);
-
 #[derive(Debug, Error)]
 pub enum MetadataApiError {
     #[error("bad request")]
@@ -306,6 +303,12 @@ pub struct MetadataFanoutStats {
     pub discovery_failed: bool,
 }
 
+#[derive(Debug)]
+struct PathHolderSelection {
+    node_id: NodeId,
+    shards: Vec<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct MetadataRealmNodeDiscovery {
     pub(crate) nodes: Vec<NodeId>,
@@ -319,6 +322,7 @@ struct MetadataFanoutScope {
     allow_partial: bool,
     discovery_failed: bool,
     subject: Option<[u8; 32]>,
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl MetadataFanoutScope {
@@ -333,6 +337,7 @@ impl MetadataFanoutScope {
             allow_partial,
             discovery_failed: false,
             subject: None,
+            deadline: None,
         }
     }
 
@@ -343,6 +348,11 @@ impl MetadataFanoutScope {
 
     fn with_subject(mut self, subject: [u8; 32]) -> Self {
         self.subject = Some(subject);
+        self
+    }
+
+    fn with_deadline(mut self, deadline: tokio::time::Instant) -> Self {
+        self.deadline = Some(deadline);
         self
     }
 }
@@ -534,23 +544,18 @@ pub async fn lookup_metadata_path(
     request: MetadataPathLookupRequest,
     auth_token: Option<MetadataAuthToken>,
 ) -> Result<MetadataPathLookupResult, MetadataApiError> {
+    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
     let normalized = MetadataRegistryRecord::normalize_document_path(&request.document_path);
     if normalized.is_empty() {
         return Err(MetadataApiError::BadRequest);
     }
     if context.net_handle.is_none() {
-        let candidates = local_path_candidates(
-            context,
-            realm_id,
-            request.group_id,
-            &normalized,
-            request.auth.as_ref(),
-        )
-        .await?;
-        return reduce_path_candidates(candidates);
+        return resolve_local_path(context, realm_id, request).await;
     }
-    let config = load_realm_config(context, realm_id)
+    let config = tokio::time::timeout_at(deadline, load_realm_config(context, realm_id))
         .await
+        .ok()
+        .flatten()
         .ok_or(MetadataApiError::ServiceUnavailable)?;
     let local_node = context
         .net_handle
@@ -572,6 +577,7 @@ pub async fn lookup_metadata_path(
             request,
             auth_token,
             config_digest,
+            deadline,
         )
         .await;
     }
@@ -586,34 +592,30 @@ pub async fn lookup_metadata_path(
     let auth_token = auth_token.or_else(|| request.auth.clone().map(MetadataAuthToken::internal));
     let group_id = request.group_id;
     let auth = request.auth.as_ref();
-    let mut replica_counts = vec![0usize; shard_count as usize];
-    let mut holder_shards: HashMap<NodeId, Vec<u32>> = HashMap::new();
-    for shard in 0..shard_count {
-        let placement = PlacementRef {
-            strategy_id: strategy.strategy_id,
-            epoch: 0,
-            shard,
-        };
-        let holders = resolve_shard_holders(&config, &placement);
-        if holders.is_empty() {
-            return Err(MetadataApiError::ServiceUnavailable);
-        }
-        for holder in holders {
-            replica_counts[shard as usize] += 1;
-            holder_shards.entry(holder).or_default().push(shard);
-        }
-    }
-    if holder_shards.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES {
-        return Err(MetadataApiError::ServiceUnavailable);
-    }
-    let mut holders = holder_shards.into_iter().collect::<Vec<_>>();
-    holders.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
-    let requests = stream::iter(holders.into_iter().map(|(holder, shards)| {
+    let (holders, replica_counts) = select_path_holders(
+        &config,
+        realm_id,
+        group_id,
+        &normalized,
+        strategy.strategy_id,
+        shard_count,
+        strategy.replica_count,
+        local_node,
+        deadline,
+    )?;
+    let requests = stream::iter(holders.into_iter().map(|selection| {
+        let holder = selection.node_id;
+        let shards = selection.shards;
         let auth_token = auth_token.clone();
         let normalized = normalized.clone();
         async move {
             let result = if holder == local_node {
-                local_path_candidates(context, realm_id, group_id, &normalized, auth).await
+                tokio::time::timeout_at(
+                    deadline,
+                    local_path_candidates(context, realm_id, group_id, &normalized, auth),
+                )
+                .await
+                .map_err(|_| MetadataApiError::ServiceUnavailable)?
             } else {
                 load_path_holder(
                     context,
@@ -622,6 +624,7 @@ pub async fn lookup_metadata_path(
                     holder,
                     auth_token,
                     config_digest,
+                    deadline,
                 )
                 .await
             };
@@ -630,7 +633,7 @@ pub async fn lookup_metadata_path(
     }))
     .buffer_unordered(METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT)
     .collect::<Vec<_>>();
-    let responses = tokio::time::timeout(METADATA_DISTRIBUTED_QUERY_DEADLINE, requests)
+    let responses = tokio::time::timeout_at(deadline, requests)
         .await
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     let mut views = Vec::new();
@@ -685,6 +688,154 @@ pub async fn lookup_metadata_path(
     }
     let candidates = merge_path_views(&replica_counts, views)?;
     reduce_path_candidates(candidates)
+}
+
+pub(crate) async fn resolve_local_path(
+    context: &DriverContext,
+    realm_id: RealmId,
+    request: MetadataPathLookupRequest,
+) -> Result<MetadataPathLookupResult, MetadataApiError> {
+    let normalized = MetadataRegistryRecord::normalize_document_path(&request.document_path);
+    if normalized.is_empty() {
+        return Err(MetadataApiError::BadRequest);
+    }
+    let candidates = local_path_candidates(
+        context,
+        realm_id,
+        request.group_id,
+        &normalized,
+        request.auth.as_ref(),
+    )
+    .await?;
+    reduce_path_candidates(candidates)
+}
+
+fn select_path_holders(
+    config: &RealmConfigDocument,
+    realm_id: RealmId,
+    group_id: GroupId,
+    normalized: &str,
+    strategy_id: Ulid,
+    shard_count: u32,
+    replica_count: Option<u32>,
+    local_node: NodeId,
+    deadline: tokio::time::Instant,
+) -> Result<(Vec<PathHolderSelection>, Vec<usize>), MetadataApiError> {
+    if shard_count == 0 {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    let subject = meta_bucket_subject(realm_id, group_id, normalized);
+    let mut ranked = Vec::with_capacity(METADATA_DISTRIBUTED_QUERY_MAX_NODES);
+    let mut local_score = None;
+    let scan_shards = if replica_count.is_none() {
+        1
+    } else {
+        shard_count
+    };
+    let mut shard_holders = Vec::with_capacity(scan_shards as usize);
+    for shard in 0..scan_shards {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
+        let placement = PlacementRef {
+            strategy_id,
+            epoch: 0,
+            shard,
+        };
+        let holders =
+            resolve_holders_limit(config, &placement, METADATA_DISTRIBUTED_QUERY_MAX_NODES);
+        if holders.is_empty() {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
+        for holder in &holders {
+            let score = neg_log2_q48(selector_hash(ROLE_NODE, &subject, holder.as_bytes()));
+            if *holder == local_node {
+                local_score = Some(score);
+                continue;
+            }
+            if ranked.iter().any(|(candidate, _)| *candidate == *holder) {
+                continue;
+            }
+            if ranked.len() < METADATA_DISTRIBUTED_QUERY_MAX_NODES {
+                ranked.push((*holder, score));
+                continue;
+            }
+            let Some((worst_index, (worst_node, worst_score))) =
+                ranked.iter().enumerate().max_by(|(_, left), (_, right)| {
+                    left.1
+                        .cmp(&right.1)
+                        .then_with(|| left.0.as_bytes().cmp(right.0.as_bytes()))
+                })
+            else {
+                continue;
+            };
+            if score < *worst_score
+                || (score == *worst_score && holder.as_bytes() < worst_node.as_bytes())
+            {
+                ranked[worst_index] = (*holder, score);
+            }
+        }
+        shard_holders.push(holders);
+    }
+    if let Some(score) = local_score {
+        if ranked.len() < METADATA_DISTRIBUTED_QUERY_MAX_NODES {
+            ranked.push((local_node, score));
+        } else if !ranked.iter().any(|(node, _)| *node == local_node)
+            && let Some((worst_index, _)) =
+                ranked.iter().enumerate().max_by(|(_, left), (_, right)| {
+                    left.1
+                        .cmp(&right.1)
+                        .then_with(|| left.0.as_bytes().cmp(right.0.as_bytes()))
+                })
+        {
+            ranked[worst_index] = (local_node, score);
+        }
+    }
+    ranked.sort_unstable_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| left.0.as_bytes().cmp(right.0.as_bytes()))
+    });
+    let mut selections = ranked
+        .into_iter()
+        .map(|(node_id, _)| PathHolderSelection {
+            node_id,
+            shards: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    if replica_count.is_none() {
+        if selections.is_empty() {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
+        for selection in &mut selections {
+            selection.shards = (0..shard_count).collect();
+        }
+        return Ok((
+            selections,
+            vec![shard_holders[0].len(); shard_count as usize],
+        ));
+    }
+    let mut replica_counts = vec![0usize; shard_count as usize];
+    for (shard, holders) in shard_holders.into_iter().enumerate() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
+        let mut selected = 0usize;
+        for holder in holders {
+            if let Some(selection) = selections
+                .iter_mut()
+                .find(|selection| selection.node_id == holder)
+            {
+                selection.shards.push(shard as u32);
+                selected += 1;
+            }
+        }
+        if selected == 0 {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
+        replica_counts[shard] = selected;
+    }
+    Ok((selections, replica_counts))
 }
 
 fn select_forward_peers(
@@ -743,6 +894,7 @@ async fn forward_path_resolution(
     request: MetadataPathLookupRequest,
     auth_token: Option<MetadataAuthToken>,
     config_digest: [u8; 32],
+    deadline: tokio::time::Instant,
 ) -> Result<MetadataPathLookupResult, MetadataApiError> {
     if request.auth.is_some() && auth_token.is_none() {
         return Err(MetadataApiError::Unauthorized);
@@ -765,8 +917,8 @@ async fn forward_path_resolution(
         let auth_token = auth_token.clone();
         let document_path = request.document_path.clone();
         async move {
-            let response = tokio::time::timeout(
-                METADATA_PEER_TIMEOUT,
+            let response = tokio::time::timeout_at(
+                deadline,
                 metadata.request_forwarded_write(
                     peer,
                     MetadataTransportMessage::ForwardPathResolution {
@@ -783,7 +935,6 @@ async fn forward_path_resolution(
     }))
     .buffer_unordered(METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT);
     futures_util::pin_mut!(requests);
-    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
     let mut auth_error = None;
     let mut divergent = false;
     let mut not_found = false;
@@ -852,7 +1003,7 @@ fn reduce_path_response(
     if let Some(error) = auth_error {
         return Err(error);
     }
-    if divergent || (success.is_some() && not_found) {
+    if divergent || (success.is_some() && (not_found || unavailable)) {
         return Err(MetadataApiError::ServiceUnavailable);
     }
     if let Some(result) = success {
@@ -956,13 +1107,14 @@ async fn load_path_holder(
     holder: NodeId,
     auth_token: Option<MetadataAuthToken>,
     config_digest: [u8; 32],
+    deadline: tokio::time::Instant,
 ) -> Result<Vec<MetadataPathCandidate>, MetadataApiError> {
     let metadata = context
         .metadata_handle
         .as_ref()
         .ok_or(MetadataApiError::ServiceUnavailable)?;
-    match tokio::time::timeout(
-        METADATA_PEER_TIMEOUT,
+    match tokio::time::timeout_at(
+        deadline,
         metadata.request_forwarded_write(
             holder,
             MetadataTransportMessage::ForwardPathLookup {
@@ -1341,6 +1493,7 @@ pub async fn query_metadata(
     local_node_id: NodeId,
     request: MetadataQueryRequest,
 ) -> Result<MetadataQueryExecution, MetadataApiError> {
+    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
     ensure_supported_query_form(&request.query)?;
     let subject = query_fingerprint(
         &request.query,
@@ -1358,7 +1511,8 @@ pub async fn query_metadata(
         request.graph_iris,
         request.query,
         MetadataFanoutScope::new(request.mode, request.target_nodes, request.allow_partial)
-            .with_subject(subject),
+            .with_subject(subject)
+            .with_deadline(deadline),
     )
     .await?;
     Ok(MetadataQueryExecution {
@@ -1371,8 +1525,9 @@ pub async fn search_metadata(
     context: &DriverContext,
     realm_id: RealmId,
     local_node_id: NodeId,
-    request: MetadataSearchRequest,
+    mut request: MetadataSearchRequest,
 ) -> Result<MetadataSearchExecution, MetadataApiError> {
+    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
     if request.query.trim().is_empty() && request.conforms_to.is_none() {
         return Err(MetadataApiError::BadRequest);
     }
@@ -1400,13 +1555,22 @@ pub async fn search_metadata(
         Some(raw) => {
             let signer_nodes = match request.mode.unwrap_or(MetadataApiQueryMode::Distributed) {
                 MetadataApiQueryMode::Local => vec![local_node_id],
-                MetadataApiQueryMode::Distributed => match request.target_nodes.clone() {
-                    Some(nodes) => fanout_nodes_with_local(nodes, local_node_id),
+                MetadataApiQueryMode::Distributed => match request.target_nodes.as_ref() {
+                    Some(nodes) => select_fanout_nodes(nodes, local_node_id, &fingerprint),
                     None => {
-                        let discovery =
-                            load_metadata_realm_nodes_with_status(context, realm_id, local_node_id)
-                                .await;
-                        let nodes = discovery.nodes.clone();
+                        let discovery = tokio::time::timeout_at(
+                            deadline,
+                            load_metadata_realm_nodes_with_status(context, realm_id, local_node_id),
+                        )
+                        .await
+                        .unwrap_or(MetadataRealmNodeDiscovery {
+                            nodes: vec![local_node_id],
+                            failed: true,
+                        });
+                        let nodes =
+                            select_fanout_nodes(&discovery.nodes, local_node_id, &fingerprint);
+                        let mut discovery = discovery;
+                        discovery.nodes = nodes.clone();
                         cursor_discovery = Some(discovery);
                         nodes
                     }
@@ -1424,11 +1588,11 @@ pub async fn search_metadata(
         None => (None, HashMap::new()),
     };
 
-    // On a continuation, attempt every node in the resume map even if realm
-    // discovery no longer reports it, so its remaining hits are not skipped.
+    // Keep resumed nodes in the bounded selection so remaining hits are not
+    // silently discarded when discovery changes.
     let (target_nodes, discovery_failed) = if request.cursor.is_some() {
-        let mut nodes = match request.target_nodes.clone() {
-            Some(nodes) => nodes,
+        let mut nodes = match request.target_nodes.as_ref() {
+            Some(nodes) => select_fanout_nodes(nodes, local_node_id, &fingerprint),
             None => match request.mode.unwrap_or(MetadataApiQueryMode::Distributed) {
                 MetadataApiQueryMode::Local => vec![local_node_id],
                 MetadataApiQueryMode::Distributed => cursor_discovery
@@ -1449,7 +1613,7 @@ pub async fn search_metadata(
                 .is_some_and(|discovery| discovery.failed),
         )
     } else {
-        (request.target_nodes.clone(), false)
+        (request.target_nodes.take(), false)
     };
 
     let (hits, next, truncated, fanout_stats) = run_search_distributed(
@@ -1467,7 +1631,8 @@ pub async fn search_metadata(
         page_size,
         MetadataFanoutScope::new(request.mode, target_nodes, true)
             .with_subject(fingerprint)
-            .with_discovery_failed(discovery_failed),
+            .with_discovery_failed(discovery_failed)
+            .with_deadline(deadline),
     )
     .await?;
     let next_cursor = match next {
@@ -2340,7 +2505,7 @@ fn map_metadata_query_error(error: MetadataError) -> MetadataApiError {
     }
 }
 
-fn map_metadata_read_error(error: MetadataReadError) -> MetadataApiError {
+fn map_read_error(error: MetadataReadError) -> MetadataApiError {
     match error {
         MetadataReadError::Unauthorized => MetadataApiError::Unauthorized,
         MetadataReadError::Forbidden => MetadataApiError::Forbidden,
@@ -2583,6 +2748,13 @@ fn select_fanout_nodes(nodes: &[NodeId], local_node_id: NodeId, subject: &[u8]) 
             ranked[worst_index] = (node_id, score);
         }
     }
+    if local_score.is_none() {
+        local_score = Some(neg_log2_q48(selector_hash(
+            ROLE_NODE,
+            subject,
+            local_node_id.as_bytes(),
+        )));
+    }
     if let Some(score) = local_score {
         if ranked.len() < METADATA_DISTRIBUTED_QUERY_MAX_NODES {
             ranked.push((local_node_id, score));
@@ -2602,13 +2774,6 @@ fn select_fanout_nodes(nodes: &[NodeId], local_node_id: NodeId, subject: &[u8]) 
             .then_with(|| left.0.as_bytes().cmp(right.0.as_bytes()))
     });
     ranked.into_iter().map(|(node_id, _)| node_id).collect()
-}
-
-fn fanout_nodes_with_local(mut nodes: Vec<NodeId>, local_node_id: NodeId) -> Vec<NodeId> {
-    if !nodes.contains(&local_node_id) {
-        nodes.push(local_node_id);
-    }
-    deduplicate_fanout_nodes(nodes)
 }
 
 pub fn forwarded_bearer(
@@ -2693,6 +2858,7 @@ async fn run_metadata_fanout_node<T>(
     operation: MetadataFanoutOperation,
     node_id: NodeId,
     local: bool,
+    deadline: tokio::time::Instant,
     local_call: MetadataNodeCall<T>,
     remote_call: MetadataNodeCall<T>,
     record_result: fn(&Span, &Result<T, MetadataReadError>),
@@ -2701,13 +2867,15 @@ async fn run_metadata_fanout_node<T>(
     let node_span = metadata_fanout_node_span(operation, node_id, local);
     let node_started = Instant::now();
     let result = if local {
-        local_call(node_id).instrument(node_span.clone()).await
+        match tokio::time::timeout_at(deadline, local_call(node_id).instrument(node_span.clone()))
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(MetadataReadError::Unavailable),
+        }
     } else {
-        match tokio::time::timeout(
-            METADATA_PEER_TIMEOUT,
-            remote_call(node_id).instrument(node_span.clone()),
-        )
-        .await
+        match tokio::time::timeout_at(deadline, remote_call(node_id).instrument(node_span.clone()))
+            .await
         {
             Ok(result) => result,
             Err(_) => Err(MetadataReadError::Unavailable),
@@ -2731,6 +2899,7 @@ async fn metadata_fanout_nodes(
     local_node_id: NodeId,
     span: &Span,
     target_nodes: Option<Vec<NodeId>>,
+    deadline: tokio::time::Instant,
 ) -> MetadataRealmNodeDiscovery {
     match target_nodes {
         Some(nodes) => {
@@ -2742,11 +2911,18 @@ async fn metadata_fanout_nodes(
         }
         None => {
             let discovery_started = Instant::now();
-            let discovery = aruna_core::telemetry::time_stage(
-                "discovery",
-                load_metadata_realm_nodes_with_status(context, realm_id, local_node_id),
+            let discovery = tokio::time::timeout_at(
+                deadline,
+                aruna_core::telemetry::time_stage(
+                    "discovery",
+                    load_metadata_realm_nodes_with_status(context, realm_id, local_node_id),
+                ),
             )
-            .await;
+            .await
+            .unwrap_or(MetadataRealmNodeDiscovery {
+                nodes: vec![local_node_id],
+                failed: true,
+            });
             record_elapsed_ms(span, "discovery_ms", discovery_started);
             discovery
         }
@@ -2775,7 +2951,10 @@ where
         allow_partial,
         discovery_failed: scope_discovery_failed,
         subject: request_subject,
+        deadline: scope_deadline,
     } = scope;
+    let deadline = scope_deadline
+        .unwrap_or_else(|| tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE);
     ensure_supported_query_mode(&mode);
     match mode.unwrap_or(MetadataApiQueryMode::Distributed) {
         MetadataApiQueryMode::Local => {
@@ -2783,6 +2962,7 @@ where
                 operation,
                 local_node_id,
                 true,
+                deadline,
                 local_call,
                 remote_call,
                 record_result,
@@ -2801,15 +2981,22 @@ where
             }
         }
         MetadataApiQueryMode::Distributed => {
-            let discovery =
-                metadata_fanout_nodes(context, realm_id, local_node_id, &span, target_nodes).await;
+            let discovery = metadata_fanout_nodes(
+                context,
+                realm_id,
+                local_node_id,
+                &span,
+                target_nodes,
+                deadline,
+            )
+            .await;
             let discovery_failed = scope_discovery_failed || discovery.failed;
             let mut nodes = discovery.nodes;
             if discovery_failed && !allow_partial {
                 return Err(MetadataApiError::ServiceUnavailable);
             }
-            let all_nodes = nodes.clone();
             let mut failed_partitions = Vec::new();
+            let mut omitted_nodes = 0usize;
             if nodes.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES {
                 let mut subject = Vec::with_capacity(32 + operation.label().len() + 32 + 1);
                 subject.extend_from_slice(realm_id.as_bytes());
@@ -2819,21 +3006,15 @@ where
                 }
                 subject.extend_from_slice(local_node_id.as_bytes());
                 let selected = select_fanout_nodes(&nodes, local_node_id, &subject);
-                failed_partitions.extend(
-                    all_nodes
-                        .iter()
-                        .copied()
-                        .filter(|node_id| !selected.contains(node_id)),
-                );
+                omitted_nodes = nodes.len().saturating_sub(selected.len());
                 nodes = selected;
-                if !allow_partial {
-                    return Err(MetadataApiError::ServiceUnavailable);
-                }
             }
             span.record("node_count", nodes.len() as u64);
             let mut fanout_stats = MetadataFanoutStats {
                 nodes_queried: nodes.len(),
-                nodes_failed: failed_partitions.len() + usize::from(discovery_failed),
+                nodes_failed: failed_partitions.len()
+                    + omitted_nodes
+                    + usize::from(discovery_failed),
                 failed_partitions,
                 discovery_failed,
             };
@@ -2841,17 +3022,11 @@ where
             let mut node_parts = Vec::new();
             let mut auth_error = None;
             let mut not_found = false;
-            let node_order = all_nodes
-                .into_iter()
-                .enumerate()
-                .map(|(index, node_id)| (node_id, index))
-                .collect::<HashMap<_, _>>();
+            let node_order = nodes.clone();
             let mut outstanding = nodes.iter().copied().collect::<HashSet<_>>();
             // Every interactive fanout gets the overall deadline; offline
             // partitions land in failed_partitions and partial-tolerant
             // callers (search) still answer from the reachable nodes.
-            let deadline = Some(tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE);
-
             let pending =
                 stream::iter(nodes.into_iter().enumerate().map(|(node_index, node_id)| {
                     let local_call = local_call.clone();
@@ -2861,6 +3036,7 @@ where
                             operation,
                             node_id,
                             node_id == local_node_id,
+                            deadline,
                             local_call,
                             remote_call,
                             record_result,
@@ -2874,23 +3050,20 @@ where
             futures_util::pin_mut!(pending);
 
             loop {
-                let next = match deadline {
-                    Some(deadline) => match tokio::time::timeout_at(deadline, pending.next()).await
-                    {
-                        Ok(next) => next,
-                        Err(_) => {
-                            fanout_stats
-                                .failed_partitions
-                                .extend(outstanding.iter().copied());
-                            fanout_stats.nodes_failed = fanout_stats.failed_partitions.len()
-                                + usize::from(fanout_stats.discovery_failed);
-                            if !allow_partial {
-                                return Err(MetadataApiError::ServiceUnavailable);
-                            }
-                            break;
+                let next = match tokio::time::timeout_at(deadline, pending.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        fanout_stats
+                            .failed_partitions
+                            .extend(outstanding.iter().copied());
+                        fanout_stats.nodes_failed = fanout_stats.failed_partitions.len()
+                            + omitted_nodes
+                            + usize::from(fanout_stats.discovery_failed);
+                        if !allow_partial && fanout_stats.nodes_failed > omitted_nodes {
+                            return Err(MetadataApiError::ServiceUnavailable);
                         }
-                    },
-                    None => pending.next().await,
+                        break;
+                    }
                 };
                 let Some((node_index, node_id, result)) = next else {
                     break;
@@ -2901,12 +3074,12 @@ where
                     Err(error @ MetadataReadError::Unauthorized) => {
                         fanout_stats.nodes_failed += 1;
                         fanout_stats.failed_partitions.push(node_id);
-                        auth_error.get_or_insert(map_metadata_read_error(error));
+                        auth_error.get_or_insert(map_read_error(error));
                     }
                     Err(error @ MetadataReadError::Forbidden) => {
                         fanout_stats.nodes_failed += 1;
                         fanout_stats.failed_partitions.push(node_id);
-                        auth_error.get_or_insert(map_metadata_read_error(error));
+                        auth_error.get_or_insert(map_read_error(error));
                     }
                     Err(MetadataReadError::NotFound) => {
                         fanout_stats.nodes_failed += 1;
@@ -2932,13 +3105,16 @@ where
             if not_found {
                 return Err(MetadataApiError::ServiceUnavailable);
             }
-            if !allow_partial && fanout_stats.nodes_failed > 0 {
+            if !allow_partial && fanout_stats.nodes_failed > omitted_nodes {
                 return Err(MetadataApiError::ServiceUnavailable);
             }
             node_parts.sort_by_key(|(node_index, _, _)| *node_index);
-            fanout_stats
-                .failed_partitions
-                .sort_by_key(|node_id| node_order.get(node_id).copied().unwrap_or(usize::MAX));
+            fanout_stats.failed_partitions.sort_by_key(|node_id| {
+                node_order
+                    .iter()
+                    .position(|candidate| candidate == node_id)
+                    .unwrap_or(usize::MAX)
+            });
             aruna_core::telemetry::record_stage("fanout", fanout_started.elapsed());
             Ok((
                 node_parts
@@ -2957,6 +3133,7 @@ pub async fn search_buckets_distributed(
     local_node_id: NodeId,
     request: BucketSearchRequest,
 ) -> Result<BucketSearchExecution, MetadataApiError> {
+    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
     let limit = request.limit.clamp(1, 50);
     let subject = query_fingerprint(
         &request.query,
@@ -3000,7 +3177,6 @@ pub async fn search_buckets_distributed(
             handle
                 .request_bucket_search(node_id, auth_token, query, limit)
                 .await
-                .map_err(|_| MetadataReadError::Unavailable)
         },
     );
     let (parts, fanout_stats) = run_metadata_fanout(
@@ -3012,12 +3188,13 @@ pub async fn search_buckets_distributed(
             request.target_nodes,
             true,
         )
-        .with_subject(subject),
+        .with_subject(subject)
+        .with_deadline(deadline),
         MetadataFanoutOperation::BucketSearch,
         local_call,
         remote_call,
         record_bucket_result,
-        map_metadata_read_error,
+        map_read_error,
     )
     .await?;
     let mut hits = parts
@@ -3179,7 +3356,7 @@ async fn run_query_distributed(
         local_call,
         remote_call,
         record_query_node_result,
-        map_metadata_read_error,
+        map_read_error,
     )
     .await?;
 
@@ -3361,7 +3538,7 @@ async fn run_search_distributed(
         local_call,
         remote_call,
         record_search_node_result,
-        map_metadata_read_error,
+        map_read_error,
     )
     .await?;
 
@@ -3718,20 +3895,14 @@ mod tests {
             Err(MetadataApiError::Forbidden)
         ));
         assert!(matches!(
-            reduce_path_response(Some(result), None, false, true, false),
+            reduce_path_response(Some(result.clone()), None, false, true, false),
             Err(MetadataApiError::ServiceUnavailable)
         ));
-    }
 
-    #[test]
-    fn peer_timeout_fits() {
-        let waves =
-            (METADATA_DISTRIBUTED_QUERY_MAX_NODES + METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT - 1)
-                / METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT;
-        assert!(
-            METADATA_PEER_TIMEOUT.as_secs() * waves as u64
-                <= METADATA_DISTRIBUTED_QUERY_DEADLINE.as_secs()
-        );
+        assert!(matches!(
+            reduce_path_response(Some(result), None, false, false, true,),
+            Err(MetadataApiError::ServiceUnavailable)
+        ));
     }
 
     #[test]
@@ -4921,7 +5092,7 @@ mod tests {
             local_call,
             remote_call,
             |_, _| {},
-            map_metadata_read_error,
+            map_read_error,
         )
         .await
         .unwrap();
@@ -4933,7 +5104,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fanout_not_found_fails() {
+    async fn bucket_denial_wins() {
+        let directory = tempdir().unwrap();
+        let context = DriverContext {
+            storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap())
+                .unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let local = iroh::SecretKey::from_bytes(&[49u8; 32]).public();
+        let denied = iroh::SecretKey::from_bytes(&[50u8; 32]).public();
+        let local_call: MetadataNodeCall<Vec<BucketSearchHit>> =
+            metadata_node_call((), |(), _| async move { Ok(Vec::new()) });
+        let remote_call: MetadataNodeCall<Vec<BucketSearchHit>> =
+            metadata_node_call(denied, |denied, node_id| async move {
+                if node_id == denied {
+                    Err(MetadataReadError::Forbidden)
+                } else {
+                    Ok(Vec::new())
+                }
+            });
+
+        let result = run_metadata_fanout(
+            &context,
+            RealmId::from_bytes([12u8; 32]),
+            local,
+            MetadataFanoutScope::new(
+                Some(MetadataApiQueryMode::Distributed),
+                Some(vec![local, denied]),
+                true,
+            ),
+            MetadataFanoutOperation::BucketSearch,
+            local_call,
+            remote_call,
+            |_, _| {},
+            map_read_error,
+        )
+        .await;
+
+        assert!(matches!(result, Err(MetadataApiError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn fanout_missing_fails() {
         let directory = tempdir().unwrap();
         let context = DriverContext {
             storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap())
@@ -4970,7 +5186,7 @@ mod tests {
             local_call,
             remote_call,
             |_, _| {},
-            map_metadata_read_error,
+            map_read_error,
         )
         .await;
 
@@ -5018,7 +5234,7 @@ mod tests {
             local_call,
             remote_call,
             |_, _| {},
-            map_metadata_read_error,
+            map_read_error,
         )
         .await
         .unwrap();
