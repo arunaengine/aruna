@@ -1138,6 +1138,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacement_stays_bounded() {
+        let (_dir, context, actor) = setup_realm().await;
+        let token_hash = bearer_token_hash("replacement");
+        for expiry in 2_000..2_070 {
+            drive(
+                RevokeTokenOperation::new(revocation(&actor, &token_hash, expiry, 1_000)),
+                &context,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            reducer_state(&context, actor.realm_id)
+                .await
+                .live_revocation_count(&actor.node_id, 1_000,),
+            1
+        );
+        assert_eq!(
+            reducer_state(&context, actor.realm_id)
+                .await
+                .live_owner_count(&actor.node_id, &actor.user_id, 1_000),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_live_cap() {
         let (_dir, context, actor) = setup_realm().await;
         let state = seed_state(&actor, MAX_LIVE_REVOCATIONS_PER_ORIGIN);
@@ -1157,6 +1184,88 @@ mod tests {
         assert!(matches!(result, Err(RevokeTokenError::CapacityReached)));
         assert_eq!(reducer_state(&context, actor.realm_id).await, state);
         assert!(index_values(&context, &actor).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_self_reserve() {
+        let (_dir, context, actor) = setup_realm().await;
+        let state = seed_state(&actor, 896);
+        write_state(&context, &state).await;
+
+        let result = drive(
+            RevokeTokenOperation::new(revocation(
+                &actor,
+                &bearer_token_hash("self-reserve"),
+                2_000,
+                1_000,
+            )),
+            &context,
+        )
+        .await;
+
+        assert!(matches!(result, Err(RevokeTokenError::CapacityReached)));
+        assert_eq!(reducer_state(&context, actor.realm_id).await, state);
+    }
+
+    #[tokio::test]
+    async fn enforces_owner_cap() {
+        let (_dir, context, actor) = setup_realm().await;
+        let state = seed_state_for(&actor, actor.user_id, 64);
+        write_state(&context, &state).await;
+
+        let result = drive(
+            RevokeTokenOperation::new(revocation(
+                &actor,
+                &bearer_token_hash("owner-cap"),
+                2_000,
+                1_000,
+            )),
+            &context,
+        )
+        .await;
+
+        assert!(matches!(result, Err(RevokeTokenError::CapacityReached)));
+        assert_eq!(reducer_state(&context, actor.realm_id).await, state);
+
+        let other = Actor {
+            user_id: UserId::local(Ulid::from_bytes([8u8; 16]), actor.realm_id),
+            ..actor
+        };
+        drive(
+            RevokeTokenOperation::new(revocation(
+                &other,
+                &bearer_token_hash("other-owner"),
+                2_000,
+                1_000,
+            )),
+            &context,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_uses_reserve() {
+        let (_dir, context, actor) = setup_realm().await;
+        let state = seed_state(&actor, 896);
+        write_state(&context, &state).await;
+        let admin = Actor {
+            user_id: UserId::local(Ulid::from_bytes([8u8; 16]), actor.realm_id),
+            ..actor
+        };
+
+        drive(
+            RevokeTokenOperation::new(admin_request(
+                &admin,
+                &bearer_token_hash("admin-reserve"),
+                actor.user_id,
+                2_000,
+                1_000,
+            )),
+            &context,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1245,6 +1354,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read.revoked_tokens.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn keeps_expiry_boundary() {
+        let (_dir, context, actor) = setup_realm().await;
+        let boundary = bearer_token_hash("boundary");
+        drive(
+            RevokeTokenOperation::new(revocation(&actor, &boundary, 2_000, 1_000)),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        drive(
+            RevokeTokenOperation::new(revocation(
+                &actor,
+                &bearer_token_hash("after-boundary"),
+                4_000,
+                2_000,
+            )),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(index_values(&context, &actor).await.len(), 2);
+        assert_eq!(token_records(&context, &actor).await.len(), 2);
+        let state = reducer_state(&context, actor.realm_id).await;
+        assert!(state.materialized_revoked_tokens().contains_key(&boundary));
     }
 
     #[tokio::test]
