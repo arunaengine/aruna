@@ -5519,23 +5519,64 @@ fn node_id_to_peer_id(node_id: &NodeId) -> PeerId {
     PeerId::from_bytes(*node_id.as_bytes())
 }
 
+fn group_sync_topics<F>(
+    topic_ids: &[irokle_crate::TopicId],
+    mut select: F,
+) -> BTreeMap<BTreeSet<PeerId>, (PeerSelection, Vec<irokle_crate::TopicId>)>
+where
+    F: FnMut(irokle_crate::TopicId) -> PeerSelection,
+{
+    let mut groups = BTreeMap::new();
+    for topic_id in topic_ids.iter().copied() {
+        let selection = select(topic_id);
+        let selected = selection.peers.clone();
+        if let Some((group, topics)) = groups.get_mut(&selected) {
+            group.truncated |= selection.truncated;
+            topics.push(topic_id);
+        } else {
+            groups.insert(selected, (selection, vec![topic_id]));
+        }
+    }
+    groups
+}
+
 fn select_sync_peers(
     candidates: impl IntoIterator<Item = PeerId>,
     local_peer: PeerId,
     subject: &[u8],
+    round: u64,
+    candidate_count: usize,
 ) -> PeerSelection {
     let mut ranked = Vec::with_capacity(DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT);
-    let mut truncated = false;
+    let truncated = candidate_count > DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT;
+    let window_start = if candidate_count == 0 {
+        0
+    } else {
+        ((round as u128 * DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT as u128) % candidate_count as u128)
+            as usize
+    };
     for peer in candidates {
         if peer == local_peer || ranked.iter().any(|(candidate, _)| *candidate == peer) {
             continue;
         }
         let score = peer_score(subject, peer);
+        if candidate_count > DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT {
+            let mut slot_bytes = [0u8; 16];
+            slot_bytes.copy_from_slice(&score[..16]);
+            let slot = (u128::from_be_bytes(slot_bytes) % candidate_count as u128) as usize;
+            let distance = if slot >= window_start {
+                slot - window_start
+            } else {
+                candidate_count - window_start + slot
+            };
+            if distance >= DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT {
+                continue;
+            }
+        }
         if ranked.len() < DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT {
             ranked.push((peer, score));
             continue;
         }
-        truncated = true;
         let Some((worst_index, _)) = ranked.iter().enumerate().min_by(|(_, left), (_, right)| {
             left.1
                 .cmp(&right.1)
@@ -7154,15 +7195,78 @@ mod tests {
 
     #[test]
     fn sync_peers_permutation() {
-        let forward = select_sync_peers((1u8..=32).map(peer), peer(0), b"document-sync-subject");
+        let forward = select_sync_peers(
+            (1u8..=32).map(peer),
+            peer(0),
+            b"document-sync-subject",
+            0,
+            32,
+        );
         let reverse = select_sync_peers(
             (1u8..=32).rev().map(peer),
             peer(0),
             b"document-sync-subject",
+            0,
+            32,
         );
 
         assert_eq!(forward.peers, reverse.peers);
         assert_ne!(forward.peers, (1u8..=8).map(peer).collect::<BTreeSet<_>>());
+    }
+
+    #[test]
+    fn sync_peers_rotate() {
+        let first = select_sync_peers(
+            (1u8..=32).map(peer),
+            peer(0),
+            b"document-sync-subject",
+            0,
+            32,
+        );
+        let second = select_sync_peers(
+            (1u8..=32).map(peer),
+            peer(0),
+            b"document-sync-subject",
+            1,
+            32,
+        );
+
+        assert!(second.peers.iter().any(|peer| !first.peers.contains(peer)));
+    }
+
+    #[test]
+    fn sync_topics_grouped() {
+        let topics = [topic(1), topic(2), topic(3)];
+        let groups = group_sync_topics(&topics, |topic_id| {
+            let selected = if topic_id == topics[1] {
+                peer(2)
+            } else {
+                peer(1)
+            };
+            PeerSelection {
+                peers: BTreeSet::from([selected]),
+                truncated: false,
+            }
+        });
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups
+                .values()
+                .map(|(_, topics)| topics.len())
+                .sum::<usize>(),
+            topics.len()
+        );
+        assert!(
+            groups
+                .values()
+                .any(|(_, grouped)| grouped == &vec![topics[1]])
+        );
+        assert!(
+            groups
+                .values()
+                .any(|(_, grouped)| grouped == &vec![topics[0], topics[2]])
+        );
     }
 
     #[test]
