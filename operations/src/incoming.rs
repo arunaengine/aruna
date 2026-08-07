@@ -553,6 +553,17 @@ impl InboundEventHandler for OperationsInboundHandler {
                         };
                         // #332: only an authenticated sync-eligible realm peer
                         // may open the blob replication plane at all.
+                        let eligible = timeout(
+                            INBOUND_BAO_TIMEOUT,
+                            self.peer_sync_eligible(*net_handle.realm_id(), node_id),
+                        )
+                        .await
+                        .unwrap_or(false);
+                        if !eligible {
+                            warn!(peer = %node_id, "Rejecting bao stream from non-sync-eligible peer");
+                            close_bao_stream(stream);
+                            return;
+                        }
                         let stream_id = match timeout(
                             INBOUND_BAO_TIMEOUT,
                             blob_handle.store_connection(node_id, stream),
@@ -847,6 +858,11 @@ async fn close_failed_bao(blob_handle: &aruna_blob::blob::BlobHandle, stream_id:
     if let Event::Blob(BlobEvent::Error(err)) = close_event {
         error!(error = ?err, "Failed to close rejected inbound bao stream");
     }
+}
+
+fn close_bao_stream(mut stream: BiStream) {
+    _ = stream.0.finish();
+    _ = stream.1.stop(0u32.into());
 }
 
 /// Re-enqueues the payloads recovered from a genesis tie-break eviction as
