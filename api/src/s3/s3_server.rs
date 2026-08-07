@@ -1052,23 +1052,10 @@ impl Service<Request<Incoming>> for WrappingService {
                 return Ok(response);
             }
 
-            let egress_permit = match egress_limit.try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => {
-                    drop(request_permit);
-                    drop(s3s_request);
-                    let response = slow_down_response(1);
-                    let code = response.status().as_u16();
-                    emit_request_completed(&span, "s3", code, started);
-                    record_s3_request(&metrics, &method, code, "egress_limited", started.elapsed());
-                    return Ok(response);
-                }
-            };
             let mut capture_permit = if delete_objects {
                 match capture_limit.try_acquire_owned() {
                     Ok(permit) => Some(permit),
                     Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => {
-                        drop(egress_permit);
                         drop(request_permit);
                         drop(s3s_request);
                         let response = slow_down_response(1);
@@ -1102,21 +1089,18 @@ impl Service<Request<Incoming>> for WrappingService {
                 _ = activity.wait_cancelled() => {
                     drop(request_permit);
                     drop(capture_permit.take());
-                    drop(egress_permit);
                     stream_activity.stop();
                     return Err(connection_error());
                 }
                 _ = deadline_activity.wait_cancelled() => {
                     drop(request_permit);
                     drop(capture_permit.take());
-                    drop(egress_permit);
                     stream_activity.stop();
                     return stream_timeout_response();
                 }
                 _ = stream_activity.wait_cancelled() => {
                     drop(request_permit);
                     drop(capture_permit.take());
-                    drop(egress_permit);
                     stream_activity.stop();
                     return stream_timeout_response();
                 }
@@ -1124,19 +1108,39 @@ impl Service<Request<Incoming>> for WrappingService {
             if deadline_activity.is_cancelled() {
                 drop(request_permit);
                 drop(capture_permit.take());
-                drop(egress_permit);
                 stream_activity.stop();
                 return stream_timeout_response();
             }
             if stream_activity.is_cancelled() {
                 drop(request_permit);
                 drop(capture_permit.take());
-                drop(egress_permit);
                 stream_activity.stop();
                 return stream_timeout_response();
             }
             let mut result = match result {
                 Ok(response) => {
+                    let egress_permit = match egress_limit.try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => {
+                            drop(response);
+                            drop(request_permit);
+                            drop(capture_permit.take());
+                            drop(local_lease);
+                            stream_activity.stop();
+                            drop(active_guard);
+                            let response = slow_down_response(1);
+                            let code = response.status().as_u16();
+                            emit_request_completed(&span, "s3", code, started);
+                            record_s3_request(
+                                &metrics,
+                                &method,
+                                code,
+                                "egress_limited",
+                                started.elapsed(),
+                            );
+                            return Ok(response);
+                        }
+                    };
                     drop(request_permit);
                     drop(capture_permit.take());
                     stream_activity.stop();
@@ -1174,7 +1178,6 @@ impl Service<Request<Incoming>> for WrappingService {
                 Err(error) => {
                     drop(request_permit);
                     drop(capture_permit.take());
-                    drop(egress_permit);
                     drop(local_lease);
                     stream_activity.stop();
                     Err(error)
