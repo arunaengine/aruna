@@ -603,6 +603,16 @@ impl TransactionTracker {
             }
             (
                 Some(TransactionEffect::Commit(txn_id)),
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::QueueFull,
+                }),
+            ) => {
+                if self.states.contains_key(&txn_id) {
+                    self.states.insert(txn_id, TransactionState::Open);
+                }
+            }
+            (
+                Some(TransactionEffect::Commit(txn_id)),
                 Event::Storage(StorageEvent::Error { .. }),
             ) => {
                 if self.states.contains_key(&txn_id) {
