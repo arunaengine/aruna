@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::admin_documents::AdminDocumentOperation;
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -24,6 +25,7 @@ use ulid::Ulid;
 // capacity rather than peer count.
 pub const OUTBOX_DRAIN_BATCH_SIZE: usize =
     4 * aruna_net::document_sync::DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT;
+const ADMIN_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/admin-operation/";
 
 // Keys order by kind then outbox id (a ULID), with admin operations additionally
 // ordered by origin sequence, so drains are FIFO instead of following the random
@@ -36,7 +38,7 @@ pub fn outbox_prefix(event: &DocumentSyncOutboxEvent) -> Key {
 }
 
 pub fn admin_outbox_prefix(node_id: NodeId) -> Key {
-    let mut bytes = b"document-sync-outbox-v1/admin-operation/".to_vec();
+    let mut bytes = ADMIN_OUTBOX_PREFIX.to_vec();
     bytes.extend_from_slice(node_id.as_bytes());
     ByteView::from(bytes)
 }
@@ -63,6 +65,17 @@ pub fn revocation_index_entry(record: &DocumentSyncOutboxRecord) -> (String, Key
         outbox_key(record),
         Value::from(vec![1u8]),
     )
+}
+
+fn revocation_index_key(record: &DocumentSyncOutboxRecord) -> Option<Key> {
+    let DocumentSyncOutboxEvent::AdminOperation { event } = &record.event else {
+        return None;
+    };
+    matches!(
+        &event.op,
+        AdminDocumentOperation::RealmConfigTokenRevoked { .. }
+    )
+    .then(|| outbox_key(record))
 }
 
 pub fn new_outbox_record(
@@ -220,16 +233,60 @@ pub async fn delete_outbox_records(
     if keys.is_empty() {
         return Ok(());
     }
-    let deletes = keys
-        .into_iter()
-        .flat_map(|key| {
-            let key = ByteView::from(key);
-            [
-                (DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), key.clone()),
-                (TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(), key),
-            ]
-        })
-        .collect();
+    let mut deletes = Vec::with_capacity(keys.len());
+    for key in keys {
+        let index_key = if key.starts_with(ADMIN_OUTBOX_PREFIX) {
+            let value = match storage
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                    key: ByteView::from(key.clone()),
+                    txn_id: None,
+                })
+                .await
+            {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+                Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+                other => return Err(format!("unexpected storage event: {other:?}")),
+            };
+
+            match value {
+                Some(value) => match postcard::from_bytes::<DocumentSyncOutboxRecord>(&value) {
+                    Ok(record) => {
+                        if let Some(index_key) = revocation_index_key(&record) {
+                            if read_index_value(storage, &index_key).await?.is_some() {
+                                Some(index_key)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => {
+                        // A malformed value can clear only an existing index row.
+                        let index_key = ByteView::from(key.clone());
+                        if read_index_value(storage, &index_key).await?.is_some() {
+                            Some(index_key)
+                        } else {
+                            None
+                        }
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        let key = ByteView::from(key);
+        deletes.push((DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), key));
+        if let Some(index_key) = index_key {
+            deletes.push((
+                TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                index_key,
+            ));
+        }
+    }
     match storage
         .send_storage_effect(StorageEffect::BatchDelete {
             deletes,
@@ -238,6 +295,21 @@ pub async fn delete_outbox_records(
         .await
     {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected storage event: {other:?}")),
+    }
+}
+
+async fn read_index_value(storage: &StorageHandle, key: &[u8]) -> Result<Option<Value>, String> {
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+            key: ByteView::from(key.to_vec()),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected storage event: {other:?}")),
     }
@@ -324,6 +396,30 @@ mod tests {
         }
     }
 
+    fn revocation_event(origin_seq: u64) -> DocumentSyncOutboxEvent {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let user_id = UserId::local(Ulid::from_parts(7, 1), realm_id);
+        DocumentSyncOutboxEvent::AdminOperation {
+            event: Box::new(AdminDocumentEvent {
+                event_id: Ulid::from_parts(2, u128::from(origin_seq)),
+                target: AdminDocumentTarget::RealmConfig { realm_id },
+                origin_node_id: node(1),
+                origin_seq,
+                observed: AdminDocumentClock::default(),
+                actor: Actor {
+                    node_id: node(1),
+                    user_id,
+                    realm_id,
+                },
+                op: AdminDocumentOperation::RealmConfigTokenRevoked {
+                    token_hash: aruna_core::auth::bearer_token_hash(&format!("token-{origin_seq}")),
+                    expires_at: 100,
+                    token_owner: user_id,
+                },
+            }),
+        }
+    }
+
     fn placement(shard: u32) -> aruna_core::structs::PlacementRef {
         aruna_core::structs::PlacementRef {
             strategy_id: Ulid::from_parts(42, 1),
@@ -365,6 +461,21 @@ mod tests {
         {
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => panic!("unexpected outbox write event: {other:?}"),
+        }
+    }
+
+    async fn write_index(storage: &StorageHandle, key: Vec<u8>) {
+        match storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                key: ByteView::from(key),
+                value: Value::from(vec![1u8]),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected index write event: {other:?}"),
         }
     }
 
@@ -615,12 +726,12 @@ mod tests {
 
     #[test]
     fn index_uses_key() {
-        let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
+        let realm_id = RealmId::from_bytes([7u8; 32]);
         let record = new_outbox_record(
             node(1),
-            DocumentSyncTarget::User { user_id },
+            DocumentSyncTarget::RealmConfig { realm_id },
             Vec::new(),
-            user_admin_event(user_id, 1),
+            revocation_event(1),
             placement(9),
             false,
         );
@@ -636,35 +747,24 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
+        let realm_id = RealmId::from_bytes([7u8; 32]);
         let record = new_outbox_record(
             node(1),
-            DocumentSyncTarget::User { user_id },
+            DocumentSyncTarget::RealmConfig { realm_id },
             Vec::new(),
-            user_admin_event(user_id, 1),
+            revocation_event(1),
             placement(9),
             false,
         );
         let record_key = outbox_key(&record).to_vec();
-        let (_, index_key, index_value) = revocation_index_entry(&record);
+        let (_, index_key, _) = revocation_index_entry(&record);
         write_raw_outbox_record(
             &storage,
             record_key.clone(),
             postcard::to_allocvec(&record).expect("record serializes"),
         )
         .await;
-        match storage
-            .send_storage_effect(StorageEffect::Write {
-                key_space: TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
-                key: index_key.clone(),
-                value: index_value,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected index write event: {other:?}"),
-        }
+        write_index(&storage, index_key.to_vec()).await;
 
         delete_outbox_records(&storage, vec![record_key.clone()])
             .await
@@ -679,6 +779,101 @@ mod tests {
             .send_storage_effect(StorageEffect::Read {
                 key_space: TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
                 key: index_key,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {}
+            other => panic!("unexpected index read event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn keeps_generic_index() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
+        let metadata = new_outbox_record(
+            node(1),
+            target(),
+            vec![node(2)],
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: vec![4, 5],
+                change: change(),
+            },
+            aruna_core::structs::PlacementRef::NIL,
+            false,
+        );
+        let admin = new_outbox_record(
+            node(1),
+            DocumentSyncTarget::User { user_id },
+            Vec::new(),
+            user_admin_event(user_id, 1),
+            placement(9),
+            false,
+        );
+        let metadata_key = outbox_key(&metadata).to_vec();
+        let admin_key = outbox_key(&admin).to_vec();
+        write_raw_outbox_record(
+            &storage,
+            metadata_key.clone(),
+            postcard::to_allocvec(&metadata).expect("metadata serializes"),
+        )
+        .await;
+        write_raw_outbox_record(
+            &storage,
+            admin_key.clone(),
+            postcard::to_allocvec(&admin).expect("admin serializes"),
+        )
+        .await;
+        write_index(&storage, metadata_key.clone()).await;
+        write_index(&storage, admin_key.clone()).await;
+
+        delete_outbox_records(&storage, vec![metadata_key.clone(), admin_key.clone()])
+            .await
+            .expect("outbox delete succeeds");
+
+        for key in [metadata_key, admin_key] {
+            match storage
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                    key: ByteView::from(key),
+                    txn_id: None,
+                })
+                .await
+            {
+                Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => {}
+                other => panic!("unexpected index read event: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn clears_malformed_index() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let record = new_outbox_record(
+            node(1),
+            DocumentSyncTarget::RealmConfig { realm_id },
+            Vec::new(),
+            revocation_event(1),
+            placement(9),
+            false,
+        );
+        let record_key = outbox_key(&record).to_vec();
+        write_raw_outbox_record(&storage, record_key.clone(), vec![1, 2, 3]).await;
+        write_index(&storage, record_key.clone()).await;
+
+        delete_outbox_records(&storage, vec![record_key.clone()])
+            .await
+            .expect("outbox delete succeeds");
+        match storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                key: ByteView::from(record_key),
                 txn_id: None,
             })
             .await
