@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -36,11 +36,26 @@ const STORAGE_EFFECT_QUEUE_CAPACITY: usize = 65_536;
 // Bulk lane queues are small so background work hits QueueFull backpressure early
 // instead of building an unbounded backlog ahead of foreground sync traffic.
 const BULK_EFFECT_QUEUE_CAPACITY: usize = 4_096;
+const MAX_TRANSACTION_CLEANUP: usize = 1024;
+const MAX_CLEANUP_ATTEMPTS: u8 = 2;
 
 enum Txn {
     Read(fjall::Snapshot),
     Write(Box<fjall::OptimisticWriteTx>),
 }
+
+#[derive(Debug, Clone, Copy)]
+enum CleanupKind {
+    Abort,
+    CommitUnknown,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CleanupEntry {
+    kind: CleanupKind,
+    attempts: u8,
+}
+
 type PageResult = (Vec<(ByteView, ByteView)>, Option<ByteView>);
 const STORAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SLOW_STORAGE_EFFECT_THRESHOLD: Duration = Duration::from_millis(50);
@@ -174,6 +189,7 @@ pub struct FjallStorage {
     store: Store,
     persist_policy: FjallPersistPolicy,
     txns: HashMap<Ulid, Txn>,
+    transaction_cleanup: Arc<Mutex<BTreeMap<Ulid, CleanupEntry>>>,
     read_pool: Vec<EffectSender>,
     next_reader: usize,
     bulk_read_pool: Vec<EffectSender>,
@@ -238,6 +254,50 @@ pub struct StorageHandle {
     bulk_channel: EffectSender,
     priority: StoragePriority,
     metrics: Arc<StorageMetrics>,
+    transaction_cleanup: Arc<Mutex<BTreeMap<Ulid, CleanupEntry>>>,
+}
+
+/// Cancellation-safe owner for a manually driven storage transaction.
+pub struct TransactionOwner {
+    handle: StorageHandle,
+    txn_id: Option<Ulid>,
+}
+
+impl TransactionOwner {
+    pub fn new(handle: StorageHandle, txn_id: Ulid) -> Self {
+        Self {
+            handle,
+            txn_id: Some(txn_id),
+        }
+    }
+
+    pub fn id(&self) -> Option<Ulid> {
+        self.txn_id
+    }
+
+    /// Releases ownership after storage proved the transaction terminal.
+    pub fn finish(&mut self) {
+        self.txn_id = None;
+    }
+
+    /// Retains an ambiguous commit without issuing an abort.
+    pub fn unknown(&mut self) {
+        if let Some(txn_id) = self.txn_id.take() {
+            if !self.handle.retain_transaction(txn_id, true) {
+                warn!(%txn_id, "Transaction cleanup handoff capacity reached");
+            }
+        }
+    }
+}
+
+impl Drop for TransactionOwner {
+    fn drop(&mut self) {
+        if let Some(txn_id) = self.txn_id.take() {
+            if !self.handle.retain_transaction(txn_id, false) {
+                warn!(%txn_id, "Transaction cleanup handoff capacity reached");
+            }
+        }
+    }
 }
 
 impl StorageHandle {
@@ -250,6 +310,7 @@ impl StorageHandle {
                 bulk_channel: bulk_sender,
                 priority: StoragePriority::Foreground,
                 metrics: Arc::new(StorageMetrics::default()),
+                transaction_cleanup: Arc::new(Mutex::new(BTreeMap::new())),
             },
             StorageReceivers { foreground, bulk },
         )
@@ -307,6 +368,36 @@ impl StorageHandle {
         }
     }
 
+    /// Transfers transaction ownership to the storage node when the caller is
+    /// cancelled. Unknown commits are retained for reconciliation and never
+    /// aborted; other states receive bounded local abort retries.
+    pub fn retain_transaction(&self, txn_id: Ulid, commit_unknown: bool) -> bool {
+        let kind = if commit_unknown {
+            CleanupKind::CommitUnknown
+        } else {
+            CleanupKind::Abort
+        };
+        if !self.retain_cleanup(txn_id, kind) {
+            return false;
+        }
+        if !commit_unknown {
+            self.enqueue_abort_transaction(txn_id, "owner_handoff");
+        }
+        true
+    }
+
+    /// Number of transaction owners retained by this storage node.
+    pub fn pending_transactions(&self) -> usize {
+        self.transaction_cleanup
+            .lock()
+            .expect("transaction cleanup mutex poisoned")
+            .len()
+    }
+
+    fn retain_cleanup(&self, txn_id: Ulid, kind: CleanupKind) -> bool {
+        retain_cleanup(&self.transaction_cleanup, txn_id, kind)
+    }
+
     #[tracing::instrument(
         name = "storage.handle.send_storage_effect",
         level = "debug",
@@ -315,6 +406,19 @@ impl StorageHandle {
     )]
     pub async fn send_storage_effect(&self, effect: StorageEffect) -> Event {
         Event::Storage(self.dispatch_storage_effect(effect).await)
+    }
+
+    pub async fn start_transaction(&self, read: bool) -> Result<TransactionOwner, StorageError> {
+        match self
+            .dispatch_storage_effect(StorageEffect::StartTransaction { read })
+            .await
+        {
+            StorageEvent::TransactionStarted { txn_id } => {
+                Ok(TransactionOwner::new(self.clone(), txn_id))
+            }
+            StorageEvent::Error { error } => Err(error),
+            _ => Err(StorageError::InvalidEffect),
+        }
     }
 
     pub async fn sync_all(&self) -> Result<(), StorageError> {
@@ -343,6 +447,10 @@ impl StorageHandle {
         let (response_tx, response_rx) = crossfire::oneshot::oneshot();
         let operation = storage_effect_kind(&effect);
         let active_txn_id = active_txn_id_for_effect(&effect);
+        let cleanup = cleanup_effect(&effect);
+        if let Some((txn_id, kind)) = cleanup {
+            self.retain_cleanup(txn_id, kind);
+        }
         let span = storage_effect_span(&effect);
         let in_flight = InFlightGuard::acquire(&self.metrics);
         match self.channel_for(&effect).try_send((
@@ -355,27 +463,42 @@ impl StorageHandle {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 if let Some(txn_id) = active_txn_id {
-                    self.enqueue_abort_transaction(txn_id, "request_queue_full");
+                    if !matches!(cleanup, Some((_, CleanupKind::Abort))) {
+                        self.enqueue_abort_transaction(txn_id, "request_queue_full");
+                    }
                 }
-                return self.observe_storage_event(StorageEvent::Error {
+                let event = StorageEvent::Error {
                     error: StorageError::QueueFull,
-                });
+                };
+                self.observe_cleanup(cleanup, &event);
+                return self.observe_storage_event(event);
             }
             Err(TrySendError::Disconnected(_)) => {
-                return self.observe_storage_event(StorageEvent::Error {
+                let event = StorageEvent::Error {
                     error: StorageError::ChannelClosed,
-                });
+                };
+                self.observe_cleanup(cleanup, &event);
+                return self.observe_storage_event(event);
             }
         }
 
         match tokio::time::timeout(STORAGE_REQUEST_TIMEOUT, response_rx).await {
-            Ok(Ok(event)) => self.observe_storage_event(event),
-            Ok(Err(_)) => self.observe_storage_event(StorageEvent::Error {
-                error: StorageError::ChannelClosed,
-            }),
+            Ok(Ok(event)) => {
+                self.observe_cleanup(cleanup, &event);
+                self.observe_storage_event(event)
+            }
+            Ok(Err(_)) => {
+                let event = StorageEvent::Error {
+                    error: StorageError::ChannelClosed,
+                };
+                self.observe_cleanup(cleanup, &event);
+                self.observe_storage_event(event)
+            }
             Err(error) => {
                 if let Some(txn_id) = active_txn_id {
-                    self.enqueue_abort_transaction(txn_id, "request_timeout");
+                    if !matches!(cleanup, Some((_, CleanupKind::CommitUnknown))) {
+                        self.enqueue_abort_transaction(txn_id, "request_timeout");
+                    }
                 }
                 warn!(
                     event = "storage.request.timeout",
@@ -384,14 +507,20 @@ impl StorageHandle {
                     error = %error,
                     "Timed out waiting for storage response"
                 );
-                self.observe_storage_event(StorageEvent::Error {
+                let event = StorageEvent::Error {
                     error: StorageError::Timeout,
-                })
+                };
+                self.observe_cleanup(cleanup, &event);
+                self.observe_storage_event(event)
             }
         }
     }
 
     fn enqueue_abort_transaction(&self, txn_id: Ulid, reason: &'static str) {
+        if !self.retain_cleanup(txn_id, CleanupKind::Abort) {
+            warn!(%txn_id, reason, "Transaction cleanup capacity reached");
+            return;
+        }
         let (response_tx, _response_rx) = crossfire::oneshot::oneshot();
         let effect = StorageEffect::AbortTransaction { txn_id };
         let span = storage_effect_span(&effect);
@@ -417,6 +546,10 @@ impl StorageHandle {
                 "Failed to enqueue storage transaction abort: channel closed"
             ),
         }
+    }
+
+    fn observe_cleanup(&self, cleanup: Option<(Ulid, CleanupKind)>, event: &StorageEvent) {
+        observe_cleanup(&self.transaction_cleanup, cleanup, event);
     }
 
     #[tracing::instrument(
@@ -496,6 +629,77 @@ fn active_txn_id_for_effect(effect: &StorageEffect) -> Option<Ulid> {
     }
 }
 
+fn cleanup_effect(effect: &StorageEffect) -> Option<(Ulid, CleanupKind)> {
+    match effect {
+        StorageEffect::AbortTransaction { txn_id } => Some((*txn_id, CleanupKind::Abort)),
+        StorageEffect::CommitTransaction { txn_id } => Some((*txn_id, CleanupKind::CommitUnknown)),
+        _ => None,
+    }
+}
+
+fn retain_cleanup(
+    pending: &Arc<Mutex<BTreeMap<Ulid, CleanupEntry>>>,
+    txn_id: Ulid,
+    kind: CleanupKind,
+) -> bool {
+    let mut pending = pending.lock().expect("transaction cleanup mutex poisoned");
+    if !pending.contains_key(&txn_id) && pending.len() >= MAX_TRANSACTION_CLEANUP {
+        return false;
+    }
+    let entry = pending
+        .entry(txn_id)
+        .or_insert(CleanupEntry { kind, attempts: 0 });
+    if matches!(kind, CleanupKind::CommitUnknown) {
+        entry.kind = kind;
+    }
+    true
+}
+
+fn observe_cleanup(
+    pending: &Arc<Mutex<BTreeMap<Ulid, CleanupEntry>>>,
+    cleanup: Option<(Ulid, CleanupKind)>,
+    event: &StorageEvent,
+) {
+    let Some((txn_id, kind)) = cleanup else {
+        return;
+    };
+    let terminal = match (kind, event) {
+        (CleanupKind::Abort, StorageEvent::TransactionAborted { txn_id: aborted })
+            if txn_id == *aborted =>
+        {
+            true
+        }
+        (
+            CleanupKind::Abort,
+            StorageEvent::Error {
+                error: StorageError::TransactionNotFound,
+            },
+        ) => true,
+        (CleanupKind::CommitUnknown, StorageEvent::TransactionCommitted { txn_id: committed })
+            if txn_id == *committed =>
+        {
+            true
+        }
+        (CleanupKind::CommitUnknown, StorageEvent::Error { error })
+            if matches!(
+                error,
+                StorageError::TransactionConflict | StorageError::TransactionNotFound
+            ) =>
+        {
+            true
+        }
+        _ => false,
+    };
+    let mut pending = pending.lock().expect("transaction cleanup mutex poisoned");
+    if terminal {
+        pending.remove(&txn_id);
+    } else if let Some(entry) = pending.get_mut(&txn_id)
+        && matches!(entry.kind, CleanupKind::Abort)
+    {
+        entry.attempts = entry.attempts.saturating_add(1);
+    }
+}
+
 #[async_trait]
 impl Handle for StorageHandle {
     #[tracing::instrument(
@@ -540,6 +744,7 @@ impl FjallStorage {
 
         let (sender, receivers) = StorageHandle::new();
         let store = Store::new(db);
+        let transaction_cleanup = sender.transaction_cleanup.clone();
         let read_pool = spawn_read_pool(
             store.clone(),
             READ_POOL_THREADS,
@@ -558,6 +763,7 @@ impl FjallStorage {
                 store,
                 persist_policy: policy,
                 txns: HashMap::new(),
+                transaction_cleanup,
                 read_pool,
                 next_reader: 0,
                 bulk_read_pool,
@@ -601,6 +807,27 @@ impl FjallStorage {
                 limit,
                 txn_id,
             } => self.iterate(key_space, prefix, start, limit, txn_id),
+        }
+    }
+
+    fn observe_cleanup(&self, cleanup: Option<(Ulid, CleanupKind)>, event: &StorageEvent) {
+        observe_cleanup(&self.transaction_cleanup, cleanup, event);
+    }
+
+    fn retry_cleanup(&mut self) {
+        let retry = self
+            .transaction_cleanup
+            .lock()
+            .expect("transaction cleanup mutex poisoned")
+            .iter()
+            .filter_map(|(txn_id, entry)| {
+                (matches!(entry.kind, CleanupKind::Abort) && entry.attempts < MAX_CLEANUP_ATTEMPTS)
+                    .then_some(*txn_id)
+            })
+            .collect::<Vec<_>>();
+        for txn_id in retry {
+            let event = self.abort_transaction(txn_id);
+            self.observe_cleanup(Some((txn_id, CleanupKind::Abort)), &event);
         }
     }
 
@@ -719,6 +946,7 @@ impl FjallStorage {
         let operation = storage_effect_kind(&effect);
         let key_space = storage_effect_key_space(&effect).map(str::to_string);
         let active_txn_id = active_txn_id_for_effect(&effect);
+        let cleanup = cleanup_effect(&effect);
         let queue_wait = enqueued_at.elapsed();
         span.record("queue_wait_ms", duration_ms(queue_wait));
         let starts_transaction = matches!(effect, StorageEffect::StartTransaction { .. });
@@ -728,7 +956,10 @@ impl FjallStorage {
         );
 
         if response_tx.is_disconnected()
-            && !matches!(effect, StorageEffect::AbortTransaction { .. })
+            && !matches!(
+                effect,
+                StorageEffect::AbortTransaction { .. } | StorageEffect::CommitTransaction { .. }
+            )
         {
             if let Some(txn_id) = active_txn_id {
                 self.cleanup_abandoned_transaction(
@@ -746,6 +977,8 @@ impl FjallStorage {
 
         let service_started = Instant::now();
         let event = self.process_effect(effect);
+        self.observe_cleanup(cleanup, &event);
+        self.retry_cleanup();
         let service_elapsed = service_started.elapsed();
         let total_elapsed = enqueued_at.elapsed();
         let result = storage_event_kind(&event);
@@ -2305,6 +2538,9 @@ mod tests {
             store: super::Store::new(db),
             persist_policy: FjallPersistPolicy::default(),
             txns: std::collections::HashMap::new(),
+            transaction_cleanup: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::BTreeMap::new(),
+            )),
             read_pool: Vec::new(),
             next_reader: 0,
             bulk_read_pool: vec![bulk_sender],
@@ -2516,6 +2752,7 @@ mod tests {
             bulk_channel,
             priority: _,
             metrics,
+            transaction_cleanup: _,
         } = handle;
 
         assert!(!metrics.channel_closed.load(Ordering::Relaxed));
@@ -2557,6 +2794,25 @@ mod tests {
             Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
             other => panic!("unexpected storage event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn owner_aborts_drop() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let owner = handle.start_transaction(true).await.unwrap();
+        let txn_id = owner.id().unwrap();
+        drop(owner);
+
+        assert!(matches!(
+            handle
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionNotFound
+            })
+        ));
+        assert_eq!(handle.pending_transactions(), 0);
     }
 
     async fn commit_transaction(handle: &StorageHandle, txn_id: Ulid) {
