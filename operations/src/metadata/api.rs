@@ -779,6 +779,7 @@ async fn forward_path_resolution(
     futures_util::pin_mut!(requests);
     let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
     let mut auth_error = None;
+    let mut divergent = false;
     let mut not_found = false;
     let mut unavailable = false;
     let mut success = None;
@@ -800,10 +801,18 @@ async fn forward_path_resolution(
                 )
                 .is_ok()
                 {
-                    success.get_or_insert(MetadataPathLookupResult {
+                    let candidate = MetadataPathLookupResult {
                         winner: result.winner,
                         conflicts: result.conflicts,
-                    });
+                    };
+                    if success.as_ref().is_some_and(|current| {
+                        current.winner != candidate.winner
+                            || current.conflicts != candidate.conflicts
+                    }) {
+                        divergent = true;
+                    } else {
+                        success.get_or_insert(candidate);
+                    }
                 } else {
                     unavailable = true;
                 }
@@ -826,6 +835,9 @@ async fn forward_path_resolution(
     }
     if let Some(error) = auth_error {
         return Err(error);
+    }
+    if divergent {
+        return Err(MetadataApiError::ServiceUnavailable);
     }
     if let Some(result) = success {
         return Ok(result);
@@ -934,7 +946,7 @@ async fn load_path_holder(
         .as_ref()
         .ok_or(MetadataApiError::ServiceUnavailable)?;
     match tokio::time::timeout(
-        METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT,
+        METADATA_PATH_PEER_TIMEOUT,
         metadata.request_forwarded_write(
             holder,
             MetadataTransportMessage::ForwardPathLookup {
