@@ -29,7 +29,7 @@ use aruna_core::structs::{
 use aruna_core::telemetry::{duration_ms, record_duration_ms, record_elapsed_ms};
 use aruna_core::types::{GroupId, UserId};
 use aruna_net::NetHandle;
-use aruna_net::streams::BiStream;
+use aruna_net::streams::{BiStream, RecvStream};
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use async_trait::async_trait;
 use byteview::ByteView;
@@ -6525,13 +6525,10 @@ async fn write_body_at(
     .map_err(|_| MetadataError::Backend("timed out writing metadata body".to_string()))?
 }
 
-async fn drain_stream_at<R>(
-    reader: &mut R,
+async fn drain_stream_at(
+    reader: &mut RecvStream,
     deadline: tokio::time::Instant,
-) -> Result<(), MetadataError>
-where
-    R: AsyncRead + Unpin + ?Sized,
-{
+) -> Result<(), MetadataError> {
     timeout_at(deadline, reader.read_to_end(1))
         .await
         .map_err(|_| {
