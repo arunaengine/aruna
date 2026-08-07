@@ -1451,7 +1451,9 @@ async fn process_blob_replication_job(
             }
             Err((SourceAuthorizationError::Unavailable(error), _)) => return Err(error),
         };
-        operation = operation.with_source_authorization(source_authorization);
+        operation = operation
+            .with_source_authorization(source_authorization)
+            .with_writer_auth(writer.clone());
         None
     };
 

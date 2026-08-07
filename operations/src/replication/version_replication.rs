@@ -34,13 +34,14 @@ use aruna_core::structs::{NodeRouting, StorageRoutingRule, resolve_backend};
 use aruna_core::types::{Effects, GroupId, Key, NodeId};
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
 use thiserror::Error;
 use tracing::debug;
 use ulid::Ulid;
 
 const ITER_PAGE_SIZE: usize = 512;
+const MAX_SCOPE_VERSIONS: usize = 1024;
 
 #[derive(Debug, Error, PartialEq)]
 pub(super) enum SourceAuthorizationError {
@@ -254,6 +255,8 @@ pub enum ReplicateScopeError {
     ReplicateObjectVersionError(#[from] ReplicateObjectVersionError),
     #[error("Source bucket not found")]
     BucketNotFound,
+    #[error("replication scope exceeds {limit} versions")]
+    ScopeLimit { limit: usize },
     #[error("Unexpected event in state {state}: expected {expected}, got {received:?}")]
     InvalidStateEvent {
         state: &'static str,
@@ -284,7 +287,9 @@ pub struct ReplicateScopeOperation {
     source_group_id: Option<GroupId>,
     sync: Option<SyncTransferContext>,
     pending_versions: Vec<VersionReplicationRequest>,
+    pending_keys: BTreeSet<(String, String, Ulid)>,
     source_authorization: Option<SourceAuthorization>,
+    writer_auth_context: Option<AuthContext>,
     routing: NodeRouting,
     result: ReplicateScopeResult,
     output: Option<Result<ReplicateScopeResult, ReplicateScopeError>>,
@@ -301,7 +306,9 @@ impl ReplicateScopeOperation {
             source_group_id: None,
             sync: None,
             pending_versions: Vec::new(),
+            pending_keys: BTreeSet::new(),
             source_authorization: None,
+            writer_auth_context: None,
             routing: NodeRouting::default(),
             result: ReplicateScopeResult {
                 replicated: 0,
@@ -325,6 +332,11 @@ impl ReplicateScopeOperation {
         self
     }
 
+    pub(super) fn with_writer_auth(mut self, auth_context: AuthContext) -> Self {
+        self.writer_auth_context = Some(auth_context);
+        self
+    }
+
     pub fn with_relationship(
         mut self,
         relationship: SyncRelationship,
@@ -332,6 +344,7 @@ impl ReplicateScopeOperation {
         mut upstream_sources: Vec<ArunaArn>,
         writer_auth_context: Option<AuthContext>,
     ) -> Self {
+        self.writer_auth_context = writer_auth_context.clone();
         if !upstream_sources
             .iter()
             .any(|source| source == &relationship.source)
@@ -469,7 +482,10 @@ impl ReplicateScopeOperation {
         })]
     }
 
-    fn enqueue_version_request(&mut self, version_key: VersionKey) {
+    fn enqueue_version_request(
+        &mut self,
+        version_key: VersionKey,
+    ) -> Result<(), ReplicateScopeError> {
         if self.sync.as_ref().is_some_and(|sync| {
             map_sync_key(
                 &version_key.key,
@@ -478,13 +494,14 @@ impl ReplicateScopeOperation {
             )
             .is_none()
         }) {
-            return;
+            return Ok(());
         }
-        if self.pending_versions.iter().any(|request| {
-            request.bucket == version_key.bucket
-                && request.key == version_key.key
-                && request.version_id == version_key.version_id
-        }) {
+        let identity = (
+            version_key.bucket.clone(),
+            version_key.key.clone(),
+            version_key.version_id,
+        );
+        if self.pending_keys.contains(&identity) {
             debug!(
                 bucket = %version_key.bucket,
                 key = %version_key.key,
@@ -492,7 +509,7 @@ impl ReplicateScopeOperation {
                 target_node = %self.input.target_node_id,
                 "Skipping duplicate replication queue entry"
             );
-            return;
+            return Ok(());
         }
 
         if let Some(authorization) = self.source_authorization.as_ref()
@@ -500,9 +517,16 @@ impl ReplicateScopeOperation {
         {
             self.result.failed = self.result.failed.saturating_add(1);
             self.result.last_error = Some(error.to_string());
-            return;
+            return Ok(());
         }
 
+        if self.pending_versions.len() >= MAX_SCOPE_VERSIONS {
+            return Err(ReplicateScopeError::ScopeLimit {
+                limit: MAX_SCOPE_VERSIONS,
+            });
+        }
+
+        self.pending_keys.insert(identity);
         debug!(
             bucket = %version_key.bucket,
             key = %version_key.key,
@@ -520,6 +544,7 @@ impl ReplicateScopeOperation {
             auth_context: self.input.auth_context.clone(),
             mode: self.input.mode,
         });
+        Ok(())
     }
 
     fn should_enqueue_version(&self, is_deleted: bool) -> bool {
@@ -553,6 +578,7 @@ impl ReplicateScopeOperation {
             "Starting version replication suboperation"
         );
         self.state = ReplicateScopeState::RunVersionReplication;
+        let writer_auth_context = self.writer_auth_context.clone();
         let operation = match self.sync.clone() {
             Some(mut sync) => {
                 let Some(target_key) = map_sync_key(
@@ -571,6 +597,10 @@ impl ReplicateScopeOperation {
             None => {
                 ReplicateObjectVersionOperation::new(request).with_routing(self.routing.clone())
             }
+        };
+        let operation = match writer_auth_context {
+            Some(auth_context) => operation.with_writer_auth(auth_context),
+            None => operation,
         };
         smallvec![Effect::SubOperation(boxed_suboperation(
             operation,
@@ -696,7 +726,9 @@ impl Operation for ReplicateScopeOperation {
                         "Loaded single version for replication"
                     );
                     if self.should_enqueue_version(version.is_deleted()) {
-                        self.enqueue_version_request(version_key);
+                        if let Err(error) = self.enqueue_version_request(version_key) {
+                            return self.fail(error);
+                        }
                     } else {
                         debug!(
                             bucket = %version_key.bucket,
@@ -752,7 +784,9 @@ impl Operation for ReplicateScopeOperation {
                         continue;
                     }
 
-                    self.enqueue_version_request(version_key);
+                    if let Err(error) = self.enqueue_version_request(version_key) {
+                        return self.fail(error);
+                    }
                 }
 
                 debug!(
@@ -913,6 +947,7 @@ pub struct ReplicateObjectVersionOperation {
     group_inputs: GroupRoutingInputs,
     bucket_rules: Vec<StorageRoutingRule>,
     sync: Option<SyncTransferContext>,
+    writer_auth_context: Option<AuthContext>,
     routing: NodeRouting,
     result: Result<ReplicationSuboperationResult, ReplicateObjectVersionError>,
 }
@@ -937,6 +972,7 @@ impl ReplicateObjectVersionOperation {
             group_inputs: GroupRoutingInputs::default(),
             bucket_rules: Vec::new(),
             sync: None,
+            writer_auth_context: None,
             routing: NodeRouting::default(),
             result: Ok(ReplicationSuboperationResult::Replicated),
         }
@@ -949,6 +985,11 @@ impl ReplicateObjectVersionOperation {
 
     fn with_sync(mut self, sync: SyncTransferContext) -> Self {
         self.sync = Some(sync);
+        self
+    }
+
+    fn with_writer_auth(mut self, auth_context: AuthContext) -> Self {
+        self.writer_auth_context = Some(auth_context);
         self
     }
 
@@ -1603,10 +1644,11 @@ impl ReplicateObjectVersionOperation {
                 .sync
                 .as_ref()
                 .map_or_else(Vec::new, |sync| sync.upstream_sources.clone()),
-            writer_auth_context: self
-                .sync
-                .as_ref()
-                .and_then(|sync| sync.writer_auth_context.clone()),
+            writer_auth_context: self.writer_auth_context.clone().or_else(|| {
+                self.sync
+                    .as_ref()
+                    .and_then(|sync| sync.writer_auth_context.clone())
+            }),
             reference_metadata: reference,
             metadata,
         });
@@ -2209,8 +2251,9 @@ impl Operation for ReplicateObjectVersionOperation {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReplicateObjectVersionError, ReplicateObjectVersionOperation, ReplicateScopeInput,
-        ReplicateScopeOperation, ReplicateScopeTarget, ReplicationVersion, SyncTransferContext,
+        MAX_SCOPE_VERSIONS, ReplicateObjectVersionError, ReplicateObjectVersionOperation,
+        ReplicateScopeError, ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
+        ReplicationVersion, SyncTransferContext,
     };
     use crate::replication::protocol::{
         ReplicationMode, VersionReplicationMessage, VersionReplicationRequest,
@@ -2480,6 +2523,78 @@ mod tests {
     }
 
     #[test]
+    fn scope_dedups_versions() {
+        let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
+        op.state = super::ReplicateScopeState::IterateVersions;
+        let version_id = Ulid::from_bytes([1u8; 16]);
+        let cursor: aruna_core::types::Key = vec![9u8].into();
+
+        let effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![version_entry("dir/file.txt", version_id); 2],
+            next_start_after: Some(cursor),
+        }));
+
+        assert!(matches!(
+            effects[0],
+            Effect::Storage(StorageEffect::Iter { .. })
+        ));
+        assert_eq!(op.pending_versions.len(), 1);
+        assert_eq!(op.pending_keys.len(), 1);
+    }
+
+    #[test]
+    fn scope_rejects_overflow() {
+        let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
+        op.state = super::ReplicateScopeState::IterateVersions;
+        let values = (0..=MAX_SCOPE_VERSIONS)
+            .map(|index| {
+                version_entry(
+                    &format!("key-{index}"),
+                    Ulid::from_bytes((index as u128 + 1).to_be_bytes()),
+                )
+            })
+            .collect();
+
+        let effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: None,
+        }));
+
+        assert!(effects.is_empty());
+        assert_eq!(op.state, super::ReplicateScopeState::Error);
+        assert_eq!(op.pending_versions.len(), MAX_SCOPE_VERSIONS);
+        assert_eq!(
+            op.output,
+            Some(Err(ReplicateScopeError::ScopeLimit {
+                limit: MAX_SCOPE_VERSIONS,
+            }))
+        );
+    }
+
+    #[test]
+    fn scope_paginates_cursor() {
+        let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
+        op.state = super::ReplicateScopeState::IterateVersions;
+        let cursor: aruna_core::types::Key = vec![9u8].into();
+
+        let effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![version_entry("dir/first", Ulid::from_bytes([1u8; 16]))],
+            next_start_after: Some(cursor.clone()),
+        }));
+        let Effect::Storage(StorageEffect::Iter { start, .. }) = &effects[0] else {
+            panic!("expected next scope page")
+        };
+        assert_eq!(start, &Some(IterStart::After(cursor)));
+
+        let effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![version_entry("dir/second", Ulid::from_bytes([2u8; 16]))],
+            next_start_after: None,
+        }));
+        assert!(matches!(effects[0], Effect::SubOperation(_)));
+        assert_eq!(op.pending_versions.len(), 1);
+    }
+
+    #[test]
     fn object_miss_does_not_fall_back_to_prefix_iteration() {
         let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Object {
             key: "dir/file".to_string(),
@@ -2678,6 +2793,22 @@ mod tests {
         let manifest = op.manifest.expect("manifest built");
         assert!(manifest.current_version);
         assert_eq!(manifest.current_version_generation, Some(generation));
+    }
+
+    #[test]
+    fn manifest_includes_writer_auth() {
+        let version_id = Ulid::generate();
+        let writer = auth_context();
+        let mut op = ReplicateObjectVersionOperation::new(version_request(version_id))
+            .with_writer_auth(writer.clone());
+        op.replication_version = Some(ReplicationVersion::Deleted {
+            created_at: SystemTime::now(),
+            created_by: test_user_id(),
+        });
+
+        op.build_manifest(None).unwrap();
+
+        assert_eq!(op.manifest.unwrap().writer_auth_context, Some(writer));
     }
 
     #[test]
