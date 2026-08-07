@@ -25,6 +25,7 @@ pub const ADMIN_DOCUMENT_STATE_KEYSPACE: &str = "admin_document_state";
 pub const ADMIN_DOCUMENT_CONFLICT_KEYSPACE: &str = "admin_document_conflicts";
 pub const DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE: &str = "document_sync_applied_ops";
 pub const DOCUMENT_SYNC_OUTBOX_KEYSPACE: &str = "document_sync_outbox";
+pub const TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE: &str = "token_revocation_outbox_index";
 pub const DOCUMENT_SYNC_REVISION_KEYSPACE: &str = "document_sync_revisions";
 pub const DOCUMENT_SYNC_CONFLICT_KEYSPACE: &str = "document_sync_conflicts";
 pub const SYNC_PLACEMENT_KEYSPACE: &str = "sync_placements";

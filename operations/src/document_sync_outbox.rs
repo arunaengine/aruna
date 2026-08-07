@@ -4,10 +4,12 @@ use aruna_core::NodeId;
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
+use aruna_core::keyspaces::{
+    DOCUMENT_SYNC_OUTBOX_KEYSPACE, TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE,
+};
 use aruna_core::structs::PlacementRef;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Key, TxnId};
+use aruna_core::types::{Key, TxnId, Value};
 use aruna_core::util::unix_timestamp_secs;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
@@ -33,6 +35,12 @@ pub fn outbox_prefix(event: &DocumentSyncOutboxEvent) -> Key {
     ByteView::from(bytes)
 }
 
+pub fn admin_outbox_prefix(node_id: NodeId) -> Key {
+    let mut bytes = b"document-sync-outbox-v1/admin-operation/".to_vec();
+    bytes.extend_from_slice(node_id.as_bytes());
+    ByteView::from(bytes)
+}
+
 pub fn outbox_key(record: &DocumentSyncOutboxRecord) -> Key {
     let mut bytes = outbox_prefix(&record.event).to_vec();
     if let DocumentSyncOutboxEvent::AdminOperation { event } = &record.event {
@@ -47,6 +55,14 @@ pub fn outbox_key(record: &DocumentSyncOutboxRecord) -> Key {
     // Ordering is untouched: the id still compares first, so this only breaks ties.
     bytes.extend_from_slice(record.target.storage_key().as_ref());
     ByteView::from(bytes)
+}
+
+pub fn revocation_index_entry(record: &DocumentSyncOutboxRecord) -> (String, Key, Value) {
+    (
+        TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+        outbox_key(record),
+        Value::from(vec![1u8]),
+    )
 }
 
 pub fn new_outbox_record(
@@ -206,11 +222,12 @@ pub async fn delete_outbox_records(
     }
     let deletes = keys
         .into_iter()
-        .map(|key| {
-            (
-                DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
-                ByteView::from(key),
-            )
+        .flat_map(|key| {
+            let key = ByteView::from(key);
+            [
+                (DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), key.clone()),
+                (TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(), key),
+            ]
         })
         .collect();
     match storage
@@ -577,6 +594,98 @@ mod tests {
         assert!(outbox_key(&earlier) < outbox_key(&later));
         // AdminOperation records take the supplied ref (no envelope change).
         assert_eq!(earlier.placement, placement(9));
+    }
+
+    #[test]
+    fn admin_prefix_scopes() {
+        let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
+        let record = new_outbox_record(
+            node(1),
+            DocumentSyncTarget::User { user_id },
+            Vec::new(),
+            user_admin_event(user_id, 1),
+            placement(9),
+            false,
+        );
+        let key = outbox_key(&record);
+
+        assert!(key.starts_with(admin_outbox_prefix(node(1)).as_ref()));
+        assert!(!key.starts_with(admin_outbox_prefix(node(2)).as_ref()));
+    }
+
+    #[test]
+    fn index_uses_key() {
+        let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
+        let record = new_outbox_record(
+            node(1),
+            DocumentSyncTarget::User { user_id },
+            Vec::new(),
+            user_admin_event(user_id, 1),
+            placement(9),
+            false,
+        );
+        let (keyspace, key, value) = revocation_index_entry(&record);
+
+        assert_eq!(keyspace, TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE);
+        assert_eq!(key, outbox_key(&record));
+        assert_eq!(value, Value::from(vec![1u8]));
+    }
+
+    #[tokio::test]
+    async fn delete_clears_index() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
+        let record = new_outbox_record(
+            node(1),
+            DocumentSyncTarget::User { user_id },
+            Vec::new(),
+            user_admin_event(user_id, 1),
+            placement(9),
+            false,
+        );
+        let record_key = outbox_key(&record).to_vec();
+        let (_, index_key, index_value) = revocation_index_entry(&record);
+        write_raw_outbox_record(
+            &storage,
+            record_key.clone(),
+            postcard::to_allocvec(&record).expect("record serializes"),
+        )
+        .await;
+        match storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                key: index_key.clone(),
+                value: index_value,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected index write event: {other:?}"),
+        }
+
+        delete_outbox_records(&storage, vec![record_key.clone()])
+            .await
+            .expect("outbox delete succeeds");
+        assert!(
+            read_outbox_record(&storage, &record_key)
+                .await
+                .expect("outbox read succeeds")
+                .is_none()
+        );
+        match storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                key: index_key,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {}
+            other => panic!("unexpected index read event: {other:?}"),
+        }
     }
 
     #[test]
