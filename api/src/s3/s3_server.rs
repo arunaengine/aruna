@@ -42,6 +42,7 @@ use tracing::{Instrument, error, info, trace};
 
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+const STREAM_LIFETIME_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DELETE_OBJECTS_MAX_BODY: usize = 2 * 1024 * 1024;
 const DELETE_CAPTURE_LIMIT: usize = 16;
 const EGRESS_LIMIT: usize = 256;
@@ -368,6 +369,30 @@ impl ConnectionActivity {
                 return;
             }
             notified.await;
+        }
+    }
+
+    async fn wait_done(&self) {
+        while !self.is_cancelled() && !self.stopped.load(Ordering::Acquire) {
+            let notified = self.notify.notified();
+            if self.is_cancelled() || self.stopped.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn wait_lifetime(&self) -> bool {
+        tokio::select! {
+            _ = self.wait_done() => false,
+            _ = tokio::time::sleep(STREAM_LIFETIME_TIMEOUT) => {
+                if self.is_cancelled() || self.stopped.load(Ordering::Acquire) {
+                    false
+                } else {
+                    self.cancel();
+                    true
+                }
+            }
         }
     }
 
@@ -1023,7 +1048,10 @@ impl Service<Request<Incoming>> for WrappingService {
                 stream_activity.touch();
                 let idle_task_activity = stream_activity.clone();
                 tokio::spawn(async move {
-                    idle_task_activity.wait_idle().await;
+                    tokio::select! {
+                        _ = idle_task_activity.wait_idle() => {}
+                        _ = idle_task_activity.wait_lifetime() => {}
+                    }
                 });
             }
 
@@ -1062,8 +1090,17 @@ impl Service<Request<Incoming>> for WrappingService {
                     let idle_task_activity = response_activity.clone();
                     let response_connection = activity.clone();
                     tokio::spawn(async move {
-                        if idle_task_activity.wait_idle().await {
-                            response_connection.cancel();
+                        tokio::select! {
+                            idle = idle_task_activity.wait_idle() => {
+                                if idle {
+                                    response_connection.cancel();
+                                }
+                            }
+                            lifetime = idle_task_activity.wait_lifetime() => {
+                                if lifetime {
+                                    response_connection.cancel();
+                                }
+                            }
                         }
                     });
                     Ok(response.map(|body| {
@@ -1369,6 +1406,119 @@ mod tests {
         watcher.await.expect("response watcher joins");
         assert!(activity.is_cancelled());
         connection.await.expect("connection task joins");
+        assert_eq!(limit.available_permits(), 1);
+        assert_eq!(activity.active.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trickle_request_expires() {
+        let activity = Arc::new(ConnectionActivity::default());
+        activity.mark_request();
+        activity.begin_request();
+        let stream_activity = Arc::new(ConnectionActivity::default());
+        stream_activity.touch();
+        let request_limit = Arc::new(Semaphore::new(1));
+        let request_permit = request_limit
+            .clone()
+            .try_acquire_owned()
+            .expect("request permit");
+        let egress_limit = Arc::new(Semaphore::new(1));
+        let egress_permit = egress_limit
+            .clone()
+            .try_acquire_owned()
+            .expect("egress permit");
+        let active = ActiveRequestGuard::new(activity.clone());
+        let ready = Arc::new(Notify::new());
+        let task_ready = ready.clone();
+        let idle_activity = stream_activity.clone();
+        let watcher = tokio::spawn(async move {
+            task_ready.notify_one();
+            tokio::select! {
+                _ = idle_activity.wait_idle() => {}
+                _ = idle_activity.wait_lifetime() => {}
+            }
+        });
+        let request_activity = stream_activity.clone();
+        let request = tokio::spawn(async move {
+            let _active = active;
+            let _request_permit = request_permit;
+            let _egress_permit = egress_permit;
+            request_activity.wait_cancelled().await;
+        });
+        ready.notified().await;
+        let tick = Duration::from_secs(19);
+        for _ in 0..94 {
+            tokio::time::advance(tick).await;
+            stream_activity.touch();
+            tokio::task::yield_now().await;
+        }
+        assert!(!stream_activity.is_cancelled());
+        tokio::time::advance(STREAM_LIFETIME_TIMEOUT - Duration::from_secs(19 * 94)).await;
+        watcher.await.expect("request watcher joins");
+        request.await.expect("request task joins");
+        assert!(stream_activity.is_cancelled());
+        assert_eq!(request_limit.available_permits(), 1);
+        assert_eq!(egress_limit.available_permits(), 1);
+        assert_eq!(activity.active.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trickle_response_expires() {
+        let activity = Arc::new(ConnectionActivity::default());
+        activity.mark_request();
+        activity.begin_request();
+        let response_activity = Arc::new(ConnectionActivity::default());
+        response_activity.touch();
+        let limit = Arc::new(Semaphore::new(1));
+        let permit = limit.clone().try_acquire_owned().expect("permit");
+        let active = ActiveRequestGuard::new(activity.clone());
+        let body = ResponseBody::new(
+            s3s::Body::empty(),
+            permit,
+            activity.clone(),
+            response_activity.clone(),
+            active,
+        );
+        let sibling = Arc::new(ConnectionActivity::default());
+        sibling.mark_request();
+        let ready = Arc::new(Notify::new());
+        let task_ready = ready.clone();
+        let idle_activity = response_activity.clone();
+        let idle_connection = activity.clone();
+        let watcher = tokio::spawn(async move {
+            task_ready.notify_one();
+            tokio::select! {
+                idle = idle_activity.wait_idle() => {
+                    if idle {
+                        idle_connection.cancel();
+                    }
+                }
+                lifetime = idle_activity.wait_lifetime() => {
+                    if lifetime {
+                        idle_connection.cancel();
+                    }
+                }
+            }
+        });
+        let connection_activity = activity.clone();
+        let connection = tokio::spawn(async move {
+            let _body = body;
+            connection_activity.wait_cancelled().await;
+        });
+        ready.notified().await;
+        let tick = Duration::from_secs(19);
+        for _ in 0..94 {
+            tokio::time::advance(tick).await;
+            response_activity.touch();
+            tokio::task::yield_now().await;
+        }
+        assert!(!response_activity.is_cancelled());
+        assert!(!activity.is_cancelled());
+        tokio::time::advance(STREAM_LIFETIME_TIMEOUT - Duration::from_secs(19 * 94)).await;
+        watcher.await.expect("response watcher joins");
+        connection.await.expect("connection task joins");
+        assert!(activity.is_cancelled());
+        assert!(!sibling.is_cancelled());
         assert_eq!(limit.available_permits(), 1);
         assert_eq!(activity.active.load(Ordering::Acquire), 0);
     }
