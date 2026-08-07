@@ -27,11 +27,13 @@ pub fn external_base_url(trusted_proxies: &[IpNet], peer: IpAddr, headers: &Head
     let scheme = from_proxy
         .then(|| header_str(headers, "x-forwarded-proto"))
         .flatten()
+        .filter(|scheme| !scheme.contains(','))
         .filter(|scheme| *scheme == "http" || *scheme == "https")
         .unwrap_or("http");
     let host = from_proxy
         .then(|| header_str(headers, "x-forwarded-host"))
         .flatten()
+        .filter(|host| !host.contains(','))
         .or_else(|| header_str(headers, http::header::HOST.as_str()))
         .unwrap_or("localhost");
     format!("{scheme}://{host}")
@@ -116,6 +118,31 @@ mod tests {
     fn rejects_xfp_duplicate() {
         let mut headers = forwarded_headers();
         headers.append("x-forwarded-proto", HeaderValue::from_static("https"));
+        let peer = IpAddr::from_str("10.1.2.3").unwrap();
+        assert_eq!(
+            external_base_url(&proxies(), peer, &headers),
+            "http://drs.example"
+        );
+    }
+
+    #[test]
+    fn rejects_xfh_list() {
+        let mut headers = forwarded_headers();
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("drs.example, attacker.example"),
+        );
+        let peer = IpAddr::from_str("10.1.2.3").unwrap();
+        assert_eq!(
+            external_base_url(&proxies(), peer, &headers),
+            "https://node.internal"
+        );
+    }
+
+    #[test]
+    fn rejects_xfp_list() {
+        let mut headers = forwarded_headers();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https, http"));
         let peer = IpAddr::from_str("10.1.2.3").unwrap();
         assert_eq!(
             external_base_url(&proxies(), peer, &headers),
