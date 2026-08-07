@@ -1272,20 +1272,22 @@ pub async fn query_metadata_document(
         None => request.auth.clone().map(MetadataAuthToken::internal),
     };
     let mut fanout_stats = MetadataFanoutStats::default();
+    let mut success = None;
+    let mut auth_error = None;
+    let mut not_found = false;
     for holder in holders {
         fanout_stats.nodes_queried += 1;
-        let result = if holder == local_node_id {
+        let result: Result<MetadataQueryResults, MetadataReadError> = if holder == local_node_id {
             match ensure_record_materialized_for_graph_read(context, &record).await {
-                Ok(()) => {
-                    metadata
-                        .query_authorized_local(
-                            request.auth.clone(),
-                            Some(vec![record.graph_iri.clone()]),
-                            request.query.clone(),
-                        )
-                        .await
-                }
-                Err(error) => Err(MetadataError::Backend(error.to_string())),
+                Ok(()) => metadata
+                    .query_authorized_local(
+                        request.auth.clone(),
+                        Some(vec![record.graph_iri.clone()]),
+                        request.query.clone(),
+                    )
+                    .await
+                    .map_err(|_| MetadataReadError::Unavailable),
+                Err(_) => Err(MetadataReadError::Unavailable),
             }
         } else {
             metadata
@@ -1300,19 +1302,35 @@ pub async fn query_metadata_document(
         };
         match result {
             Ok(results) => {
-                fanout_stats.nodes_failed = 0;
-                fanout_stats.failed_partitions.clear();
-                return Ok(MetadataQueryExecution {
-                    results,
-                    fanout_stats,
-                });
+                success.get_or_insert(results);
             }
-            Err(error) => {
+            Err(MetadataReadError::Unauthorized) => {
+                auth_error.get_or_insert(MetadataApiError::Unauthorized);
+            }
+            Err(MetadataReadError::Forbidden) => {
+                auth_error.get_or_insert(MetadataApiError::Forbidden);
+            }
+            Err(MetadataReadError::NotFound) => not_found = true,
+            Err(MetadataReadError::Unavailable) => {
                 fanout_stats.nodes_failed += 1;
                 fanout_stats.failed_partitions.push(holder);
-                warn!(%holder, %error, "Document query holder failed; trying the next replica");
+                warn!(%holder, "Document query holder unavailable; trying the next replica");
             }
         }
+    }
+    if let Some(error) = auth_error {
+        return Err(error);
+    }
+    if success.is_some() && not_found {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    if let Some(results) = success {
+        fanout_stats.nodes_failed = 0;
+        fanout_stats.failed_partitions.clear();
+        return Ok(MetadataQueryExecution {
+            results,
+            fanout_stats,
+        });
     }
     Err(MetadataApiError::ServiceUnavailable)
 }
