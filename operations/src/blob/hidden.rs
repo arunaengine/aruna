@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::StorageError;
@@ -19,6 +19,7 @@ use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 use ulid::Ulid;
 
@@ -26,10 +27,36 @@ use crate::driver::DriverContext;
 use crate::jobs::store::iter_prefix_page;
 use crate::task_persistence::persist_task_effect;
 
-const SWEEP_PAGE_SIZE: usize = 512;
+const SWEEP_PAGE_SIZE: usize = 128;
+const SWEEP_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const SWEEP_BUDGET: Duration = Duration::from_secs(30);
+const MAX_JOB_BYTES: usize = 1024 * 1024;
 pub const HIDDEN_SWEEP_AFTER: Duration = Duration::from_secs(60 * 60);
 pub const HIDDEN_SWEEP_RETRY: Duration = Duration::from_secs(30);
 const ORPHAN_GRACE: Duration = Duration::from_secs(60 * 60);
+const HIDDEN_CURSOR_KEY: &[u8] = b"hidden-sweep";
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SweepCursor {
+    phase: SweepPhase,
+    start_after: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+enum SweepPhase {
+    Cleanup,
+    Uploads,
+    Hidden,
+}
+
+impl Default for SweepCursor {
+    fn default() -> Self {
+        Self {
+            phase: SweepPhase::Cleanup,
+            start_after: None,
+        }
+    }
+}
 
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct HiddenSweepOutcome {
@@ -68,195 +95,237 @@ pub async fn restore_hidden_sweep(storage: &StorageHandle, task_handle: &TaskHan
     }
 }
 
-async fn sweep_at(context: &DriverContext, now_ms: u64) -> Result<HiddenSweepOutcome, String> {
-    let (active_jobs, active_rocrate, mut referenced) = scan_jobs(&context.storage_handle).await?;
-    let cleanup_pending = sweep_upload_cleanups(context).await?;
-    let uploads_deleted = sweep_uploads(context, &active_jobs, now_ms, &mut referenced).await?;
-    let entries = list_hidden(context).await?;
-    let cutoff = UNIX_EPOCH
-        .checked_add(Duration::from_millis(
-            now_ms.saturating_sub(ORPHAN_GRACE.as_millis() as u64),
-        ))
-        .unwrap_or(UNIX_EPOCH);
-    let mut orphans_deleted = 0usize;
-    for entry in entries {
-        if is_orphaned(&entry, &referenced, &active_rocrate, cutoff) {
-            delete_key(context, entry.key).await?;
-            orphans_deleted = orphans_deleted.saturating_add(1);
-        }
+fn time_left(deadline: Instant) -> Duration {
+    deadline
+        .saturating_duration_since(Instant::now())
+        .min(SWEEP_IO_TIMEOUT)
+}
+
+async fn load_cursor(storage: &StorageHandle, deadline: Instant) -> Result<SweepCursor, String> {
+    let event = tokio::time::timeout(
+        time_left(deadline),
+        storage.send_storage_effect(StorageEffect::Read {
+            key_space: NODE_STATE_KEYSPACE.to_string(),
+            key: ByteView::from(HIDDEN_CURSOR_KEY.to_vec()),
+            txn_id: None,
+        }),
+    )
+    .await
+    .map_err(|_| "timed out reading hidden sweep cursor".to_string())?;
+    match event {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => postcard::from_bytes(value.as_ref()).map_err(|error| error.to_string()),
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(SweepCursor::default()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected hidden sweep cursor event: {other:?}")),
     }
+}
+
+async fn save_cursor(
+    storage: &StorageHandle,
+    cursor: &SweepCursor,
+    deadline: Instant,
+) -> Result<(), String> {
+    let value = postcard::to_allocvec(cursor).map_err(|error| error.to_string())?;
+    let event = tokio::time::timeout(
+        time_left(deadline),
+        storage.send_storage_effect(StorageEffect::Write {
+            key_space: NODE_STATE_KEYSPACE.to_string(),
+            key: ByteView::from(HIDDEN_CURSOR_KEY.to_vec()),
+            value: ByteView::from(value),
+            txn_id: None,
+        }),
+    )
+    .await
+    .map_err(|_| "timed out writing hidden sweep cursor".to_string())?;
+    match event {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected hidden sweep cursor event: {other:?}")),
+    }
+}
+
+async fn sweep_at(context: &DriverContext, now_ms: u64) -> Result<HiddenSweepOutcome, String> {
+    let deadline = Instant::now() + SWEEP_BUDGET;
+    let mut cursor = load_cursor(&context.storage_handle, deadline).await?;
+    let mut cleanup_pending = false;
+    let mut uploads_deleted = 0;
+    let mut orphans_deleted = 0;
+    let more = match cursor.phase {
+        SweepPhase::Cleanup => {
+            let (pending, more) =
+                sweep_upload_cleanups(context, &mut cursor.start_after, deadline).await?;
+            cleanup_pending = pending;
+            if !more {
+                cursor.phase = SweepPhase::Uploads;
+                cursor.start_after = None;
+            }
+            more
+        }
+        SweepPhase::Uploads => {
+            let (deleted, more, pending) =
+                sweep_uploads(context, now_ms, &mut cursor.start_after, deadline).await?;
+            uploads_deleted = deleted;
+            cleanup_pending = pending;
+            if !more {
+                cursor.phase = SweepPhase::Hidden;
+                cursor.start_after = None;
+            }
+            more
+        }
+        SweepPhase::Hidden => {
+            let (deleted, more, pending) =
+                sweep_hidden(context, now_ms, &mut cursor.start_after, deadline).await?;
+            orphans_deleted = deleted;
+            cleanup_pending = pending;
+            if !more {
+                cursor.phase = SweepPhase::Cleanup;
+                cursor.start_after = None;
+            }
+            more
+        }
+    };
+    save_cursor(&context.storage_handle, &cursor, deadline).await?;
     Ok(HiddenSweepOutcome {
-        cleanup_pending,
+        cleanup_pending: cleanup_pending || more,
         uploads_deleted,
         orphans_deleted,
     })
 }
 
-async fn sweep_upload_cleanups(context: &DriverContext) -> Result<bool, String> {
+async fn sweep_upload_cleanups(
+    context: &DriverContext,
+    cursor: &mut Option<Vec<u8>>,
+    deadline: Instant,
+) -> Result<(bool, bool), String> {
     let mut pending = false;
-    let mut start_after = None;
-    loop {
-        let (values, next) = iter_prefix_page(
+    let start_after = cursor.take().map(ByteView::from);
+    let (values, next) = tokio::time::timeout(
+        time_left(deadline),
+        iter_prefix_page(
             &context.storage_handle,
             ROCRATE_UPLOAD_CLEANUP_KEYSPACE,
             None,
-            start_after.take(),
+            start_after,
             SWEEP_PAGE_SIZE,
             None,
+        ),
+    )
+    .await
+    .map_err(|_| "timed out scanning upload cleanup rows".to_string())??;
+    for (storage_key, value) in values {
+        if time_left(deadline).is_zero() {
+            return Err("hidden sweep budget exhausted".to_string());
+        }
+        let cleanup = match RoCrateUploadCleanup::from_bytes(&value) {
+            Ok(cleanup) => cleanup,
+            Err(error) => {
+                warn!(error = %error, "Failed to decode RO-Crate upload cleanup");
+                continue;
+            }
+        };
+        let record_cleanup = match delete_unclaimed(
+            &context.storage_handle,
+            cleanup.upload_id,
+            unix_timestamp_millis(),
+            deadline,
         )
-        .await?;
-        for (storage_key, value) in values {
-            let cleanup = match RoCrateUploadCleanup::from_bytes(&value) {
-                Ok(cleanup) => cleanup,
-                Err(error) => {
-                    warn!(error = %error, "Failed to decode RO-Crate upload cleanup");
+        .await
+        {
+            Ok(cleanup) => cleanup,
+            Err(error) => {
+                warn!(error = %error, "Failed to compensate RO-Crate upload record");
+                pending = true;
+                continue;
+            }
+        };
+        match record_cleanup {
+            RecordCleanup::Protected => {
+                pending = true;
+            }
+            RecordCleanup::Missing | RecordCleanup::Deleted => {
+                if let Err(error) = delete_key(context, cleanup.hidden_key, deadline).await {
+                    warn!(error = %error, "Failed to delete upload cleanup blob");
                     pending = true;
                     continue;
                 }
-            };
-            let record_cleanup =
-                match delete_unclaimed(&context.storage_handle, cleanup.upload_id).await {
-                    Ok(cleanup) => cleanup,
-                    Err(error) => {
-                        warn!(error = %error, "Failed to compensate RO-Crate upload record");
-                        pending = true;
-                        continue;
-                    }
-                };
-            match record_cleanup {
-                RecordCleanup::Protected => {
+                if let Err(error) = delete_cleanup(context, storage_key, deadline).await {
+                    warn!(error = %error, "Failed to delete upload cleanup row");
                     pending = true;
                 }
-                RecordCleanup::Missing | RecordCleanup::Deleted => {
-                    if delete_key(context, cleanup.hidden_key).await.is_err() {
-                        pending = true;
-                        continue;
-                    }
-                    if delete_cleanup(context, storage_key).await.is_err() {
-                        pending = true;
-                    }
-                }
             }
         }
-        match next {
-            Some(next) => start_after = Some(next),
-            None => break,
-        }
     }
-    Ok(pending)
-}
-
-async fn scan_jobs(
-    storage: &StorageHandle,
-) -> Result<(HashSet<JobId>, HashSet<JobId>, HashSet<HiddenBlobKey>), String> {
-    let mut active = HashSet::new();
-    let mut active_rocrate = HashSet::new();
-    let mut referenced = HashSet::new();
-    let mut start_after = None;
-    loop {
-        // Scan the versioned record prefix only.
-        let (values, next) = iter_prefix_page(
-            storage,
-            JOB_KEYSPACE,
-            Some(ByteView::from(JOB_RECORD_KEY_PREFIX.to_vec())),
-            start_after.take(),
-            SWEEP_PAGE_SIZE,
-            None,
-        )
-        .await?;
-        for (_, value) in values {
-            let record = JobRecord::from_bytes(&value).map_err(|error| error.to_string())?;
-            if !record.state.is_terminal() {
-                active.insert(record.job_id);
-                if record.payload.is_rocrate() {
-                    active_rocrate.insert(record.job_id);
-                    for location in checkpoint_refs(storage, record.job_id).await? {
-                        referenced.insert(
-                            HiddenBlobKey::try_from(&location)
-                                .map_err(|error| error.to_string())?,
-                        );
-                    }
-                }
-            }
-            if let Some(JobResultPayload::ExportRoCrate(result)) = record.result
-                && let Some(artifact) = result.artifact
-            {
-                referenced.insert(
-                    HiddenBlobKey::try_from(&artifact.location)
-                        .map_err(|error| error.to_string())?,
-                );
-            }
-        }
-        match next {
-            Some(next) => start_after = Some(next),
-            None => break,
-        }
-    }
-    Ok((active, active_rocrate, referenced))
-}
-
-async fn checkpoint_refs(
-    storage: &StorageHandle,
-    job_id: JobId,
-) -> Result<Vec<BackendLocation>, String> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: ROCRATE_JOB_STATE_KEYSPACE.to_string(),
-            key: job_id.to_bytes().to_vec().into(),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => postcard::take_from_bytes::<RoCrateCheckpointRefs>(value.as_ref())
-            .map(|(refs, _)| refs.hidden_locations)
-            .map_err(|error| error.to_string()),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(Vec::new()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!(
-            "unexpected RO-Crate checkpoint read event: {other:?}"
-        )),
-    }
+    let more = next.is_some();
+    *cursor = next.map(|key| key.to_vec());
+    Ok((pending, more))
 }
 
 async fn sweep_uploads(
     context: &DriverContext,
-    active_jobs: &HashSet<JobId>,
     now_ms: u64,
-    referenced: &mut HashSet<HiddenBlobKey>,
-) -> Result<usize, String> {
+    cursor: &mut Option<Vec<u8>>,
+    deadline: Instant,
+) -> Result<(usize, bool, bool), String> {
     let mut deleted = 0usize;
-    let mut start_after = None;
-    loop {
-        let (values, next) = iter_prefix_page(
+    let mut pending = false;
+    let start_after = cursor.take().map(ByteView::from);
+    let (values, next) = tokio::time::timeout(
+        time_left(deadline),
+        iter_prefix_page(
             &context.storage_handle,
             ROCRATE_UPLOAD_KEYSPACE,
             None,
-            start_after.take(),
+            start_after,
             SWEEP_PAGE_SIZE,
             None,
-        )
-        .await?;
-        for (storage_key, value) in values {
-            let record: RoCrateUploadRecord =
-                postcard::from_bytes(&value).map_err(|error| error.to_string())?;
-            let key =
-                HiddenBlobKey::try_from(&record.location).map_err(|error| error.to_string())?;
-            if upload_is_live(&record, active_jobs, now_ms) {
-                referenced.insert(key);
+        ),
+    )
+    .await
+    .map_err(|_| "timed out scanning RO-Crate uploads".to_string())??;
+    for (_storage_key, value) in values {
+        if time_left(deadline).is_zero() {
+            return Err("hidden sweep budget exhausted".to_string());
+        }
+        let record: RoCrateUploadRecord = match postcard::from_bytes(&value) {
+            Ok(record) => record,
+            Err(error) => {
+                warn!(error = %error, "Failed to decode RO-Crate upload");
                 continue;
             }
-            delete_key(context, key).await?;
-            delete_record(&context.storage_handle, storage_key).await?;
-            deleted = deleted.saturating_add(1);
+        };
+        let key = match HiddenBlobKey::try_from(&record.location) {
+            Ok(key) => key,
+            Err(error) => {
+                warn!(error = %error, "Invalid RO-Crate upload location");
+                continue;
+            }
+        };
+        let record_cleanup =
+            match delete_unclaimed(&context.storage_handle, record.upload_id, now_ms, deadline)
+                .await
+            {
+                Ok(cleanup) => cleanup,
+                Err(error) => {
+                    warn!(error = %error, "Failed to claim stale RO-Crate upload cleanup");
+                    pending = true;
+                    continue;
+                }
+            };
+        if matches!(record_cleanup, RecordCleanup::Protected) {
+            continue;
         }
-        match next {
-            Some(next) => start_after = Some(next),
-            None => break,
+        if let Err(error) = delete_key(context, key, deadline).await {
+            warn!(error = %error, "Failed to delete stale upload blob");
+            pending = true;
+            continue;
         }
+        deleted = deleted.saturating_add(1);
     }
-    Ok(deleted)
+    let more = next.is_some();
+    *cursor = next.map(|key| key.to_vec());
+    Ok((deleted, more, pending))
 }
 
 fn upload_is_live(record: &RoCrateUploadRecord, active_jobs: &HashSet<JobId>, now_ms: u64) -> bool {

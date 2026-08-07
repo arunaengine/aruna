@@ -14,7 +14,9 @@ use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::METADATA_AUDIT_KEYSPACE;
 use aruna_core::metadata::MetadataAuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{AuthContext, MetadataAuditRecord, Permission, RealmId};
+use aruna_core::structs::{
+    AuthContext, MetadataAuditRecord, Permission, RealmConfigDocument, RealmId,
+};
 use aruna_core::types::{Effects, GroupId, Key, NodeId, Value};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -819,11 +821,7 @@ async fn local_audit_result(
         return Err(MetadataReadError::Unavailable);
     }
     let local_node = net_handle.node_id();
-    if !config
-        .nodes
-        .iter()
-        .any(|node| node.node_id == local_node.to_string() && node.kind.is_sync_eligible())
-    {
+    if !audit_member(&config, realm_id, local_node) {
         return Err(MetadataReadError::Unavailable);
     }
     let metadata = context
@@ -853,6 +851,14 @@ async fn local_audit_result(
     drive_until(operation, context.as_ref(), deadline)
         .await
         .map_err(|_| MetadataReadError::Unavailable)
+}
+
+fn audit_member(config: &RealmConfigDocument, realm_id: RealmId, node_id: NodeId) -> bool {
+    config.realm_id == realm_id
+        && config
+            .nodes
+            .iter()
+            .any(|node| node.node_id == node_id.to_string() && node.kind.is_sync_eligible())
 }
 
 async fn authorize_admin(
@@ -905,8 +911,8 @@ mod tests {
         AUDIT_OUTBOUND_LIMIT, AuditPageEntry, AuditPageResponse, Effect, Event, ListAuditError,
         ListAuditOperation, ListAuditRequest, LocalAuditPageOperation, MAX_AUDIT_CURSOR_CHARS,
         MAX_AUDIT_PAGE_SIZE, MAX_AUDIT_PEERS, MetadataReadError, NetEffect, NetEvent, Operation,
-        StorageEvent, audit_scope, authorize_admin, decode_cursor, drive_until, encode_cursor,
-        list_audit, select_peers,
+        StorageEvent, audit_member, audit_scope, authorize_admin, decode_cursor, drive_until,
+        encode_cursor, list_audit, select_peers,
     };
     use crate::driver::DriverContext;
     use crate::metadata::repository::{metadata_audit_key, write_audit_effect};
@@ -919,6 +925,7 @@ mod tests {
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::{
         Actor, AuthContext, Group, GroupAuthorizationDocument, RealmAuthorizationDocument,
+        RealmNodeKind,
     };
     use aruna_core::structs::{MetadataAuditOperation, MetadataAuditRecord, RealmId};
     use aruna_storage::storage::FjallStorage;
@@ -940,6 +947,22 @@ mod tests {
             occurred_at_ms: 1,
             details: None,
         }
+    }
+
+    #[test]
+    fn checks_audit_member() {
+        let realm_id = RealmId([1u8; 32]);
+        let node = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let mut config = aruna_core::structs::RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(node, RealmNodeKind::Server);
+
+        assert!(audit_member(&config, realm_id, node));
+        assert!(!audit_member(&config, RealmId([3u8; 32]), node));
+        assert!(!audit_member(
+            &config,
+            realm_id,
+            iroh::SecretKey::from_bytes(&[4u8; 32]).public()
+        ));
     }
 
     fn entry(
