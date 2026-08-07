@@ -38,7 +38,9 @@ use super::rocrate_jsonld::{
 };
 use super::store::{put_job_entry, put_rocrate_checkpoint};
 use crate::blob::hidden::delete_hidden;
-use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
+use crate::blob::resolve_blob_permission_paths::{
+    MAX_HASH_ALIASES, ResolveBlobPermissionPathsOperation,
+};
 use crate::blob_holders::GetBlobHoldersOperation;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
@@ -534,15 +536,32 @@ async fn extend_hash_candidates(
     let aliases = drive(ResolveBlobPermissionPathsOperation::new(hash), &ctx.driver)
         .await
         .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    if aliases.len() > MAX_HASH_ALIASES {
+        return Err(ExportFailure::Retryable(
+            "hash alias limit exceeded".to_string(),
+        ));
+    }
+    let mut seen_aliases = BTreeSet::<(String, Ulid)>::new();
+    for candidate in candidates.iter() {
+        if let CandidateSource::Local {
+            permission_path, ..
+        } = &candidate.source
+            && let Some(version) = candidate.resolved_version
+        {
+            seen_aliases.insert((permission_path.clone(), version));
+        }
+    }
     for alias in aliases
         .into_iter()
         .filter(|alias| alias.realm_id == spec.auth_context.realm_id)
     {
+        let alias_key = alias_identity(&alias);
+        if !seen_aliases.insert(alias_key) {
+            continue;
+        }
         match resolve_alias(ctx, spec, &alias, policies).await? {
             ResolveResult::Candidate(candidate) => {
-                if !candidates.contains(&candidate) {
-                    candidates.push(candidate);
-                }
+                candidates.push(candidate);
             }
             ResolveResult::Denied => *denied = true,
             ResolveResult::Missing { .. } => {}
@@ -558,23 +577,35 @@ async fn extend_hash_candidates(
         Ok(holders) => holders,
         Err(_) => return Ok(true),
     };
-    let remote_count = candidates
-        .iter()
-        .filter(|candidate| !matches!(candidate.source, CandidateSource::Local { .. }))
-        .count();
+    let mut seen_holders = BTreeSet::<(NodeId, [u8; 32])>::new();
+    for candidate in candidates.iter() {
+        if let CandidateSource::RemoteHash {
+            node_id,
+            hash: candidate_hash,
+        } = &candidate.source
+        {
+            seen_holders.insert((*node_id, *candidate_hash));
+        }
+    }
+    let remote_count = seen_holders.len();
     let holder_limit = REMOTE_ATTEMPTS.saturating_sub(remote_count);
     for node_id in holders.into_iter().take(holder_limit) {
+        if !seen_holders.insert((node_id, hash)) {
+            continue;
+        }
         let candidate = ExportCandidate {
             source: CandidateSource::RemoteHash { node_id, hash },
             report_source: ExportReportSource::Hash,
             resolved_version,
             expected_blake3: Some(hash),
         };
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
+        candidates.push(candidate);
     }
     Ok(false)
+}
+
+fn alias_identity(alias: &HashPathIndexKey) -> (String, Ulid) {
+    (alias.permission_path(), alias.version_id)
 }
 
 async fn resolve_exact(
@@ -3122,6 +3153,25 @@ mod tests {
         ));
         assert!(!learn_probe_hash(&mut entity, 0, hash));
         assert_eq!(entity.candidates.len(), 2);
+    }
+
+    #[test]
+    fn deduplicates_alias_identity() {
+        let realm_id = RealmId::from_bytes([11; 32]);
+        let alias = HashPathIndexKey::new(
+            [12; 32],
+            Ulid::from_bytes([13; 16]),
+            realm_id,
+            Ulid::from_bytes([14; 16]),
+            iroh::SecretKey::from_bytes(&[15; 32]).public(),
+            "bucket",
+            "key",
+        );
+        let mut identities = BTreeSet::new();
+        for _ in 0..=MAX_HASH_ALIASES {
+            identities.insert(alias_identity(&alias));
+        }
+        assert_eq!(identities.len(), 1);
     }
 
     async fn sample_archive() -> Vec<u8> {
