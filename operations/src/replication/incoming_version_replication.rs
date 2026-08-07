@@ -47,7 +47,6 @@ enum IncomingVersionReplicationState {
     ReadDestinationBucket,
     CreateDestinationBucket,
     LoadDestinationRouting,
-    CheckWriterPermissions,
     ReadExistingVersion,
     ReadReplacedBlob,
     ReadQuotaConfig,
@@ -270,7 +269,6 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::ReadDestinationBucket => "ReadDestinationBucket",
             IncomingVersionReplicationState::CreateDestinationBucket => "CreateDestinationBucket",
             IncomingVersionReplicationState::LoadDestinationRouting => "LoadDestinationRouting",
-            IncomingVersionReplicationState::CheckWriterPermissions => "CheckWriterPermissions",
             IncomingVersionReplicationState::ReadExistingVersion => "ReadExistingVersion",
             IncomingVersionReplicationState::ReadReplacedBlob => "ReadReplacedBlob",
             IncomingVersionReplicationState::ReadQuotaConfig => "ReadQuotaConfig",
@@ -1443,24 +1441,6 @@ impl Operation for IncomingVersionReplicationOperation {
                     );
                 }
                 self.read_destination_bucket()
-            }
-            IncomingVersionReplicationState::CheckWriterPermissions => {
-                let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
-                else {
-                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::SubOperation(SubOperationEvent::AuthorizationResult)",
-                        received: event,
-                    });
-                };
-
-                match allowed {
-                    Ok(true) => self.read_existing_version(),
-                    Ok(false) => self.reject_negotiation(
-                        IncomingVersionReplicationError::WriterPermissionDenied,
-                    ),
-                    Err(err) => self.reject_negotiation(err.into()),
-                }
             }
             IncomingVersionReplicationState::ReadExistingVersion => {
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {

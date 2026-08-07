@@ -3,7 +3,7 @@ use std::collections::{HashSet, VecDeque};
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -273,7 +273,6 @@ enum IncomingBaoReadState {
     ReadExactBucket,
     ReadHashAliases,
     ReadHashVersion,
-    CheckPermission,
     ReadLocation,
     SendAccepted,
     ServeRead,
@@ -492,7 +491,6 @@ impl IncomingBaoReadOperation {
             IncomingBaoReadState::ReadExactBucket => "read_exact_bucket",
             IncomingBaoReadState::ReadHashAliases => "read_hash_aliases",
             IncomingBaoReadState::ReadHashVersion => "read_hash_version",
-            IncomingBaoReadState::CheckPermission => "check_permission",
             IncomingBaoReadState::ReadLocation => "read_location",
             IncomingBaoReadState::SendAccepted => "send_accepted",
             IncomingBaoReadState::ServeRead => "serve_read",
@@ -652,30 +650,6 @@ impl IncomingBaoReadOperation {
         }
     }
 
-    fn handle_permission(&mut self, event: Event) -> Effects {
-        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
-            return self.unexpected(event);
-        };
-        match allowed {
-            Ok(true) => {
-                if matches!(&self.request.target, BaoReadTarget::ExactVersion(_)) {
-                    self.read_exact_version()
-                } else {
-                    self.read_location()
-                }
-            }
-            Ok(false) => {
-                self.had_denial = true;
-                if matches!(&self.request.target, BaoReadTarget::Blake3(_)) {
-                    self.next_candidate()
-                } else {
-                    self.send_refusal(BaoReadRefusal::ReadDenied)
-                }
-            }
-            Err(_) => self.send_refusal(BaoReadRefusal::BackendFailure),
-        }
-    }
-
     fn handle_location(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected(event);
@@ -729,7 +703,6 @@ impl Operation for IncomingBaoReadOperation {
             IncomingBaoReadState::ReadExactBucket => self.handle_exact_bucket(event),
             IncomingBaoReadState::ReadHashAliases => self.handle_hash_aliases(event),
             IncomingBaoReadState::ReadHashVersion => self.handle_hash_version(event),
-            IncomingBaoReadState::CheckPermission => self.handle_permission(event),
             IncomingBaoReadState::ReadLocation => self.handle_location(event),
             IncomingBaoReadState::SendAccepted => {
                 let Event::Blob(BlobEvent::MessageSent { .. }) = event else {
