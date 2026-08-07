@@ -696,10 +696,9 @@ fn select_forward_peers(
         .iter()
         .filter(|node| matches!(node.kind, RealmNodeKind::Management | RealmNodeKind::Server))
     {
-        let peer = node
-            .node_id
-            .parse::<NodeId>()
-            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+        let Ok(peer) = node.node_id.parse::<NodeId>() else {
+            continue;
+        };
         if peer == local_node || ranked.iter().any(|(candidate, _)| *candidate == peer) {
             continue;
         }
@@ -828,11 +827,11 @@ async fn forward_path_resolution(
     if let Some(error) = auth_error {
         return Err(error);
     }
-    if unavailable {
-        return Err(MetadataApiError::ServiceUnavailable);
-    }
     if let Some(result) = success {
         return Ok(result);
+    }
+    if unavailable {
+        return Err(MetadataApiError::ServiceUnavailable);
     }
     if not_found {
         Err(MetadataApiError::NotFound)
@@ -3432,6 +3431,10 @@ mod tests {
                 aruna_core::structs::RealmNodeKind::Server,
             );
         }
+        config.nodes.push(aruna_core::structs::RealmNode {
+            node_id: "invalid-node".to_string(),
+            kind: aruna_core::structs::RealmNodeKind::Server,
+        });
         let mut reversed = config.clone();
         reversed.nodes.reverse();
         let first = select_forward_peers(
