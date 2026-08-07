@@ -607,10 +607,14 @@ impl Operation for PermissionRulesOperation {
 mod test {
     use std::collections::{HashMap, HashSet};
 
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::operation::Operation;
     use aruna_core::UserId;
     use aruna_core::structs::{
-        AuthContext, MetadataRegistryRecord, PathRestriction, Permission,
-        RealmAuthorizationDocument, RealmId, Role,
+        AuthContext, GroupAuthorizationDocument, MetadataRegistryRecord, PathRestriction,
+        Permission, RealmAuthorizationDocument, RealmId, Role,
     };
     use ulid::Ulid;
 
@@ -885,5 +889,72 @@ mod test {
                 .expect("roles collected")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn reuses_parent_txn() {
+        let realm_id = RealmId([14u8; 32]);
+        let group_id = Ulid::from(15u128);
+        let txn_id = Ulid::from(16u128);
+        let mut operation = PermissionRulesOperation::new_with_txn(
+            PermissionRulesConfig {
+                auth_context: AuthContext::anonymous(realm_id),
+                path: format!("/{realm_id}/g/{group_id}"),
+            },
+            txn_id,
+        );
+
+        let effects = operation.start();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read {
+                key_space,
+                txn_id: Some(read_txn),
+                ..
+            })] if key_space == AUTH_KEYSPACE && *read_txn == txn_id
+        ));
+
+        let realm = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(postcard::to_allocvec(&realm).unwrap().into()),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read {
+                key_space,
+                txn_id: Some(read_txn),
+                ..
+            })] if key_space == AUTH_KEYSPACE && *read_txn == txn_id
+        ));
+
+        let group = GroupAuthorizationDocument::new_default_group_doc(
+            UserId::nil(realm_id),
+            realm_id,
+            group_id,
+        );
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(postcard::to_allocvec(&group).unwrap().into()),
+        }));
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert!(operation.finalize().is_ok());
+
+        let mut failed = PermissionRulesOperation::new_with_txn(
+            PermissionRulesConfig {
+                auth_context: AuthContext::anonymous(realm_id),
+                path: format!("/{realm_id}/g/{group_id}"),
+            },
+            txn_id,
+        );
+        failed.start();
+        let effects = failed.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: None,
+        }));
+        assert!(effects.is_empty());
+        assert!(failed.is_complete());
+        assert!(failed.finalize().is_err());
     }
 }
