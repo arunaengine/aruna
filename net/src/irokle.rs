@@ -35,8 +35,8 @@ use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
     DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, GROUP_OWNER_INDEX_KEYSPACE,
     METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-    NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE,
-    USER_SUBJECT_INDEX_KEYSPACE,
+    METADATA_GRAPH_LIFECYCLE_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
@@ -3661,15 +3661,6 @@ async fn apply_metadata_registry_upsert_to_storage(
     if !registry_identity_valid(&record) {
         return Ok(MetadataPlacementOutcome::Rejected);
     }
-    if metadata_graph_deleted_in_storage(storage, &record.graph_iri).await? {
-        storage_batch_delete_to(
-            storage,
-            metadata_registry_delete_entries(record.group_id, record.document_id),
-        )
-        .await?;
-        return Ok(MetadataPlacementOutcome::Accepted(()));
-    }
-
     let mut base_entries = metadata_registry_write_entries(&record)
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
     if let Some((_, _, value)) = base_entries.first_mut() {
@@ -3681,6 +3672,42 @@ async fn apply_metadata_registry_upsert_to_storage(
     };
     for _ in 0..2 {
         let txn_id = start_storage_transaction(storage).await?;
+        match record_fenced_txn(storage, &record, txn_id).await {
+            Ok(true) => {
+                let deletes = metadata_registry_delete_entries(record.group_id, record.document_id);
+                match storage_batch_delete_and_write_in_transaction(
+                    storage,
+                    txn_id,
+                    deletes,
+                    Vec::new(),
+                )
+                .await
+                {
+                    Ok(()) => return Ok(MetadataPlacementOutcome::Accepted(())),
+                    Err(NetError::Dht(message))
+                        if message == StorageError::TransactionConflict.to_string() =>
+                    {
+                        let _ = storage
+                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                            .await;
+                        continue;
+                    }
+                    Err(error) => {
+                        let _ = storage
+                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                            .await;
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
         match metadata_placement_fence_in_transaction(storage, &record, txn_id).await {
             Ok(MetadataPlacementOutcome::Accepted(MetadataPlacementFence)) => {}
             Ok(MetadataPlacementOutcome::Deferred(dependency)) => {
@@ -3779,18 +3806,74 @@ async fn apply_metadata_graph_lifecycle_to_storage(
     record: &MetadataGraphLifecycleRecord,
     primary_bytes: Vec<u8>,
 ) -> Result<bool> {
-    if record.is_deleted() && !metadata_graph_lifecycle_delete_current(storage, record).await? {
+    if !record.is_deleted() {
         return Ok(false);
     }
-
     let (key_space, key, _) = metadata_graph_lifecycle_write_entry(record)
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    storage_batch_write_to(storage, vec![(key_space, key, primary_bytes.into())]).await?;
-    if record.is_deleted() {
-        apply_metadata_registry_delete_to_storage(storage, record.group_id, record.document_id)
-            .await?;
+    for _ in 0..2 {
+        let txn_id = start_storage_transaction(storage).await?;
+        let delete = match delete_record_txn(storage, record.document_id, txn_id).await {
+            Ok(delete) => delete,
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        };
+        let Some(delete) = delete else {
+            let _ = storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Ok(false);
+        };
+        let registry_live = match registry_live_txn(
+            storage,
+            record.group_id,
+            record.document_id,
+            &delete,
+            txn_id,
+        )
+        .await
+        {
+            Ok(live) => live,
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        };
+        if !metadata_document_delete_matches_graph_lifecycle(&delete, record) || registry_live {
+            let _ = storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Ok(false);
+        }
+        let deletes = metadata_registry_delete_entries(record.group_id, record.document_id);
+        let writes = vec![(key_space.clone(), key.clone(), primary_bytes.clone().into())];
+        match storage_batch_delete_and_write_in_transaction(storage, txn_id, deletes, writes).await
+        {
+            Ok(()) => return Ok(true),
+            Err(NetError::Dht(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
     }
-    Ok(true)
+    Err(NetError::Dht(
+        "metadata graph lifecycle conflicted twice".to_string(),
+    ))
 }
 
 async fn apply_metadata_document_lifecycle_to_storage(
@@ -3798,23 +3881,95 @@ async fn apply_metadata_document_lifecycle_to_storage(
     record: &MetadataDocumentLifecycleRecord,
     change: DocumentSyncChange,
 ) -> Result<bool> {
-    let Some(writes) =
-        metadata_document_lifecycle_write_entries_if_current(storage, record, &change).await?
-    else {
-        return Ok(false);
-    };
-    storage_batch_write_to(storage, writes).await?;
-    if let MetadataDocumentLifecycleRecord::Delete { event } = record
-        && event.tombstone.is_deleted()
-    {
-        apply_metadata_registry_delete_to_storage(
-            storage,
-            event.tombstone.group_id,
-            event.tombstone.document_id,
+    for _ in 0..2 {
+        let txn_id = start_storage_transaction(storage).await?;
+        let writes = match metadata_document_lifecycle_write_entries_if_current(
+            storage, record, &change, txn_id,
         )
-        .await?;
+        .await
+        {
+            Ok(writes) => writes,
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        };
+        let cleanup_delete = if let MetadataDocumentLifecycleRecord::Delete { event } = record
+            && event.tombstone.is_deleted()
+        {
+            let current = match delete_record_txn(storage, record.document_id(), txn_id).await {
+                Ok(current) => current,
+                Err(error) => {
+                    let _ = storage
+                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                        .await;
+                    return Err(error);
+                }
+            };
+            if writes.is_some() {
+                Some(event.as_ref().clone())
+            } else {
+                current
+            }
+        } else {
+            None
+        };
+        let deletes = if let Some(delete) = cleanup_delete.as_ref() {
+            match registry_cleanup_txn(
+                storage,
+                delete.tombstone.group_id,
+                delete.tombstone.document_id,
+                delete,
+                txn_id,
+            )
+            .await
+            {
+                Ok(deletes) => deletes,
+                Err(error) => {
+                    let _ = storage
+                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                        .await;
+                    return Err(error);
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        if writes.is_none() && deletes.is_empty() {
+            let _ = storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Ok(false);
+        }
+        match storage_batch_delete_and_write_in_transaction(
+            storage,
+            txn_id,
+            deletes,
+            writes.unwrap_or_default(),
+        )
+        .await
+        {
+            Ok(()) => return Ok(true),
+            Err(NetError::Dht(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
     }
-    Ok(true)
+    Err(NetError::Dht(
+        "metadata document lifecycle conflicted twice".to_string(),
+    ))
 }
 
 async fn apply_metadata_registry_delete_to_storage(
@@ -3822,36 +3977,61 @@ async fn apply_metadata_registry_delete_to_storage(
     group_id: Ulid,
     document_id: Ulid,
 ) -> Result<()> {
-    let Some(delete) = metadata_document_delete_in_storage(storage, document_id).await? else {
-        return Ok(());
-    };
-    if metadata_document_delete_matches_registry(&delete, group_id, document_id)
-        && !metadata_registry_live_after_delete(storage, group_id, document_id, &delete).await?
-    {
-        storage_batch_delete_to(
-            storage,
-            metadata_registry_delete_entries(group_id, document_id),
-        )
-        .await?;
+    for _ in 0..2 {
+        let txn_id = start_storage_transaction(storage).await?;
+        let delete = match delete_record_txn(storage, document_id, txn_id).await {
+            Ok(delete) => delete,
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        };
+        let Some(delete) = delete else {
+            let _ = storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Ok(());
+        };
+        let deletes =
+            match registry_cleanup_txn(storage, group_id, document_id, &delete, txn_id).await {
+                Ok(deletes) => deletes,
+                Err(error) => {
+                    let _ = storage
+                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                        .await;
+                    return Err(error);
+                }
+            };
+        if deletes.is_empty() {
+            let _ = storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Ok(());
+        }
+        match storage_batch_delete_and_write_in_transaction(storage, txn_id, deletes, Vec::new())
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(NetError::Dht(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
     }
-    Ok(())
-}
-
-async fn metadata_graph_lifecycle_delete_current(
-    storage: &StorageHandle,
-    record: &MetadataGraphLifecycleRecord,
-) -> Result<bool> {
-    let Some(delete) = metadata_document_delete_in_storage(storage, record.document_id).await?
-    else {
-        return Ok(false);
-    };
-    if !metadata_document_delete_matches_graph_lifecycle(&delete, record) {
-        return Ok(false);
-    }
-    Ok(
-        !metadata_registry_live_after_delete(storage, record.group_id, record.document_id, &delete)
-            .await?,
-    )
+    Err(NetError::Dht(
+        "metadata registry cleanup conflicted twice".to_string(),
+    ))
 }
 
 fn metadata_document_delete_matches_graph_lifecycle(
@@ -3871,31 +4051,6 @@ fn metadata_document_delete_matches_registry(
     delete.tombstone.is_deleted()
         && delete.tombstone.group_id == group_id
         && delete.tombstone.document_id == document_id
-}
-
-async fn metadata_registry_live_after_delete(
-    storage: &StorageHandle,
-    group_id: Ulid,
-    document_id: Ulid,
-    delete: &MetadataDocumentDeleteRecord,
-) -> Result<bool> {
-    let target = DocumentSyncTarget::MetadataRegistry {
-        group_id,
-        document_id,
-    };
-    let Some(value) = storage_read_from(
-        storage,
-        target.storage_keyspace().to_string(),
-        target.storage_key(),
-    )
-    .await?
-    else {
-        return Ok(false);
-    };
-    let record: MetadataRegistryRecord =
-        postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    Ok(record.updated_at_ms > delete.tombstone.updated_at_ms
-        || record.last_event_id > delete.deleted_after_event_id)
 }
 
 async fn apply_admin_document_operation_to_storage(
@@ -4954,16 +5109,17 @@ async fn metadata_document_lifecycle_write_entries_if_current(
     storage: &StorageHandle,
     record: &MetadataDocumentLifecycleRecord,
     change: &DocumentSyncChange,
+    txn_id: TxnId,
 ) -> Result<Option<Vec<(String, ByteView, Value)>>> {
     let target = DocumentSyncTarget::MetadataDocumentLifecycle {
         document_id: record.document_id(),
     };
-    if incoming_metadata_document_lifecycle_stale_or_equal(storage, &target, change).await? {
+    if lifecycle_stale_txn(storage, &target, change, txn_id).await? {
         return Ok(None);
     }
     if let MetadataDocumentLifecycleRecord::Upsert { event } = record {
         validate_metadata_event(event)?;
-        if metadata_create_fenced_in_storage(storage, event).await? {
+        if create_fence_txn(storage, event, txn_id).await? {
             return Ok(None);
         }
     }
@@ -4989,15 +5145,17 @@ async fn metadata_document_lifecycle_write_entries_if_current(
     Ok(Some(entries))
 }
 
-async fn incoming_metadata_document_lifecycle_stale_or_equal(
+async fn lifecycle_stale_txn(
     storage: &StorageHandle,
     target: &DocumentSyncTarget,
     incoming: &DocumentSyncChange,
+    txn_id: TxnId,
 ) -> Result<bool> {
-    let value = storage_read_from(
+    let value = storage_read_from_transaction(
         storage,
         DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
         document_sync_revision_key(target),
+        Some(txn_id),
     )
     .await?;
     let Some(value) = value else {
@@ -5083,32 +5241,36 @@ fn metadata_registry_freshness(record: &MetadataRegistryRecord) -> (u64, Ulid) {
     (record.updated_at_ms, record.last_event_id)
 }
 
-async fn metadata_graph_deleted_in_storage(
+async fn graph_record_txn(
     storage: &StorageHandle,
     graph_iri: &str,
-) -> Result<bool> {
-    let value = storage_read_from(
+    txn_id: TxnId,
+) -> Result<Option<MetadataGraphLifecycleRecord>> {
+    let value = storage_read_from_transaction(
         storage,
-        aruna_core::keyspaces::METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+        METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
         metadata_graph_lifecycle_key(graph_iri),
+        Some(txn_id),
     )
     .await?;
     let Some(value) = value else {
-        return Ok(false);
+        return Ok(None);
     };
     let record: MetadataGraphLifecycleRecord =
         postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    Ok(record.is_deleted())
+    Ok(Some(record))
 }
 
-async fn metadata_document_delete_in_storage(
+async fn delete_record_txn(
     storage: &StorageHandle,
     document_id: Ulid,
+    txn_id: TxnId,
 ) -> Result<Option<MetadataDocumentDeleteRecord>> {
-    let value = storage_read_from(
+    let value = storage_read_from_transaction(
         storage,
         METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
         metadata_document_lifecycle_key(document_id),
+        Some(txn_id),
     )
     .await?;
     let Some(value) = value else {
@@ -5122,16 +5284,72 @@ async fn metadata_document_delete_in_storage(
     }
 }
 
-async fn metadata_create_fenced_in_storage(
+async fn create_fence_txn(
     storage: &StorageHandle,
     event: &MetadataCreateEventRecord,
+    txn_id: TxnId,
 ) -> Result<bool> {
-    if let Some(delete) =
-        metadata_document_delete_in_storage(storage, event.record.document_id).await?
-    {
+    if let Some(delete) = delete_record_txn(storage, event.record.document_id, txn_id).await? {
         return Ok(event.event_id <= delete.deleted_after_event_id);
     }
-    metadata_graph_deleted_in_storage(storage, &event.record.graph_iri).await
+    Ok(graph_record_txn(storage, &event.record.graph_iri, txn_id)
+        .await?
+        .is_some_and(|record| record.is_deleted()))
+}
+
+async fn record_fenced_txn(
+    storage: &StorageHandle,
+    record: &MetadataRegistryRecord,
+    txn_id: TxnId,
+) -> Result<bool> {
+    if let Some(delete) = delete_record_txn(storage, record.document_id, txn_id).await? {
+        return Ok(record.last_event_id <= delete.deleted_after_event_id);
+    }
+    Ok(graph_record_txn(storage, &record.graph_iri, txn_id)
+        .await?
+        .is_some_and(|record| record.is_deleted()))
+}
+
+async fn registry_live_txn(
+    storage: &StorageHandle,
+    group_id: Ulid,
+    document_id: Ulid,
+    delete: &MetadataDocumentDeleteRecord,
+    txn_id: TxnId,
+) -> Result<bool> {
+    let target = DocumentSyncTarget::MetadataRegistry {
+        group_id,
+        document_id,
+    };
+    let Some(value) = storage_read_from_transaction(
+        storage,
+        target.storage_keyspace().to_string(),
+        target.storage_key(),
+        Some(txn_id),
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+    let record: MetadataRegistryRecord =
+        postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    Ok(record.updated_at_ms > delete.tombstone.updated_at_ms
+        || record.last_event_id > delete.deleted_after_event_id)
+}
+
+async fn registry_cleanup_txn(
+    storage: &StorageHandle,
+    group_id: Ulid,
+    document_id: Ulid,
+    delete: &MetadataDocumentDeleteRecord,
+    txn_id: TxnId,
+) -> Result<Vec<(String, ByteView)>> {
+    if !metadata_document_delete_matches_registry(delete, group_id, document_id)
+        || registry_live_txn(storage, group_id, document_id, delete, txn_id).await?
+    {
+        return Ok(Vec::new());
+    }
+    Ok(metadata_registry_delete_entries(group_id, document_id))
 }
 
 async fn metadata_placement_fence_in_transaction(
