@@ -737,16 +737,6 @@ impl TransactionTracker {
             .is_some_and(|owner| owner.commit_unknown(txn_id))
     }
 
-    fn commit_timeout(&mut self, txn_id: TxnId) {
-        let storage_unknown = self
-            .owner
-            .as_ref()
-            .is_some_and(|owner| owner.commit_unknown(txn_id));
-        if self.states.contains_key(&txn_id) && !storage_unknown {
-            self.states.insert(txn_id, TransactionState::Open);
-        }
-    }
-
     fn retain(&self, txn_id: TxnId, state: TransactionState) {
         let Some(owner) = self.owner.as_ref() else {
             return;
@@ -923,9 +913,6 @@ fn drive_suboperation<'a>(
                         dispatch_effect(effect, context, depth).await
                     };
                     tracker.observe(transaction, &event);
-                    if commit && let Some(TransactionEffect::Commit(txn_id)) = transaction {
-                        tracker.commit_timeout(txn_id);
-                    }
                     committed |= commit_done(transaction, &event);
                     if !operation.is_complete() {
                         queue.extend(operation.step(event).into_iter().filter(|effect| {
@@ -1071,9 +1058,6 @@ pub async fn drive_until<O: Operation>(
                 }
             };
             tracker.observe(transaction, &event);
-            if commit && let Some(TransactionEffect::Commit(txn_id)) = transaction {
-                tracker.commit_timeout(txn_id);
-            }
             committed |= commit_done(transaction, &event);
             if !operation.is_complete() {
                 queue.extend(operation.step(event).into_iter().filter(|effect| {
@@ -1857,7 +1841,7 @@ mod test {
     }
 
     #[test]
-    fn unpolled_commit_open() {
+    fn commit_failure_kept() {
         let (handle, _receivers) = storage::StorageHandle::new();
         let id = ulid::Ulid::generate();
         let mut tracker = TransactionTracker::new(handle.clone());
@@ -1871,8 +1855,10 @@ mod test {
                 error: StorageError::CommitFailed,
             }),
         );
-        tracker.commit_timeout(id);
-        assert_eq!(tracker.states.get(&id), Some(&TransactionState::Open));
+        assert_eq!(
+            tracker.states.get(&id),
+            Some(&TransactionState::CommitUnknown)
+        );
         assert!(!handle.commit_unknown(id));
     }
 
