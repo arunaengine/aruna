@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use aruna_core::DhtKeyId;
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{
@@ -92,6 +93,8 @@ const DOCUMENT_SYNC_PEER_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 // Matches irokle's 1024-topic wire batches; the worst-case data stream sends
 // three messages per topic, staying under the peer's 4096-message stream cap.
 pub const DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT: usize = 1_024;
+const DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT: usize = 8;
+const DOCUMENT_SYNC_FANOUT_DOMAIN: &[u8] = b"aruna-document-sync-fanout-v1";
 const DOCUMENT_SYNC_INBOUND_SYNC_MESSAGE_LIMIT: usize = 4_096;
 const DOCUMENT_SYNC_INBOUND_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
 // Admission budgets: worst-case inbound cost is bounded before any stream is
@@ -135,6 +138,12 @@ struct PublishEventsOutcome {
     published_indices: Vec<usize>,
     retry_indices: Vec<usize>,
     retry_error: Option<String>,
+}
+
+#[derive(Debug)]
+struct PeerSelection {
+    peers: BTreeSet<PeerId>,
+    truncated: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -600,9 +609,10 @@ impl DocumentSyncService {
         topic_id: irokle_crate::TopicId,
         peers: Vec<NodeId>,
     ) -> Result<()> {
-        let sync_peers = self.sync_peers(peers);
-        self.allow_sync_peers(&sync_peers)?;
-        self.sync_topic(topic_id, sync_peers).await?;
+        let selection = self.sync_peer_selection(&peers, &topic_id);
+        self.log_peer_selection(topic_id, &selection);
+        self.allow_sync_peers(&selection.peers)?;
+        self.sync_topic(topic_id, selection).await?;
         self.flush_database()
     }
 
@@ -996,16 +1006,17 @@ impl DocumentSyncService {
         topic_id: irokle_crate::TopicId,
         peers: Vec<NodeId>,
     ) -> DocumentSyncNetEvent {
-        let sync_peers = self.sync_peers(peers);
-        if let Err(error) = self.allow_sync_peers(&sync_peers) {
-            return DocumentSyncNetEvent::Error {
-                target: None,
-                error: error.to_string(),
-            };
-        }
         match self.has_topic(topic_id) {
             Ok(true) => {
-                if let Err(error) = self.sync_topic(topic_id, sync_peers).await {
+                let selection = self.sync_peer_selection(&peers, &topic_id);
+                self.log_peer_selection(topic_id, &selection);
+                if let Err(error) = self.allow_sync_peers(&selection.peers) {
+                    return DocumentSyncNetEvent::Error {
+                        target: None,
+                        error: error.to_string(),
+                    };
+                }
+                if let Err(error) = self.sync_topic(topic_id, selection).await {
                     return DocumentSyncNetEvent::Error {
                         target: None,
                         error: error.to_string(),
@@ -1013,7 +1024,7 @@ impl DocumentSyncService {
                 }
             }
             Ok(false) => {
-                if let Err(error) = self.bootstrap_topic_from_peers(topic_id, &sync_peers).await {
+                if let Err(error) = self.bootstrap_topic_from_peers(topic_id, &peers).await {
                     return DocumentSyncNetEvent::Error {
                         target: None,
                         error: error.to_string(),
@@ -1054,13 +1065,6 @@ impl DocumentSyncService {
     ) -> DocumentSyncNetEvent {
         let sync_started = Instant::now();
         let target_count = topic_ids.len();
-        let sync_peers = self.sync_peers(peers);
-        if let Err(error) = self.allow_sync_peers(&sync_peers) {
-            return DocumentSyncNetEvent::Error {
-                target: None,
-                error: error.to_string(),
-            };
-        }
 
         let mut seen_topics = BTreeSet::new();
         let mut topic_ids_out: Vec<irokle_crate::TopicId> = Vec::new();
@@ -1075,7 +1079,7 @@ impl DocumentSyncService {
                     // found yet (e.g. an empty shard whose rank-0 holder has not
                     // created it) is skipped, not fatal — it arrives via gossip
                     // or a later anti-entropy pass.
-                    match self.bootstrap_topic_from_peers(topic_id, &sync_peers).await {
+                    match self.bootstrap_topic_from_peers(topic_id, &peers).await {
                         Ok(()) => topic_ids_out.push(topic_id),
                         Err(error) => {
                             debug!(%topic_id, error = %error, "skipping unbootstrappable document sync topic");
@@ -1094,7 +1098,7 @@ impl DocumentSyncService {
         let bootstrap_elapsed = sync_started.elapsed();
         let topic_ids = topic_ids_out;
         let peer_sync_started = Instant::now();
-        if let Err(error) = self.sync_topics(topic_ids.clone(), sync_peers).await {
+        if let Err(error) = self.sync_topics(topic_ids.clone(), &peers).await {
             return DocumentSyncNetEvent::Error {
                 target: None,
                 error: error.to_string(),
@@ -1478,6 +1482,39 @@ impl DocumentSyncService {
         sync_peers
     }
 
+    fn sync_peer_selection(
+        &self,
+        peers: &[NodeId],
+        topic_id: &irokle_crate::TopicId,
+    ) -> PeerSelection {
+        let mut subject = [0u8; 64];
+        subject[..32].copy_from_slice(topic_id.as_ref());
+        subject[32..].copy_from_slice(self.node.peer_id().as_bytes());
+        if peers.is_empty() {
+            let defaults = self.default_peers.read();
+            select_sync_peers(defaults.iter().copied(), self.node.peer_id(), &subject)
+        } else {
+            select_sync_peers(
+                peers
+                    .iter()
+                    .copied()
+                    .map(|node_id| node_id_to_peer_id(&node_id)),
+                self.node.peer_id(),
+                &subject,
+            )
+        }
+    }
+
+    fn log_peer_selection(&self, topic_id: irokle_crate::TopicId, selection: &PeerSelection) {
+        if selection.truncated {
+            debug!(
+                %topic_id,
+                selected = selection.peers.len(),
+                "Document sync fan-out bounded; omitted peers remain anti-entropy work"
+            );
+        }
+    }
+
     fn allow_sync_peers(&self, peers: &BTreeSet<PeerId>) -> Result<()> {
         self.node
             .add_peers_to_whitelist(peers.iter().copied())
@@ -1485,7 +1522,7 @@ impl DocumentSyncService {
     }
 
     async fn fan_out_peer_syncs<F, Fut>(
-        peers: BTreeSet<PeerId>,
+        selection: PeerSelection,
         context: String,
         run: F,
     ) -> Result<()>
@@ -1493,14 +1530,15 @@ impl DocumentSyncService {
         F: Fn(PeerId) -> Fut,
         Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
-        let attempted = peers.len();
+        let omitted = selection.truncated;
+        let attempted = selection.peers.len();
         if attempted == 0 {
             return Ok(());
         }
 
         let fanout_started = Instant::now();
         let mut syncs = JoinSet::new();
-        for peer in peers {
+        for peer in selection.peers {
             let future = run(peer);
             syncs.spawn(async move {
                 let peer_started = Instant::now();
@@ -1545,6 +1583,7 @@ impl DocumentSyncService {
             event = "pipeline.fanout.summary",
             context = %context,
             peers = attempted,
+            omitted,
             ok = successes,
             failed = attempted - successes,
             total_ms = duration_ms(fanout_started.elapsed()),
@@ -1563,11 +1602,11 @@ impl DocumentSyncService {
     async fn sync_topic(
         &self,
         topic_id: irokle_crate::TopicId,
-        peers: BTreeSet<PeerId>,
+        selection: PeerSelection,
     ) -> Result<()> {
         let net = self.net.clone();
         Self::fan_out_peer_syncs(
-            peers,
+            selection,
             format!("document sync topic {topic_id}"),
             move |peer| {
                 let net = net.clone();
@@ -1591,13 +1630,19 @@ impl DocumentSyncService {
     async fn sync_topics(
         &self,
         topic_ids: Vec<irokle_crate::TopicId>,
-        peers: BTreeSet<PeerId>,
+        peers: &[NodeId],
     ) -> Result<()> {
-        if topic_ids.is_empty() || peers.is_empty() {
+        if topic_ids.is_empty() {
             return Ok(());
         }
         for chunk in topic_ids.chunks(DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT) {
-            self.sync_topic_batch(chunk, peers.clone()).await?;
+            let Some(topic_id) = chunk.first() else {
+                continue;
+            };
+            let selection = self.sync_peer_selection(peers, topic_id);
+            self.log_peer_selection(*topic_id, &selection);
+            self.allow_sync_peers(&selection.peers)?;
+            self.sync_topic_batch(chunk, selection).await?;
         }
         Ok(())
     }
@@ -1605,7 +1650,7 @@ impl DocumentSyncService {
     async fn sync_topic_batch(
         &self,
         topic_ids: &[irokle_crate::TopicId],
-        peers: BTreeSet<PeerId>,
+        selection: PeerSelection,
     ) -> Result<()> {
         if topic_ids.is_empty() {
             return Ok(());
@@ -1613,7 +1658,7 @@ impl DocumentSyncService {
         let service = self.clone();
         let topic_ids = topic_ids.to_vec();
         Self::fan_out_peer_syncs(
-            peers,
+            selection,
             format!("document sync topic batch of {} topics", topic_ids.len()),
             move |peer| {
                 let service = service.clone();
@@ -1762,11 +1807,14 @@ impl DocumentSyncService {
     async fn bootstrap_topic_from_peers(
         &self,
         topic_id: irokle_crate::TopicId,
-        peers: &BTreeSet<PeerId>,
+        peers: &[NodeId],
     ) -> Result<()> {
+        let selection = self.sync_peer_selection(peers, &topic_id);
+        self.log_peer_selection(topic_id, &selection);
+        self.allow_sync_peers(&selection.peers)?;
         let mut first_error = None;
-        for peer in peers {
-            match self.bootstrap_topic_from_peer(topic_id, *peer).await {
+        for peer in selection.peers {
+            match self.bootstrap_topic_from_peer(topic_id, peer).await {
                 Ok(()) => return Ok(()),
                 Err(error) => {
                     warn!(%peer, %topic_id, error = %error, "Document sync bootstrap attempt failed");
@@ -5426,6 +5474,50 @@ fn node_id_to_peer_id(node_id: &NodeId) -> PeerId {
     PeerId::from_bytes(*node_id.as_bytes())
 }
 
+fn select_sync_peers(
+    candidates: impl IntoIterator<Item = PeerId>,
+    local_peer: PeerId,
+    subject: &[u8],
+) -> PeerSelection {
+    let mut ranked = Vec::with_capacity(DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT);
+    let mut truncated = false;
+    for peer in candidates {
+        if peer == local_peer || ranked.iter().any(|(candidate, _)| *candidate == peer) {
+            continue;
+        }
+        let score = peer_score(subject, peer);
+        if ranked.len() < DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT {
+            ranked.push((peer, score));
+            continue;
+        }
+        truncated = true;
+        let Some((worst_index, _)) = ranked.iter().enumerate().min_by(|(_, left), (_, right)| {
+            left.1
+                .cmp(&right.1)
+                .then_with(|| right.0.as_bytes().cmp(left.0.as_bytes()))
+        }) else {
+            continue;
+        };
+        let (worst_peer, worst_score) = ranked[worst_index];
+        if score > worst_score || (score == worst_score && peer.as_bytes() < worst_peer.as_bytes())
+        {
+            ranked[worst_index] = (peer, score);
+        }
+    }
+    PeerSelection {
+        peers: ranked.into_iter().map(|(peer, _)| peer).collect(),
+        truncated,
+    }
+}
+
+fn peer_score(subject: &[u8], peer: PeerId) -> [u8; 32] {
+    let mut input = Vec::with_capacity(DOCUMENT_SYNC_FANOUT_DOMAIN.len() + subject.len() + 32);
+    input.extend_from_slice(DOCUMENT_SYNC_FANOUT_DOMAIN);
+    input.extend_from_slice(subject);
+    input.extend_from_slice(peer.as_bytes());
+    *DhtKeyId::from_data(&input).as_bytes()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AdminOperationFamily {
     Group,
@@ -6988,6 +7080,28 @@ mod tests {
         assert!(budget.acquire(peer(3)).is_none());
         fill.clear();
         assert!(budget.acquire(peer(3)).is_some());
+    }
+
+    #[test]
+    fn sync_peers_bounded() {
+        let selection = select_sync_peers((1u8..=32).map(peer), peer(0), b"document-sync-subject");
+
+        assert_eq!(selection.peers.len(), DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT);
+        assert!(selection.truncated);
+        assert!(!selection.peers.contains(&peer(0)));
+    }
+
+    #[test]
+    fn sync_peers_order_free() {
+        let forward = select_sync_peers((1u8..=32).map(peer), peer(0), b"document-sync-subject");
+        let reverse = select_sync_peers(
+            (1u8..=32).rev().map(peer),
+            peer(0),
+            b"document-sync-subject",
+        );
+
+        assert_eq!(forward.peers, reverse.peers);
+        assert_ne!(forward.peers, (1u8..=8).map(peer).collect::<BTreeSet<_>>());
     }
 
     #[test]
@@ -11563,10 +11677,13 @@ mod tests {
     async fn fan_out_peer_syncs_fails_when_any_peer_failed() {
         let ok_peer = peer(1);
         let failed_peer = peer(2);
-        let peers = BTreeSet::from([ok_peer, failed_peer]);
+        let selection = PeerSelection {
+            peers: BTreeSet::from([ok_peer, failed_peer]),
+            truncated: false,
+        };
 
         let error = DocumentSyncService::fan_out_peer_syncs(
-            peers,
+            selection,
             "test document sync".to_string(),
             move |peer| async move {
                 if peer == ok_peer {
