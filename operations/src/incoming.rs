@@ -1,8 +1,8 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use crate::blob::blob_keyspace_helper::iter_hash_path_index_effect;
+use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
 use crate::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, schedule_outbox_drain_effect, write_outbox_effect,
@@ -18,6 +18,7 @@ use crate::metadata::projector::{
 use crate::metadata::prune_queue::process_metadata_graph_tombstones;
 use crate::notifications::watch::emit::emit_resource_watch_event;
 use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
+use crate::permission_rules::GroupPermissionRules;
 use crate::process_placements::process_shard_placements;
 use crate::queue_backoff::queue_retry_after_ms;
 use crate::replication::bao_read::IncomingBaoReadOperation;
@@ -27,7 +28,9 @@ use crate::replication::incoming_version_replication::{
 use crate::replication::location_summary::LocationSummaryOperation;
 use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
 use crate::request_authorization::{AuthorizeError, authorize};
-use crate::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
+use crate::request_policy::{
+    PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
+};
 use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use crate::usage_stats::refresh_realm_usage_summary_for_targets;
 use aruna_core::alpn::Alpn;
@@ -271,15 +274,15 @@ async fn bao_policy(
     local_realm: RealmId,
     local_node: NodeId,
     request: &crate::replication::protocol::BaoReadRequest,
-) -> Result<HashSet<String>, String> {
+) -> Result<(HashSet<String>, Vec<HashPathIndexKey>, bool), String> {
     let mut paths = HashSet::new();
-    if request.realm_id != local_realm || request.auth_context.realm_id != request.realm_id {
-        return Ok(paths);
+    if request.realm_id != local_realm || !auth_matches(&request.auth_context, request.realm_id) {
+        return Ok((paths, Vec::new(), false));
     }
     match &request.target {
         crate::replication::protocol::BaoReadTarget::ExactVersion(target) => {
             if target.realm_id != request.realm_id || target.node_id != local_node {
-                return Ok(paths);
+                return Ok((paths, Vec::new(), false));
             }
             let group_id =
                 match drive(GetBucketInfoOperation::new(target.bucket.clone()), context).await {
@@ -306,42 +309,68 @@ async fn bao_policy(
             {
                 paths.insert(path);
             }
+            return Ok((paths, Vec::new(), false));
         }
         crate::replication::protocol::BaoReadTarget::Blake3(hash) => {
-            let effect =
-                iter_hash_path_index_effect(hash, None, None).map_err(|error| error.to_string())?;
-            let Effect::Storage(effect) = effect else {
-                return Err("hash policy lookup emitted a non-storage effect".to_string());
-            };
-            let event = context.storage_handle.send_storage_effect(effect).await;
-            let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-                return Err(format!("hash policy lookup returned {event:?}"));
-            };
-            for (key, _) in values {
-                let candidate = HashPathIndexKey::from_bytes(key.as_ref())
-                    .map_err(|error| error.to_string())?;
+            let candidates = drive(ResolveBlobPermissionPathsOperation::new(*hash), context)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut unique = BTreeMap::new();
+            for candidate in candidates {
                 if candidate.realm_id != request.realm_id
                     || candidate.node_id != local_node
                     || candidate.blake3_hash != *hash
                 {
                     continue;
                 }
+                let key = candidate.to_bytes().map_err(|error| error.to_string())?;
+                unique.entry(key).or_insert(candidate);
+            }
+            let candidates = unique.into_values().collect::<Vec<_>>();
+            let evaluators = PolicyEvaluator::load_bulk(
+                context,
+                candidates
+                    .iter()
+                    .map(|candidate| (candidate.realm_id, candidate.group_id)),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            let permissions = GroupPermissionRules::collect(
+                context,
+                Some(&request.auth_context),
+                candidates.iter().map(|candidate| candidate.group_id),
+            )
+            .await;
+            let mut allowed = Vec::with_capacity(candidates.len());
+            let mut had_denial = false;
+            for candidate in candidates {
                 let path = candidate.permission_path();
-                if allow_policy(
-                    context,
-                    &request.auth_context,
+                if !permissions.allows(candidate.group_id, &path, &Permission::READ) {
+                    had_denial = true;
+                    continue;
+                }
+                let request = policy_request_with(
                     &path,
                     &Permission::READ,
-                    "s3.GetObject",
-                )
-                .await?
-                {
-                    paths.insert(path);
+                    Some(&request.auth_context.user_id),
+                    PolicyRequestExtras::operation("s3.GetObject"),
+                );
+                let evaluator = evaluators
+                    .get(&(candidate.realm_id, candidate.group_id))
+                    .ok_or_else(|| "hash policy evaluator is unavailable".to_string())?;
+                match evaluator.evaluate(&request) {
+                    Ok(()) => {
+                        paths.insert(path);
+                        allowed.push(candidate);
+                    }
+                    Err(PolicyEnforcementError::Denied { .. }) => had_denial = true,
+                    Err(error) => return Err(error.to_string()),
                 }
             }
+            return Ok((paths, allowed, had_denial));
         }
     }
-    Ok(paths)
+    Ok((paths, Vec::new(), false))
 }
 
 // Coalesces concurrent inbound reconcile triggers: one run in flight, all
@@ -650,7 +679,8 @@ impl InboundEventHandler for OperationsInboundHandler {
                                         }
                                     }
                                     Ok(VersionReplicationMessage::BaoReadRequest(request)) => {
-                                        let policy_paths = match bao_policy(
+                                        let (policy_paths, policy_candidates, had_denial) =
+                                            match bao_policy(
                                             self.context.as_ref(),
                                             *net_handle.realm_id(),
                                             net_handle.node_id(),
@@ -658,7 +688,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                                         )
                                         .await
                                         {
-                                            Ok(paths) => paths,
+                                            Ok(result) => result,
                                             Err(error) => {
                                                 error!(peer = %node_id, stream_id = %stream_id, error = %error, "Refusing inbound bao read with unavailable request policy");
                                                 close_failed_bao(&blob_handle, stream_id).await;
@@ -672,7 +702,8 @@ impl InboundEventHandler for OperationsInboundHandler {
                                             stream_id,
                                             request,
                                         )
-                                        .with_policy_paths(policy_paths);
+                                        .with_policy_paths(policy_paths)
+                                        .with_policy_candidates(policy_candidates, had_denial);
                                         if let Err(error) =
                                             drive(op, self.context.as_ref()).await
                                         {

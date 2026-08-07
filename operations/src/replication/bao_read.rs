@@ -19,7 +19,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use super::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget, VersionReplicationMessage};
-use crate::blob::blob_keyspace_helper::{blob_location_read, iter_hash_path_index_effect};
+use crate::blob::blob_keyspace_helper::blob_location_read;
 use crate::realm_peer::ensure_realm_peer;
 
 #[derive(Debug, PartialEq)]
@@ -271,7 +271,6 @@ enum IncomingBaoReadState {
     ReadRealm,
     ReadExactVersion,
     ReadExactBucket,
-    ReadHashAliases,
     ReadHashVersion,
     ReadLocation,
     SendAccepted,
@@ -296,6 +295,7 @@ pub struct IncomingBaoReadOperation {
     blob_hash: Option<[u8; 32]>,
     location_key: Option<BlobLocationKey>,
     location: Option<BackendLocation>,
+    candidates_ready: bool,
     had_denial: bool,
     refusal: Option<BaoReadRefusal>,
     output: Option<Result<IncomingBaoReadResult, BaoReadError>>,
@@ -322,6 +322,7 @@ impl IncomingBaoReadOperation {
             blob_hash: None,
             location_key: None,
             location: None,
+            candidates_ready: false,
             had_denial: false,
             refusal: None,
             output: None,
@@ -331,6 +332,17 @@ impl IncomingBaoReadOperation {
 
     pub fn with_policy_paths(mut self, paths: HashSet<String>) -> Self {
         self.policy_paths = paths;
+        self
+    }
+
+    pub fn with_policy_candidates(
+        mut self,
+        candidates: Vec<HashPathIndexKey>,
+        had_denial: bool,
+    ) -> Self {
+        self.candidates = candidates.into();
+        self.candidates_ready = true;
+        self.had_denial = had_denial;
         self
     }
 
@@ -385,17 +397,6 @@ impl IncomingBaoReadOperation {
             key: bucket.as_bytes().into(),
             txn_id: None,
         })]
-    }
-
-    fn read_hash_aliases(&mut self) -> Effects {
-        let Some(hash) = self.hash_target() else {
-            return self.send_refusal(BaoReadRefusal::InvalidTarget);
-        };
-        self.state = IncomingBaoReadState::ReadHashAliases;
-        match iter_hash_path_index_effect(&hash, None, None) {
-            Ok(effect) => smallvec![effect],
-            Err(error) => self.fail(error.into()),
-        }
     }
 
     fn next_candidate(&mut self) -> Effects {
@@ -489,7 +490,6 @@ impl IncomingBaoReadOperation {
             IncomingBaoReadState::ReadRealm => "read_realm",
             IncomingBaoReadState::ReadExactVersion => "read_exact_version",
             IncomingBaoReadState::ReadExactBucket => "read_exact_bucket",
-            IncomingBaoReadState::ReadHashAliases => "read_hash_aliases",
             IncomingBaoReadState::ReadHashVersion => "read_hash_version",
             IncomingBaoReadState::ReadLocation => "read_location",
             IncomingBaoReadState::SendAccepted => "send_accepted",
@@ -531,8 +531,10 @@ impl IncomingBaoReadOperation {
                     .is_some_and(|expected| expected != *hash)
                 {
                     self.send_refusal(BaoReadRefusal::HashMismatch)
+                } else if self.candidates_ready {
+                    self.next_candidate()
                 } else {
-                    self.read_hash_aliases()
+                    self.send_refusal(BaoReadRefusal::BackendFailure)
                 }
             }
         }
@@ -590,32 +592,6 @@ impl IncomingBaoReadOperation {
         } else {
             self.send_refusal(BaoReadRefusal::ReadDenied)
         }
-    }
-
-    fn handle_hash_aliases(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-            return self.unexpected(event);
-        };
-        let Some(hash) = self.hash_target() else {
-            return self.send_refusal(BaoReadRefusal::InvalidTarget);
-        };
-        let mut candidates = Vec::with_capacity(values.len());
-        for (key, _) in values {
-            let candidate = match HashPathIndexKey::from_bytes(key.as_ref()) {
-                Ok(candidate) => candidate,
-                Err(_) => return self.send_refusal(BaoReadRefusal::BackendFailure),
-            };
-            if candidate.realm_id == self.request.realm_id
-                && candidate.node_id == self.local_node
-                && candidate.blake3_hash == hash
-            {
-                candidates.push(candidate);
-            }
-        }
-        candidates
-            .sort_by_cached_key(|candidate| (candidate.permission_path(), candidate.version_id));
-        self.candidates = candidates.into();
-        self.next_candidate()
     }
 
     fn handle_hash_version(&mut self, event: Event) -> Effects {
@@ -682,6 +658,7 @@ impl Operation for IncomingBaoReadOperation {
     fn start(&mut self) -> Effects {
         if self.request.realm_id != self.local_realm
             || self.request.auth_context.realm_id != self.request.realm_id
+            || self.request.auth_context.user_id.realm_id != self.request.realm_id
         {
             return self.send_refusal(BaoReadRefusal::RealmPeerDenied);
         }
@@ -701,7 +678,6 @@ impl Operation for IncomingBaoReadOperation {
             IncomingBaoReadState::ReadRealm => self.handle_realm(event),
             IncomingBaoReadState::ReadExactVersion => self.handle_exact_version(event),
             IncomingBaoReadState::ReadExactBucket => self.handle_exact_bucket(event),
-            IncomingBaoReadState::ReadHashAliases => self.handle_hash_aliases(event),
             IncomingBaoReadState::ReadHashVersion => self.handle_hash_version(event),
             IncomingBaoReadState::ReadLocation => self.handle_location(event),
             IncomingBaoReadState::SendAccepted => {
@@ -796,8 +772,8 @@ mod tests {
     use aruna_core::operation::Operation;
     use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, RealmConfigDocument,
-        RealmId, RealmNodeKind, VersionedObjectArn,
+        AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, HashPathIndexKey,
+        RealmConfigDocument, RealmId, RealmNodeKind, VersionedObjectArn,
     };
     use aruna_core::types::Effects;
     use ulid::Ulid;
@@ -1109,5 +1085,29 @@ mod tests {
         }));
 
         assert_eq!(refusal_from(&effects), BaoReadRefusal::HashMismatch);
+    }
+
+    #[test]
+    fn hash_requires_candidates() {
+        let local_node = node_from_seed(1);
+        let peer = node_from_seed(2);
+        let hash = [4u8; 32];
+        let mut request = read_request(local_node, hash);
+        request.target = BaoReadTarget::Blake3(hash);
+        let mut operation = IncomingBaoReadOperation::new(
+            peer,
+            local_node,
+            test_realm(),
+            Ulid::from(9u128),
+            request,
+        );
+
+        operation.start();
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: Some(realm_value(peer)),
+        }));
+
+        assert_eq!(refusal_from(&effects), BaoReadRefusal::BackendFailure);
     }
 }
