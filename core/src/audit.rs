@@ -59,6 +59,7 @@ pub struct AuditPageBatch {
     pub horizon: Option<Vec<u8>>,
     pub completed_nodes: BTreeSet<NodeId>,
     pub missing_nodes: BTreeSet<NodeId>,
+    pub missing_overflow: usize,
     pub conflict: bool,
     pub bytes: usize,
 }
@@ -75,6 +76,7 @@ impl AuditPageBatch {
             horizon: None,
             completed_nodes: BTreeSet::new(),
             missing_nodes: BTreeSet::new(),
+            missing_overflow: 0,
             conflict: false,
             bytes: 0,
         }
@@ -82,7 +84,27 @@ impl AuditPageBatch {
 
     pub fn mark_missing(&mut self, node: NodeId) {
         self.completed_nodes.remove(&node);
-        self.missing_nodes.insert(node);
+        if self.missing_nodes.contains(&node) {
+            return;
+        }
+        if self.missing_nodes.len() == MAX_AUDIT_PEERS {
+            self.missing_overflow = self.missing_overflow.saturating_add(1);
+        } else {
+            self.missing_nodes.insert(node);
+        }
+    }
+
+    fn mark_complete(&mut self, node: NodeId) -> bool {
+        self.missing_nodes.remove(&node);
+        if self.completed_nodes.contains(&node) {
+            return true;
+        }
+        if self.completed_nodes.len() == MAX_AUDIT_PEERS {
+            self.missing_overflow = self.missing_overflow.saturating_add(1);
+            return false;
+        }
+        self.completed_nodes.insert(node);
+        true
     }
 
     pub fn add_page(
@@ -95,7 +117,9 @@ impl AuditPageBatch {
             self.mark_missing(node);
             return Err(error);
         }
-        self.completed_nodes.insert(node);
+        if !self.mark_complete(node) {
+            return Err(AuditPageError::TooManyPeers);
+        }
         if page.next_start_after.is_some() {
             let marker = page
                 .records
@@ -166,7 +190,10 @@ impl AuditPageBatch {
     }
 
     pub fn merge(&mut self, other: AuditPageBatch) {
-        self.completed_nodes.extend(other.completed_nodes);
+        self.missing_overflow = self.missing_overflow.saturating_add(other.missing_overflow);
+        for node in other.completed_nodes {
+            self.mark_complete(node);
+        }
         for node in other.missing_nodes {
             self.mark_missing(node);
         }
@@ -290,6 +317,8 @@ pub enum AuditPageError {
     TooLarge,
     #[error("invalid audit page marker")]
     InvalidMarker,
+    #[error("audit peer limit exceeded")]
+    TooManyPeers,
 }
 
 pub fn validate_page(
@@ -319,6 +348,7 @@ pub fn validate_page(
                 .document_id
                 .is_some_and(|document_id| entry.record.document_id != document_id)
             || entry.record.user_id.realm_id != request.realm_id
+            || key_document(&entry.key) != Some(entry.record.document_id)
             || invalid_iri(&entry.record)
         {
             return Err(AuditPageError::InvalidRecord);
@@ -373,4 +403,9 @@ fn page_bytes(page: &AuditPageResponse) -> Result<usize, AuditPageError> {
 
 fn invalid_iri(record: &MetadataAuditRecord) -> bool {
     record.graph_iri.trim().is_empty() || oxrdf::NamedNode::new(&record.graph_iri).is_err()
+}
+
+fn key_document(key: &[u8]) -> Option<Ulid> {
+    let bytes = key.get(16..32)?.try_into().ok()?;
+    Some(Ulid::from_bytes(bytes))
 }
