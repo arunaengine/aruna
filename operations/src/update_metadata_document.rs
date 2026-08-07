@@ -830,9 +830,12 @@ mod tests {
         METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
         METADATA_EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE,
         METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
-        METADATA_MATERIALIZATION_STATUS_KEYSPACE,
+        METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_RAW_BUDGET_KEYSPACE,
     };
-    use aruna_core::storage_entries::{document_sync_revision_key, metadata_registry_key};
+    use aruna_core::storage_entries::{
+        document_sync_revision_key, metadata_create_acceptance_key, metadata_event_log_key,
+        metadata_registry_key, raw_budget_key,
+    };
     use aruna_core::structs::{Actor, PlacementRef, RealmId};
 
     fn actor() -> Actor {
@@ -922,6 +925,92 @@ mod tests {
         })
     }
 
+    fn create_event(record: &MetadataRegistryRecord) -> MetadataCreateEventRecord {
+        let node_id = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+        MetadataCreateEventRecord {
+            event_id: record.establishing_event_id,
+            record: record.clone(),
+            user_id: aruna_core::UserId::local(Ulid::from_parts(2, 2), record.realm_id),
+            node_id,
+            payload: MetadataCreateEventPayload::Scaffold {
+                name: "name".to_string(),
+                description: "description".to_string(),
+                date_published: "date".to_string(),
+                license: None,
+            },
+            occurred_at_ms: record.created_at_ms,
+        }
+    }
+
+    fn budget(
+        record: &MetadataRegistryRecord,
+        events: u32,
+        encoded_bytes: u64,
+    ) -> MetadataRawOriginBudget {
+        let create = create_event(record);
+        let create_bytes = postcard::serialized_size(&create).unwrap() as u64;
+        let mut budget = raw_quotas(
+            record.document_id,
+            &record.holder_node_ids,
+            actor().node_id,
+            create_bytes,
+        )
+        .unwrap()
+        .into_iter()
+        .find(|budget| budget.node_id == actor().node_id)
+        .unwrap();
+        budget.events = events;
+        budget.encoded_bytes = encoded_bytes;
+        budget
+    }
+
+    fn raw_read_for(
+        record: &MetadataRegistryRecord,
+        node_id: aruna_core::NodeId,
+        budget: Option<MetadataRawOriginBudget>,
+    ) -> Event {
+        let create = create_event(record);
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    raw_budget_key(record.document_id, node_id),
+                    budget.map(|budget| postcard::to_allocvec(&budget).unwrap().into()),
+                ),
+                (
+                    metadata_create_acceptance_key(record.document_id),
+                    Some(postcard::to_allocvec(&create).unwrap().into()),
+                ),
+            ],
+        })
+    }
+
+    fn raw_read(record: &MetadataRegistryRecord, budget: Option<MetadataRawOriginBudget>) -> Event {
+        raw_read_for(record, actor().node_id, budget)
+    }
+
+    fn raw_budget_read(record: &MetadataRegistryRecord, events: u32, encoded_bytes: u64) -> Event {
+        raw_read(record, Some(budget(record, events, encoded_bytes)))
+    }
+
+    fn raw_missing_budget(record: &MetadataRegistryRecord) -> Event {
+        raw_read(record, None)
+    }
+
+    fn raw_missing_for(record: &MetadataRegistryRecord, node_id: aruna_core::NodeId) -> Event {
+        raw_read_for(record, node_id, None)
+    }
+
+    fn raw_events(record: &MetadataRegistryRecord) -> Event {
+        let create = create_event(record);
+        Event::Storage(StorageEvent::IterResult {
+            values: vec![(
+                metadata_event_log_key(record.document_id, create.event_id),
+                postcard::to_allocvec(&create).unwrap().into(),
+            )],
+            next_start_after: None,
+        })
+    }
+
     fn assert_no_graph_mutation_or_sync(effects: &[Effect]) {
         for effect in effects {
             match effect {
@@ -968,6 +1057,7 @@ mod tests {
             METADATA_MATERIALIZATION_STATUS_KEYSPACE,
             METADATA_MATERIALIZATION_JOB_KEYSPACE,
             METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
+            METADATA_RAW_BUDGET_KEYSPACE,
         ] {
             assert!(
                 writes
@@ -1043,7 +1133,7 @@ mod tests {
         };
         let txn_id = Ulid::generate();
         let mut operation = UpdateMetadataDocumentOperation::new(config(
-            actor,
+            actor.clone(),
             &record,
             UpdateMetadataDocumentMutation::ReplaceRoCrate {
                 jsonld: replace_jsonld(record.document_id, "Placement Preserved"),
@@ -1064,7 +1154,13 @@ mod tests {
                 ..
             })] if *read_txn == txn_id
         ));
-        let effects = operation.step(registry_read(&record));
+        operation.step(registry_read(&record));
+        operation.step(raw_budget_read(
+            &record,
+            1,
+            postcard::serialized_size(&create_event(&record)).unwrap() as u64,
+        ));
+        let effects = operation.step(raw_events(&record));
 
         let event = assert_update_batch(effects.as_slice(), txn_id, |payload| {
             matches!(payload, MetadataCreateEventPayload::ReplaceRoCrate { .. })
@@ -1110,12 +1206,220 @@ mod tests {
             })] if *read_txn == txn_id
         ));
 
+        operation.step(registry_read(&fenced));
+        operation.step(raw_budget_read(
+            &record,
+            1,
+            postcard::serialized_size(&create_event(&record)).unwrap() as u64,
+        ));
         let event = assert_update_batch(
-            operation.step(registry_read(&fenced)).as_slice(),
+            operation.step(raw_events(&record)).as_slice(),
             txn_id,
             |payload| matches!(payload, MetadataCreateEventPayload::UpsertDataEntity { .. }),
         );
         assert_eq!(event.record.placement, fenced.placement);
+    }
+
+    #[test]
+    fn rejects_raw_limit() {
+        let actor = actor();
+        let record = record(&actor);
+        let txn_id = Ulid::generate();
+        let mut operation = UpdateMetadataDocumentOperation::new(config(
+            actor,
+            &record,
+            UpdateMetadataDocumentMutation::UpsertDataEntity {
+                jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
+            },
+        ));
+
+        operation.start();
+        operation.step(registry_read(&record));
+        operation.step(realm_config_read(&record));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(registry_read(&record));
+        operation.step(raw_budget_read(
+            &record,
+            1,
+            postcard::serialized_size(&create_event(&record)).unwrap() as u64,
+        ));
+        let values = (0..RAW_EVENT_LIMIT)
+            .map(|index| (ByteView::from(vec![index as u8]), ByteView::from(vec![0])))
+            .collect();
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: Some(ByteView::from(vec![1])),
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
+                if *abort_txn == txn_id
+        ));
+        assert_eq!(
+            operation.finalize(),
+            Err(UpdateMetadataDocumentError::RawLimit)
+        );
+    }
+
+    #[test]
+    fn accepts_raw_history() {
+        let actor = actor();
+        let record = record(&actor);
+        let txn_id = Ulid::generate();
+        let mut operation = UpdateMetadataDocumentOperation::new(config(
+            actor,
+            &record,
+            UpdateMetadataDocumentMutation::UpsertDataEntity {
+                jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
+            },
+        ));
+
+        operation.start();
+        operation.step(registry_read(&record));
+        operation.step(realm_config_read(&record));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(registry_read(&record));
+        operation.step(raw_budget_read(
+            &record,
+            1,
+            postcard::serialized_size(&create_event(&record)).unwrap() as u64,
+        ));
+        let effects = operation.step(raw_events(&record));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchWrite {
+                txn_id: Some(write_txn),
+                ..
+            })] if *write_txn == txn_id
+        ));
+    }
+
+    #[test]
+    fn rebuilds_missing_budget() {
+        let actor = actor();
+        let record = record(&actor);
+        let create = create_event(&record);
+        let txn_id = Ulid::generate();
+        let mut operation = UpdateMetadataDocumentOperation::new(config(
+            actor.clone(),
+            &record,
+            UpdateMetadataDocumentMutation::UpsertDataEntity {
+                jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
+            },
+        ));
+
+        operation.start();
+        operation.step(registry_read(&record));
+        operation.step(realm_config_read(&record));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(registry_read(&record));
+        let effects = operation.step(raw_missing_budget(&record));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter {
+                limit: RAW_EVENT_LIMIT,
+                start: None,
+                ..
+            })]
+        ));
+        let create_value = postcard::to_allocvec(&create).unwrap();
+        let create_len = create_value.len() as u64;
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![(
+                metadata_event_log_key(record.document_id, create.event_id),
+                create_value.clone().into(),
+            )],
+            next_start_after: None,
+        }));
+        let event = assert_update_batch(effects.as_slice(), txn_id, |payload| {
+            matches!(payload, MetadataCreateEventPayload::UpsertDataEntity { .. })
+        });
+        let budget_value = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Storage(StorageEffect::BatchWrite { writes, .. }) => writes
+                    .iter()
+                    .find(|(keyspace, _, _)| keyspace == METADATA_RAW_BUDGET_KEYSPACE)
+                    .map(|(_, _, value)| value),
+                _ => None,
+            })
+            .expect("rebuilt budget write exists");
+        let budget: MetadataRawOriginBudget = postcard::from_bytes(budget_value).unwrap();
+        assert_eq!(budget.events, 2);
+        assert_eq!(
+            budget.encoded_bytes,
+            create_len + postcard::serialized_size(&event).unwrap() as u64
+        );
+        assert_eq!(budget.node_id, actor.node_id);
+        assert_eq!(event.record.document_id, record.document_id);
+    }
+
+    #[test]
+    fn rejects_new_origin() {
+        let creator = actor();
+        let original = record(&creator);
+        let mut current = original.clone();
+        let mut outsider = creator.clone();
+        outsider.node_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+        current.holder_node_ids = vec![outsider.node_id];
+        let txn_id = Ulid::generate();
+        let mut operation = UpdateMetadataDocumentOperation::new(config(
+            outsider.clone(),
+            &current,
+            UpdateMetadataDocumentMutation::UpsertDataEntity {
+                jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
+            },
+        ));
+
+        operation.start();
+        operation.step(registry_read(&current));
+        operation.step(realm_config_read(&current));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(registry_read(&current));
+        let effects = operation.step(raw_missing_for(&original, outsider.node_id));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
+                if *abort_txn == txn_id
+        ));
+        assert_eq!(
+            operation.finalize(),
+            Err(UpdateMetadataDocumentError::RawLimit)
+        );
+    }
+
+    #[test]
+    fn rejects_origin_budget() {
+        let actor = actor();
+        let record = record(&actor);
+        let txn_id = Ulid::generate();
+        let mut operation = UpdateMetadataDocumentOperation::new(config(
+            actor,
+            &record,
+            UpdateMetadataDocumentMutation::UpsertDataEntity {
+                jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
+            },
+        ));
+
+        operation.start();
+        operation.step(registry_read(&record));
+        operation.step(realm_config_read(&record));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(registry_read(&record));
+        operation.step(raw_budget_read(&record, METADATA_RAW_EVENT_LIMIT, 0));
+        let effects = operation.step(raw_events(&record));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
+                if *abort_txn == txn_id
+        ));
+        assert_eq!(
+            operation.finalize(),
+            Err(UpdateMetadataDocumentError::RawLimit)
+        );
     }
 
     #[test]
@@ -1186,6 +1490,14 @@ mod tests {
         assert_no_graph_mutation_or_sync(effects.as_slice());
         let effects = operation.step(registry_read(&record));
         assert_no_graph_mutation_or_sync(effects.as_slice());
+        let effects = operation.step(raw_budget_read(
+            &record,
+            1,
+            postcard::serialized_size(&create_event(&record)).unwrap() as u64,
+        ));
+        assert_no_graph_mutation_or_sync(effects.as_slice());
+        let effects = operation.step(raw_events(&record));
+        assert_no_graph_mutation_or_sync(effects.as_slice());
         assert_update_batch(effects.as_slice(), txn_id, |payload| {
             matches!(payload, MetadataCreateEventPayload::ReplaceRoCrate { .. })
         });
@@ -1212,7 +1524,13 @@ mod tests {
         assert_start_transaction(effects.as_slice());
 
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        let effects = operation.step(registry_read(&record));
+        operation.step(registry_read(&record));
+        operation.step(raw_budget_read(
+            &record,
+            1,
+            postcard::serialized_size(&create_event(&record)).unwrap() as u64,
+        ));
+        let effects = operation.step(raw_events(&record));
         let event = assert_update_batch(effects.as_slice(), txn_id, |payload| {
             matches!(payload, MetadataCreateEventPayload::UpsertDataEntity { .. })
         });
@@ -1220,7 +1538,7 @@ mod tests {
     }
 
     #[test]
-    fn update_with_no_holders_persists_projection_without_lifecycle_outbox() {
+    fn rejects_no_holders() {
         let actor = actor();
         let mut record = record(&actor);
         record.holder_node_ids.clear();
@@ -1239,73 +1557,17 @@ mod tests {
         assert_start_transaction(effects.as_slice());
 
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        let effects = operation.step(registry_read(&record));
-        let [
-            Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id: Some(write_txn_id),
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected update batch write, got {effects:?}");
-        };
-        assert_eq!(*write_txn_id, txn_id);
-        for keyspace in [
-            METADATA_EVENT_LOG_KEYSPACE,
-            METADATA_INDEX_KEYSPACE,
-            METADATA_DOCUMENT_INDEX_KEYSPACE,
-            METADATA_AUDIT_KEYSPACE,
-            METADATA_MATERIALIZATION_STATUS_KEYSPACE,
-            METADATA_MATERIALIZATION_JOB_KEYSPACE,
-            METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
-            METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-            DOCUMENT_SYNC_REVISION_KEYSPACE,
-        ] {
-            assert!(
-                writes
-                    .iter()
-                    .any(|(entry_keyspace, _, _)| entry_keyspace == keyspace),
-                "missing keyspace {keyspace} in update batch: {writes:?}"
-            );
-        }
-        assert!(
-            writes
-                .iter()
-                .all(|(keyspace, _, _)| keyspace != DOCUMENT_SYNC_OUTBOX_KEYSPACE)
-        );
-        let event = writes
-            .iter()
-            .find(|(keyspace, _, _)| keyspace == METADATA_EVENT_LOG_KEYSPACE)
-            .map(|(_, _, value)| {
-                postcard::from_bytes::<MetadataCreateEventRecord>(value)
-                    .expect("update event decodes")
-            })
-            .expect("event log write exists");
-        assert!(event.record.holder_node_ids.is_empty());
-        let lifecycle = writes
-            .iter()
-            .find(|(keyspace, _, _)| keyspace == METADATA_DOCUMENT_LIFECYCLE_KEYSPACE)
-            .map(|(_, _, value)| {
-                postcard::from_bytes::<MetadataDocumentLifecycleRecord>(value)
-                    .expect("lifecycle source decodes")
-            })
-            .expect("lifecycle source write exists");
+        operation.step(registry_read(&record));
+        let effects = operation.step(raw_missing_budget(&record));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
+                if *abort_txn == txn_id
+        ));
         assert_eq!(
-            lifecycle,
-            MetadataDocumentLifecycleRecord::Upsert {
-                event: Box::new(event.clone())
-            }
+            operation.finalize(),
+            Err(UpdateMetadataDocumentError::RawLimit)
         );
-        let revision = writes
-            .iter()
-            .find(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_REVISION_KEYSPACE)
-            .map(|(_, _, value)| {
-                postcard::from_bytes::<DocumentSyncChange>(value)
-                    .expect("lifecycle revision decodes")
-            })
-            .expect("lifecycle revision write exists");
-        assert_eq!(revision.current.event_id, event.event_id);
-        assert_eq!(revision.current.generation, event.record.updated_at_ms);
     }
 
     #[test]
@@ -1333,6 +1595,14 @@ mod tests {
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert_no_graph_mutation_or_sync(effects.as_slice());
         let effects = operation.step(registry_read(&record));
+        assert_no_graph_mutation_or_sync(effects.as_slice());
+        let effects = operation.step(raw_budget_read(
+            &record,
+            1,
+            postcard::serialized_size(&create_event(&record)).unwrap() as u64,
+        ));
+        assert_no_graph_mutation_or_sync(effects.as_slice());
+        let effects = operation.step(raw_events(&record));
         assert_no_graph_mutation_or_sync(effects.as_slice());
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: Vec::new(),
