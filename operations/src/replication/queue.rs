@@ -12,9 +12,10 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    ArunaArn, AuthContext, BucketInfo, BucketReplicationConfig, SyncMode, SyncRelationship,
-    SyncState, WatchEvent, WatchEventDetail, WatchEventKind, blob_object_permission_path,
-    data_watch_resource_path, sync_relationship_key, sync_relationship_prefix,
+    ArunaArn, AuthContext, BucketInfo, BucketReplicationConfig, BucketReplicationTarget, SyncMode,
+    SyncRelationship, SyncState, WatchEvent, WatchEventDetail, WatchEventKind,
+    blob_object_permission_path, data_watch_resource_path, sync_relationship_key,
+    sync_relationship_prefix,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
@@ -108,7 +109,8 @@ struct BlobReplicationJobIdentity<'a> {
 pub struct LiveReplicationContinuation {
     pub relationship_after: Option<Vec<u8>>,
     pub relationships_complete: bool,
-    pub config_after: usize,
+    pub relationship_targets: Vec<(NodeId, String)>,
+    pub config_after: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -939,6 +941,10 @@ fn live_replication_jobs_from_config(
         .collect()
 }
 
+fn target_key(target: &BucketReplicationTarget) -> Result<Vec<u8>, ConversionError> {
+    Ok(postcard::to_allocvec(target)?)
+}
+
 fn config_jobs_page(
     local_node_id: NodeId,
     auth_context: &AuthContext,
@@ -947,17 +953,27 @@ fn config_jobs_page(
     version_id: Ulid,
     delete_marker: bool,
     config: BucketReplicationConfig,
-    start: usize,
+    start: Option<&[u8]>,
     limit: usize,
-) -> (Vec<BlobReplicationJobRecord>, Option<usize>) {
+) -> Result<(Vec<BlobReplicationJobRecord>, Option<Vec<u8>>), ConversionError> {
+    let mut targets = config
+        .targets
+        .into_iter()
+        .map(|target| target_key(&target).map(|key| (key, target)))
+        .collect::<Result<Vec<_>, _>>()?;
+    targets.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    targets.dedup_by(|left, right| left.0 == right.0);
     let now_ms = unix_timestamp_millis();
     let mut jobs = Vec::with_capacity(limit);
-    for (index, target) in config.targets.into_iter().enumerate().skip(start) {
+    for (key, target) in targets {
+        if start.is_some_and(|after| key.as_slice() <= after) {
+            continue;
+        }
         if target.node_id == local_node_id || (delete_marker && !target.replicate_delete_markers) {
             continue;
         }
         if jobs.len() == limit {
-            return (jobs, Some(index));
+            return Ok((jobs, Some(key)));
         }
         jobs.push(
             BlobReplicationJobRecord::new(
@@ -978,7 +994,7 @@ fn config_jobs_page(
             .with_writer_auth(auth_context.clone()),
         );
     }
-    (jobs, None)
+    Ok((jobs, None))
 }
 
 pub async fn restore_blob_replication_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
@@ -1779,12 +1795,17 @@ fn continuation_newer(
         return candidate.relationships_complete;
     }
     if candidate.relationships_complete {
-        return candidate.config_after > current.config_after;
+        return match (&candidate.config_after, &current.config_after) {
+            (Some(candidate), Some(current)) => candidate > current,
+            (Some(_), None) => true,
+            (None, Some(_)) | (None, None) => false,
+        };
     }
     match (&candidate.relationship_after, &current.relationship_after) {
         (Some(candidate), Some(current)) => candidate > current,
         (Some(_), None) => true,
-        (None, Some(_)) | (None, None) => false,
+        (None, Some(_)) => false,
+        (None, None) => candidate.relationship_targets.len() > current.relationship_targets.len(),
     }
 }
 
@@ -2008,7 +2029,7 @@ async fn write_live_jobs(
     }
     let mut cursor = obligation.continuation.clone().unwrap_or_default();
     let mut relationship_jobs = Vec::with_capacity(LIVE_REPLICATION_JOB_LIMIT);
-    let mut relationship_targets = Vec::with_capacity(LIVE_REPLICATION_JOB_LIMIT);
+    let mut relationship_targets = cursor.relationship_targets.clone();
     if !cursor.relationships_complete {
         let Some(page) = relationships else {
             return Ok(LiveRepairWrite {
@@ -2053,7 +2074,12 @@ async fn write_live_jobs(
                 }
                 relationship_jobs.push(job);
                 if let Some(target) = target {
-                    relationship_targets.push(target);
+                    if !relationship_targets
+                        .iter()
+                        .any(|existing| existing == &target)
+                    {
+                        relationship_targets.push(target);
+                    }
                 }
                 if relationship_jobs.len() == LIVE_REPLICATION_JOB_LIMIT {
                     complete = index + 1 == page.values.len() && page.next.is_none();
@@ -2077,15 +2103,16 @@ async fn write_live_jobs(
             cursor.relationships_complete = true;
         } else {
             cursor.relationships_complete = false;
-            cursor.config_after = 0;
+            cursor.config_after = None;
         }
     }
+    cursor.relationship_targets = relationship_targets;
     let mut continuation = (!cursor.relationships_complete).then(|| cursor.clone());
     if cursor.relationships_complete
         && obligation.origin.is_none()
         && let Some(config) = config
     {
-        let config = filter_config(config.clone(), &relationship_targets);
+        let config = filter_config(config.clone(), &cursor.relationship_targets);
         let available = LIVE_REPLICATION_JOB_LIMIT.saturating_sub(relationship_jobs.len());
         let (legacy, next_config) = config_jobs_page(
             obligation.local_node_id,
@@ -2095,15 +2122,15 @@ async fn write_live_jobs(
             obligation.version_id,
             obligation.delete_marker,
             config,
-            cursor.config_after,
+            cursor.config_after.as_deref(),
             available,
-        );
+        )?;
         relationship_jobs.extend(legacy);
         if let Some(next_config) = next_config {
             cursor.config_after = next_config;
             continuation = Some(cursor);
         } else {
-            cursor.config_after = 0;
+            cursor.config_after = None;
             continuation = None;
         }
     }
