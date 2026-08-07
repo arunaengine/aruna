@@ -109,7 +109,6 @@ struct BlobReplicationJobIdentity<'a> {
 pub struct LiveReplicationContinuation {
     pub relationship_after: Option<Vec<u8>>,
     pub relationships_complete: bool,
-    pub relationship_targets: Vec<(NodeId, String)>,
     pub config_after: Option<Vec<u8>>,
 }
 
@@ -965,6 +964,7 @@ fn config_jobs_page(
     targets.dedup_by(|left, right| left.0 == right.0);
     let now_ms = unix_timestamp_millis();
     let mut jobs = Vec::with_capacity(limit);
+    let mut last_key = None;
     for (key, target) in targets {
         if start.is_some_and(|after| key.as_slice() <= after) {
             continue;
@@ -973,7 +973,7 @@ fn config_jobs_page(
             continue;
         }
         if jobs.len() == limit {
-            return Ok((jobs, Some(key)));
+            return Ok((jobs, Some(last_key.unwrap_or(key))));
         }
         jobs.push(
             BlobReplicationJobRecord::new(
@@ -993,6 +993,7 @@ fn config_jobs_page(
             )
             .with_writer_auth(auth_context.clone()),
         );
+        last_key = Some(key);
     }
     Ok((jobs, None))
 }
@@ -1804,8 +1805,7 @@ fn continuation_newer(
     match (&candidate.relationship_after, &current.relationship_after) {
         (Some(candidate), Some(current)) => candidate > current,
         (Some(_), None) => true,
-        (None, Some(_)) => false,
-        (None, None) => candidate.relationship_targets.len() > current.relationship_targets.len(),
+        (None, Some(_)) | (None, None) => false,
     }
 }
 
@@ -2029,7 +2029,7 @@ async fn write_live_jobs(
     }
     let mut cursor = obligation.continuation.clone().unwrap_or_default();
     let mut relationship_jobs = Vec::with_capacity(LIVE_REPLICATION_JOB_LIMIT);
-    let mut relationship_targets = cursor.relationship_targets.clone();
+    let mut relationship_targets = Vec::with_capacity(LIVE_REPLICATION_JOB_LIMIT);
     if !cursor.relationships_complete {
         let Some(page) = relationships else {
             return Ok(LiveRepairWrite {
@@ -2074,12 +2074,7 @@ async fn write_live_jobs(
                 }
                 relationship_jobs.push(job);
                 if let Some(target) = target {
-                    if !relationship_targets
-                        .iter()
-                        .any(|existing| existing == &target)
-                    {
-                        relationship_targets.push(target);
-                    }
+                    relationship_targets.push(target);
                 }
                 if relationship_jobs.len() == LIVE_REPLICATION_JOB_LIMIT {
                     complete = index + 1 == page.values.len() && page.next.is_none();
@@ -2106,13 +2101,12 @@ async fn write_live_jobs(
             cursor.config_after = None;
         }
     }
-    cursor.relationship_targets = relationship_targets;
     let mut continuation = (!cursor.relationships_complete).then(|| cursor.clone());
     if cursor.relationships_complete
         && obligation.origin.is_none()
         && let Some(config) = config
     {
-        let config = filter_config(config.clone(), &cursor.relationship_targets);
+        let config = filter_config(config.clone(), &relationship_targets);
         let available = LIVE_REPLICATION_JOB_LIMIT.saturating_sub(relationship_jobs.len());
         let (legacy, next_config) = config_jobs_page(
             obligation.local_node_id,
@@ -2778,7 +2772,7 @@ mod tests {
                 key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
                 prefix: None,
                 start: None,
-                limit: 16,
+                limit: LIVE_REPLICATION_RELATIONSHIP_LIMIT,
                 txn_id: None,
             })
             .await
@@ -3106,6 +3100,20 @@ mod tests {
                 .collect(),
             other => panic!("unexpected storage event: {other:?}"),
         }
+    }
+
+    async fn repair_live(storage: &StorageHandle) {
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        process_live_replication_obligations(&context)
+            .await
+            .expect("live obligation repairs");
     }
 
     #[tokio::test]
@@ -3448,6 +3456,83 @@ mod tests {
         assert!(!stored);
     }
 
+    #[test]
+    fn config_cursor_stable() {
+        let config = BucketReplicationConfig {
+            targets: vec![
+                BucketReplicationTarget {
+                    node_id: node(3),
+                    realm_id: realm(),
+                    bucket: "bucket".to_string(),
+                    arn: "remote-b".to_string(),
+                    replicate_delete_markers: true,
+                },
+                BucketReplicationTarget {
+                    node_id: node(2),
+                    realm_id: realm(),
+                    bucket: "bucket".to_string(),
+                    arn: "remote-a".to_string(),
+                    replicate_delete_markers: true,
+                },
+            ],
+        };
+        let (first, after) = config_jobs_page(
+            node(1),
+            &auth_context(),
+            "bucket",
+            "key",
+            Ulid::from_parts(90, 1),
+            false,
+            config.clone(),
+            None,
+            1,
+        )
+        .unwrap();
+        let (second, end) = config_jobs_page(
+            node(1),
+            &auth_context(),
+            "bucket",
+            "key",
+            Ulid::from_parts(90, 1),
+            false,
+            config,
+            Some(after.as_deref().unwrap()),
+            1,
+        )
+        .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_ne!(
+            first[0].input.target_node_id,
+            second[0].input.target_node_id
+        );
+        assert!(end.is_none());
+    }
+
+    #[test]
+    fn continuation_order() {
+        let current = LiveReplicationContinuation {
+            relationship_after: Some(vec![2]),
+            relationships_complete: false,
+            config_after: None,
+        };
+        let older = LiveReplicationContinuation {
+            relationship_after: Some(vec![1]),
+            ..current.clone()
+        };
+        let newer = LiveReplicationContinuation {
+            relationship_after: Some(vec![3]),
+            ..current.clone()
+        };
+        let complete = LiveReplicationContinuation {
+            relationships_complete: true,
+            ..current.clone()
+        };
+        assert!(!continuation_newer(&older, &current));
+        assert!(continuation_newer(&newer, &current));
+        assert!(continuation_newer(&complete, &current));
+    }
+
     #[tokio::test]
     async fn duplicate_blob_replication_request_preserves_future_retry() {
         let temp_dir = tempdir().expect("temp dir");
@@ -3756,7 +3841,9 @@ mod tests {
         .await
         .expect("relationship queue succeeds");
 
-        assert_eq!(result.queued, 2);
+        assert_eq!(result.queued, 0);
+        assert_eq!(read_obligations(&storage).await.len(), 1);
+        repair_live(&storage).await;
         let jobs = read_jobs(&storage).await;
         assert_eq!(jobs.len(), 2);
         assert!(jobs.iter().any(|(_, job)| {
@@ -3806,7 +3893,8 @@ mod tests {
         .await
         .expect("relationship queue succeeds");
 
-        assert_eq!(result.queued, 1);
+        assert_eq!(result.queued, 0);
+        repair_live(&storage).await;
         let jobs = read_jobs(&storage).await;
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].1.relationship_id, Some(included.id));
@@ -3845,7 +3933,8 @@ mod tests {
         .await
         .expect("merged queue succeeds");
 
-        assert_eq!(result.queued, 2);
+        assert_eq!(result.queued, 0);
+        repair_live(&storage).await;
         let jobs = read_jobs(&storage).await;
         assert_eq!(jobs.len(), 2);
         let relationship_job = jobs
@@ -3895,7 +3984,8 @@ mod tests {
         .await
         .expect("live queue succeeds");
 
-        assert_eq!(result.queued, 1);
+        assert_eq!(result.queued, 0);
+        repair_live(&storage).await;
         let jobs = read_jobs(&storage).await;
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].1.input.target_node_id, node(3));
@@ -3970,6 +4060,7 @@ mod tests {
         .await
         .expect("live queue succeeds");
 
+        repair_live(&storage).await;
         assert_eq!(result.queued, 0);
         let jobs = read_jobs(&storage).await;
         assert_eq!(
@@ -3979,6 +4070,72 @@ mod tests {
                 future_job
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn repair_continues_jobs() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        for id in 100..165 {
+            write_relationship(&storage, &relationship(id, 2, None, true)).await;
+        }
+        write_live_obligation(&storage, Ulid::from_parts(91, 1)).await;
+
+        repair_live(&storage).await;
+        assert_eq!(read_jobs(&storage).await.len(), LIVE_REPLICATION_JOB_LIMIT);
+        assert_eq!(read_obligations(&storage).await.len(), 1);
+
+        repair_live(&storage).await;
+        assert_eq!(read_jobs(&storage).await.len(), 65);
+        assert!(read_obligations(&storage).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn relationship_page_caps() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let writes = (200..1225)
+            .map(|id| {
+                let relationship = relationship(id, 2, None, true);
+                (
+                    SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
+                    sync_relationship_key("bucket", relationship.id).into(),
+                    relationship.to_bytes().unwrap().into(),
+                )
+            })
+            .collect();
+        match storage
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+            other => panic!("unexpected relationship batch write event: {other:?}"),
+        }
+
+        let first = read_relationships_limit(
+            &storage,
+            "bucket",
+            None,
+            LIVE_REPLICATION_RELATIONSHIP_LIMIT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.values.len(), LIVE_REPLICATION_RELATIONSHIP_LIMIT);
+        let second = read_relationships_limit(
+            &storage,
+            "bucket",
+            Some(first.next.clone().expect("relationship page continues")),
+            LIVE_REPLICATION_RELATIONSHIP_LIMIT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.values.len(), 1);
+        assert!(second.next.is_none());
     }
 
     #[tokio::test]
@@ -4094,6 +4251,35 @@ mod tests {
             .await
             .expect("wrapped scan restarts");
         assert_eq!(restarted.jobs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cursor_malformed_resets() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        write_raw_queue_record(
+            &storage,
+            NODE_STATE_KEYSPACE,
+            REPLICATION_CURSOR_KEY.to_vec(),
+            vec![0xff],
+        )
+        .await;
+        write_blob_replication_job(
+            &storage,
+            &BlobReplicationJobRecord::new(on_demand_input(), None, unix_timestamp_millis()),
+        )
+        .await
+        .expect("job writes");
+
+        let scan = scan_due_blob_replication_jobs(&storage, unix_timestamp_millis(), 1)
+            .await
+            .expect("malformed cursor resets");
+        assert_eq!(scan.jobs.len(), 1);
+        advance_replication_cursor(&storage, scan.next_cursor)
+            .await
+            .expect("reset cursor persists");
+        assert!(read_replication_cursor(&storage).await.is_ok());
     }
 
     #[tokio::test]
