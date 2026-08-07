@@ -73,7 +73,7 @@ use irokle_crate::Event as _;
 use irokle_crate::Storage as _;
 use irokle_crate::TopicControl;
 use irokle_crate::net::{decode_sync_message, encode_frame, encode_sync_message};
-use irokle_crate::oplog::{Oplog, topological_subset};
+use irokle_crate::oplog::Oplog;
 use irokle_crate::sync::{SyncData, SyncMessage, SyncRequest};
 use irokle_crate::{
     EventEnvelope, PeerId, ReplicationPolicy, TopicEviction, TopicGenesis, TopicPayload,
@@ -111,6 +111,7 @@ const DOCUMENT_SYNC_INBOUND_GLOBAL_STREAMS: usize = 64;
 const DOCUMENT_SYNC_INBOUND_PEER_BYTES: usize = 512 * 1024 * 1024;
 const DOCUMENT_SYNC_INBOUND_GLOBAL_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const DOCUMENT_SYNC_FRAME_LEN_LIMIT: usize = 16 * 1024 * 1024;
+const DOCUMENT_SYNC_REPLAY_BATCH_LIMIT: usize = 1_024;
 const MAX_DEFERRED_TOPICS: usize = 1_024;
 const MAX_DEFERRED_TOPICS_PER_DEPENDENCY: usize = 256;
 /// Bounds concurrent co-holder genesis probes so a large holder set cannot open
@@ -124,6 +125,11 @@ struct PendingMetadataCreateApply {
     record: MetadataCreateEventRecord,
     bytes: Vec<u8>,
     lifecycle_revision: Option<DocumentSyncChange>,
+}
+
+struct DocumentEventBatch {
+    cursor: irokle_crate::ActorClock,
+    events: Vec<(DocumentSyncEvent, irokle_crate::ActorId, u64)>,
 }
 
 /// Placement fence outcome. The transactional read of the realm config is the
@@ -2225,24 +2231,21 @@ impl DocumentSyncService {
                 Some(value) => postcard::from_bytes(value.as_ref()).unwrap_or_default(),
                 None => irokle_crate::ActorClock::default(),
             };
-            let topic_clock = self
-                .node
-                .storage()
-                .actor_clock(&topic_id)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            if cursor.dominates(&topic_clock) {
+            let batch = self.document_event_batch(
+                topic_id,
+                &cursor,
+                DOCUMENT_SYNC_FRAME_LEN_LIMIT,
+            )?;
+            if batch.cursor == cursor {
                 continue;
             }
-            let events = self.document_events_after(topic_id, &cursor)?;
-            // Every admitted op counted in `topic_clock` is either one of
-            // `events`, an already-applied event, or a control op, so the
-            // merged clock is the new applied watermark.
-            cursor.merge(&topic_clock);
+            // Persist only this causal batch; anti-entropy will revisit the topic.
+            cursor = batch.cursor;
             let mut deferred_creates = false;
             let mut deferred_admin_events = Vec::new();
             let mut satisfied_admin_dependencies = BTreeSet::new();
             let mut cross_topic_dependencies = BTreeSet::new();
-            for (event, actor_id, actor_seq) in events {
+            for (event, actor_id, actor_seq) in batch.events {
                 if self
                     .shard_publishers
                     .read()
@@ -2832,52 +2835,182 @@ impl DocumentSyncService {
         })
     }
 
-    /// Returns authenticated document events above a component-wise cursor.
-    /// Actor ranges keep covered DAG heads from hiding unapplied dependencies.
+    /// Returns one bounded causal batch above a component-wise cursor.
+    fn document_event_batch(
+        &self,
+        topic_id: irokle_crate::TopicId,
+        cursor: &irokle_crate::ActorClock,
+        byte_limit: usize,
+    ) -> Result<DocumentEventBatch> {
+        let storage = self.node.storage();
+        let topic_clock = storage
+            .actor_clock(&topic_id)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let mut working_cursor = cursor.clone();
+        let mut queued = BTreeSet::new();
+        for (actor_id, actor_tip) in topic_clock.iter() {
+            if working_cursor.get(actor_id) < *actor_tip {
+                queued.insert(*actor_id);
+            }
+        }
+
+        // A candidate can wait on a dependency actor's next contiguous op. Wake
+        // it only after that actor reaches the required sequence.
+        let mut blocked_by: BTreeMap<
+            irokle_crate::ActorId,
+            BTreeMap<u64, BTreeSet<irokle_crate::ActorId>>,
+        > = BTreeMap::new();
+        let mut events = Vec::with_capacity(DOCUMENT_SYNC_REPLAY_BATCH_LIMIT);
+        let mut processed = 0usize;
+        let mut batch_bytes = 0usize;
+        while processed < DOCUMENT_SYNC_REPLAY_BATCH_LIMIT {
+            let Some(actor_id) = queued.pop_first() else {
+                break;
+            };
+            let actor_seq = working_cursor
+                .get(&actor_id)
+                .checked_add(1)
+                .ok_or_else(|| NetError::Bootstrap("document sync actor sequence overflow".into()))?;
+            if actor_seq > topic_clock.get(&actor_id) {
+                continue;
+            }
+            let op_id = storage
+                .actor_index(&topic_id, &actor_id, actor_seq)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                .ok_or_else(|| {
+                    NetError::Bootstrap(format!(
+                        "missing document sync op for actor {actor_id} sequence {actor_seq}"
+                    ))
+                })?;
+            let meta = storage
+                .get_meta(&op_id)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                .ok_or_else(|| NetError::Bootstrap(format!("missing document sync op meta {op_id}")))?;
+            if meta.topic_id != topic_id
+                || meta.actor_id != actor_id
+                || meta.actor_seq != actor_seq
+            {
+                return Err(NetError::Bootstrap(format!(
+                    "document sync actor index mismatch for actor {actor_id} sequence {actor_seq}"
+                )));
+            }
+
+            let mut missing = BTreeMap::new();
+            for dependency in &meta.deps {
+                let dependency_meta = storage
+                    .get_meta(dependency)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                    .ok_or_else(|| {
+                        NetError::Bootstrap(format!(
+                            "missing document sync dependency meta {dependency}"
+                        ))
+                    })?;
+                if dependency_meta.topic_id != topic_id {
+                    return Err(NetError::Bootstrap(
+                        "document sync dependency belongs to another topic".into(),
+                    ));
+                }
+                if dependency_meta.actor_seq > working_cursor.get(&dependency_meta.actor_id) {
+                    missing
+                        .entry(dependency_meta.actor_id)
+                        .and_modify(|sequence| *sequence = (*sequence).max(dependency_meta.actor_seq))
+                        .or_insert(dependency_meta.actor_seq);
+                }
+            }
+            if !missing.is_empty() {
+                for (dependency_actor, dependency_seq) in missing {
+                    blocked_by
+                        .entry(dependency_actor)
+                        .or_default()
+                        .entry(dependency_seq)
+                        .or_default()
+                        .insert(actor_id);
+                }
+                continue;
+            }
+
+            let op = storage
+                .get_op(&op_id)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                .ok_or_else(|| NetError::Bootstrap(format!("missing document sync op {op_id}")))?;
+            let op_bytes = postcard::serialized_size(&op)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            if op_bytes > DOCUMENT_SYNC_FRAME_LEN_LIMIT {
+                return Err(NetError::Bootstrap(
+                    "document sync operation exceeds replay frame limit".into(),
+                ));
+            }
+            if processed > 0
+                && batch_bytes.saturating_add(op_bytes) > byte_limit
+            {
+                break;
+            }
+            let actor_id = op.signed.body.actor_id;
+            let actor_seq = op.signed.body.actor_seq;
+            match op.signed.body.payload {
+                TopicPayload::Event(envelope) => events.push((
+                    envelope
+                        .decode_event::<DocumentSyncEvent>()
+                        .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+                    actor_id,
+                    actor_seq,
+                )),
+                TopicPayload::Genesis(_) | TopicPayload::Control(_) => {}
+            }
+            working_cursor.observe(actor_id, actor_seq);
+            processed += 1;
+            batch_bytes = batch_bytes.saturating_add(op_bytes);
+
+            let mut wake = BTreeSet::new();
+            if let Some(waiters) = blocked_by.get_mut(&actor_id) {
+                let ready = waiters
+                    .range(..=actor_seq)
+                    .map(|(sequence, _)| *sequence)
+                    .collect::<Vec<_>>();
+                for sequence in ready {
+                    if let Some(waiters) = waiters.remove(&sequence) {
+                        wake.extend(waiters);
+                    }
+                }
+            }
+            if blocked_by
+                .get(&actor_id)
+                .is_some_and(|waiters| waiters.is_empty())
+            {
+                blocked_by.remove(&actor_id);
+            }
+            queued.extend(wake);
+            if working_cursor.get(&actor_id) < topic_clock.get(&actor_id) {
+                queued.insert(actor_id);
+            }
+        }
+
+        if processed == 0 {
+            if !cursor.dominates(&topic_clock) {
+                return Err(NetError::Bootstrap(
+                    "document sync causal replay made no progress".into(),
+                ));
+            }
+            return Ok(DocumentEventBatch {
+                cursor: working_cursor,
+                events: Vec::new(),
+            });
+        }
+
+        Ok(DocumentEventBatch {
+            cursor: working_cursor,
+            events,
+        })
+    }
+
     fn document_events_after(
         &self,
         topic_id: irokle_crate::TopicId,
         cursor: &irokle_crate::ActorClock,
     ) -> Result<Vec<(DocumentSyncEvent, irokle_crate::ActorId, u64)>> {
-        let storage = self.node.storage();
-        let topic_clock = storage
-            .actor_clock(&topic_id)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        let mut op_ids = BTreeSet::new();
-        for (actor_id, actor_tip) in topic_clock.iter() {
-            let Some(first_unapplied) = cursor.get(actor_id).checked_add(1) else {
-                continue;
-            };
-            for actor_seq in first_unapplied..=*actor_tip {
-                let op_id = storage
-                    .actor_index(&topic_id, actor_id, actor_seq)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?
-                    .ok_or_else(|| {
-                        NetError::Bootstrap(format!(
-                            "missing document sync op for actor {actor_id} sequence {actor_seq}"
-                        ))
-                    })?;
-                op_ids.insert(op_id);
-            }
-        }
-        let ops = topological_subset(storage, &op_ids)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        let mut events = Vec::new();
-        for op in ops {
-            let actor_id = op.signed.body.actor_id;
-            let actor_seq = op.signed.body.actor_seq;
-            let TopicPayload::Event(envelope) = op.signed.body.payload else {
-                continue;
-            };
-            events.push((
-                envelope
-                    .decode_event::<DocumentSyncEvent>()
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-                actor_id,
-                actor_seq,
-            ));
-        }
-        Ok(events)
+        Ok(self
+            .document_event_batch(topic_id, cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)?
+            .events)
     }
 
     fn pending_metadata_create_apply(
@@ -7060,7 +7193,10 @@ fn validate_watch_subscription_upsert(
     {
         return Err("watch subscription path prefix is invalid".to_string());
     }
-    let known_mask = WatchEventMask::METADATA_CREATED | WatchEventMask::DATA_UPLOADED;
+    let known_mask = WatchEventMask::METADATA_CREATED
+        | WatchEventMask::DATA_UPLOADED
+        | WatchEventMask::SYNC_COMPLETED
+        | WatchEventMask::SYNC_FAILED;
     if subscription.event_mask.is_empty() || subscription.event_mask.bits() & !known_mask != 0 {
         return Err("watch subscription event mask is invalid".to_string());
     }
@@ -15678,15 +15814,11 @@ mod tests {
         let (_left_dir, left) = test_storage();
         let (_right_dir, right) = test_storage();
         let realm_id = RealmId::from_bytes([57u8; 32]);
-        let make = |seed: u8| {
+        let make = |seed: u8, event_mask: WatchEventMask| {
             let owner = UserId::local(Ulid::from_parts(seed as u64, 1), realm_id);
             let watch_id = Ulid::from_parts(seed as u64, 2);
-            let mut subscription = WatchSubscription::new(
-                owner,
-                format!("watch/{seed}"),
-                WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
-                1,
-            );
+            let mut subscription =
+                WatchSubscription::new(owner, format!("watch/{seed}"), event_mask, 1);
             subscription.watch_id = watch_id;
             let change = DocumentSyncChange {
                 base: None,
@@ -15705,9 +15837,13 @@ mod tests {
                 change,
             )
         };
-        let first = make(1);
-        let second = make(2);
+        let first = make(
+            1,
+            WatchEventMask::from_kinds([WatchEventKind::SyncCompleted]),
+        );
+        let second = make(2, WatchEventMask::from_kinds([WatchEventKind::SyncFailed]));
 
+        assert!(validate_watch_subscription_upsert(&first.0, &first.1, &first.2).is_ok());
         assert!(
             apply_watch_subscription_change_to_storage(
                 &left,
@@ -15718,6 +15854,7 @@ mod tests {
             .await
             .expect("first origin applies")
         );
+        assert!(validate_watch_subscription_upsert(&second.0, &second.1, &second.2).is_ok());
         assert!(
             apply_watch_subscription_change_to_storage(
                 &left,
@@ -15728,6 +15865,7 @@ mod tests {
             .await
             .expect("second origin applies")
         );
+        assert!(validate_watch_subscription_upsert(&second.0, &second.1, &second.2).is_ok());
         assert!(
             apply_watch_subscription_change_to_storage(
                 &right,
@@ -15738,6 +15876,7 @@ mod tests {
             .await
             .expect("second origin applies in reverse order")
         );
+        assert!(validate_watch_subscription_upsert(&first.0, &first.1, &first.2).is_ok());
         assert!(
             apply_watch_subscription_change_to_storage(
                 &right,
@@ -15761,6 +15900,11 @@ mod tests {
                     .is_some()
             );
         }
+        let unknown_mask: WatchEventMask =
+            postcard::from_bytes(&postcard::to_allocvec(&16u32).expect("unknown mask serializes"))
+                .expect("unknown mask decodes");
+        let (target, bytes, change) = make(3, unknown_mask);
+        assert!(validate_watch_subscription_upsert(&target, &bytes, &change).is_err());
     }
 
     #[test]
@@ -16404,6 +16548,102 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(event_ids, vec![remote_event_id]);
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replay_backlog() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let service = open_restart_service(root.path(), "replay-batch-storage").await;
+        let topic_id = restart_topic();
+        let target = restart_target();
+        service
+            .ensure_document_sync_topics(&[topic_id], Vec::new())
+            .expect("shard topic exists");
+
+        let documents = (0..(DOCUMENT_SYNC_REPLAY_BATCH_LIMIT + 1))
+            .map(|index| {
+                let event_id = Ulid::from_parts(1_800_000_000_000 + index as u64, 1);
+                DocumentSyncPublish::Upsert {
+                    event_id,
+                    target: target.clone(),
+                    bytes: restart_payload(),
+                    change: DocumentSyncChange {
+                        base: None,
+                        current: DocumentSyncRevision {
+                            generation: 1,
+                            event_id,
+                            actor: service.local_node_id().expect("local node id"),
+                            updated_at_ms: 1_800_000_000_000 + index as u64,
+                        },
+                        kind: DocumentSyncChangeKind::Upsert,
+                        placement: restart_placement(),
+                    },
+                    allow_genesis: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            service.publish_documents(documents, Vec::new()).await,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+
+        let cursor = irokle_crate::ActorClock::default();
+        service
+            .storage_write(
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                topic_cursor_key(topic_id),
+                postcard::to_allocvec(&cursor)
+                    .expect("cursor serializes")
+                    .into(),
+            )
+            .await
+            .expect("cursor resets");
+
+        let first = service
+            .document_event_batch(topic_id, &cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)
+            .expect("first replay batch");
+        assert_eq!(
+            first.events.len(),
+            DOCUMENT_SYNC_REPLAY_BATCH_LIMIT - 1,
+            "genesis consumes one bounded replay slot"
+        );
+        let actor = irokle_crate::actor_id_for(topic_id, service.node().peer_id());
+        assert_eq!(
+            first.cursor.get(&actor),
+            DOCUMENT_SYNC_REPLAY_BATCH_LIMIT as u64
+        );
+        let topic_clock = service
+            .node()
+            .storage()
+            .actor_clock(&topic_id)
+            .expect("topic clock");
+        assert!(!first.cursor.dominates(&topic_clock));
+
+        // An interrupted run before the cursor write retries the same batch.
+        let retry = service
+            .document_event_batch(topic_id, &cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)
+            .expect("retry replay batch");
+        assert_eq!(retry.cursor, first.cursor);
+        let remaining = service
+            .document_event_batch(
+                topic_id,
+                &first.cursor,
+                DOCUMENT_SYNC_FRAME_LEN_LIMIT,
+            )
+            .expect("remaining replay batch");
+        assert!(remaining.cursor.dominates(&topic_clock));
+
+        let byte_first = service
+            .document_event_batch(topic_id, &cursor, 0)
+            .expect("single operation byte batch");
+        assert_eq!(byte_first.cursor.get(&actor), 1);
+        let byte_second = service
+            .document_event_batch(topic_id, &byte_first.cursor, 0)
+            .expect("second operation byte batch");
+        assert_eq!(byte_second.cursor.get(&actor), 2);
+        assert!(!byte_second.cursor.dominates(&topic_clock));
 
         service.shutdown().await;
     }
