@@ -535,7 +535,7 @@ mod tests {
         };
         let bytes = postcard::to_allocvec(&message).unwrap();
         assert!(bytes.len() <= audit_frame_cap());
-        let (mut writer, mut reader) = tokio::io::duplex(bytes.len() + 4);
+        let (mut writer, mut reader) = tokio::io::duplex(bytes.len() + 5);
         writer.write_all(&[AUDIT_FRAME]).await.unwrap();
         writer
             .write_all(&(bytes.len() as u32).to_be_bytes())
