@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use aruna_core::NodeId;
@@ -1147,8 +1148,14 @@ pub async fn process_blob_replication_batch(
 
     let mut succeeded = 0usize;
     let mut failed = 0usize;
+    let relationships = read_job_relationships(&context.storage_handle, &scan.jobs).await?;
     for (job_key, job) in scan.jobs {
-        match process_blob_replication_job(context, &job).await {
+        let relationship = job.relationship_id.and_then(|relationship_id| {
+            relationships
+                .get(&(job.input.bucket.clone(), relationship_id))
+                .cloned()
+        });
+        match process_blob_replication_job(context, &job, relationship).await {
             Ok(BlobReplicationJobOutcome::Succeeded) => {
                 delete_blob_replication_job(&context.storage_handle, job_key).await?;
                 succeeded = succeeded.saturating_add(1);
@@ -1340,6 +1347,7 @@ async fn emit_sync_watch(
 async fn process_blob_replication_job(
     context: &DriverContext,
     job: &BlobReplicationJobRecord,
+    stored_relationship: Option<SyncRelationship>,
 ) -> Result<BlobReplicationJobOutcome, String> {
     let routing = match quota_marked_routing(context).await {
         Ok(routing) => routing,
@@ -1354,12 +1362,7 @@ async fn process_blob_replication_job(
     let mut operation = ReplicateScopeOperation::new(job.input.clone()).with_routing(routing);
     let mut watch_group_id = None;
     let mut relationship = if let Some(relationship_id) = job.relationship_id {
-        let relationship = read_relationships(&context.storage_handle, &job.input.bucket)
-            .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .find(|relationship| relationship.id == relationship_id);
-        let Some(relationship) = relationship else {
+        let Some(relationship) = stored_relationship else {
             info!(
                 relationship_id = %relationship_id,
                 "Skipping replication job for missing sync relationship"
@@ -1521,6 +1524,73 @@ async fn process_blob_replication_job(
         }
     }
     Err(error)
+}
+
+async fn read_job_relationships(
+    storage: &StorageHandle,
+    jobs: &[(Vec<u8>, BlobReplicationJobRecord)],
+) -> Result<HashMap<(String, Ulid), SyncRelationship>, BlobReplicationQueueError> {
+    let mut requested = HashSet::new();
+    let mut keys = Vec::new();
+    for (_, job) in jobs {
+        let Some(relationship_id) = job.relationship_id else {
+            continue;
+        };
+        let identity = (job.input.bucket.clone(), relationship_id);
+        if requested.insert(identity.clone()) {
+            keys.push(identity);
+        }
+    }
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let reads = keys
+        .iter()
+        .map(|(bucket, relationship_id)| {
+            (
+                SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
+                sync_relationship_key(bucket, *relationship_id).into(),
+            )
+        })
+        .collect();
+    let values = match storage
+        .send_storage_effect(StorageEffect::BatchRead {
+            reads,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => {
+            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
+                "{other:?}"
+            )));
+        }
+    };
+    if values.len() != keys.len() {
+        return Err(BlobReplicationQueueError::UnexpectedEvent(
+            "blob replication relationship read count mismatch".to_string(),
+        ));
+    }
+
+    let mut relationships = HashMap::with_capacity(keys.len());
+    for ((bucket, relationship_id), (key, value)) in keys.into_iter().zip(values) {
+        let Some(value) = value else {
+            continue;
+        };
+        let relationship = SyncRelationship::from_bytes(&value)?;
+        validate_sync_key(&bucket, &key, &relationship)?;
+        if relationship.id != relationship_id {
+            return Err(ConversionError::FromStrError(
+                "sync relationship id does not match requested id".to_string(),
+            )
+            .into());
+        }
+        relationships.insert((bucket, relationship_id), relationship);
+    }
+    Ok(relationships)
 }
 
 async fn process_live_replication_obligations(
@@ -1840,6 +1910,7 @@ async fn scan_due_blob_replication_jobs(
     let mut start_after = None;
     let mut jobs = Vec::new();
     let mut next_due_at_ms = None;
+    let mut canonical_changed = false;
     loop {
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
@@ -1865,7 +1936,7 @@ async fn scan_due_blob_replication_jobs(
 
         for (key, value) in values {
             let mut key = key.to_vec();
-            let job = match BlobReplicationJobRecord::from_bytes(&value) {
+            let mut job = match BlobReplicationJobRecord::from_bytes(&value) {
                 Ok(job) => job,
                 Err(error) => {
                     warn!(error = %error, key = ?key, "Deleting malformed blob replication job");
@@ -1881,56 +1952,26 @@ async fn scan_due_blob_replication_jobs(
                     && blob_replication_job_preferred(&existing, &job)
                 {
                     delete_blob_replication_job(storage, key).await?;
-                    if existing.due_at_ms > now_ms {
-                        next_due_at_ms = min_due_at(next_due_at_ms, existing.due_at_ms);
-                        continue;
-                    }
-                    jobs.push((canonical_key, existing));
-                    if jobs.len() >= limit {
-                        return Ok(BlobReplicationJobScan {
-                            jobs,
-                            has_more_due: true,
-                            next_due_at_ms,
-                        });
-                    }
-                    continue;
-                }
-                write_blob_replication_job(storage, &job).await?;
-                delete_blob_replication_job(storage, key).await?;
-                key = canonical_key;
-            }
-            if let Some((existing_key, existing)) =
-                find_decoded_blob_replication_duplicate(storage, &job, Some(key.as_slice())).await?
-                && blob_replication_job_preferred(&existing, &job)
-            {
-                let existing_canonical_key = blob_replication_job_key(&existing)?.to_vec();
-                write_blob_replication_job(storage, &existing).await?;
-                if existing_key.as_slice() != existing_canonical_key.as_slice() {
-                    delete_blob_replication_job(storage, existing_key).await?;
-                }
-                if key.as_slice() != existing_canonical_key.as_slice() {
+                    job = existing;
+                } else {
+                    write_blob_replication_job(storage, &job).await?;
                     delete_blob_replication_job(storage, key).await?;
+                    canonical_changed = true;
+                    jobs.retain(|(existing_key, _)| existing_key != &canonical_key);
                 }
-                if existing.due_at_ms > now_ms {
-                    next_due_at_ms = min_due_at(next_due_at_ms, existing.due_at_ms);
-                    continue;
+                key = canonical_key;
+            } else if canonical_changed {
+                if let Some(existing) =
+                    read_blob_replication_job_at_key(storage, &canonical_key).await?
+                {
+                    job = existing;
                 }
-                jobs.push((existing_canonical_key, existing));
-                if jobs.len() >= limit {
-                    return Ok(BlobReplicationJobScan {
-                        jobs,
-                        has_more_due: true,
-                        next_due_at_ms,
-                    });
-                }
-                continue;
             }
             if job.due_at_ms > now_ms {
                 next_due_at_ms = min_due_at(next_due_at_ms, job.due_at_ms);
                 continue;
             }
-            jobs.push((key, job));
-            if jobs.len() >= limit {
+            if merge_due_job(&mut jobs, key, job, limit) {
                 return Ok(BlobReplicationJobScan {
                     jobs,
                     has_more_due: true,
@@ -1948,65 +1989,6 @@ async fn scan_due_blob_replication_jobs(
                     next_due_at_ms,
                 });
             }
-        }
-    }
-}
-
-async fn find_decoded_blob_replication_duplicate(
-    storage: &StorageHandle,
-    job: &BlobReplicationJobRecord,
-    skip_key: Option<&[u8]>,
-) -> Result<Option<(Vec<u8>, BlobReplicationJobRecord)>, BlobReplicationQueueError> {
-    let canonical_key = blob_replication_job_key(job)?.to_vec();
-    let mut selected = None;
-    let mut start_after = None;
-    loop {
-        let event = storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
-                prefix: None,
-                start: start_after.take().map(IterStart::After),
-                limit: REPLICATION_SCAN_PAGE_SIZE,
-                txn_id: None,
-            })
-            .await;
-        let (values, next_start_after) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => {
-                return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
-            }
-        };
-
-        for (key, value) in values {
-            if skip_key.is_some_and(|skip_key| key.as_ref() == skip_key) {
-                continue;
-            }
-            let Ok(candidate) = BlobReplicationJobRecord::from_bytes(&value) else {
-                continue;
-            };
-            if blob_replication_job_key(&candidate)?.as_ref() != canonical_key.as_slice() {
-                continue;
-            }
-            match selected.as_mut() {
-                Some((_, selected_job))
-                    if blob_replication_job_preferred(&candidate, selected_job) =>
-                {
-                    selected = Some((key.to_vec(), candidate));
-                }
-                Some(_) => {}
-                None => selected = Some((key.to_vec(), candidate)),
-            }
-        }
-
-        match next_start_after {
-            Some(next) => start_after = Some(next),
-            None => return Ok(selected),
         }
     }
 }
@@ -2115,6 +2097,26 @@ async fn reschedule_blob_replication_job(
 
 fn min_due_at(current: Option<u64>, due_at_ms: u64) -> Option<u64> {
     Some(current.map_or(due_at_ms, |current| current.min(due_at_ms)))
+}
+
+fn merge_due_job(
+    jobs: &mut Vec<(Vec<u8>, BlobReplicationJobRecord)>,
+    key: Vec<u8>,
+    job: BlobReplicationJobRecord,
+    limit: usize,
+) -> bool {
+    if let Some((_, existing)) = jobs
+        .iter_mut()
+        .find(|(existing_key, _)| existing_key.as_slice() == key.as_slice())
+    {
+        if blob_replication_job_preferred(&job, existing) {
+            *existing = job;
+        }
+        false
+    } else {
+        jobs.push((key, job));
+        jobs.len() >= limit
+    }
 }
 
 fn due_after(now_ms: u64, due_at_ms: u64) -> Duration {
@@ -3400,6 +3402,108 @@ mod tests {
         assert_eq!(result.processed, 0);
         assert!(!result.has_more_due);
         assert!(result.next_due_after.is_some());
+    }
+
+    #[tokio::test]
+    async fn canonical_scan_once() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let job = BlobReplicationJobRecord::new(on_demand_input(), None, unix_timestamp_millis());
+        write_blob_replication_job(&storage, &job)
+            .await
+            .expect("job writes");
+
+        let before = storage.snapshot_metrics().requests_total;
+        let scan = scan_due_blob_replication_jobs(&storage, unix_timestamp_millis(), 1)
+            .await
+            .expect("job scan succeeds");
+
+        assert_eq!(scan.jobs.len(), 1);
+        assert_eq!(
+            storage.snapshot_metrics().requests_total - before,
+            1,
+            "canonical jobs need one iteration, not a nested duplicate scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn repairs_duplicate_job() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let job = BlobReplicationJobRecord::new(on_demand_input(), None, unix_timestamp_millis());
+        let preferred = BlobReplicationJobRecord {
+            attempts: 1,
+            last_error: Some("retry".to_string()),
+            ..job.clone()
+        };
+        write_blob_replication_job(&storage, &job)
+            .await
+            .expect("canonical job writes");
+        write_raw_queue_record(
+            &storage,
+            BLOB_REPLICATION_JOB_KEYSPACE,
+            b"legacy-job".to_vec(),
+            preferred.to_bytes().expect("job serializes"),
+        )
+        .await;
+
+        let scan = scan_due_blob_replication_jobs(&storage, unix_timestamp_millis(), 2)
+            .await
+            .expect("duplicate repair succeeds");
+
+        assert_eq!(scan.jobs.len(), 1);
+        assert_eq!(scan.jobs[0].1.attempts, 1);
+        assert_eq!(
+            scan.jobs[0].0,
+            blob_replication_job_key(&preferred).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn relationship_reads_batch() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let relationship = relationship(90, 2, None, true);
+        write_relationship(&storage, &relationship).await;
+        let jobs = vec![
+            (
+                Vec::new(),
+                BlobReplicationJobRecord::new_relationship(
+                    on_demand_input(),
+                    None,
+                    relationship.id,
+                    unix_timestamp_millis(),
+                ),
+            ),
+            (
+                Vec::new(),
+                BlobReplicationJobRecord::new_relationship(
+                    on_demand_input(),
+                    None,
+                    relationship.id,
+                    unix_timestamp_millis(),
+                ),
+            ),
+        ];
+
+        let before = storage.snapshot_metrics().requests_total;
+        let found = read_job_relationships(&storage, &jobs)
+            .await
+            .expect("relationship read succeeds");
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[&("bucket".to_string(), relationship.id)],
+            relationship
+        );
+        assert_eq!(
+            storage.snapshot_metrics().requests_total - before,
+            1,
+            "duplicate jobs share one bounded relationship batch read"
+        );
     }
 
     #[tokio::test]
