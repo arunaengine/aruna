@@ -382,20 +382,6 @@ impl ConnectionActivity {
         }
     }
 
-    async fn wait_lifetime(&self) -> bool {
-        tokio::select! {
-            _ = self.wait_done() => false,
-            _ = tokio::time::sleep(STREAM_LIFETIME_TIMEOUT) => {
-                if self.is_cancelled() || self.stopped.load(Ordering::Acquire) {
-                    false
-                } else {
-                    self.cancel();
-                    true
-                }
-            }
-        }
-    }
-
     async fn wait_idle(&self) -> bool {
         loop {
             if self.is_cancelled() || self.stopped.load(Ordering::Acquire) {
@@ -425,17 +411,19 @@ impl ConnectionActivity {
 
 struct ActiveRequestGuard {
     activity: Arc<ConnectionActivity>,
+    deadline: Arc<ConnectionActivity>,
 }
 
 impl ActiveRequestGuard {
-    fn new(activity: Arc<ConnectionActivity>) -> Self {
-        Self { activity }
+    fn new(activity: Arc<ConnectionActivity>, deadline: Arc<ConnectionActivity>) -> Self {
+        Self { activity, deadline }
     }
 }
 
 impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
         self.activity.end_request();
+        self.deadline.stop();
     }
 }
 
@@ -939,9 +927,37 @@ impl Service<Request<Incoming>> for WrappingService {
                 return Ok(response);
             }
             activity.begin_request();
-            let active_guard = ActiveRequestGuard::new(activity.clone());
+            let deadline_activity = Arc::new(ConnectionActivity::default());
+            let deadline = tokio::time::Instant::now() + STREAM_LIFETIME_TIMEOUT;
+            let deadline_task_activity = deadline_activity.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = deadline_task_activity.wait_done() => {}
+                    _ = tokio::time::sleep_until(deadline) => {
+                        if !deadline_task_activity.is_cancelled()
+                            && !deadline_task_activity.stopped.load(Ordering::Acquire)
+                        {
+                            deadline_task_activity.cancel();
+                        }
+                    }
+                }
+            });
+            let active_guard = ActiveRequestGuard::new(activity.clone(), deadline_activity.clone());
             let bucket_cors = if origin_header.is_some() {
-                match load_bucket_cors_config(driver_ctx, bucket).await {
+                let cors_result = tokio::select! {
+                    result = load_bucket_cors_config(driver_ctx, bucket) => result,
+                    _ = activity.wait_cancelled() => {
+                        drop(request_permit);
+                        drop(s3s_request);
+                        return Err(connection_error());
+                    }
+                    _ = deadline_activity.wait_cancelled() => {
+                        drop(request_permit);
+                        drop(s3s_request);
+                        return stream_timeout_response();
+                    }
+                };
+                match cors_result {
                     Ok(bucket_cors) => bucket_cors,
                     Err(error) => {
                         span.record("status_code", 500);
@@ -960,6 +976,12 @@ impl Service<Request<Incoming>> for WrappingService {
             } else {
                 None
             };
+
+            if deadline_activity.is_cancelled() {
+                drop(request_permit);
+                drop(s3s_request);
+                return stream_timeout_response();
+            }
 
             // Answer CORS preflight before s3s signature validation: an unsigned
             // OPTIONS request must not fail with 403.
@@ -1048,10 +1070,7 @@ impl Service<Request<Incoming>> for WrappingService {
                 stream_activity.touch();
                 let idle_task_activity = stream_activity.clone();
                 tokio::spawn(async move {
-                    tokio::select! {
-                        _ = idle_task_activity.wait_idle() => {}
-                        _ = idle_task_activity.wait_lifetime() => {}
-                    }
+                    idle_task_activity.wait_idle().await;
                 });
             }
 
@@ -1064,6 +1083,13 @@ impl Service<Request<Incoming>> for WrappingService {
                     stream_activity.stop();
                     return Err(connection_error());
                 }
+                _ = deadline_activity.wait_cancelled() => {
+                    drop(request_permit);
+                    drop(capture_permit.take());
+                    drop(egress_permit);
+                    stream_activity.stop();
+                    return stream_timeout_response();
+                }
                 _ = stream_activity.wait_cancelled() => {
                     drop(request_permit);
                     drop(capture_permit.take());
@@ -1072,6 +1098,13 @@ impl Service<Request<Incoming>> for WrappingService {
                     return stream_timeout_response();
                 }
             };
+            if deadline_activity.is_cancelled() {
+                drop(request_permit);
+                drop(capture_permit.take());
+                drop(egress_permit);
+                stream_activity.stop();
+                return stream_timeout_response();
+            }
             if stream_activity.is_cancelled() {
                 drop(request_permit);
                 drop(capture_permit.take());
@@ -1089,6 +1122,7 @@ impl Service<Request<Incoming>> for WrappingService {
                     response_activity.touch();
                     let idle_task_activity = response_activity.clone();
                     let response_connection = activity.clone();
+                    let response_deadline = deadline_activity.clone();
                     tokio::spawn(async move {
                         tokio::select! {
                             idle = idle_task_activity.wait_idle() => {
@@ -1096,8 +1130,8 @@ impl Service<Request<Incoming>> for WrappingService {
                                     response_connection.cancel();
                                 }
                             }
-                            lifetime = idle_task_activity.wait_lifetime() => {
-                                if lifetime {
+                            _ = response_deadline.wait_done() => {
+                                if response_deadline.is_cancelled() {
                                     response_connection.cancel();
                                 }
                             }
@@ -1378,7 +1412,8 @@ mod tests {
         response_activity.touch();
         let limit = Arc::new(Semaphore::new(1));
         let permit = limit.clone().try_acquire_owned().expect("permit");
-        let active = ActiveRequestGuard::new(activity.clone());
+        let deadline_activity = Arc::new(ConnectionActivity::default());
+        let active = ActiveRequestGuard::new(activity.clone(), deadline_activity);
         let body = ResponseBody::new(
             s3s::Body::empty(),
             permit,
@@ -1411,12 +1446,28 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn trickle_request_expires() {
+    async fn request_deadline_expires() {
         let activity = Arc::new(ConnectionActivity::default());
         activity.mark_request();
         activity.begin_request();
+        let deadline_activity = Arc::new(ConnectionActivity::default());
+        let deadline = tokio::time::Instant::now() + STREAM_LIFETIME_TIMEOUT;
+        let timer_activity = deadline_activity.clone();
+        let ready = Arc::new(Notify::new());
+        let timer_ready = ready.clone();
+        let timer = tokio::spawn(async move {
+            timer_ready.notify_one();
+            tokio::select! {
+                _ = timer_activity.wait_done() => {}
+                _ = tokio::time::sleep_until(deadline) => timer_activity.cancel(),
+            }
+        });
         let stream_activity = Arc::new(ConnectionActivity::default());
         stream_activity.touch();
+        let idle_activity = stream_activity.clone();
+        let idle = tokio::spawn(async move {
+            idle_activity.wait_idle().await;
+        });
         let request_limit = Arc::new(Semaphore::new(1));
         let request_permit = request_limit
             .clone()
@@ -1427,25 +1478,20 @@ mod tests {
             .clone()
             .try_acquire_owned()
             .expect("egress permit");
-        let active = ActiveRequestGuard::new(activity.clone());
-        let ready = Arc::new(Notify::new());
-        let task_ready = ready.clone();
-        let idle_activity = stream_activity.clone();
-        let watcher = tokio::spawn(async move {
-            task_ready.notify_one();
-            tokio::select! {
-                _ = idle_activity.wait_idle() => {}
-                _ = idle_activity.wait_lifetime() => {}
-            }
-        });
+        let active = ActiveRequestGuard::new(activity.clone(), deadline_activity.clone());
         let request_activity = stream_activity.clone();
+        let request_deadline = deadline_activity.clone();
         let request = tokio::spawn(async move {
             let _active = active;
             let _request_permit = request_permit;
             let _egress_permit = egress_permit;
-            request_activity.wait_cancelled().await;
+            tokio::select! {
+                _ = request_activity.wait_cancelled() => {}
+                _ = request_deadline.wait_cancelled() => request_activity.stop(),
+            }
         });
         ready.notified().await;
+        tokio::task::yield_now().await;
         let tick = Duration::from_secs(19);
         for _ in 0..94 {
             tokio::time::advance(tick).await;
@@ -1454,24 +1500,38 @@ mod tests {
         }
         assert!(!stream_activity.is_cancelled());
         tokio::time::advance(STREAM_LIFETIME_TIMEOUT - Duration::from_secs(19 * 94)).await;
-        watcher.await.expect("request watcher joins");
+        timer.await.expect("deadline timer joins");
+        idle.await.expect("idle watcher joins");
         request.await.expect("request task joins");
-        assert!(stream_activity.is_cancelled());
+        assert!(deadline_activity.is_cancelled());
+        assert!(stream_activity.stopped.load(Ordering::Acquire));
         assert_eq!(request_limit.available_permits(), 1);
         assert_eq!(egress_limit.available_permits(), 1);
         assert_eq!(activity.active.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn trickle_response_expires() {
+    async fn response_deadline_expires() {
         let activity = Arc::new(ConnectionActivity::default());
         activity.mark_request();
         activity.begin_request();
+        let deadline_activity = Arc::new(ConnectionActivity::default());
+        let deadline = tokio::time::Instant::now() + STREAM_LIFETIME_TIMEOUT;
+        let timer_activity = deadline_activity.clone();
+        let ready = Arc::new(Notify::new());
+        let timer_ready = ready.clone();
+        let timer = tokio::spawn(async move {
+            timer_ready.notify_one();
+            tokio::select! {
+                _ = timer_activity.wait_done() => {}
+                _ = tokio::time::sleep_until(deadline) => timer_activity.cancel(),
+            }
+        });
         let response_activity = Arc::new(ConnectionActivity::default());
         response_activity.touch();
         let limit = Arc::new(Semaphore::new(1));
         let permit = limit.clone().try_acquire_owned().expect("permit");
-        let active = ActiveRequestGuard::new(activity.clone());
+        let active = ActiveRequestGuard::new(activity.clone(), deadline_activity.clone());
         let body = ResponseBody::new(
             s3s::Body::empty(),
             permit,
@@ -1481,20 +1541,18 @@ mod tests {
         );
         let sibling = Arc::new(ConnectionActivity::default());
         sibling.mark_request();
-        let ready = Arc::new(Notify::new());
-        let task_ready = ready.clone();
         let idle_activity = response_activity.clone();
         let idle_connection = activity.clone();
+        let response_deadline = deadline_activity.clone();
         let watcher = tokio::spawn(async move {
-            task_ready.notify_one();
             tokio::select! {
                 idle = idle_activity.wait_idle() => {
                     if idle {
                         idle_connection.cancel();
                     }
                 }
-                lifetime = idle_activity.wait_lifetime() => {
-                    if lifetime {
+                _ = response_deadline.wait_done() => {
+                    if response_deadline.is_cancelled() {
                         idle_connection.cancel();
                     }
                 }
@@ -1506,6 +1564,7 @@ mod tests {
             connection_activity.wait_cancelled().await;
         });
         ready.notified().await;
+        tokio::task::yield_now().await;
         let tick = Duration::from_secs(19);
         for _ in 0..94 {
             tokio::time::advance(tick).await;
@@ -1515,6 +1574,7 @@ mod tests {
         assert!(!response_activity.is_cancelled());
         assert!(!activity.is_cancelled());
         tokio::time::advance(STREAM_LIFETIME_TIMEOUT - Duration::from_secs(19 * 94)).await;
+        timer.await.expect("deadline timer joins");
         watcher.await.expect("response watcher joins");
         connection.await.expect("connection task joins");
         assert!(activity.is_cancelled());
@@ -1541,7 +1601,8 @@ mod tests {
         let permit = limit.clone().try_acquire_owned().expect("permit");
         let activity = Arc::new(ConnectionActivity::default());
         activity.begin_request();
-        let active = ActiveRequestGuard::new(activity.clone());
+        let deadline = Arc::new(ConnectionActivity::default());
+        let active = ActiveRequestGuard::new(activity.clone(), deadline);
         let stream_activity = Arc::new(ConnectionActivity::default());
         let body = ResponseBody::new(
             s3s::Body::empty(),
@@ -1561,11 +1622,13 @@ mod tests {
     async fn drops_pending_guard() {
         let activity = Arc::new(ConnectionActivity::default());
         activity.begin_request();
+        let deadline = Arc::new(ConnectionActivity::default());
         let ready = Arc::new(Notify::new());
         let task_activity = activity.clone();
+        let task_deadline = deadline.clone();
         let task_ready = ready.clone();
         let task = tokio::spawn(async move {
-            let _guard = ActiveRequestGuard::new(task_activity);
+            let _guard = ActiveRequestGuard::new(task_activity, task_deadline);
             task_ready.notify_one();
             std::future::pending::<()>().await;
         });
@@ -1573,6 +1636,7 @@ mod tests {
         task.abort();
         let _ = task.await;
         assert_eq!(activity.active.load(Ordering::Acquire), 0);
+        assert!(deadline.stopped.load(Ordering::Acquire));
     }
 
     #[test]
