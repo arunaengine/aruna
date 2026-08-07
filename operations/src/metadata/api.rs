@@ -1652,7 +1652,7 @@ pub async fn search_metadata(
                     None => {
                         let discovery = tokio::time::timeout_at(
                             deadline,
-                            load_metadata_realm_nodes_with_status(context, realm_id, local_node_id),
+                            discover_realm_nodes(context, realm_id, local_node_id),
                         )
                         .await
                         .unwrap_or(MetadataRealmNodeDiscovery {
@@ -1924,12 +1924,12 @@ pub async fn load_metadata_realm_nodes(
     realm_id: RealmId,
     local_node_id: NodeId,
 ) -> Vec<NodeId> {
-    load_metadata_realm_nodes_with_status(context, realm_id, local_node_id)
+    discover_realm_nodes(context, realm_id, local_node_id)
         .await
         .nodes
 }
 
-pub(crate) async fn load_metadata_realm_nodes_with_status(
+pub(crate) async fn discover_realm_nodes(
     context: &DriverContext,
     realm_id: RealmId,
     local_node_id: NodeId,
@@ -3182,7 +3182,7 @@ async fn metadata_fanout_nodes(
                 deadline,
                 aruna_core::telemetry::time_stage(
                     "discovery",
-                    load_metadata_realm_nodes_with_status(context, realm_id, local_node_id),
+                    discover_realm_nodes(context, realm_id, local_node_id),
                 ),
             )
             .await
@@ -3484,7 +3484,7 @@ fn record_bucket_result(span: &Span, result: &Result<Vec<BucketSearchHit>, Metad
     }
 }
 
-fn record_query_node_result(span: &Span, result: &Result<MetadataQueryResults, MetadataReadError>) {
+fn record_query_result(span: &Span, result: &Result<MetadataQueryResults, MetadataReadError>) {
     match result {
         Ok(result) => {
             span.record("result", result.kind());
@@ -3622,7 +3622,7 @@ async fn run_query_distributed(
         MetadataFanoutOperation::Query,
         local_call,
         remote_call,
-        record_query_node_result,
+        record_query_result,
         map_read_error,
     )
     .await?;
