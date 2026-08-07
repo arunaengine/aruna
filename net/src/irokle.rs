@@ -2859,20 +2859,8 @@ impl DocumentSyncService {
                 );
                 continue;
             }
-            if self.metadata_create_fenced(&apply.record).await? {
-                continue;
-            }
             let mut entries = Vec::new();
             if let Some(revision) = &apply.lifecycle_revision {
-                if incoming_metadata_document_lifecycle_stale_or_equal(
-                    &self.storage,
-                    &apply.target,
-                    revision,
-                )
-                .await?
-                {
-                    continue;
-                }
                 entries.push(
                     document_sync_revision_write_entry(&apply.target, revision)
                         .map_err(|error| NetError::Bootstrap(error.to_string()))?,
@@ -2906,6 +2894,36 @@ impl DocumentSyncService {
         let mut create_acceptances: BTreeMap<Ulid, MetadataCreateEventRecord> = BTreeMap::new();
         let mut deferred_cursor_topics = BTreeSet::new();
         for (apply, entries) in candidates {
+            let fenced = match create_fence_txn(&self.storage, &apply.record, txn_id).await {
+                Ok(fenced) => fenced,
+                Err(error) => {
+                    let _ = self
+                        .storage
+                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                        .await;
+                    return Err(error);
+                }
+            };
+            if fenced {
+                continue;
+            }
+            if let Some(revision) = &apply.lifecycle_revision {
+                let stale =
+                    match lifecycle_stale_txn(&self.storage, &apply.target, revision, txn_id).await
+                    {
+                        Ok(stale) => stale,
+                        Err(error) => {
+                            let _ = self
+                                .storage
+                                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                                .await;
+                            return Err(error);
+                        }
+                    };
+                if stale {
+                    continue;
+                }
+            }
             match metadata_placement_fence_in_transaction(
                 &self.storage,
                 &apply.record.record,
@@ -3103,25 +3121,16 @@ impl DocumentSyncService {
                 )));
             }
             validate_metadata_event(&record)?;
-            if self.metadata_create_fenced(&record).await? {
-                return Ok(());
-            }
-            return self
-                .storage_write(
-                    DocumentSyncTarget::MetadataCreateEvent {
-                        document_id,
-                        event_id,
-                    }
-                    .storage_keyspace()
-                    .to_string(),
-                    DocumentSyncTarget::MetadataCreateEvent {
-                        document_id,
-                        event_id,
-                    }
-                    .storage_key(),
-                    bytes.into(),
-                )
-                .await;
+            return apply_create_event(
+                &self.storage,
+                &record,
+                DocumentSyncTarget::MetadataCreateEvent {
+                    document_id,
+                    event_id,
+                },
+                bytes,
+            )
+            .await;
         }
         if let DocumentSyncTarget::MetadataDocumentLifecycle { document_id } = target {
             let record: MetadataDocumentLifecycleRecord = postcard::from_bytes(&bytes)
@@ -3228,10 +3237,6 @@ impl DocumentSyncService {
         apply_metadata_graph_lifecycle_to_storage(&self.storage, &record, primary_bytes).await
     }
 
-    async fn metadata_create_fenced(&self, event: &MetadataCreateEventRecord) -> Result<bool> {
-        metadata_create_fenced_in_storage(&self.storage, event).await
-    }
-
     async fn apply_delete(
         &self,
         target: DocumentSyncTarget,
@@ -3301,6 +3306,58 @@ fn target_write_entry(target: DocumentSyncTarget, value: Value) -> (String, Byte
         target.storage_key(),
         value,
     )
+}
+
+async fn apply_create_event(
+    storage: &StorageHandle,
+    event: &MetadataCreateEventRecord,
+    target: DocumentSyncTarget,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    for _ in 0..2 {
+        let txn_id = start_storage_transaction(storage).await?;
+        match create_fence_txn(storage, event, txn_id).await {
+            Ok(true) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
+        let writes = vec![(
+            target.storage_keyspace().to_string(),
+            target.storage_key(),
+            ByteView::from(bytes.clone()),
+        )];
+        match storage_batch_delete_and_write_in_transaction(storage, txn_id, Vec::new(), writes)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(NetError::Dht(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
+    }
+    Err(NetError::Dht(
+        "metadata create admission conflicted twice".to_string(),
+    ))
 }
 
 fn overlay_group_reducer_materialization(
