@@ -48,6 +48,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 pub const INITIAL_REALM_ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
 pub const INITIAL_LOCAL_ONBOARDING_SECRET_KEY: &[u8] = b"initial_local_onboarding_secret";
+pub(crate) const DOWNLOAD_SLOTS: usize = 256;
 #[derive(Clone, Debug)]
 pub struct ServerState {
     // Contains neccessary drivers for request handling
@@ -79,6 +80,7 @@ pub struct ServerState {
     // Peers allowed to set `x-forwarded-*`; empty means no proxy is trusted.
     trusted_proxies: Vec<ipnet::IpNet>,
     rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
+    download_slots: Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -184,6 +186,7 @@ impl ServerState {
             rocrate_limits: RoCrateLimits::default(),
             trusted_proxies: Vec::new(),
             rate_limits: Arc::new(crate::rate_limit::ApiRateLimits::default()),
+            download_slots: Arc::new(Semaphore::new(DOWNLOAD_SLOTS)),
         };
         state.persist_trusted_realms().await;
         state
@@ -241,6 +244,11 @@ impl ServerState {
 
     pub fn rate_limits(&self) -> &crate::rate_limit::ApiRateLimits {
         &self.rate_limits
+    }
+
+
+    pub(crate) fn try_acquire_download(&self) -> Option<OwnedSemaphorePermit> {
+        self.download_slots.clone().try_acquire_owned().ok()
     }
 
     pub fn jobs_runtime(&self) -> Arc<JobsRuntime> {
