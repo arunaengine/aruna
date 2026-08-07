@@ -539,10 +539,7 @@ impl RealmConfigDocument {
 
     /// Merges an existing revocation index without rebuilding reducer paths.
     pub fn merge_revocation_index(&mut self, index: &RevocationIndex, now: u64) {
-        self.revocation_floor = self
-            .revocation_floor
-            .max(index.watermark())
-            .max(now);
+        self.revocation_floor = self.revocation_floor.max(index.watermark()).max(now);
         let effective_now = self.revocation_floor;
         let mut merged: BTreeMap<String, u64> = self
             .revoked_tokens

@@ -253,7 +253,6 @@ impl ServerState {
         self.rocrate_upload_slots.clone().try_acquire_owned().ok()
     }
 
-
     pub(crate) fn try_acquire_download(&self) -> Option<OwnedSemaphorePermit> {
         self.download_slots.clone().try_acquire_owned().ok()
     }
