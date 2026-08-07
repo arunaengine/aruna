@@ -1024,7 +1024,7 @@ impl PutObjectOperation {
             Event::Storage(StorageEvent::Error { error }) => {
                 match self.pending_cleanup.retry(&error) {
                     Some(effect) => smallvec![effect],
-                    None => self.release_or_error(),
+                    None => self.emit_pending_error(),
                 }
             }
             _ => self.emit_error(PutObjectError::InvalidOperationState),
@@ -1960,6 +1960,39 @@ mod test {
                 .is_empty()
         );
         assert!(op.is_complete());
+    }
+
+    #[test]
+    fn closed_keeps_hold() {
+        // A closed storage channel leaves the durable reservation for restart reconciliation.
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let mut op = PutObjectOperation::new(put_config(
+            realm_id,
+            Ulid::generate(),
+            iroh::SecretKey::generate().public(),
+        ));
+        let location = test_location(op.config.user_id);
+        let id = location.ulid;
+        op.pending_error = Some(PutObjectError::StorageError(StorageError::ChannelClosed));
+        op.release_id = Some(id);
+        op.state = PutObjectState::QueueCleanupRow;
+        assert!(
+            op.pending_cleanup
+                .queue(super::BlobCleanupWork::ReconcileReservation { location })
+                .is_some()
+        );
+
+        let effects = op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::ChannelClosed,
+        }));
+        assert!(effects.is_empty());
+        assert_eq!(op.release_id, Some(id));
+        assert!(op.pending_cleanup.retry(&StorageError::Timeout).is_none());
+        assert!(op.is_complete());
+        assert!(matches!(
+            op.finalize(),
+            Err(PutObjectError::StorageError(StorageError::ChannelClosed))
+        ));
     }
 
     #[test]
