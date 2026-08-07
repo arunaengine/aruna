@@ -237,6 +237,7 @@ const SUBOP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 const AUDIT_FANOUT_CONCURRENCY: usize = 8;
 const AUDIT_PEER_DEADLINE: Duration = Duration::from_secs(3);
 const AUDIT_FANOUT_DEADLINE: Duration = Duration::from_secs(30);
+const REALM_PEER_REFRESH_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[tracing::instrument(
     name = "operation.effect",
@@ -310,10 +311,22 @@ async fn dispatch_effect_until(
                         Event::Storage(aruna_core::events::StorageEvent::WriteResult { .. }),
                         Some(bytes),
                     ) => {
-                        if let Err(error) =
-                            Box::pin(net_handle.refresh_realm_peers_from_bytes(&bytes)).await
+                        match tokio::time::timeout(
+                            REALM_PEER_REFRESH_TIMEOUT,
+                            net_handle.refresh_realm_peers_from_bytes(&bytes),
+                        )
+                        .await
                         {
-                            warn!(error = %error, "Failed to refresh realm peers from written realm config");
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                warn!(error = %error, "Failed to refresh realm peers from written realm config");
+                            }
+                            Err(_) => {
+                                warn!(
+                                    timeout_ms = REALM_PEER_REFRESH_TIMEOUT.as_millis() as u64,
+                                    "Timed out refreshing realm peers from written realm config"
+                                );
+                            }
                         }
                     }
                     (
@@ -322,8 +335,22 @@ async fn dispatch_effect_until(
                         }),
                         _,
                     ) if refresh_after_commit => {
-                        if let Err(error) = Box::pin(net_handle.reload_realm_peers()).await {
-                            warn!(error = %error, "Failed to refresh realm peers after storage commit");
+                        match tokio::time::timeout(
+                            REALM_PEER_REFRESH_TIMEOUT,
+                            net_handle.reload_realm_peers(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                warn!(error = %error, "Failed to refresh realm peers after storage commit");
+                            }
+                            Err(_) => {
+                                warn!(
+                                    timeout_ms = REALM_PEER_REFRESH_TIMEOUT.as_millis() as u64,
+                                    "Timed out refreshing realm peers after storage commit"
+                                );
+                            }
                         }
                     }
                     _ => {}
@@ -588,13 +615,18 @@ fn commit_done(transaction: Option<TransactionEffect>, event: &Event) -> bool {
 }
 
 fn managed_effect(effect: &Effect) -> bool {
-    matches!(
-        effect,
+    match effect {
         Effect::Blob(BlobEffect::SpoolHidden {
-            deadline: Some(_),
+            deadline: Some(_), ..
+        }) => true,
+        Effect::Storage(StorageEffect::CommitTransaction { .. }) => true,
+        Effect::Storage(StorageEffect::Write {
+            key_space,
+            txn_id: None,
             ..
-        })
-    )
+        }) => key_space == REALM_CONFIG_KEYSPACE,
+        _ => false,
+    }
 }
 
 #[derive(Default)]
@@ -1002,7 +1034,7 @@ pub async fn drive_until<O: Operation>(
                 event
             } else {
                 let managed = managed_effect(&effect);
-                // The blob adapter owns the writer abort at its deadline.
+                // Managed effects own their timeout and must not be canceled here.
                 let dispatch = Box::pin(dispatch_effect_until(effect, context, 0, Some(deadline)));
                 match if managed {
                     Ok(dispatch.await)
@@ -1203,6 +1235,7 @@ mod test {
         effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect},
         errors::StorageError,
         events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent},
+        keyspaces::REALM_CONFIG_KEYSPACE,
         operation::{Operation, boxed_suboperation},
         structs::{ResolvedSourceAccess, SourceConnectorKind},
         task::{TaskEffect, TaskKey},
@@ -1211,6 +1244,7 @@ mod test {
     use aruna_storage::storage;
     use byteview::ByteView;
     use std::convert::Infallible;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
@@ -1566,6 +1600,70 @@ mod test {
         }
     }
 
+    #[derive(Debug, PartialEq)]
+    struct CommitOutcome {
+        state: u8,
+        failed: bool,
+        txn_id: Option<TxnId>,
+    }
+
+    impl Operation for CommitOutcome {
+        type Output = ();
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            self.state = 1;
+            smallvec::smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            match (event, self.state) {
+                (Event::Storage(StorageEvent::TransactionStarted { txn_id }), 1) => {
+                    self.txn_id = Some(txn_id);
+                    self.state = 2;
+                    smallvec::smallvec![Effect::Storage(StorageEffect::Write {
+                        key_space: "default".to_string(),
+                        key: ByteView::from(*b"commit-outcome"),
+                        value: ByteView::from(*b"committed"),
+                        txn_id: Some(txn_id),
+                    })]
+                }
+                (Event::Storage(StorageEvent::WriteResult { .. }), 2) => {
+                    self.state = 3;
+                    smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
+                        txn_id: self.txn_id.expect("transaction id recorded"),
+                    })]
+                }
+                (Event::Storage(StorageEvent::TransactionCommitted { .. }), 3) => {
+                    self.state = 4;
+                    smallvec::smallvec![]
+                }
+                (Event::Storage(StorageEvent::Error { .. }), 3) => {
+                    self.failed = true;
+                    self.state = 4;
+                    smallvec::smallvec![]
+                }
+                _ => smallvec::smallvec![],
+            }
+        }
+
+        fn is_complete(&self) -> bool {
+            self.state == 4
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            if self.failed { Err(()) } else { Ok(()) }
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            self.failed = true;
+            self.state = 4;
+            smallvec::smallvec![]
+        }
+    }
+
     #[derive(Debug)]
     struct DeadlineOperation {
         state: u8,
@@ -1908,6 +2006,114 @@ mod test {
             Some(ByteView::from(*b"staged"))
         );
         assert!(transaction_reopens(&context).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn commit_refresh_survives() {
+        assert!(managed_effect(&Effect::Storage(
+            StorageEffect::CommitTransaction {
+                txn_id: ulid::Ulid::generate(),
+            },
+        )));
+        assert!(managed_effect(&Effect::Storage(StorageEffect::Write {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: ByteView::from(*b"realm"),
+            value: ByteView::from(*b"config"),
+            txn_id: None,
+        })));
+        let directory = tempdir().unwrap();
+        let direct = storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let (storage_handle, receivers) = storage::StorageHandle::new();
+        let receiver = receivers.foreground;
+        drop(receivers.bulk);
+        let committed = Arc::new(AtomicBool::new(false));
+        let committed_for_actor = committed.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let actor = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut started_tx = Some(started_tx);
+            let mut done_tx = Some(done_tx);
+            while let Ok((effect, response, _span, _queued, _in_flight)) = receiver.recv() {
+                let gated = committed_for_actor.load(Ordering::Acquire)
+                    && matches!(
+                        &effect,
+                        StorageEffect::Read { key_space, .. }
+                            if key_space == REALM_CONFIG_KEYSPACE
+                    );
+                if gated {
+                    if let Some(sender) = started_tx.take() {
+                        let _ = sender.send(());
+                    }
+                    release_rx.recv().unwrap();
+                    committed_for_actor.store(false, Ordering::Release);
+                }
+                let committed_effect = matches!(&effect, StorageEffect::CommitTransaction { .. });
+                let Event::Storage(event) = runtime.block_on(direct.send_storage_effect(effect))
+                else {
+                    unreachable!("storage proxy only handles storage events");
+                };
+                let committed_event =
+                    committed_effect && matches!(&event, StorageEvent::TransactionCommitted { .. });
+                let _ = response.send(event);
+                if committed_event {
+                    committed_for_actor.store(true, Ordering::Release);
+                }
+                if gated {
+                    if let Some(sender) = done_tx.take() {
+                        let _ = sender.send(());
+                    }
+                }
+            }
+        });
+        let net_handle = aruna_net::NetHandle::new(
+            aruna_net::NetConfig {
+                discovery_method: aruna_net::DiscoveryMethod::None,
+                relay_method: aruna_net::RelayMethod::None,
+                ..aruna_net::NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let context = DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: Some(net_handle.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let task_context = context.clone();
+        let task = tokio::spawn(async move {
+            crate::driver::drive_until(
+                CommitOutcome {
+                    state: 0,
+                    failed: false,
+                    txn_id: None,
+                },
+                &task_context,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(100),
+            )
+            .await
+        });
+
+        started_rx.await.unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert!(task.await.unwrap().is_ok());
+
+        committed.store(false, Ordering::Release);
+        release_tx.send(()).unwrap();
+        done_rx.await.unwrap();
+        net_handle.shutdown().await;
+        drop(context);
+        drop(net_handle);
+        drop(storage_handle);
+        actor.join().unwrap();
     }
 
     #[tokio::test]
