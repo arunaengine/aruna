@@ -1090,7 +1090,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, USER_ACCESS_KEYSPACE};
     use aruna_core::structs::{
         Actor, GroupAuthorizationDocument, JobId, JobPayload, RealmAuthorizationDocument, RealmId,
     };
@@ -1270,7 +1270,31 @@ mod tests {
         .unwrap()
         .unwrap()
         .unwrap();
-        let restrictions = access.path_restrictions.unwrap();
+        let mut expired = access.clone();
+        expired.expiry = SystemTime::UNIX_EPOCH;
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: USER_ACCESS_KEYSPACE.to_string(),
+                key: expired.access_key.as_bytes().into(),
+                value: expired.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        let renewed = mint_workspace_credential(&context, &spec, &record, node_id, &bucket)
+            .await
+            .unwrap();
+        assert_eq!(renewed.access_key, first.access_key);
+        let renewed_access = Box::pin(drive(
+            GetUserAccessOperation::new(first.access_key.clone()),
+            &context,
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert!(!renewed_access.is_expired(SystemTime::now()));
+        let restrictions = renewed_access.path_restrictions.unwrap();
         let bucket_path = blob_bucket_permission_path(realm_id, spec.group_id, node_id, &bucket);
         let permits = |path: &str| {
             restrictions.iter().any(|restriction| {
