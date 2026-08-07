@@ -855,7 +855,7 @@ impl MetadataHandle {
         group_id: GroupId,
         limit: usize,
     ) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
-        list_local_group_records(self.inner.clone(), group_id, limit).await
+        list_group_records(self.inner.clone(), group_id, limit).await
     }
 
     pub(crate) async fn snapshot_iri_references(
@@ -4533,7 +4533,7 @@ fn registry_records_for_group(
     )
 }
 
-async fn list_local_group_records(
+async fn list_group_records(
     inner: Arc<MetadataInner>,
     group_id: GroupId,
     limit: usize,
@@ -7200,7 +7200,7 @@ mod tests {
     }
 
     #[test]
-    fn upsert_over_limit_discards_cache() {
+    fn upsert_discards_cache() {
         let records = (0..METADATA_REGISTRY_CANDIDATE_LIMIT)
             .map(|index| registry_record(&format!("datasets/{index}")))
             .collect();
