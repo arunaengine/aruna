@@ -17,6 +17,7 @@ pub enum RevokeUserAccessState {
     ReadUserAccess,
     ReadOwnerIndex,
     WriteUserAccess,
+    DeleteUserAccess,
     CommitTransaction,
     Finish,
     Error,
@@ -128,51 +129,57 @@ impl RevokeUserAccessOperation {
         let Some(mut access) = self.access.clone() else {
             return self.emit_error(RevokeUserAccessError::NotFound);
         };
+        let already_revoked = access.revoked_at.is_some();
         let indexed = index.remove(&self.access_key);
-        if !indexed && access.revoked_at.is_some() {
-            self.output = Some(Ok(access));
-            self.state = RevokeUserAccessState::CommitTransaction;
-            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+        if access.revoked_at.is_none() {
+            access.revoked_at = Some(SystemTime::now());
+        }
+        self.access = Some(access.clone());
+        self.output = Some(Ok(access.clone()));
+        if !indexed && already_revoked {
+            self.state = RevokeUserAccessState::DeleteUserAccess;
+            return smallvec![Effect::Storage(StorageEffect::Delete {
+                key_space: USER_ACCESS_KEYSPACE.to_string(),
+                key: self.access_key.as_bytes().into(),
+                txn_id: Some(txn_id),
+            })];
         }
         if !indexed {
             return self.emit_error(RevokeUserAccessError::IndexInconsistent);
         }
-        if access.revoked_at.is_none() {
-            access.revoked_at = Some(SystemTime::now());
-        }
-        let access_bytes = match access.to_bytes() {
-            Ok(bytes) => bytes,
-            Err(err) => return self.emit_error(err.into()),
-        };
         let index_value = match encode_index(&index) {
             Ok(value) => value,
             Err(err) => return self.emit_error(err.into()),
         };
-        self.access = Some(access.clone());
-        self.output = Some(Ok(access));
         self.state = RevokeUserAccessState::WriteUserAccess;
-        let Some(access) = self.access.as_ref() else {
-            return self.emit_error(RevokeUserAccessError::NotFound);
-        };
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: vec![
-                (
-                    USER_ACCESS_KEYSPACE.to_string(),
-                    self.access_key.as_bytes().into(),
-                    access_bytes.into(),
-                ),
-                (
-                    USER_ACCESS_OWNER_KEYSPACE.to_string(),
-                    owner_key(access.user_identity),
-                    index_value,
-                ),
-            ],
+            writes: vec![(
+                USER_ACCESS_OWNER_KEYSPACE.to_string(),
+                owner_key(access.user_identity),
+                index_value,
+            )],
             txn_id: Some(txn_id),
         })]
     }
 
     fn handle_user_access_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
+            return self.emit_error(RevokeUserAccessError::InvalidOperationState);
+        };
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(RevokeUserAccessError::NoTransactionFound);
+        };
+
+        self.state = RevokeUserAccessState::DeleteUserAccess;
+        smallvec![Effect::Storage(StorageEffect::Delete {
+            key_space: USER_ACCESS_KEYSPACE.to_string(),
+            key: self.access_key.as_bytes().into(),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn handle_user_access_deleted(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
             return self.emit_error(RevokeUserAccessError::InvalidOperationState);
         };
         let Some(txn_id) = self.txn_id else {
@@ -216,6 +223,7 @@ impl Operation for RevokeUserAccessOperation {
             RevokeUserAccessState::ReadUserAccess => self.handle_user_access_read(event),
             RevokeUserAccessState::ReadOwnerIndex => self.handle_index_read(event),
             RevokeUserAccessState::WriteUserAccess => self.handle_user_access_written(event),
+            RevokeUserAccessState::DeleteUserAccess => self.handle_user_access_deleted(event),
             RevokeUserAccessState::CommitTransaction => self.handle_transaction_committed(event),
             RevokeUserAccessState::Finish => smallvec![],
             RevokeUserAccessState::Error => self.abort(),
@@ -301,6 +309,13 @@ mod tests {
         }));
         assert!(matches!(
             effects.as_slice(),
+            [Effect::Storage(StorageEffect::Delete { .. })]
+        ));
+        let effects = op.step(Event::Storage(StorageEvent::DeleteResult {
+            key: access.access_key.as_bytes().into(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
             [Effect::Storage(StorageEffect::CommitTransaction { .. })]
         ));
 
@@ -361,6 +376,17 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(result.revoked_at.is_some());
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: USER_ACCESS_KEYSPACE.to_string(),
+                key: result.access_key.as_bytes().into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("credential read failed");
+        };
+        assert!(value.is_none());
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
             .send_storage_effect(StorageEffect::Read {
                 key_space: USER_ACCESS_OWNER_KEYSPACE.to_string(),

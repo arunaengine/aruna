@@ -88,7 +88,7 @@ async fn credential_stays_local() -> Result<(), Box<dyn std::error::Error>> {
         nodes[0].context.as_ref(),
     )
     .await?;
-    assert!(matches!(revoked, Some(Ok(access)) if access.revoked_at.is_some()));
+    assert!(revoked.is_none());
 
     shutdown_nodes(nodes).await;
     Ok(())
