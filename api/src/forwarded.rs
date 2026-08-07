@@ -7,16 +7,21 @@ use ipnet::IpNet;
 use std::net::IpAddr;
 
 fn header_str<'headers>(headers: &'headers HeaderMap, name: &str) -> Option<&'headers str> {
-    headers.get(name).and_then(|value| value.to_str().ok())
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok()
 }
 
 pub fn peer_is_trusted(trusted_proxies: &[IpNet], peer: IpAddr) -> bool {
     trusted_proxies.iter().any(|net| net.contains(&peer))
 }
 
-/// Base URL (`scheme://host`) as the client sees it. Forwarded scheme and host
-/// apply only from a trusted proxy, and the scheme only when it is a real HTTP
-/// scheme; every other caller gets the transport-derived values.
+/// Base URL (`scheme://host`) as seen by the client. Forwarded scheme and host
+/// are honored only from trusted proxies; non-HTTP schemes use transport-derived
+/// values.
 pub fn external_base_url(trusted_proxies: &[IpNet], peer: IpAddr, headers: &HeaderMap) -> String {
     let from_proxy = peer_is_trusted(trusted_proxies, peer);
     let scheme = from_proxy
@@ -32,10 +37,9 @@ pub fn external_base_url(trusted_proxies: &[IpNet], peer: IpAddr, headers: &Head
     format!("{scheme}://{host}")
 }
 
-/// Client address for attribution. Behind a trusted proxy the chain is walked
-/// right-to-left, peeling every configured trusted hop; the first untrusted
-/// address is the client. A direct caller, an all-trusted chain, or a malformed
-/// entry falls back to the transport address.
+/// Client address for attribution. Behind trusted proxies, peel trusted hops
+/// right-to-left; the first untrusted address is the client. Direct callers,
+/// all-trusted chains, and malformed entries fall back to the transport address.
 pub fn client_ip(trusted_proxies: &[IpNet], peer: IpAddr, headers: &HeaderMap) -> IpAddr {
     if !peer_is_trusted(trusted_proxies, peer) {
         return peer;
@@ -95,6 +99,31 @@ mod tests {
     }
 
     #[test]
+    fn rejects_xfh_duplicate() {
+        let mut headers = forwarded_headers();
+        headers.append(
+            "x-forwarded-host",
+            HeaderValue::from_static("attacker.example"),
+        );
+        let peer = IpAddr::from_str("10.1.2.3").unwrap();
+        assert_eq!(
+            external_base_url(&proxies(), peer, &headers),
+            "https://node.internal"
+        );
+    }
+
+    #[test]
+    fn rejects_xfp_duplicate() {
+        let mut headers = forwarded_headers();
+        headers.append("x-forwarded-proto", HeaderValue::from_static("https"));
+        let peer = IpAddr::from_str("10.1.2.3").unwrap();
+        assert_eq!(
+            external_base_url(&proxies(), peer, &headers),
+            "http://drs.example"
+        );
+    }
+
+    #[test]
     fn rejects_bogus_scheme() {
         // A forwarded scheme outside http/https falls back instead of being
         // spliced into every absolute link.
@@ -125,6 +154,51 @@ mod tests {
             IpAddr::from_str("198.51.100.7").unwrap()
         );
         assert_eq!(client_ip(&proxies(), proxy, &HeaderMap::new()), proxy);
+    }
+
+    #[test]
+    fn rejects_xff_duplicate() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", HeaderValue::from_static("192.0.2.1"));
+        headers.append("x-forwarded-for", HeaderValue::from_static("198.51.100.7"));
+        let proxy = IpAddr::from_str("10.1.2.3").unwrap();
+        assert_eq!(client_ip(&proxies(), proxy, &headers), proxy);
+    }
+
+    #[test]
+    fn accepts_xff_chain() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("192.0.2.1, 198.51.100.7"),
+        );
+        let proxy = IpAddr::from_str("10.1.2.3").unwrap();
+        assert_eq!(
+            client_ip(&proxies(), proxy, &headers),
+            IpAddr::from_str("198.51.100.7").unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_bad_xff() {
+        let proxy = IpAddr::from_str("10.1.2.3").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_bytes(b"\xff").unwrap());
+        assert_eq!(client_ip(&proxies(), proxy, &headers), proxy);
+
+        headers.insert("x-forwarded-for", HeaderValue::from_static("bogus"));
+        assert_eq!(client_ip(&proxies(), proxy, &headers), proxy);
+    }
+
+    #[test]
+    fn ignores_untrusted_xff() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("192.0.2.1, 198.51.100.7"),
+        );
+        let peer = IpAddr::from_str("203.0.113.9").unwrap();
+        assert_eq!(client_ip(&proxies(), peer, &headers), peer);
     }
 
     #[test]
