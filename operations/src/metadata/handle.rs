@@ -6028,20 +6028,23 @@ async fn resolve_graph_visibility_scope(
             .iter()
             .map(|record| (record.realm_id, record.group_id)),
     )
-    .await;
+    .await
+    .map_err(|error| MetadataError::Backend(error.to_string()))?;
     let policy_user = auth_context.as_ref().map(|auth| auth.user_id);
     let records = Arc::new(
         records
             .iter()
             .filter(|record| {
-                evaluators.get(&record.group_id).is_some_and(|evaluator| {
-                    evaluator
-                        .evaluate(&crate::metadata::api::metadata_read_request(
-                            &record.permission_path,
-                            policy_user.as_ref(),
-                        ))
-                        .is_ok()
-                })
+                evaluators
+                    .get(&(record.realm_id, record.group_id))
+                    .is_some_and(|evaluator| {
+                        evaluator
+                            .evaluate(&crate::metadata::api::metadata_read_request(
+                                &record.permission_path,
+                                policy_user.as_ref(),
+                            ))
+                            .is_ok()
+                    })
             })
             .cloned()
             .collect(),
