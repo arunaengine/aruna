@@ -16,7 +16,7 @@ use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{MetaResourceId, StructuredId};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload,
+    CreateMetadataDocumentPayload, mint_forward_document, mint_local_document,
 };
 #[cfg(test)]
 use aruna_operations::driver::drive;
@@ -30,8 +30,8 @@ use aruna_operations::metadata::api::{
     MetadataReferencesExecution, MetadataReferencesRequest,
     MetadataRoCrateExportView as OperationMetadataRoCrateExportView, MetadataSearchRequest,
     forwarded_bearer, list_visible_metadata_documents as run_list_visible_metadata_documents,
-    lookup_metadata_path as run_lookup_metadata_path, query_metadata as run_query_metadata,
-    query_metadata_document as run_query_metadata_document,
+    load_realm_config, lookup_metadata_path as run_lookup_metadata_path,
+    query_metadata as run_query_metadata, query_metadata_document as run_query_metadata_document,
     references_metadata as run_references_metadata, search_metadata as run_search_metadata,
 };
 use aruna_operations::metadata::forward::{
@@ -636,26 +636,58 @@ pub async fn create_metadata_document(
             },
         ),
     };
-    if MetadataRegistryRecord::normalize_document_path(&path).is_empty() {
+    let path = MetadataRegistryRecord::normalize_document_path(&path);
+    if path.is_empty() {
         return Err(ServerError::BadRequest);
     }
     let ctx = state.get_ctx();
-    if !is_user_origin(&ctx, state.get_realm_id(), state.get_node_id())
+    let user_origin = is_user_origin(&ctx, state.get_realm_id(), state.get_node_id())
         .await
-        .map_err(map_metadata_api_error)?
-    {
+        .map_err(map_metadata_api_error)?;
+    let realm_config = load_realm_config(ctx.as_ref(), state.get_realm_id())
+        .await
+        .ok_or(ServerError::ServiceUnavailable)?;
+    let actor = Actor {
+        node_id: state.get_node_id(),
+        user_id: auth.user_id,
+        realm_id: state.get_realm_id(),
+    };
+    let document_id = if user_origin {
+        mint_forward_document(&realm_config, &actor, group_id, &path)
+            .map_err(map_create_error)?
+            .as_ulid()
+    } else {
+        match mint_local_document(&realm_config, &actor, group_id, &path) {
+            Ok(document_id) => document_id.as_ulid(),
+            Err(CreateMetadataDocumentError::OriginHoldsNoBucket) => {
+                mint_forward_document(&realm_config, &actor, group_id, &path)
+                    .map_err(map_create_error)?
+                    .as_ulid()
+            }
+            Err(error) => return Err(map_create_error(error)),
+        }
+    };
+    if !user_origin {
         ensure_metadata_write_scope(&state, &auth, group_id).await?;
+        ensure_permission(
+            &state,
+            auth.clone(),
+            MetadataRegistryRecord::permission_path_for(
+                &auth.realm_id,
+                group_id,
+                &path,
+                document_id,
+            ),
+            Permission::WRITE,
+        )
+        .await?;
     }
     let created = run_create_metadata_document(
         CreateMetadataDocumentOperation::new_for_generated_document_id(
             CreateMetadataDocumentConfig {
-                actor: Actor {
-                    node_id: state.get_node_id(),
-                    user_id: auth.user_id,
-                    realm_id: state.get_realm_id(),
-                },
+                actor,
                 group_id,
-                document_id: Ulid::nil(),
+                document_id,
                 document_path: path,
                 public,
                 payload,
