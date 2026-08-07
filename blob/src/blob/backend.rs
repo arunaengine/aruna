@@ -11,6 +11,7 @@ use aruna_core::structs::{
     MULTIPART_PART_PREFIX, ensure_confined_relative_path,
 };
 use aruna_core::types::TxnId;
+use aruna_storage::storage::TransactionOwner;
 use byteview::ByteView;
 use opendal::Operator;
 use std::path::PathBuf;
@@ -277,19 +278,13 @@ impl BlobHandler {
         marker: &ByteView,
         capacity: Option<u64>,
     ) -> Result<LoadUpdate, BlobError> {
-        let txn_id = match self
-            .storage
-            .send_effect(Effect::Storage(StorageEffect::StartTransaction {
-                read: false,
-            }))
-            .await
-        {
-            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-            _ => {
-                return Err(BlobError::ReadError(
-                    "failed to start hidden bucket transaction".to_string(),
-                ));
-            }
+        let mut owner = self.storage.start_transaction(false).await.map_err(|_| {
+            BlobError::ReadError("failed to start hidden bucket transaction".to_string())
+        })?;
+        let Some(txn_id) = owner.id() else {
+            return Err(BlobError::ReadError(
+                "hidden bucket transaction owner missing transaction".to_string(),
+            ));
         };
         let marker_exists = match self
             .storage
@@ -302,25 +297,25 @@ impl BlobHandler {
         {
             Event::Storage(StorageEvent::ReadResult { value, .. }) => value.is_some(),
             _ => {
-                self.abort_stats_txn(txn_id).await;
+                self.abort_stats_txn(&mut owner).await;
                 return Err(BlobError::ReadError(
                     "failed to read hidden bucket reservation".to_string(),
                 ));
             }
         };
         if marker_exists {
-            self.abort_stats_txn(txn_id).await;
+            self.abort_stats_txn(&mut owner).await;
             return Ok(LoadUpdate::Applied);
         }
         let load = match self.bucket_load_txn(backend, bucket, txn_id).await {
             Ok(load) => load,
             Err(error) => {
-                self.abort_stats_txn(txn_id).await;
+                self.abort_stats_txn(&mut owner).await;
                 return Err(error);
             }
         };
         if capacity.is_some_and(|capacity| load >= capacity) {
-            self.abort_stats_txn(txn_id).await;
+            self.abort_stats_txn(&mut owner).await;
             return Ok(LoadUpdate::Full);
         }
         let adjusted = load.saturating_add(1);
@@ -335,7 +330,7 @@ impl BlobHandler {
             }))
             .await;
         if !matches!(event, Event::Storage(StorageEvent::WriteResult { .. })) {
-            self.abort_stats_txn(txn_id).await;
+            self.abort_stats_txn(&mut owner).await;
             return Err(BlobError::ReadError(
                 "failed to reserve hidden bucket capacity".to_string(),
             ));
@@ -350,7 +345,7 @@ impl BlobHandler {
             }))
             .await;
         if !matches!(event, Event::Storage(StorageEvent::WriteResult { .. })) {
-            self.abort_stats_txn(txn_id).await;
+            self.abort_stats_txn(&mut owner).await;
             return Err(BlobError::ReadError(
                 "failed to persist hidden bucket reservation".to_string(),
             ));
@@ -360,16 +355,39 @@ impl BlobHandler {
             .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
             .await
         {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(LoadUpdate::Applied),
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::TransactionConflict,
-            }) => Ok(LoadUpdate::Conflict),
-            Event::Storage(StorageEvent::Error { error }) => Err(BlobError::ReadError(format!(
-                "failed to reserve hidden bucket: {error}"
-            ))),
-            _ => Err(BlobError::ReadError(
-                "unexpected hidden bucket reservation event".to_string(),
-            )),
+            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
+                if committed == txn_id =>
+            {
+                owner.finish();
+                Ok(LoadUpdate::Applied)
+            }
+            Event::Storage(StorageEvent::Error { error }) => match error {
+                StorageError::TransactionConflict => {
+                    owner.finish();
+                    Ok(LoadUpdate::Conflict)
+                }
+                StorageError::TransactionNotFound => {
+                    owner.finish();
+                    Err(BlobError::ReadError(
+                        "hidden bucket transaction was not found".to_string(),
+                    ))
+                }
+                StorageError::QueueFull => Err(BlobError::ReadError(
+                    "failed to reserve hidden bucket: queue full".to_string(),
+                )),
+                error => {
+                    owner.unknown();
+                    Err(BlobError::ReadError(format!(
+                        "failed to reserve hidden bucket: {error}"
+                    )))
+                }
+            },
+            other => {
+                owner.unknown();
+                Err(BlobError::ReadError(format!(
+                    "unexpected hidden bucket reservation event: {other:?}"
+                )))
+            }
         }
     }
 
@@ -378,19 +396,13 @@ impl BlobHandler {
         key: &HiddenBlobKey,
         marker: &ByteView,
     ) -> Result<LoadUpdate, BlobError> {
-        let txn_id = match self
-            .storage
-            .send_effect(Effect::Storage(StorageEffect::StartTransaction {
-                read: false,
-            }))
-            .await
-        {
-            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-            _ => {
-                return Err(BlobError::ReadError(
-                    "failed to start hidden bucket release".to_string(),
-                ));
-            }
+        let mut owner = self.storage.start_transaction(false).await.map_err(|_| {
+            BlobError::ReadError("failed to start hidden bucket release".to_string())
+        })?;
+        let Some(txn_id) = owner.id() else {
+            return Err(BlobError::ReadError(
+                "hidden bucket release owner missing transaction".to_string(),
+            ));
         };
         let marker_exists = match self
             .storage
@@ -403,14 +415,14 @@ impl BlobHandler {
         {
             Event::Storage(StorageEvent::ReadResult { value, .. }) => value.is_some(),
             _ => {
-                self.abort_stats_txn(txn_id).await;
+                self.abort_stats_txn(&mut owner).await;
                 return Err(BlobError::ReadError(
                     "failed to read hidden bucket release".to_string(),
                 ));
             }
         };
         if !marker_exists {
-            self.abort_stats_txn(txn_id).await;
+            self.abort_stats_txn(&mut owner).await;
             return Ok(LoadUpdate::Applied);
         }
         let load = match self
@@ -419,7 +431,7 @@ impl BlobHandler {
         {
             Ok(load) => load,
             Err(error) => {
-                self.abort_stats_txn(txn_id).await;
+                self.abort_stats_txn(&mut owner).await;
                 return Err(error);
             }
         };
@@ -433,7 +445,7 @@ impl BlobHandler {
             }))
             .await;
         if !matches!(event, Event::Storage(StorageEvent::WriteResult { .. })) {
-            self.abort_stats_txn(txn_id).await;
+            self.abort_stats_txn(&mut owner).await;
             return Err(BlobError::ReadError(
                 "failed to release hidden bucket capacity".to_string(),
             ));
@@ -447,7 +459,7 @@ impl BlobHandler {
             }))
             .await;
         if !matches!(event, Event::Storage(StorageEvent::DeleteResult { .. })) {
-            self.abort_stats_txn(txn_id).await;
+            self.abort_stats_txn(&mut owner).await;
             return Err(BlobError::ReadError(
                 "failed to delete hidden bucket reservation".to_string(),
             ));
@@ -457,16 +469,39 @@ impl BlobHandler {
             .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
             .await
         {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(LoadUpdate::Applied),
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::TransactionConflict,
-            }) => Ok(LoadUpdate::Conflict),
-            Event::Storage(StorageEvent::Error { error }) => Err(BlobError::ReadError(format!(
-                "failed to release hidden bucket: {error}"
-            ))),
-            _ => Err(BlobError::ReadError(
-                "unexpected hidden bucket release event".to_string(),
-            )),
+            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
+                if committed == txn_id =>
+            {
+                owner.finish();
+                Ok(LoadUpdate::Applied)
+            }
+            Event::Storage(StorageEvent::Error { error }) => match error {
+                StorageError::TransactionConflict => {
+                    owner.finish();
+                    Ok(LoadUpdate::Conflict)
+                }
+                StorageError::TransactionNotFound => {
+                    owner.finish();
+                    Err(BlobError::ReadError(
+                        "hidden bucket release transaction was not found".to_string(),
+                    ))
+                }
+                StorageError::QueueFull => Err(BlobError::ReadError(
+                    "failed to release hidden bucket: queue full".to_string(),
+                )),
+                error => {
+                    owner.unknown();
+                    Err(BlobError::ReadError(format!(
+                        "failed to release hidden bucket: {error}"
+                    )))
+                }
+            },
+            other => {
+                owner.unknown();
+                Err(BlobError::ReadError(format!(
+                    "unexpected hidden bucket release event: {other:?}"
+                )))
+            }
         }
     }
 
@@ -643,22 +678,19 @@ impl BlobHandler {
         delta: i64,
         capacity: Option<u64>,
     ) -> Result<LoadUpdate, BlobError> {
-        let event = self
-            .storage
-            .send_effect(Effect::Storage(StorageEffect::StartTransaction {
-                read: false,
-            }))
-            .await;
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
+        let mut owner = self.storage.start_transaction(false).await.map_err(|_| {
+            BlobError::ReadError("failed to start bucket stats transaction".to_string())
+        })?;
+        let Some(txn_id) = owner.id() else {
             return Err(BlobError::ReadError(
-                "failed to start bucket stats transaction".to_string(),
+                "bucket stats transaction owner missing transaction".to_string(),
             ));
         };
 
         let load = match self.bucket_load_txn(backend, bucket, txn_id).await {
             Ok(load) => load,
             Err(error) => {
-                self.abort_stats_txn(txn_id).await;
+                self.abort_stats_txn(&mut owner).await;
                 return Err(error);
             }
         };
@@ -666,7 +698,7 @@ impl BlobHandler {
             && let Some(capacity) = capacity
             && load >= capacity
         {
-            self.abort_stats_txn(txn_id).await;
+            self.abort_stats_txn(&mut owner).await;
             return Ok(LoadUpdate::Full);
         }
         let adjusted = if delta >= 0 {
@@ -685,7 +717,7 @@ impl BlobHandler {
             }))
             .await;
         if !matches!(event, Event::Storage(StorageEvent::WriteResult { .. })) {
-            self.abort_stats_txn(txn_id).await;
+            self.abort_stats_txn(&mut owner).await;
             return Err(BlobError::ReadError(
                 "failed to write bucket stats".to_string(),
             ));
@@ -696,16 +728,39 @@ impl BlobHandler {
             .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
             .await;
         match event {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(LoadUpdate::Applied),
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::TransactionConflict,
-            }) => Ok(LoadUpdate::Conflict),
-            Event::Storage(StorageEvent::Error { error }) => Err(BlobError::ReadError(format!(
-                "failed to commit bucket stats: {error}"
-            ))),
-            _ => Err(BlobError::ReadError(
-                "unexpected storage event while committing bucket stats".to_string(),
-            )),
+            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
+                if committed == txn_id =>
+            {
+                owner.finish();
+                Ok(LoadUpdate::Applied)
+            }
+            Event::Storage(StorageEvent::Error { error }) => match error {
+                StorageError::TransactionConflict => {
+                    owner.finish();
+                    Ok(LoadUpdate::Conflict)
+                }
+                StorageError::TransactionNotFound => {
+                    owner.finish();
+                    Err(BlobError::ReadError(
+                        "bucket stats transaction was not found".to_string(),
+                    ))
+                }
+                StorageError::QueueFull => Err(BlobError::ReadError(
+                    "failed to commit bucket stats: queue full".to_string(),
+                )),
+                error => {
+                    owner.unknown();
+                    Err(BlobError::ReadError(format!(
+                        "failed to commit bucket stats: {error}"
+                    )))
+                }
+            },
+            other => {
+                owner.unknown();
+                Err(BlobError::ReadError(format!(
+                    "unexpected storage event while committing bucket stats: {other:?}"
+                )))
+            }
         }
     }
 
@@ -736,16 +791,26 @@ impl BlobHandler {
         }
     }
 
-    async fn abort_stats_txn(&self, txn_id: TxnId) {
+    async fn abort_stats_txn(&self, owner: &mut TransactionOwner) {
+        let Some(txn_id) = owner.id() else {
+            return;
+        };
         let event = self
             .storage
             .send_effect(Effect::Storage(StorageEffect::AbortTransaction { txn_id }))
             .await;
-        if !matches!(
-            event,
-            Event::Storage(StorageEvent::TransactionAborted { .. })
-        ) {
-            tracing::warn!(%txn_id, "failed to abort bucket stats transaction");
+        match event {
+            Event::Storage(StorageEvent::TransactionAborted { txn_id: aborted })
+                if aborted == txn_id =>
+            {
+                owner.finish()
+            }
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionNotFound,
+            }) => owner.finish(),
+            other => {
+                tracing::warn!(%txn_id, event = ?other, "failed to abort bucket stats transaction");
+            }
         }
     }
 

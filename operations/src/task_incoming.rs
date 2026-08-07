@@ -1464,25 +1464,20 @@ impl OperationsTaskHandler {
         };
         let local_node_id = net_handle.node_id();
 
-        let snapshot_txn_id = match self
-            .context
-            .storage_handle
-            .send_storage_effect(StorageEffect::StartTransaction { read: true })
-            .await
-        {
-            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-            Event::Storage(StorageEvent::Error { error }) => {
+        let mut snapshot_owner = match self.context.storage_handle.start_transaction(true).await {
+            Ok(owner) => owner,
+            Err(error) => {
                 warn!(task_id = ?retry_key, error = %error, "Failed to start notification outbox snapshot");
                 self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
                     .await;
                 return;
             }
-            other => {
-                warn!(task_id = ?retry_key, event = ?other, "Unexpected notification outbox snapshot start result");
-                self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
-                    .await;
-                return;
-            }
+        };
+        let Some(snapshot_txn_id) = snapshot_owner.id() else {
+            warn!(task_id = ?retry_key, "Notification outbox snapshot owner missing transaction");
+            self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
+                .await;
+            return;
         };
 
         let mut start_after: Option<Vec<u8>> = None;
@@ -1641,13 +1636,26 @@ impl OperationsTaskHandler {
             })
             .await
         {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {}
+            Event::Storage(StorageEvent::TransactionCommitted { txn_id })
+                if txn_id == snapshot_txn_id =>
+            {
+                snapshot_owner.finish()
+            }
             Event::Storage(StorageEvent::Error { error }) => {
                 warn!(task_id = ?retry_key, error = %error, "Failed to close notification outbox snapshot");
+                match error {
+                    aruna_core::errors::StorageError::TransactionConflict
+                    | aruna_core::errors::StorageError::TransactionNotFound => {
+                        snapshot_owner.finish();
+                    }
+                    aruna_core::errors::StorageError::QueueFull => {}
+                    _ => snapshot_owner.unknown(),
+                }
                 retry_needed = true;
             }
             other => {
                 warn!(task_id = ?retry_key, event = ?other, "Unexpected notification outbox snapshot close result");
+                snapshot_owner.unknown();
                 retry_needed = true;
             }
         }
