@@ -1267,6 +1267,16 @@ impl FjallStorage {
         fields(read)
     )]
     fn start_transaction(&mut self, read: bool) -> StorageEvent {
+        let retained = self
+            .transaction_cleanup
+            .lock()
+            .expect("transaction cleanup mutex poisoned")
+            .len();
+        if self.txns.len().saturating_add(retained) >= MAX_TRANSACTION_CLEANUP {
+            return StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            };
+        }
         let txn_id = Ulid::generate();
 
         let txn = if read {
@@ -2813,6 +2823,39 @@ mod tests {
             })
         ));
         assert_eq!(handle.pending_transactions(), 0);
+    }
+
+    #[tokio::test]
+    async fn transaction_cap() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let mut owners = Vec::with_capacity(super::MAX_TRANSACTION_CLEANUP);
+        for _ in 0..super::MAX_TRANSACTION_CLEANUP {
+            let owner = handle.start_transaction(true).await.unwrap();
+            owners.push(owner);
+        }
+
+        assert!(matches!(
+            handle
+                .send_storage_effect(StorageEffect::StartTransaction { read: true })
+                .await,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict
+            })
+        ));
+
+        for mut owner in owners {
+            let txn_id = owner.id().unwrap();
+            match handle
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await
+            {
+                Event::Storage(StorageEvent::TransactionAborted { .. }) => owner.finish(),
+                other => panic!("unexpected storage event: {other:?}"),
+            }
+        }
+        assert_eq!(handle.pending_transactions(), 0);
+        assert!(handle.start_transaction(true).await.is_ok());
     }
 
     async fn commit_transaction(handle: &StorageHandle, txn_id: Ulid) {
