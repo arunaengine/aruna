@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_AUDIT_PAGE_BYTES};
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
 use aruna_core::structs::{MetadataRegistryRecord, PathClaimRecord, SyncRelationship};
@@ -5,6 +7,7 @@ use aruna_core::types::GroupId;
 use aruna_net::streams::BiStream;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use ulid::Ulid;
 
 use crate::create_metadata_document::CreateMetadataDocumentPayload;
@@ -15,8 +18,9 @@ use crate::update_metadata_document::UpdateMetadataDocumentMutation;
 
 pub use aruna_core::metadata::{MetadataAuthToken, MetadataAuthTokenError};
 
-const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 const AUDIT_FRAME_OVERHEAD: usize = 256;
+pub(crate) const METADATA_INBOUND_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const STANDARD_FRAME: u8 = 0;
 const AUDIT_FRAME: u8 = 1;
 
@@ -272,10 +276,37 @@ pub async fn read_message(stream: &mut BiStream) -> Result<MetadataTransportMess
     read_message_cap(&mut stream.1, MAX_MESSAGE_SIZE).await
 }
 
+pub(crate) async fn read_message_budget<R>(
+    reader: &mut R,
+    max_size: usize,
+    byte_budget: &Arc<Semaphore>,
+) -> Result<(MetadataTransportMessage, OwnedSemaphorePermit), String>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    let (message, permit) = read_message_inner(reader, max_size, Some(byte_budget)).await?;
+    permit
+        .ok_or_else(|| "metadata inbound frame budget missing".to_string())
+        .map(|permit| (message, permit))
+}
+
 pub(crate) async fn read_message_cap<R>(
     reader: &mut R,
     max_size: usize,
 ) -> Result<MetadataTransportMessage, String>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    read_message_inner(reader, max_size, None)
+        .await
+        .map(|(message, _)| message)
+}
+
+async fn read_message_inner<R>(
+    reader: &mut R,
+    max_size: usize,
+    byte_budget: Option<&Arc<Semaphore>>,
+) -> Result<(MetadataTransportMessage, Option<OwnedSemaphorePermit>), String>
 where
     R: AsyncRead + Unpin + ?Sized,
 {
@@ -298,6 +329,23 @@ where
     if len > max_size.min(MAX_MESSAGE_SIZE) {
         return Err("metadata frame exceeds maximum size".to_string());
     }
+    if class == AUDIT_FRAME && len > audit_frame_cap() {
+        return Err("metadata audit frame exceeds maximum size".to_string());
+    }
+
+    let permit = match byte_budget {
+        Some(byte_budget) => {
+            let permits = u32::try_from(len)
+                .map_err(|_| "metadata frame length is unsupported".to_string())?;
+            Some(
+                byte_budget
+                    .clone()
+                    .try_acquire_many_owned(permits)
+                    .map_err(|_| "metadata inbound frame budget unavailable".to_string())?,
+            )
+        }
+        None => None,
+    };
 
     let mut bytes = vec![0u8; len];
     reader
@@ -312,7 +360,7 @@ where
     if decoded_class == AUDIT_FRAME && len > audit_frame_cap() {
         return Err("metadata audit frame exceeds maximum size".to_string());
     }
-    Ok(message)
+    Ok((message, permit))
 }
 
 fn audit_frame_cap() -> usize {
@@ -336,6 +384,9 @@ pub(crate) fn frame_class(message: &MetadataTransportMessage) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use super::*;
     use aruna_core::audit::AuditPageEntry;
     use aruna_core::metadata::MAX_METADATA_BEARER_TOKEN_LEN;
@@ -344,6 +395,7 @@ mod tests {
         RealmId,
     };
     use aruna_core::types::UserId;
+    use tokio::sync::Semaphore;
 
     #[test]
     fn transport_messages_use_auth_token_fields() {
@@ -553,6 +605,85 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error, "metadata frame exceeds maximum size");
+    }
+
+    #[tokio::test]
+    async fn audit_rejects_early() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        let length = (audit_frame_cap() + 1) as u32;
+        writer.write_all(&[AUDIT_FRAME]).await.unwrap();
+        writer.write_all(&length.to_be_bytes()).await.unwrap();
+        let budget = Arc::new(Semaphore::new(1));
+
+        let error = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "metadata audit frame exceeds maximum size");
+        assert_eq!(budget.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn budget_releases() {
+        let message = MetadataTransportMessage::Reject(String::new());
+        let bytes = postcard::to_allocvec(&message).unwrap();
+        let (mut writer, mut reader) = tokio::io::duplex(bytes.len() + 5);
+        writer.write_all(&[STANDARD_FRAME]).await.unwrap();
+        writer
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        writer.write_all(&bytes).await.unwrap();
+        let budget = Arc::new(Semaphore::new(32));
+
+        let (decoded, permit) = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
+            .await
+            .unwrap();
+        assert_eq!(decoded, message);
+        assert_eq!(budget.available_permits(), 32 - bytes.len());
+        drop(permit);
+        assert_eq!(budget.available_permits(), 32);
+    }
+
+    #[tokio::test]
+    async fn budget_rejects() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        writer
+            .write_all(&[STANDARD_FRAME, 0, 0, 0, 8])
+            .await
+            .unwrap();
+        let budget = Arc::new(Semaphore::new(4));
+
+        let error = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "metadata inbound frame budget unavailable");
+        assert_eq!(budget.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn budget_cancels() {
+        let (mut writer, reader) = tokio::io::duplex(16);
+        writer
+            .write_all(&[STANDARD_FRAME, 0, 0, 0, 8])
+            .await
+            .unwrap();
+        let budget = Arc::new(Semaphore::new(8));
+        let task_budget = budget.clone();
+        let task = tokio::spawn(async move {
+            let mut reader = reader;
+            read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &task_budget).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while budget.available_permits() == 8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        let _ = task.await;
+        assert_eq!(budget.available_permits(), 8);
     }
 
     #[tokio::test]

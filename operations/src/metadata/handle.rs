@@ -48,13 +48,15 @@ use serde_json::Value;
 use spareval::{CancellationToken, QueryEvaluator};
 use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExpression};
 use spargebra::{Query, SparqlParser};
-use tokio::time::{sleep, timeout};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::time::{sleep, timeout, timeout_at};
 use tracing::{Instrument, Span, debug, debug_span, field, warn};
 use ulid::Ulid;
 
 use super::protocol::{
     MetadataAuthToken, MetadataReadError, MetadataTransportMessage, encode_message, frame_class,
-    read_message, read_message_cap, response_cap, write_encoded_message, write_message,
+    read_message, read_message_budget, read_message_cap, response_cap, write_encoded_message,
+    write_message,
 };
 use super::query_cache::{
     CachedQuery, LocalScopeKind, MetadataQueryCache, ScopeDigest, graphs_digest, local_key,
@@ -274,6 +276,7 @@ struct MetadataInner {
     query_cache: MetadataQueryCache,
     craqle_permits: Arc<tokio::sync::Semaphore>,
     craqle_read_permits: Arc<tokio::sync::Semaphore>,
+    inbound_frame_bytes: Arc<tokio::sync::Semaphore>,
     deferred_persist_requested: AtomicBool,
     deferred_persist_running: AtomicBool,
 }
@@ -852,6 +855,9 @@ impl MetadataHandle {
                 query_cache: MetadataQueryCache::new(),
                 craqle_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
                 craqle_read_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
+                inbound_frame_bytes: Arc::new(tokio::sync::Semaphore::new(
+                    super::protocol::METADATA_INBOUND_FRAME_BYTES,
+                )),
                 deferred_persist_requested: AtomicBool::new(false),
                 deferred_persist_running: AtomicBool::new(false),
             }),
@@ -1273,7 +1279,14 @@ impl MetadataHandle {
         let audit_deadline =
             tokio::time::Instant::now() + Duration::from_secs(super::audit::AUDIT_DEADLINE_SECS);
         let read_started = Instant::now();
-        let message = read_transport_message(&mut stream).await?;
+        let (message, _frame_budget) = read_message_budget(
+            &mut stream.1,
+            super::protocol::MAX_MESSAGE_SIZE,
+            &self.inner.inbound_frame_bytes,
+        )
+        .await
+        .map_err(MetadataError::Backend)?;
+        let is_audit = matches!(&message, MetadataTransportMessage::ForwardAuditPage { .. });
         let span = Span::current();
         record_elapsed_ms(&span, "read_ms", read_started);
         span.record("request", transport_message_kind(&message));
@@ -1576,19 +1589,42 @@ impl MetadataHandle {
         record_elapsed_ms(&span, "process_ms", process_started);
 
         let drain_started = Instant::now();
-        drain_request_stream(&mut stream).await?;
+        let drain_result = if is_audit {
+            drain_stream_at(&mut stream.1, audit_deadline).await
+        } else {
+            drain_request_stream(&mut stream).await
+        };
+        if let Err(error) = drain_result {
+            if is_audit {
+                close_stream_at(&mut stream, audit_deadline);
+            }
+            return Err(error);
+        }
         record_elapsed_ms(&span, "drain_ms", drain_started);
 
         let write_started = Instant::now();
-        if write_transport_message(&mut stream, &response)
-            .await
-            .is_ok()
-            && let Some(body) = response_body
-        {
-            let _ = write_stream_body(&mut stream, &body).await;
+        let response_written = if is_audit {
+            write_message_at(&mut stream, &response, audit_deadline)
+                .await
+                .is_ok()
+        } else {
+            write_transport_message(&mut stream, &response)
+                .await
+                .is_ok()
+        };
+        if response_written && let Some(body) = response_body {
+            if is_audit {
+                let _ = write_body_at(&mut stream, &body, audit_deadline).await;
+            } else {
+                let _ = write_stream_body(&mut stream, &body).await;
+            }
         }
         record_elapsed_ms(&span, "write_ms", write_started);
-        close_stream(&mut stream).await;
+        if is_audit {
+            close_stream_at(&mut stream, audit_deadline);
+        } else {
+            close_stream(&mut stream).await;
+        }
         record_elapsed_ms(&span, "elapsed_ms", total_started);
         span.record("response", transport_message_kind(&response));
         Ok(())
@@ -6438,6 +6474,59 @@ async fn read_stream_body(stream: &mut BiStream, length: u64) -> Result<Vec<u8>,
 async fn close_stream(stream: &mut BiStream) {
     let _ = stream.0.finish();
     let _ = stream.1.stop(0u32.into());
+}
+
+fn close_stream_at(stream: &mut BiStream, deadline: tokio::time::Instant) {
+    if tokio::time::Instant::now() < deadline {
+        let _ = stream.0.finish();
+    }
+    let _ = stream.1.stop(0u32.into());
+}
+
+async fn write_message_at(
+    stream: &mut BiStream,
+    message: &MetadataTransportMessage,
+    deadline: tokio::time::Instant,
+) -> Result<(), MetadataError> {
+    timeout_at(deadline, write_message(stream, message))
+        .await
+        .map_err(|_| MetadataError::Backend("timed out writing metadata message".to_string()))?
+        .map_err(MetadataError::Backend)
+}
+
+async fn write_body_at(
+    stream: &mut BiStream,
+    bytes: &[u8],
+    deadline: tokio::time::Instant,
+) -> Result<(), MetadataError> {
+    timeout_at(deadline, async {
+        for chunk in bytes.chunks(METADATA_CHUNK_SIZE) {
+            stream
+                .0
+                .write_all(chunk)
+                .await
+                .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        }
+        Ok::<(), MetadataError>(())
+    })
+    .await
+    .map_err(|_| MetadataError::Backend("timed out writing metadata body".to_string()))?
+}
+
+async fn drain_stream_at<R>(
+    reader: &mut R,
+    deadline: tokio::time::Instant,
+) -> Result<(), MetadataError>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    timeout_at(deadline, reader.read_to_end(1))
+        .await
+        .map_err(|_| {
+            MetadataError::Backend("timed out draining metadata request stream".to_string())
+        })?
+        .map(|_| ())
+        .map_err(|error| MetadataError::Backend(error.to_string()))
 }
 
 async fn drain_request_stream(stream: &mut BiStream) -> Result<(), MetadataError> {
