@@ -21,16 +21,17 @@ use hyper::service::Service;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
+use percent_encoding::percent_decode_str;
 use s3s::HttpError;
 use s3s::HttpResponse;
-use s3s::host::SingleDomain;
+use s3s::host::{S3Host, SingleDomain};
 use s3s::s3_error;
 use s3s::service::S3Service;
 use s3s::service::S3ServiceBuilder;
 use s3s::validation::AwsNameValidation;
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -299,12 +300,33 @@ fn query_has_any(uri: &http::Uri, names: &[&str]) -> bool {
     })
 }
 
-fn is_object_path(host: Option<&str>, path: &str, domain: &str) -> bool {
-    if host.is_some_and(|host| virtual_hosted_bucket(host, domain).is_some()) {
-        return !path.trim_matches('/').is_empty();
+fn query_value(uri: &http::Uri, name: &str, expected: &str) -> bool {
+    uri.query().is_some_and(|query| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .any(|(key, value)| key.as_ref() == name && value.as_ref() == expected)
+    })
+}
+
+fn request_path(host: Option<&str>, path: &str, domain: &str) -> Option<s3s::path::S3Path> {
+    let path = percent_decode_str(path).decode_utf8().ok()?;
+    if let Some(host) = host
+        && host.parse::<SocketAddr>().is_err()
+        && host.parse::<IpAddr>().is_err()
+    {
+        let s3_host = SingleDomain::new(domain).ok()?;
+        let virtual_host = s3_host.parse_host_header(host).ok()?;
+        return s3s::path::parse_virtual_hosted_style(virtual_host.bucket(), path.as_ref()).ok();
     }
 
-    path.trim_start_matches('/').split('/').nth(1).is_some()
+    s3s::path::parse_path_style(path.as_ref()).ok()
+}
+
+fn is_multipart(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("multipart/form-data"))
 }
 
 fn is_bulk_request(
@@ -316,7 +338,13 @@ fn is_bulk_request(
     headers: &http::HeaderMap,
 ) -> bool {
     // s3s resolves the operation later, so admission mirrors only data-heavy routes.
-    let object = is_object_path(host, path, domain);
+    let parsed_path = request_path(host, path, domain);
+    let object = parsed_path
+        .as_ref()
+        .is_some_and(|path| path.as_object().is_some_and(|(_, key)| !key.is_empty()));
+    let bucket = parsed_path
+        .as_ref()
+        .is_some_and(|path| path.as_bucket().is_some());
     match method.as_str() {
         "GET" => {
             object
@@ -336,11 +364,20 @@ fn is_bulk_request(
         "PUT" => object && !query_has_any(uri, &["acl", "legal-hold", "retention", "tagging"]),
         "DELETE" => object && !query_has_any(uri, &["tagging"]),
         "POST" => {
-            query_has_any(uri, &["delete", "select", "uploadId"])
-                || headers
-                    .get(header::CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok())
-                    .is_some_and(|value| value.starts_with("multipart/form-data"))
+            let select =
+                object && query_has_any(uri, &["select"]) && query_value(uri, "select-type", "2");
+            let control = if select {
+                false
+            } else if object {
+                query_has_any(uri, &["uploads", "restore"])
+            } else {
+                query_has_any(uri, &["metadataTable"])
+            };
+            !control
+                && (select
+                    || (object && query_has_any(uri, &["uploadId"]))
+                    || (bucket && query_has_any(uri, &["delete"]))
+                    || ((object || bucket) && is_multipart(headers)))
         }
         _ => false,
     }
@@ -638,8 +675,9 @@ pub struct WrappingService {
     control_limit: Arc<Semaphore>,
     // Held while bulk request parsing and handler work are in progress.
     bulk_limit: Arc<Semaphore>,
-    // Read responses use an independent lane from mutations and controls.
+    // Bulk responses use an independent lane from controls and metadata.
     read_limit: Arc<Semaphore>,
+    // Control responses retain their bounded admission reserve.
     mutation_limit: Arc<Semaphore>,
     // Bounds concurrent DeleteObjects body aggregation.
     capture_limit: Arc<Semaphore>,
@@ -716,8 +754,12 @@ impl S3Server {
             bulk_limit: Arc::new(Semaphore::new(bulk_capacity(
                 DEFAULT_S3_MAX_CONCURRENT_REQUESTS,
             ))),
-            read_limit: Arc::new(Semaphore::new(EGRESS_LIMIT)),
-            mutation_limit: Arc::new(Semaphore::new(CONTROL_EGRESS_LIMIT)),
+            read_limit: Arc::new(Semaphore::new(
+                bulk_capacity(DEFAULT_S3_MAX_CONCURRENT_REQUESTS).min(EGRESS_LIMIT),
+            )),
+            mutation_limit: Arc::new(Semaphore::new(
+                control_capacity(DEFAULT_S3_MAX_CONCURRENT_REQUESTS).min(CONTROL_EGRESS_LIMIT),
+            )),
             capture_limit: Arc::new(Semaphore::new(DELETE_CAPTURE_LIMIT)),
             trusted_proxies: Arc::new(Vec::new()),
         })
@@ -730,8 +772,12 @@ impl S3Server {
         self.connection_limit = Arc::new(Semaphore::new(max_connections.max(1)));
         self.control_limit = Arc::new(Semaphore::new(control_capacity(max_requests)));
         self.bulk_limit = Arc::new(Semaphore::new(bulk_capacity(max_requests)));
-        self.read_limit = Arc::new(Semaphore::new(max_requests.clamp(1, EGRESS_LIMIT)));
-        self.mutation_limit = Arc::new(Semaphore::new(max_requests.clamp(1, CONTROL_EGRESS_LIMIT)));
+        self.read_limit = Arc::new(Semaphore::new(
+            bulk_capacity(max_requests).min(EGRESS_LIMIT),
+        ));
+        self.mutation_limit = Arc::new(Semaphore::new(
+            control_capacity(max_requests).min(CONTROL_EGRESS_LIMIT),
+        ));
         self.capture_limit = Arc::new(Semaphore::new(max_requests.clamp(1, DELETE_CAPTURE_LIMIT)));
         self
     }
@@ -956,8 +1002,8 @@ impl Service<Request<Incoming>> for WrappingService {
         } else {
             self.control_limit.clone()
         };
-        // GET and HEAD are read streams; mutations and controls retain capacity.
-        let egress_limit = if method == Method::GET || method == Method::HEAD {
+        // Bulk responses use an independent lane from controls and metadata.
+        let egress_limit = if bulk_request {
             self.read_limit.clone()
         } else {
             self.mutation_limit.clone()
@@ -1793,6 +1839,11 @@ mod tests {
                 control_capacity(max_requests) + bulk_capacity(max_requests),
                 normalized
             );
+            assert!(
+                control_capacity(max_requests).min(CONTROL_EGRESS_LIMIT)
+                    + bulk_capacity(max_requests).min(EGRESS_LIMIT)
+                    <= normalized
+            );
             assert!(control_capacity(max_requests) >= 1);
         }
         assert_eq!(bulk_capacity(1), 0);
@@ -1810,6 +1861,26 @@ mod tests {
         assert_eq!(control.available_permits(), control_capacity(4));
         drop(bulk_permits);
         assert_eq!(bulk.available_permits(), bulk_capacity(4));
+
+        let control_egress = Arc::new(Semaphore::new(
+            control_capacity(4).min(CONTROL_EGRESS_LIMIT),
+        ));
+        let bulk_egress = Arc::new(Semaphore::new(bulk_capacity(4).min(EGRESS_LIMIT)));
+        let bulk_egress_permits = (0..bulk_capacity(4).min(EGRESS_LIMIT))
+            .map(|_| {
+                bulk_egress
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("bulk egress permit")
+            })
+            .collect::<Vec<_>>();
+        assert!(bulk_egress.clone().try_acquire_owned().is_err());
+        let control_egress_permit = control_egress
+            .clone()
+            .try_acquire_owned()
+            .expect("control egress permit");
+        drop(control_egress_permit);
+        drop(bulk_egress_permits);
     }
 
     #[test]
@@ -1825,10 +1896,50 @@ mod tests {
         ));
         assert!(is_bulk_request(
             &Method::PUT,
+            None,
+            "/bucket/%2F",
+            "s3.example",
+            &http::Uri::from_static("/bucket/%2F"),
+            &headers,
+        ));
+        assert!(is_bulk_request(
+            &Method::PUT,
+            None,
+            "/bucket//",
+            "s3.example",
+            &http::Uri::from_static("/bucket//"),
+            &headers,
+        ));
+        assert!(!is_bulk_request(
+            &Method::PUT,
+            None,
+            "/bucket/",
+            "s3.example",
+            &http::Uri::from_static("/bucket/"),
+            &headers,
+        ));
+        assert!(is_bulk_request(
+            &Method::PUT,
             Some("bucket.s3.example"),
             "/key",
             "s3.example",
             &http::Uri::from_static("/key?partNumber=1&uploadId=upload"),
+            &headers,
+        ));
+        assert!(!is_bulk_request(
+            &Method::PUT,
+            Some("bucket.s3.example"),
+            "/",
+            "s3.example",
+            &http::Uri::from_static("/"),
+            &headers,
+        ));
+        assert!(is_bulk_request(
+            &Method::PUT,
+            Some("bucket.s3.example"),
+            "/%2F",
+            "s3.example",
+            &http::Uri::from_static("/%2F"),
             &headers,
         ));
         assert!(is_bulk_request(
@@ -1846,6 +1957,27 @@ mod tests {
             "s3.example",
             &http::Uri::from_static("/bucket/key?uploads"),
             &headers,
+        ));
+        assert!(!is_bulk_request(
+            &Method::POST,
+            None,
+            "/bucket/key",
+            "s3.example",
+            &http::Uri::from_static("/bucket/key?uploads&uploadId=upload"),
+            &headers,
+        ));
+        let mut multipart = http::HeaderMap::new();
+        multipart.insert(
+            header::CONTENT_TYPE,
+            http::HeaderValue::from_static("Multipart/Form-Data; boundary=x"),
+        );
+        assert!(is_bulk_request(
+            &Method::POST,
+            None,
+            "/bucket/key",
+            "s3.example",
+            &http::Uri::from_static("/bucket/key"),
+            &multipart,
         ));
         assert!(!is_bulk_request(
             &Method::PUT,
@@ -1877,6 +2009,14 @@ mod tests {
             "/bucket/key",
             "s3.example",
             &http::Uri::from_static("/bucket/key?uploadId=upload"),
+            &headers,
+        ));
+        assert!(!is_bulk_request(
+            &Method::DELETE,
+            None,
+            "/bucket/key",
+            "s3.example",
+            &http::Uri::from_static("/bucket/key?tagging&uploadId=upload"),
             &headers,
         ));
         assert!(!is_bulk_request(
