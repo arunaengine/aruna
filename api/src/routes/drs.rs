@@ -1,7 +1,8 @@
 use crate::auth::{ensure_permission, require_realm_auth};
 use crate::download::{self, AdmissionError};
 use crate::error::ServerError;
-use crate::forwarded::external_base_url;
+use crate::forwarded::{client_ip, external_base_url};
+use crate::rate_limit::LocalKey;
 use crate::server_state::ServerState;
 use aruna_core::structs::{
     ArunaArn, ArunaArnType, AuthContext, BackendLocation, Permission, SourceMetadata,
@@ -351,6 +352,8 @@ pub async fn post_objects(
 pub async fn download_object(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
     Query(query): Query<DownloadQuery>,
 ) -> Response {
     let anonymous = auth.is_none();
@@ -366,7 +369,12 @@ pub async fn download_object(
         Err(error) => return error.into_response(),
     };
 
-    let permit = match download::admit(state.as_ref(), (!anonymous).then_some(auth.user_id)) {
+    let key = if anonymous {
+        LocalKey::Ip(client_ip(state.trusted_proxies(), peer.ip(), &headers))
+    } else {
+        LocalKey::User(auth.user_id)
+    };
+    let permit = match download::admit(state.as_ref(), key) {
         Ok(permit) => permit,
         Err(AdmissionError::Total) => {
             return drs_error(

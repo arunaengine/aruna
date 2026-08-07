@@ -1,6 +1,5 @@
 use crate::rate_limit::{LocalKey, LocalPermit};
 use crate::server_state::ServerState;
-use aruna_core::UserId;
 use aruna_core::stream::{BackendStream, StreamError};
 use axum::body::Body;
 use bytes::Bytes;
@@ -23,20 +22,14 @@ pub(crate) struct DownloadPermit {
     user: Option<LocalPermit>,
 }
 
-pub(crate) fn admit(
-    state: &ServerState,
-    user: Option<UserId>,
-) -> Result<DownloadPermit, AdmissionError> {
+pub(crate) fn admit(state: &ServerState, key: LocalKey) -> Result<DownloadPermit, AdmissionError> {
     let total = state.try_acquire_download().ok_or(AdmissionError::Total)?;
-    let user = match user {
-        Some(user) => match state.rate_limits().try_acquire_local(LocalKey::User(user)) {
-            Some(permit) => Some(permit),
-            None => {
-                drop(total);
-                return Err(AdmissionError::User);
-            }
-        },
-        None => None,
+    let user = match state.rate_limits().try_acquire_local(key) {
+        Some(permit) => Some(permit),
+        None => {
+            drop(total);
+            return Err(AdmissionError::User);
+        }
     };
     Ok(DownloadPermit { total, user })
 }

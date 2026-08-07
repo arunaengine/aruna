@@ -38,6 +38,7 @@ use crate::auth::{
 };
 use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::rate_limit::LocalKey;
 use crate::server_state::ServerState;
 use aruna_operations::driver::drive;
 
@@ -1012,7 +1013,7 @@ async fn artifact_response(
         );
     }
     let body = if download && content_length > 0 {
-        let permit = match download::admit(state.as_ref(), Some(auth.user_id)) {
+        let permit = match download::admit(state.as_ref(), LocalKey::User(auth.user_id)) {
             Ok(permit) => permit,
             Err(AdmissionError::Total) => {
                 return Err(ServerError::ServiceUnavailableReason(
