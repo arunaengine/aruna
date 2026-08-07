@@ -33,10 +33,11 @@ use super::protocol::{ReplicationMode, SyncOrigin};
 use super::version_replication::{
     ReplicateScopeError, ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
 };
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive, quota_marked_routing};
 use crate::notifications::watch::emit::emit_resource_watch_event;
 use crate::queue_backoff::queue_retry_after_ms;
+use crate::request_authorization::{AuthorizeError, authorize};
+use crate::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::s3::get_bucket_info::GetBucketInfoOperation;
 use crate::sync_mirror_repair::{kick_mirror_repair, store_sync_status};
 
@@ -1342,26 +1343,37 @@ async fn creator_can_read(
         Err(error) => return Err((error.to_string(), None)),
     };
     let group_id = bucket_info.group_id;
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: AuthContext {
-                user_id: relationship.created_by,
-                realm_id: relationship.source.realm_id,
-                path_restrictions: None,
-            },
-            path: blob_bucket_permission_path(
-                relationship.source.realm_id,
-                group_id,
-                relationship.source.node_id,
-                bucket,
-            ),
-            required_permission: Permission::READ,
-        }),
+    let auth_context = AuthContext {
+        user_id: relationship.created_by,
+        realm_id: relationship.source.realm_id,
+        path_restrictions: None,
+    };
+    let path = blob_bucket_permission_path(
+        relationship.source.realm_id,
+        group_id,
+        relationship.source.node_id,
+        bucket,
+    );
+    match authorize(
         context,
+        auth_context.realm_id,
+        &auth_context,
+        &path,
+        &Permission::READ,
+        PolicyRequestExtras::operation("s3.GetObject"),
     )
     .await
-    .map_err(|error| (error.to_string(), Some(group_id)))?;
-    Ok((allowed, group_id))
+    {
+        Ok(()) => Ok((true, group_id)),
+        Err(
+            AuthorizeError::PermissionDenied
+            | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }),
+        ) => Ok((false, group_id)),
+        Err(AuthorizeError::Policy(PolicyEnforcementError::Unavailable(error))) => {
+            Err((error.to_string(), Some(group_id)))
+        }
+        Err(AuthorizeError::CheckFailed(error)) => Err((error, Some(group_id))),
+    }
 }
 
 fn mark_failure(relationship: &mut SyncRelationship, error: &str) {
@@ -2207,6 +2219,7 @@ mod tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+    use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::{
         Actor, ArunaArn, BackendRef, BlobVersion, BucketInfo, BucketReplicationTarget,
         GroupAuthorizationDocument, RealmAuthorizationDocument, RealmId, ReferenceHandling,
@@ -2359,6 +2372,31 @@ mod tests {
             GroupAuthorizationDocument::new_default_group_doc(user(), realm(), group_id)
                 .to_bytes(&actor)
                 .unwrap(),
+        )
+        .await;
+    }
+
+    async fn write_group_policy(storage: &StorageHandle, group_id: Ulid, expression: &str) {
+        let actor = Actor {
+            node_id: node(1),
+            user_id: user(),
+            realm_id: realm(),
+        };
+        let mut document =
+            GroupAuthorizationDocument::new_default_group_doc(user(), realm(), group_id);
+        document.policies.push(RequestPolicy {
+            policy_id: Ulid::from_parts(7, 7),
+            name: "replication-policy".to_string(),
+            kind: PolicyKind::Deny,
+            when: None,
+            expression: expression.to_string(),
+            enabled: true,
+        });
+        write_raw_queue_record(
+            storage,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            document.to_bytes(&actor).unwrap(),
         )
         .await;
     }
@@ -2709,8 +2747,8 @@ mod tests {
         let group_id = Ulid::from_parts(2, 2);
         write_bucket(&storage, "bucket").await;
         write_auth_docs(&storage, group_id).await;
-        let mut relationship = relationship(79, 2, None, true);
-        relationship.created_by = UserId::local(Ulid::from_parts(79, 1), realm());
+        write_group_policy(&storage, group_id, "operation == 's3.GetObject'").await;
+        let relationship = relationship(79, 2, None, true);
         write_relationship(&storage, &relationship).await;
         let context = DriverContext {
             storage_handle: storage.clone(),
