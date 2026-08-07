@@ -48,6 +48,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 pub const INITIAL_REALM_ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
 pub const INITIAL_LOCAL_ONBOARDING_SECRET_KEY: &[u8] = b"initial_local_onboarding_secret";
+pub(crate) const ROCRATE_UPLOAD_SLOTS: usize = 32;
 pub(crate) const DOWNLOAD_SLOTS: usize = 256;
 #[derive(Clone, Debug)]
 pub struct ServerState {
