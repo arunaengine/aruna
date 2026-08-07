@@ -288,6 +288,7 @@ pub struct ReplicateScopeOperation {
     sync: Option<SyncTransferContext>,
     pending_versions: Vec<VersionReplicationRequest>,
     pending_keys: BTreeSet<(String, String, Ulid)>,
+    examined_versions: usize,
     source_authorization: Option<SourceAuthorization>,
     writer_auth_context: Option<AuthContext>,
     routing: NodeRouting,
@@ -307,6 +308,7 @@ impl ReplicateScopeOperation {
             sync: None,
             pending_versions: Vec::new(),
             pending_keys: BTreeSet::new(),
+            examined_versions: 0,
             source_authorization: None,
             writer_auth_context: None,
             routing: NodeRouting::default(),
@@ -756,6 +758,13 @@ impl Operation for ReplicateScopeOperation {
                 };
 
                 let page_len = values.len();
+                let examined = self.examined_versions.saturating_add(page_len);
+                if examined > MAX_SCOPE_VERSIONS {
+                    return self.fail(ReplicateScopeError::ScopeLimit {
+                        limit: MAX_SCOPE_VERSIONS,
+                    });
+                }
+                self.examined_versions = examined;
                 let pending_before = self.pending_versions.len();
 
                 for (key, value) in values {
@@ -2253,8 +2262,9 @@ mod tests {
     use super::{
         MAX_SCOPE_VERSIONS, ReplicateObjectVersionError, ReplicateObjectVersionOperation,
         ReplicateScopeError, ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
-        ReplicationVersion, SyncTransferContext,
+        ReplicationVersion, SourceAuthorization, SyncTransferContext,
     };
+    use crate::driver::DriverContext;
     use crate::replication::protocol::{
         ReplicationMode, VersionReplicationMessage, VersionReplicationRequest,
     };
@@ -2263,22 +2273,25 @@ mod tests {
     use aruna_core::events::{
         BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent,
     };
-    use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, SYNC_REFERENCE_STATE_KEYSPACE};
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, SYNC_REFERENCE_STATE_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, CurrentVersionPointer,
-        GroupRoutingInputs, MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
-        MultipartObjectSummary, PortableSourceDescriptor, RealmId, ReferenceHandling,
-        ReplicationItemKind, ReplicationNegotiationResult, ReplicationSuboperationResult,
-        ResolvedSourceAccess, SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey,
-        VersionSourceBinding,
+        Actor, AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo,
+        CurrentVersionPointer, GroupAuthorizationDocument, GroupRoutingInputs,
+        MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
+        MultipartObjectSummary, PortableSourceDescriptor, RealmAuthorizationDocument, RealmId,
+        ReferenceHandling, ReplicationItemKind, ReplicationNegotiationResult,
+        ReplicationSuboperationResult, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata,
+        StagingStrategy, VersionKey, VersionSourceBinding,
     };
     use aruna_core::types::Effects;
+    use aruna_storage::FjallStorage;
     use bytes::Bytes;
     use futures_util::stream;
     use std::collections::HashMap;
     use std::time::SystemTime;
+    use tempfile::TempDir;
     use ulid::Ulid;
 
     /// Replays the routing loader and bucket-rules read the reference path adds.
@@ -2344,6 +2357,66 @@ mod tests {
             replicate_delete_markers: true,
             mode: ReplicationMode::Live,
         }
+    }
+
+    async fn denied_auth(input: &ReplicateScopeInput) -> (TempDir, SourceAuthorization) {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let realm_id = input.auth_context.realm_id;
+        let group_id = Ulid::from_bytes([3u8; 16]);
+        let actor = Actor {
+            node_id: input.target_node_id,
+            user_id: input.auth_context.user_id,
+            realm_id,
+        };
+        let realm = RealmAuthorizationDocument {
+            realm_id,
+            roles: HashMap::new(),
+            operation_restrictions: HashMap::new(),
+        };
+        let group = GroupAuthorizationDocument {
+            group_id,
+            roles: HashMap::new(),
+            policies: Vec::new(),
+        };
+        let event = storage
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes: vec![
+                    (
+                        AUTH_KEYSPACE.to_string(),
+                        realm_id.as_bytes().to_vec().into(),
+                        realm.to_bytes(&actor).unwrap().into(),
+                    ),
+                    (
+                        AUTH_KEYSPACE.to_string(),
+                        group_id.to_bytes().into(),
+                        group.to_bytes(&actor).unwrap().into(),
+                    ),
+                ],
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+        let authorization = SourceAuthorization::load(
+            &context,
+            input.auth_context.clone(),
+            group_id,
+            input.target_node_id,
+        )
+        .await
+        .unwrap();
+        (directory, authorization)
     }
 
     fn version_entry(
@@ -2592,6 +2665,69 @@ mod tests {
         }));
         assert!(matches!(effects[0], Effect::SubOperation(_)));
         assert_eq!(op.pending_versions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scope_caps_denied() {
+        // Authorization-denied pages must consume the same finite scan budget.
+        let input = scope_input(ReplicateScopeTarget::Bucket);
+        let (_directory, authorization) = denied_auth(&input).await;
+        let mut op = ReplicateScopeOperation::new(input).with_source_authorization(authorization);
+        op.state = super::ReplicateScopeState::IterateVersions;
+
+        let first = (0..512)
+            .map(|index| {
+                version_entry(
+                    &format!("key-{index}"),
+                    Ulid::from_bytes((index as u128 + 1).to_be_bytes()),
+                )
+            })
+            .collect();
+        let cursor = vec![1u8].into();
+        let effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values: first,
+            next_start_after: Some(cursor),
+        }));
+        assert!(matches!(
+            effects[0],
+            Effect::Storage(StorageEffect::Iter { .. })
+        ));
+
+        let second = (512..1024)
+            .map(|index| {
+                version_entry(
+                    &format!("key-{index}"),
+                    Ulid::from_bytes((index as u128 + 1).to_be_bytes()),
+                )
+            })
+            .collect();
+        let cursor = vec![2u8].into();
+        let effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values: second,
+            next_start_after: Some(cursor),
+        }));
+        assert!(matches!(
+            effects[0],
+            Effect::Storage(StorageEffect::Iter { .. })
+        ));
+        assert_eq!(op.examined_versions, MAX_SCOPE_VERSIONS);
+        assert!(op.pending_versions.is_empty());
+
+        let effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![version_entry(
+                "key-1024",
+                Ulid::from_bytes((MAX_SCOPE_VERSIONS as u128 + 1).to_be_bytes()),
+            )],
+            next_start_after: None,
+        }));
+        assert!(effects.is_empty());
+        assert_eq!(op.state, super::ReplicateScopeState::Error);
+        assert_eq!(
+            op.output,
+            Some(Err(ReplicateScopeError::ScopeLimit {
+                limit: MAX_SCOPE_VERSIONS,
+            }))
+        );
     }
 
     #[test]
