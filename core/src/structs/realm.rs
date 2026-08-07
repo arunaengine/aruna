@@ -1,5 +1,5 @@
 use crate::NodeId;
-use crate::admin_document_reducer::AdminDocumentReducerState;
+use crate::admin_document_reducer::{AdminDocumentReducerState, RevocationIndex};
 use crate::auth::revocation_live;
 use crate::errors::ConversionError;
 use crate::structs::structs::{Permission, Role};
@@ -525,12 +525,18 @@ impl RealmConfigDocument {
     /// set and drops entries whose token has expired. Ownership stays in the
     /// reducer path; the deny overlay only needs one hash and expiry per token.
     pub fn merge_revocations(&mut self, reducer_state: &AdminDocumentReducerState, now: u64) {
+        let index = reducer_state.revocation_index(now);
+        self.merge_revocation_index(&index, now);
+    }
+
+    /// Merges an existing revocation index without rebuilding reducer paths.
+    pub fn merge_revocation_index(&mut self, index: &RevocationIndex, now: u64) {
         let mut merged: BTreeMap<String, u64> = self
             .revoked_tokens
             .drain(..)
             .map(|entry| (entry.token_hash, entry.expires_at))
             .collect();
-        for (token_hash, expires_at) in reducer_state.materialized_revoked_tokens() {
+        for (token_hash, expires_at) in index.materialized() {
             merged
                 .entry(token_hash)
                 .and_modify(|current| *current = (*current).max(expires_at))

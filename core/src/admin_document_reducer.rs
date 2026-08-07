@@ -1491,7 +1491,7 @@ impl AdminDocumentReducerState {
     }
 
     pub fn revocation_index(&self, now: u64) -> RevocationIndex {
-        RevocationIndex::build(self, self.revocation_floor.max(now))
+        RevocationIndex::build(self, now)
     }
 
     pub fn materialized_revoked_tokens(&self) -> BTreeMap<String, u64> {
