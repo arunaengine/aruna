@@ -24,7 +24,9 @@ use aruna_operations::auth::{
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::revoke_token::{RevokeTokenConfig, RevokeTokenOperation};
+use aruna_operations::revoke_token::{
+    RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
+};
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::{FjallStorage, StorageHandle};
 use async_trait::async_trait;
@@ -90,6 +92,7 @@ async fn peer_denies_token() -> TestResult<()> {
             token_hash: token_hash.clone(),
             expires_at,
             token_owner: user_id,
+            admission: RevokeTokenAdmission::SelfService,
             now: aruna_core::util::unix_timestamp_secs(),
         }),
         nodes[0].context.as_ref(),

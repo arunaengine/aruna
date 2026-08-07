@@ -627,7 +627,9 @@ mod test {
     use aruna_operations::register_or_get_oidc_user::{
         RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
     };
-    use aruna_operations::revoke_token::{RevokeTokenConfig, RevokeTokenOperation};
+    use aruna_operations::revoke_token::{
+        RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
+    };
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use axum::Json;
@@ -889,6 +891,7 @@ mod test {
                 token_hash: bearer_token_hash(token),
                 expires_at: now + 600,
                 token_owner,
+                admission: RevokeTokenAdmission::SelfService,
                 now,
             }),
             driver_ctx,

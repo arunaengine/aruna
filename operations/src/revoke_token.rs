@@ -3,12 +3,13 @@ use aruna_core::admin_document_reducer::{
 };
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::auth::valid_token_hash;
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    ADMIN_DOCUMENT_STATE_KEYSPACE, TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE,
+    ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE,
+    TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
@@ -19,6 +20,7 @@ use aruna_core::structs::{Actor, RealmConfigDocument};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, UserId, Value};
 use smallvec::smallvec;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use tracing::warn;
 
@@ -27,6 +29,17 @@ use crate::document_sync_outbox::{
     schedule_outbox_drain_effect,
 };
 use crate::placement::placement_ref_for_target;
+
+const PRIVILEGED_REVOCATION_RESERVE: usize = 128;
+const SELF_SERVICE_REVOCATION_CAP: usize =
+    MAX_LIVE_REVOCATIONS_PER_ORIGIN - PRIVILEGED_REVOCATION_RESERVE;
+const SELF_SERVICE_OWNER_CAP: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokeTokenAdmission {
+    SelfService,
+    Privileged,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RevokeTokenConfig {
@@ -37,6 +50,8 @@ pub struct RevokeTokenConfig {
     pub expires_at: u64,
     /// Verified subject of the revoked bearer token.
     pub token_owner: UserId,
+    /// Immutable request class derived from the authenticated actor and owner.
+    pub admission: RevokeTokenAdmission,
     /// Current unix seconds, used to prune revocations that expired.
     pub now: u64,
 }
@@ -61,7 +76,30 @@ enum RevokeTokenState {
         document: RealmConfigDocument,
         reducer_state: AdminDocumentReducerState,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
+        apply_event: bool,
+        write_canonical: bool,
+        pending_deletes: Vec<(KeySpace, Key)>,
+        pending_live: BTreeMap<String, BTreeSet<UserId>>,
     },
+    ReadOutboxRecords {
+        document: RealmConfigDocument,
+        reducer_state: AdminDocumentReducerState,
+        stale_conflict_deletes: Vec<(KeySpace, Key)>,
+        apply_event: bool,
+        write_canonical: bool,
+        pending_deletes: Vec<(KeySpace, Key)>,
+        pending_live: BTreeMap<String, BTreeSet<UserId>>,
+        index_keys: Vec<Key>,
+        next_start_after: Option<Key>,
+    },
+    DeletePendingOutbox {
+        document: RealmConfigDocument,
+        reducer_state: AdminDocumentReducerState,
+        stale_conflict_deletes: Vec<(KeySpace, Key)>,
+        apply_event: bool,
+        write_canonical: bool,
+    },
+    CommitCapacityCleanup,
     WriteDocumentAndAdminState {
         document: RealmConfigDocument,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
@@ -200,25 +238,16 @@ impl RevokeTokenOperation {
             .get(&self.config.token_hash)
             .copied();
 
-        if existing_expiry.is_some_and(|expires_at| expires_at >= self.config.expires_at) {
-            self.output = Some(Ok(document.clone()));
-            if canonical_changed {
-                return self.emit_write(document, reducer_state, stale_conflict_deletes, false);
-            }
-            return Ok(self.emit_commit_noop(document));
-        }
-
-        let same_origin = reducer_state
-            .revocation_origin(&self.config.token_hash)
-            .is_some_and(|origin| origin == self.config.actor.node_id);
-        if !same_origin
-            && reducer_state.live_revocation_count(&self.config.actor.node_id)
-                >= MAX_LIVE_REVOCATIONS_PER_ORIGIN
-        {
-            return Err(RevokeTokenError::CapacityReached);
-        }
-
-        self.emit_capacity_read(document, reducer_state, stale_conflict_deletes)
+        self.output = Some(Ok(document.clone()));
+        let apply_event =
+            !existing_expiry.is_some_and(|expires_at| expires_at >= self.config.expires_at);
+        self.emit_capacity_read(
+            document,
+            reducer_state,
+            stale_conflict_deletes,
+            apply_event,
+            canonical_changed,
+        )
     }
 
     fn emit_capacity_read(
@@ -226,6 +255,8 @@ impl RevokeTokenOperation {
         document: RealmConfigDocument,
         reducer_state: AdminDocumentReducerState,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
+        apply_event: bool,
+        write_canonical: bool,
     ) -> Result<Effects, RevokeTokenError> {
         let Some(txn_id) = self.txn_id else {
             return Err(RevokeTokenError::MissingTransaction);
@@ -234,14 +265,199 @@ impl RevokeTokenOperation {
             document,
             reducer_state,
             stale_conflict_deletes,
+            apply_event,
+            write_canonical,
+            pending_deletes: Vec::new(),
+            pending_live: BTreeMap::new(),
         };
         Ok(smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
             prefix: Some(admin_outbox_prefix(self.config.actor.node_id)),
             start: None,
-            limit: MAX_LIVE_REVOCATIONS_PER_ORIGIN.saturating_add(1),
+            limit: MAX_LIVE_REVOCATIONS_PER_ORIGIN,
             txn_id: Some(txn_id),
         })])
+    }
+
+    fn pending_revocation(
+        &self,
+        record: &DocumentSyncOutboxRecord,
+    ) -> Option<(String, u64, UserId)> {
+        if record.node_id != self.config.actor.node_id || record.target != self.document_ref() {
+            return None;
+        }
+        let DocumentSyncOutboxEvent::AdminOperation { event } = &record.event else {
+            return None;
+        };
+        if event.origin_node_id != self.config.actor.node_id
+            || event.actor.node_id != self.config.actor.node_id
+            || event.target != self.admin_target()
+        {
+            return None;
+        }
+        let AdminDocumentOperation::RealmConfigTokenRevoked {
+            token_hash,
+            expires_at,
+            token_owner,
+        } = &event.op
+        else {
+            return None;
+        };
+        valid_token_hash(token_hash).then_some((token_hash.clone(), *expires_at, *token_owner))
+    }
+
+    fn collect_pending(
+        &self,
+        index_keys: Vec<Key>,
+        values: Vec<(Key, Option<Value>)>,
+        pending_deletes: &mut Vec<(KeySpace, Key)>,
+        pending_live: &mut BTreeMap<String, BTreeSet<UserId>>,
+    ) -> Result<(), RevokeTokenError> {
+        if index_keys.len() != values.len() {
+            return Err(RevokeTokenError::UnexpectedEvent {
+                state: format!("{:?}", self.state),
+                expected: "one outbox value for every revocation index key",
+                got: format!("{} values for {} keys", values.len(), index_keys.len()),
+            });
+        }
+
+        for (index_key, (outbox_key, value)) in index_keys.into_iter().zip(values) {
+            let Some(value) = value else {
+                pending_deletes.push((
+                    TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                    index_key,
+                ));
+                continue;
+            };
+            let Ok(record) = postcard::from_bytes::<DocumentSyncOutboxRecord>(&value) else {
+                pending_deletes.push((
+                    TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                    index_key,
+                ));
+                continue;
+            };
+            let Some((token_hash, expires_at, token_owner)) = self.pending_revocation(&record)
+            else {
+                pending_deletes.push((
+                    TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                    index_key,
+                ));
+                continue;
+            };
+            if expires_at < self.config.now {
+                pending_deletes.extend([
+                    (DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), outbox_key),
+                    (
+                        TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                        index_key,
+                    ),
+                ]);
+            } else {
+                pending_live
+                    .entry(token_hash)
+                    .or_default()
+                    .insert(token_owner);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_capacity(
+        &mut self,
+        document: RealmConfigDocument,
+        reducer_state: AdminDocumentReducerState,
+        stale_conflict_deletes: Vec<(KeySpace, Key)>,
+        apply_event: bool,
+        write_canonical: bool,
+        mut pending_deletes: Vec<(KeySpace, Key)>,
+        pending_live: BTreeMap<String, BTreeSet<UserId>>,
+    ) -> Result<Effects, RevokeTokenError> {
+        pending_deletes.sort();
+        pending_deletes.dedup();
+
+        let origin = self.config.actor.node_id;
+        let existing_origin = reducer_state.revocation_origin(&self.config.token_hash);
+        let same_origin =
+            existing_origin == Some(origin) || pending_live.contains_key(&self.config.token_hash);
+        let pending_count = pending_live
+            .keys()
+            .filter(|hash| reducer_state.revocation_origin(hash) != Some(origin))
+            .count();
+        let live_count = reducer_state.live_revocation_count(&origin, self.config.now);
+        let origin_cap = match self.config.admission {
+            RevokeTokenAdmission::SelfService => SELF_SERVICE_REVOCATION_CAP,
+            RevokeTokenAdmission::Privileged => MAX_LIVE_REVOCATIONS_PER_ORIGIN,
+        };
+        let owner_count =
+            reducer_state.live_owner_count(&origin, &self.config.token_owner, self.config.now)
+                + pending_live
+                    .iter()
+                    .filter(|(hash, owners)| {
+                        owners.contains(&self.config.token_owner)
+                            && reducer_state.revocation_origin(hash) != Some(origin)
+                    })
+                    .count();
+        let capacity_reached = apply_event
+            && !same_origin
+            && (live_count.saturating_add(pending_count) >= origin_cap
+                || (self.config.admission == RevokeTokenAdmission::SelfService
+                    && owner_count >= SELF_SERVICE_OWNER_CAP));
+
+        if capacity_reached {
+            let error = RevokeTokenError::CapacityReached;
+            if pending_deletes.is_empty() {
+                return Err(error);
+            }
+            self.output = Some(Err(error));
+            self.state = RevokeTokenState::CommitCapacityCleanup;
+            let Some(txn_id) = self.txn_id else {
+                return Err(RevokeTokenError::MissingTransaction);
+            };
+            return Ok(smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                deletes: pending_deletes,
+                txn_id: Some(txn_id),
+            })]);
+        }
+
+        if pending_deletes.is_empty() {
+            return self.emit_after_capacity(
+                document,
+                reducer_state,
+                stale_conflict_deletes,
+                apply_event,
+                write_canonical,
+            );
+        }
+
+        let Some(txn_id) = self.txn_id else {
+            return Err(RevokeTokenError::MissingTransaction);
+        };
+        self.state = RevokeTokenState::DeletePendingOutbox {
+            document,
+            reducer_state,
+            stale_conflict_deletes,
+            apply_event,
+            write_canonical,
+        };
+        Ok(smallvec![Effect::Storage(StorageEffect::BatchDelete {
+            deletes: pending_deletes,
+            txn_id: Some(txn_id),
+        })])
+    }
+
+    fn emit_after_capacity(
+        &mut self,
+        document: RealmConfigDocument,
+        reducer_state: AdminDocumentReducerState,
+        stale_conflict_deletes: Vec<(KeySpace, Key)>,
+        apply_event: bool,
+        write_canonical: bool,
+    ) -> Result<Effects, RevokeTokenError> {
+        if apply_event || write_canonical {
+            self.emit_write(document, reducer_state, stale_conflict_deletes, apply_event)
+        } else {
+            Ok(self.emit_commit_noop(document))
+        }
     }
 
     fn emit_write(
@@ -390,20 +606,160 @@ impl Operation for RevokeTokenOperation {
                 document,
                 reducer_state,
                 stale_conflict_deletes,
+                apply_event,
+                write_canonical,
+                pending_deletes,
+                pending_live,
             } => match event {
-                Event::Storage(StorageEvent::IterResult { values, .. }) => {
-                    if values.len() >= MAX_LIVE_REVOCATIONS_PER_ORIGIN {
-                        return self.fail(RevokeTokenError::CapacityReached);
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => {
+                    if values.is_empty() && next_start_after.is_none() {
+                        return match self.finish_capacity(
+                            document,
+                            reducer_state,
+                            stale_conflict_deletes,
+                            apply_event,
+                            write_canonical,
+                            pending_deletes,
+                            pending_live,
+                        ) {
+                            Ok(effects) => effects,
+                            Err(error) => self.fail(error),
+                        };
                     }
-                    match self.emit_write(document, reducer_state, stale_conflict_deletes, true) {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
-                    }
+                    let index_keys: Vec<_> = values.into_iter().map(|(key, _)| key).collect();
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(RevokeTokenError::MissingTransaction);
+                    };
+                    let reads = index_keys
+                        .iter()
+                        .cloned()
+                        .map(|key| (DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), key))
+                        .collect();
+                    self.state = RevokeTokenState::ReadOutboxRecords {
+                        document,
+                        reducer_state,
+                        stale_conflict_deletes,
+                        apply_event,
+                        write_canonical,
+                        pending_deletes,
+                        pending_live,
+                        index_keys,
+                        next_start_after,
+                    };
+                    smallvec![Effect::Storage(StorageEffect::BatchRead {
+                        reads,
+                        txn_id: Some(txn_id),
+                    })]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => {
                     self.unexpected_event("outbox capacity iteration result", format!("{other:?}"))
                 }
+            },
+            RevokeTokenState::ReadOutboxRecords {
+                document,
+                reducer_state,
+                stale_conflict_deletes,
+                apply_event,
+                write_canonical,
+                mut pending_deletes,
+                mut pending_live,
+                index_keys,
+                next_start_after,
+            } => match event {
+                Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                    if let Err(error) = self.collect_pending(
+                        index_keys,
+                        values,
+                        &mut pending_deletes,
+                        &mut pending_live,
+                    ) {
+                        return self.fail(error);
+                    }
+                    if let Some(start_after) = next_start_after {
+                        let Some(txn_id) = self.txn_id else {
+                            return self.fail(RevokeTokenError::MissingTransaction);
+                        };
+                        self.state = RevokeTokenState::ReadOutboxCapacity {
+                            document,
+                            reducer_state,
+                            stale_conflict_deletes,
+                            apply_event,
+                            write_canonical,
+                            pending_deletes,
+                            pending_live,
+                        };
+                        smallvec![Effect::Storage(StorageEffect::Iter {
+                            key_space: TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                            prefix: Some(admin_outbox_prefix(self.config.actor.node_id)),
+                            start: Some(IterStart::After(start_after)),
+                            limit: MAX_LIVE_REVOCATIONS_PER_ORIGIN,
+                            txn_id: Some(txn_id),
+                        })]
+                    } else {
+                        match self.finish_capacity(
+                            document,
+                            reducer_state,
+                            stale_conflict_deletes,
+                            apply_event,
+                            write_canonical,
+                            pending_deletes,
+                            pending_live,
+                        ) {
+                            Ok(effects) => effects,
+                            Err(error) => self.fail(error),
+                        }
+                    }
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => {
+                    self.unexpected_event("outbox record batch read result", format!("{other:?}"))
+                }
+            },
+            RevokeTokenState::DeletePendingOutbox {
+                document,
+                reducer_state,
+                stale_conflict_deletes,
+                apply_event,
+                write_canonical,
+            } => match event {
+                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => match self
+                    .emit_after_capacity(
+                        document,
+                        reducer_state,
+                        stale_conflict_deletes,
+                        apply_event,
+                        write_canonical,
+                    ) {
+                    Ok(effects) => effects,
+                    Err(error) => self.fail(error),
+                },
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => {
+                    self.unexpected_event("pending outbox cleanup result", format!("{other:?}"))
+                }
+            },
+            RevokeTokenState::CommitCapacityCleanup => match event {
+                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(RevokeTokenError::MissingTransaction);
+                    };
+                    self.state = RevokeTokenState::CommitCapacityCleanup;
+                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                }
+                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                    self.txn_id = None;
+                    self.state = RevokeTokenState::Error;
+                    smallvec![]
+                }
+                Event::Storage(StorageEvent::Error { error }) => {
+                    self.txn_id = None;
+                    self.fail(error.into())
+                }
+                other => self.unexpected_event("capacity cleanup result", format!("{other:?}")),
             },
             RevokeTokenState::WriteDocumentAndAdminState {
                 document,
@@ -507,8 +863,8 @@ impl Operation for RevokeTokenOperation {
 mod tests {
     use super::{
         ADMIN_DOCUMENT_STATE_KEYSPACE, AdminDocumentReducerState, AdminDocumentTarget, Event,
-        MAX_LIVE_REVOCATIONS_PER_ORIGIN, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
-        StorageEffect, StorageEvent, admin_document_reducer_state_key,
+        MAX_LIVE_REVOCATIONS_PER_ORIGIN, RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError,
+        RevokeTokenOperation, StorageEffect, StorageEvent, admin_document_reducer_state_key,
     };
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::document_sync_outbox::admin_outbox_prefix;
@@ -568,11 +924,37 @@ mod tests {
             token_hash: token_hash.to_string(),
             expires_at,
             token_owner: actor.user_id,
+            admission: RevokeTokenAdmission::SelfService,
+            now,
+        }
+    }
+
+    fn admin_request(
+        actor: &Actor,
+        token_hash: &str,
+        token_owner: UserId,
+        expires_at: u64,
+        now: u64,
+    ) -> RevokeTokenConfig {
+        RevokeTokenConfig {
+            actor: actor.clone(),
+            token_hash: token_hash.to_string(),
+            expires_at,
+            token_owner,
+            admission: RevokeTokenAdmission::Privileged,
             now,
         }
     }
 
     fn seed_state(actor: &Actor, count: usize) -> AdminDocumentReducerState {
+        seed_state_for(actor, actor.user_id, count)
+    }
+
+    fn seed_state_for(
+        actor: &Actor,
+        token_owner: UserId,
+        count: usize,
+    ) -> AdminDocumentReducerState {
         let target = AdminDocumentTarget::RealmConfig {
             realm_id: actor.realm_id,
         };
@@ -584,7 +966,7 @@ mod tests {
                     AdminDocumentOperation::RealmConfigTokenRevoked {
                         token_hash: bearer_token_hash(&format!("seed-token-{index}")),
                         expires_at: 2_000,
-                        token_owner: actor.user_id,
+                        token_owner,
                     },
                 )
                 .unwrap();
@@ -811,7 +1193,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_index_cap() {
+    async fn cleans_orphan_index() {
         let (_dir, context, actor) = setup_realm().await;
         let state = seed_state(&actor, 1);
         write_state(&context, &state).await;
@@ -828,12 +1210,9 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result, Err(RevokeTokenError::CapacityReached)));
-        assert_eq!(reducer_state(&context, actor.realm_id).await, state);
-        assert_eq!(
-            index_values(&context, &actor).await.len(),
-            MAX_LIVE_REVOCATIONS_PER_ORIGIN
-        );
+        assert!(result.is_ok());
+        assert_ne!(reducer_state(&context, actor.realm_id).await, state);
+        assert_eq!(index_values(&context, &actor).await.len(), 1);
     }
 
     #[tokio::test]
@@ -859,6 +1238,8 @@ mod tests {
         assert_eq!(document.revoked_tokens.len(), 1);
         assert!(!document.token_revoked(&stale, 3_000));
         assert!(document.token_revoked(&fresh, 3_000));
+        assert_eq!(index_values(&context, &actor).await.len(), 1);
+        assert_eq!(token_records(&context, &actor).await.len(), 1);
 
         let read = drive(GetRealmConfigOperation::new(actor.realm_id), &context)
             .await

@@ -10,7 +10,9 @@ use aruna_core::util::unix_timestamp_secs;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::forwarded_bearer;
 use aruna_operations::metadata::forward::{forward_token_revoke, is_user_origin};
-use aruna_operations::revoke_token::{RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation};
+use aruna_operations::revoke_token::{
+    RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
+};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::post;
@@ -108,6 +110,11 @@ pub async fn revoke_token(
             token_hash: bearer_token_hash(&request.token),
             expires_at,
             token_owner: subject.user_id,
+            admission: if auth.user_id == subject.user_id {
+                RevokeTokenAdmission::SelfService
+            } else {
+                RevokeTokenAdmission::Privileged
+            },
             now: unix_timestamp_secs(),
         }),
         ctx.as_ref(),
