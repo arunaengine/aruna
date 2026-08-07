@@ -895,6 +895,7 @@ pub mod test {
             )]),
             equivalent_value_dots: BTreeMap::new(),
             revocation_floor: 0,
+            revocation_next_expiry: None,
         }
     }
 
@@ -928,6 +929,7 @@ pub mod test {
             user_subject_ids: BTreeMap::new(),
             equivalent_value_dots: BTreeMap::new(),
             revocation_floor: 0,
+            revocation_next_expiry: None,
         }
     }
 

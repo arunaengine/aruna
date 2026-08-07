@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound::{Included, Unbounded};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,7 @@ use crate::admin_documents::{
     AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
     AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
-use crate::auth::{revocation_live, revocation_retained, valid_token_hash};
+use crate::auth::{REVOCATION_GRACE_SECS, revocation_live, revocation_retained, valid_token_hash};
 use crate::structs::{
     Actor, BandPool, BindingScope, DocumentClass, HandleRange, MAX_PLACEMENT_SHARD_COUNT,
     MetadataRegistryRecord, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig,
@@ -89,6 +90,7 @@ pub struct AdminDocumentReducerState {
     #[serde(default)]
     pub equivalent_value_dots: BTreeMap<String, BTreeSet<AdminDocumentDot>>,
     pub revocation_floor: u64,
+    pub revocation_next_expiry: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,6 +123,11 @@ pub struct RevocationIndex {
     live: BTreeMap<String, RevocationCandidate>,
     origin_counts: BTreeMap<NodeId, usize>,
     owner_counts: BTreeMap<(NodeId, UserId), usize>,
+    next_expiry: Option<u64>,
+}
+
+fn expiry_threshold(expires_at: u64) -> u64 {
+    expires_at.saturating_add(REVOCATION_GRACE_SECS)
 }
 
 fn candidate_cmp(left: &RevocationCandidate, right: &RevocationCandidate) -> Ordering {
@@ -138,6 +145,28 @@ fn value_matches(version: &AdminDocumentAttributeVersion, expires_at: u64) -> bo
         == Some(expires_at)
 }
 
+fn add_paths<T>(
+    paths: &BTreeMap<String, T>,
+    indexed: &mut BTreeMap<String, Option<RevocationPath>>,
+) {
+    let prefix = format!("{REALM_CONFIG_REVOKED_TOKENS_PATH}.");
+    for path in paths
+        .range((Included(prefix.clone()), Unbounded))
+        .map(|(path, _)| path)
+    {
+        if !path.starts_with(&prefix) {
+            break;
+        }
+        indexed.entry(path.clone()).or_insert_with(|| {
+            revoked_token_entry(path).map(|(hash, expires_at, token_owner)| RevocationPath {
+                hash: hash.to_string(),
+                expires_at,
+                token_owner,
+            })
+        });
+    }
+}
+
 impl RevocationIndex {
     fn build(state: &AdminDocumentReducerState, now: u64) -> Self {
         if !matches!(&state.target, AdminDocumentTarget::RealmConfig { .. }) {
@@ -148,37 +177,14 @@ impl RevocationIndex {
                 live: BTreeMap::new(),
                 origin_counts: BTreeMap::new(),
                 owner_counts: BTreeMap::new(),
+                next_expiry: None,
             };
         }
 
         let mut indexed = BTreeMap::new();
-        for path in state.user_subject_ids.keys() {
-            indexed.entry(path.clone()).or_insert_with(|| {
-                revoked_token_entry(path).map(|(hash, expires_at, token_owner)| RevocationPath {
-                    hash: hash.to_string(),
-                    expires_at,
-                    token_owner,
-                })
-            });
-        }
-        for path in state.equivalent_value_dots.keys() {
-            indexed.entry(path.clone()).or_insert_with(|| {
-                revoked_token_entry(path).map(|(hash, expires_at, token_owner)| RevocationPath {
-                    hash: hash.to_string(),
-                    expires_at,
-                    token_owner,
-                })
-            });
-        }
-        for path in state.conflicts.keys() {
-            indexed.entry(path.clone()).or_insert_with(|| {
-                revoked_token_entry(path).map(|(hash, expires_at, token_owner)| RevocationPath {
-                    hash: hash.to_string(),
-                    expires_at,
-                    token_owner,
-                })
-            });
-        }
+        add_paths(&state.user_subject_ids, &mut indexed);
+        add_paths(&state.equivalent_value_dots, &mut indexed);
+        add_paths(&state.conflicts, &mut indexed);
 
         let mut groups = BTreeMap::new();
         for (path, entry) in indexed {
@@ -237,6 +243,7 @@ impl RevocationIndex {
         let mut live = BTreeMap::new();
         let mut origin_counts = BTreeMap::new();
         let mut owner_counts = BTreeMap::new();
+        let mut next_expiry = None;
         for (hash, group) in &groups {
             let Some(winner) = group
                 .candidates
@@ -246,6 +253,11 @@ impl RevocationIndex {
             else {
                 continue;
             };
+            next_expiry = Some(
+                next_expiry.map_or(expiry_threshold(winner.expires_at), |current| {
+                    current.min(expiry_threshold(winner.expires_at))
+                }),
+            );
             if revocation_retained(winner.expires_at, now) {
                 *origin_counts.entry(winner.dot.origin_node_id).or_insert(0) += 1;
                 *owner_counts
@@ -265,6 +277,7 @@ impl RevocationIndex {
             live,
             origin_counts,
             owner_counts,
+            next_expiry,
         }
     }
 
@@ -303,6 +316,19 @@ impl RevocationIndex {
 
     pub(crate) fn watermark(&self) -> u64 {
         self.now
+    }
+
+    fn next_expiry(&self) -> Option<u64> {
+        self.next_expiry
+    }
+
+    fn refresh_expiry(&mut self) {
+        self.next_expiry = self
+            .groups
+            .values()
+            .flat_map(|group| group.candidates.iter())
+            .map(|candidate| expiry_threshold(candidate.expires_at))
+            .min();
     }
 
     fn clear_hash(&mut self, hash: &str) {
@@ -377,6 +403,8 @@ impl RevocationIndex {
                 .insert(token_hash.to_string(), Self::canonical_group(&winner));
             self.set_hash(token_hash, winner);
         }
+        self.refresh_expiry();
+        state.revocation_next_expiry = self.next_expiry();
         state.clock.advance(event.origin_node_id, event.origin_seq);
         if status != AdminDocumentApplyStatus::Redundant {
             state.applied_event_ids.insert(event.event_id);
@@ -421,6 +449,8 @@ impl RevocationIndex {
                 .insert(hash.clone(), Self::canonical_group(winner));
             self.set_hash(&hash, winner.clone());
         }
+        self.refresh_expiry();
+        state.revocation_next_expiry = self.next_expiry();
     }
 }
 
@@ -689,6 +719,7 @@ impl AdminDocumentReducerState {
             user_subject_ids: BTreeMap::new(),
             equivalent_value_dots: BTreeMap::new(),
             revocation_floor: 0,
+            revocation_next_expiry: None,
         }
     }
 
@@ -961,6 +992,7 @@ impl AdminDocumentReducerState {
                 }
                 apply_status =
                     self.apply_revocation_full(event, token_hash, *expires_at, *token_owner);
+                self.refresh_revocation_expiry();
             }
             (
                 AdminDocumentTarget::RealmConfig { .. },
@@ -1498,6 +1530,15 @@ impl AdminDocumentReducerState {
         RevocationIndex::build(self, now)
     }
 
+    pub fn revocation_compaction_due(&self, now: u64) -> bool {
+        self.revocation_next_expiry
+            .is_some_and(|threshold| now > threshold)
+    }
+
+    pub fn advance_revocation_floor(&mut self, now: u64) {
+        self.revocation_floor = self.revocation_floor.max(now);
+    }
+
     pub fn materialized_revoked_tokens(&self) -> BTreeMap<String, u64> {
         self.revocation_index(self.revocation_floor).materialized()
     }
@@ -1552,6 +1593,10 @@ impl AdminDocumentReducerState {
         } else {
             AdminDocumentApplyStatus::Redundant
         }
+    }
+
+    fn refresh_revocation_expiry(&mut self) {
+        self.revocation_next_expiry = self.revocation_index(self.revocation_floor).next_expiry();
     }
 
     fn canonicalize_revocation(
@@ -2590,6 +2635,7 @@ mod tests {
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation,
         AdminDocumentRoleDefinition, AdminDocumentTarget,
     };
+    use crate::auth::REVOCATION_GRACE_SECS;
     use crate::structs::{
         Actor, AffinityEffect, AffinityRule, BindingError, BindingScope, DocumentClass,
         FIRST_GRANTABLE_HANDLE, GroupQuotaOverride, HandleRange, KIND_LABEL_KEY, LabelMatch,
@@ -6311,6 +6357,38 @@ mod tests {
         assert!(state.user_subject_ids.contains_key(&path));
         state.compact_revocations(1_201);
         assert!(!state.user_subject_ids.contains_key(&path));
+    }
+
+    #[test]
+    fn expiry_schedule_bounds() {
+        let mut state = realm_config_state();
+        let event = revoke_token_at(52, 1, "scheduled", 2_000);
+        state.apply(&event).unwrap();
+
+        assert_eq!(
+            state.revocation_next_expiry,
+            Some(2_000 + REVOCATION_GRACE_SECS)
+        );
+        assert!(!state.revocation_compaction_due(2_000 + REVOCATION_GRACE_SECS));
+
+        state
+            .apply(&set_realm_config_description(53, 2, "unrelated"))
+            .unwrap();
+        state.advance_revocation_floor(2_100);
+        assert!(!state.revocation_compaction_due(2_100));
+        assert_eq!(
+            state.revocation_next_expiry,
+            Some(2_000 + REVOCATION_GRACE_SECS)
+        );
+
+        state.compact_revocations(2_000 + REVOCATION_GRACE_SECS + 1);
+        assert_eq!(state.revocation_next_expiry, None);
+        assert!(
+            state
+                .user_subject_ids
+                .keys()
+                .all(|path| !path.contains("scheduled"))
+        );
     }
 
     #[test]

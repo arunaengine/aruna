@@ -3392,7 +3392,7 @@ fn overlay_realm_config_reducer_materialization(
     config: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
     now: u64,
-    revocation_index: &RevocationIndex,
+    revocation_index: Option<&RevocationIndex>,
 ) {
     if !reducer_state
         .conflicts
@@ -3435,10 +3435,13 @@ fn overlay_realm_config_reducer_materialization(
         config.request_policies = request_policies;
     }
 
-    // Union, so a locally accepted revocation is never dropped because the
-    // replicated set has not carried it yet.
     config.revocation_floor = config.revocation_floor.max(reducer_state.revocation_floor);
-    config.merge_revocation_index(revocation_index, now);
+    // Without an index, the existing set remains fail-closed until each entry's expiry.
+    if let Some(revocation_index) = revocation_index {
+        // Union, so a locally accepted revocation is never dropped because the
+        // replicated set has not carried it yet.
+        config.merge_revocation_index(revocation_index, now);
+    }
 
     for path in reducer_state.conflicts.keys() {
         if let Some(node_id) = realm_config_node_id_from_path(path) {
@@ -3482,7 +3485,7 @@ fn realm_config_from_reducer_materialization(
     realm_id: RealmId,
     reducer_state: &AdminDocumentReducerState,
     now: u64,
-    revocation_index: &RevocationIndex,
+    revocation_index: Option<&RevocationIndex>,
 ) -> Option<RealmConfigDocument> {
     let metadata_replication = reducer_state.materialized_realm_config_metadata_replication()?;
     let discovery = reducer_state.materialized_realm_config_discovery()?;
@@ -3512,6 +3515,15 @@ fn realm_config_from_reducer_materialization(
     };
     overlay_realm_config_reducer_materialization(&mut config, reducer_state, now, revocation_index);
     Some(config)
+}
+
+fn needs_revocation_index(
+    is_revocation: bool,
+    config_present: bool,
+    reducer_state: &AdminDocumentReducerState,
+    now: u64,
+) -> bool {
+    is_revocation || !config_present || reducer_state.revocation_compaction_due(now)
 }
 
 fn remove_realm_config_node(config: &mut RealmConfigDocument, node_id: &NodeId) {
@@ -4452,10 +4464,24 @@ async fn apply_realm_config_admin_document_operation_to_storage(
         let mut reducer_state = previous_state
             .clone()
             .unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
-        let mut revocation_index = reducer_state.revocation_index(effective_now);
+        let needs_index = needs_revocation_index(
+            is_revocation,
+            previous_config.is_some(),
+            &reducer_state,
+            effective_now,
+        );
+        let mut revocation_index =
+            needs_index.then(|| reducer_state.revocation_index(effective_now));
         if is_revocation {
-            if let Err(error) = reducer_state.apply_revocation_event(&event, &mut revocation_index)
-            {
+            let Some(index) = revocation_index.as_mut() else {
+                return Err(abort_error(
+                    storage,
+                    txn_id,
+                    NetError::Bootstrap("revocation index was not admitted".to_string()),
+                )
+                .await);
+            };
+            if let Err(error) = reducer_state.apply_revocation_event(&event, index) {
                 return Err(
                     abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await,
                 );
@@ -4463,7 +4489,10 @@ async fn apply_realm_config_admin_document_operation_to_storage(
         } else if let Err(error) = reducer_state.apply(&event) {
             return Err(abort_error(storage, txn_id, NetError::Bootstrap(error.to_string())).await);
         }
-        revocation_index.compact(&mut reducer_state);
+        reducer_state.advance_revocation_floor(effective_now);
+        if let Some(index) = revocation_index.as_mut() {
+            index.compact(&mut reducer_state);
+        }
 
         let mut config_changed = false;
         let config = match previous_config {
@@ -4486,7 +4515,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
                     &mut config,
                     &reducer_state,
                     effective_now,
-                    &revocation_index,
+                    revocation_index.as_ref(),
                 );
                 config_changed = config != before;
                 Some(config)
@@ -4496,7 +4525,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
                     realm_id,
                     &reducer_state,
                     effective_now,
-                    &revocation_index,
+                    revocation_index.as_ref(),
                 );
                 config_changed = config.is_some();
                 config
@@ -7000,6 +7029,41 @@ mod tests {
     }
 
     #[test]
+    fn index_skip_expiry() {
+        let realm_id = RealmId::from_bytes([76; 32]);
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let actor = test_actor(
+            45,
+            UserId::local(Ulid::from_parts(1_810, 1), realm_id),
+            realm_id,
+        );
+        let mut state = AdminDocumentReducerState::new(target.clone());
+        state
+            .apply(&test_admin_event(
+                Ulid::from_parts(1_811, 1),
+                target,
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigTokenRevoked {
+                    token_hash: aruna_core::auth::bearer_token_hash("scheduled"),
+                    expires_at: 2_000,
+                    token_owner: actor.user_id,
+                },
+            ))
+            .expect("revocation applies");
+
+        assert!(!needs_revocation_index(false, true, &state, 2_000));
+        assert!(needs_revocation_index(
+            false,
+            true,
+            &state,
+            2_000 + REVOCATION_GRACE_SECS + 1
+        ));
+        assert!(needs_revocation_index(true, true, &state, 2_000));
+        assert!(needs_revocation_index(false, false, &state, 2_000));
+    }
+
+    #[test]
     fn floor_stays_monotonic() {
         // A clock rollback must not resurrect compacted revocation paths.
         let realm_id = RealmId::from_bytes([75; 32]);
@@ -8055,7 +8119,7 @@ mod tests {
 
         let now = unix_timestamp_secs();
         let index = state.revocation_index(now);
-        overlay_realm_config_reducer_materialization(&mut config, &state, now, &index);
+        overlay_realm_config_reducer_materialization(&mut config, &state, now, Some(&index));
         assert_eq!(config.default_strategy_id, None);
 
         for (event_id, actor, strategy_id) in [
@@ -8089,7 +8153,7 @@ mod tests {
         assert_eq!(state.materialized_realm_config_default_strategy(), None);
 
         let index = state.revocation_index(now);
-        overlay_realm_config_reducer_materialization(&mut config, &state, now, &index);
+        overlay_realm_config_reducer_materialization(&mut config, &state, now, Some(&index));
         assert_eq!(config.default_strategy_id, None);
     }
 
@@ -8732,7 +8796,12 @@ mod tests {
         );
         let mut future_config = config;
         let index = state.revocation_index(future);
-        overlay_realm_config_reducer_materialization(&mut future_config, &state, future, &index);
+        overlay_realm_config_reducer_materialization(
+            &mut future_config,
+            &state,
+            future,
+            Some(&index),
+        );
         assert_eq!(future_config.revoked_tokens.len(), 1);
     }
 
