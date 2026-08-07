@@ -301,14 +301,92 @@ impl RevocationIndex {
             .collect()
     }
 
-    fn compact(self, state: &mut AdminDocumentReducerState) {
-        let Self {
-            now,
-            groups,
-            retained,
-            ..
-        } = self;
-        state.revocation_floor = state.revocation_floor.max(now);
+    fn clear_hash(&mut self, hash: &str) {
+        if let Some(candidate) = self.retained.remove(hash) {
+            let origin = candidate.dot.origin_node_id;
+            let owner = (origin, candidate.token_owner);
+            if let Some(count) = self.origin_counts.get_mut(&origin) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.origin_counts.remove(&origin);
+                }
+            }
+            if let Some(count) = self.owner_counts.get_mut(&owner) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.owner_counts.remove(&owner);
+                }
+            }
+        }
+        self.live.remove(hash);
+    }
+
+    fn set_hash(&mut self, hash: &str, winner: RevocationCandidate) {
+        self.clear_hash(hash);
+        if revocation_retained(winner.expires_at, self.now) {
+            *self
+                .origin_counts
+                .entry(winner.dot.origin_node_id)
+                .or_insert(0) += 1;
+            *self
+                .owner_counts
+                .entry((winner.dot.origin_node_id, winner.token_owner))
+                .or_insert(0) += 1;
+            self.retained.insert(hash.to_string(), winner.clone());
+        }
+        if revocation_live(winner.expires_at, self.now) {
+            self.live.insert(hash.to_string(), winner);
+        }
+    }
+
+    fn canonical_group(winner: &RevocationCandidate) -> RevocationGroup {
+        RevocationGroup {
+            paths: BTreeSet::from([winner.path.clone()]),
+            candidates: vec![winner.clone()],
+            event_ids: BTreeSet::from([winner.dot.event_id]),
+        }
+    }
+
+    fn apply(
+        &mut self,
+        state: &mut AdminDocumentReducerState,
+        event: &AdminDocumentEvent,
+        token_hash: &str,
+        expires_at: u64,
+        token_owner: UserId,
+    ) -> AdminDocumentApplyStatus {
+        self.clear_hash(token_hash);
+        let group = self.groups.remove(token_hash).unwrap_or_default();
+        let winner = state.canonicalize_group(
+            token_hash,
+            group,
+            Some((expires_at, token_owner, event.dot())),
+        );
+        let status = winner
+            .as_ref()
+            .filter(|winner| winner.dot == event.dot())
+            .map_or(AdminDocumentApplyStatus::Redundant, |_| {
+                AdminDocumentApplyStatus::Applied
+            });
+        if let Some(winner) = winner {
+            self.groups
+                .insert(token_hash.to_string(), Self::canonical_group(&winner));
+            self.set_hash(token_hash, winner);
+        }
+        state.clock.advance(event.origin_node_id, event.origin_seq);
+        if status != AdminDocumentApplyStatus::Redundant {
+            state.applied_event_ids.insert(event.event_id);
+        }
+        status
+    }
+
+    pub fn compact(&mut self, state: &mut AdminDocumentReducerState) {
+        let groups = std::mem::take(&mut self.groups);
+        let retained = std::mem::take(&mut self.retained);
+        self.live.clear();
+        self.origin_counts.clear();
+        self.owner_counts.clear();
+        state.revocation_floor = state.revocation_floor.max(self.now);
         for (hash, group) in groups {
             let Some(winner) = retained.get(&hash) else {
                 state.remove_revocation_group(&group);
@@ -335,6 +413,9 @@ impl RevocationIndex {
                 );
             }
             state.applied_event_ids.insert(winner.dot.event_id);
+            self.groups
+                .insert(hash.clone(), Self::canonical_group(winner));
+            self.set_hash(&hash, winner.clone());
         }
     }
 }
@@ -626,6 +707,54 @@ impl AdminDocumentReducerState {
         Ok(event)
     }
 
+    pub fn apply_revocation_operation(
+        &mut self,
+        actor: &Actor,
+        op: AdminDocumentOperation,
+        index: &mut RevocationIndex,
+    ) -> Result<AdminDocumentEvent, AdminDocumentReducerError> {
+        let observed = self.clock.clone();
+        let event = AdminDocumentEvent {
+            event_id: Ulid::generate(),
+            target: self.target.clone(),
+            origin_node_id: actor.node_id,
+            origin_seq: observed.sequence_for(&actor.node_id) + 1,
+            observed,
+            actor: actor.clone(),
+            op,
+        };
+        self.apply_revocation_event(&event, index)?;
+        Ok(event)
+    }
+
+    pub fn apply_revocation_event(
+        &mut self,
+        event: &AdminDocumentEvent,
+        index: &mut RevocationIndex,
+    ) -> Result<AdminDocumentApplyStatus, AdminDocumentReducerError> {
+        if event.target != self.target {
+            return Err(AdminDocumentReducerError::TargetMismatch);
+        }
+        if self.applied_event_ids.contains(&event.event_id) {
+            return Ok(AdminDocumentApplyStatus::Duplicate);
+        }
+        let AdminDocumentOperation::RealmConfigTokenRevoked {
+            token_hash,
+            expires_at,
+            token_owner,
+        } = &event.op
+        else {
+            return Err(AdminDocumentReducerError::UnsupportedTarget);
+        };
+        if !matches!(&event.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return Err(AdminDocumentReducerError::UnsupportedTarget);
+        }
+        if !valid_token_hash(token_hash) {
+            return Err(AdminDocumentReducerError::InvalidTokenHash);
+        }
+        Ok(index.apply(self, event, token_hash, *expires_at, *token_owner))
+    }
+
     pub fn apply(
         &mut self,
         event: &AdminDocumentEvent,
@@ -826,7 +955,8 @@ impl AdminDocumentReducerState {
                 if !valid_token_hash(token_hash) {
                     return Err(AdminDocumentReducerError::InvalidTokenHash);
                 }
-                apply_status = self.apply_revocation(event, token_hash, *expires_at, *token_owner);
+                apply_status =
+                    self.apply_revocation_full(event, token_hash, *expires_at, *token_owner);
             }
             (
                 AdminDocumentTarget::RealmConfig { .. },
@@ -1376,7 +1506,7 @@ impl AdminDocumentReducerState {
         }
 
         self.revocation_floor = self.revocation_floor.max(now);
-        let index = self.revocation_index(self.revocation_floor);
+        let mut index = self.revocation_index(self.revocation_floor);
         index.compact(self);
     }
 
@@ -1404,7 +1534,7 @@ impl AdminDocumentReducerState {
             .owner(token_hash)
     }
 
-    fn apply_revocation(
+    fn apply_revocation_full(
         &mut self,
         event: &AdminDocumentEvent,
         token_hash: &str,
@@ -1425,13 +1555,28 @@ impl AdminDocumentReducerState {
         token_hash: &str,
         candidate: Option<(u64, UserId, AdminDocumentDot)>,
     ) -> Option<AdminDocumentDot> {
-        let mut group = self
+        let group = self
             .revocation_index(self.revocation_floor)
             .groups
             .remove(token_hash)
             .unwrap_or_default();
+        let winner = self.canonicalize_group(token_hash, group, candidate);
+        let Some(winner) = winner else {
+            return None;
+        };
+        Some(winner.dot)
+    }
+
+    fn canonicalize_group(
+        &mut self,
+        token_hash: &str,
+        mut group: RevocationGroup,
+        candidate: Option<(u64, UserId, AdminDocumentDot)>,
+    ) -> Option<RevocationCandidate> {
         if let Some((expires_at, token_owner, dot)) = candidate {
             let path = revoked_token_path(token_hash, expires_at, &token_owner);
+            group.paths.insert(path.clone());
+            group.event_ids.insert(dot.event_id);
             group.candidates.push(RevocationCandidate {
                 path,
                 expires_at,
@@ -1439,17 +1584,15 @@ impl AdminDocumentReducerState {
                 dot,
             });
         }
-
         let winner = group
             .candidates
             .iter()
             .max_by(|left, right| candidate_cmp(left, right))
             .cloned();
-        let Some(winner) = winner else {
+        let Some(winner) = winner.clone() else {
             self.remove_revocation_group(&group);
             return None;
         };
-
         let unchanged = group.paths.len() == 1
             && group.paths.contains(&winner.path)
             && self
@@ -1460,12 +1603,10 @@ impl AdminDocumentReducerState {
                 })
             && !self.equivalent_value_dots.contains_key(&winner.path)
             && !self.conflicts.contains_key(&winner.path);
-
         if !unchanged {
             self.remove_revocation_group(&group);
-            let path = revoked_token_path(token_hash, winner.expires_at, &winner.token_owner);
             self.user_subject_ids.insert(
-                path,
+                winner.path.clone(),
                 AdminDocumentAttributeVersion {
                     value: Some(winner.expires_at.to_string()),
                     dot: winner.dot,
@@ -1473,7 +1614,7 @@ impl AdminDocumentReducerState {
             );
         }
         self.applied_event_ids.insert(winner.dot.event_id);
-        Some(winner.dot)
+        Some(winner)
     }
 
     fn remove_revocation_group(&mut self, group: &RevocationGroup) {
@@ -6166,6 +6307,32 @@ mod tests {
         assert!(state.user_subject_ids.contains_key(&path));
         state.compact_revocations(1_201);
         assert!(!state.user_subject_ids.contains_key(&path));
+    }
+
+    #[test]
+    fn indexed_apply_refreshes() {
+        let mut state = realm_config_state();
+        state
+            .apply(&revoke_token_at(51, 1, "indexed", 2_000))
+            .unwrap();
+        let mut index = state.revocation_index(1_000);
+        let event = revoke_token_at(52, 2, "indexed", 3_000);
+
+        assert_eq!(
+            state.apply_revocation_event(&event, &mut index),
+            Ok(AdminDocumentApplyStatus::Applied)
+        );
+        assert_eq!(
+            index.origin(&crate::auth::bearer_token_hash("indexed")),
+            Some(node(2))
+        );
+        assert_eq!(index.count(&node(1)), 0);
+        assert_eq!(index.count(&node(2)), 1);
+        index.compact(&mut state);
+        assert_eq!(
+            state.materialized_revoked_tokens(),
+            BTreeMap::from([(crate::auth::bearer_token_hash("indexed"), 3_000)])
+        );
     }
 
     #[test]
