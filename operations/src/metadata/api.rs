@@ -2340,6 +2340,16 @@ fn map_metadata_query_error(error: MetadataError) -> MetadataApiError {
     }
 }
 
+fn map_metadata_read_error(error: MetadataReadError) -> MetadataApiError {
+    match error {
+        MetadataReadError::Unauthorized => MetadataApiError::Unauthorized,
+        MetadataReadError::Forbidden => MetadataApiError::Forbidden,
+        MetadataReadError::NotFound | MetadataReadError::Unavailable => {
+            MetadataApiError::ServiceUnavailable
+        }
+    }
+}
+
 fn map_metadata_internal_error(error: MetadataError) -> MetadataApiError {
     MetadataApiError::Internal(error.to_string())
 }
@@ -2615,14 +2625,14 @@ fn fanout_bearer(token: Option<&str>) -> Option<MetadataAuthToken> {
 }
 
 type MetadataNodeCall<T> =
-    Arc<dyn Fn(NodeId) -> BoxFuture<'static, Result<T, MetadataError>> + Send + Sync>;
+    Arc<dyn Fn(NodeId) -> BoxFuture<'static, Result<T, MetadataReadError>> + Send + Sync>;
 
 fn metadata_node_call<C, T, F, Fut>(context: C, call: F) -> MetadataNodeCall<T>
 where
     C: Clone + Send + Sync + 'static,
     T: Send + 'static,
     F: Fn(C, NodeId) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<T, MetadataError>> + Send + 'static,
+    Fut: Future<Output = Result<T, MetadataReadError>> + Send + 'static,
 {
     Arc::new(move |node_id| {
         let context = context.clone();
@@ -2644,14 +2654,6 @@ impl MetadataFanoutOperation {
             Self::Search => "search",
             Self::BucketSearch => "bucket_search",
         }
-    }
-
-    fn timeout_error(self) -> MetadataError {
-        MetadataError::Backend(format!(
-            "distributed metadata {} node timed out after {}ms",
-            self.label(),
-            METADATA_PEER_TIMEOUT.as_millis()
-        ))
     }
 }
 
@@ -2693,9 +2695,9 @@ async fn run_metadata_fanout_node<T>(
     local: bool,
     local_call: MetadataNodeCall<T>,
     remote_call: MetadataNodeCall<T>,
-    record_result: fn(&Span, &Result<T, MetadataError>),
+    record_result: fn(&Span, &Result<T, MetadataReadError>),
     record_stage_detail: bool,
-) -> Result<T, MetadataError> {
+) -> Result<T, MetadataReadError> {
     let node_span = metadata_fanout_node_span(operation, node_id, local);
     let node_started = Instant::now();
     let result = if local {
@@ -2708,7 +2710,7 @@ async fn run_metadata_fanout_node<T>(
         .await
         {
             Ok(result) => result,
-            Err(_) => Err(operation.timeout_error()),
+            Err(_) => Err(MetadataReadError::Unavailable),
         }
     };
     let elapsed = record_elapsed_ms(&node_span, "elapsed_ms", node_started);
@@ -2760,8 +2762,8 @@ async fn run_metadata_fanout<T>(
     operation: MetadataFanoutOperation,
     local_call: MetadataNodeCall<T>,
     remote_call: MetadataNodeCall<T>,
-    record_result: fn(&Span, &Result<T, MetadataError>),
-    map_local_error: fn(MetadataError) -> MetadataApiError,
+    record_result: fn(&Span, &Result<T, MetadataReadError>),
+    map_local_error: fn(MetadataReadError) -> MetadataApiError,
 ) -> Result<(Vec<(NodeId, T)>, MetadataFanoutStats), MetadataApiError>
 where
     T: Send + 'static,
@@ -2837,6 +2839,8 @@ where
             };
             let fanout_started = Instant::now();
             let mut node_parts = Vec::new();
+            let mut auth_error = None;
+            let mut not_found = false;
             let node_order = all_nodes
                 .into_iter()
                 .enumerate()
@@ -2894,22 +2898,43 @@ where
                 outstanding.remove(&node_id);
                 match result {
                     Ok(result) => node_parts.push((node_index, node_id, result)),
-                    Err(error) => {
+                    Err(error @ MetadataReadError::Unauthorized) => {
+                        fanout_stats.nodes_failed += 1;
+                        fanout_stats.failed_partitions.push(node_id);
+                        auth_error.get_or_insert(map_metadata_read_error(error));
+                    }
+                    Err(error @ MetadataReadError::Forbidden) => {
+                        fanout_stats.nodes_failed += 1;
+                        fanout_stats.failed_partitions.push(node_id);
+                        auth_error.get_or_insert(map_metadata_read_error(error));
+                    }
+                    Err(MetadataReadError::NotFound) => {
+                        fanout_stats.nodes_failed += 1;
+                        fanout_stats.failed_partitions.push(node_id);
+                        not_found = true;
+                    }
+                    Err(MetadataReadError::Unavailable) => {
                         fanout_stats.nodes_failed += 1;
                         fanout_stats.failed_partitions.push(node_id);
                         warn!(
                             node_id = ?node_id,
                             operation = operation.label(),
-                            error = %error,
+                            error = "unavailable",
                             "distributed metadata skipped failed node result"
                         );
-                        if !allow_partial {
-                            return Err(MetadataApiError::ServiceUnavailable);
-                        }
                     }
                 }
             }
 
+            if let Some(error) = auth_error {
+                return Err(error);
+            }
+            if not_found {
+                return Err(MetadataApiError::ServiceUnavailable);
+            }
+            if !allow_partial && fanout_stats.nodes_failed > 0 {
+                return Err(MetadataApiError::ServiceUnavailable);
+            }
             node_parts.sort_by_key(|(node_index, _, _)| *node_index);
             fanout_stats
                 .failed_partitions
@@ -2966,7 +2991,7 @@ pub async fn search_buckets_distributed(
                 },
             )
             .await
-            .map_err(|error| MetadataError::Backend(error.to_string()))
+            .map_err(|_| MetadataReadError::Unavailable)
         },
     );
     let remote_call: MetadataNodeCall<Vec<BucketSearchHit>> = metadata_node_call(
@@ -2975,6 +3000,7 @@ pub async fn search_buckets_distributed(
             handle
                 .request_bucket_search(node_id, auth_token, query, limit)
                 .await
+                .map_err(|_| MetadataReadError::Unavailable)
         },
     );
     let (parts, fanout_stats) = run_metadata_fanout(
@@ -2991,7 +3017,7 @@ pub async fn search_buckets_distributed(
         local_call,
         remote_call,
         record_bucket_result,
-        map_metadata_internal_error,
+        map_metadata_read_error,
     )
     .await?;
     let mut hits = parts
@@ -3002,7 +3028,7 @@ pub async fn search_buckets_distributed(
     Ok(BucketSearchExecution { hits, fanout_stats })
 }
 
-fn record_bucket_result(span: &Span, result: &Result<Vec<BucketSearchHit>, MetadataError>) {
+fn record_bucket_result(span: &Span, result: &Result<Vec<BucketSearchHit>, MetadataReadError>) {
     match result {
         Ok(hits) => {
             span.record("result", "ok");
@@ -3014,7 +3040,7 @@ fn record_bucket_result(span: &Span, result: &Result<Vec<BucketSearchHit>, Metad
     }
 }
 
-fn record_query_node_result(span: &Span, result: &Result<MetadataQueryResults, MetadataError>) {
+fn record_query_node_result(span: &Span, result: &Result<MetadataQueryResults, MetadataReadError>) {
     match result {
         Ok(result) => {
             span.record("result", result.kind());
@@ -3027,7 +3053,7 @@ fn record_query_node_result(span: &Span, result: &Result<MetadataQueryResults, M
 
 fn record_search_node_result(
     span: &Span,
-    result: &Result<(Vec<MetadataSearchHit>, usize), MetadataError>,
+    result: &Result<(Vec<MetadataSearchHit>, usize), MetadataReadError>,
 ) {
     match result {
         Ok((hits, _)) => {
@@ -3125,7 +3151,10 @@ async fn run_query_distributed(
             query.clone(),
         ),
         |(handle, auth, graph_iris, query), _| async move {
-            handle.query_authorized_local(auth, graph_iris, query).await
+            handle
+                .query_authorized_local(auth, graph_iris, query)
+                .await
+                .map_err(super::handle::metadata_read_error)
         },
     );
     let remote_call: MetadataNodeCall<MetadataQueryResults> = metadata_node_call(
@@ -3150,7 +3179,7 @@ async fn run_query_distributed(
         local_call,
         remote_call,
         record_query_node_result,
-        map_metadata_query_error,
+        map_metadata_read_error,
     )
     .await?;
 
@@ -3266,14 +3295,15 @@ async fn run_search_distributed(
                             object_iri,
                             group_id,
                         )
-                        .await?
+                        .await
                 }
                 None => {
                     handle
                         .search_authorized_local(auth, graph_iris, query, limit, group_id)
-                        .await?
+                        .await
                 }
             };
+            let hits = hits.map_err(super::handle::metadata_read_error)?;
             Ok((hits, limit))
         },
     );
@@ -3331,7 +3361,7 @@ async fn run_search_distributed(
         local_call,
         remote_call,
         record_search_node_result,
-        map_metadata_internal_error,
+        map_metadata_read_error,
     )
     .await?;
 
@@ -4872,7 +4902,7 @@ mod tests {
         let remote_call: MetadataNodeCall<usize> =
             metadata_node_call(failed, |failed, node_id| async move {
                 if node_id == failed {
-                    Err(MetadataError::Backend("offline".to_string()))
+                    Err(MetadataReadError::Unavailable)
                 } else {
                     Ok(2)
                 }
@@ -4891,7 +4921,7 @@ mod tests {
             local_call,
             remote_call,
             |_, _| {},
-            map_metadata_internal_error,
+            map_metadata_read_error,
         )
         .await
         .unwrap();
@@ -4900,6 +4930,51 @@ mod tests {
         assert_eq!(stats.nodes_queried, 3);
         assert_eq!(stats.nodes_failed, 1);
         assert_eq!(stats.failed_partitions, vec![failed]);
+    }
+
+    #[tokio::test]
+    async fn fanout_not_found_fails() {
+        let directory = tempdir().unwrap();
+        let context = DriverContext {
+            storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap())
+                .unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let local = iroh::SecretKey::from_bytes(&[47u8; 32]).public();
+        let stale = iroh::SecretKey::from_bytes(&[48u8; 32]).public();
+        let local_call: MetadataNodeCall<usize> =
+            metadata_node_call((), |(), _| async move { Ok(1) });
+        let remote_call: MetadataNodeCall<usize> =
+            metadata_node_call(stale, |stale, node_id| async move {
+                if node_id == stale {
+                    Err(MetadataReadError::NotFound)
+                } else {
+                    Ok(2)
+                }
+            });
+
+        let result = run_metadata_fanout(
+            &context,
+            RealmId::from_bytes([11u8; 32]),
+            local,
+            MetadataFanoutScope::new(
+                Some(MetadataApiQueryMode::Distributed),
+                Some(vec![local, stale]),
+                true,
+            ),
+            MetadataFanoutOperation::Search,
+            local_call,
+            remote_call,
+            |_, _| {},
+            map_metadata_read_error,
+        )
+        .await;
+
+        assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -4924,7 +4999,7 @@ mod tests {
         let remote_call: MetadataNodeCall<usize> =
             metadata_node_call(hanging, |hanging, node_id| async move {
                 if node_id == hanging {
-                    std::future::pending::<Result<usize, MetadataError>>().await
+                    std::future::pending::<Result<usize, MetadataReadError>>().await
                 } else {
                     Ok(2)
                 }
@@ -4943,7 +5018,7 @@ mod tests {
             local_call,
             remote_call,
             |_, _| {},
-            map_metadata_internal_error,
+            map_metadata_read_error,
         )
         .await
         .unwrap();
