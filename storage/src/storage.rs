@@ -25,6 +25,7 @@ use ulid::Ulid;
 use crate::errors::StorageLibError;
 pub type EffectHandle = (StorageEffect, ResponseSender, Span, Instant, InFlightGuard);
 pub type EffectSender = crossfire::MTx<mpsc::Array<EffectHandle>>;
+type AsyncEffectSender = crossfire::MAsyncTx<mpsc::Array<EffectHandle>>;
 pub type EffectReceiver = crossfire::Rx<mpsc::Array<EffectHandle>>;
 type StorageReply = (StorageEvent, ResponseToken);
 
@@ -259,6 +260,8 @@ pub struct StorageReceivers {
 pub struct StorageHandle {
     write_channel: EffectSender,
     bulk_channel: EffectSender,
+    write_async: AsyncEffectSender,
+    bulk_async: AsyncEffectSender,
     priority: StoragePriority,
     metrics: Arc<StorageMetrics>,
     transaction_cleanup: Arc<Mutex<BTreeMap<Ulid, CleanupEntry>>>,
@@ -356,6 +359,8 @@ impl StorageHandle {
         let (bulk_sender, bulk) = mpsc::bounded_blocking(BULK_EFFECT_QUEUE_CAPACITY);
         (
             StorageHandle {
+                write_async: sender.clone().into_async(),
+                bulk_async: bulk_sender.clone().into_async(),
                 write_channel: sender,
                 bulk_channel: bulk_sender,
                 priority: StoragePriority::Foreground,
@@ -383,6 +388,16 @@ impl StorageHandle {
         match self.priority {
             StoragePriority::Foreground => &self.write_channel,
             StoragePriority::Bulk => &self.bulk_channel,
+        }
+    }
+
+    fn async_channel_for(&self, effect: &StorageEffect) -> &AsyncEffectSender {
+        if matches!(effect, StorageEffect::AbortTransaction { .. }) {
+            return &self.write_async;
+        }
+        match self.priority {
+            StoragePriority::Foreground => &self.write_async,
+            StoragePriority::Bulk => &self.bulk_async,
         }
     }
 
@@ -537,6 +552,7 @@ impl StorageHandle {
         let operation = storage_effect_kind(&effect);
         let active_txn_id = active_txn_id_for_effect(&effect);
         let cleanup = cleanup_effect(&effect);
+        let cleanup_write = is_cleanup_write(&effect);
         if let StorageEffect::CommitTransaction { txn_id } = &effect
             && self
                 .transaction_cleanup
@@ -548,63 +564,61 @@ impl StorageHandle {
             return self
                 .observe_storage_event(StorageEvent::TransactionCommitted { txn_id: *txn_id });
         }
-        let send_result: Result<(), TrySendError<EffectHandle>> =
-            if let Some((txn_id, kind)) = cleanup {
-                let mut pending = self
-                    .transaction_cleanup
-                    .lock()
-                    .expect("transaction cleanup mutex poisoned");
-                let admission = match reserve_cleanup(&mut pending, txn_id, kind) {
-                    Ok(admission) => admission,
-                    Err(error) => {
-                        return self.observe_storage_event(StorageEvent::Error { error });
-                    }
-                };
-                let response_tx = ResponseSender::new(sender, ResponseToken::new(self, &effect));
-                let span = storage_effect_span(&effect);
-                let in_flight = InFlightGuard::acquire(&self.metrics);
-                match self.channel_for(&effect).try_send((
-                    effect,
-                    response_tx,
-                    span,
-                    Instant::now(),
-                    in_flight,
-                )) {
-                    Ok(()) => Ok(()),
-                    Err(TrySendError::Full(item)) => {
-                        rollback_cleanup(&mut pending, admission);
-                        Err(TrySendError::Full(item))
-                    }
-                    Err(TrySendError::Disconnected(item)) => {
-                        rollback_cleanup(&mut pending, admission);
-                        Err(TrySendError::Disconnected(item))
+        let send_result: Result<(), StorageError> = if let Some((txn_id, kind)) = cleanup {
+            let mut pending = self
+                .transaction_cleanup
+                .lock()
+                .expect("transaction cleanup mutex poisoned");
+            let admission = match reserve_cleanup(&mut pending, txn_id, kind) {
+                Ok(admission) => admission,
+                Err(error) => {
+                    return self.observe_storage_event(StorageEvent::Error { error });
+                }
+            };
+            let response_tx = ResponseSender::new(sender, ResponseToken::new(self, &effect));
+            let span = storage_effect_span(&effect);
+            let in_flight = InFlightGuard::acquire(&self.metrics);
+            match self.channel_for(&effect).try_send((
+                effect,
+                response_tx,
+                span,
+                Instant::now(),
+                in_flight,
+            )) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(item)) => {
+                    rollback_cleanup(&mut pending, admission);
+                    drop(item);
+                    Err(StorageError::QueueFull)
+                }
+                Err(TrySendError::Disconnected(item)) => {
+                    rollback_cleanup(&mut pending, admission);
+                    drop(item);
+                    Err(StorageError::ChannelClosed)
+                }
+            }
+        } else {
+            let response_tx = ResponseSender::new(sender, ResponseToken::new(self, &effect));
+            let span = storage_effect_span(&effect);
+            let in_flight = InFlightGuard::acquire(&self.metrics);
+            let item = (effect, response_tx, span, Instant::now(), in_flight);
+            match self.channel_for(&item.0).try_send(item) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(item)) if cleanup_write => {
+                    let channel = self.async_channel_for(&item.0).clone();
+                    match channel.send(item).await {
+                        Ok(()) => Ok(()),
+                        Err(_) => Err(StorageError::ChannelClosed),
                     }
                 }
-            } else {
-                let response_tx = ResponseSender::new(sender, ResponseToken::new(self, &effect));
-                let span = storage_effect_span(&effect);
-                let in_flight = InFlightGuard::acquire(&self.metrics);
-                self.channel_for(&effect).try_send((
-                    effect,
-                    response_tx,
-                    span,
-                    Instant::now(),
-                    in_flight,
-                ))
-            };
+                Err(TrySendError::Full(_)) => Err(StorageError::QueueFull),
+                Err(TrySendError::Disconnected(_)) => Err(StorageError::ChannelClosed),
+            }
+        };
         match send_result {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                let event = StorageEvent::Error {
-                    error: StorageError::QueueFull,
-                };
-                return self.observe_storage_event(event);
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                let event = StorageEvent::Error {
-                    error: StorageError::ChannelClosed,
-                };
-                return self.observe_storage_event(event);
+            Err(error) => {
+                return self.observe_storage_event(StorageEvent::Error { error });
             }
         }
 
@@ -802,6 +816,13 @@ fn cleanup_effect(effect: &StorageEffect) -> Option<(Ulid, CleanupKind)> {
         StorageEffect::CommitTransaction { txn_id } => Some((*txn_id, CleanupKind::CommitQueued)),
         _ => None,
     }
+}
+
+fn is_cleanup_write(effect: &StorageEffect) -> bool {
+    matches!(
+        effect,
+        StorageEffect::Write { key_space, .. } if key_space == aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE
+    )
 }
 
 fn reserve_cleanup(
@@ -2762,6 +2783,7 @@ mod tests {
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
+    use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
     use std::{env, process::Command, thread};
@@ -2771,6 +2793,32 @@ mod tests {
     const RESTART_CHILD_PATH_ENV: &str = "ARUNA_STORAGE_RESTART_CHILD_PATH";
     const RESTART_CHILD_MODE_ENV: &str = "ARUNA_STORAGE_RESTART_CHILD_MODE";
     const RESTART_CHILD_TEST: &str = "storage::tests::buffered_persistence_restart_child_process";
+
+    fn small_handle(capacity: usize) -> (StorageHandle, super::StorageReceivers) {
+        let (sender, foreground) = crossfire::mpsc::bounded_blocking(capacity);
+        let (bulk_sender, bulk) = crossfire::mpsc::bounded_blocking(capacity);
+        let handle = StorageHandle {
+            write_async: sender.clone().into_async(),
+            bulk_async: bulk_sender.clone().into_async(),
+            write_channel: sender,
+            bulk_channel: bulk_sender,
+            priority: StoragePriority::Foreground,
+            metrics: std::sync::Arc::new(super::StorageMetrics::default()),
+            transaction_cleanup: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::BTreeMap::new(),
+            )),
+        };
+        (handle, super::StorageReceivers { foreground, bulk })
+    }
+
+    fn cleanup_write() -> StorageEffect {
+        StorageEffect::Write {
+            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
+            key: b"cleanup".to_vec().into(),
+            value: b"work".to_vec().into(),
+            txn_id: None,
+        }
+    }
 
     #[test]
     fn foreground_precedes_bulk() {
@@ -2916,6 +2964,89 @@ mod tests {
             "bulk lane still saturated"
         );
         drop(keep);
+    }
+
+    #[tokio::test]
+    async fn cleanup_waits_space() {
+        let (handle, receivers) = small_handle(1);
+        let filler = StorageEffect::Read {
+            key_space: "ordinary".to_string(),
+            key: b"filler".to_vec().into(),
+            txn_id: None,
+        };
+        let (filler_tx, _filler_rx) = super::response_channel(super::ResponseToken::empty());
+        let filler_span = super::storage_effect_span(&filler);
+        let filler_guard = super::InFlightGuard::acquire(&handle.metrics);
+        handle
+            .write_channel
+            .try_send((filler, filler_tx, filler_span, Instant::now(), filler_guard))
+            .expect("fill queue");
+
+        let receiver = receivers.foreground.into_async();
+        let waiter = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.send_storage_effect(cleanup_write()).await }
+        });
+        let (effect, ..) = receiver.recv().await.expect("filler effect");
+        assert!(!super::is_cleanup_write(&effect));
+        let (effect, response_tx, ..) = receiver.recv().await.expect("cleanup effect");
+        assert!(super::is_cleanup_write(&effect));
+        assert!(response_tx.send(StorageEvent::WriteResult {
+            key: b"cleanup".to_vec().into(),
+        }));
+
+        assert!(matches!(
+            waiter.await.expect("cleanup sender"),
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn ordinary_write_full() {
+        let (handle, receivers) = small_handle(1);
+        let filler = StorageEffect::Read {
+            key_space: "ordinary".to_string(),
+            key: b"filler".to_vec().into(),
+            txn_id: None,
+        };
+        let (filler_tx, _filler_rx) = super::response_channel(super::ResponseToken::empty());
+        let filler_span = super::storage_effect_span(&filler);
+        let filler_guard = super::InFlightGuard::acquire(&handle.metrics);
+        handle
+            .write_channel
+            .try_send((filler, filler_tx, filler_span, Instant::now(), filler_guard))
+            .expect("fill queue");
+
+        let event = handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: "ordinary".to_string(),
+                key: b"target".to_vec().into(),
+                value: b"value".to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::QueueFull
+            })
+        ));
+        drop(receivers);
+    }
+
+    #[tokio::test]
+    async fn closed_cleanup_stops() {
+        let (handle, receivers) = small_handle(1);
+        drop(receivers.foreground);
+
+        let event = handle.send_storage_effect(cleanup_write()).await;
+
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::ChannelClosed
+            })
+        ));
     }
 
     #[tokio::test]
@@ -3179,6 +3310,8 @@ mod tests {
         let StorageHandle {
             write_channel,
             bulk_channel,
+            write_async,
+            bulk_async,
             priority: _,
             metrics,
             transaction_cleanup: _,
@@ -3187,6 +3320,8 @@ mod tests {
         assert!(!metrics.channel_closed.load(Ordering::Relaxed));
         drop(write_channel);
         drop(bulk_channel);
+        drop(write_async);
+        drop(bulk_async);
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while !metrics.channel_closed.load(Ordering::Relaxed) && Instant::now() < deadline {
