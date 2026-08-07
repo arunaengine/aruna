@@ -50,6 +50,7 @@ use crate::metadata::api::{
     MetadataRoCrateExportView,
 };
 use crate::metadata::forward::export_rocrate_routed;
+use crate::permission_rules::{PermissionRules, PermissionRulesConfig, PermissionRulesOperation};
 use crate::replication::bao_read::{BaoReadError, BaoReadOperation, BaoReadOutput};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::request_policy::{
@@ -245,6 +246,32 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
     let mut probed = None;
     let mut candidate_failures = BTreeMap::<usize, BTreeMap<usize, OpenStatus>>::new();
     let mut policies = BTreeMap::<GroupId, std::sync::Arc<PolicyEvaluator>>::new();
+    let mut permission_rules = BTreeMap::<GroupId, PermissionRules>::new();
+    let mut alias_paths = BTreeSet::<(GroupId, String)>::new();
+    let mut alias_keys = BTreeSet::<([u8; 32], String, Ulid)>::new();
+    let mut alias_cache = BTreeMap::<[u8; 32], Vec<HashPathIndexKey>>::new();
+    let mut resolved_aliases = BTreeMap::<[u8; 32], (Vec<ExportCandidate>, bool)>::new();
+    let mut authorized_aliases = BTreeMap::<(GroupId, String), bool>::new();
+    for entity in &checkpoint.entities {
+        for candidate in &entity.candidates {
+            if candidate.report_source != ExportReportSource::Hash {
+                continue;
+            }
+            if let CandidateSource::Local {
+                group_id,
+                permission_path,
+                ..
+            } = &candidate.source
+            {
+                alias_paths.insert((*group_id, permission_path.clone()));
+                if let (Some(hash), Some(version)) =
+                    (candidate.expected_blake3, candidate.resolved_version)
+                {
+                    alias_keys.insert((hash, permission_path.clone(), version));
+                }
+            }
+        }
+    }
 
     loop {
         if ctx.cancel.is_cancelled() {
@@ -254,6 +281,14 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
         if ctx.shutdown.is_cancelled() {
             return JobRunOutcome::Interrupted;
         }
+        if alias_paths.len() > MAX_HASH_ALIASES || alias_keys.len() > MAX_HASH_ALIASES {
+            return finish_export(
+                ctx,
+                &mut checkpoint,
+                ExportFailure::Retryable("export alias limit exceeded".to_string()),
+            )
+            .await;
+        }
         if let Err(error) = load_candidate_policies(ctx, spec, &checkpoint, &mut policies).await {
             return finish_export(ctx, &mut checkpoint, error).await;
         }
@@ -261,7 +296,19 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
         let result = match checkpoint.phase {
             ExportPhase::Snapshot => snapshot_export(ctx, spec, &mut checkpoint).await,
             ExportPhase::Resolve => {
-                resolve_entries(ctx, spec, &mut checkpoint, &mut policies).await
+                resolve_entries(
+                    ctx,
+                    spec,
+                    &mut checkpoint,
+                    &mut policies,
+                    &mut permission_rules,
+                    &mut alias_paths,
+                    &mut alias_keys,
+                    &mut alias_cache,
+                    &mut resolved_aliases,
+                    &mut authorized_aliases,
+                )
+                .await
             }
             ExportPhase::Plan => {
                 match Box::pin(probe_sources_checked(
@@ -270,6 +317,12 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
                     &mut checkpoint,
                     &candidate_failures,
                     &mut policies,
+                    &mut permission_rules,
+                    &mut alias_paths,
+                    &mut alias_keys,
+                    &mut alias_cache,
+                    &mut resolved_aliases,
+                    &mut authorized_aliases,
                 ))
                 .await
                 {
@@ -289,6 +342,12 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
                         &mut checkpoint,
                         &candidate_failures,
                         &mut policies,
+                        &mut permission_rules,
+                        &mut alias_paths,
+                        &mut alias_keys,
+                        &mut alias_cache,
+                        &mut resolved_aliases,
+                        &mut authorized_aliases,
                     ))
                     .await
                     {
@@ -406,6 +465,12 @@ async fn resolve_entries(
     spec: &ExportRoCrateSpec,
     checkpoint: &mut ExportCheckpoint,
     policies: &mut BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
+    permission_rules: &mut BTreeMap<GroupId, PermissionRules>,
+    alias_paths: &mut BTreeSet<(GroupId, String)>,
+    alias_keys: &mut BTreeSet<([u8; 32], String, Ulid)>,
+    alias_cache: &mut BTreeMap<[u8; 32], Vec<HashPathIndexKey>>,
+    resolved_aliases: &mut BTreeMap<[u8; 32], (Vec<ExportCandidate>, bool)>,
+    authorized_aliases: &mut BTreeMap<(GroupId, String), bool>,
 ) -> Result<(), ExportFailure> {
     for index in 0..checkpoint.entities.len() {
         if ctx.cancel.is_cancelled() {
@@ -490,6 +555,12 @@ async fn resolve_entries(
                 &mut candidates,
                 &mut denied,
                 policies,
+                permission_rules,
+                alias_paths,
+                alias_keys,
+                alias_cache,
+                resolved_aliases,
+                authorized_aliases,
             )
             .await?;
             if unavailable && candidates.is_empty() {
@@ -532,40 +603,66 @@ async fn extend_hash_candidates(
     candidates: &mut Vec<ExportCandidate>,
     denied: &mut bool,
     policies: &mut BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
+    permission_rules: &mut BTreeMap<GroupId, PermissionRules>,
+    alias_paths: &mut BTreeSet<(GroupId, String)>,
+    alias_keys: &mut BTreeSet<([u8; 32], String, Ulid)>,
+    alias_cache: &mut BTreeMap<[u8; 32], Vec<HashPathIndexKey>>,
+    resolved_aliases: &mut BTreeMap<[u8; 32], (Vec<ExportCandidate>, bool)>,
+    authorized_aliases: &mut BTreeMap<(GroupId, String), bool>,
 ) -> Result<bool, ExportFailure> {
-    let aliases = drive(ResolveBlobPermissionPathsOperation::new(hash), &ctx.driver)
-        .await
-        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
-    if aliases.len() > MAX_HASH_ALIASES {
-        return Err(ExportFailure::Retryable(
-            "hash alias limit exceeded".to_string(),
-        ));
-    }
-    let mut seen_aliases = BTreeSet::<(String, Ulid)>::new();
-    for candidate in candidates.iter() {
-        if let CandidateSource::Local {
-            permission_path, ..
-        } = &candidate.source
-            && let Some(version) = candidate.resolved_version
-        {
-            seen_aliases.insert((permission_path.clone(), version));
+    let aliases = if let Some(aliases) = alias_cache.get(&hash) {
+        aliases.clone()
+    } else {
+        let aliases = drive(ResolveBlobPermissionPathsOperation::new(hash), &ctx.driver)
+            .await
+            .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+        if aliases.len() > MAX_HASH_ALIASES {
+            return Err(ExportFailure::Retryable(
+                "hash alias limit exceeded".to_string(),
+            ));
         }
-    }
-    for alias in aliases
-        .into_iter()
-        .filter(|alias| alias.realm_id == spec.auth_context.realm_id)
-    {
-        let alias_key = alias_identity(&alias);
-        if !seen_aliases.insert(alias_key) {
-            continue;
-        }
-        match resolve_alias(ctx, spec, &alias, policies).await? {
-            ResolveResult::Candidate(candidate) => {
-                candidates.push(candidate);
+        alias_cache.insert(hash, aliases.clone());
+        aliases
+    };
+    let distinct = collect_aliases(
+        &aliases,
+        spec.auth_context.realm_id,
+        alias_paths,
+        alias_keys,
+    )?;
+    if let Some((cached, cached_denied)) = resolved_aliases.get(&hash) {
+        merge_candidates(candidates, cached);
+        *denied |= *cached_denied;
+    } else {
+        let groups = distinct
+            .keys()
+            .map(|(group_id, _)| *group_id)
+            .collect::<BTreeSet<_>>();
+        load_rules(ctx, spec, permission_rules, groups.iter().copied()).await?;
+        load_policies(ctx, spec, policies, groups).await?;
+        let mut resolved = Vec::new();
+        let mut alias_denied = false;
+        for (key, _) in &distinct {
+            if !authorized_aliases.contains_key(key) {
+                let allowed = alias_allowed(spec, key.0, &key.1, permission_rules, policies)?;
+                authorized_aliases.insert(key.clone(), allowed);
             }
-            ResolveResult::Denied => *denied = true,
-            ResolveResult::Missing { .. } => {}
         }
+        for aliases in distinct.values() {
+            for alias in aliases {
+                match resolve_alias(ctx, alias, authorized_aliases).await? {
+                    ResolveResult::Candidate(candidate) => resolved.push(candidate),
+                    ResolveResult::Denied => alias_denied = true,
+                    ResolveResult::Missing { .. } => {}
+                }
+            }
+        }
+        resolved_aliases.insert(hash, (resolved, alias_denied));
+        let (cached, cached_denied) = resolved_aliases
+            .get(&hash)
+            .ok_or_else(|| ExportFailure::Retryable("alias cache unavailable".to_string()))?;
+        merge_candidates(candidates, cached);
+        *denied |= *cached_denied;
     }
 
     let holders = match drive(
@@ -577,35 +674,87 @@ async fn extend_hash_candidates(
         Ok(holders) => holders,
         Err(_) => return Ok(true),
     };
-    let mut seen_holders = BTreeSet::<(NodeId, [u8; 32])>::new();
-    for candidate in candidates.iter() {
-        if let CandidateSource::RemoteHash {
-            node_id,
-            hash: candidate_hash,
-        } = &candidate.source
-        {
-            seen_holders.insert((*node_id, *candidate_hash));
-        }
-    }
-    let remote_count = seen_holders.len();
+    let mut holder_candidates = Vec::new();
+    let remote_count = candidates
+        .iter()
+        .filter(|candidate| matches!(candidate.source, CandidateSource::RemoteHash { .. }))
+        .count();
     let holder_limit = REMOTE_ATTEMPTS.saturating_sub(remote_count);
     for node_id in holders.into_iter().take(holder_limit) {
-        if !seen_holders.insert((node_id, hash)) {
-            continue;
-        }
-        let candidate = ExportCandidate {
+        holder_candidates.push(ExportCandidate {
             source: CandidateSource::RemoteHash { node_id, hash },
             report_source: ExportReportSource::Hash,
             resolved_version,
             expected_blake3: Some(hash),
-        };
-        candidates.push(candidate);
+        });
     }
+    merge_candidates(candidates, &holder_candidates);
     Ok(false)
 }
 
-fn alias_identity(alias: &HashPathIndexKey) -> (String, Ulid) {
-    (alias.permission_path(), alias.version_id)
+fn collect_aliases(
+    aliases: &[HashPathIndexKey],
+    realm_id: RealmId,
+    seen: &mut BTreeSet<(GroupId, String)>,
+    alias_keys: &mut BTreeSet<([u8; 32], String, Ulid)>,
+) -> Result<BTreeMap<(GroupId, String), Vec<HashPathIndexKey>>, ExportFailure> {
+    if aliases.len() > MAX_HASH_ALIASES {
+        return Err(ExportFailure::Retryable(
+            "hash alias limit exceeded".to_string(),
+        ));
+    }
+    let mut distinct = BTreeMap::new();
+    for alias in aliases.iter().filter(|alias| alias.realm_id == realm_id) {
+        let key = (alias.group_id, alias.permission_path());
+        if !alias_keys.insert((alias.blake3_hash, key.1.clone(), alias.version_id)) {
+            continue;
+        }
+        distinct
+            .entry(key.clone())
+            .or_insert_with(Vec::new)
+            .push(alias.clone());
+        seen.insert(key);
+    }
+    if seen.len() > MAX_HASH_ALIASES || alias_keys.len() > MAX_HASH_ALIASES {
+        return Err(ExportFailure::Retryable(
+            "export alias limit exceeded".to_string(),
+        ));
+    }
+    Ok(distinct)
+}
+
+fn merge_candidates(target: &mut Vec<ExportCandidate>, additions: &[ExportCandidate]) {
+    let mut local = BTreeSet::<(String, Ulid)>::new();
+    let mut remote = BTreeSet::<(NodeId, [u8; 32])>::new();
+    for candidate in target.iter() {
+        match &candidate.source {
+            CandidateSource::Local {
+                permission_path, ..
+            } => {
+                if let Some(version) = candidate.resolved_version {
+                    local.insert((permission_path.clone(), version));
+                }
+            }
+            CandidateSource::RemoteHash { node_id, hash } => {
+                remote.insert((*node_id, *hash));
+            }
+            CandidateSource::RemoteExact { .. } => {}
+        }
+    }
+    for candidate in additions {
+        let insert = match &candidate.source {
+            CandidateSource::Local {
+                permission_path, ..
+            } => candidate
+                .resolved_version
+                .is_none_or(|version| local.insert((permission_path.clone(), version))),
+            CandidateSource::RemoteHash { node_id, hash } => remote.insert((*node_id, *hash)),
+            CandidateSource::RemoteExact { .. } => true,
+        };
+        if insert {
+            target.push(candidate.clone());
+        }
+    }
 }
 
 async fn resolve_exact(
@@ -674,13 +823,16 @@ async fn resolve_exact(
 
 async fn resolve_alias(
     ctx: &JobContext,
-    spec: &ExportRoCrateSpec,
     alias: &HashPathIndexKey,
-    policies: &mut BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
+    allowed: &BTreeMap<(GroupId, String), bool>,
 ) -> Result<ResolveResult, ExportFailure> {
     let permission_path = alias.permission_path();
-    let evaluator = load_policy(ctx, spec, policies, alias.group_id).await?;
-    if !check_read(&ctx.driver, spec, &permission_path, evaluator).await? {
+    let Some(is_allowed) = allowed.get(&(alias.group_id, permission_path.clone())) else {
+        return Err(ExportFailure::Retryable(
+            "alias authorization unavailable".to_string(),
+        ));
+    };
+    if !is_allowed {
         return Ok(ResolveResult::Denied);
     }
     let key = VersionKey::new(alias.bucket.clone(), alias.key.clone(), alias.version_id)
@@ -779,16 +931,93 @@ async fn load_policy(
     policies: &mut BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
     group_id: GroupId,
 ) -> Result<&PolicyEvaluator, ExportFailure> {
-    if !policies.contains_key(&group_id) {
-        let evaluator =
-            PolicyEvaluator::load(&ctx.driver, spec.auth_context.realm_id, Some(group_id))
-                .await
-                .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
-        policies.insert(group_id, std::sync::Arc::new(evaluator));
-    }
+    load_policies(ctx, spec, policies, [group_id]).await?;
     policies
         .get(&group_id)
         .ok_or_else(|| ExportFailure::Retryable("object policy unavailable".to_string()))
+}
+
+async fn load_policies(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    policies: &mut BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
+    group_ids: impl IntoIterator<Item = GroupId>,
+) -> Result<(), ExportFailure> {
+    let pending = group_ids
+        .into_iter()
+        .filter(|group_id| !policies.contains_key(group_id))
+        .collect::<BTreeSet<_>>();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let realm_id = spec.auth_context.realm_id;
+    let mut loaded = PolicyEvaluator::load_bulk(
+        &ctx.driver,
+        pending.iter().map(|group_id| (realm_id, *group_id)),
+    )
+    .await
+    .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    for group_id in pending {
+        let evaluator = loaded
+            .remove(&(realm_id, group_id))
+            .ok_or_else(|| ExportFailure::Retryable("object policy unavailable".to_string()))?;
+        policies.insert(group_id, std::sync::Arc::new(evaluator));
+    }
+    Ok(())
+}
+
+async fn load_rules(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    rules: &mut BTreeMap<GroupId, PermissionRules>,
+    group_ids: impl IntoIterator<Item = GroupId>,
+) -> Result<(), ExportFailure> {
+    let pending = group_ids
+        .into_iter()
+        .filter(|group_id| !rules.contains_key(group_id))
+        .collect::<BTreeSet<_>>();
+    for group_id in pending {
+        let config = PermissionRulesConfig {
+            auth_context: spec.auth_context.clone(),
+            path: format!("/{}/g/{group_id}", spec.auth_context.realm_id),
+        };
+        let loaded = drive(PermissionRulesOperation::new(config), &ctx.driver)
+            .await
+            .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+        rules.insert(group_id, loaded);
+    }
+    Ok(())
+}
+
+fn alias_allowed(
+    spec: &ExportRoCrateSpec,
+    group_id: GroupId,
+    path: &str,
+    rules: &BTreeMap<GroupId, PermissionRules>,
+    policies: &BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
+) -> Result<bool, ExportFailure> {
+    let rules = rules
+        .get(&group_id)
+        .ok_or_else(|| ExportFailure::Retryable("authorization rules unavailable".to_string()))?;
+    if !rules.allows(path, &Permission::READ) {
+        return Ok(false);
+    }
+    let evaluator = policies
+        .get(&group_id)
+        .ok_or_else(|| ExportFailure::Retryable("object policy unavailable".to_string()))?;
+    let request = policy_request_with(
+        path,
+        &Permission::READ,
+        Some(&spec.auth_context.user_id),
+        PolicyRequestExtras::operation("s3.GetObject"),
+    );
+    match evaluator.evaluate(&request) {
+        Ok(()) => Ok(true),
+        Err(PolicyEnforcementError::Denied { .. }) => Ok(false),
+        Err(PolicyEnforcementError::Unavailable(error)) => {
+            Err(ExportFailure::Retryable(error.to_string()))
+        }
+    }
 }
 
 async fn load_candidate_policies(
@@ -805,10 +1034,7 @@ async fn load_candidate_policies(
             Some(*group_id)
         })
     });
-    for group_id in groups {
-        load_policy(ctx, spec, policies, group_id).await?;
-    }
-    Ok(())
+    load_policies(ctx, spec, policies, groups).await
 }
 
 async fn storage_value(
@@ -868,8 +1094,27 @@ async fn probe_sources(
     candidate_failures: &BTreeMap<usize, BTreeMap<usize, OpenStatus>>,
 ) -> Result<Vec<ProbedEntry>, ExportFailure> {
     let mut policies = BTreeMap::new();
+    let mut permission_rules = BTreeMap::new();
+    let mut alias_paths = BTreeSet::new();
+    let mut alias_keys = BTreeSet::new();
+    let mut alias_cache = BTreeMap::new();
+    let mut resolved_aliases = BTreeMap::new();
+    let mut authorized_aliases = BTreeMap::new();
     load_candidate_policies(ctx, spec, checkpoint, &mut policies).await?;
-    probe_sources_checked(ctx, spec, checkpoint, candidate_failures, &mut policies).await
+    probe_sources_checked(
+        ctx,
+        spec,
+        checkpoint,
+        candidate_failures,
+        &mut policies,
+        &mut permission_rules,
+        &mut alias_paths,
+        &mut alias_keys,
+        &mut alias_cache,
+        &mut resolved_aliases,
+        &mut authorized_aliases,
+    )
+    .await
 }
 
 async fn probe_sources_checked(
@@ -878,6 +1123,12 @@ async fn probe_sources_checked(
     checkpoint: &mut ExportCheckpoint,
     candidate_failures: &BTreeMap<usize, BTreeMap<usize, OpenStatus>>,
     policies: &mut BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
+    permission_rules: &mut BTreeMap<GroupId, PermissionRules>,
+    alias_paths: &mut BTreeSet<(GroupId, String)>,
+    alias_keys: &mut BTreeSet<([u8; 32], String, Ulid)>,
+    alias_cache: &mut BTreeMap<[u8; 32], Vec<HashPathIndexKey>>,
+    resolved_aliases: &mut BTreeMap<[u8; 32], (Vec<ExportCandidate>, bool)>,
+    authorized_aliases: &mut BTreeMap<(GroupId, String), bool>,
 ) -> Result<Vec<ProbedEntry>, ExportFailure> {
     let mut probed = Vec::new();
     for index in 0..checkpoint.entities.len() {
@@ -934,6 +1185,12 @@ async fn probe_sources_checked(
                             &mut checkpoint.entities[index].candidates,
                             &mut denied,
                             policies,
+                            permission_rules,
+                            alias_paths,
+                            alias_keys,
+                            alias_cache,
+                            resolved_aliases,
+                            authorized_aliases,
                         )
                         .await?;
                     }
@@ -3156,7 +3413,7 @@ mod tests {
     }
 
     #[test]
-    fn deduplicates_alias_identity() {
+    fn deduplicates_aliases() {
         let realm_id = RealmId::from_bytes([11; 32]);
         let alias = HashPathIndexKey::new(
             [12; 32],
@@ -3167,11 +3424,42 @@ mod tests {
             "bucket",
             "key",
         );
-        let mut identities = BTreeSet::new();
-        for _ in 0..=MAX_HASH_ALIASES {
-            identities.insert(alias_identity(&alias));
-        }
-        assert_eq!(identities.len(), 1);
+        let aliases = vec![alias; MAX_HASH_ALIASES];
+        let mut paths = BTreeSet::new();
+        let mut keys = BTreeSet::new();
+        let distinct = collect_aliases(&aliases, realm_id, &mut paths, &mut keys).unwrap();
+        assert_eq!(distinct.len(), 1);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(keys.len(), 1);
+        let repeated = collect_aliases(&aliases, realm_id, &mut paths, &mut keys).unwrap();
+        assert!(repeated.is_empty());
+    }
+
+    #[test]
+    fn rejects_alias_budget() {
+        let realm_id = RealmId::from_bytes([11; 32]);
+        let alias = HashPathIndexKey::new(
+            [12; 32],
+            Ulid::from_bytes([13; 16]),
+            realm_id,
+            Ulid::from_bytes([14; 16]),
+            iroh::SecretKey::from_bytes(&[15; 32]).public(),
+            "bucket",
+            "key",
+        );
+        let aliases = (0..=MAX_HASH_ALIASES)
+            .map(|index| {
+                let mut alias = alias.clone();
+                alias.key = format!("key-{index}");
+                alias
+            })
+            .collect::<Vec<_>>();
+        let mut paths = BTreeSet::new();
+        let mut keys = BTreeSet::new();
+        assert!(matches!(
+            collect_aliases(&aliases, realm_id, &mut paths, &mut keys),
+            Err(ExportFailure::Retryable(message)) if message == "export alias limit exceeded"
+        ));
     }
 
     async fn sample_archive() -> Vec<u8> {
