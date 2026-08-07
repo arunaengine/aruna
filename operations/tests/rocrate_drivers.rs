@@ -1691,10 +1691,13 @@ async fn hidden_count(
     match handle
         .send_blob_effect(BlobEffect::ListHidden {
             namespace: Some(namespace),
+            cursor: None,
         })
         .await
     {
-        Event::Blob(aruna_core::events::BlobEvent::HiddenListed { entries }) => Ok(entries.len()),
+        Event::Blob(aruna_core::events::BlobEvent::HiddenListed { entries, .. }) => {
+            Ok(entries.len())
+        }
         Event::Blob(aruna_core::events::BlobEvent::Error(error)) => Err(error.to_string().into()),
         other => Err(format!("unexpected hidden list event: {other:?}").into()),
     }

@@ -2083,9 +2083,10 @@ mod tests {
         assert!(matches!(
             blob.send_blob_effect(BlobEffect::ListHidden {
                 namespace: Some(upload_id),
+                cursor: None,
             })
             .await,
-            Event::Blob(BlobEvent::HiddenListed { entries }) if entries.is_empty()
+            Event::Blob(BlobEvent::HiddenListed { entries, .. }) if entries.is_empty()
         ));
     }
 }
