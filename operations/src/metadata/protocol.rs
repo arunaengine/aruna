@@ -199,6 +199,7 @@ pub enum MetadataTransportMessage {
         token: String,
     },
     ForwardedTokenRevoked,
+    ForwardedTokenRevocationCapacity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -376,6 +377,21 @@ mod tests {
             postcard::from_bytes::<MetadataTransportMessage>(&bytes).unwrap(),
             message
         );
+    }
+
+    #[test]
+    fn token_revoke_roundtrip() {
+        for response in [
+            MetadataTransportMessage::ForwardedTokenRevoked,
+            MetadataTransportMessage::ForwardedTokenRevocationCapacity,
+        ] {
+            let bytes = postcard::to_allocvec(&response).unwrap();
+
+            assert_eq!(
+                postcard::from_bytes::<MetadataTransportMessage>(&bytes).unwrap(),
+                response
+            );
+        }
     }
 
     #[test]

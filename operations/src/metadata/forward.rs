@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -32,7 +34,9 @@ use crate::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
     MetadataApiError, export_metadata_rocrate, get_visible_metadata_document,
 };
-use crate::metadata::handle::{MetadataRequestDelivery, MetadataWritePeerError};
+use crate::metadata::handle::{
+    MetadataRequestDelivery, MetadataRequestError, MetadataWritePeerError,
+};
 use crate::metadata::protocol::{
     MetadataAuthToken, MetadataReadError, MetadataTransportMessage, MetadataWriteAuthError,
 };
@@ -40,7 +44,9 @@ use crate::placement::{holds_placement, resolve_shard_holders};
 use crate::process_placements::load_realm_config;
 use crate::request_authorization::{AuthorizeError, authorize};
 use crate::request_policy::PolicyRequestExtras;
-use crate::revoke_token::{RevokeTokenConfig, RevokeTokenOperation};
+use crate::revoke_token::{
+    RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
+};
 use crate::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
     UpdateMetadataDocumentOperation, update_metadata_document,
@@ -162,11 +168,24 @@ pub async fn forward_token_revoke(
     ])) % peers.len();
     peers.rotate_left(start);
     let message = MetadataTransportMessage::ForwardTokenRevocation { auth_token, token };
-    for peer in peers {
-        match metadata
-            .request_forwarded_write(peer, message.clone())
-            .await
-        {
+    run_revoke(&peers, message, |peer, message| {
+        metadata.request_forwarded_write(peer, message)
+    })
+    .await
+}
+
+async fn run_revoke<F, Fut>(
+    peers: &[NodeId],
+    message: MetadataTransportMessage,
+    mut request: F,
+) -> Result<(), MetadataApiError>
+where
+    F: FnMut(NodeId, MetadataTransportMessage) -> Fut,
+    Fut: Future<Output = Result<MetadataTransportMessage, MetadataRequestError>>,
+{
+    let mut seen = HashSet::new();
+    for peer in peers.iter().copied().filter(|peer| seen.insert(*peer)) {
+        match request(peer, message.clone()).await {
             Ok(MetadataTransportMessage::ForwardedTokenRevoked) => return Ok(()),
             Ok(MetadataTransportMessage::ForwardedWriteDenied {
                 error: MetadataWriteAuthError::Unauthorized,
@@ -174,7 +193,8 @@ pub async fn forward_token_revoke(
             Ok(MetadataTransportMessage::ForwardedWriteDenied {
                 error: MetadataWriteAuthError::Forbidden,
             }) => return Err(MetadataApiError::Forbidden),
-            Ok(MetadataTransportMessage::ForwardedWriteUnavailable) => continue,
+            Ok(MetadataTransportMessage::ForwardedWriteUnavailable)
+            | Ok(MetadataTransportMessage::ForwardedTokenRevocationCapacity) => continue,
             Ok(MetadataTransportMessage::Reject(error)) => {
                 warn!(%peer, %error, "Peer rejected a forwarded token revocation");
                 return Err(MetadataApiError::ServiceUnavailable);
@@ -1031,6 +1051,11 @@ pub(crate) async fn apply_token_revoke(
             token_hash: bearer_token_hash(&token),
             expires_at,
             token_owner: subject.user_id,
+            admission: if auth.user_id == subject.user_id {
+                RevokeTokenAdmission::SelfService
+            } else {
+                RevokeTokenAdmission::Privileged
+            },
             now: unix_timestamp_secs(),
         }),
         context.as_ref(),
@@ -1038,6 +1063,9 @@ pub(crate) async fn apply_token_revoke(
     .await
     {
         Ok(_) => MetadataTransportMessage::ForwardedTokenRevoked,
+        Err(RevokeTokenError::CapacityReached) => {
+            MetadataTransportMessage::ForwardedTokenRevocationCapacity
+        }
         Err(error) => reject(format!("token revocation failed: {error}")),
     }
 }
@@ -1409,7 +1437,8 @@ fn forwarded_unavailable(message: &MetadataTransportMessage) -> MetadataTranspor
         }
         MetadataTransportMessage::ForwardCreateDocument { .. }
         | MetadataTransportMessage::ForwardUpdateDocument { .. }
-        | MetadataTransportMessage::ForwardDeleteDocument { .. } => {
+        | MetadataTransportMessage::ForwardDeleteDocument { .. }
+        | MetadataTransportMessage::ForwardTokenRevocation { .. } => {
             MetadataTransportMessage::ForwardedWriteUnavailable
         }
         _ => reject("unexpected forwarded metadata message"),
@@ -1671,5 +1700,79 @@ mod tests {
         let mut changed = record.clone();
         changed.document_path = "docs/two".to_string();
         assert!(!update_record_matches(&record, &changed));
+    }
+
+    fn revoke_message() -> MetadataTransportMessage {
+        MetadataTransportMessage::ForwardTokenRevocation {
+            auth_token: MetadataAuthToken::bearer("caller-token").unwrap(),
+            token: "target-token".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn capacity_then_success() {
+        let peers = vec![node(1), node(2)];
+        let mut calls = Vec::new();
+        let result = run_revoke(&peers, revoke_message(), |peer, _| {
+            calls.push(peer);
+            std::future::ready(Ok(if peer == peers[0] {
+                MetadataTransportMessage::ForwardedTokenRevocationCapacity
+            } else {
+                MetadataTransportMessage::ForwardedTokenRevoked
+            }))
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls, peers);
+    }
+
+    #[tokio::test]
+    async fn all_capacity_unavailable() {
+        let peers = vec![node(1), node(2)];
+        let mut calls = Vec::new();
+        let result = run_revoke(&peers, revoke_message(), |peer, _| {
+            calls.push(peer);
+            std::future::ready(Ok(
+                MetadataTransportMessage::ForwardedTokenRevocationCapacity,
+            ))
+        })
+        .await;
+
+        assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
+        assert_eq!(calls, peers);
+    }
+
+    #[tokio::test]
+    async fn reject_stops_retry() {
+        let peers = vec![node(1), node(2)];
+        let mut calls = Vec::new();
+        let result = run_revoke(&peers, revoke_message(), |peer, _| {
+            calls.push(peer);
+            std::future::ready(Ok(MetadataTransportMessage::Reject(
+                "invalid token".to_string(),
+            )))
+        })
+        .await;
+
+        assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
+        assert_eq!(calls, vec![peers[0]]);
+    }
+
+    #[tokio::test]
+    async fn no_retry_loop() {
+        let peer = node(1);
+        let peers = vec![peer, peer];
+        let mut calls = Vec::new();
+        let result = run_revoke(&peers, revoke_message(), |peer, _| {
+            calls.push(peer);
+            std::future::ready(Ok(
+                MetadataTransportMessage::ForwardedTokenRevocationCapacity,
+            ))
+        })
+        .await;
+
+        assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
+        assert_eq!(calls, vec![peer]);
     }
 }
