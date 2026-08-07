@@ -3831,7 +3831,7 @@ async fn persist_stale_admin_document_event(
     match apply_status {
         AdminDocumentApplyStatus::Applied => Ok(false),
         AdminDocumentApplyStatus::Duplicate => Ok(true),
-        AdminDocumentApplyStatus::StaleOriginSequence => {
+        AdminDocumentApplyStatus::Redundant | AdminDocumentApplyStatus::StaleOriginSequence => {
             storage_batch_write_to(
                 storage,
                 vec![
@@ -4335,6 +4335,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
     let mut reducer_state = previous_state
         .clone()
         .unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
+    reducer_state.compact_revocations(unix_timestamp_secs());
     let apply_status = reducer_state
         .apply(&event)
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -8250,6 +8251,92 @@ mod tests {
         );
         let config = read_realm_config_doc(&storage, realm_id).await;
         assert_eq!(config.revoked_tokens.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn redundant_persists_clock() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([64; 32]);
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let actor_a = test_actor(
+            18,
+            UserId::local(Ulid::from_parts(1_690, 1), realm_id),
+            realm_id,
+        );
+        let actor_b = test_actor(
+            19,
+            UserId::local(Ulid::from_parts(1_691, 1), realm_id),
+            realm_id,
+        );
+        let token_hash = aruna_core::auth::bearer_token_hash("redundant-token");
+        let expires_at = unix_timestamp_secs() + 600;
+        let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                document_target.clone(),
+                seed_config
+                    .to_bytes(&actor_a)
+                    .expect("seed config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("seed config writes");
+        let first = test_admin_event(
+            Ulid::from_parts(1_692, 1),
+            target.clone(),
+            &actor_a,
+            1,
+            AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: token_hash.clone(),
+                expires_at,
+                token_owner: actor_a.user_id,
+            },
+        );
+        apply_admin_document_operation_to_storage(&storage, document_target.clone(), first)
+            .await
+            .expect("first revocation applies");
+        let config_key = document_target.storage_key();
+        let before = read_storage_value(
+            &storage,
+            document_target.storage_keyspace(),
+            config_key.clone(),
+        )
+        .await
+        .expect("config exists after first revocation");
+
+        let second = test_admin_event(
+            Ulid::from_parts(1_693, 1),
+            target.clone(),
+            &actor_b,
+            1,
+            AdminDocumentOperation::RealmConfigTokenRevoked {
+                token_hash: token_hash.clone(),
+                expires_at,
+                token_owner: actor_b.user_id,
+            },
+        );
+        apply_admin_document_operation_to_storage(&storage, document_target.clone(), second)
+            .await
+            .expect("redundant revocation applies");
+
+        let after = read_storage_value(&storage, document_target.storage_keyspace(), config_key)
+            .await
+            .expect("config remains after redundant revocation");
+        assert_eq!(before, after);
+        let state = read_admin_reducer_state(&storage, &target)
+            .await
+            .expect("reducer state reads")
+            .expect("reducer state exists");
+        assert_eq!(state.clock.sequence_for(&actor_a.node_id), 1);
+        assert_eq!(state.clock.sequence_for(&actor_b.node_id), 1);
+        assert_eq!(state.applied_event_ids.len(), 1);
+        assert_eq!(
+            state.materialized_revoked_tokens(),
+            BTreeMap::from([(token_hash, expires_at)])
+        );
     }
 
     #[tokio::test]
