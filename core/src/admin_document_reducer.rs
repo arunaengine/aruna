@@ -11,7 +11,7 @@ use crate::admin_documents::{
     AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
     AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
-use crate::auth::valid_token_hash;
+use crate::auth::{revocation_live, revocation_retained, valid_token_hash};
 use crate::structs::{
     Actor, BandPool, BindingScope, DocumentClass, HandleRange, MAX_PLACEMENT_SHARD_COUNT,
     MetadataRegistryRecord, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig,
@@ -88,6 +88,7 @@ pub struct AdminDocumentReducerState {
     pub user_subject_ids: BTreeMap<String, AdminDocumentAttributeVersion>,
     #[serde(default)]
     pub equivalent_value_dots: BTreeMap<String, BTreeSet<AdminDocumentDot>>,
+    pub revocation_floor: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,10 +106,21 @@ struct RevocationCandidate {
     dot: AdminDocumentDot,
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct RevocationGroup {
     paths: BTreeSet<String>,
     candidates: Vec<RevocationCandidate>,
+    event_ids: BTreeSet<Ulid>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevocationIndex {
+    now: u64,
+    groups: BTreeMap<String, RevocationGroup>,
+    retained: BTreeMap<String, RevocationCandidate>,
+    live: BTreeMap<String, RevocationCandidate>,
+    origin_counts: BTreeMap<NodeId, usize>,
+    owner_counts: BTreeMap<(NodeId, UserId), usize>,
 }
 
 fn candidate_cmp(left: &RevocationCandidate, right: &RevocationCandidate) -> Ordering {
@@ -116,6 +128,215 @@ fn candidate_cmp(left: &RevocationCandidate, right: &RevocationCandidate) -> Ord
         .cmp(&right.expires_at)
         .then_with(|| right.dot.cmp(&left.dot))
         .then_with(|| right.token_owner.cmp(&left.token_owner))
+}
+
+fn value_matches(version: &AdminDocumentAttributeVersion, expires_at: u64) -> bool {
+    version
+        .value
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        == Some(expires_at)
+}
+
+impl RevocationIndex {
+    fn build(state: &AdminDocumentReducerState, now: u64) -> Self {
+        if !matches!(&state.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return Self {
+                now,
+                groups: BTreeMap::new(),
+                retained: BTreeMap::new(),
+                live: BTreeMap::new(),
+                origin_counts: BTreeMap::new(),
+                owner_counts: BTreeMap::new(),
+            };
+        }
+
+        let mut indexed = BTreeMap::new();
+        for path in state.user_subject_ids.keys() {
+            indexed.entry(path.clone()).or_insert_with(|| {
+                revoked_token_entry(path).map(|(hash, expires_at, token_owner)| RevocationPath {
+                    hash: hash.to_string(),
+                    expires_at,
+                    token_owner,
+                })
+            });
+        }
+        for path in state.equivalent_value_dots.keys() {
+            indexed.entry(path.clone()).or_insert_with(|| {
+                revoked_token_entry(path).map(|(hash, expires_at, token_owner)| RevocationPath {
+                    hash: hash.to_string(),
+                    expires_at,
+                    token_owner,
+                })
+            });
+        }
+        for path in state.conflicts.keys() {
+            indexed.entry(path.clone()).or_insert_with(|| {
+                revoked_token_entry(path).map(|(hash, expires_at, token_owner)| RevocationPath {
+                    hash: hash.to_string(),
+                    expires_at,
+                    token_owner,
+                })
+            });
+        }
+
+        let mut groups = BTreeMap::new();
+        for (path, entry) in indexed {
+            let Some(entry) = entry else {
+                continue;
+            };
+            let group = groups
+                .entry(entry.hash.clone())
+                .or_insert_with(RevocationGroup::default);
+            group.paths.insert(path.clone());
+
+            if let Some(version) = state.user_subject_ids.get(&path) {
+                group.event_ids.insert(version.dot.event_id);
+                if value_matches(version, entry.expires_at) {
+                    group.candidates.push(RevocationCandidate {
+                        path: path.clone(),
+                        expires_at: entry.expires_at,
+                        token_owner: entry.token_owner,
+                        dot: version.dot,
+                    });
+                }
+            }
+            if let Some(dots) = state.equivalent_value_dots.get(&path) {
+                group.event_ids.extend(dots.iter().map(|dot| dot.event_id));
+                group
+                    .candidates
+                    .extend(dots.iter().copied().map(|dot| RevocationCandidate {
+                        path: path.clone(),
+                        expires_at: entry.expires_at,
+                        token_owner: entry.token_owner,
+                        dot,
+                    }));
+            }
+            if let Some(conflict) = state.conflicts.get(&path) {
+                group
+                    .event_ids
+                    .extend(conflict.values.iter().map(|value| value.dot.event_id));
+                group.candidates.extend(
+                    conflict
+                        .values
+                        .iter()
+                        .filter(|value| {
+                            value.value.as_deref() == Some(entry.expires_at.to_string().as_str())
+                        })
+                        .map(|value| RevocationCandidate {
+                            path: path.clone(),
+                            expires_at: entry.expires_at,
+                            token_owner: entry.token_owner,
+                            dot: value.dot,
+                        }),
+                );
+            }
+        }
+
+        let mut retained = BTreeMap::new();
+        let mut live = BTreeMap::new();
+        let mut origin_counts = BTreeMap::new();
+        let mut owner_counts = BTreeMap::new();
+        for (hash, group) in &groups {
+            let Some(winner) = group
+                .candidates
+                .iter()
+                .max_by(|left, right| candidate_cmp(left, right))
+                .cloned()
+            else {
+                continue;
+            };
+            if revocation_retained(winner.expires_at, now) {
+                *origin_counts.entry(winner.dot.origin_node_id).or_insert(0) += 1;
+                *owner_counts
+                    .entry((winner.dot.origin_node_id, winner.token_owner))
+                    .or_insert(0) += 1;
+                retained.insert(hash.clone(), winner.clone());
+            }
+            if revocation_live(winner.expires_at, now) {
+                live.insert(hash.clone(), winner);
+            }
+        }
+
+        Self {
+            now,
+            groups,
+            retained,
+            live,
+            origin_counts,
+            owner_counts,
+        }
+    }
+
+    pub fn origin(&self, token_hash: &str) -> Option<NodeId> {
+        self.retained
+            .get(token_hash)
+            .map(|candidate| candidate.dot.origin_node_id)
+    }
+
+    pub fn owner(&self, token_hash: &str) -> Option<UserId> {
+        self.retained
+            .get(token_hash)
+            .map(|candidate| candidate.token_owner)
+    }
+
+    pub fn count(&self, origin_node_id: &NodeId) -> usize {
+        self.origin_counts
+            .get(origin_node_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn owner_count(&self, origin_node_id: &NodeId, token_owner: &UserId) -> usize {
+        self.owner_counts
+            .get(&(*origin_node_id, *token_owner))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn materialized(&self) -> BTreeMap<String, u64> {
+        self.live
+            .iter()
+            .map(|(hash, candidate)| (hash.clone(), candidate.expires_at))
+            .collect()
+    }
+
+    fn compact(self, state: &mut AdminDocumentReducerState) {
+        let Self {
+            now,
+            groups,
+            retained,
+            ..
+        } = self;
+        state.revocation_floor = state.revocation_floor.max(now);
+        for (hash, group) in groups {
+            let Some(winner) = retained.get(&hash) else {
+                state.remove_revocation_group(&group);
+                continue;
+            };
+            let unchanged = group.paths.len() == 1
+                && group.paths.contains(&winner.path)
+                && state
+                    .user_subject_ids
+                    .get(&winner.path)
+                    .is_some_and(|version| {
+                        value_matches(version, winner.expires_at) && version.dot == winner.dot
+                    })
+                && !state.equivalent_value_dots.contains_key(&winner.path)
+                && !state.conflicts.contains_key(&winner.path);
+            if !unchanged {
+                state.remove_revocation_group(&group);
+                state.user_subject_ids.insert(
+                    winner.path.clone(),
+                    AdminDocumentAttributeVersion {
+                        value: Some(winner.expires_at.to_string()),
+                        dot: winner.dot,
+                    },
+                );
+            }
+            state.applied_event_ids.insert(winner.dot.event_id);
+        }
+    }
 }
 
 pub fn decode_admin_document_reducer_state(
@@ -382,6 +603,7 @@ impl AdminDocumentReducerState {
             user_name: None,
             user_subject_ids: BTreeMap::new(),
             equivalent_value_dots: BTreeMap::new(),
+            revocation_floor: 0,
         }
     }
 
@@ -1138,93 +1360,28 @@ impl AdminDocumentReducerState {
             .collect()
     }
 
-    /// Realm-wide bearer token revocations as hash to expiry. Both come from
-    /// the path, so a divergent entry can never erase a revocation; the longest
-    /// expiry of a hash wins.
-    pub fn materialized_revoked_tokens(&self) -> BTreeMap<String, u64> {
-        let mut revoked = BTreeMap::new();
-        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
-            return revoked;
-        }
+    pub fn revocation_index(&self, now: u64) -> RevocationIndex {
+        RevocationIndex::build(self, self.revocation_floor.max(now))
+    }
 
-        for (path, version) in &self.user_subject_ids {
-            let Some((hash, expires_at, _)) = revoked_token_entry(path) else {
-                continue;
-            };
-            if version.value.as_deref() != Some(expires_at.to_string().as_str()) {
-                continue;
-            }
-            revoked
-                .entry(hash.to_string())
-                .and_modify(|current| *current = expires_at.max(*current))
-                .or_insert(expires_at);
-        }
-        revoked
+    pub fn materialized_revoked_tokens(&self) -> BTreeMap<String, u64> {
+        self.revocation_index(self.revocation_floor).materialized()
     }
 
     /// Drops expired revocations and canonicalizes each live token to one dot.
-    /// The clock is the compacting node's own; a replicated event must never
-    /// carry one.
+    /// The floor prevents a later clock rollback from deleting more state.
     pub fn compact_revocations(&mut self, now: u64) {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return;
         }
 
-        for (_hash, group) in self.revocation_groups(Some(now)) {
-            let winner = group
-                .candidates
-                .iter()
-                .max_by(|left, right| candidate_cmp(left, right));
-            let Some(winner) = winner else {
-                for path in &group.paths {
-                    self.remove_revocation_path(path);
-                }
-                continue;
-            };
-
-            let unchanged = group.paths.len() == 1
-                && group.paths.contains(&winner.path)
-                && self
-                    .user_subject_ids
-                    .get(&winner.path)
-                    .is_some_and(|version| {
-                        version.value.as_deref() == Some(winner.expires_at.to_string().as_str())
-                            && version.dot == winner.dot
-                    })
-                && !self.equivalent_value_dots.contains_key(&winner.path)
-                && !self.conflicts.contains_key(&winner.path);
-
-            if !unchanged {
-                for path in &group.paths {
-                    self.remove_revocation_path(path);
-                }
-                self.user_subject_ids.insert(
-                    winner.path.clone(),
-                    AdminDocumentAttributeVersion {
-                        value: Some(winner.expires_at.to_string()),
-                        dot: winner.dot,
-                    },
-                );
-            }
-            self.applied_event_ids.insert(winner.dot.event_id);
-        }
+        self.revocation_floor = self.revocation_floor.max(now);
+        let index = self.revocation_index(self.revocation_floor);
+        index.compact(self);
     }
 
     pub fn live_revocation_count(&self, origin_node_id: &NodeId, now: u64) -> usize {
-        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
-            return 0;
-        }
-
-        self.revocation_groups(Some(now))
-            .values()
-            .filter_map(|group| {
-                group
-                    .candidates
-                    .iter()
-                    .max_by(|left, right| candidate_cmp(left, right))
-            })
-            .filter(|candidate| candidate.dot.origin_node_id == *origin_node_id)
-            .count()
+        self.revocation_index(now).count(origin_node_id)
     }
 
     pub fn live_owner_count(
@@ -1233,39 +1390,18 @@ impl AdminDocumentReducerState {
         token_owner: &UserId,
         now: u64,
     ) -> usize {
-        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
-            return 0;
-        }
-
-        self.revocation_groups(Some(now))
-            .values()
-            .filter_map(|group| {
-                group
-                    .candidates
-                    .iter()
-                    .max_by(|left, right| candidate_cmp(left, right))
-            })
-            .filter(|candidate| {
-                candidate.dot.origin_node_id == *origin_node_id
-                    && candidate.token_owner == *token_owner
-            })
-            .count()
+        self.revocation_index(now)
+            .owner_count(origin_node_id, token_owner)
     }
 
     pub fn revocation_origin(&self, token_hash: &str) -> Option<NodeId> {
-        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
-            return None;
-        }
+        self.revocation_index(self.revocation_floor)
+            .origin(token_hash)
+    }
 
-        self.revocation_groups(None)
-            .get(token_hash)
-            .and_then(|group| {
-                group
-                    .candidates
-                    .iter()
-                    .max_by(|left, right| candidate_cmp(left, right))
-            })
-            .map(|candidate| candidate.dot.origin_node_id)
+    pub fn revocation_owner(&self, token_hash: &str) -> Option<UserId> {
+        self.revocation_index(self.revocation_floor)
+            .owner(token_hash)
     }
 
     fn apply_revocation(
@@ -1290,7 +1426,8 @@ impl AdminDocumentReducerState {
         candidate: Option<(u64, UserId, AdminDocumentDot)>,
     ) -> Option<AdminDocumentDot> {
         let mut group = self
-            .revocation_groups(None)
+            .revocation_index(self.revocation_floor)
+            .groups
             .remove(token_hash)
             .unwrap_or_default();
         if let Some((expires_at, token_owner, dot)) = candidate {
@@ -1309,9 +1446,7 @@ impl AdminDocumentReducerState {
             .max_by(|left, right| candidate_cmp(left, right))
             .cloned();
         let Some(winner) = winner else {
-            for path in &group.paths {
-                self.remove_revocation_path(path);
-            }
+            self.remove_revocation_group(&group);
             return None;
         };
 
@@ -1321,16 +1456,13 @@ impl AdminDocumentReducerState {
                 .user_subject_ids
                 .get(&winner.path)
                 .is_some_and(|version| {
-                    version.value.as_deref() == Some(winner.expires_at.to_string().as_str())
-                        && version.dot == winner.dot
+                    value_matches(version, winner.expires_at) && version.dot == winner.dot
                 })
             && !self.equivalent_value_dots.contains_key(&winner.path)
             && !self.conflicts.contains_key(&winner.path);
 
         if !unchanged {
-            for path in &group.paths {
-                self.remove_revocation_path(path);
-            }
+            self.remove_revocation_group(&group);
             let path = revoked_token_path(token_hash, winner.expires_at, &winner.token_owner);
             self.user_subject_ids.insert(
                 path,
@@ -1344,109 +1476,15 @@ impl AdminDocumentReducerState {
         Some(winner.dot)
     }
 
-    fn revocation_groups(&self, now: Option<u64>) -> BTreeMap<String, RevocationGroup> {
-        let mut indexed = BTreeMap::new();
-        let mut index = |path: &String| {
-            indexed.entry(path.clone()).or_insert_with(|| {
-                revoked_token_entry(path).map(|(hash, expires_at, token_owner)| RevocationPath {
-                    hash: hash.to_string(),
-                    expires_at,
-                    token_owner,
-                })
-            });
-        };
-        for path in self.user_subject_ids.keys() {
-            index(path);
+    fn remove_revocation_group(&mut self, group: &RevocationGroup) {
+        for event_id in &group.event_ids {
+            self.applied_event_ids.remove(event_id);
         }
-        for path in self.equivalent_value_dots.keys() {
-            index(path);
+        for path in &group.paths {
+            self.user_subject_ids.remove(path);
+            self.equivalent_value_dots.remove(path);
+            self.conflicts.remove(path);
         }
-        for path in self.conflicts.keys() {
-            index(path);
-        }
-
-        let mut groups = BTreeMap::new();
-        for (path, entry) in indexed {
-            let Some(entry) = entry else {
-                continue;
-            };
-            let group = groups
-                .entry(entry.hash.clone())
-                .or_insert_with(|| RevocationGroup {
-                    paths: BTreeSet::new(),
-                    candidates: Vec::new(),
-                });
-            group.paths.insert(path.clone());
-
-            let Some(version) = self.user_subject_ids.get(&path) else {
-                continue;
-            };
-            if version.value.as_deref() != Some(entry.expires_at.to_string().as_str())
-                || now.is_some_and(|current| entry.expires_at < current)
-            {
-                continue;
-            }
-
-            group.candidates.push(RevocationCandidate {
-                path: path.clone(),
-                expires_at: entry.expires_at,
-                token_owner: entry.token_owner,
-                dot: version.dot,
-            });
-            if let Some(dots) = self.equivalent_value_dots.get(&path) {
-                group
-                    .candidates
-                    .extend(dots.iter().copied().map(|dot| RevocationCandidate {
-                        path: path.clone(),
-                        expires_at: entry.expires_at,
-                        token_owner: entry.token_owner,
-                        dot,
-                    }));
-            }
-            if let Some(conflict) = self.conflicts.get(&path) {
-                group.candidates.extend(
-                    conflict
-                        .values
-                        .iter()
-                        .filter(|value| {
-                            value.value.as_deref() == Some(entry.expires_at.to_string().as_str())
-                        })
-                        .map(|value| RevocationCandidate {
-                            path: path.clone(),
-                            expires_at: entry.expires_at,
-                            token_owner: entry.token_owner,
-                            dot: value.dot,
-                        }),
-                );
-            }
-        }
-        groups
-    }
-
-    fn remove_revocation_path(&mut self, path: &str) {
-        for event_id in self.path_event_ids(path) {
-            self.applied_event_ids.remove(&event_id);
-        }
-        self.user_subject_ids.remove(path);
-        self.equivalent_value_dots.remove(path);
-        self.conflicts.remove(path);
-    }
-
-    /// Every event id that contributed to a path's value or to its conflict.
-    fn path_event_ids(&self, path: &str) -> Vec<Ulid> {
-        let mut event_ids: Vec<Ulid> = self
-            .user_subject_ids
-            .get(path)
-            .map(|version| version.dot.event_id)
-            .into_iter()
-            .collect();
-        if let Some(dots) = self.equivalent_value_dots.get(path) {
-            event_ids.extend(dots.iter().map(|dot| dot.event_id));
-        }
-        if let Some(conflict) = self.conflicts.get(path) {
-            event_ids.extend(conflict.values.iter().map(|value| value.dot.event_id));
-        }
-        event_ids
     }
 
     pub fn materialized_band_pools(&self) -> BTreeMap<Ulid, BandPool> {
@@ -6079,9 +6117,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(state.live_revocation_count(&node(1), 1_000), 2);
-        assert_eq!(state.live_revocation_count(&node(1), 1_001), 1);
+        assert_eq!(state.live_revocation_count(&node(1), 1_001), 2);
         state.compact_revocations(1_001);
-        assert_eq!(state.live_revocation_count(&node(1), 1_001), 1);
+        assert_eq!(state.live_revocation_count(&node(1), 1_001), 2);
     }
 
     #[test]
@@ -6107,6 +6145,27 @@ mod tests {
         assert_eq!(state.live_owner_count(&node(1), &owner_a, 1_000), 2);
         assert_eq!(state.live_owner_count(&node(1), &owner_b, 1_000), 1);
         assert_eq!(state.live_owner_count(&node(2), &owner_a, 1_000), 1);
+    }
+
+    #[test]
+    fn index_counts_grace() {
+        let mut state = realm_config_state();
+        state.apply(&revoke_token_at(50, 1, "grace", 900)).unwrap();
+
+        let index = state.revocation_index(1_000);
+        assert_eq!(index.count(&node(1)), 1);
+        assert_eq!(index.materialized(), BTreeMap::new());
+        assert_eq!(
+            index.origin(&crate::auth::bearer_token_hash("grace")),
+            Some(node(1))
+        );
+
+        state.compact_revocations(1_200);
+        let path =
+            super::revoked_token_path(&crate::auth::bearer_token_hash("grace"), 900, &user_id());
+        assert!(state.user_subject_ids.contains_key(&path));
+        state.compact_revocations(1_201);
+        assert!(!state.user_subject_ids.contains_key(&path));
     }
 
     #[test]
