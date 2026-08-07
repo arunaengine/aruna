@@ -11,10 +11,9 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    ArunaArn, AuthContext, BucketInfo, BucketReplicationConfig, Permission, SyncMode,
-    SyncRelationship, SyncState, WatchEvent, WatchEventDetail, WatchEventKind,
-    blob_object_permission_path, data_watch_resource_path, sync_relationship_key,
-    sync_relationship_prefix,
+    ArunaArn, AuthContext, BucketInfo, BucketReplicationConfig, SyncMode, SyncRelationship,
+    SyncState, WatchEvent, WatchEventDetail, WatchEventKind, blob_object_permission_path,
+    data_watch_resource_path, sync_relationship_key, sync_relationship_prefix,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
@@ -32,12 +31,11 @@ use ulid::Ulid;
 use super::protocol::{ReplicationMode, SyncOrigin};
 use super::version_replication::{
     ReplicateScopeError, ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
+    SourceAuthorization, SourceAuthorizationError,
 };
 use crate::driver::{DriverContext, drive, quota_marked_routing};
 use crate::notifications::watch::emit::emit_resource_watch_event;
 use crate::queue_backoff::queue_retry_after_ms;
-use crate::request_authorization::{AuthorizeError, authorize};
-use crate::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::s3::get_bucket_info::GetBucketInfoOperation;
 use crate::sync_mirror_repair::{kick_mirror_repair, store_sync_status};
 
@@ -1198,53 +1196,39 @@ pub async fn process_blob_replication_batch(
     })
 }
 
-async fn source_can_read(
+async fn load_source_authorization(
     context: &DriverContext,
-    auth_context: &AuthContext,
+    auth_context: AuthContext,
     source_node_id: NodeId,
     bucket: &str,
-    key: &str,
-) -> Result<(bool, GroupId), (String, Option<GroupId>)> {
+) -> Result<SourceAuthorization, (SourceAuthorizationError, Option<GroupId>)> {
     let bucket_info = match drive(GetBucketInfoOperation::new(bucket.to_string()), context).await {
         Ok(Some(Ok(bucket_info))) => bucket_info,
-        Ok(Some(Err(error))) => return Err((error.to_string(), None)),
-        Ok(None) => {
-            return Err(("source bucket lookup produced no result".to_string(), None));
+        Ok(Some(Err(error))) => {
+            return Err((
+                SourceAuthorizationError::Unavailable(error.to_string()),
+                None,
+            ));
         }
-        Err(error) => return Err((error.to_string(), None)),
+        Ok(None) => {
+            return Err((
+                SourceAuthorizationError::Unavailable(
+                    "source bucket lookup produced no result".to_string(),
+                ),
+                None,
+            ));
+        }
+        Err(error) => {
+            return Err((
+                SourceAuthorizationError::Unavailable(error.to_string()),
+                None,
+            ));
+        }
     };
     let group_id = bucket_info.group_id;
-    let path =
-        blob_object_permission_path(auth_context.realm_id, group_id, source_node_id, bucket, key);
-    match authorize(
-        context,
-        auth_context.realm_id,
-        &auth_context,
-        &path,
-        &Permission::READ,
-        PolicyRequestExtras::operation("s3.GetObject"),
-    )
-    .await
-    {
-        Ok(()) => Ok((true, group_id)),
-        Err(
-            AuthorizeError::PermissionDenied
-            | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }),
-        ) => Ok((false, group_id)),
-        Err(AuthorizeError::Policy(PolicyEnforcementError::Unavailable(error))) => {
-            Err((error.to_string(), Some(group_id)))
-        }
-        Err(AuthorizeError::CheckFailed(error)) => Err((error, Some(group_id))),
-    }
-}
-
-fn source_key(input: &ReplicateScopeInput) -> Option<&str> {
-    match &input.target {
-        ReplicateScopeTarget::Object { key } | ReplicateScopeTarget::Version { key, .. } => {
-            Some(key)
-        }
-        ReplicateScopeTarget::Bucket | ReplicateScopeTarget::Prefix(_) => None,
-    }
+    SourceAuthorization::load(context, auth_context, group_id, source_node_id)
+        .await
+        .map_err(|error| (error, Some(group_id)))
 }
 
 fn mark_failure(relationship: &mut SyncRelationship, error: &str) {
@@ -1278,7 +1262,9 @@ fn mark_success(relationship: &mut SyncRelationship, replicated: u64, bytes: u64
 }
 
 fn is_access_denied(error: &str) -> bool {
-    error.contains("Replication requires WRITE permission") || error.contains("access_denied")
+    error.contains("Replication requires WRITE permission")
+        || error.contains("access_denied")
+        || error.contains("source access denied")
 }
 
 fn is_writer_denied(error: &str) -> bool {
@@ -1393,43 +1379,48 @@ async fn process_blob_replication_job(
         };
         let creator = AuthContext {
             user_id: relationship.created_by,
-            realm_id: relationship.source.realm_id,
+            realm_id: relationship.created_by.realm_id,
             path_restrictions: None,
         };
-        let Some(key) = source_key(&job.input) else {
-            return Ok(BlobReplicationJobOutcome::TerminalFailure);
-        };
-        match source_can_read(context, &creator, relationship.source.node_id, bucket, key).await {
-            Ok((true, group_id)) => watch_group_id = Some(group_id),
-            Ok((false, group_id)) => {
-                let mut relationship = relationship;
-                relationship.state = SyncState::Failed {
-                    reason: "access_denied".to_string(),
-                };
-                mark_failure(&mut relationship, "access_denied");
-                if store_relationship(context, relationship.clone()).await? {
-                    emit_sync_watch(context, &relationship, group_id, 0, Some("access_denied"))
-                        .await;
+        let source_authorization =
+            match load_source_authorization(context, creator, relationship.source.node_id, bucket)
+                .await
+            {
+                Ok(authorization) => {
+                    watch_group_id = Some(authorization.group_id());
+                    authorization
                 }
-                return Ok(BlobReplicationJobOutcome::TerminalFailure);
-            }
-            Err((error, group_id)) => {
-                let mut relationship = relationship;
-                mark_failure(&mut relationship, &error);
-                if store_relationship(context, relationship.clone()).await?
-                    && let Some(group_id) = group_id
-                {
-                    emit_sync_watch(context, &relationship, group_id, 0, Some(&error)).await;
+                Err((SourceAuthorizationError::Denied, group_id)) => {
+                    let mut relationship = relationship;
+                    relationship.state = SyncState::Failed {
+                        reason: "access_denied".to_string(),
+                    };
+                    mark_failure(&mut relationship, "access_denied");
+                    if store_relationship(context, relationship.clone()).await? {
+                        emit_sync_watch(context, &relationship, group_id, 0, Some("access_denied"))
+                            .await;
+                    }
+                    return Ok(BlobReplicationJobOutcome::TerminalFailure);
                 }
-                return Err(error);
-            }
-        }
-        operation = operation.with_relationship(
-            relationship.clone(),
-            job.origin.clone(),
-            job.upstream_sources.clone(),
-            job.writer_auth_context.clone(),
-        );
+                Err((SourceAuthorizationError::Unavailable(error), group_id)) => {
+                    let mut relationship = relationship;
+                    mark_failure(&mut relationship, &error);
+                    if store_relationship(context, relationship.clone()).await?
+                        && let Some(group_id) = group_id
+                    {
+                        emit_sync_watch(context, &relationship, group_id, 0, Some(&error)).await;
+                    }
+                    return Err(error);
+                }
+            };
+        operation = operation
+            .with_relationship(
+                relationship.clone(),
+                job.origin.clone(),
+                job.upstream_sources.clone(),
+                job.writer_auth_context.clone(),
+            )
+            .with_source_authorization(source_authorization);
         Some(relationship)
     } else {
         let Some(writer) = job.writer_auth_context.as_ref() else {
@@ -1439,21 +1430,24 @@ async fn process_blob_replication_job(
             );
             return Ok(BlobReplicationJobOutcome::TerminalFailure);
         };
-        let Some(key) = source_key(&job.input) else {
-            error!(
-                bucket = %job.input.bucket,
-                "Dropping replication job without an exact source object"
-            );
-            return Ok(BlobReplicationJobOutcome::TerminalFailure);
-        };
         let Some(source_node_id) = context.net_handle.as_ref().map(|net| net.node_id()) else {
             return Err("source node identity unavailable".to_string());
         };
-        match source_can_read(context, writer, source_node_id, &job.input.bucket, key).await {
-            Ok((true, _)) => {}
-            Ok((false, _)) => return Ok(BlobReplicationJobOutcome::TerminalFailure),
-            Err((error, _)) => return Err(error),
-        }
+        let source_authorization = match load_source_authorization(
+            context,
+            writer.clone(),
+            source_node_id,
+            &job.input.bucket,
+        )
+        .await
+        {
+            Ok(authorization) => authorization,
+            Err((SourceAuthorizationError::Denied, _)) => {
+                return Ok(BlobReplicationJobOutcome::TerminalFailure);
+            }
+            Err((SourceAuthorizationError::Unavailable(error), _)) => return Err(error),
+        };
+        operation = operation.with_source_authorization(source_authorization);
         None
     };
 
@@ -1507,6 +1501,9 @@ async fn process_blob_replication_job(
         Ok(None) => "replication produced no result".to_string(),
         Err(error) => error.to_string(),
     };
+    if is_access_denied(&error) || is_writer_denied(&error) {
+        return Ok(BlobReplicationJobOutcome::TerminalFailure);
+    }
     if let Some(relationship) = relationship.as_mut() {
         if is_writer_denied(&error) {
             return Ok(BlobReplicationJobOutcome::TerminalFailure);
@@ -2800,12 +2797,11 @@ mod tests {
             realm_id: relationship.source.realm_id,
             path_restrictions: None,
         };
-        let Err((_, group_id)) = source_can_read(
+        let Err((SourceAuthorizationError::Denied, group_id)) = load_source_authorization(
             &context,
-            &creator,
+            creator,
             relationship.source.node_id,
             source_bucket,
-            "key",
         )
         .await
         else {

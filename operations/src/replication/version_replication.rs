@@ -3,15 +3,18 @@ use crate::connectors::resolver::ARUNA_NATIVE_RELATIONSHIP_ID;
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
 };
+use crate::driver::{DriverContext, drive};
 use crate::group_backends::{RecordReadError, parse_read};
 use crate::group_routing::load_group_inputs;
+use crate::permission_rules::{PermissionRules, PermissionRulesConfig, PermissionRulesOperation};
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{
     MaterializedBlobInfo, MultipartObjectReplicationMetadata, ReplicationMode, SyncOrigin,
     VersionReplicationManifest, VersionReplicationMessage, VersionReplicationRequest,
 };
+use crate::request_policy::{PolicyEvaluator, PolicyRequestExtras, policy_request_with};
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -21,11 +24,11 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     ArunaArn, AuthContext, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, BucketInfo, CurrentVersionPointer, GroupRoutingInputs,
-    MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
+    MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, Permission,
     PortableSourceDescriptor, ReferenceHandling, ReplicationItemKind, ReplicationNegotiationResult,
     ReplicationSuboperationResult, ResolvedSourceAccess, RoutingError, SourceConnectorKind,
     SourceMetadata, StagingStrategy, SyncMode, SyncRelationship, VersionKey, VersionSourceBinding,
-    sync_state_key,
+    blob_object_permission_path, sync_state_key,
 };
 use aruna_core::structs::{NodeRouting, StorageRoutingRule, resolve_backend};
 use aruna_core::types::{Effects, GroupId, Key, NodeId};
@@ -38,6 +41,101 @@ use tracing::debug;
 use ulid::Ulid;
 
 const ITER_PAGE_SIZE: usize = 512;
+
+#[derive(Debug, Error, PartialEq)]
+pub(super) enum SourceAuthorizationError {
+    #[error("source access denied")]
+    Denied,
+    #[error("source authorization unavailable: {0}")]
+    Unavailable(String),
+}
+
+pub(super) struct SourceAuthorization {
+    group_id: GroupId,
+    source_node_id: NodeId,
+    auth_context: AuthContext,
+    permissions: PermissionRules,
+    policies: PolicyEvaluator,
+}
+
+impl std::fmt::Debug for SourceAuthorization {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SourceAuthorization")
+            .field("group_id", &self.group_id)
+            .field("source_node_id", &self.source_node_id)
+            .field("auth_context", &self.auth_context)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SourceAuthorization {
+    pub(super) async fn load(
+        context: &DriverContext,
+        auth_context: AuthContext,
+        group_id: GroupId,
+        source_node_id: NodeId,
+    ) -> Result<Self, SourceAuthorizationError> {
+        let permissions = drive(
+            PermissionRulesOperation::new(PermissionRulesConfig {
+                auth_context: auth_context.clone(),
+                path: format!("/{}/g/{group_id}", auth_context.realm_id),
+            }),
+            context,
+        )
+        .await
+        .map_err(permission_error)?;
+        let policies = PolicyEvaluator::load(context, auth_context.realm_id, Some(group_id))
+            .await
+            .map_err(|error| SourceAuthorizationError::Unavailable(error.to_string()))?;
+        Ok(Self {
+            group_id,
+            source_node_id,
+            auth_context,
+            permissions,
+            policies,
+        })
+    }
+
+    pub(super) fn group_id(&self) -> GroupId {
+        self.group_id
+    }
+
+    fn allows(&self, bucket: &str, key: &str) -> Result<(), SourceAuthorizationError> {
+        let path = blob_object_permission_path(
+            self.auth_context.realm_id,
+            self.group_id,
+            self.source_node_id,
+            bucket,
+            key,
+        );
+        if !self
+            .permissions
+            .allows(self.group_id, &path, &Permission::READ)
+        {
+            return Err(SourceAuthorizationError::Denied);
+        }
+        let request = policy_request_with(
+            &path,
+            &Permission::READ,
+            Some(&self.auth_context.user_id),
+            PolicyRequestExtras::operation("s3.GetObject"),
+        );
+        self.policies
+            .evaluate(&request)
+            .map_err(|_| SourceAuthorizationError::Denied)
+    }
+}
+
+fn permission_error(error: AuthorizationError) -> SourceAuthorizationError {
+    match error {
+        AuthorizationError::AuthDocNotFound
+        | AuthorizationError::GroupNotFound
+        | AuthorizationError::InvalidGroupId
+        | AuthorizationError::InvalidRealmId => SourceAuthorizationError::Denied,
+        other => SourceAuthorizationError::Unavailable(other.to_string()),
+    }
+}
 
 #[derive(Serialize)]
 struct ReferenceFingerprint<'a> {
@@ -176,7 +274,7 @@ enum ReplicateScopeState {
     Error,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub struct ReplicateScopeOperation {
     input: ReplicateScopeInput,
     state: ReplicateScopeState,
@@ -186,6 +284,7 @@ pub struct ReplicateScopeOperation {
     source_group_id: Option<GroupId>,
     sync: Option<SyncTransferContext>,
     pending_versions: Vec<VersionReplicationRequest>,
+    source_authorization: Option<SourceAuthorization>,
     routing: NodeRouting,
     result: ReplicateScopeResult,
     output: Option<Result<ReplicateScopeResult, ReplicateScopeError>>,
@@ -202,6 +301,7 @@ impl ReplicateScopeOperation {
             source_group_id: None,
             sync: None,
             pending_versions: Vec::new(),
+            source_authorization: None,
             routing: NodeRouting::default(),
             result: ReplicateScopeResult {
                 replicated: 0,
@@ -217,6 +317,11 @@ impl ReplicateScopeOperation {
     /// Node-local routing, forwarded to every version sub-operation.
     pub fn with_routing(mut self, routing: NodeRouting) -> Self {
         self.routing = routing;
+        self
+    }
+
+    pub(super) fn with_source_authorization(mut self, authorization: SourceAuthorization) -> Self {
+        self.source_authorization = Some(authorization);
         self
     }
 
@@ -387,6 +492,14 @@ impl ReplicateScopeOperation {
                 target_node = %self.input.target_node_id,
                 "Skipping duplicate replication queue entry"
             );
+            return;
+        }
+
+        if let Some(authorization) = self.source_authorization.as_ref()
+            && let Err(error) = authorization.allows(&version_key.bucket, &version_key.key)
+        {
+            self.result.failed = self.result.failed.saturating_add(1);
+            self.result.last_error = Some(error.to_string());
             return;
         }
 
