@@ -2,20 +2,25 @@ use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::errors::StorageError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{JOB_KEYSPACE, ROCRATE_JOB_STATE_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE};
+use aruna_core::keyspaces::{
+    JOB_KEYSPACE, ROCRATE_JOB_STATE_KEYSPACE, ROCRATE_UPLOAD_CLEANUP_KEYSPACE,
+    ROCRATE_UPLOAD_KEYSPACE,
+};
 use aruna_core::structs::{
     BackendLocation, HiddenBlobEntry, HiddenBlobKey, JOB_RECORD_KEY_PREFIX, JobId, JobRecord,
-    JobResultPayload, RoCrateCheckpointRefs, RoCrateUploadRecord,
+    JobResultPayload, RoCrateCheckpointRefs, RoCrateUploadCleanup, RoCrateUploadRecord,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::Key;
+use aruna_core::types::{Key, TxnId};
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use tracing::warn;
+use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::jobs::store::iter_prefix_page;
@@ -28,6 +33,7 @@ const ORPHAN_GRACE: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct HiddenSweepOutcome {
+    pub cleanup_pending: bool,
     pub uploads_deleted: usize,
     pub orphans_deleted: usize,
 }
@@ -64,6 +70,7 @@ pub async fn restore_hidden_sweep(storage: &StorageHandle, task_handle: &TaskHan
 
 async fn sweep_at(context: &DriverContext, now_ms: u64) -> Result<HiddenSweepOutcome, String> {
     let (active_jobs, active_rocrate, mut referenced) = scan_jobs(&context.storage_handle).await?;
+    let cleanup_pending = sweep_upload_cleanups(context).await?;
     let uploads_deleted = sweep_uploads(context, &active_jobs, now_ms, &mut referenced).await?;
     let entries = list_hidden(context).await?;
     let cutoff = UNIX_EPOCH
@@ -79,9 +86,64 @@ async fn sweep_at(context: &DriverContext, now_ms: u64) -> Result<HiddenSweepOut
         }
     }
     Ok(HiddenSweepOutcome {
+        cleanup_pending,
         uploads_deleted,
         orphans_deleted,
     })
+}
+
+async fn sweep_upload_cleanups(context: &DriverContext) -> Result<bool, String> {
+    let mut pending = false;
+    let mut start_after = None;
+    loop {
+        let (values, next) = iter_prefix_page(
+            &context.storage_handle,
+            ROCRATE_UPLOAD_CLEANUP_KEYSPACE,
+            None,
+            start_after.take(),
+            SWEEP_PAGE_SIZE,
+            None,
+        )
+        .await?;
+        for (storage_key, value) in values {
+            let cleanup = match RoCrateUploadCleanup::from_bytes(&value) {
+                Ok(cleanup) => cleanup,
+                Err(error) => {
+                    warn!(error = %error, "Failed to decode RO-Crate upload cleanup");
+                    pending = true;
+                    continue;
+                }
+            };
+            let record_cleanup =
+                match delete_unclaimed(&context.storage_handle, cleanup.upload_id).await {
+                    Ok(cleanup) => cleanup,
+                    Err(error) => {
+                        warn!(error = %error, "Failed to compensate RO-Crate upload record");
+                        pending = true;
+                        continue;
+                    }
+                };
+            match record_cleanup {
+                RecordCleanup::Protected => {
+                    pending = true;
+                }
+                RecordCleanup::Missing | RecordCleanup::Deleted => {
+                    if delete_key(context, cleanup.hidden_key).await.is_err() {
+                        pending = true;
+                        continue;
+                    }
+                    if delete_cleanup(context, storage_key).await.is_err() {
+                        pending = true;
+                    }
+                }
+            }
+        }
+        match next {
+            Some(next) => start_after = Some(next),
+            None => break,
+        }
+    }
+    Ok(pending)
 }
 
 async fn scan_jobs(
@@ -248,6 +310,123 @@ async fn delete_key(context: &DriverContext, key: HiddenBlobKey) -> Result<(), S
         Event::Blob(BlobEvent::Error(error)) => Err(error.to_string()),
         other => Err(format!("unexpected hidden blob delete event: {other:?}")),
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecordCleanup {
+    Missing,
+    Protected,
+    Deleted,
+}
+
+async fn delete_unclaimed(
+    storage: &StorageHandle,
+    upload_id: Ulid,
+) -> Result<RecordCleanup, String> {
+    let txn_id = start_txn(storage).await?;
+    let event = storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
+            key: ByteView::from(upload_id.to_bytes().to_vec()),
+            txn_id: Some(txn_id),
+        })
+        .await;
+    let value = match event {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => value,
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+            abort_txn(storage, txn_id).await;
+            return Ok(RecordCleanup::Missing);
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            abort_txn(storage, txn_id).await;
+            return Err(error.to_string());
+        }
+        other => {
+            abort_txn(storage, txn_id).await;
+            return Err(format!("unexpected upload cleanup read event: {other:?}"));
+        }
+    };
+    let record: RoCrateUploadRecord = match postcard::from_bytes(value.as_ref()) {
+        Ok(record) => record,
+        Err(error) => {
+            abort_txn(storage, txn_id).await;
+            return Err(error.to_string());
+        }
+    };
+    if record.claimed_by.is_some() {
+        abort_txn(storage, txn_id).await;
+        return Ok(RecordCleanup::Protected);
+    }
+    let event = storage
+        .send_storage_effect(StorageEffect::Delete {
+            key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
+            key: ByteView::from(upload_id.to_bytes().to_vec()),
+            txn_id: Some(txn_id),
+        })
+        .await;
+    if !matches!(event, Event::Storage(StorageEvent::DeleteResult { .. })) {
+        abort_txn(storage, txn_id).await;
+        return match event {
+            Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+            other => Err(format!("unexpected upload cleanup delete event: {other:?}")),
+        };
+    }
+    match commit_txn(storage, txn_id).await {
+        Ok(()) => Ok(RecordCleanup::Deleted),
+        Err(error) => Err(error),
+    }
+}
+
+async fn delete_cleanup(storage: &StorageHandle, key: Key) -> Result<(), String> {
+    match storage
+        .send_storage_effect(StorageEffect::Delete {
+            key_space: ROCRATE_UPLOAD_CLEANUP_KEYSPACE.to_string(),
+            key,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!(
+            "unexpected upload cleanup row delete event: {other:?}"
+        )),
+    }
+}
+
+async fn start_txn(storage: &StorageHandle) -> Result<TxnId, String> {
+    match storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!(
+            "unexpected upload cleanup transaction event: {other:?}"
+        )),
+    }
+}
+
+async fn commit_txn(storage: &StorageHandle, txn_id: TxnId) -> Result<(), String> {
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }) => Err("upload cleanup transaction conflicted".to_string()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected upload cleanup commit event: {other:?}")),
+    }
+}
+
+async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
+    let _ = storage
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        .await;
 }
 
 async fn delete_record(storage: &StorageHandle, key: Key) -> Result<(), String> {

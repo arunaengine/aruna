@@ -1,16 +1,19 @@
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, StorageError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::ROCRATE_UPLOAD_KEYSPACE;
+use aruna_core::events::{BlobEvent, Event, StorageEvent, TaskEvent};
+use aruna_core::keyspaces::{ROCRATE_UPLOAD_CLEANUP_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{HiddenBlobKey, JobId, RoCrateMediaType, RoCrateUploadRecord};
+use aruna_core::structs::{
+    HiddenBlobKey, JobId, RoCrateMediaType, RoCrateUploadCleanup, RoCrateUploadRecord,
+};
+use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, TxnId, UserId};
 use aruna_storage::StorageHandle;
 use bytes::Bytes;
 use byteview::ByteView;
 use smallvec::smallvec;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -55,6 +58,8 @@ enum CreateUploadState {
     Write,
     CleanupBlob,
     CleanupRecord,
+    QueueCleanup,
+    ScheduleSweep,
     Finish,
     Error,
 }
@@ -121,6 +126,44 @@ impl CreateRoCrateUploadOperation {
             .unwrap_or_default()
     }
 
+    fn cleanup_obligation_effect(&self) -> Effects {
+        let Some(hidden_key) = self.hidden_key.clone() else {
+            return smallvec![];
+        };
+        let obligation = RoCrateUploadCleanup {
+            upload_id: self.upload_id,
+            hidden_key,
+        };
+        let Ok(value) = obligation.to_bytes() else {
+            return smallvec![];
+        };
+        smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: ROCRATE_UPLOAD_CLEANUP_KEYSPACE.to_string(),
+            key: upload_key(self.upload_id),
+            value: ByteView::from(value),
+            txn_id: None,
+        })]
+    }
+
+    fn schedule_sweep(&mut self) -> Effects {
+        self.state = CreateUploadState::ScheduleSweep;
+        smallvec![Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::SweepHiddenBlobs,
+            after: Duration::ZERO,
+        })]
+    }
+
+    fn queue_cleanup(&mut self, error: CreateRoCrateUploadError) -> Effects {
+        self.pending_error = Some(error);
+        self.cleanup_attempts = 0;
+        let effects = self.cleanup_obligation_effect();
+        if effects.is_empty() {
+            return self.schedule_sweep();
+        }
+        self.state = CreateUploadState::QueueCleanup;
+        effects
+    }
+
     fn fail_with_cleanup(&mut self, error: CreateRoCrateUploadError) -> Effects {
         let (state, effects) = if self.record.is_some() {
             (CreateUploadState::CleanupRecord, self.record_effect())
@@ -156,6 +199,8 @@ impl CreateRoCrateUploadOperation {
             CreateUploadState::Write => "write",
             CreateUploadState::CleanupBlob => "cleanup_blob",
             CreateUploadState::CleanupRecord => "cleanup_record",
+            CreateUploadState::QueueCleanup => "queue_cleanup",
+            CreateUploadState::ScheduleSweep => "schedule_sweep",
             CreateUploadState::Finish => "finish",
             CreateUploadState::Error => "error",
         }
@@ -182,6 +227,7 @@ impl CreateRoCrateUploadOperation {
                     expires_at_ms: self.expires_at_ms,
                     claimed_by: None,
                 };
+                self.record = Some(record.clone());
                 let value = match postcard::to_allocvec(&record) {
                     Ok(value) => ByteView::from(value),
                     Err(error) => {
@@ -191,7 +237,6 @@ impl CreateRoCrateUploadOperation {
                         ));
                     }
                 };
-                self.record = Some(record);
                 self.hidden_key = Some(hidden_key);
                 self.state = CreateUploadState::Write;
                 smallvec![Effect::Storage(StorageEffect::Write {
@@ -236,16 +281,12 @@ impl CreateRoCrateUploadOperation {
                     self.cleanup_attempts += 1;
                     return self.cleanup_effect();
                 }
-                self.pending_error = Some(error.into());
-                self.emit_pending_error()
+                self.queue_cleanup(error.into())
             }
-            event => {
-                self.hidden_key = None;
-                self.unexpected_event(
-                    "Event::Blob(BlobEvent::HiddenDeleted | BlobEvent::Error)",
-                    event,
-                )
-            }
+            event => self.unexpected_event(
+                "Event::Blob(BlobEvent::HiddenDeleted | BlobEvent::Error)",
+                event,
+            ),
         }
     }
 
@@ -267,11 +308,38 @@ impl CreateRoCrateUploadOperation {
                     self.cleanup_attempts += 1;
                     return self.record_effect();
                 }
-                self.pending_error = Some(error.into());
-                self.emit_pending_error()
+                self.queue_cleanup(error.into())
             }
             event => self.unexpected_event(
                 "Event::Storage(StorageEvent::DeleteResult | StorageEvent::Error)",
+                event,
+            ),
+        }
+    }
+
+    fn handle_cleanup_queue(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::WriteResult { .. }) => self.schedule_sweep(),
+            Event::Storage(StorageEvent::Error { .. }) => {
+                if self.cleanup_attempts < 2 {
+                    self.cleanup_attempts += 1;
+                    return self.cleanup_obligation_effect();
+                }
+                self.schedule_sweep()
+            }
+            event => self.unexpected_event(
+                "Event::Storage(StorageEvent::WriteResult | StorageEvent::Error)",
+                event,
+            ),
+        }
+    }
+
+    fn handle_schedule_sweep(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Task(TaskEvent::TimerScheduled { .. })
+            | Event::Task(TaskEvent::Error { .. }) => self.emit_pending_error(),
+            event => self.unexpected_event(
+                "Event::Task(TaskEvent::TimerScheduled | TaskEvent::Error)",
                 event,
             ),
         }
@@ -282,7 +350,6 @@ impl CreateRoCrateUploadOperation {
             .pending_error
             .take()
             .unwrap_or(CreateRoCrateUploadError::Aborted);
-        self.hidden_key = None;
         self.fail(error)
     }
 }
@@ -315,6 +382,8 @@ impl Operation for CreateRoCrateUploadOperation {
             }
             CreateUploadState::CleanupBlob => self.handle_cleanup_blob(event),
             CreateUploadState::CleanupRecord => self.handle_cleanup_record(event),
+            CreateUploadState::QueueCleanup => self.handle_cleanup_queue(event),
+            CreateUploadState::ScheduleSweep => self.handle_schedule_sweep(event),
         }
     }
 
@@ -335,6 +404,15 @@ impl Operation for CreateRoCrateUploadOperation {
         }
         if self.state == CreateUploadState::CleanupRecord {
             return self.record_effect();
+        }
+        if self.state == CreateUploadState::QueueCleanup {
+            return self.cleanup_obligation_effect();
+        }
+        if self.state == CreateUploadState::ScheduleSweep {
+            return smallvec![Effect::Task(TaskEffect::ShortenTimer {
+                key: TaskKey::SweepHiddenBlobs,
+                after: Duration::ZERO,
+            })];
         }
         if self.is_complete() {
             return smallvec![];
@@ -707,6 +785,77 @@ mod tests {
             operation
                 .step(Event::Blob(BlobEvent::HiddenDeleted))
                 .is_empty()
+        );
+        assert_eq!(
+            operation.finalize(),
+            Err(CreateRoCrateUploadError::Storage(StorageError::WriteError))
+        );
+    }
+
+    #[test]
+    fn queues_record_cleanup() {
+        let (mut operation, location) = upload_operation();
+        operation.start();
+        operation.step(Event::Blob(BlobEvent::HiddenSpooled {
+            location: location.clone(),
+            blake3: [4u8; 32],
+            size: 7,
+        }));
+        let mut effects = operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::WriteError,
+        }));
+        for attempt in 0..3 {
+            if attempt < 2 {
+                assert!(matches!(
+                    effects.as_slice(),
+                    [Effect::Storage(StorageEffect::Delete { .. })]
+                ));
+            }
+            effects = operation.step(Event::Storage(StorageEvent::Error {
+                error: StorageError::WriteError,
+            }));
+        }
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected durable cleanup row")
+        };
+        assert_eq!(key_space, ROCRATE_UPLOAD_CLEANUP_KEYSPACE);
+        assert_eq!(key, &upload_key(Ulid::from_bytes([2u8; 16])));
+        let cleanup = RoCrateUploadCleanup::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(cleanup.upload_id, Ulid::from_bytes([2u8; 16]));
+        assert_eq!(
+            cleanup.hidden_key,
+            HiddenBlobKey::try_from(&location).unwrap()
+        );
+
+        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: upload_key(Ulid::from_bytes([2u8; 16])),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Task(TaskEffect::ShortenTimer {
+                key: TaskKey::SweepHiddenBlobs,
+                after
+            })] if after.is_zero()
+        ));
+        assert!(
+            operation
+                .step(Event::Task(TaskEvent::TimerScheduled {
+                    key: TaskKey::SweepHiddenBlobs,
+                    after: Duration::ZERO,
+                }))
+                .is_empty()
+        );
+        assert_eq!(
+            operation.hidden_key,
+            Some(HiddenBlobKey::try_from(&location).unwrap())
         );
         assert_eq!(
             operation.finalize(),
