@@ -908,6 +908,7 @@ mod tests {
             user_name: None,
             user_subject_ids: BTreeMap::new(),
             equivalent_value_dots: BTreeMap::new(),
+            revocation_floor: 0,
         };
 
         let (keyspace, key, value) = admin_document_reducer_state_write_entry(&state).unwrap();
@@ -938,6 +939,7 @@ mod tests {
                 },
             )]),
             equivalent_value_dots: BTreeMap::new(),
+            revocation_floor: 0,
         };
 
         let (keyspace, key, value) = admin_document_reducer_state_write_entry(&state).unwrap();
@@ -1170,6 +1172,7 @@ mod tests {
             user_name: None,
             user_subject_ids: BTreeMap::new(),
             equivalent_value_dots: BTreeMap::new(),
+            revocation_floor: 0,
         };
 
         let entries = admin_document_conflict_write_entries(&state).unwrap();
@@ -1236,6 +1239,7 @@ mod tests {
             user_name: None,
             user_subject_ids: BTreeMap::new(),
             equivalent_value_dots: BTreeMap::new(),
+            revocation_floor: 0,
         };
         let current = AdminDocumentReducerState {
             conflicts: BTreeMap::from([(
