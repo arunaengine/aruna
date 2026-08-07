@@ -243,7 +243,6 @@ impl RevocationIndex {
         let mut live = BTreeMap::new();
         let mut origin_counts = BTreeMap::new();
         let mut owner_counts = BTreeMap::new();
-        let mut next_expiry = None;
         for (hash, group) in &groups {
             let Some(winner) = group
                 .candidates
@@ -253,11 +252,6 @@ impl RevocationIndex {
             else {
                 continue;
             };
-            next_expiry = Some(
-                next_expiry.map_or(expiry_threshold(winner.expires_at), |current| {
-                    current.min(expiry_threshold(winner.expires_at))
-                }),
-            );
             if revocation_retained(winner.expires_at, now) {
                 *origin_counts.entry(winner.dot.origin_node_id).or_insert(0) += 1;
                 *owner_counts
@@ -269,6 +263,12 @@ impl RevocationIndex {
                 live.insert(hash.clone(), winner);
             }
         }
+        let next_expiry = groups
+            .values()
+            .flat_map(|group| group.paths.iter())
+            .filter_map(|path| revoked_token_entry(path))
+            .map(|(_, expires_at, _)| expiry_threshold(expires_at))
+            .min();
 
         Self {
             now,
@@ -326,8 +326,9 @@ impl RevocationIndex {
         self.next_expiry = self
             .groups
             .values()
-            .flat_map(|group| group.candidates.iter())
-            .map(|candidate| expiry_threshold(candidate.expires_at))
+            .flat_map(|group| group.paths.iter())
+            .filter_map(|path| revoked_token_entry(path))
+            .map(|(_, expires_at, _)| expiry_threshold(expires_at))
             .min();
     }
 
