@@ -16,6 +16,8 @@ use aruna_core::structs::{
 };
 use aruna_core::util::unix_timestamp_secs;
 use aruna_core::{MetaResourceId, StructuredId};
+use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
 use thiserror::Error;
 use tokio::time::{Instant, timeout};
 use tracing::{error, warn};
@@ -91,6 +93,10 @@ pub enum MetadataWriteError {
 const TOKEN_REVOKE_PEER_LIMIT: usize = 4;
 const TOKEN_REVOKE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 const TOKEN_REVOKE_DEADLINE: Duration = Duration::from_secs(15);
+const METADATA_READ_FANOUT_LIMIT: usize = 8;
+const METADATA_READ_HOLDER_LIMIT: usize = 32;
+const METADATA_READ_PEER_TIMEOUT: Duration = Duration::from_secs(2);
+const METADATA_READ_DEADLINE: Duration = Duration::from_secs(12);
 
 /// Route for a write against `placement`, from the local node's point of view.
 ///
@@ -282,6 +288,57 @@ pub async fn origin_holds_document(
     Ok(holds_placement(&config, &placement, local_node_id))
 }
 
+async fn read_holders<T, F>(
+    holders: Vec<NodeId>,
+    request: F,
+) -> (Vec<(NodeId, Result<T, MetadataReadError>)>, bool)
+where
+    T: Send + 'static,
+    F: Fn(NodeId) -> BoxFuture<'static, Result<T, MetadataReadError>> + Send + Sync,
+{
+    let requests = futures_util::stream::iter(holders.into_iter().map(|holder| {
+        let request = request(holder);
+        async move {
+            let result = timeout(METADATA_READ_PEER_TIMEOUT, request)
+                .await
+                .unwrap_or(Err(MetadataReadError::Unavailable));
+            (holder, result)
+        }
+    }))
+    .buffer_unordered(METADATA_READ_FANOUT_LIMIT);
+    futures_util::pin_mut!(requests);
+
+    let deadline = Instant::now() + METADATA_READ_DEADLINE;
+    let mut results = Vec::new();
+    loop {
+        match tokio::time::timeout_at(deadline, requests.next()).await {
+            Ok(Some(result)) => results.push(result),
+            Ok(None) => return (results, false),
+            Err(_) => return (results, true),
+        }
+    }
+}
+
+fn select_read_holders(holders: Vec<NodeId>, local_node: Option<NodeId>) -> (Vec<NodeId>, bool) {
+    let truncated = holders.len() > METADATA_READ_HOLDER_LIMIT;
+    let local = local_node.filter(|local| {
+        !holders
+            .iter()
+            .take(METADATA_READ_HOLDER_LIMIT)
+            .any(|holder| holder == local)
+            && holders.iter().any(|holder| holder == local)
+    });
+    let mut selected = holders
+        .into_iter()
+        .take(METADATA_READ_HOLDER_LIMIT)
+        .collect::<Vec<_>>();
+    if let Some(local) = local {
+        selected.pop();
+        selected.push(local);
+    }
+    (selected, truncated)
+}
+
 pub async fn get_metadata_routed(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
@@ -299,84 +356,86 @@ pub async fn get_metadata_routed(
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     let placement = resolve_metadata_id(&config, realm_id, None, request.document_id)
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let holders = resolve_shard_holders(&config, &placement);
+    let (holders, truncated) = select_read_holders(
+        resolve_shard_holders(&config, &placement),
+        context.net_handle.as_ref().map(|net| net.node_id()),
+    );
     let holder_count = holders.len();
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let context = Arc::clone(context);
+    let config = Arc::new(config);
+    let metadata = context.metadata_handle.clone();
+    let request_template = request.clone();
+    let (responses, timed_out) = read_holders(holders, move |holder| {
+        let context = context.clone();
+        let config = config.clone();
+        let metadata = metadata.clone();
+        let request = request_template.clone();
+        let auth_token = auth_token.clone();
+        Box::pin(async move {
+            if Some(holder) == local_node {
+                let record = get_visible_metadata_document(context.as_ref(), realm_id, request)
+                    .await
+                    .map_err(read_error)?;
+                if routed_record_matches(&config, realm_id, record.document_id, &placement, &record)
+                {
+                    Ok(record)
+                } else {
+                    Err(MetadataReadError::Unavailable)
+                }
+            } else {
+                let Some(metadata) = metadata else {
+                    return Err(MetadataReadError::Unavailable);
+                };
+                match metadata
+                    .request_forwarded_write(
+                        holder,
+                        MetadataTransportMessage::ForwardReadDocument {
+                            auth_token,
+                            config_digest,
+                            document_id: request.document_id,
+                        },
+                    )
+                    .await
+                {
+                    Ok(MetadataTransportMessage::ForwardedRead { result }) => {
+                        let record = result?;
+                        if routed_record_matches(
+                            &config,
+                            realm_id,
+                            record.document_id,
+                            &placement,
+                            &record,
+                        ) {
+                            Ok(*record)
+                        } else {
+                            Err(MetadataReadError::Unavailable)
+                        }
+                    }
+                    _ => Err(MetadataReadError::Unavailable),
+                }
+            }
+        })
+    })
+    .await;
     let mut not_found = 0usize;
     let mut success = None;
     let mut auth_error = None;
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    if local_node.is_some_and(|node| holders.contains(&node)) {
-        match get_visible_metadata_document(context.as_ref(), realm_id, request.clone()).await {
-            Ok(record)
-                if routed_record_matches(
-                    &config,
-                    realm_id,
-                    request.document_id,
-                    &placement,
-                    &record,
-                ) =>
-            {
-                success = Some(record);
+    let mut unavailable = timed_out;
+    for (_, response) in responses {
+        match response {
+            Ok(record) => {
+                success.get_or_insert(record);
             }
-            Ok(_) => {}
-            Err(MetadataApiError::NotFound) => not_found += 1,
-            Err(MetadataApiError::ServiceUnavailable) => {}
-            Err(error @ (MetadataApiError::Unauthorized | MetadataApiError::Forbidden)) => {
-                auth_error.get_or_insert(error);
+            Err(MetadataReadError::Unauthorized) => {
+                auth_error.get_or_insert(MetadataApiError::Unauthorized);
             }
-            Err(error) => return Err(error),
-        }
-    }
-    if let Some(metadata) = context.metadata_handle.as_ref() {
-        for holder in holders
-            .into_iter()
-            .filter(|holder| Some(*holder) != local_node)
-        {
-            let response = metadata
-                .request_forwarded_write(
-                    holder,
-                    MetadataTransportMessage::ForwardReadDocument {
-                        auth_token: auth_token.clone(),
-                        config_digest,
-                        document_id: request.document_id,
-                    },
-                )
-                .await;
-            match response {
-                Ok(MetadataTransportMessage::ForwardedRead { result: Ok(record) }) => {
-                    if success.is_none()
-                        && routed_record_matches(
-                            &config,
-                            realm_id,
-                            request.document_id,
-                            &placement,
-                            &record,
-                        )
-                    {
-                        success = Some(*record);
-                    }
-                }
-                Ok(MetadataTransportMessage::ForwardedRead {
-                    result: Err(MetadataReadError::Unauthorized),
-                }) => {
-                    auth_error.get_or_insert(MetadataApiError::Unauthorized);
-                }
-                Ok(MetadataTransportMessage::ForwardedRead {
-                    result: Err(MetadataReadError::Forbidden),
-                }) => {
-                    auth_error.get_or_insert(MetadataApiError::Forbidden);
-                }
-                Ok(MetadataTransportMessage::ForwardedRead {
-                    result: Err(MetadataReadError::NotFound),
-                }) => not_found += 1,
-                Ok(MetadataTransportMessage::ForwardedRead {
-                    result: Err(MetadataReadError::Unavailable),
-                })
-                | Ok(MetadataTransportMessage::Reject(_))
-                | Err(_) => {}
-                Ok(_) => {}
+            Err(MetadataReadError::Forbidden) => {
+                auth_error.get_or_insert(MetadataApiError::Forbidden);
             }
-        }
+            Err(MetadataReadError::NotFound) => not_found += 1,
+            Err(MetadataReadError::Unavailable) => unavailable = true,
+        };
     }
     if let Some(error) = auth_error {
         return Err(error);
@@ -384,10 +443,13 @@ pub async fn get_metadata_routed(
     if success.is_some() && not_found > 0 {
         return Err(MetadataApiError::ServiceUnavailable);
     }
+    if success.is_some() && truncated {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
     if let Some(record) = success {
         return Ok(record);
     }
-    if holder_count > 0 && not_found == holder_count {
+    if !unavailable && holder_count > 0 && not_found == holder_count {
         Err(MetadataApiError::NotFound)
     } else {
         Err(MetadataApiError::ServiceUnavailable)
@@ -416,59 +478,70 @@ pub async fn export_rocrate_routed(
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     let placement = resolve_metadata_id(&config, realm_id, None, request.document_id)
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let holders = resolve_shard_holders(&config, &placement);
+    let (holders, truncated) = select_read_holders(
+        resolve_shard_holders(&config, &placement),
+        context.net_handle.as_ref().map(|net| net.node_id()),
+    );
     let holder_count = holders.len();
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let context = Arc::clone(context);
+    let metadata = context.metadata_handle.clone();
+    let request_template = request.clone();
+    let (responses, timed_out) = read_holders(holders, move |holder| {
+        let context = context.clone();
+        let metadata = metadata.clone();
+        let request = request_template.clone();
+        let forward_token = forward_token.clone();
+        Box::pin(async move {
+            if Some(holder) == local_node {
+                let export = export_metadata_rocrate(context.as_ref(), realm_id, request).await;
+                let export = export.map_err(read_error)?;
+                ensure_export_limit(&export, metadata_bytes).map_err(read_error)?;
+                Ok(export)
+            } else {
+                let Some(metadata) = metadata else {
+                    return Err(MetadataReadError::Unavailable);
+                };
+                match metadata
+                    .request_export(
+                        holder,
+                        MetadataTransportMessage::ForwardExportDocument {
+                            auth_token: forward_token,
+                            config_digest,
+                            document_id: request.document_id,
+                            view: request.view,
+                            metadata_bytes,
+                            limit: request.limit,
+                            offset: request.offset,
+                            after: request.after,
+                        },
+                    )
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(MetadataReadError::Unavailable),
+                }
+            }
+        })
+    })
+    .await;
     let mut not_found = 0usize;
     let mut success = None;
     let mut auth_error = None;
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    if local_node.is_some_and(|node| holders.contains(&node)) {
-        match export_metadata_rocrate(context.as_ref(), realm_id, request.clone()).await {
-            Ok(result) => {
-                ensure_export_limit(&result, metadata_bytes)?;
-                success = Some(result);
+    let mut unavailable = timed_out;
+    for (_, response) in responses {
+        match response {
+            Ok(export) => {
+                success.get_or_insert(export);
             }
-            Err(MetadataApiError::NotFound) => not_found += 1,
-            Err(MetadataApiError::ServiceUnavailable) => {}
-            Err(error @ (MetadataApiError::Unauthorized | MetadataApiError::Forbidden)) => {
-                auth_error.get_or_insert(error);
+            Err(MetadataReadError::Unauthorized) => {
+                auth_error.get_or_insert(MetadataApiError::Unauthorized);
             }
-            Err(error) => return Err(error),
-        }
-    }
-    if let Some(metadata) = context.metadata_handle.as_ref() {
-        for holder in holders
-            .into_iter()
-            .filter(|holder| Some(*holder) != local_node)
-        {
-            let response = metadata
-                .request_export(
-                    holder,
-                    MetadataTransportMessage::ForwardExportDocument {
-                        auth_token: forward_token.clone(),
-                        config_digest,
-                        document_id: request.document_id,
-                        view: request.view,
-                        metadata_bytes,
-                        limit: request.limit,
-                        offset: request.offset,
-                        after: request.after.clone(),
-                    },
-                )
-                .await;
-            match response {
-                Ok(Ok(export)) => {
-                    success.get_or_insert(export);
-                }
-                Ok(Err(MetadataReadError::Unauthorized)) => {
-                    auth_error.get_or_insert(MetadataApiError::Unauthorized);
-                }
-                Ok(Err(MetadataReadError::Forbidden)) => {
-                    auth_error.get_or_insert(MetadataApiError::Forbidden);
-                }
-                Ok(Err(MetadataReadError::NotFound)) => not_found += 1,
-                Ok(Err(MetadataReadError::Unavailable)) | Err(_) => {}
+            Err(MetadataReadError::Forbidden) => {
+                auth_error.get_or_insert(MetadataApiError::Forbidden);
             }
+            Err(MetadataReadError::NotFound) => not_found += 1,
+            Err(MetadataReadError::Unavailable) => unavailable = true,
         }
     }
     if let Some(error) = auth_error {
@@ -477,10 +550,13 @@ pub async fn export_rocrate_routed(
     if success.is_some() && not_found > 0 {
         return Err(MetadataApiError::ServiceUnavailable);
     }
+    if success.is_some() && truncated {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
     if let Some(export) = success {
         return Ok(export);
     }
-    if holder_count > 0 && not_found == holder_count {
+    if !unavailable && holder_count > 0 && not_found == holder_count {
         Err(MetadataApiError::NotFound)
     } else {
         Err(MetadataApiError::ServiceUnavailable)

@@ -1365,7 +1365,7 @@ impl MetadataHandle {
             )
             .await
             {
-                Some(auth) => match self.inner.net_handle.as_ref() {
+                Ok(auth) => match self.inner.net_handle.as_ref() {
                     Some(net_handle) => match search_local_buckets(
                         context.as_ref(),
                         SearchBucketsInput {
@@ -1379,14 +1379,18 @@ impl MetadataHandle {
                     )
                     .await
                     {
-                        Ok(hits) => MetadataTransportMessage::BucketSearchResults { hits },
-                        Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                        Ok(hits) => {
+                            MetadataTransportMessage::BucketSearchResults { result: Ok(hits) }
+                        }
+                        Err(_) => MetadataTransportMessage::BucketSearchResults {
+                            result: Err(MetadataReadError::Unavailable),
+                        },
                     },
-                    None => MetadataTransportMessage::Reject(
-                        "metadata network handle unavailable".to_string(),
-                    ),
+                    None => MetadataTransportMessage::BucketSearchResults {
+                        result: Err(MetadataReadError::Unavailable),
+                    },
                 },
-                None => MetadataTransportMessage::BucketSearchResults { hits: Vec::new() },
+                Err(error) => MetadataTransportMessage::BucketSearchResults { result: Err(error) },
             },
             MetadataTransportMessage::CreateSyncMirror {
                 auth_token,
@@ -1475,7 +1479,7 @@ impl MetadataHandle {
                             {
                                 Err(MetadataReadError::Unavailable)
                             } else {
-                                let result = super::api::lookup_metadata_path(
+                                let result = super::api::resolve_local_path(
                                     context.as_ref(),
                                     realm_id,
                                     super::api::MetadataPathLookupRequest {
@@ -1483,7 +1487,6 @@ impl MetadataHandle {
                                         document_path,
                                         auth,
                                     },
-                                    None,
                                 )
                                 .await
                                 .map(|result| {
@@ -2201,7 +2204,7 @@ impl MetadataHandle {
         auth_token: Option<MetadataAuthToken>,
         query: String,
         limit: usize,
-    ) -> Result<Vec<BucketSearchHit>, MetadataError> {
+    ) -> Result<Vec<BucketSearchHit>, MetadataReadError> {
         let started = Instant::now();
         let span = Span::current();
         let result = match send_remote_metadata_request(
@@ -2215,13 +2218,10 @@ impl MetadataHandle {
             },
         )
         .await
-        .map_err(MetadataRequestError::into_metadata_error)?
+        .map_err(|_| MetadataReadError::Unavailable)?
         {
-            MetadataTransportMessage::BucketSearchResults { hits } => Ok(hits),
-            MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
-            other => Err(MetadataError::Backend(format!(
-                "unexpected bucket search response: {other:?}"
-            ))),
+            MetadataTransportMessage::BucketSearchResults { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
         };
         record_elapsed_ms(&span, "elapsed_ms", started);
         match &result {
@@ -2229,7 +2229,7 @@ impl MetadataHandle {
                 span.record("result", "ok");
                 span.record("hit_count", hits.len() as u64);
             }
-            Err(error) => record_error(&span, &error.to_string()),
+            Err(error) => record_error(&span, &format!("{error:?}")),
         }
         result
     }
@@ -2391,21 +2391,26 @@ async fn bucket_search_auth<S>(
     peer: NodeId,
     local_realm_id: Option<RealmId>,
     auth_token: Option<MetadataAuthToken>,
-) -> Option<AuthContext>
+) -> Result<AuthContext, MetadataReadError>
 where
     S: ArunaBearerTokenValidationState + ?Sized,
 {
-    let auth = authorize_remote_metadata_peer(
-        state,
-        storage_handle,
-        peer,
-        local_realm_id,
-        auth_token,
-        false,
-    )
-    .await
-    .ok()??;
-    (Some(auth.realm_id) == local_realm_id).then_some(auth)
+    let Some(MetadataAuthToken::Bearer(token)) = auth_token else {
+        return Err(MetadataReadError::Unauthorized);
+    };
+    let auth = validate_aruna_bearer_token(state, token.as_str())
+        .await
+        .map_err(|_| MetadataReadError::Unauthorized)?;
+    let Some(local_realm_id) = local_realm_id else {
+        return Err(MetadataReadError::Unavailable);
+    };
+    if auth.realm_id != local_realm_id {
+        return Err(MetadataReadError::Forbidden);
+    }
+    ensure_remote_metadata_peer_is_configured_for_realm(storage_handle, peer, auth.realm_id, false)
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?;
+    Ok(auth)
 }
 
 async fn authorize_remote_metadata_peer<S>(
@@ -4455,18 +4460,14 @@ async fn list_local_registry_records(
     let started = Instant::now();
     let span = Span::current();
     match inner.visibility_cache.registry_records_any() {
-        Some((records, fresh)) => {
-            if !fresh {
-                spawn_visibility_cache_refill(inner.clone());
-            }
+        Some((records, true)) => {
             span.record("cache_hit", true);
-            span.record("stale", !fresh);
+            span.record("stale", false);
             span.record("record_count", records.len() as u64);
             record_elapsed_ms(&span, "elapsed_ms", started);
             Ok(records)
         }
-        None => {
-            // Cold start only: block until the first fill completes.
+        Some((_, false)) | None => {
             let _fill = inner
                 .visibility_cache
                 .registry_fill
@@ -4512,17 +4513,14 @@ async fn list_local_registry_records_for_group(
         .visibility_cache
         .registry_records_for_group_any(group_id)
     {
-        Some((records, fresh)) => {
-            if !fresh {
-                spawn_visibility_cache_refill(inner.clone());
-            }
+        Some((records, true)) => {
             span.record("cache_hit", true);
-            span.record("stale", !fresh);
+            span.record("stale", false);
             span.record("record_count", records.len() as u64);
             record_elapsed_ms(&span, "elapsed_ms", started);
             Ok(records)
         }
-        None => {
+        Some((_, false)) | None => {
             let _fill = inner
                 .visibility_cache
                 .registry_fill
@@ -4576,7 +4574,7 @@ async fn list_group_records(
     limit: usize,
 ) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
     let limit = limit.min(METADATA_REGISTRY_CANDIDATE_LIMIT);
-    if let Some((records, _)) = inner
+    if let Some((records, true)) = inner
         .visibility_cache
         .registry_records_for_group_any(group_id)
     {
@@ -4615,32 +4613,6 @@ async fn list_group_records(
             .filter(|record| !deleted_graphs.contains(&record.graph_iri))
             .collect(),
     ))
-}
-
-// Single-flight background refill; readers keep being served the stale entry
-// until the new Arc is swapped in.
-fn spawn_visibility_cache_refill(inner: Arc<MetadataInner>) {
-    let Ok(guard) = inner
-        .visibility_cache
-        .registry_fill
-        .clone()
-        .try_lock_owned()
-    else {
-        return;
-    };
-    tokio::spawn(async move {
-        let _guard = guard;
-        if let Some((_, true)) = inner.visibility_cache.registry_records_any() {
-            return;
-        }
-        if let Err(error) = fill_visibility_caches(&inner).await {
-            warn!(
-                event = "metadata.visibility.refill_failed",
-                error = %error,
-                "Background metadata visibility cache refill failed; serving stale entries"
-            );
-        }
-    });
 }
 
 #[tracing::instrument(
@@ -6264,11 +6236,14 @@ async fn send_request(
         .map_err(MetadataRequestError::definitely_not_sent)?;
 
     let open_started = Instant::now();
-    let mut stream = net_handle
-        .open_stream(node_id, Alpn::Metadata)
-        .await
-        .map_err(|error| MetadataError::Backend(error.to_string()))
-        .map_err(MetadataRequestError::definitely_not_sent)?;
+    let mut stream = timeout(
+        METADATA_IO_TIMEOUT,
+        net_handle.open_stream(node_id, Alpn::Metadata),
+    )
+    .await
+    .map_err(|_| MetadataError::Backend("timed out opening metadata stream".to_string()))
+    .and_then(|result| result.map_err(|error| MetadataError::Backend(error.to_string())))
+    .map_err(MetadataRequestError::definitely_not_sent)?;
     record_elapsed_ms(&span, "open_stream_ms", open_started);
 
     let write_started = Instant::now();
@@ -6320,11 +6295,14 @@ async fn send_export_request(
         .net_handle
         .clone()
         .ok_or_else(|| MetadataRequestError::definitely_not_sent(MetadataError::HandleMissing))?;
-    let mut stream = net_handle
-        .open_stream(node_id, Alpn::Metadata)
-        .await
-        .map_err(|error| MetadataError::Backend(error.to_string()))
-        .map_err(MetadataRequestError::definitely_not_sent)?;
+    let mut stream = timeout(
+        METADATA_IO_TIMEOUT,
+        net_handle.open_stream(node_id, Alpn::Metadata),
+    )
+    .await
+    .map_err(|_| MetadataError::Backend("timed out opening metadata stream".to_string()))
+    .and_then(|result| result.map_err(|error| MetadataError::Backend(error.to_string())))
+    .map_err(MetadataRequestError::definitely_not_sent)?;
     write_encoded_transport_message(&mut stream, frame_class(&message), &bytes)
         .await
         .map_err(MetadataRequestError::possibly_sent)?;
@@ -6417,13 +6395,18 @@ async fn read_transport_cap(
 }
 
 async fn write_stream_body(stream: &mut BiStream, bytes: &[u8]) -> Result<(), MetadataError> {
-    for chunk in bytes.chunks(METADATA_CHUNK_SIZE) {
-        timeout(METADATA_IO_TIMEOUT, stream.0.write_all(chunk))
-            .await
-            .map_err(|_| MetadataError::Backend("timed out writing metadata body".to_string()))?
-            .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    }
-    Ok(())
+    timeout(METADATA_IO_TIMEOUT, async {
+        for chunk in bytes.chunks(METADATA_CHUNK_SIZE) {
+            stream
+                .0
+                .write_all(chunk)
+                .await
+                .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        }
+        Ok::<(), MetadataError>(())
+    })
+    .await
+    .map_err(|_| MetadataError::Backend("timed out writing metadata body".to_string()))?
 }
 
 fn metadata_body_limit(metadata_bytes: u64) -> u64 {
@@ -6438,13 +6421,18 @@ async fn read_stream_body(stream: &mut BiStream, length: u64) -> Result<Vec<u8>,
         .try_reserve_exact(length)
         .map_err(|_| MetadataError::Backend("metadata body allocation failed".to_string()))?;
     bytes.resize(length, 0);
-    for chunk in bytes.chunks_mut(METADATA_CHUNK_SIZE) {
-        timeout(METADATA_IO_TIMEOUT, stream.1.read_exact(chunk))
-            .await
-            .map_err(|_| MetadataError::Backend("timed out reading metadata body".to_string()))?
-            .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    }
-    Ok(bytes)
+    timeout(METADATA_IO_TIMEOUT, async {
+        for chunk in bytes.chunks_mut(METADATA_CHUNK_SIZE) {
+            stream
+                .1
+                .read_exact(chunk)
+                .await
+                .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        }
+        Ok::<Vec<u8>, MetadataError>(bytes)
+    })
+    .await
+    .map_err(|_| MetadataError::Backend("timed out reading metadata body".to_string()))?
 }
 
 async fn close_stream(stream: &mut BiStream) {
@@ -6822,7 +6810,7 @@ mod tests {
         )
         .await;
 
-        assert!(auth.is_none());
+        assert_eq!(auth, Err(MetadataReadError::Unauthorized));
     }
 
     #[tokio::test]

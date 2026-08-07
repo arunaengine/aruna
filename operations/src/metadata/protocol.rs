@@ -117,7 +117,7 @@ pub enum MetadataTransportMessage {
         limit: usize,
     },
     BucketSearchResults {
-        hits: Vec<BucketSearchHit>,
+        result: Result<Vec<BucketSearchHit>, MetadataReadError>,
     },
     CreateSyncMirror {
         auth_token: Option<MetadataAuthToken>,
@@ -502,8 +502,9 @@ mod tests {
         ] {
             let query = MetadataTransportMessage::QueryResults { result: Err(error) };
             let search = MetadataTransportMessage::SearchResults { result: Err(error) };
+            let buckets = MetadataTransportMessage::BucketSearchResults { result: Err(error) };
 
-            for message in [query, search] {
+            for message in [query, search, buckets] {
                 let bytes = postcard::to_allocvec(&message).unwrap();
                 assert_eq!(postcard::from_bytes(&bytes).unwrap(), message);
             }
