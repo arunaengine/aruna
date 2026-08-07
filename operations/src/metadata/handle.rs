@@ -1279,7 +1279,7 @@ impl MetadataHandle {
         let audit_deadline =
             tokio::time::Instant::now() + Duration::from_secs(super::audit::AUDIT_DEADLINE_SECS);
         let read_started = Instant::now();
-        let (message, _frame_budget) = read_message_budget(
+        let (message, frame_budget) = read_message_budget(
             &mut stream.1,
             super::protocol::MAX_MESSAGE_SIZE,
             &self.inner.inbound_frame_bytes,
@@ -1625,6 +1625,7 @@ impl MetadataHandle {
         } else {
             close_stream(&mut stream).await;
         }
+        drop(frame_budget);
         record_elapsed_ms(&span, "elapsed_ms", total_started);
         span.record("response", transport_message_kind(&response));
         Ok(())
