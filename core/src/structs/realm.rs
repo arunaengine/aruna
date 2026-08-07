@@ -518,14 +518,14 @@ impl RealmConfigDocument {
     }
 
     /// Whether the realm-wide revocation set denies this bearer token hash.
-    /// Entries past their expiry are ignored: the token they name is expired.
+    /// A clock below the persisted floor fails closed until it catches up.
     pub fn token_revoked(&self, token_hash: &str, now: u64) -> bool {
-        let effective_now = self.revocation_floor.max(now);
+        if now < self.revocation_floor {
+            return true;
+        }
         self.revoked_tokens
             .iter()
-            .any(|entry| {
-                entry.token_hash == token_hash && revocation_live(entry.expires_at, effective_now)
-            })
+            .any(|entry| entry.token_hash == token_hash && revocation_live(entry.expires_at, now))
     }
 
     /// Unions the locally accepted revocations with the reducer's materialized
@@ -951,7 +951,8 @@ mod test {
         config.merge_revocation_index(&index, 2_000);
         assert!(config.revoked_tokens.is_empty());
         assert_eq!(config.revocation_floor, 2_000);
-        assert!(!config.token_revoked(&token_hash, 999));
+        assert!(config.token_revoked(&token_hash, 1_999));
+        assert!(!config.token_revoked(&token_hash, 2_000));
     }
 
     #[test]
