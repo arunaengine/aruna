@@ -2,7 +2,7 @@ use aruna_core::errors::AuthorizationError;
 use aruna_core::events::Event;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{AuthContext, Permission};
-use aruna_core::types::Effects;
+use aruna_core::types::{Effects, TxnId};
 
 use crate::permission_rules::{PermissionRulesConfig, PermissionRulesOperation};
 
@@ -30,6 +30,20 @@ impl CheckPermissionsOperation {
                 auth_context: config.auth_context,
                 path: config.path.clone(),
             }),
+            path: config.path,
+            required_permission: config.required_permission,
+        }
+    }
+
+    pub fn new_with_txn(config: CheckPermissionsConfig, txn_id: TxnId) -> Self {
+        CheckPermissionsOperation {
+            rules: PermissionRulesOperation::new_with_txn(
+                PermissionRulesConfig {
+                    auth_context: config.auth_context,
+                    path: config.path.clone(),
+                },
+                txn_id,
+            ),
             path: config.path,
             required_permission: config.required_permission,
         }

@@ -428,12 +428,18 @@ impl LocationSummaryOperation {
                 PolicyDecision::Allowed
             );
         self.state = SummaryState::CheckPermission;
+        let Some(txn_id) = self.txn_id else {
+            return self.deny();
+        };
         smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.request.auth_context.clone(),
-                path,
-                required_permission: Permission::READ,
-            }),
+            CheckPermissionsOperation::new_with_txn(
+                CheckPermissionsConfig {
+                    auth_context: self.request.auth_context.clone(),
+                    path,
+                    required_permission: Permission::READ,
+                },
+                txn_id,
+            ),
             |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
         ))]
     }

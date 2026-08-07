@@ -247,6 +247,7 @@ pub struct PermissionRulesConfig {
 pub struct PermissionRulesOperation {
     config: PermissionRulesConfig,
     txn_id: Option<TxnId>,
+    external_txn: bool,
     group_id: Option<GroupId>,
     realm_auth_doc: Option<RealmAuthorizationDocument>,
     group_auth_doc: Option<GroupAuthorizationDocument>,
@@ -288,6 +289,20 @@ impl PermissionRulesOperation {
         PermissionRulesOperation {
             config,
             txn_id: None,
+            external_txn: false,
+            group_id: None,
+            realm_auth_doc: None,
+            group_auth_doc: None,
+            output: None,
+            state: PermissionRulesState::Init,
+        }
+    }
+
+    pub fn new_with_txn(config: PermissionRulesConfig, txn_id: TxnId) -> Self {
+        PermissionRulesOperation {
+            config,
+            txn_id: Some(txn_id),
+            external_txn: true,
             group_id: None,
             realm_auth_doc: None,
             group_auth_doc: None,
@@ -417,14 +432,18 @@ impl PermissionRulesOperation {
                 })])
             }
             None => {
-                self.state = PermissionRulesState::CollectRules;
-                Ok(smallvec![Effect::Storage(
-                    StorageEffect::CommitTransaction {
-                        txn_id: self
-                            .txn_id
-                            .ok_or_else(|| AuthorizationError::NoTransactionFound)?
-                    }
-                )])
+                if self.external_txn {
+                    self.emit_rules()
+                } else {
+                    self.state = PermissionRulesState::CollectRules;
+                    Ok(smallvec![Effect::Storage(
+                        StorageEffect::CommitTransaction {
+                            txn_id: self
+                                .txn_id
+                                .ok_or_else(|| AuthorizationError::NoTransactionFound)?
+                        }
+                    )])
+                }
             }
         }
     }
@@ -433,18 +452,22 @@ impl PermissionRulesOperation {
         &mut self,
         value: Option<byteview::ByteView>,
     ) -> Result<Effects, AuthorizationError> {
-        self.state = PermissionRulesState::CollectRules;
         self.group_auth_doc = Some(GroupAuthorizationDocument::from_bytes(
             &value.ok_or_else(|| AuthorizationError::AuthDocNotFound)?,
         )?);
 
-        Ok(smallvec![Effect::Storage(
-            StorageEffect::CommitTransaction {
-                txn_id: self
-                    .txn_id
-                    .ok_or_else(|| AuthorizationError::NoTransactionFound)?
-            }
-        )])
+        if self.external_txn {
+            self.emit_rules()
+        } else {
+            self.state = PermissionRulesState::CollectRules;
+            Ok(smallvec![Effect::Storage(
+                StorageEffect::CommitTransaction {
+                    txn_id: self
+                        .txn_id
+                        .ok_or_else(|| AuthorizationError::NoTransactionFound)?
+                }
+            )])
+        }
     }
 
     fn emit_rules(&mut self) -> Result<Effects, AuthorizationError> {
@@ -528,6 +551,12 @@ impl Operation for PermissionRulesOperation {
     type Error = AuthorizationError;
 
     fn start(&mut self) -> Effects {
+        if self.external_txn {
+            return match self.read_realm_doc() {
+                Ok(effects) => effects,
+                Err(err) => self.fail(err),
+            };
+        }
         self.state = PermissionRulesState::StartTransaction;
 
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -564,6 +593,9 @@ impl Operation for PermissionRulesOperation {
     }
 
     fn abort(&mut self) -> Effects {
+        if self.external_txn {
+            return smallvec![];
+        }
         match self.txn_id {
             Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
             None => smallvec![],
