@@ -130,6 +130,7 @@ use s3s::dto::{
     UploadPartOutput,
 };
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -150,6 +151,8 @@ const S3_URL_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'.')
     .remove(b'~');
+
+const MAX_REPLICATION_TARGETS: usize = 64;
 
 fn object_range_request(range: s3s::dto::Range) -> ObjectRangeRequest {
     match range {
@@ -313,7 +316,21 @@ impl ArunaS3Service {
                 "Workspace buckets cannot be replication sources"
             ));
         }
+
+        let enabled_targets = configuration
+            .rules
+            .iter()
+            .filter(|rule| rule.status.as_str() == ReplicationRuleStatus::ENABLED)
+            .count();
+        if enabled_targets > MAX_REPLICATION_TARGETS {
+            return Err(s3_error!(
+                InvalidArgument,
+                "Replication supports at most {MAX_REPLICATION_TARGETS} enabled targets"
+            ));
+        }
+
         let mut targets = Vec::new();
+        let mut seen = BTreeSet::new();
 
         for rule in &configuration.rules {
             if rule.status.as_str() != ReplicationRuleStatus::ENABLED {
@@ -359,10 +376,19 @@ impl ArunaS3Service {
                 .as_ref()
                 .and_then(|replication| replication.status.as_ref())
                 .is_some_and(|status| status.as_str() == DeleteMarkerReplicationStatus::ENABLED);
+            let target_bucket = target_bucket.to_string();
+            if !seen.insert((
+                arn.node_id,
+                arn.realm_id,
+                target_bucket.clone(),
+                replicate_delete_markers,
+            )) {
+                continue;
+            }
             targets.push(aruna_core::structs::BucketReplicationTarget {
                 node_id: arn.node_id,
                 realm_id: arn.realm_id,
-                bucket: target_bucket.to_string(),
+                bucket: target_bucket,
                 arn: arn.to_string(),
                 replicate_delete_markers,
             });
@@ -3545,6 +3571,69 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].bucket, "target-bucket");
         assert_eq!(parsed[0].arn, target.to_string());
+    }
+
+    #[test]
+    fn deduplicates_targets() {
+        let realm_id = RealmId([77u8; 32]);
+        let source_node = iroh::SecretKey::from_bytes(&[78u8; 32]).public();
+        let target_node = iroh::SecretKey::from_bytes(&[79u8; 32]).public();
+        let (_storage_dir, service) = parser_service(realm_id, source_node);
+        let target = ArunaArn::s3_bucket(realm_id, target_node, "target-bucket").unwrap();
+        let mut configuration = replication_config(target.to_string());
+        let rule = configuration.rules[0].clone();
+        configuration.rules.push(rule);
+
+        let parsed = service
+            .parse_replication_targets("source-bucket", &configuration)
+            .unwrap();
+
+        assert_eq!(parsed.len(), 1);
+    }
+
+    #[test]
+    fn retains_delete_modes() {
+        let realm_id = RealmId([80u8; 32]);
+        let source_node = iroh::SecretKey::from_bytes(&[81u8; 32]).public();
+        let target_node = iroh::SecretKey::from_bytes(&[82u8; 32]).public();
+        let (_storage_dir, service) = parser_service(realm_id, source_node);
+        let target = ArunaArn::s3_bucket(realm_id, target_node, "target-bucket").unwrap();
+        let mut configuration = replication_config(target.to_string());
+        let rule = configuration.rules[0].clone();
+        configuration.rules.push(ReplicationRule {
+            delete_marker_replication: Some(DeleteMarkerReplication {
+                status: Some(DeleteMarkerReplicationStatus::ENABLED),
+            }),
+            ..rule
+        });
+
+        let parsed = service
+            .parse_replication_targets("source-bucket", &configuration)
+            .unwrap();
+
+        assert_eq!(parsed.len(), 2);
+        assert!(!parsed[0].replicate_delete_markers);
+        assert!(parsed[1].replicate_delete_markers);
+    }
+
+    #[test]
+    fn rejects_target_cap() {
+        let realm_id = RealmId([83u8; 32]);
+        let source_node = iroh::SecretKey::from_bytes(&[84u8; 32]).public();
+        let target_node = iroh::SecretKey::from_bytes(&[85u8; 32]).public();
+        let (_storage_dir, service) = parser_service(realm_id, source_node);
+        let target = ArunaArn::s3_bucket(realm_id, target_node, "target-bucket").unwrap();
+        let mut configuration = replication_config(target.to_string());
+        let rule = configuration.rules[0].clone();
+        configuration
+            .rules
+            .extend((0..MAX_REPLICATION_TARGETS).map(|_| rule.clone()));
+
+        assert!(
+            service
+                .parse_replication_targets("source-bucket", &configuration)
+                .is_err()
+        );
     }
 
     #[test]
