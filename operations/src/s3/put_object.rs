@@ -299,6 +299,10 @@ impl PutObjectOperation {
             Event::Blob(BlobEvent::Error(BlobError::StreamFailed(message))) => {
                 return self.cleanup_failed_write(PutObjectError::WriteFailed(message));
             }
+            Event::Blob(BlobEvent::Error(BlobError::WriteCleanup { location, message })) => {
+                self.written_location = Some(location);
+                return self.cleanup_failed_write(PutObjectError::BlobWriteFailed(message));
+            }
             Event::Blob(BlobEvent::Error(error)) => {
                 return self
                     .cleanup_failed_write(PutObjectError::BlobWriteFailed(error.to_string()));

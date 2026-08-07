@@ -53,6 +53,7 @@ where
 struct HiddenReservation {
     handler: BlobHandler,
     key: Arc<StdMutex<Option<HiddenBlobKey>>>,
+    location: Option<BackendLocation>,
     operator: Option<Operator>,
     storage_path: Option<String>,
     writer: Option<opendal::Writer>,
@@ -63,6 +64,7 @@ impl HiddenReservation {
         Self {
             handler,
             key: Arc::new(StdMutex::new(None)),
+            location: None,
             operator: None,
             storage_path: None,
             writer: None,
@@ -72,6 +74,10 @@ impl HiddenReservation {
     fn set_operator(&mut self, operator: Operator, storage_path: String) {
         self.operator = Some(operator);
         self.storage_path = Some(storage_path);
+    }
+
+    fn set_location(&mut self, location: BackendLocation) {
+        self.location = Some(location);
     }
 
     fn set_writer(&mut self, writer: opendal::Writer) {
@@ -96,7 +102,16 @@ impl HiddenReservation {
     async fn fail(&mut self, error: BlobError) -> BlobEvent {
         match self.abort().await {
             Ok(()) => BlobEvent::Error(error),
-            Err(cleanup) => BlobEvent::Error(cleanup),
+            Err(cleanup) => {
+                let plain = self.key.lock().map_or(true, |key| key.is_none());
+                match (plain, self.location.clone()) {
+                    (true, Some(location)) => BlobEvent::Error(BlobError::WriteCleanup {
+                        location,
+                        message: cleanup.to_string(),
+                    }),
+                    _ => BlobEvent::Error(cleanup),
+                }
+            }
         }
     }
 
@@ -199,6 +214,7 @@ impl BlobHandler {
     ) -> BlobEvent {
         let mut plain = HiddenReservation::new(self.clone());
         let reservation = reservation.unwrap_or(&mut plain);
+        reservation.set_location(location.clone());
         let storage_path = match location.get_storage_path() {
             Ok(storage_path) => storage_path,
             Err(e) => return reservation.fail(e).await,
@@ -533,8 +549,10 @@ impl BlobHandler {
         {
             BlobEvent::WriteFinished { location } => BlobEvent::WriteFinished { location },
             other => {
-                self.release_bucket(&resolved.backend, &backend_bucket)
-                    .await;
+                if !matches!(&other, BlobEvent::Error(BlobError::WriteCleanup { .. })) {
+                    self.release_bucket(&resolved.backend, &backend_bucket)
+                        .await;
+                }
                 other
             }
         }

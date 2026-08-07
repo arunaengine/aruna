@@ -1,4 +1,4 @@
-use crate::structs::SourceConnectorKind;
+use crate::structs::{BackendLocation, SourceConnectorKind};
 use std::array::TryFromSliceError;
 use thiserror::Error;
 
@@ -61,6 +61,12 @@ pub enum BlobError {
     /// Client-sourced body stream fault; the request, not the node, is at fault.
     #[error("Stream failed: {0}")]
     StreamFailed(String),
+    /// The output location must be handed to durable cleanup before releasing capacity.
+    #[error("Write cleanup failed for {location:?}: {message}")]
+    WriteCleanup {
+        location: BackendLocation,
+        message: String,
+    },
     #[error("Blob exceeds the {limit} byte limit")]
     SizeLimitExceeded { limit: u64 },
     #[error("Read error: {0}")]

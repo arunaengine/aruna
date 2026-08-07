@@ -14,7 +14,7 @@ use crate::replication::protocol::{
 };
 use crate::request_policy::{PolicyEvaluator, PolicyRequestExtras, policy_request_with};
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
-use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::errors::{AuthorizationError, BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -1500,6 +1500,10 @@ impl ReplicateObjectVersionOperation {
                     metadata,
                 });
                 self.read_current_lookup()
+            }
+            Event::Blob(BlobEvent::Error(BlobError::WriteCleanup { location, .. })) => {
+                self.cleanup_reference_blob = Some(location);
+                self.fail(ReplicationError::ReplicationFailed.into())
             }
             Event::Blob(BlobEvent::Error(_)) => {
                 self.fail(ReplicationError::ReplicationFailed.into())
