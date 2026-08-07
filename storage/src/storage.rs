@@ -462,15 +462,15 @@ impl StorageHandle {
         )) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
+                let event = StorageEvent::Error {
+                    error: StorageError::QueueFull,
+                };
+                self.observe_cleanup(cleanup, &event);
                 if let Some(txn_id) = active_txn_id {
                     if !matches!(cleanup, Some((_, CleanupKind::Abort))) {
                         self.enqueue_abort_transaction(txn_id, "request_queue_full");
                     }
                 }
-                let event = StorageEvent::Error {
-                    error: StorageError::QueueFull,
-                };
-                self.observe_cleanup(cleanup, &event);
                 return self.observe_storage_event(event);
             }
             Err(TrySendError::Disconnected(_)) => {
@@ -517,6 +517,16 @@ impl StorageHandle {
     }
 
     fn enqueue_abort_transaction(&self, txn_id: Ulid, reason: &'static str) {
+        if self
+            .transaction_cleanup
+            .lock()
+            .expect("transaction cleanup mutex poisoned")
+            .get(&txn_id)
+            .is_some_and(|entry| matches!(entry.kind, CleanupKind::CommitUnknown))
+        {
+            warn!(%txn_id, reason, "Skipping abort after an unknown commit outcome");
+            return;
+        }
         if !self.retain_cleanup(txn_id, CleanupKind::Abort) {
             warn!(%txn_id, reason, "Transaction cleanup capacity reached");
             return;
@@ -690,8 +700,20 @@ fn observe_cleanup(
         }
         _ => false,
     };
+    let downgrade = matches!(kind, CleanupKind::CommitUnknown)
+        && matches!(
+            event,
+            StorageEvent::Error {
+                error: StorageError::QueueFull
+            }
+        );
     let mut pending = pending.lock().expect("transaction cleanup mutex poisoned");
-    if terminal {
+    if downgrade {
+        if let Some(entry) = pending.get_mut(&txn_id) {
+            entry.kind = CleanupKind::Abort;
+            entry.attempts = 0;
+        }
+    } else if terminal {
         pending.remove(&txn_id);
     } else if let Some(entry) = pending.get_mut(&txn_id)
         && matches!(entry.kind, CleanupKind::Abort)
