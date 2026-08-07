@@ -334,9 +334,9 @@ fn is_bulk_request(
                 )
         }
         "PUT" => object && !query_has_any(uri, &["acl", "legal-hold", "retention", "tagging"]),
-        "DELETE" => object && !query_has_any(uri, &["tagging", "uploadId"]),
+        "DELETE" => object && !query_has_any(uri, &["tagging"]),
         "POST" => {
-            query_has_any(uri, &["delete", "select"])
+            query_has_any(uri, &["delete", "select", "uploadId"])
                 || headers
                     .get(header::CONTENT_TYPE)
                     .and_then(|value| value.to_str().ok())
@@ -1831,12 +1831,20 @@ mod tests {
             &http::Uri::from_static("/key?partNumber=1&uploadId=upload"),
             &headers,
         ));
-        assert!(!is_bulk_request(
+        assert!(is_bulk_request(
             &Method::POST,
             None,
             "/bucket/key",
             "s3.example",
             &http::Uri::from_static("/bucket/key?uploadId=upload"),
+            &headers,
+        ));
+        assert!(!is_bulk_request(
+            &Method::POST,
+            None,
+            "/bucket/key",
+            "s3.example",
+            &http::Uri::from_static("/bucket/key?uploads"),
             &headers,
         ));
         assert!(!is_bulk_request(
@@ -1861,6 +1869,14 @@ mod tests {
             "/bucket/key",
             "s3.example",
             &http::Uri::from_static("/bucket/key"),
+            &headers,
+        ));
+        assert!(is_bulk_request(
+            &Method::DELETE,
+            None,
+            "/bucket/key",
+            "s3.example",
+            &http::Uri::from_static("/bucket/key?uploadId=upload"),
             &headers,
         ));
         assert!(!is_bulk_request(
