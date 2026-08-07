@@ -5448,6 +5448,14 @@ async fn metadata_document_lifecycle_write_entries_if_current(
             metadata_document_delete_write_entries(event)?
         }
     };
+    if let MetadataDocumentLifecycleRecord::Upsert { event } = record
+        && event_is_create(event)
+    {
+        entries.push(
+            metadata_create_acceptance_write_entry(event)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+        );
+    }
     entries.push(
         document_sync_revision_write_entry(&target, change)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
@@ -13956,6 +13964,17 @@ mod tests {
         );
         let revision = read_lifecycle_revision(&storage, document_id).await;
         assert_eq!(revision, change);
+        let acceptance = read_storage_value(
+            &storage,
+            METADATA_CREATE_ACCEPTANCE_KEYSPACE,
+            metadata_create_acceptance_key(document_id),
+        )
+        .await
+        .expect("create acceptance exists");
+        assert_eq!(
+            postcard::from_bytes::<MetadataCreateEventRecord>(&acceptance).unwrap(),
+            event
+        );
     }
 
     #[tokio::test]
