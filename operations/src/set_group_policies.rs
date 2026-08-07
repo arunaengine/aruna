@@ -139,7 +139,7 @@ impl SetGroupPoliciesOperation {
         })]
     }
 
-    fn emit_write_document_and_admin_state(
+    fn emit_write_state(
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
@@ -293,7 +293,7 @@ impl Operation for SetGroupPoliciesOperation {
                             format!("{values:?}"),
                         );
                     };
-                    match self.emit_write_document_and_admin_state(
+                    match self.emit_write_state(
                         document_value.clone(),
                         reducer_state_value.clone(),
                         realm_config_value.clone(),

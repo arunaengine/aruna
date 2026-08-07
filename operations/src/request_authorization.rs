@@ -1,8 +1,6 @@
-//! The single request-authorization entry point. Every externally reachable
-//! REST and S3 permission decision routes through [`authorize`], so ordinary
-//! RBAC and public visibility are applied first and every applicable deny or
-//! require policy second. Bulk routes that authorize many candidates against
-//! one group reuse [`PolicyEvaluator`] to read policy state once.
+//! The request-authorization entry point for REST and S3: [`authorize`] applies
+//! RBAC and public visibility first, then every applicable deny/require policy.
+//! Bulk routes reuse [`PolicyEvaluator`] to read one group's policy state once.
 
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};

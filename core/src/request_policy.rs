@@ -1,13 +1,10 @@
-//! CEL request policies. A policy narrows what the authorization layer already
-//! allowed: a `Deny` policy denies when its expression is `true`, a `Require`
-//! policy denies unless its expression is `true`. An optional `when` guard
-//! decides applicability. Anything that fails to compile, fails to evaluate, or
-//! yields a non-boolean denies (fail-closed).
+//! CEL request policies narrow already-authorized requests: `Deny` denies on a
+//! match, `Require` denies without one, and `when` guards applicability; compile,
+//! evaluation, and non-boolean failures deny (fail-closed).
 //!
-//! Policy evaluation is pure. The caller assembles a [`PolicyRequest`]; the
-//! engine never performs I/O and never reads, buffers, or delays a streaming
-//! body. Body-content policies only ever run for operations whose handler
-//! already holds the full parsed body.
+//! Evaluation is pure: it performs no I/O and never reads, buffers, or delays a
+//! streaming body; body-content policies run only after the handler holds the
+//! full parsed body.
 
 use cel_interpreter::{Context, Program, Value};
 use serde::{Deserialize, Serialize};

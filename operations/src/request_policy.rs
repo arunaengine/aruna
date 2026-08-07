@@ -1,7 +1,6 @@
-//! Enforcement seam for the CEL request policies. Called at the request choke
-//! points after authorization allowed the action and before it executes; policy
-//! compile and evaluation failures deny (fail-closed), and a policy-state read
-//! that fails for any reason other than an absent config also denies.
+//! CEL policy enforcement runs after authorization allows an action and before
+//! execution; compile/evaluation failures and policy-state read failures deny,
+//! except an absent config, which carries no policies.
 
 use crate::driver::{DriverContext, drive};
 use crate::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
@@ -139,10 +138,9 @@ impl PolicyEvaluator {
     }
 }
 
-/// Evaluates the realm's then the group's request policies against one request.
-/// An absent realm config or group document carries no policies and allows;
-/// every other read failure, a policy that cannot be compiled, and any
-/// evaluation error deny. Either scope may deny; neither may grant.
+/// Evaluates realm then group policies for one request. Absent config carries no
+/// policies and allows; other read, compile, or evaluation failures deny. Either
+/// scope may deny; neither may grant.
 pub async fn enforce_policies(
     context: &DriverContext,
     realm_id: RealmId,

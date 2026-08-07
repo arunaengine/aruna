@@ -141,12 +141,9 @@ impl S3Access for AuthProvider {
         // handlers evaluate against the real query and allowlisted headers.
         let extras = request_extras(cx, &operation_name);
 
-        // DeleteObjects lists its target keys in the request body rather than the
-        // URL, so per-object authorization (RBAC and policy) is deferred to the
-        // handler, which evaluates each entry against one loaded policy set.
-        // Credentials, issuer, expiry, revocation and bucket ownership are
-        // already validated above, so anonymous and cross-group requests still
-        // fail closed here.
+        // DeleteObjects keys live in the body, so per-object RBAC/policy checks stay in
+        // the handler against one loaded policy set. Prior credential, issuer, expiry,
+        // revocation, and ownership checks keep anonymous/cross-group requests fail-closed.
         if cx.s3_op().name() != "DeleteObjects" {
             authorize(
                 self.driver_ctx.as_ref(),

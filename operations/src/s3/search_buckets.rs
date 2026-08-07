@@ -275,10 +275,9 @@ impl SearchBucketsOperation {
     }
 }
 
-/// Runs one node's bucket search and drops every hit denied by the realm or
-/// group request policies. Policy state is read once per distinct candidate
-/// group, a group whose policy state cannot be read stays invisible, and the
-/// page is filled across scans so a hidden bucket cannot shorten it.
+/// Runs one node's bucket search, dropping hits denied by realm/group policies.
+/// Policy state is read once per candidate group; unreadable groups stay invisible,
+/// and scans continue so hidden buckets cannot shorten the page.
 pub async fn search_local_buckets(
     context: &DriverContext,
     input: SearchBucketsInput,
