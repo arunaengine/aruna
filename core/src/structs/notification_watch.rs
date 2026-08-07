@@ -8,11 +8,12 @@ use ulid::Ulid;
 use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::{NotificationKind, PathRestriction, RealmId};
-use crate::types::{GroupId, Key, UserId, Value};
+use crate::types::{GroupId, Key, UserId};
 
 pub const NOTIFICATION_WATCH_PER_USER_CAP: usize = 50;
-pub const NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP: usize = 1024;
 pub const NOTIFICATION_WATCH_MAX_PREFIX_LEN: usize = 1024;
+pub const NOTIFICATION_WATCH_INTEREST_ENTRY_CAP: usize = 1024;
+pub const NOTIFICATION_WATCH_INTEREST_BYTES_CAP: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DataWatchResourcePath<'a> {
@@ -193,6 +194,14 @@ pub struct WatchEvent {
     pub actor: UserId,
     pub occurred_at_ms: u64,
     pub detail: WatchEventDetail,
+}
+
+/// A bounded holder-side continuation for a watch event scan. The event batch
+/// is retained until every subscription page has been applied.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchEventRetry {
+    pub events: Vec<WatchEvent>,
+    pub cursor: Option<Vec<u8>>,
 }
 
 /// Kind-specific payload carried by a [`WatchEvent`].
@@ -413,27 +422,6 @@ pub fn watch_subscription_prefix(owner: UserId) -> Key {
     ByteView::from(owner.to_storage_key())
 }
 
-const WATCH_SUBSCRIPTION_COUNT_PREFIX: &[u8] = b"count/";
-
-pub fn watch_count_key(realm_id: RealmId) -> Key {
-    let mut key = WATCH_SUBSCRIPTION_COUNT_PREFIX.to_vec();
-    key.extend_from_slice(realm_id.as_bytes());
-    ByteView::from(key)
-}
-
-pub fn watch_count_value(count: usize) -> Value {
-    Value::from((count as u64).to_be_bytes().to_vec())
-}
-
-pub fn decode_watch_count(value: &[u8]) -> Result<usize, ConversionError> {
-    let bytes: [u8; 8] = value.try_into().map_err(|_| {
-        ConversionError::InvalidLength("invalid watch subscription count".to_string())
-    })?;
-    usize::try_from(u64::from_be_bytes(bytes)).map_err(|_| {
-        ConversionError::InvalidLength("watch subscription count does not fit usize".to_string())
-    })
-}
-
 pub fn parse_watch_subscription_key(key: &[u8]) -> Result<(UserId, Ulid), ConversionError> {
     if key.len() != 64 {
         return Err(ConversionError::InvalidLength(format!(
@@ -453,6 +441,7 @@ pub fn parse_watch_subscription_key(key: &[u8]) -> Result<(UserId, Ulid), Conver
 pub const WATCH_INTEREST_NODE_PREFIX: &[u8] = b"n/";
 pub const WATCH_INTEREST_DIRTY_PREFIX: &[u8] = b"dirty/";
 const WATCH_INTEREST_PENDING_PREFIX: &[u8] = b"pending/";
+const WATCH_INTEREST_RETRY_PREFIX: &[u8] = b"retry/";
 
 /// One coalesced interest entry: the union of every subscription a node holds
 /// for a realm that shares this path prefix.
@@ -551,6 +540,19 @@ pub fn watch_interest_pending_key(realm_id: RealmId) -> Vec<u8> {
     let mut key = Vec::with_capacity(WATCH_INTEREST_PENDING_PREFIX.len() + 32);
     key.extend_from_slice(WATCH_INTEREST_PENDING_PREFIX);
     key.extend_from_slice(realm_id.as_bytes());
+    key
+}
+
+pub fn watch_retry_prefix(realm_id: RealmId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(WATCH_INTEREST_RETRY_PREFIX.len() + 32);
+    key.extend_from_slice(WATCH_INTEREST_RETRY_PREFIX);
+    key.extend_from_slice(realm_id.as_bytes());
+    key
+}
+
+pub fn watch_retry_key(realm_id: RealmId, event_id: Ulid) -> Vec<u8> {
+    let mut key = watch_retry_prefix(realm_id);
+    key.extend_from_slice(&event_id.to_bytes());
     key
 }
 
@@ -761,16 +763,6 @@ mod tests {
             parse_watch_subscription_key(&long),
             Err(ConversionError::InvalidLength(_))
         ));
-    }
-
-    #[test]
-    fn count_roundtrips() {
-        let realm = RealmId([7; 32]);
-        let key = watch_count_key(realm);
-        assert!(key.starts_with(b"count/"));
-        assert_eq!(key.len(), 38);
-        assert_eq!(decode_watch_count(&watch_count_value(17)).unwrap(), 17);
-        assert!(decode_watch_count(&[0; 7]).is_err());
     }
 
     #[test]
