@@ -1283,25 +1283,20 @@ impl MetadataHandle {
                 auth_token,
                 graph_iris,
                 sparql,
-            } => match authorize_remote_metadata_peer(
-                &self.inner.auth_validation,
-                &self.inner.storage_handle,
-                peer,
-                self.inner.net_handle.as_ref().map(|net| *net.realm_id()),
-                auth_token,
-                false,
-            )
-            .await
-            {
+            } => match self.authorize_read_peer(peer, auth_token, false).await {
                 Ok(auth_context) => {
                     match query_local_graphs(self.inner.clone(), auth_context, graph_iris, sparql)
                         .await
                     {
-                        Ok(results) => MetadataTransportMessage::QueryResults { results },
-                        Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                        Ok(results) => MetadataTransportMessage::QueryResults {
+                            result: Ok(results),
+                        },
+                        Err(error) => MetadataTransportMessage::QueryResults {
+                            result: Err(metadata_read_error(error)),
+                        },
                     }
                 }
-                Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                Err(error) => MetadataTransportMessage::QueryResults { result: Err(error) },
             },
             MetadataTransportMessage::SearchGraphs {
                 auth_token,
@@ -1309,16 +1304,7 @@ impl MetadataHandle {
                 query,
                 limit,
                 group_id,
-            } => match authorize_remote_metadata_peer(
-                &self.inner.auth_validation,
-                &self.inner.storage_handle,
-                peer,
-                self.inner.net_handle.as_ref().map(|net| *net.realm_id()),
-                auth_token,
-                false,
-            )
-            .await
-            {
+            } => match self.authorize_read_peer(peer, auth_token, false).await {
                 Ok(auth_context) => match search_local_graphs(
                     self.inner.clone(),
                     auth_context,
@@ -1330,10 +1316,12 @@ impl MetadataHandle {
                 )
                 .await
                 {
-                    Ok(hits) => MetadataTransportMessage::SearchResults { hits },
-                    Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                    Ok(hits) => MetadataTransportMessage::SearchResults { result: Ok(hits) },
+                    Err(error) => MetadataTransportMessage::SearchResults {
+                        result: Err(metadata_read_error(error)),
+                    },
                 },
-                Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                Err(error) => MetadataTransportMessage::SearchResults { result: Err(error) },
             },
             MetadataTransportMessage::FilteredSearchGraphs {
                 auth_token,
@@ -1343,16 +1331,7 @@ impl MetadataHandle {
                 predicate_iri,
                 object_iri,
                 group_id,
-            } => match authorize_remote_metadata_peer(
-                &self.inner.auth_validation,
-                &self.inner.storage_handle,
-                peer,
-                self.inner.net_handle.as_ref().map(|net| *net.realm_id()),
-                auth_token,
-                false,
-            )
-            .await
-            {
+            } => match self.authorize_read_peer(peer, auth_token, false).await {
                 Ok(auth_context) => match search_local_graphs(
                     self.inner.clone(),
                     auth_context,
@@ -1364,10 +1343,12 @@ impl MetadataHandle {
                 )
                 .await
                 {
-                    Ok(hits) => MetadataTransportMessage::SearchResults { hits },
-                    Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                    Ok(hits) => MetadataTransportMessage::SearchResults { result: Ok(hits) },
+                    Err(error) => MetadataTransportMessage::SearchResults {
+                        result: Err(metadata_read_error(error)),
+                    },
                 },
-                Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                Err(error) => MetadataTransportMessage::SearchResults { result: Err(error) },
             },
             MetadataTransportMessage::SearchBuckets {
                 auth_token,
@@ -2112,7 +2093,7 @@ impl MetadataHandle {
         auth_token: Option<MetadataAuthToken>,
         graph_iris: Option<Vec<String>>,
         sparql: String,
-    ) -> Result<MetadataQueryResults, MetadataError> {
+    ) -> Result<MetadataQueryResults, MetadataReadError> {
         let started = Instant::now();
         let span = Span::current();
         let result = match send_remote_metadata_request(
@@ -2126,13 +2107,10 @@ impl MetadataHandle {
             },
         )
         .await
-        .map_err(MetadataRequestError::into_metadata_error)?
+        .map_err(|_| MetadataReadError::Unavailable)?
         {
-            MetadataTransportMessage::QueryResults { results } => Ok(results),
-            MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
-            other => Err(MetadataError::Backend(format!(
-                "unexpected metadata query response: {other:?}"
-            ))),
+            MetadataTransportMessage::QueryResults { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
         };
         record_elapsed_ms(&span, "elapsed_ms", started);
         match &result {
@@ -2140,7 +2118,7 @@ impl MetadataHandle {
                 span.record("result", results.kind());
                 record_metadata_query_result_counts(&span, results);
             }
-            Err(error) => record_error(&span, &error.to_string()),
+            Err(error) => record_error(&span, &format!("{error:?}")),
         }
         result
     }
@@ -2152,7 +2130,7 @@ impl MetadataHandle {
         config_digest: [u8; 32],
         document_id: Ulid,
         sparql: String,
-    ) -> Result<MetadataQueryResults, MetadataError> {
+    ) -> Result<MetadataQueryResults, MetadataReadError> {
         match send_remote_metadata_request(
             &self.inner,
             &Span::current(),
@@ -2165,18 +2143,10 @@ impl MetadataHandle {
             },
         )
         .await
-        .map_err(MetadataRequestError::into_metadata_error)?
+        .map_err(|_| MetadataReadError::Unavailable)?
         {
-            MetadataTransportMessage::DocumentQueryResults {
-                result: Ok(results),
-            } => Ok(results),
-            MetadataTransportMessage::DocumentQueryResults { result: Err(error) } => Err(
-                MetadataError::Backend(format!("document query failed: {error:?}")),
-            ),
-            response => Err(MetadataError::Backend(format!(
-                "unexpected document query response: {}",
-                transport_message_kind(&response)
-            ))),
+            MetadataTransportMessage::DocumentQueryResults { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
         }
     }
 
@@ -2203,7 +2173,7 @@ impl MetadataHandle {
         query: String,
         limit: usize,
         group_id: Option<GroupId>,
-    ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+    ) -> Result<Vec<MetadataSearchHit>, MetadataReadError> {
         self.request_remote_search_graphs_with_filter(
             node_id, auth_token, graph_iris, query, limit, group_id, None,
         )
@@ -2329,7 +2299,7 @@ impl MetadataHandle {
         predicate_iri: String,
         object_iri: String,
         group_id: Option<GroupId>,
-    ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+    ) -> Result<Vec<MetadataSearchHit>, MetadataReadError> {
         self.request_remote_search_graphs_with_filter(
             node_id,
             auth_token,
@@ -2352,7 +2322,7 @@ impl MetadataHandle {
         limit: usize,
         group_id: Option<GroupId>,
         iri_filter: Option<(String, String)>,
-    ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+    ) -> Result<Vec<MetadataSearchHit>, MetadataReadError> {
         let started = Instant::now();
         let span = Span::current();
         let message = match iri_filter {
@@ -2375,13 +2345,10 @@ impl MetadataHandle {
         };
         let result = match send_remote_metadata_request(&self.inner, &span, node_id, message)
             .await
-            .map_err(MetadataRequestError::into_metadata_error)?
+            .map_err(|_| MetadataReadError::Unavailable)?
         {
-            MetadataTransportMessage::SearchResults { hits } => Ok(hits),
-            MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
-            other => Err(MetadataError::Backend(format!(
-                "unexpected metadata search response: {other:?}"
-            ))),
+            MetadataTransportMessage::SearchResults { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
         };
         record_elapsed_ms(&span, "elapsed_ms", started);
         match &result {
@@ -2389,7 +2356,7 @@ impl MetadataHandle {
                 span.record("result", "ok");
                 span.record("hit_count", hits.len() as u64);
             }
-            Err(error) => record_error(&span, &error.to_string()),
+            Err(error) => record_error(&span, &format!("{error:?}")),
         }
         result
     }
@@ -4227,6 +4194,21 @@ fn claim_read_error(error: super::api::MetadataApiError) -> MetadataReadError {
         super::api::MetadataApiError::Forbidden => MetadataReadError::Forbidden,
         super::api::MetadataApiError::NotFound => MetadataReadError::NotFound,
         _ => MetadataReadError::Unavailable,
+    }
+}
+
+pub(crate) fn metadata_read_error(error: MetadataError) -> MetadataReadError {
+    match error {
+        MetadataError::GraphNotFound => MetadataReadError::NotFound,
+        MetadataError::InvalidInput(_)
+        | MetadataError::ChannelClosed
+        | MetadataError::InvalidEffect
+        | MetadataError::HandleMissing
+        | MetadataError::TaskJoin(_)
+        | MetadataError::Validation(_)
+        | MetadataError::Persist(_)
+        | MetadataError::Storage(_)
+        | MetadataError::Backend(_) => MetadataReadError::Unavailable,
     }
 }
 
@@ -6652,6 +6634,18 @@ mod tests {
             parse_metadata_query(&" ".repeat(METADATA_QUERY_MAX_BYTES + 1)),
             Err(MetadataError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn read_error_mapping() {
+        assert_eq!(
+            metadata_read_error(MetadataError::GraphNotFound),
+            MetadataReadError::NotFound
+        );
+        assert_eq!(
+            metadata_read_error(MetadataError::Backend("storage".to_string())),
+            MetadataReadError::Unavailable
+        );
     }
 
     #[test]

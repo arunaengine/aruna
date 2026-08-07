@@ -53,7 +53,7 @@ pub enum MetadataTransportMessage {
         sparql: String,
     },
     QueryResults {
-        results: MetadataQueryResults,
+        result: Result<MetadataQueryResults, MetadataReadError>,
     },
     SearchGraphs {
         auth_token: Option<MetadataAuthToken>,
@@ -63,7 +63,7 @@ pub enum MetadataTransportMessage {
         group_id: Option<GroupId>,
     },
     SearchResults {
-        hits: Vec<MetadataSearchHit>,
+        result: Result<Vec<MetadataSearchHit>, MetadataReadError>,
     },
     /// A metadata write that arrived at a node holding none of the document's
     /// bucket, forwarded to a holder. The payloads mirror the HTTP handlers'
@@ -479,6 +479,24 @@ mod tests {
             postcard::from_bytes::<MetadataTransportMessage>(&bytes).unwrap(),
             message
         );
+    }
+
+    #[test]
+    fn read_results_preserve_errors() {
+        for error in [
+            MetadataReadError::Unauthorized,
+            MetadataReadError::Forbidden,
+            MetadataReadError::NotFound,
+            MetadataReadError::Unavailable,
+        ] {
+            let query = MetadataTransportMessage::QueryResults { result: Err(error) };
+            let search = MetadataTransportMessage::SearchResults { result: Err(error) };
+
+            for message in [query, search] {
+                let bytes = postcard::to_allocvec(&message).unwrap();
+                assert_eq!(postcard::from_bytes(&bytes).unwrap(), message);
+            }
+        }
     }
 
     #[test]
