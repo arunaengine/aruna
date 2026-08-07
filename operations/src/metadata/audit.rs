@@ -670,7 +670,7 @@ mod tests {
         peers.insert(1, unique[0]);
         let group_id = Ulid::from_bytes([3u8; 16]);
         let mut operation =
-            ListAuditOperation::new(group_id, None, peers, None, 10, None, [0u8; 32]);
+            ListAuditOperation::new(group_id, None, peers.clone(), None, 10, None, [0u8; 32]);
 
         let effects = operation.start();
         assert_eq!(effects.len(), 2);
@@ -685,7 +685,7 @@ mod tests {
         }));
         assert!(!operation.is_complete());
         operation.step(Event::Net(NetEvent::AuditPages(
-            peers
+            unique
                 .iter()
                 .map(|node| AuditPageEvent::Unavailable {
                     node: *node,
@@ -697,7 +697,7 @@ mod tests {
         assert!(operation.is_complete());
         let aggregate = operation.finalize().unwrap();
         assert!(aggregate.partial);
-        assert_eq!(aggregate.missing_nodes.len(), peers.len());
+        assert_eq!(aggregate.missing_nodes.len(), unique.len());
         assert!(aggregate.records.is_empty());
     }
 
