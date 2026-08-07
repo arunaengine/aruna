@@ -355,7 +355,7 @@ pub async fn list_visible_metadata_documents(
     let group_ids = check_policy_limit(match request.group_id {
         Some(group_id) => vec![group_id],
         None => drive(
-            ListGroupOperation::with_pagination(MAX_POLICY_CANDIDATES + 1, 0),
+            ListGroupOperation::with_pagination(METADATA_REGISTRY_CANDIDATE_LIMIT + 1, 0),
             context,
         )
         .await
@@ -369,14 +369,14 @@ pub async fn list_visible_metadata_documents(
     // never once per group.
     let recent = request.order == MetadataListOrder::Recent;
     let mut pending = if request.include_summary || recent {
-        load_pending_records(context, request.group_id, MAX_POLICY_CANDIDATES).await?
+        load_pending_records(context, request.group_id, METADATA_REGISTRY_CANDIDATE_LIMIT).await?
     } else {
         HashMap::new()
     };
 
     let mut records = Vec::new();
     for group_id in group_ids {
-        let remaining = MAX_POLICY_CANDIDATES.saturating_sub(records.len());
+        let remaining = METADATA_REGISTRY_CANDIDATE_LIMIT.saturating_sub(records.len());
         let mut group_records = load_group_records(context, group_id, remaining).await?;
         if let Some(pending_records) = pending.remove(&group_id) {
             merge_pending_metadata_records(&mut group_records, pending_records);
@@ -622,7 +622,7 @@ pub async fn lookup_metadata_path(
         match response {
             Ok(returned) => {
                 candidate_count = candidate_count.saturating_add(returned.len());
-                if candidate_count > MAX_POLICY_CANDIDATES {
+                if candidate_count > METADATA_REGISTRY_CANDIDATE_LIMIT {
                     return Err(MetadataApiError::ServiceUnavailable);
                 }
                 only_auth = false;
@@ -682,7 +682,7 @@ async fn forward_path_resolution(
         .as_ref()
         .map(|net| net.node_id())
         .ok_or(MetadataApiError::ServiceUnavailable)?;
-    let mut coordinators = config
+    let mut peers = config
         .nodes
         .iter()
         .filter(|node| matches!(node.kind, RealmNodeKind::Management | RealmNodeKind::Server))
@@ -692,8 +692,14 @@ async fn forward_path_resolution(
                 .map_err(|_| MetadataApiError::ServiceUnavailable)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    coordinators.retain(|node| *node != local_node);
-    coordinators.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    peers.retain(|node| *node != local_node);
+    let mut seen = HashSet::new();
+    peers.retain(|peer| seen.insert(*peer));
+    peers.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    peers.truncate(METADATA_DISTRIBUTED_QUERY_MAX_NODES);
+    if peers.is_empty() {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
     let metadata = context
         .metadata_handle
         .as_ref()
@@ -701,36 +707,55 @@ async fn forward_path_resolution(
     let config_digest = config
         .digest()
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    for coordinator in coordinators {
-        let response = tokio::time::timeout(
-            METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT,
-            metadata.request_forwarded_write(
-                coordinator,
-                MetadataTransportMessage::ForwardPathResolution {
-                    auth_token: auth_token.clone(),
-                    group_id: request.group_id,
-                    document_path: request.document_path.clone(),
-                    config_digest,
-                },
-            ),
-        )
-        .await;
+    let requests = stream::iter(peers.into_iter().map(|peer| {
+        let auth_token = auth_token.clone();
+        let document_path = request.document_path.clone();
+        async move {
+            let response = metadata
+                .request_forwarded_write(
+                    peer,
+                    MetadataTransportMessage::ForwardPathResolution {
+                        auth_token,
+                        group_id: request.group_id,
+                        document_path,
+                        config_digest,
+                    },
+                )
+                .await;
+            (response, peer)
+        }
+    }))
+    .buffer_unordered(METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT);
+    futures_util::pin_mut!(requests);
+    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
+    let mut not_found = false;
+    let mut unavailable = false;
+    loop {
+        let response = match tokio::time::timeout_at(deadline, requests.next()).await {
+            Ok(response) => response,
+            Err(_) => return Err(MetadataApiError::ServiceUnavailable),
+        };
+        let Some((response, _peer)) = response else {
+            break;
+        };
         match response {
-            Ok(Ok(MetadataTransportMessage::ForwardedPathResolution { result: Ok(result) })) => {
+            Ok(Ok(MetadataTransportMessage::ForwardedPathResolution {
+                result: Ok(result),
+            })) => {
                 if validate_path_resolution(
                     realm_id,
                     request.group_id,
                     &request.document_path,
                     &result,
                 )
-                .is_err()
+                .is_ok()
                 {
-                    continue;
+                    return Ok(MetadataPathLookupResult {
+                        winner: result.winner,
+                        conflicts: result.conflicts,
+                    });
                 }
-                return Ok(MetadataPathLookupResult {
-                    winner: result.winner,
-                    conflicts: result.conflicts,
-                });
+                unavailable = true;
             }
             Ok(Ok(MetadataTransportMessage::ForwardedPathResolution {
                 result: Err(MetadataReadError::Unauthorized),
@@ -740,11 +765,15 @@ async fn forward_path_resolution(
             })) => return Err(MetadataApiError::Forbidden),
             Ok(Ok(MetadataTransportMessage::ForwardedPathResolution {
                 result: Err(MetadataReadError::NotFound),
-            })) => return Err(MetadataApiError::NotFound),
-            _ => {}
+            })) => not_found = true,
+            _ => unavailable = true,
         }
     }
-    Err(MetadataApiError::ServiceUnavailable)
+    if not_found && !unavailable {
+        Err(MetadataApiError::NotFound)
+    } else {
+        Err(MetadataApiError::ServiceUnavailable)
+    }
 }
 
 fn validate_path_resolution(
@@ -1599,7 +1628,7 @@ fn effective_list_limit(requested: Option<usize>, anonymous: bool) -> usize {
 }
 
 fn check_policy_limit(group_ids: Vec<GroupId>) -> Result<Vec<GroupId>, MetadataApiError> {
-    if group_ids.len() > MAX_POLICY_CANDIDATES {
+    if group_ids.len() > METADATA_REGISTRY_CANDIDATE_LIMIT {
         return Err(MetadataApiError::ServiceUnavailable);
     }
     Ok(group_ids)
@@ -1655,7 +1684,7 @@ async fn load_claim_records(
     let group_ids = check_policy_limit(match group_id {
         Some(group_id) => vec![group_id],
         None => drive(
-            ListGroupOperation::with_pagination(MAX_POLICY_CANDIDATES + 1, 0),
+            ListGroupOperation::with_pagination(METADATA_REGISTRY_CANDIDATE_LIMIT + 1, 0),
             context,
         )
         .await
@@ -1664,10 +1693,15 @@ async fn load_claim_records(
         .map(|group| group.group_id)
         .collect(),
     })?;
-    let mut pending = load_pending_records(context, group_id, MAX_POLICY_CANDIDATES).await?;
+    let mut pending = load_pending_records(
+        context,
+        group_id,
+        METADATA_REGISTRY_CANDIDATE_LIMIT,
+    )
+    .await?;
     let mut records = Vec::new();
     for group_id in group_ids {
-        let remaining = MAX_POLICY_CANDIDATES.saturating_sub(records.len());
+        let remaining = METADATA_REGISTRY_CANDIDATE_LIMIT.saturating_sub(records.len());
         let mut group_records = load_group_records(context, group_id, remaining).await?;
         if let Some(pending_records) = pending.remove(&group_id) {
             merge_pending_metadata_records(&mut group_records, pending_records);
@@ -1679,7 +1713,7 @@ async fn load_claim_records(
         records.extend(group_records);
     }
     for pending_records in pending.into_values() {
-        if records.len().saturating_add(pending_records.len()) > MAX_POLICY_CANDIDATES {
+        if records.len().saturating_add(pending_records.len()) > METADATA_REGISTRY_CANDIDATE_LIMIT {
             return Err(MetadataApiError::ServiceUnavailable);
         }
         records.extend(pending_records);
@@ -3312,12 +3346,12 @@ mod tests {
 
     #[test]
     fn policy_scope_limit() {
-        let within = (0..MAX_POLICY_CANDIDATES)
+        let within = (0..METADATA_REGISTRY_CANDIDATE_LIMIT)
             .map(|_| Ulid::generate())
             .collect();
         assert!(check_policy_limit(within).is_ok());
 
-        let over = (0..=MAX_POLICY_CANDIDATES)
+        let over = (0..=METADATA_REGISTRY_CANDIDATE_LIMIT)
             .map(|_| Ulid::generate())
             .collect();
         assert!(matches!(
