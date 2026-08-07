@@ -1,7 +1,7 @@
 use aruna_blob::blob::{BlobHandle, GroupHold};
 use aruna_compute::ExecutorRegistry;
 use aruna_core::effects::{AuditPageEffect, Effect, JobControlEffect, NetEffect, StorageEffect};
-use aruna_core::errors::BlobError;
+use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{
     AuditPageEvent, BlobEvent, Event, JobControlEvent, NetEvent, StorageEvent, SubOperationEvent,
 };
@@ -18,7 +18,7 @@ use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use futures_util::{StreamExt, stream};
 use std::any::{type_name, type_name_of_val};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -361,12 +361,8 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
                     max_depth: MAX_SUBOP_DEPTH,
                 })
             } else {
-                let context = context.clone();
-                tokio::spawn(
-                    async move { drive_suboperation(sub_operation, &context, depth + 1).await },
-                )
-                .await
-                .expect("suboperation task panicked or was cancelled")
+                // Keep the child owned by this future so cancellation cannot detach it.
+                drive_suboperation(sub_operation, context, depth + 1).await
             }
         }
         Effect::Task(task_effect) => {
@@ -514,31 +510,140 @@ fn task_effect_key(effect: &TaskEffect) -> Option<TaskKey> {
     }
 }
 
-fn note_transaction_effect(open_txn: &mut Option<TxnId>, effect: &Effect) {
-    if let Effect::Storage(
-        StorageEffect::CommitTransaction { txn_id } | StorageEffect::AbortTransaction { txn_id },
-    ) = effect
-        && *open_txn == Some(*txn_id)
-    {
-        *open_txn = None;
+const MAX_TRACKED_TRANSACTIONS: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransactionState {
+    Open,
+    CommitUnknown,
+    AbortFailed,
+}
+
+#[derive(Clone, Copy)]
+enum TransactionEffect {
+    Start,
+    Commit(TxnId),
+    Abort(TxnId),
+}
+
+fn transaction_effect(effect: &Effect) -> Option<TransactionEffect> {
+    let Effect::Storage(storage_effect) = effect else {
+        return None;
+    };
+    match storage_effect {
+        StorageEffect::StartTransaction { .. } => Some(TransactionEffect::Start),
+        StorageEffect::CommitTransaction { txn_id } => Some(TransactionEffect::Commit(*txn_id)),
+        StorageEffect::AbortTransaction { txn_id } => Some(TransactionEffect::Abort(*txn_id)),
+        _ => None,
     }
 }
 
-fn note_transaction_event(open_txn: &mut Option<TxnId>, event: &Event) {
-    if let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event {
-        *open_txn = Some(*txn_id);
+#[derive(Default)]
+struct TransactionTracker {
+    states: BTreeMap<TxnId, TransactionState>,
+}
+
+impl TransactionTracker {
+    fn observe(&mut self, effect: Option<TransactionEffect>, event: &Event) -> Option<TxnId> {
+        match (effect, event) {
+            (
+                Some(TransactionEffect::Start),
+                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
+            ) => {
+                if self.states.len() >= MAX_TRACKED_TRANSACTIONS {
+                    warn!(%txn_id, "Too many transactions tracked by operation driver");
+                    Some(*txn_id)
+                } else {
+                    self.states.insert(*txn_id, TransactionState::Open);
+                    None
+                }
+            }
+            (
+                Some(TransactionEffect::Commit(txn_id)),
+                Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed }),
+            ) if txn_id == *committed => {
+                self.states.remove(&txn_id);
+                None
+            }
+            (
+                Some(TransactionEffect::Commit(txn_id)),
+                Event::Storage(StorageEvent::Error { error }),
+            ) if error.proves_no_commit() => {
+                self.states.remove(&txn_id);
+                None
+            }
+            (
+                Some(TransactionEffect::Commit(txn_id)),
+                Event::Storage(StorageEvent::Error { .. }),
+            ) => {
+                if self.states.contains_key(&txn_id) {
+                    self.states.insert(txn_id, TransactionState::CommitUnknown);
+                }
+                None
+            }
+            (
+                Some(TransactionEffect::Abort(txn_id)),
+                Event::Storage(StorageEvent::TransactionAborted { txn_id: aborted }),
+            ) if txn_id == *aborted => {
+                self.states.remove(&txn_id);
+                None
+            }
+            (
+                Some(TransactionEffect::Abort(txn_id)),
+                Event::Storage(StorageEvent::Error { error }),
+            ) if matches!(error, StorageError::TransactionNotFound) => {
+                self.states.remove(&txn_id);
+                None
+            }
+            (
+                Some(TransactionEffect::Abort(txn_id)),
+                Event::Storage(StorageEvent::Error { .. }),
+            ) => {
+                if self.states.contains_key(&txn_id) {
+                    self.states.insert(txn_id, TransactionState::AbortFailed);
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn pending(&self) -> Vec<(TxnId, TransactionState)> {
+        self.states
+            .iter()
+            .filter_map(|(txn_id, state)| match state {
+                TransactionState::CommitUnknown => None,
+                state => Some((*txn_id, *state)),
+            })
+            .collect()
     }
 }
 
-async fn abort_leaked_transaction(open_txn: Option<TxnId>, context: &DriverContext, depth: usize) {
-    if let Some(txn_id) = open_txn {
-        warn!(%txn_id, "Aborting a transaction left open by an operation");
-        let _ = Box::pin(dispatch_effect(
-            Effect::Storage(StorageEffect::AbortTransaction { txn_id }),
-            context,
-            depth,
-        ))
-        .await;
+async fn abort_leaked_transaction(
+    tracker: &mut TransactionTracker,
+    context: &DriverContext,
+    depth: usize,
+) {
+    for (txn_id, state) in tracker.pending() {
+        let attempts = match state {
+            TransactionState::Open => 2,
+            TransactionState::AbortFailed => 1,
+            TransactionState::CommitUnknown => 0,
+        };
+        for attempt in 0..attempts {
+            let effect = Effect::Storage(StorageEffect::AbortTransaction { txn_id });
+            let event = dispatch_effect(effect, context, depth).await;
+            tracker.observe(Some(TransactionEffect::Abort(txn_id)), &event);
+            if !tracker.states.contains_key(&txn_id) {
+                break;
+            }
+            if attempt + 1 < attempts {
+                warn!(%txn_id, "Retrying failed transaction cleanup");
+            }
+        }
+        if tracker.states.remove(&txn_id).is_some() {
+            warn!(%txn_id, "Transaction cleanup failed");
+        }
     }
 }
 
@@ -559,14 +664,19 @@ fn drive_suboperation<'a>(
             );
             let mut queue: VecDeque<_> = operation.start().into_iter().collect();
             let mut holds = Vec::new();
-            let mut open_txn = None;
+            let mut tracker = TransactionTracker::default();
 
             while !operation.is_complete() {
                 while let Some(effect) = queue.pop_front() {
-                    note_transaction_effect(&mut open_txn, &effect);
+                    let transaction = transaction_effect(&effect);
                     hold_backends(context, &effect, &mut holds);
                     let event = dispatch_effect(effect, context, depth).await;
-                    note_transaction_event(&mut open_txn, &event);
+                    let emergency_abort = tracker.observe(transaction, &event);
+                    if let Some(txn_id) = emergency_abort {
+                        queue.push_front(Effect::Storage(StorageEffect::AbortTransaction {
+                            txn_id,
+                        }));
+                    }
                     queue.extend(operation.step(event));
                 }
 
@@ -578,7 +688,7 @@ fn drive_suboperation<'a>(
                 }
             }
 
-            abort_leaked_transaction(open_txn, context, depth).await;
+            abort_leaked_transaction(&mut tracker, context, depth).await;
             trace!(
                 event = "suboperation.completed",
                 operation = %operation_name,
@@ -609,11 +719,11 @@ pub async fn drive_until<O: Operation>(
     let mut queue: VecDeque<_> = operation.start().into_iter().collect();
     let mut expired = false;
     let mut holds = Vec::new();
-    let mut open_txn = None;
+    let mut tracker = TransactionTracker::default();
 
     while !operation.is_complete() {
         while let Some(effect) = queue.pop_front() {
-            note_transaction_effect(&mut open_txn, &effect);
+            let transaction = transaction_effect(&effect);
             hold_backends(context, &effect, &mut holds);
             let dispatch = Box::pin(dispatch_effect(effect, context, 0));
             let event = if expired {
@@ -633,7 +743,10 @@ pub async fn drive_until<O: Operation>(
                     }
                 }
             };
-            note_transaction_event(&mut open_txn, &event);
+            let emergency_abort = tracker.observe(transaction, &event);
+            if let Some(txn_id) = emergency_abort {
+                queue.push_front(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
+            }
             queue.extend(operation.step(event));
         }
 
@@ -644,7 +757,7 @@ pub async fn drive_until<O: Operation>(
             }
         }
     }
-    abort_leaked_transaction(open_txn, context, 0).await;
+    abort_leaked_transaction(&mut tracker, context, 0).await;
     operation.finalize()
 }
 
@@ -668,14 +781,17 @@ pub async fn drive<O: Operation>(
 
     let mut queue: VecDeque<_> = operation.start().into_iter().collect();
     let mut holds = Vec::new();
-    let mut open_txn = None;
+    let mut tracker = TransactionTracker::default();
 
     while !operation.is_complete() {
         while let Some(effect) = queue.pop_front() {
-            note_transaction_effect(&mut open_txn, &effect);
+            let transaction = transaction_effect(&effect);
             hold_backends(context, &effect, &mut holds);
             let event = Box::pin(dispatch_effect(effect, context, 0)).await;
-            note_transaction_event(&mut open_txn, &event);
+            let emergency_abort = tracker.observe(transaction, &event);
+            if let Some(txn_id) = emergency_abort {
+                queue.push_front(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
+            }
             queue.extend(operation.step(event));
         }
 
@@ -686,7 +802,7 @@ pub async fn drive<O: Operation>(
             }
         }
     }
-    abort_leaked_transaction(open_txn, context, 0).await;
+    abort_leaked_transaction(&mut tracker, context, 0).await;
     let result = operation.finalize();
     match &result {
         Ok(_) => trace!(
@@ -743,10 +859,12 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use aruna_core::{
         effects::{Effect, StagingSourceEffect, StorageEffect},
+        errors::StorageError,
         events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent},
         operation::{Operation, boxed_suboperation},
         structs::{ResolvedSourceAccess, SourceConnectorKind},
         task::{TaskEffect, TaskKey},
+        types::TxnId,
     };
     use aruna_storage::storage;
     use byteview::ByteView;
@@ -1028,6 +1146,7 @@ mod test {
     struct MarkerAbortOperation {
         state: u8,
         fail: bool,
+        txn_id: Option<TxnId>,
     }
 
     impl Operation for MarkerAbortOperation {
@@ -1043,18 +1162,28 @@ mod test {
 
         fn step(&mut self, event: Event) -> aruna_core::types::Effects {
             match (event, self.state) {
-                (Event::Storage(StorageEvent::TransactionStarted { .. }), 1) if self.fail => {
-                    self.state = 3;
-                    smallvec::smallvec![]
-                }
                 (Event::Storage(StorageEvent::TransactionStarted { txn_id }), 1) => {
+                    self.txn_id = Some(txn_id);
                     self.state = 2;
-                    smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
-                        txn_id,
+                    smallvec::smallvec![Effect::Storage(StorageEffect::Write {
+                        key_space: "default".to_string(),
+                        key: ByteView::from(*b"staged-marker"),
+                        value: ByteView::from(*b"staged"),
+                        txn_id: Some(txn_id),
                     })]
                 }
-                (Event::Storage(StorageEvent::TransactionCommitted { .. }), 2) => {
+                (Event::Storage(StorageEvent::WriteResult { .. }), 2) if self.fail => {
+                    self.state = 4;
+                    smallvec::smallvec![]
+                }
+                (Event::Storage(StorageEvent::WriteResult { .. }), 2) => {
                     self.state = 3;
+                    smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
+                        txn_id: self.txn_id.expect("transaction id recorded")
+                    })]
+                }
+                (Event::Storage(StorageEvent::TransactionCommitted { .. }), 3) => {
+                    self.state = 4;
                     smallvec::smallvec![]
                 }
                 _ => smallvec::smallvec![],
@@ -1062,7 +1191,7 @@ mod test {
         }
 
         fn is_complete(&self) -> bool {
-            self.state == 3
+            self.state == 4
         }
 
         fn finalize(self) -> Result<Self::Output, Self::Error> {
@@ -1094,6 +1223,21 @@ mod test {
         value.is_none()
     }
 
+    async fn staged_value(context: &DriverContext) -> Option<ByteView> {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: "default".to_string(),
+                key: ByteView::from(*b"staged-marker"),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("unexpected storage event");
+        };
+        value
+    }
+
     async fn transaction_reopens(context: &DriverContext) -> bool {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = context
             .storage_handle
@@ -1110,6 +1254,76 @@ mod test {
             Event::Storage(StorageEvent::TransactionAborted { txn_id: aborted })
                 if aborted == txn_id
         )
+    }
+
+    fn test_context() -> (tempfile::TempDir, DriverContext) {
+        let directory = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        (directory, context)
+    }
+
+    #[test]
+    fn commit_unknown_safe() {
+        let id = ulid::Ulid::generate();
+        let mut tracker = TransactionTracker::default();
+        let started = Event::Storage(StorageEvent::TransactionStarted { txn_id: id });
+        let failed = Event::Storage(StorageEvent::Error {
+            error: StorageError::CommitFailed,
+        });
+        tracker.observe(Some(TransactionEffect::Start), &started);
+        tracker.observe(Some(TransactionEffect::Commit(id)), &failed);
+        assert_eq!(
+            tracker.states.get(&id),
+            Some(&TransactionState::CommitUnknown)
+        );
+        assert!(tracker.pending().is_empty());
+    }
+
+    #[test]
+    fn abort_failure_kept() {
+        let id = ulid::Ulid::generate();
+        let mut tracker = TransactionTracker::default();
+        let started = Event::Storage(StorageEvent::TransactionStarted { txn_id: id });
+        let failed = Event::Storage(StorageEvent::Error {
+            error: StorageError::WriteError,
+        });
+        tracker.observe(Some(TransactionEffect::Start), &started);
+        tracker.observe(Some(TransactionEffect::Abort(id)), &failed);
+        assert_eq!(
+            tracker.states.get(&id),
+            Some(&TransactionState::AbortFailed)
+        );
+        assert_eq!(tracker.pending(), vec![(id, TransactionState::AbortFailed)]);
+    }
+
+    #[test]
+    fn tracker_bounds() {
+        let mut tracker = TransactionTracker::default();
+        for _ in 0..MAX_TRACKED_TRANSACTIONS {
+            let id = ulid::Ulid::generate();
+            let started = Event::Storage(StorageEvent::TransactionStarted { txn_id: id });
+            assert!(
+                tracker
+                    .observe(Some(TransactionEffect::Start), &started)
+                    .is_none()
+            );
+        }
+        let id = ulid::Ulid::generate();
+        let started = Event::Storage(StorageEvent::TransactionStarted { txn_id: id });
+        assert_eq!(
+            tracker.observe(Some(TransactionEffect::Start), &started),
+            Some(id)
+        );
+        assert_eq!(tracker.states.len(), MAX_TRACKED_TRANSACTIONS);
     }
 
     #[tokio::test]
@@ -1130,6 +1344,7 @@ mod test {
             MarkerAbortOperation {
                 state: 0,
                 fail: false,
+                txn_id: None,
             },
             &context,
         )
@@ -1137,6 +1352,10 @@ mod test {
 
         assert!(result.is_ok());
         assert!(marker_absent(&context).await);
+        assert_eq!(
+            staged_value(&context).await,
+            Some(ByteView::from(*b"staged"))
+        );
         assert!(transaction_reopens(&context).await);
     }
 
@@ -1158,6 +1377,7 @@ mod test {
             MarkerAbortOperation {
                 state: 0,
                 fail: true,
+                txn_id: None,
             },
             &context,
         )
@@ -1165,6 +1385,79 @@ mod test {
 
         assert!(result.is_err());
         assert!(marker_absent(&context).await);
+        assert_eq!(staged_value(&context).await, None);
+        assert!(transaction_reopens(&context).await);
+    }
+
+    #[tokio::test]
+    async fn deadline_commit_safe() {
+        let (_directory, context) = test_context();
+        let result = crate::driver::drive_until(
+            MarkerAbortOperation {
+                state: 0,
+                fail: false,
+                txn_id: None,
+            },
+            &context,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(marker_absent(&context).await);
+        assert_eq!(
+            staged_value(&context).await,
+            Some(ByteView::from(*b"staged"))
+        );
+        assert!(transaction_reopens(&context).await);
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct NestedTransactionOperation {
+        done: bool,
+    }
+
+    impl Operation for NestedTransactionOperation {
+        type Output = ();
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![Effect::SubOperation(boxed_suboperation(
+                MarkerAbortOperation {
+                    state: 0,
+                    fail: true,
+                    txn_id: None,
+                },
+                |_| Event::SubOperation(SubOperationEvent::DepthLimitExceeded { max_depth: 0 }),
+            ))]
+        }
+
+        fn step(&mut self, _: Event) -> aruna_core::types::Effects {
+            self.done = true;
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            self.done
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            Ok(())
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn subop_error_cleanup() {
+        let (_directory, context) = test_context();
+        let result = drive(NestedTransactionOperation { done: false }, &context).await;
+
+        assert!(result.is_ok());
+        assert!(marker_absent(&context).await);
+        assert_eq!(staged_value(&context).await, None);
         assert!(transaction_reopens(&context).await);
     }
 
