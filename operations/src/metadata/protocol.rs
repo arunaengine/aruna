@@ -235,16 +235,16 @@ pub async fn write_message(
 }
 
 pub(crate) fn encode_message(message: &MetadataTransportMessage) -> Result<Vec<u8>, String> {
-    let max_size = if frame_class(message) == AUDIT_FRAME {
-        audit_frame_cap()
-    } else {
-        MAX_MESSAGE_SIZE
-    };
-    let size = postcard::serialized_size(message).map_err(|err| err.to_string())?;
-    if size > max_size {
-        return Err("metadata message exceeds maximum size".to_string());
+    if frame_class(message) == AUDIT_FRAME {
+        let size = postcard::serialized_size(message).map_err(|err| err.to_string())?;
+        if size > audit_frame_cap() {
+            return Err("metadata message exceeds maximum size".to_string());
+        }
     }
     let bytes = postcard::to_allocvec(message).map_err(|err| err.to_string())?;
+    if bytes.len() > MAX_MESSAGE_SIZE {
+        return Err("metadata message exceeds maximum size".to_string());
+    }
 
     Ok(bytes)
 }

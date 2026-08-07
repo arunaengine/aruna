@@ -283,14 +283,11 @@ fn group_from_path(path: &str) -> Option<GroupId> {
 }
 
 /// Compiles one scope's policy set, mapping a compile failure to a fail-closed
-/// error. An empty set needs no compiled program.
+/// error. An empty set is represented by an empty compiled program.
 fn compile_scope(
     policies: &[RequestPolicy],
     scope: &str,
 ) -> Result<Option<Arc<CompiledPolicySet>>, PolicyEnforcementError> {
-    if policies.is_empty() {
-        return Ok(None);
-    }
     match compiled_set(policies) {
         Ok(set) => Ok(Some(set)),
         Err(error) => {
@@ -478,6 +475,15 @@ mod tests {
             result,
             Err(PolicyEnforcementError::Unavailable(_))
         ));
+    }
+
+    #[test]
+    fn empty_scopes_present() {
+        let realm = compile_scope(&[], "realm").unwrap();
+        let group = compile_scope(&[], "group").unwrap();
+
+        assert!(realm.as_ref().is_some_and(|set| set.is_empty()));
+        assert!(group.as_ref().is_some_and(|set| set.is_empty()));
     }
 
     #[test]

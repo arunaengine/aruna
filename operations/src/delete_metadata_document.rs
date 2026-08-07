@@ -64,6 +64,7 @@ enum DeleteMetadataDocumentState {
     ReadRecord,
     ReadRealmConfig,
     StartTransaction,
+    ReadFence,
     WriteGraphLifecycle,
     WriteGraphPruneJob,
     WriteDocumentLifecycle,
@@ -344,14 +345,6 @@ impl Operation for DeleteMetadataDocumentOperation {
         match self.state {
             DeleteMetadataDocumentState::ReadRecord => match parse_registry_read(event) {
                 Ok(Some(record)) => {
-                    let lifecycle_record = self.lifecycle_record(&record);
-                    self.document_lifecycle_record =
-                        Some(self.document_lifecycle_record(&record, lifecycle_record.clone()));
-                    self.prune_job_record = Some(new_graph_prune_job(
-                        lifecycle_record.graph_iri.clone(),
-                        unix_timestamp_millis(),
-                    ));
-                    self.lifecycle_record = Some(lifecycle_record);
                     let realm_id = record.realm_id;
                     self.record = Some(record);
                     self.state = DeleteMetadataDocumentState::ReadRealmConfig;
@@ -403,6 +396,30 @@ impl Operation for DeleteMetadataDocumentOperation {
             DeleteMetadataDocumentState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.txn_id = Some(txn_id);
+                    self.state = DeleteMetadataDocumentState::ReadFence;
+                    smallvec![read_registry_effect(
+                        self.group_id,
+                        self.document_id,
+                        Some(txn_id),
+                    )]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+            },
+            DeleteMetadataDocumentState::ReadFence => match parse_registry_read(event) {
+                Ok(Some(record)) => {
+                    let lifecycle_record = self.lifecycle_record(&record);
+                    self.document_lifecycle_record =
+                        Some(self.document_lifecycle_record(&record, lifecycle_record.clone()));
+                    self.prune_job_record = Some(new_graph_prune_job(
+                        lifecycle_record.graph_iri.clone(),
+                        unix_timestamp_millis(),
+                    ));
+                    self.lifecycle_record = Some(lifecycle_record);
+                    self.record = Some(record);
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(DeleteMetadataDocumentError::MissingTransaction);
+                    };
                     let Some(lifecycle_record) = self.lifecycle_record.as_ref() else {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     };
@@ -414,8 +431,9 @@ impl Operation for DeleteMetadataDocumentOperation {
                         }
                     }
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                Ok(None) => self.fail(DeleteMetadataDocumentError::DocumentNotFound),
+                Err(StorageReadError::Storage(error)) => self.fail(error.into()),
+                Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
             },
             DeleteMetadataDocumentState::WriteGraphLifecycle => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => {
@@ -871,6 +889,22 @@ mod tests {
             key: ByteView::from(*record.realm_id.as_bytes()),
             value: Some(postcard::to_allocvec(&config).unwrap().into()),
         }));
+        let txn_id = Ulid::generate();
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read {
+                txn_id: Some(read_txn_id),
+                ..
+            })] if *read_txn_id == txn_id
+        ));
+        let _ = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: crate::metadata::repository::metadata_registry_key(
+                record.group_id,
+                record.document_id,
+            ),
+            value: Some(postcard::to_allocvec(&record).unwrap().into()),
+        }));
 
         assert_eq!(operation.document_lifecycle_placement_ref, record.placement);
         assert_eq!(operation.graph_lifecycle_placement_ref, record.placement);
@@ -923,6 +957,8 @@ mod tests {
     fn delete_writes_prune_job_in_same_transaction_before_commit() {
         let actor = actor();
         let record = record(&actor);
+        let mut fenced = record.clone();
+        fenced.last_event_id = Ulid::from_parts(8, 8);
         let mut operation = DeleteMetadataDocumentOperation::new(
             actor.clone(),
             record.group_id,
@@ -956,6 +992,21 @@ mod tests {
 
         let txn_id = Ulid::generate();
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read {
+                txn_id: Some(read_txn_id),
+                ..
+            })] if *read_txn_id == txn_id
+        ));
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: crate::metadata::repository::metadata_registry_key(
+                fenced.group_id,
+                fenced.document_id,
+            ),
+            value: Some(postcard::to_allocvec(&fenced).unwrap().into()),
+        }));
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Write { txn_id: Some(write_txn_id), .. })]
@@ -1009,6 +1060,7 @@ mod tests {
         let MetadataDocumentLifecycleRecord::Delete { event } = lifecycle else {
             panic!("expected delete lifecycle record");
         };
+        assert_eq!(event.deleted_after_event_id, fenced.last_event_id);
         let target = DocumentSyncTarget::MetadataDocumentLifecycle {
             document_id: record.document_id,
         };
@@ -1027,6 +1079,53 @@ mod tests {
         assert_eq!(revision.current.actor, actor.node_id);
         assert_eq!(revision.current.generation, event.tombstone.updated_at_ms);
         assert_eq!(revision.kind, DocumentSyncChangeKind::Delete);
+    }
+
+    #[test]
+    fn delete_fence_missing() {
+        let actor = actor();
+        let record = record(&actor);
+        let txn_id = Ulid::generate();
+        let mut operation =
+            DeleteMetadataDocumentOperation::new(actor, record.group_id, record.document_id);
+
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: crate::metadata::repository::metadata_registry_key(
+                record.group_id,
+                record.document_id,
+            ),
+            value: Some(postcard::to_allocvec(&record).unwrap().into()),
+        }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(*record.realm_id.as_bytes()),
+            value: None,
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read {
+                txn_id: Some(read_txn_id),
+                ..
+            })] if *read_txn_id == txn_id
+        ));
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: crate::metadata::repository::metadata_registry_key(
+                record.group_id,
+                record.document_id,
+            ),
+            value: None,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
+                if *abort_txn == txn_id
+        ));
+        assert_eq!(
+            operation.finalize(),
+            Err(DeleteMetadataDocumentError::DocumentNotFound)
+        );
     }
 
     #[test]

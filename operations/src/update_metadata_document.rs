@@ -72,6 +72,7 @@ enum UpdateMetadataDocumentState {
     ReadRealmConfig,
     ValidateMutation,
     StartTransaction,
+    ReadFence,
     WriteUpdateBatch,
     CommitTransaction,
     ScheduleMaterializationDrain,
@@ -282,9 +283,15 @@ pub async fn update_metadata_document(
     operation: UpdateMetadataDocumentOperation,
     context: &DriverContext,
 ) -> Result<MetadataRegistryRecord, UpdateMetadataDocumentError> {
+    let cache_generation = context
+        .metadata_handle
+        .as_ref()
+        .map(|metadata_handle| metadata_handle.visibility_generation());
     let updated = drive(operation, context).await?;
-    if let Some(metadata_handle) = context.metadata_handle.as_ref() {
-        metadata_handle.upsert_cached_registry_record(updated.clone());
+    if let (Some(metadata_handle), Some(cache_generation)) =
+        (context.metadata_handle.as_ref(), cache_generation)
+    {
+        metadata_handle.upsert_cached_at(updated.clone(), cache_generation);
     }
     Ok(updated)
 }
@@ -361,12 +368,7 @@ impl Operation for UpdateMetadataDocumentOperation {
         match self.state {
             UpdateMetadataDocumentState::ReadCurrent => match parse_registry_read(event) {
                 Ok(Some(record)) => {
-                    let record = self.updated_record(record);
-                    let update_event = self.update_event_record(&record);
-                    // The event carries the new revision id; the returned record and
-                    // registry cache must reflect it, not the pre-update id.
-                    self.record = Some(update_event.record.clone());
-                    self.update_event = Some(update_event);
+                    self.record = Some(record.clone());
                     self.state = UpdateMetadataDocumentState::ReadRealmConfig;
                     smallvec![Effect::Storage(StorageEffect::Read {
                         key_space: REALM_CONFIG_KEYSPACE.to_string(),
@@ -411,14 +413,34 @@ impl Operation for UpdateMetadataDocumentOperation {
             UpdateMetadataDocumentState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.txn_id = Some(txn_id);
+                    self.state = UpdateMetadataDocumentState::ReadFence;
+                    smallvec![read_registry_effect(
+                        self.config.group_id,
+                        self.config.document_id,
+                        Some(txn_id),
+                    )]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+            },
+            UpdateMetadataDocumentState::ReadFence => match parse_registry_read(event) {
+                Ok(Some(record)) => {
+                    let record = self.updated_record(record);
+                    let update_event = self.update_event_record(&record);
+                    self.record = Some(update_event.record.clone());
+                    self.update_event = Some(update_event);
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                    };
                     self.state = UpdateMetadataDocumentState::WriteUpdateBatch;
                     match self.write_update_batch_effect(txn_id) {
                         Ok(effect) => smallvec![effect],
                         Err(error) => self.fail(error),
                     }
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                Ok(None) => self.fail(UpdateMetadataDocumentError::DocumentNotFound),
+                Err(StorageReadError::Storage(error)) => self.fail(error.into()),
+                Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
             },
             UpdateMetadataDocumentState::WriteUpdateBatch => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
@@ -746,11 +768,101 @@ mod tests {
             graph_iri: record.graph_iri.clone(),
         }));
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read {
+                txn_id: Some(read_txn),
+                ..
+            })] if *read_txn == txn_id
+        ));
+        let effects = operation.step(registry_read(&record));
 
         let event = assert_update_batch(effects.as_slice(), txn_id, |payload| {
             matches!(payload, MetadataCreateEventPayload::ReplaceRoCrate { .. })
         });
         assert_eq!(event.record.placement, record.placement);
+    }
+
+    #[test]
+    fn update_uses_fence() {
+        let actor = actor();
+        let record = record(&actor);
+        let mut fenced = record.clone();
+        fenced.placement = PlacementRef {
+            strategy_id: Ulid::from_bytes([6u8; 16]),
+            epoch: 1,
+            shard: 12,
+        };
+        let txn_id = Ulid::generate();
+        let mut operation = UpdateMetadataDocumentOperation::new(config(
+            actor,
+            &record,
+            UpdateMetadataDocumentMutation::UpsertDataEntity {
+                jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
+            },
+        ));
+
+        operation.start();
+        operation.step(registry_read(&record));
+        operation.step(realm_config_read(&record));
+        assert_start_transaction(
+            operation
+                .step(Event::Metadata(MetadataEvent::ValidationResult {
+                    graph_iri: record.graph_iri.clone(),
+                }))
+                .as_slice(),
+        );
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read {
+                txn_id: Some(read_txn),
+                ..
+            })] if *read_txn == txn_id
+        ));
+
+        let event = assert_update_batch(
+            operation.step(registry_read(&fenced)).as_slice(),
+            txn_id,
+            |payload| matches!(payload, MetadataCreateEventPayload::UpsertDataEntity { .. }),
+        );
+        assert_eq!(event.record.placement, fenced.placement);
+    }
+
+    #[test]
+    fn update_fence_missing() {
+        let actor = actor();
+        let record = record(&actor);
+        let txn_id = Ulid::generate();
+        let mut operation = UpdateMetadataDocumentOperation::new(config(
+            actor,
+            &record,
+            UpdateMetadataDocumentMutation::UpsertDataEntity {
+                jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
+            },
+        ));
+
+        operation.start();
+        operation.step(registry_read(&record));
+        operation.step(realm_config_read(&record));
+        assert_start_transaction(
+            operation
+                .step(Event::Storage(StorageEvent::TransactionStarted { txn_id }))
+                .as_slice(),
+        );
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: metadata_registry_key(record.group_id, record.document_id),
+            value: None,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
+                if *abort_txn == txn_id
+        ));
+        assert_eq!(
+            operation.finalize(),
+            Err(UpdateMetadataDocumentError::DocumentNotFound)
+        );
     }
 
     #[test]
@@ -783,6 +895,8 @@ mod tests {
 
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert_no_graph_mutation_or_sync(effects.as_slice());
+        let effects = operation.step(registry_read(&record));
+        assert_no_graph_mutation_or_sync(effects.as_slice());
         assert_update_batch(effects.as_slice(), txn_id, |payload| {
             matches!(payload, MetadataCreateEventPayload::ReplaceRoCrate { .. })
         });
@@ -809,6 +923,7 @@ mod tests {
         assert_start_transaction(effects.as_slice());
 
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let effects = operation.step(registry_read(&record));
         let event = assert_update_batch(effects.as_slice(), txn_id, |payload| {
             matches!(payload, MetadataCreateEventPayload::UpsertDataEntity { .. })
         });
@@ -835,6 +950,7 @@ mod tests {
         assert_start_transaction(effects.as_slice());
 
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let effects = operation.step(registry_read(&record));
         let [
             Effect::Storage(StorageEffect::BatchWrite {
                 writes,
@@ -926,6 +1042,8 @@ mod tests {
         }));
         assert_no_graph_mutation_or_sync(effects.as_slice());
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert_no_graph_mutation_or_sync(effects.as_slice());
+        let effects = operation.step(registry_read(&record));
         assert_no_graph_mutation_or_sync(effects.as_slice());
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: Vec::new(),
