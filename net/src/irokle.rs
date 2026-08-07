@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use aruna_core::DhtKeyId;
@@ -97,6 +97,7 @@ const DOCUMENT_SYNC_PEER_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT: usize = 1_024;
 const DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT: usize = 8;
 const DOCUMENT_SYNC_FANOUT_DOMAIN: &[u8] = b"aruna-document-sync-fanout-v1";
+const DOCUMENT_SYNC_FANOUT_KEYSPACE: &str = "document-sync-fanout";
 const DOCUMENT_SYNC_INBOUND_SYNC_MESSAGE_LIMIT: usize = 4_096;
 const DOCUMENT_SYNC_INBOUND_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
 // A frame is meaningful progress; a byte trickle cannot retain a permit forever.
@@ -309,6 +310,7 @@ pub struct DocumentSyncService {
     node: irokle_crate::Irokle<irokle_crate::FjallStorage>,
     net: Arc<irokle_crate::net::IrohNet<irokle_crate::FjallStorage>>,
     db: fjall::OptimisticTxDatabase,
+    fanout_cursors: fjall::OptimisticTxKeyspace,
     persist_policy: FjallPersistPolicy,
     storage: StorageHandle,
     default_peers: Arc<RwLock<BTreeSet<PeerId>>>,
@@ -332,7 +334,6 @@ pub struct DocumentSyncService {
     // Flips true on the first realm-config-driven peer refresh, after which
     // `configured_peers` no longer grant admission.
     realm_config_materialized: Arc<AtomicBool>,
-    selection_round: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for DocumentSyncService {
@@ -384,6 +385,12 @@ impl DocumentSyncService {
             .manual_journal_persist(true)
             .open()
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let fanout_cursors = db
+            .keyspace(
+                DOCUMENT_SYNC_FANOUT_KEYSPACE,
+                fjall::KeyspaceCreateOptions::default,
+            )
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         let node = irokle_crate::Irokle::builder()
             .with_iroh_secret_key(endpoint.secret_key())
             .with_peer_whitelist(default_peers.clone())
@@ -409,6 +416,7 @@ impl DocumentSyncService {
             node,
             net,
             db,
+            fanout_cursors,
             persist_policy,
             storage,
             default_peers: Arc::new(RwLock::new(default_peers.clone())),
@@ -421,7 +429,6 @@ impl DocumentSyncService {
             inbound_budget: Arc::new(InboundSyncBudget::default()),
             configured_peers: default_peers,
             realm_config_materialized: Arc::new(AtomicBool::new(false)),
-            selection_round: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -446,6 +453,16 @@ impl DocumentSyncService {
     /// reconcile skip arm), and ops not authored by the local node are rejected
     /// since an eviction is by construction the local node's own chain.
     pub fn decode_eviction(&self, eviction: TopicEviction) -> Vec<DocumentSyncEvictedDocument> {
+        if let Err(error) = self
+            .fanout_cursors
+            .remove(topic_cursor_key(eviction.topic_id))
+        {
+            warn!(
+                %error,
+                topic_id = %eviction.topic_id,
+                "Failed to clear document sync fan-out cursor after topic reset"
+            );
+        }
         let local_peer = self.node.peer_id();
         let mut documents = Vec::new();
         for evicted in eviction.evicted {
@@ -616,8 +633,7 @@ impl DocumentSyncService {
         topic_id: irokle_crate::TopicId,
         peers: Vec<NodeId>,
     ) -> Result<()> {
-        let round = self.next_sync_round();
-        let selection = self.sync_peer_selection(&peers, &topic_id, round);
+        let selection = self.sync_peer_selection(&peers, &topic_id)?;
         self.log_peer_selection(topic_id, &selection);
         self.allow_sync_peers(&selection.peers)?;
         self.sync_topic(topic_id, selection).await?;
@@ -1018,10 +1034,17 @@ impl DocumentSyncService {
         topic_id: irokle_crate::TopicId,
         peers: Vec<NodeId>,
     ) -> DocumentSyncNetEvent {
-        let round = self.next_sync_round();
         match self.has_topic(topic_id) {
             Ok(true) => {
-                let selection = self.sync_peer_selection(&peers, &topic_id, round);
+                let selection = match self.sync_peer_selection(&peers, &topic_id) {
+                    Ok(selection) => selection,
+                    Err(error) => {
+                        return DocumentSyncNetEvent::Error {
+                            target: None,
+                            error: error.to_string(),
+                        };
+                    }
+                };
                 self.log_peer_selection(topic_id, &selection);
                 if let Err(error) = self.allow_sync_peers(&selection.peers) {
                     return DocumentSyncNetEvent::Error {
@@ -1037,10 +1060,7 @@ impl DocumentSyncService {
                 }
             }
             Ok(false) => {
-                if let Err(error) = self
-                    .bootstrap_topic_from_peers(topic_id, &peers, round)
-                    .await
-                {
+                if let Err(error) = self.bootstrap_topic_from_peers(topic_id, &peers).await {
                     return DocumentSyncNetEvent::Error {
                         target: None,
                         error: error.to_string(),
@@ -1081,7 +1101,6 @@ impl DocumentSyncService {
     ) -> DocumentSyncNetEvent {
         let sync_started = Instant::now();
         let target_count = topic_ids.len();
-        let round = self.next_sync_round();
 
         let mut seen_topics = BTreeSet::new();
         let mut topic_ids_out: Vec<irokle_crate::TopicId> = Vec::new();
@@ -1096,10 +1115,7 @@ impl DocumentSyncService {
                     // found yet (e.g. an empty shard whose rank-0 holder has not
                     // created it) is skipped, not fatal — it arrives via gossip
                     // or a later anti-entropy pass.
-                    match self
-                        .bootstrap_topic_from_peers(topic_id, &peers, round)
-                        .await
-                    {
+                    match self.bootstrap_topic_from_peers(topic_id, &peers).await {
                         Ok(()) => topic_ids_out.push(topic_id),
                         Err(error) => {
                             debug!(%topic_id, error = %error, "skipping unbootstrappable document sync topic");
@@ -1118,7 +1134,7 @@ impl DocumentSyncService {
         let bootstrap_elapsed = sync_started.elapsed();
         let topic_ids = topic_ids_out;
         let peer_sync_started = Instant::now();
-        if let Err(error) = self.sync_topics(topic_ids.clone(), &peers, round).await {
+        if let Err(error) = self.sync_topics(topic_ids.clone(), &peers).await {
             return DocumentSyncNetEvent::Error {
                 target: None,
                 error: error.to_string(),
@@ -1502,38 +1518,29 @@ impl DocumentSyncService {
         sync_peers
     }
 
-    fn next_sync_round(&self) -> u64 {
-        self.selection_round.fetch_add(1, Ordering::Relaxed)
+    fn next_sync_round(&self, topic_id: irokle_crate::TopicId) -> Result<u64> {
+        advance_cursor(&self.fanout_cursors, topic_id)
     }
 
     fn sync_peer_selection(
         &self,
         peers: &[NodeId],
         topic_id: &irokle_crate::TopicId,
-        round: u64,
-    ) -> PeerSelection {
+    ) -> Result<PeerSelection> {
+        let round = self.next_sync_round(*topic_id)?;
         let mut subject = [0u8; 64];
         subject[..32].copy_from_slice(topic_id.as_ref());
         subject[32..].copy_from_slice(self.node.peer_id().as_bytes());
         if peers.is_empty() {
             let defaults = self.default_peers.read();
-            let candidate_count = defaults
-                .iter()
-                .filter(|peer| **peer != self.node.peer_id())
-                .count();
-            select_sync_peers(
+            Ok(select_sync_peers(
                 defaults.iter().copied(),
                 self.node.peer_id(),
                 &subject,
                 round,
-                candidate_count,
-            )
+            ))
         } else {
-            let candidate_count = peers
-                .iter()
-                .filter(|node_id| node_id_to_peer_id(node_id) != self.node.peer_id())
-                .count();
-            select_sync_peers(
+            Ok(select_sync_peers(
                 peers
                     .iter()
                     .copied()
@@ -1541,8 +1548,7 @@ impl DocumentSyncService {
                 self.node.peer_id(),
                 &subject,
                 round,
-                candidate_count,
-            )
+            ))
         }
     }
 
@@ -1672,15 +1678,22 @@ impl DocumentSyncService {
         &self,
         topic_ids: Vec<irokle_crate::TopicId>,
         peers: &[NodeId],
-        round: u64,
     ) -> Result<()> {
         if topic_ids.is_empty() {
             return Ok(());
         }
         for chunk in topic_ids.chunks(DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT) {
-            let groups = group_sync_topics(chunk, |topic_id| {
-                self.sync_peer_selection(peers, &topic_id, round)
-            });
+            let mut groups = BTreeMap::new();
+            for topic_id in chunk.iter().copied() {
+                let selection = self.sync_peer_selection(peers, &topic_id)?;
+                let selected = selection.peers.clone();
+                if let Some((group, topics)) = groups.get_mut(&selected) {
+                    group.truncated |= selection.truncated;
+                    topics.push(topic_id);
+                } else {
+                    groups.insert(selected, (selection, vec![topic_id]));
+                }
+            }
             for (_, (selection, topics)) in groups {
                 let Some(topic_id) = topics.first() else {
                     continue;
@@ -1854,9 +1867,8 @@ impl DocumentSyncService {
         &self,
         topic_id: irokle_crate::TopicId,
         peers: &[NodeId],
-        round: u64,
     ) -> Result<()> {
-        let selection = self.sync_peer_selection(peers, &topic_id, round);
+        let selection = self.sync_peer_selection(peers, &topic_id)?;
         self.log_peer_selection(topic_id, &selection);
         self.allow_sync_peers(&selection.peers)?;
         let mut first_error = None;
@@ -5937,6 +5949,7 @@ fn node_id_to_peer_id(node_id: &NodeId) -> PeerId {
     PeerId::from_bytes(*node_id.as_bytes())
 }
 
+#[cfg(test)]
 fn group_sync_topics<F>(
     topic_ids: &[irokle_crate::TopicId],
     mut select: F,
@@ -5963,54 +5976,33 @@ fn select_sync_peers(
     local_peer: PeerId,
     subject: &[u8],
     round: u64,
-    candidate_count: usize,
 ) -> PeerSelection {
-    let mut ranked = Vec::with_capacity(DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT);
-    let truncated = candidate_count > DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT;
-    let window_start = if candidate_count == 0 {
+    let mut ranked = candidates
+        .into_iter()
+        .filter(|peer| *peer != local_peer)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|peer| (peer, peer_score(subject, peer)))
+        .collect::<Vec<_>>();
+    ranked.sort_unstable_by(|(left_peer, left_score), (right_peer, right_score)| {
+        left_score
+            .cmp(right_score)
+            .then_with(|| left_peer.as_bytes().cmp(right_peer.as_bytes()))
+    });
+    let candidate_count = ranked.len();
+    let selected = DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT.min(candidate_count);
+    let start = if candidate_count == 0 {
         0
     } else {
         ((round as u128 * DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT as u128) % candidate_count as u128)
             as usize
     };
-    for peer in candidates {
-        if peer == local_peer || ranked.iter().any(|(candidate, _)| *candidate == peer) {
-            continue;
-        }
-        let score = peer_score(subject, peer);
-        if candidate_count > DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT {
-            let mut slot_bytes = [0u8; 16];
-            slot_bytes.copy_from_slice(&score[..16]);
-            let slot = (u128::from_be_bytes(slot_bytes) % candidate_count as u128) as usize;
-            let distance = if slot >= window_start {
-                slot - window_start
-            } else {
-                candidate_count - window_start + slot
-            };
-            if distance >= DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT {
-                continue;
-            }
-        }
-        if ranked.len() < DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT {
-            ranked.push((peer, score));
-            continue;
-        }
-        let Some((worst_index, _)) = ranked.iter().enumerate().min_by(|(_, left), (_, right)| {
-            left.1
-                .cmp(&right.1)
-                .then_with(|| right.0.as_bytes().cmp(left.0.as_bytes()))
-        }) else {
-            continue;
-        };
-        let (worst_peer, worst_score) = ranked[worst_index];
-        if score > worst_score || (score == worst_score && peer.as_bytes() < worst_peer.as_bytes())
-        {
-            ranked[worst_index] = (peer, score);
-        }
-    }
+    let peers = (0..selected)
+        .map(|offset| ranked[(start + offset) % candidate_count].0)
+        .collect();
     PeerSelection {
-        peers: ranked.into_iter().map(|(peer, _)| peer).collect(),
-        truncated,
+        peers,
+        truncated: candidate_count > selected,
     }
 }
 
@@ -7123,6 +7115,40 @@ fn topic_cursor_key(topic_id: irokle_crate::TopicId) -> ByteView {
     ByteView::from(key)
 }
 
+fn advance_cursor(
+    cursors: &fjall::OptimisticTxKeyspace,
+    topic_id: irokle_crate::TopicId,
+) -> Result<u64> {
+    let updated = cursors
+        .update_fetch(topic_cursor_key(topic_id), |value| {
+            let current = value
+                .filter(|value| value.len() == std::mem::size_of::<u64>())
+                .map(|value| {
+                    let mut bytes = [0u8; std::mem::size_of::<u64>()];
+                    bytes.copy_from_slice(value.as_ref());
+                    u64::from_be_bytes(bytes)
+                })
+                .unwrap_or_default();
+            Some(fjall::Slice::from(current.wrapping_add(1).to_be_bytes()))
+        })
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    let Some(updated) = updated else {
+        return Err(NetError::Bootstrap(
+            "document sync fan-out cursor update returned no value".to_string(),
+        ));
+    };
+    if updated.len() != std::mem::size_of::<u64>() {
+        return Err(NetError::Bootstrap(
+            "document sync fan-out cursor has invalid length".to_string(),
+        ));
+    }
+    let mut bytes = [0u8; std::mem::size_of::<u64>()];
+    bytes.copy_from_slice(updated.as_ref());
+    // Reserve the next slice before sending; failed or crashed attempts must
+    // not hold the same peers forever.
+    Ok(u64::from_be_bytes(bytes).wrapping_sub(1))
+}
+
 fn deferred_topics_key() -> ByteView {
     // Retain the original key so previously persisted admin dependencies decode.
     ByteView::from(b"deferred-admin-topics".to_vec())
@@ -7598,13 +7624,8 @@ mod tests {
 
     #[test]
     fn sync_peers_bounded() {
-        let selection = select_sync_peers(
-            (1u8..=32).map(peer),
-            peer(0),
-            b"document-sync-subject",
-            0,
-            32,
-        );
+        let selection =
+            select_sync_peers((1u8..=32).map(peer), peer(0), b"document-sync-subject", 0);
 
         assert_eq!(selection.peers.len(), DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT);
         assert!(selection.truncated);
@@ -7612,20 +7633,83 @@ mod tests {
     }
 
     #[test]
-    fn sync_peers_permutation() {
-        let forward = select_sync_peers(
-            (1u8..=32).map(peer),
+    fn sync_peers_dedup() {
+        let candidates = (1u8..=9).map(peer).collect::<Vec<_>>();
+        let selection = select_sync_peers(
+            candidates.iter().copied().chain(candidates.iter().copied()),
             peer(0),
             b"document-sync-subject",
             0,
-            32,
         );
+
+        assert_eq!(selection.peers.len(), DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT);
+        assert!(selection.truncated);
+    }
+
+    #[test]
+    fn sync_peers_cover() {
+        let candidates = (1u8..=17).map(peer).collect::<BTreeSet<_>>();
+        let mut seen = BTreeSet::new();
+        let rounds = (candidates.len() + DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT - 1)
+            / DOCUMENT_SYNC_OUTBOUND_PEER_LIMIT;
+        for round in 0..rounds as u64 {
+            seen.extend(
+                select_sync_peers(
+                    candidates.iter().copied(),
+                    peer(0),
+                    b"document-sync-subject",
+                    round,
+                )
+                .peers,
+            );
+        }
+
+        assert_eq!(seen, candidates);
+    }
+
+    #[test]
+    fn fanout_cursor_restart() {
+        let root = TempDir::new().expect("fanout cursor tempdir");
+        let topic_id = topic(42);
+        {
+            let db = fjall::OptimisticTxDatabase::builder(root.path())
+                .manual_journal_persist(true)
+                .open()
+                .expect("fanout cursor database");
+            let cursors = db
+                .keyspace(
+                    DOCUMENT_SYNC_FANOUT_KEYSPACE,
+                    fjall::KeyspaceCreateOptions::default,
+                )
+                .expect("fanout cursor keyspace");
+            assert_eq!(advance_cursor(&cursors, topic_id).expect("first cursor"), 0);
+            db.persist(fjall::PersistMode::SyncAll)
+                .expect("persist fanout cursor");
+        }
+        let db = fjall::OptimisticTxDatabase::builder(root.path())
+            .manual_journal_persist(true)
+            .open()
+            .expect("reopen fanout cursor database");
+        let cursors = db
+            .keyspace(
+                DOCUMENT_SYNC_FANOUT_KEYSPACE,
+                fjall::KeyspaceCreateOptions::default,
+            )
+            .expect("reopen fanout cursor keyspace");
+        assert_eq!(
+            advance_cursor(&cursors, topic_id).expect("restarted cursor"),
+            1,
+        );
+    }
+
+    #[test]
+    fn sync_peers_permutation() {
+        let forward = select_sync_peers((1u8..=32).map(peer), peer(0), b"document-sync-subject", 0);
         let reverse = select_sync_peers(
             (1u8..=32).rev().map(peer),
             peer(0),
             b"document-sync-subject",
             0,
-            32,
         );
 
         assert_eq!(forward.peers, reverse.peers);
@@ -7634,20 +7718,8 @@ mod tests {
 
     #[test]
     fn sync_peers_rotate() {
-        let first = select_sync_peers(
-            (1u8..=32).map(peer),
-            peer(0),
-            b"document-sync-subject",
-            0,
-            32,
-        );
-        let second = select_sync_peers(
-            (1u8..=32).map(peer),
-            peer(0),
-            b"document-sync-subject",
-            1,
-            32,
-        );
+        let first = select_sync_peers((1u8..=32).map(peer), peer(0), b"document-sync-subject", 0);
+        let second = select_sync_peers((1u8..=32).map(peer), peer(0), b"document-sync-subject", 1);
 
         assert!(second.peers.iter().any(|peer| !first.peers.contains(peer)));
     }
