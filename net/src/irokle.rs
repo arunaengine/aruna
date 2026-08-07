@@ -35,9 +35,8 @@ use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
     DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, GROUP_OWNER_INDEX_KEYSPACE,
     METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-    METADATA_GRAPH_LIFECYCLE_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
-    NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE,
-    USER_SUBJECT_INDEX_KEYSPACE,
+    METADATA_GRAPH_LIFECYCLE_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
@@ -57,13 +56,13 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::{
     BindingError, DocumentClass, FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument,
-    HANDLE_RANGE_SIZE, MetadataRegistryRecord, NOTIFICATION_WATCH_MAX_PREFIX_LEN,
-    NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP, NodeInfoDocument, NodeUsageSnapshot, PlacementRef,
-    PlacementScope, PoolAdmission, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-    RealmNodeKind, Role, User, WatchEventMask, WatchInterestDigest, WatchSubscription,
-    admit_band_pool, coordinator_spans, decode_watch_count, group_owner_index_key,
-    node_usage_key_node_id, reserved_label, watch_count_key, watch_count_value,
-    watch_interest_dirty_key, watch_interest_key_node_id, watch_interest_key_realm_id,
+    HANDLE_RANGE_SIZE, MetadataRegistryRecord, NOTIFICATION_WATCH_INTEREST_BYTES_CAP,
+    NOTIFICATION_WATCH_INTEREST_ENTRY_CAP, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument,
+    NodeUsageSnapshot, PlacementRef, PlacementScope, PoolAdmission, RealmAuthorizationDocument,
+    RealmConfigDocument, RealmId, RealmNodeKind, Role, User, WatchEventMask, WatchInterestDigest,
+    WatchSubscription, admit_band_pool, coordinator_spans, group_owner_index_key,
+    node_usage_key_node_id, reserved_label, watch_interest_dirty_key, watch_interest_key_node_id,
+    watch_interest_key_realm_id,
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::{RoleId, TxnId, UserId, Value};
@@ -2303,7 +2302,7 @@ impl DocumentSyncService {
                             );
                             continue;
                         }
-                        if let Err(reason) = validate_watch_interest_upsert(&target, &bytes) {
+                        if let Err(reason) = validate_watch_interest(&target, &bytes) {
                             warn!(
                                 %topic_id,
                                 realm_id = %realm_id,
@@ -3202,7 +3201,7 @@ impl DocumentSyncService {
             // reconcile loop already validated the signed publisher and this
             // payload, but re-check the digest's self-consistency here so the
             // generic storage write below can never persist an unvalidated digest.
-            validate_watch_interest_upsert(&target, &bytes).map_err(NetError::Bootstrap)?;
+            validate_watch_interest(&target, &bytes).map_err(NetError::Bootstrap)?;
         }
         if let DocumentSyncTarget::NodeInfo { .. } = target {
             // Structural guard for the shared node-info keyspace, mirroring the
@@ -5607,53 +5606,6 @@ async fn start_storage_transaction(storage: &StorageHandle) -> Result<TxnId> {
     }
 }
 
-async fn load_watch_count(
-    storage: &StorageHandle,
-    realm_id: RealmId,
-    txn_id: TxnId,
-    force_scan: bool,
-) -> Result<(Option<usize>, bool)> {
-    let stored = storage_read_from_transaction(
-        storage,
-        NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
-        watch_count_key(realm_id),
-        Some(txn_id),
-    )
-    .await?;
-    if let Some(value) = stored {
-        if let Ok(count) = decode_watch_count(&value)
-            && (!force_scan || count > 0)
-        {
-            return Ok((Some(count), false));
-        }
-    }
-
-    let values = match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
-            prefix: Some(UserId::storage_prefix(realm_id)),
-            start: None,
-            limit: NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP.saturating_add(1),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(NetError::Dht(error.to_string()));
-        }
-        other => {
-            return Err(NetError::Dht(format!(
-                "unexpected watch subscription count scan event: {other:?}"
-            )));
-        }
-    };
-    if values.len() > NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP {
-        return Ok((None, true));
-    }
-    Ok((Some(values.len()), true))
-}
-
 async fn apply_watch_subscription_change_to_storage(
     storage: &StorageHandle,
     target: DocumentSyncTarget,
@@ -5731,93 +5683,6 @@ async fn apply_watch_subscription_change_to_storage(
             DocumentSyncTarget::WatchSubscription { owner, .. } => owner.realm_id,
             _ => unreachable!("watch subscription apply requires a subscription target"),
         };
-        let row_present = match storage_read_from_transaction(
-            storage,
-            NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
-            target.storage_key(),
-            Some(txn_id),
-        )
-        .await
-        {
-            Ok(value) => value.is_some(),
-            Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(error);
-            }
-        };
-        let count_state = match change.kind {
-            DocumentSyncChangeKind::Upsert => {
-                match load_watch_count(storage, realm_id, txn_id, row_present).await {
-                    Ok(state) => Some(state),
-                    Err(error) => {
-                        let _ = storage
-                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                            .await;
-                        return Err(error);
-                    }
-                }
-            }
-            DocumentSyncChangeKind::Delete if row_present => {
-                match load_watch_count(storage, realm_id, txn_id, true).await {
-                    Ok(state) => Some(state),
-                    Err(error) => {
-                        let _ = storage
-                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                            .await;
-                        return Err(error);
-                    }
-                }
-            }
-            DocumentSyncChangeKind::Delete => None,
-        };
-        let mut count_write = None;
-        if let Some((count, repaired)) = count_state {
-            match change.kind {
-                DocumentSyncChangeKind::Upsert => {
-                    let Some(count) = count else {
-                        let _ = storage
-                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                            .await;
-                        return Ok(false);
-                    };
-                    if !row_present && count >= NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP {
-                        let _ = storage
-                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                            .await;
-                        return Ok(false);
-                    }
-                    let next = if row_present {
-                        count
-                    } else {
-                        count.saturating_add(1)
-                    };
-                    if repaired || !row_present {
-                        count_write = Some(watch_count_value(next));
-                    }
-                }
-                DocumentSyncChangeKind::Delete => {
-                    let Some(count) = count else {
-                        let _ = storage
-                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                            .await;
-                        return Err(NetError::AdmissionRejected(
-                            "watch subscription count exceeds cap".to_string(),
-                        ));
-                    };
-                    if count == 0 {
-                        let _ = storage
-                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                            .await;
-                        return Err(NetError::Bootstrap(
-                            "watch subscription count is zero for a stored row".to_string(),
-                        ));
-                    }
-                    count_write = Some(watch_count_value(count - 1));
-                }
-            }
-        }
         let revision_entry = match document_sync_revision_write_entry(&target, &change) {
             Ok(entry) => entry,
             Err(error) => {
@@ -5835,13 +5700,6 @@ async fn apply_watch_subscription_change_to_storage(
                 ByteView::from(Ulid::generate().to_bytes().to_vec()),
             ),
         ];
-        if let Some(value) = count_write {
-            writes.push((
-                NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
-                watch_count_key(realm_id),
-                value,
-            ));
-        }
         let deletes = if let Some(bytes) = bytes.as_ref() {
             writes.push((
                 target.storage_keyspace().to_string(),
@@ -7066,15 +6924,27 @@ fn validate_node_usage_upsert(
 /// its sync target. Does not check the publisher's identity (the caller enforces
 /// that against the signed actor). Empty digests are valid: they clear a node's
 /// interest for the realm while preserving single-writer ownership.
-fn validate_watch_interest_upsert(
+fn validate_watch_interest(
     target: &DocumentSyncTarget,
     bytes: &[u8],
 ) -> std::result::Result<(), String> {
+    if bytes.len() > NOTIFICATION_WATCH_INTEREST_BYTES_CAP {
+        return Err(format!(
+            "watch interest digest exceeds serialized byte cap {}",
+            NOTIFICATION_WATCH_INTEREST_BYTES_CAP
+        ));
+    }
     let DocumentSyncTarget::WatchInterest { realm_id, node_id } = target else {
         return Err("target is not a watch interest digest".to_string());
     };
     let digest = WatchInterestDigest::from_bytes(bytes)
         .map_err(|error| format!("undecodable watch interest digest: {error}"))?;
+    if digest.entries.len() > NOTIFICATION_WATCH_INTEREST_ENTRY_CAP {
+        return Err(format!(
+            "watch interest digest exceeds entry cap {}",
+            NOTIFICATION_WATCH_INTEREST_ENTRY_CAP
+        ));
+    }
     if digest.node_id != *node_id {
         return Err(format!(
             "digest node id {} does not match target node id {node_id}",
@@ -15604,7 +15474,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_watch_interest_upsert_accepts_owner_and_rejects_forgeries() {
+    fn watch_interest_validation() {
         use aruna_core::structs::{WatchEventKind, WatchEventMask};
 
         let node_id = node(7);
@@ -15620,14 +15490,29 @@ mod tests {
             )],
         );
         let owned_bytes = owned.to_bytes().unwrap();
-        assert!(validate_watch_interest_upsert(&target, &owned_bytes).is_ok());
+        assert!(validate_watch_interest(&target, &owned_bytes).is_ok());
 
         // Empty digests are legitimate upserts that clear a node's interest.
         let empty = WatchInterestDigest {
             node_id,
             entries: Vec::new(),
         };
-        assert!(validate_watch_interest_upsert(&target, &empty.to_bytes().unwrap()).is_ok());
+        assert!(validate_watch_interest(&target, &empty.to_bytes().unwrap()).is_ok());
+
+        let too_many = WatchInterestDigest::from_subscriptions(
+            node_id,
+            (0..=NOTIFICATION_WATCH_INTEREST_ENTRY_CAP).map(|index| {
+                (
+                    format!("/entry/{index}"),
+                    WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+                )
+            }),
+        );
+        assert!(validate_watch_interest(&target, &too_many.to_bytes().unwrap()).is_err());
+        assert!(
+            validate_watch_interest(&target, &vec![0; NOTIFICATION_WATCH_INTEREST_BYTES_CAP + 1],)
+                .is_err()
+        );
 
         // A digest whose embedded node id is a different node is rejected.
         let misattributed = WatchInterestDigest::from_subscriptions(
@@ -15637,19 +15522,107 @@ mod tests {
                 WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
             )],
         );
-        assert!(
-            validate_watch_interest_upsert(&target, &misattributed.to_bytes().unwrap()).is_err()
-        );
+        assert!(validate_watch_interest(&target, &misattributed.to_bytes().unwrap()).is_err());
 
         // Undecodable payloads and non watch-interest targets are rejected.
-        assert!(validate_watch_interest_upsert(&target, b"not-a-digest").is_err());
+        assert!(validate_watch_interest(&target, b"not-a-digest").is_err());
         assert!(
-            validate_watch_interest_upsert(
-                &DocumentSyncTarget::RealmConfig { realm_id },
-                &owned_bytes,
-            )
-            .is_err()
+            validate_watch_interest(&DocumentSyncTarget::RealmConfig { realm_id }, &owned_bytes,)
+                .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn watch_origins_converge() {
+        // Independent origins must not lose a replica to arrival-order admission.
+        use aruna_core::structs::{WatchEventKind, WatchEventMask};
+
+        let (_left_dir, left) = test_storage();
+        let (_right_dir, right) = test_storage();
+        let realm_id = RealmId::from_bytes([57u8; 32]);
+        let make = |seed: u8| {
+            let owner = UserId::local(Ulid::from_parts(seed as u64, 1), realm_id);
+            let watch_id = Ulid::from_parts(seed as u64, 2);
+            let mut subscription = WatchSubscription::new(
+                owner,
+                format!("watch/{seed}"),
+                WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+                1,
+            );
+            subscription.watch_id = watch_id;
+            let change = DocumentSyncChange {
+                base: None,
+                current: DocumentSyncRevision {
+                    generation: 1,
+                    event_id: Ulid::from_parts(seed as u64, 3),
+                    actor: node(seed),
+                    updated_at_ms: 1,
+                },
+                kind: DocumentSyncChangeKind::Upsert,
+                placement: PlacementRef::NIL,
+            };
+            (
+                DocumentSyncTarget::WatchSubscription { owner, watch_id },
+                subscription.to_bytes().expect("subscription serializes"),
+                change,
+            )
+        };
+        let first = make(1);
+        let second = make(2);
+
+        assert!(
+            apply_watch_subscription_change_to_storage(
+                &left,
+                first.0.clone(),
+                Some(first.1.clone()),
+                first.2,
+            )
+            .await
+            .expect("first origin applies")
+        );
+        assert!(
+            apply_watch_subscription_change_to_storage(
+                &left,
+                second.0.clone(),
+                Some(second.1.clone()),
+                second.2,
+            )
+            .await
+            .expect("second origin applies")
+        );
+        assert!(
+            apply_watch_subscription_change_to_storage(
+                &right,
+                second.0.clone(),
+                Some(second.1.clone()),
+                second.2,
+            )
+            .await
+            .expect("second origin applies in reverse order")
+        );
+        assert!(
+            apply_watch_subscription_change_to_storage(
+                &right,
+                first.0.clone(),
+                Some(first.1.clone()),
+                first.2,
+            )
+            .await
+            .expect("first origin applies in reverse order")
+        );
+
+        for storage in [&left, &right] {
+            assert!(
+                read_storage_value(storage, first.0.storage_keyspace(), first.0.storage_key(),)
+                    .await
+                    .is_some()
+            );
+            assert!(
+                read_storage_value(storage, second.0.storage_keyspace(), second.0.storage_key(),)
+                    .await
+                    .is_some()
+            );
+        }
     }
 
     #[test]
