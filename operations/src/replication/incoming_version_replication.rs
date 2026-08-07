@@ -3944,7 +3944,7 @@ mod tests {
     }
 
     #[test]
-    fn allows_relationship_without_writer() {
+    fn allows_relationship_writer() {
         let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         manifest.origin = Some(SyncOrigin {
             relationship_id: Ulid::generate(),
