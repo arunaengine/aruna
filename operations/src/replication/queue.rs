@@ -549,12 +549,6 @@ enum QueueLiveVersionReplicationState {
     WriteObligation,
     CommitObligation,
     AbortObligation,
-    ReadRelationships,
-    ReadConfig,
-    ReadExistingJobs,
-    WriteJobs,
-    WriteContinuation,
-    DeleteObligation,
     ScheduleDrain,
     Finish,
     Error,
@@ -564,13 +558,6 @@ enum QueueLiveVersionReplicationState {
 pub struct QueueLiveVersionReplicationOperation {
     input: QueueLiveVersionReplicationInput,
     state: QueueLiveVersionReplicationState,
-    queued: usize,
-    relationship_jobs: Vec<BlobReplicationJobRecord>,
-    relationship_targets: Vec<(NodeId, String)>,
-    pending_jobs: Vec<BlobReplicationJobRecord>,
-    cursor: LiveReplicationContinuation,
-    continuation_pending: bool,
-    relationship_work: usize,
     seed_key: Option<Key>,
     seed_value: Option<ByteView>,
     txn_id: Option<Ulid>,
@@ -583,17 +570,6 @@ impl QueueLiveVersionReplicationOperation {
         Self {
             input,
             state: QueueLiveVersionReplicationState::Init,
-            queued: 0,
-            relationship_jobs: Vec::new(),
-            relationship_targets: Vec::new(),
-            pending_jobs: Vec::new(),
-            cursor: LiveReplicationContinuation {
-                relationship_after: None,
-                relationships_complete: false,
-                config_after: 0,
-            },
-            continuation_pending: false,
-            relationship_work: 0,
             seed_key: None,
             seed_value: None,
             txn_id: None,
@@ -692,174 +668,6 @@ impl QueueLiveVersionReplicationOperation {
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
-    fn read_relationships(&mut self, start: Option<Key>) -> Effects {
-        self.state = QueueLiveVersionReplicationState::ReadRelationships;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
-            prefix: Some(sync_relationship_prefix(&self.input.bucket).into()),
-            start: start.map(IterStart::After),
-            limit: REPLICATION_SCAN_PAGE_SIZE,
-            txn_id: None,
-        })]
-    }
-
-    fn read_config(&mut self) -> Effects {
-        self.state = QueueLiveVersionReplicationState::ReadConfig;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: self.input.bucket.as_bytes().to_vec().into(),
-            txn_id: None,
-        })]
-    }
-
-    fn merge_config(
-        &mut self,
-        config: Option<BucketReplicationConfig>,
-    ) -> Result<Vec<BlobReplicationJobRecord>, BlobReplicationQueueError> {
-        let jobs = std::mem::take(&mut self.relationship_jobs);
-        let Some(config) = config else {
-            self.cursor.config_after = 0;
-            self.continuation_pending = false;
-            return Ok(jobs);
-        };
-        let config = filter_config(config, &self.relationship_targets);
-        let available = LIVE_REPLICATION_JOB_LIMIT.saturating_sub(jobs.len());
-        let (legacy, next_config) = config_jobs_page(
-            self.input.local_node_id,
-            &self.input.auth_context,
-            &self.input.bucket,
-            &self.input.key,
-            self.input.version_id,
-            self.input.delete_marker,
-            config,
-            self.cursor.config_after,
-            available,
-        );
-        if let Some(next_config) = next_config {
-            self.cursor.relationship_after = None;
-            self.cursor.relationships_complete = true;
-            self.cursor.config_after = next_config;
-            self.continuation_pending = true;
-        } else {
-            self.cursor.config_after = 0;
-            self.continuation_pending = false;
-        }
-        Ok(jobs.into_iter().chain(legacy).collect())
-    }
-
-    fn read_existing_jobs(&mut self, jobs: Vec<BlobReplicationJobRecord>) -> Effects {
-        if jobs.is_empty() {
-            return self.delete_obligation();
-        }
-        if jobs.len() > LIVE_REPLICATION_JOB_LIMIT {
-            return self.fail(BlobReplicationQueueError::UnexpectedEvent(
-                "live replication job limit exceeded".to_string(),
-            ));
-        }
-        let reads = match jobs
-            .iter()
-            .map(|job| {
-                Ok((
-                    BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
-                    blob_replication_job_key(job)?,
-                ))
-            })
-            .collect::<Result<Vec<_>, ConversionError>>()
-        {
-            Ok(reads) => reads,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.pending_jobs = jobs;
-        self.state = QueueLiveVersionReplicationState::ReadExistingJobs;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
-    }
-
-    fn write_jobs(&mut self, jobs: Vec<BlobReplicationJobRecord>) -> Effects {
-        if jobs.is_empty() {
-            self.queued = 0;
-            return if self.continuation_pending {
-                self.write_continuation()
-            } else {
-                self.delete_obligation()
-            };
-        }
-        if jobs.len() > LIVE_REPLICATION_JOB_LIMIT {
-            return self.fail(BlobReplicationQueueError::UnexpectedEvent(
-                "live replication job limit exceeded".to_string(),
-            ));
-        }
-
-        let mut writes = Vec::with_capacity(jobs.len());
-        for job in &jobs {
-            let write = match blob_replication_job_write_entry(job) {
-                Ok(write) => write,
-                Err(error) => return self.fail(error.into()),
-            };
-            writes.push(write);
-        }
-        self.queued = writes.len();
-        self.state = QueueLiveVersionReplicationState::WriteJobs;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })]
-    }
-
-    fn write_continuation(&mut self) -> Effects {
-        let mut record = LiveReplicationObligationRecord::new(
-            self.input.local_node_id,
-            self.input.auth_context.clone(),
-            self.input.bucket.clone(),
-            self.input.key.clone(),
-            self.input.version_id,
-            self.input.delete_marker,
-        );
-        record.continuation = Some(self.cursor.clone());
-        let (key, value) = match live_replication_obligation_write_entry(&record) {
-            Ok((_, key, value)) => (key, value),
-            Err(error) => return self.fail(error.into()),
-        };
-        self.state = QueueLiveVersionReplicationState::WriteContinuation;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
-            key,
-            value,
-            txn_id: None,
-        })]
-    }
-
-    fn delete_obligation(&mut self) -> Effects {
-        let record = LiveReplicationObligationRecord::new(
-            self.input.local_node_id,
-            self.input.auth_context.clone(),
-            self.input.bucket.clone(),
-            self.input.key.clone(),
-            self.input.version_id,
-            self.input.delete_marker,
-        );
-        let key = match live_replication_obligation_key(&record) {
-            Ok(key) => key,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.state = QueueLiveVersionReplicationState::DeleteObligation;
-        smallvec![Effect::Storage(StorageEffect::Delete {
-            key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
-            key,
-            txn_id: None,
-        })]
-    }
-
-    fn finish_after_obligation_delete(&mut self) -> Effects {
-        if self.queued > 0 {
-            self.schedule_drain()
-        } else {
-            self.finish(0, false)
-        }
-    }
-
     fn schedule_drain(&mut self) -> Effects {
         self.state = QueueLiveVersionReplicationState::ScheduleDrain;
         smallvec![schedule_blob_replication_drain_effect()]
@@ -943,175 +751,12 @@ impl Operation for QueueLiveVersionReplicationOperation {
                     "{other:?}"
                 ))),
             },
-            QueueLiveVersionReplicationState::ReadRelationships => match event {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => {
-                    let page_len = values.len();
-                    for (index, (key, value)) in values.into_iter().enumerate() {
-                        if self.relationship_work >= LIVE_REPLICATION_RELATIONSHIP_LIMIT {
-                            self.continuation_pending = true;
-                            break;
-                        }
-                        self.relationship_work = self.relationship_work.saturating_add(1);
-                        let key_bytes = key.to_vec();
-                        self.cursor.relationship_after = Some(key_bytes.clone());
-                        let relationship = match SyncRelationship::from_bytes(&value) {
-                            Ok(relationship) => relationship,
-                            Err(error) => return self.fail(error.into()),
-                        };
-                        if let Err(error) =
-                            validate_sync_key(&self.input.bucket, &key, &relationship)
-                        {
-                            return self.fail(error.into());
-                        }
-                        let target = relationship
-                            .target
-                            .bucket()
-                            .map(|bucket| (relationship.target.node_id, bucket.to_string()));
-                        if let Some(job) = relationship_job(
-                            self.input.local_node_id,
-                            RelationshipJobTarget {
-                                bucket: &self.input.bucket,
-                                key: &self.input.key,
-                                version_id: self.input.version_id,
-                                delete_marker: self.input.delete_marker,
-                            },
-                            relationship,
-                            None,
-                            &[],
-                        )
-                        .map(|job| job.with_writer_auth(self.input.auth_context.clone()))
-                        {
-                            if self.relationship_jobs.len() >= LIVE_REPLICATION_JOB_LIMIT {
-                                self.continuation_pending = true;
-                                break;
-                            }
-                            self.relationship_jobs.push(job);
-                            if let Some(target) = target {
-                                self.relationship_targets.push(target);
-                            }
-                        }
-                        if self.relationship_jobs.len() >= LIVE_REPLICATION_JOB_LIMIT
-                            || self.relationship_work >= LIVE_REPLICATION_RELATIONSHIP_LIMIT
-                        {
-                            let complete = index + 1 == page_len && next_start_after.is_none();
-                            if complete {
-                                self.cursor.relationship_after = None;
-                                self.cursor.relationships_complete = true;
-                                self.continuation_pending = false;
-                            } else {
-                                self.cursor.relationships_complete = false;
-                                self.cursor.config_after = 0;
-                                self.continuation_pending = true;
-                            }
-                            break;
-                        }
-                    }
-                    if self.continuation_pending {
-                        return self.write_jobs(std::mem::take(&mut self.relationship_jobs));
-                    }
-                    match next_start_after {
-                        Some(start) => self.read_relationships(Some(start)),
-                        None => {
-                            self.cursor.relationship_after = None;
-                            self.cursor.relationships_complete = true;
-                            self.read_config()
-                        }
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobReplicationQueueError::UnexpectedEvent(format!(
-                    "{other:?}"
-                ))),
-            },
-            QueueLiveVersionReplicationState::ReadConfig => match event {
-                Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-                    match self.merge_config(None) {
-                        Ok(jobs) => self.read_existing_jobs(jobs),
-                        Err(error) => self.fail(error),
-                    }
-                }
-                Event::Storage(StorageEvent::ReadResult {
-                    value: Some(value), ..
-                }) => match BucketInfo::from_bytes(value.as_ref()) {
-                    Ok(info) => match self.merge_config(info.replication) {
-                        Ok(jobs) => self.read_existing_jobs(jobs),
-                        Err(error) => self.fail(error),
-                    },
-                    Err(error) => self.fail(error.into()),
-                },
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobReplicationQueueError::UnexpectedEvent(format!(
-                    "{other:?}"
-                ))),
-            },
-            QueueLiveVersionReplicationState::ReadExistingJobs => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    if values.len() != self.pending_jobs.len() {
-                        return self.fail(BlobReplicationQueueError::UnexpectedEvent(
-                            "blob replication existing job read count mismatch".to_string(),
-                        ));
-                    }
-                    let mut jobs = Vec::new();
-                    let pending_jobs = std::mem::take(&mut self.pending_jobs);
-                    for (job, (_, value)) in pending_jobs.into_iter().zip(values) {
-                        match value {
-                            Some(value) => match BlobReplicationJobRecord::from_bytes(&value) {
-                                Ok(existing) if blob_replication_job_preferred(&existing, &job) => {
-                                }
-                                Ok(_) | Err(_) => jobs.push(job),
-                            },
-                            None => jobs.push(job),
-                        }
-                    }
-                    self.write_jobs(jobs)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobReplicationQueueError::UnexpectedEvent(format!(
-                    "{other:?}"
-                ))),
-            },
-            QueueLiveVersionReplicationState::WriteJobs => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    if self.continuation_pending {
-                        self.write_continuation()
-                    } else {
-                        self.delete_obligation()
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobReplicationQueueError::UnexpectedEvent(format!(
-                    "{other:?}"
-                ))),
-            },
-            QueueLiveVersionReplicationState::WriteContinuation => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => self.schedule_drain(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobReplicationQueueError::UnexpectedEvent(format!(
-                    "{other:?}"
-                ))),
-            },
-            QueueLiveVersionReplicationState::DeleteObligation => match event {
-                Event::Storage(StorageEvent::DeleteResult { .. }) => {
-                    self.finish_after_obligation_delete()
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    warn!(error = ?error, "Live replication jobs persisted but obligation cleanup failed");
-                    self.finish_after_obligation_delete()
-                }
-                other => {
-                    warn!(event = ?other, "Live replication jobs persisted but obligation cleanup returned an unexpected event");
-                    self.finish_after_obligation_delete()
-                }
-            },
             QueueLiveVersionReplicationState::ScheduleDrain => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish(self.queued, true),
-                Event::Task(TaskEvent::Error { .. }) => self.finish(self.queued, false),
+                Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish(0, true),
+                Event::Task(TaskEvent::Error { .. }) => self.finish(0, false),
                 other => {
-                    warn!(event = ?other, "Live replication jobs persisted but drain scheduling returned an unexpected event");
-                    self.finish(self.queued, false)
+                    warn!(event = ?other, "Durable replication obligation persisted but drain scheduling returned an unexpected event");
+                    self.finish(0, false)
                 }
             },
             QueueLiveVersionReplicationState::Finish => smallvec![],
