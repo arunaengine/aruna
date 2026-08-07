@@ -25,7 +25,9 @@ use crate::notifications::inbox::upsert_inbox_records_reporting;
 use crate::notifications::mark_read::MARK_READ_MAX_IDS;
 use crate::notifications::outbox::NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE;
 use crate::notifications::placement::resolve_inbox_holder;
-use crate::notifications::protocol::{NotificationTransportMessage, notification_message_kind};
+use crate::notifications::protocol::{
+    NOTIFICATION_WATCH_EVENT_BATCH_SIZE, NotificationTransportMessage, notification_message_kind,
+};
 use crate::notifications::watch::authorization::{
     WatchAuthorization, authorize_forwarded_watch, list_authorized_watch_subscriptions,
 };
@@ -314,6 +316,13 @@ fn validate_inbound_watch_events(
     realm_id: RealmId,
     now_ms: u64,
 ) -> Result<(), String> {
+    if events.len() > NOTIFICATION_WATCH_EVENT_BATCH_SIZE {
+        return Err(format!(
+            "watch event batch count {} exceeds cap {}",
+            events.len(),
+            NOTIFICATION_WATCH_EVENT_BATCH_SIZE
+        ));
+    }
     for event in events {
         validate_inbound_watch_event(event, realm_id, now_ms)?;
     }
@@ -674,6 +683,13 @@ fn message_realm(message: &NotificationTransportMessage) -> Result<RealmId, Stri
             let Some(first) = events.first() else {
                 return Err("empty batch".to_string());
             };
+            if events.len() > NOTIFICATION_WATCH_EVENT_BATCH_SIZE {
+                return Err(format!(
+                    "watch event batch count {} exceeds cap {}",
+                    events.len(),
+                    NOTIFICATION_WATCH_EVENT_BATCH_SIZE
+                ));
+            }
             let realm_id = first.realm_id;
             if events.iter().any(|event| event.realm_id != realm_id) {
                 return Err("mixed-realm batch".to_string());
@@ -2161,6 +2177,22 @@ mod tests {
         assert_eq!(
             validate_inbound_watch_event(&event, realm_id, 1_000),
             Err("watch event metadata path does not match detail".to_string())
+        );
+    }
+
+    #[test]
+    fn watch_batch_caps() {
+        let realm_id = RealmId::from_bytes([80u8; 32]);
+        let actor = UserId::new(Ulid::generate(), realm_id);
+        let events = vec![
+            upload_event(realm_id, actor, "bucket/object");
+            NOTIFICATION_WATCH_EVENT_BATCH_SIZE + 1
+        ];
+
+        assert!(
+            validate_inbound_watch_events(&events, realm_id, 1_700_000_000_000)
+                .expect_err("oversized watch batch must be rejected")
+                .contains("exceeds cap")
         );
     }
 

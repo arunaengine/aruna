@@ -15,6 +15,10 @@ use crate::notifications::inbox::{
     InboxWriteOutcome, UpsertFailure, upsert_inbox_records_in_transaction,
 };
 use crate::notifications::placement::filter_locally_held_watch_subscriptions;
+use crate::notifications::protocol::{
+    NOTIFICATION_WATCH_EVENT_BATCH_SIZE, NOTIFICATION_WATCH_EXPANSION_CANDIDATE_CAP,
+    NOTIFICATION_WATCH_EXPANSION_RECORD_CAP, NOTIFICATION_WATCH_EXPANSION_WORK_CAP,
+};
 use crate::notifications::routing::route_watch_event;
 use crate::notifications::watch::authorization::{
     WatchAuthorization, evaluate_watch_authorization, evaluate_watch_delivery,
@@ -40,6 +44,13 @@ pub async fn expand_watch_events(
 ) -> Result<(InboxWriteOutcome, bool), String> {
     if events.is_empty() {
         return Ok((InboxWriteOutcome::default(), false));
+    }
+    if events.len() > NOTIFICATION_WATCH_EVENT_BATCH_SIZE {
+        return Err(format!(
+            "watch event batch count {} exceeds cap {}",
+            events.len(),
+            NOTIFICATION_WATCH_EVENT_BATCH_SIZE
+        ));
     }
     for attempt in 0..2 {
         match expand_watch_events_once(context, realm_id, realm_config, local_node_id, events).await
@@ -77,11 +88,27 @@ async fn expand_watch_events_once(
     if subscriptions.is_empty() {
         return Ok((InboxWriteOutcome::default(), found_stale));
     }
-    let mut candidates = Vec::new();
+    let work = expansion_budget(events.len(), subscriptions.len()).map_err(UpsertFailure::Fatal)?;
+    let mut candidates = Vec::with_capacity(work.min(NOTIFICATION_WATCH_EXPANSION_CANDIDATE_CAP));
+    let mut record_count = 0;
     for event in events {
         for subscription in &subscriptions {
             let routed = route_watch_event(event, std::slice::from_ref(subscription));
             if !routed.is_empty() {
+                add_limit(
+                    candidates.len(),
+                    1,
+                    NOTIFICATION_WATCH_EXPANSION_CANDIDATE_CAP,
+                    "candidate",
+                )
+                .map_err(UpsertFailure::Fatal)?;
+                record_count = add_limit(
+                    record_count,
+                    routed.len(),
+                    NOTIFICATION_WATCH_EXPANSION_RECORD_CAP,
+                    "record",
+                )
+                .map_err(UpsertFailure::Fatal)?;
                 candidates.push((subscription, event, routed));
             }
         }
@@ -123,7 +150,17 @@ async fn stage_watch_expansion(
     txn_id: TxnId,
     candidates: Vec<WatchCandidate<'_>>,
 ) -> Result<(InboxWriteOutcome, bool), UpsertFailure> {
-    let mut subscriptions = Vec::new();
+    let mut record_budget = 0;
+    for (_, _, routed) in &candidates {
+        record_budget = add_limit(
+            record_budget,
+            routed.len(),
+            NOTIFICATION_WATCH_EXPANSION_RECORD_CAP,
+            "record",
+        )
+        .map_err(UpsertFailure::Fatal)?;
+    }
+    let mut subscriptions = Vec::with_capacity(candidates.len());
     for (subscription, _, _) in &candidates {
         if !subscriptions
             .iter()
@@ -197,7 +234,7 @@ async fn stage_watch_expansion(
         }
     }
 
-    let mut records = Vec::new();
+    let mut records = Vec::with_capacity(record_budget);
     let mut dropped = false;
     for (subscription, event, routed) in candidates {
         match evaluate_watch_delivery(
@@ -273,6 +310,31 @@ fn classify_storage_error(error: StorageError) -> UpsertFailure {
     } else {
         UpsertFailure::Fatal(error.to_string())
     }
+}
+
+fn expansion_budget(events: usize, subscriptions: usize) -> Result<usize, String> {
+    let work = events
+        .checked_mul(subscriptions)
+        .ok_or_else(|| "watch expansion work budget overflow".to_string())?;
+    if work > NOTIFICATION_WATCH_EXPANSION_WORK_CAP {
+        return Err(format!(
+            "watch expansion work {} exceeds cap {}",
+            work, NOTIFICATION_WATCH_EXPANSION_WORK_CAP
+        ));
+    }
+    Ok(work)
+}
+
+fn add_limit(total: usize, added: usize, limit: usize, label: &str) -> Result<usize, String> {
+    let next = total
+        .checked_add(added)
+        .ok_or_else(|| format!("watch expansion {label} budget overflow"))?;
+    if next > limit {
+        return Err(format!(
+            "watch expansion {label} count {next} exceeds cap {limit}"
+        ));
+    }
+    Ok(next)
 }
 
 async fn abort_transaction(context: &DriverContext, txn_id: TxnId) {
@@ -365,6 +427,42 @@ mod tests {
                 size_bytes: 8,
             },
         }
+    }
+
+    #[test]
+    fn expansion_caps_work() {
+        assert!(expansion_budget(65, 64).is_err());
+    }
+
+    #[test]
+    fn expansion_checks_overflow() {
+        assert!(expansion_budget(usize::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn expansion_caps_candidates() {
+        assert!(
+            add_limit(
+                NOTIFICATION_WATCH_EXPANSION_CANDIDATE_CAP,
+                1,
+                NOTIFICATION_WATCH_EXPANSION_CANDIDATE_CAP,
+                "candidate"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn expansion_caps_records() {
+        assert!(
+            add_limit(
+                NOTIFICATION_WATCH_EXPANSION_RECORD_CAP,
+                1,
+                NOTIFICATION_WATCH_EXPANSION_RECORD_CAP,
+                "record"
+            )
+            .is_err()
+        );
     }
 
     async fn install_authorization(

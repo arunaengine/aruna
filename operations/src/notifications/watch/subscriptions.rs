@@ -26,12 +26,14 @@ use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
 use crate::driver::DriverContext;
+use crate::notifications::protocol::NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP;
 use crate::notifications::watch::authorization::{WatchAuthorization, evaluate_watch_creation};
 use crate::notifications::watch::interest::watch_interest_dirty_marker_write;
 
 /// Single owner-prefix scan bound. Watches are hard-capped per user, so one page
 /// always covers a subscription set with a wide safety margin.
 const WATCH_SUBSCRIPTION_LIST_LIMIT: usize = 256;
+const WATCH_SUBSCRIPTION_PAGE_LIMIT: usize = 256;
 
 /// Stable reject reason for a cap-exceeded create; matched verbatim by the
 /// holder proxy to surface a 409 to the API layer.
@@ -657,15 +659,19 @@ pub async fn list_realm_watch_subscriptions(
     realm_id: RealmId,
 ) -> Result<Vec<WatchSubscription>, WatchSubscriptionError> {
     let prefix = UserId::storage_prefix(realm_id);
-    let mut subscriptions = Vec::new();
+    let mut subscriptions = Vec::with_capacity(NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP);
     let mut start = None;
     loop {
+        let remaining = NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP - subscriptions.len();
+        let limit = remaining
+            .saturating_add(1)
+            .min(WATCH_SUBSCRIPTION_PAGE_LIMIT);
         let (values, next) = match storage
             .send_storage_effect(StorageEffect::Iter {
                 key_space: NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
                 prefix: Some(prefix.clone()),
                 start: start.map(IterStart::After),
-                limit: 1_000,
+                limit,
                 txn_id: None,
             })
             .await
@@ -683,6 +689,11 @@ pub async fn list_realm_watch_subscriptions(
                 )));
             }
         };
+        if values.len() > remaining {
+            return Err(WatchSubscriptionError::Storage(
+                "notification watch realm subscription cap reached".to_string(),
+            ));
+        }
         for (key, value) in values {
             let subscription = decode_stored_subscription(&key, &value)?;
             if subscription.owner.realm_id != realm_id {
@@ -1060,6 +1071,39 @@ mod tests {
             .expect("other realm scan succeeds");
         assert_eq!(other_subs.len(), 1);
         assert_eq!(other_subs[0].owner, outsider);
+    }
+
+    #[tokio::test]
+    async fn realm_scan_caps() {
+        let (_dir, storage) = temp_storage();
+        let realm = RealmId([9u8; 32]);
+        let writes = (0..=NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP)
+            .map(|index| {
+                let owner = UserId::new(
+                    Ulid::from_bytes([(index / NOTIFICATION_WATCH_PER_USER_CAP) as u8; 16]),
+                    realm,
+                );
+                let mut subscription =
+                    WatchSubscription::new(owner, format!("p/{index}"), mask(), index as u64);
+                subscription.watch_id = Ulid::from_bytes((index as u128).to_be_bytes());
+                watch_subscription_write_entry(&subscription).expect("subscription encodes")
+            })
+            .collect();
+        assert!(matches!(
+            storage
+                .send_storage_effect(StorageEffect::BatchWrite {
+                    writes,
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+
+        assert!(matches!(
+            list_realm_watch_subscriptions(&storage, realm).await,
+            Err(WatchSubscriptionError::Storage(reason))
+                if reason.contains("realm subscription cap")
+        ));
     }
 
     #[test]

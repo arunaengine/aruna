@@ -8,6 +8,11 @@ use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
 pub const NOTIFICATION_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+pub const NOTIFICATION_WATCH_EVENT_BATCH_SIZE: usize = 128;
+pub const NOTIFICATION_WATCH_REALM_SUBSCRIPTION_CAP: usize = 1024;
+pub const NOTIFICATION_WATCH_EXPANSION_WORK_CAP: usize = 4096;
+pub const NOTIFICATION_WATCH_EXPANSION_CANDIDATE_CAP: usize = 1024;
+pub const NOTIFICATION_WATCH_EXPANSION_RECORD_CAP: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NotificationTransportMessage {
