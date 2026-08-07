@@ -44,6 +44,9 @@ const REPLICATION_SCAN_PAGE_SIZE: usize = 512;
 const REPLICATION_BATCH_SIZE: usize = 64;
 const RELATIONSHIP_STATS_PAGE_SIZE: usize = 256;
 const LIVE_REPLICATION_OBLIGATION_BATCH_SIZE: usize = 64;
+const LIVE_REPLICATION_JOB_LIMIT: usize = 64;
+const LIVE_REPLICATION_RELATIONSHIP_LIMIT: usize = 1024;
+const REPLICATION_CURSOR_KEY: &[u8] = b"\xffaruna-blob-replication-cursor";
 
 pub const BLOB_REPLICATION_POLL_AFTER: Duration = Duration::from_secs(5);
 pub const BLOB_REPLICATION_RETRY_AFTER: Duration = Duration::from_secs(1);
@@ -123,6 +126,12 @@ struct LiveReplicationObligationIdentity<'a> {
 struct BlobReplicationJobScan {
     jobs: Vec<(Vec<u8>, BlobReplicationJobRecord)>,
     has_more_due: bool,
+    next_due_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ReplicationScanCursor {
+    after: Option<Vec<u8>>,
     next_due_at_ms: Option<u64>,
 }
 
@@ -576,12 +585,20 @@ impl QueueLiveVersionReplicationOperation {
     fn merge_config(
         &mut self,
         config: Option<BucketReplicationConfig>,
-    ) -> Vec<BlobReplicationJobRecord> {
+    ) -> Result<Vec<BlobReplicationJobRecord>, BlobReplicationQueueError> {
         let jobs = std::mem::take(&mut self.relationship_jobs);
         let Some(config) = config else {
-            return jobs;
+            return Ok(jobs);
         };
         let config = filter_config(config, &self.relationship_targets);
+        let available = LIVE_REPLICATION_JOB_LIMIT.saturating_sub(jobs.len());
+        if count_config_jobs(self.input.local_node_id, self.input.delete_marker, &config)
+            > available
+        {
+            return Err(BlobReplicationQueueError::UnexpectedEvent(
+                "live replication job limit exceeded".to_string(),
+            ));
+        }
         let legacy = live_replication_jobs_from_config(
             self.input.local_node_id,
             &self.input.auth_context,
@@ -591,12 +608,17 @@ impl QueueLiveVersionReplicationOperation {
             self.input.delete_marker,
             config,
         );
-        jobs.into_iter().chain(legacy).collect()
+        Ok(jobs.into_iter().chain(legacy).collect())
     }
 
     fn read_existing_jobs(&mut self, jobs: Vec<BlobReplicationJobRecord>) -> Effects {
         if jobs.is_empty() {
             return self.delete_obligation();
+        }
+        if jobs.len() > LIVE_REPLICATION_JOB_LIMIT {
+            return self.fail(BlobReplicationQueueError::UnexpectedEvent(
+                "live replication job limit exceeded".to_string(),
+            ));
         }
         let reads = match jobs
             .iter()
@@ -623,6 +645,11 @@ impl QueueLiveVersionReplicationOperation {
         if jobs.is_empty() {
             self.queued = 0;
             return self.delete_obligation();
+        }
+        if jobs.len() > LIVE_REPLICATION_JOB_LIMIT {
+            return self.fail(BlobReplicationQueueError::UnexpectedEvent(
+                "live replication job limit exceeded".to_string(),
+            ));
         }
 
         let mut writes = Vec::with_capacity(jobs.len());
@@ -726,6 +753,11 @@ impl Operation for QueueLiveVersionReplicationOperation {
                         )
                         .map(|job| job.with_writer_auth(self.input.auth_context.clone()))
                         {
+                            if self.relationship_jobs.len() >= LIVE_REPLICATION_JOB_LIMIT {
+                                return self.fail(BlobReplicationQueueError::UnexpectedEvent(
+                                    "live replication job limit exceeded".to_string(),
+                                ));
+                            }
                             self.relationship_jobs.push(job);
                             if let Some(target) = target {
                                 self.relationship_targets.push(target);
@@ -744,16 +776,18 @@ impl Operation for QueueLiveVersionReplicationOperation {
             },
             QueueLiveVersionReplicationState::ReadConfig => match event {
                 Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-                    let jobs = self.merge_config(None);
-                    self.read_existing_jobs(jobs)
+                    match self.merge_config(None) {
+                        Ok(jobs) => self.read_existing_jobs(jobs),
+                        Err(error) => self.fail(error),
+                    }
                 }
                 Event::Storage(StorageEvent::ReadResult {
                     value: Some(value), ..
                 }) => match BucketInfo::from_bytes(value.as_ref()) {
-                    Ok(info) => {
-                        let jobs = self.merge_config(info.replication);
-                        self.read_existing_jobs(jobs)
-                    }
+                    Ok(info) => match self.merge_config(info.replication) {
+                        Ok(jobs) => self.read_existing_jobs(jobs),
+                        Err(error) => self.fail(error),
+                    },
                     Err(error) => self.fail(error.into()),
                 },
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
@@ -946,6 +980,19 @@ fn filter_config(
     config
 }
 
+fn count_config_jobs(
+    local_node_id: NodeId,
+    delete_marker: bool,
+    config: &BucketReplicationConfig,
+) -> usize {
+    config
+        .targets
+        .iter()
+        .filter(|target| target.node_id != local_node_id)
+        .filter(|target| !delete_marker || target.replicate_delete_markers)
+        .count()
+}
+
 fn validate_sync_key(
     bucket: &str,
     key: &Key,
@@ -1025,12 +1072,14 @@ pub async fn blob_replication_jobs_exist(
             key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
             prefix: None,
             start: None,
-            limit: 1,
+            limit: 2,
             txn_id: None,
         })
         .await
     {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(!values.is_empty()),
+        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(values
+            .iter()
+            .any(|(key, _)| !is_replication_cursor(key.as_ref()))),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
             "{other:?}"
@@ -1063,7 +1112,10 @@ pub async fn relationship_job_stats(
                 values,
                 next_start_after,
             }) => {
-                for (_, value) in values {
+                for (key, value) in values {
+                    if is_replication_cursor(key.as_ref()) {
+                        continue;
+                    }
                     let record = BlobReplicationJobRecord::from_bytes(value.as_ref())?;
                     if record.relationship_id == Some(relationship_id) {
                         pending = pending.saturating_add(1);
@@ -1621,13 +1673,35 @@ async fn process_live_replication_obligations(
 ) -> Result<LiveReplicationRepairResult, BlobReplicationQueueError> {
     let (obligations, has_more) =
         read_live_replication_obligations(&context.storage_handle).await?;
+    let mut relationship_cache = HashMap::new();
+    let mut relationship_work = 0usize;
+    for (_, obligation) in &obligations {
+        if obligation
+            .origin
+            .as_ref()
+            .is_some_and(|origin| origin.hop_count >= 4)
+            || relationship_cache.contains_key(&obligation.bucket)
+        {
+            continue;
+        }
+        let remaining = LIVE_REPLICATION_RELATIONSHIP_LIMIT.saturating_sub(relationship_work);
+        let relationships =
+            read_relationships_limit(&context.storage_handle, &obligation.bucket, remaining)
+                .await?;
+        relationship_work = relationship_work.saturating_add(relationships.len());
+        relationship_cache.insert(obligation.bucket.clone(), relationships);
+    }
     let mut result = LiveReplicationRepairResult {
         has_more,
         ..Default::default()
     };
 
     for (obligation_key, obligation) in obligations {
-        let queued = write_live_jobs(&context.storage_handle, &obligation).await?;
+        let relationships = relationship_cache
+            .get(&obligation.bucket)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let queued = write_live_jobs(&context.storage_handle, &obligation, relationships).await?;
         delete_live_obligation(&context.storage_handle, obligation_key).await?;
         result.processed = result.processed.saturating_add(1);
         result.queued = result.queued.saturating_add(queued);
@@ -1736,9 +1810,65 @@ async fn read_relationships(
     }
 }
 
+async fn read_relationships_limit(
+    storage: &StorageHandle,
+    bucket: &str,
+    limit: usize,
+) -> Result<Vec<SyncRelationship>, BlobReplicationQueueError> {
+    if limit == 0 {
+        return Err(BlobReplicationQueueError::UnexpectedEvent(
+            "live replication relationship limit exceeded".to_string(),
+        ));
+    }
+    let mut start_after = None;
+    let mut relationships = Vec::with_capacity(limit.min(REPLICATION_SCAN_PAGE_SIZE));
+    loop {
+        let page_limit = (limit - relationships.len()).min(REPLICATION_SCAN_PAGE_SIZE);
+        let event = storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
+                prefix: Some(sync_relationship_prefix(bucket).into()),
+                start: start_after.take().map(IterStart::After),
+                limit: page_limit,
+                txn_id: None,
+            })
+            .await;
+        let (values, next_start_after) = match event {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+            other => {
+                return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
+                    "{other:?}"
+                )));
+            }
+        };
+        for (key, value) in values {
+            let relationship = SyncRelationship::from_bytes(&value)?;
+            validate_sync_key(bucket, &key, &relationship)?;
+            relationships.push(relationship);
+        }
+        if relationships.len() == limit {
+            if next_start_after.is_some() {
+                return Err(BlobReplicationQueueError::UnexpectedEvent(
+                    "live replication relationship limit exceeded".to_string(),
+                ));
+            }
+            return Ok(relationships);
+        }
+        match next_start_after {
+            Some(next) => start_after = Some(next),
+            None => return Ok(relationships),
+        }
+    }
+}
+
 async fn write_live_jobs(
     storage: &StorageHandle,
     obligation: &LiveReplicationObligationRecord,
+    relationships: &[SyncRelationship],
 ) -> Result<usize, BlobReplicationQueueError> {
     if obligation
         .origin
@@ -1759,9 +1889,10 @@ async fn write_live_jobs(
     {
         upstream_sources.push(source);
     }
-    let mut relationship_jobs = Vec::new();
-    let mut relationship_targets = Vec::new();
-    for relationship in read_relationships(storage, &obligation.bucket).await? {
+    let mut relationship_jobs =
+        Vec::with_capacity(relationships.len().min(LIVE_REPLICATION_JOB_LIMIT));
+    let mut relationship_targets = Vec::with_capacity(LIVE_REPLICATION_JOB_LIMIT);
+    for relationship in relationships {
         let target = relationship
             .target
             .bucket()
@@ -1780,6 +1911,11 @@ async fn write_live_jobs(
         )
         .map(|job| job.with_writer_auth(obligation.auth_context.clone()))
         {
+            if relationship_jobs.len() >= LIVE_REPLICATION_JOB_LIMIT {
+                return Err(BlobReplicationQueueError::UnexpectedEvent(
+                    "live replication job limit exceeded".to_string(),
+                ));
+            }
             relationship_jobs.push(job);
             if let Some(target) = target {
                 relationship_targets.push(target);
@@ -1792,6 +1928,14 @@ async fn write_live_jobs(
     ) {
         (true, Some(config)) => {
             let config = filter_config(config, &relationship_targets);
+            let available = LIVE_REPLICATION_JOB_LIMIT.saturating_sub(relationship_jobs.len());
+            if count_config_jobs(obligation.local_node_id, obligation.delete_marker, &config)
+                > available
+            {
+                return Err(BlobReplicationQueueError::UnexpectedEvent(
+                    "live replication job limit exceeded".to_string(),
+                ));
+            }
             live_replication_jobs_from_config(
                 obligation.local_node_id,
                 &obligation.auth_context,
@@ -1810,6 +1954,11 @@ async fn write_live_jobs(
         return Ok(0);
     }
 
+    if jobs.len() > LIVE_REPLICATION_JOB_LIMIT {
+        return Err(BlobReplicationQueueError::UnexpectedEvent(
+            "live replication job limit exceeded".to_string(),
+        ));
+    }
     let reads = jobs
         .iter()
         .map(|job| {
@@ -1925,95 +2074,172 @@ async fn delete_live_obligation(
     }
 }
 
+fn is_replication_cursor(key: &[u8]) -> bool {
+    key == REPLICATION_CURSOR_KEY
+}
+
+async fn read_replication_cursor(
+    storage: &StorageHandle,
+) -> Result<Option<ReplicationScanCursor>, BlobReplicationQueueError> {
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
+            key: ByteView::from(REPLICATION_CURSOR_KEY.to_vec()),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => Ok(Some(postcard::from_bytes(value.as_ref())?)),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
+    }
+}
+
+async fn store_replication_cursor(
+    storage: &StorageHandle,
+    cursor: Option<ReplicationScanCursor>,
+) -> Result<(), BlobReplicationQueueError> {
+    let effect = match cursor {
+        Some(cursor) => StorageEffect::Write {
+            key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
+            key: ByteView::from(REPLICATION_CURSOR_KEY.to_vec()),
+            value: ByteView::from(postcard::to_allocvec(&cursor)?),
+            txn_id: None,
+        },
+        None => StorageEffect::Delete {
+            key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
+            key: ByteView::from(REPLICATION_CURSOR_KEY.to_vec()),
+            txn_id: None,
+        },
+    };
+    match storage.send_storage_effect(effect).await {
+        Event::Storage(StorageEvent::WriteResult { .. })
+        | Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(BlobReplicationQueueError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
+    }
+}
+
 async fn scan_due_blob_replication_jobs(
     storage: &StorageHandle,
     now_ms: u64,
     limit: usize,
 ) -> Result<BlobReplicationJobScan, BlobReplicationQueueError> {
-    let mut start_after = None;
+    let cursor = read_replication_cursor(storage).await?;
+    let start_after = cursor.as_ref().and_then(|cursor| cursor.after.clone());
     let mut jobs = Vec::new();
-    let mut next_due_at_ms = None;
+    let mut next_due_at_ms = cursor.and_then(|cursor| cursor.next_due_at_ms);
     let mut canonical_changed = false;
-    loop {
-        let event = storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
-                prefix: None,
-                start: start_after.take().map(IterStart::After),
-                limit: REPLICATION_SCAN_PAGE_SIZE,
-                txn_id: None,
-            })
-            .await;
-        let (values, next_start_after) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => {
-                return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
-            }
-        };
+    let event = storage
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: BLOB_REPLICATION_JOB_KEYSPACE.to_string(),
+            prefix: None,
+            start: start_after.map(IterStart::After),
+            limit: REPLICATION_SCAN_PAGE_SIZE,
+            txn_id: None,
+        })
+        .await;
+    let (values, next_start_after) = match event {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) => (values, next_start_after),
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => {
+            return Err(BlobReplicationQueueError::UnexpectedEvent(format!(
+                "{other:?}"
+            )));
+        }
+    };
+    let mut last_key = None;
 
-        for (key, value) in values {
-            let mut key = key.to_vec();
-            let mut job = match BlobReplicationJobRecord::from_bytes(&value) {
-                Ok(job) => job,
-                Err(error) => {
-                    warn!(error = %error, key = ?key, "Deleting malformed blob replication job");
-                    delete_blob_replication_job(storage, key).await?;
-                    continue;
-                }
-            };
-            let canonical_key = blob_replication_job_key(&job)?.to_vec();
-            if canonical_key.as_slice() != key.as_slice() {
-                warn!(key = ?key, "Repairing blob replication job stored under non-canonical key");
-                if let Some(existing) =
-                    read_blob_replication_job_at_key(storage, &canonical_key).await?
-                    && blob_replication_job_preferred(&existing, &job)
-                {
-                    delete_blob_replication_job(storage, key).await?;
-                    job = existing;
-                } else {
-                    write_blob_replication_job(storage, &job).await?;
-                    delete_blob_replication_job(storage, key).await?;
-                    canonical_changed = true;
-                    jobs.retain(|(existing_key, _)| existing_key != &canonical_key);
-                }
-                key = canonical_key;
-            } else if canonical_changed {
-                if let Some(existing) =
-                    read_blob_replication_job_at_key(storage, &canonical_key).await?
-                {
-                    job = existing;
-                }
-            }
-            if job.due_at_ms > now_ms {
-                next_due_at_ms = min_due_at(next_due_at_ms, job.due_at_ms);
+    for (key, value) in values {
+        if is_replication_cursor(key.as_ref()) {
+            continue;
+        }
+        let mut key = key.to_vec();
+        last_key = Some(key.clone());
+        let mut job = match BlobReplicationJobRecord::from_bytes(&value) {
+            Ok(job) => job,
+            Err(error) => {
+                warn!(error = %error, key = ?key, "Deleting malformed blob replication job");
+                delete_blob_replication_job(storage, key).await?;
                 continue;
             }
-            if merge_due_job(&mut jobs, key, job, limit) {
-                return Ok(BlobReplicationJobScan {
-                    jobs,
-                    has_more_due: true,
-                    next_due_at_ms,
-                });
+        };
+        let canonical_key = blob_replication_job_key(&job)?.to_vec();
+        if canonical_key.as_slice() != key.as_slice() {
+            warn!(key = ?key, "Repairing blob replication job stored under non-canonical key");
+            if let Some(existing) =
+                read_blob_replication_job_at_key(storage, &canonical_key).await?
+                && blob_replication_job_preferred(&existing, &job)
+            {
+                delete_blob_replication_job(storage, key).await?;
+                job = existing;
+            } else {
+                write_blob_replication_job(storage, &job).await?;
+                delete_blob_replication_job(storage, key).await?;
+                canonical_changed = true;
+                jobs.retain(|(existing_key, _)| existing_key != &canonical_key);
+            }
+            key = canonical_key;
+        } else if canonical_changed {
+            if let Some(existing) =
+                read_blob_replication_job_at_key(storage, &canonical_key).await?
+            {
+                job = existing;
             }
         }
-
-        match next_start_after {
-            Some(next) => start_after = Some(next),
-            None => {
-                return Ok(BlobReplicationJobScan {
-                    jobs,
-                    has_more_due: false,
+        if job.due_at_ms > now_ms {
+            next_due_at_ms = min_due_at(next_due_at_ms, job.due_at_ms);
+            continue;
+        }
+        if merge_due_job(&mut jobs, key, job, limit) {
+            store_replication_cursor(
+                storage,
+                Some(ReplicationScanCursor {
+                    after: last_key,
                     next_due_at_ms,
-                });
-            }
+                }),
+            )
+            .await?;
+            return Ok(BlobReplicationJobScan {
+                jobs,
+                has_more_due: true,
+                next_due_at_ms,
+            });
         }
     }
+
+    if let Some(next) = next_start_after {
+        store_replication_cursor(
+            storage,
+            Some(ReplicationScanCursor {
+                after: Some(next.to_vec()),
+                next_due_at_ms,
+            }),
+        )
+        .await?;
+        return Ok(BlobReplicationJobScan {
+            jobs,
+            has_more_due: true,
+            next_due_at_ms,
+        });
+    }
+
+    store_replication_cursor(storage, None).await?;
+    Ok(BlobReplicationJobScan {
+        jobs,
+        has_more_due: false,
+        next_due_at_ms,
+    })
 }
 
 async fn read_blob_replication_job_at_key(
@@ -2207,6 +2433,7 @@ mod tests {
         {
             Event::Storage(StorageEvent::IterResult { values, .. }) => values
                 .into_iter()
+                .filter(|(key, _)| !is_replication_cursor(key.as_ref()))
                 .map(|(key, value)| {
                     (
                         key.to_vec(),
@@ -3112,7 +3339,19 @@ mod tests {
             hop_count: 0,
         }));
 
-        assert_eq!(write_live_jobs(&storage, &obligation).await.unwrap(), 1);
+        let relationships = read_relationships_limit(
+            &storage,
+            &obligation.bucket,
+            LIVE_REPLICATION_RELATIONSHIP_LIMIT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            write_live_jobs(&storage, &obligation, &relationships)
+                .await
+                .unwrap(),
+            1
+        );
         let jobs = read_jobs(&storage).await;
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].1.relationship_id, Some(forward.id));
@@ -3445,9 +3684,54 @@ mod tests {
         assert_eq!(scan.jobs.len(), 1);
         assert_eq!(
             storage.snapshot_metrics().requests_total - before,
-            1,
-            "canonical jobs need one iteration, not a nested duplicate scan"
+            3,
+            "canonical jobs need one iteration and cursor persistence"
         );
+    }
+
+    #[tokio::test]
+    async fn cursor_wraps_queue() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let first = BlobReplicationJobRecord::new(on_demand_input(), None, unix_timestamp_millis());
+        let mut second_input = on_demand_input();
+        second_input.target = ReplicateScopeTarget::Object {
+            key: "other".to_string(),
+        };
+        let second = BlobReplicationJobRecord::new(second_input, None, unix_timestamp_millis());
+        write_blob_replication_job(&storage, &first)
+            .await
+            .expect("first job writes");
+        write_blob_replication_job(&storage, &second)
+            .await
+            .expect("second job writes");
+
+        let first_scan = scan_due_blob_replication_jobs(&storage, unix_timestamp_millis(), 1)
+            .await
+            .expect("first cursor scan succeeds");
+        let before = storage.snapshot_metrics().requests_total;
+        let second_scan = scan_due_blob_replication_jobs(&storage, unix_timestamp_millis(), 1)
+            .await
+            .expect("second cursor scan succeeds");
+        assert_eq!(
+            storage.snapshot_metrics().requests_total - before,
+            3,
+            "resumed scans use one page instead of restarting the keyspace"
+        );
+        assert_eq!(first_scan.jobs.len(), 1);
+        assert_eq!(second_scan.jobs.len(), 1);
+        assert_ne!(first_scan.jobs[0].0, second_scan.jobs[0].0);
+
+        let wrapped = scan_due_blob_replication_jobs(&storage, unix_timestamp_millis(), 1)
+            .await
+            .expect("cursor wrap succeeds");
+        assert!(wrapped.jobs.is_empty());
+        assert!(!wrapped.has_more_due);
+        let restarted = scan_due_blob_replication_jobs(&storage, unix_timestamp_millis(), 1)
+            .await
+            .expect("wrapped scan restarts");
+        assert_eq!(restarted.jobs.len(), 1);
     }
 
     #[tokio::test]
