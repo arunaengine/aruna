@@ -1,17 +1,17 @@
 use std::time::Duration;
 
-use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
+use crate::replication::util::dht_registration_effect;
+use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
     S3_MULTIPART_UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::structs::{
     BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, GroupStorageBackend,
-    MultipartUploadPart, MultipartUploadPartKey, WriteOwner,
+    MultipartUploadPart, MultipartUploadPartKey, RealmId, RoCrateLimits, WriteOwner,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
@@ -62,10 +62,20 @@ impl PendingCleanup {
 }
 
 fn cleanup_row_write(work: &BlobCleanupWork) -> Option<Effect> {
+    let key = match work {
+        BlobCleanupWork::ReconcileWrite { location, .. } => {
+            location.ulid.to_bytes().to_vec().into()
+        }
+        BlobCleanupWork::DeleteBlob { .. }
+        | BlobCleanupWork::RegisterDht { .. }
+        | BlobCleanupWork::ReconcileReservation { .. } => {
+            Ulid::generate().to_bytes().to_vec().into()
+        }
+    };
     match work.to_bytes() {
         Ok(bytes) => Some(Effect::Storage(StorageEffect::Write {
             key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
-            key: Ulid::generate().to_bytes().to_vec().into(),
+            key,
             value: bytes.into(),
             txn_id: None,
         })),
@@ -214,31 +224,55 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> boo
         BlobCleanupWork::ReconcileWrite { location, owner } => {
             match owns_write(context, &owner, &location).await {
                 None => false,
-                Some(true) => true,
+                Some(true) => {
+                    if let Some(blob_handle) = context.blob_handle.as_ref() {
+                        blob_handle.clear_reservation(location.ulid);
+                    }
+                    match owner {
+                        WriteOwner::Blob {
+                            blake3,
+                            realm_id,
+                            ttl_ms,
+                        } => register_dht(context, blake3, realm_id, ttl_ms).await,
+                        WriteOwner::UploadPart { .. } => true,
+                    }
+                }
                 Some(false) => delete_blob(context, location).await,
             }
+        }
+        BlobCleanupWork::ReconcileReservation { location } => {
+            reconcile_reservation(context, location).await
         }
         BlobCleanupWork::RegisterDht {
             blake3,
             realm_id,
             ttl_ms,
-        } => {
-            let Some(net_handle) = context.net_handle.as_ref() else {
-                return false;
-            };
-            let effect = Effect::Net(NetEffect::Dht(DhtEffect::Put {
-                key: DhtKeyId::from_bytes(blake3),
-                realm_id,
-                value: Vec::new(),
-                ttl: Duration::from_millis(ttl_ms),
-            }));
-            match net_handle.send_effect(effect).await {
-                Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. })) => true,
-                event => {
-                    warn!(?event, "Deferred blob DHT registration failed");
-                    false
-                }
-            }
+        } => register_dht(context, blake3, realm_id, ttl_ms).await,
+    }
+}
+
+async fn register_dht(
+    context: &DriverContext,
+    blake3: [u8; 32],
+    realm_id: RealmId,
+    ttl_ms: u64,
+) -> bool {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return false;
+    };
+    let limits = RoCrateLimits {
+        holder_ttl_ms: ttl_ms,
+        ..RoCrateLimits::default()
+    };
+    let Ok(effect) = dht_registration_effect(&blake3, realm_id, net_handle.node_id(), &limits)
+    else {
+        return false;
+    };
+    match net_handle.send_effect(effect).await {
+        Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. })) => true,
+        event => {
+            warn!(?event, "Deferred blob DHT registration failed");
+            false
         }
     }
 }
@@ -259,6 +293,19 @@ async fn delete_blob(context: &DriverContext, location: BackendLocation) -> bool
     }
 }
 
+async fn reconcile_reservation(context: &DriverContext, location: BackendLocation) -> bool {
+    let Some(blob_handle) = context.blob_handle.as_ref() else {
+        return false;
+    };
+    match blob_handle.reconcile_reservation(location).await {
+        Ok(done) => done,
+        Err(error) => {
+            warn!(%error, "Deferred bucket reservation reconciliation failed");
+            false
+        }
+    }
+}
+
 /// Whether committed metadata still names this exact physical copy. `None`
 /// means the record could not be read or decoded, so nothing is proven.
 async fn owns_write(
@@ -267,7 +314,7 @@ async fn owns_write(
     location: &BackendLocation,
 ) -> Option<bool> {
     let (key_space, key): (&str, Key) = match owner {
-        WriteOwner::Blob { blake3 } => (
+        WriteOwner::Blob { blake3, .. } => (
             BLOB_LOCATIONS_KEYSPACE,
             BlobLocationKey::new(*blake3, location.backend.clone())
                 .to_bytes()
@@ -315,7 +362,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE};
     use aruna_core::structs::{
-        BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, WriteOwner,
+        BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, RoCrateLimits, WriteOwner,
     };
     use aruna_core::types::UserId;
     use aruna_storage::storage::{FjallStorage, StorageHandle};
@@ -458,16 +505,19 @@ mod tests {
     fn reconcile_work(location: &BackendLocation) -> Vec<u8> {
         BlobCleanupWork::ReconcileWrite {
             location: location.clone(),
-            owner: WriteOwner::Blob { blake3: [7u8; 32] },
+            owner: WriteOwner::Blob {
+                blake3: [7u8; 32],
+                realm_id: location.created_by.realm_id,
+                ttl_ms: RoCrateLimits::default().holder_ttl_ms,
+            },
         }
         .to_bytes()
         .unwrap()
     }
 
     #[tokio::test]
-    async fn owned_write_reconciles() {
-        // The location row proves the ambiguous commit landed, so the row is
-        // done without any delete being attempted.
+    async fn owned_write_waits() {
+        // The committed copy stays queued until its DHT holder is registered.
         let (_dir, storage, context) = setup_context();
         let BlobCleanupWork::DeleteBlob { location } =
             BlobCleanupWork::from_bytes(&delete_work()).unwrap()
@@ -492,9 +542,9 @@ mod tests {
 
         let outcome = process_cleanup_batch(&context).await.unwrap();
 
-        assert_eq!(outcome.processed, 1);
-        assert_eq!(outcome.failed, 0);
-        assert_eq!(remaining_rows(&storage).await, 0);
+        assert_eq!(outcome.processed, 0);
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(remaining_rows(&storage).await, 1);
     }
 
     #[tokio::test]

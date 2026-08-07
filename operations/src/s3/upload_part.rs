@@ -26,6 +26,7 @@ pub enum UploadPartState {
     WritePart,
     CleanupFailedWrite,
     QueueCleanupRow,
+    WriteCleanupRow,
     StartTransaction,
     FenceBackend,
     ReReadUpload,
@@ -400,12 +401,50 @@ impl UploadPartOperation {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.emit_error(UploadPartError::InvalidOperationState);
         };
+        self.write_cleanup_row()
+    }
+
+    fn write_cleanup_row(&mut self) -> Effects {
+        let Some(location) = self.written_location.clone() else {
+            return self.emit_error(UploadPartError::UploadPartFailed);
+        };
+        let key = location.ulid.to_bytes().to_vec().into();
+        let work = BlobCleanupWork::ReconcileWrite {
+            location,
+            owner: WriteOwner::UploadPart {
+                upload_id: self.input.upload_id,
+                part_number: self.input.part_number,
+            },
+        };
+        let value = match work.to_bytes() {
+            Ok(value) => value,
+            Err(error) => return self.emit_error(error.into()),
+        };
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(UploadPartError::NoTransactionFound);
         };
 
-        self.state = UploadPartState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        self.state = UploadPartState::WriteCleanupRow;
+        smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE.to_string(),
+            key,
+            value: value.into(),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn handle_cleanup_row(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {
+                let Some(txn_id) = self.txn_id else {
+                    return self.emit_error(UploadPartError::NoTransactionFound);
+                };
+                self.state = UploadPartState::CommitTransaction;
+                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
+            _ => self.emit_error(UploadPartError::InvalidOperationState),
+        }
     }
 
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
@@ -486,6 +525,7 @@ impl Operation for UploadPartOperation {
             UploadPartState::WritePart => self.handle_write_finished(event),
             UploadPartState::CleanupFailedWrite => self.handle_failed_write_cleanup(event),
             UploadPartState::QueueCleanupRow => self.handle_cleanup_queued(event),
+            UploadPartState::WriteCleanupRow => self.handle_cleanup_row(event),
             UploadPartState::StartTransaction => self.handle_transaction_started(event),
             UploadPartState::FenceBackend => self.handle_backend_fenced(event),
             UploadPartState::ReReadUpload => self.handle_upload_reread(event),
@@ -694,6 +734,51 @@ mod test {
             Err(UploadPartError::BackendFenceError(BackendFenceError::Read(
                 _
             )))
+        ));
+    }
+
+    #[test]
+    fn queues_part_row() {
+        // Part reconciliation is written before its transaction can be ambiguous.
+        let mut op = upload_part_op(Ulid::from_bytes([5u8; 16]));
+        let txn_id = Ulid::from_bytes([3u8; 16]);
+        op.txn_id = Some(txn_id);
+        let location = op.written_location.clone().unwrap();
+
+        let effects = op.write_cleanup_row();
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space,
+                key,
+                txn_id: observed,
+                value,
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected a transactional reconciliation row, got {effects:?}")
+        };
+        assert_eq!(key_space, BLOB_CLEANUP_KEYSPACE);
+        assert_eq!(key.as_ref(), location.ulid.to_bytes());
+        assert_eq!(*observed, Some(txn_id));
+        assert_eq!(
+            BlobCleanupWork::from_bytes(value.as_ref()).unwrap(),
+            BlobCleanupWork::ReconcileWrite {
+                location,
+                owner: WriteOwner::UploadPart {
+                    upload_id: op.input.upload_id,
+                    part_number: 1,
+                },
+            }
+        );
+
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"cleanup".to_vec().into(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: observed })]
+                if *observed == txn_id
         ));
     }
 
