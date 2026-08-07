@@ -100,6 +100,7 @@ enum RevokeTokenState {
     DeletePendingOutbox {
         document: RealmConfigDocument,
         reducer_state: AdminDocumentReducerState,
+        revocation_index: RevocationIndex,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
         apply_event: bool,
         write_canonical: bool,
@@ -230,7 +231,8 @@ impl RevokeTokenOperation {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentReducerState::new(target));
-        let revocation_index = reducer_state.revocation_index(self.config.now);
+        let effective_now = reducer_state.revocation_floor.max(self.config.now);
+        let revocation_index = reducer_state.revocation_index(effective_now);
         let materialized = revocation_index.materialized();
         let document_materialized = document
             .revoked_tokens
@@ -424,6 +426,7 @@ impl RevokeTokenOperation {
                 return self.emit_after_capacity(
                     document,
                     reducer_state,
+                    revocation_index,
                     stale_conflict_deletes,
                     false,
                     true,
@@ -432,6 +435,7 @@ impl RevokeTokenOperation {
             self.state = RevokeTokenState::DeletePendingOutbox {
                 document,
                 reducer_state,
+                revocation_index,
                 stale_conflict_deletes,
                 apply_event: false,
                 write_canonical: true,
@@ -449,6 +453,7 @@ impl RevokeTokenOperation {
             return self.emit_after_capacity(
                 document,
                 reducer_state,
+                revocation_index,
                 stale_conflict_deletes,
                 apply_event,
                 write_canonical,
@@ -461,6 +466,7 @@ impl RevokeTokenOperation {
         self.state = RevokeTokenState::DeletePendingOutbox {
             document,
             reducer_state,
+            revocation_index,
             stale_conflict_deletes,
             apply_event,
             write_canonical,
@@ -475,12 +481,19 @@ impl RevokeTokenOperation {
         &mut self,
         document: RealmConfigDocument,
         reducer_state: AdminDocumentReducerState,
+        revocation_index: RevocationIndex,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
         apply_event: bool,
         write_canonical: bool,
     ) -> Result<Effects, RevokeTokenError> {
         if apply_event || write_canonical {
-            self.emit_write(document, reducer_state, stale_conflict_deletes, apply_event)
+            self.emit_write(
+                document,
+                reducer_state,
+                revocation_index,
+                stale_conflict_deletes,
+                apply_event,
+            )
         } else {
             Ok(self.emit_commit_noop(document))
         }
@@ -490,6 +503,7 @@ impl RevokeTokenOperation {
         &mut self,
         mut document: RealmConfigDocument,
         mut reducer_state: AdminDocumentReducerState,
+        mut revocation_index: RevocationIndex,
         _stale_conflict_deletes: Vec<(KeySpace, Key)>,
         apply_event: bool,
     ) -> Result<Effects, RevokeTokenError> {
@@ -498,18 +512,19 @@ impl RevokeTokenOperation {
         };
         let previous_reducer_state = reducer_state.clone();
         let admin_event = apply_event.then(|| {
-            reducer_state.apply_operation(
+            reducer_state.apply_revocation_operation(
                 &self.config.actor,
                 AdminDocumentOperation::RealmConfigTokenRevoked {
                     token_hash: self.config.token_hash.clone(),
                     expires_at: self.config.expires_at,
                     token_owner: self.config.token_owner,
                 },
+                &mut revocation_index,
             )
         });
         let admin_event = admin_event.transpose()?;
-        reducer_state.compact_revocations(self.config.now);
-        document.merge_revocations(&reducer_state, self.config.now);
+        revocation_index.compact(&mut reducer_state);
+        document.merge_revocation_index(&revocation_index, self.config.now);
         let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
             Some(&previous_reducer_state),
             Some(&reducer_state),
@@ -761,6 +776,7 @@ impl Operation for RevokeTokenOperation {
             RevokeTokenState::DeletePendingOutbox {
                 document,
                 reducer_state,
+                revocation_index,
                 stale_conflict_deletes,
                 apply_event,
                 write_canonical,
@@ -769,6 +785,7 @@ impl Operation for RevokeTokenOperation {
                     .emit_after_capacity(
                         document,
                         reducer_state,
+                        revocation_index,
                         stale_conflict_deletes,
                         apply_event,
                         write_canonical,

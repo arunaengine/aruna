@@ -74,6 +74,9 @@ pub async fn revoke_token(
         return Err(ServerError::BadRequest);
     }
     let subject: AuthContext = claims.try_into().map_err(|_| ServerError::BadRequest)?;
+    if subject.realm_id != state.get_realm_id() {
+        return Err(ServerError::BadRequest);
+    }
     if auth.user_id != subject.user_id && !user_origin {
         ensure_permission(
             &state,
@@ -98,10 +101,6 @@ pub async fn revoke_token(
         .await
         .map_err(map_metadata_api_error)?;
         return Ok(StatusCode::NO_CONTENT);
-    }
-
-    if subject.realm_id != state.get_realm_id() {
-        return Err(ServerError::BadRequest);
     }
 
     drive(
