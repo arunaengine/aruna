@@ -26,13 +26,16 @@ use crate::notifications::mark_read::MARK_READ_MAX_IDS;
 use crate::notifications::outbox::NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE;
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::protocol::{NotificationTransportMessage, notification_message_kind};
-use crate::notifications::watch::authorization::list_authorized_watch_subscriptions;
+use crate::notifications::watch::authorization::{
+    WatchAuthorization, authorize_forwarded_watch, list_authorized_watch_subscriptions,
+};
 use crate::notifications::watch::expand::expand_watch_events;
 use crate::notifications::watch::interest::{
     mark_watch_interest_dirty, schedule_watch_interest_publish,
 };
 use crate::notifications::watch::subscriptions::{
-    create_replicated_watch_subscription, delete_replicated_watch_subscription,
+    WATCH_SUBSCRIPTION_UNAUTHORIZED, create_replicated_watch_subscription,
+    delete_replicated_watch_subscription,
 };
 
 const NOTIFICATION_MAX_FUTURE_SKEW_MS: u64 = 5 * 60 * 1000;
@@ -173,6 +176,33 @@ async fn build_response(
             if let Err(reason) = verify_recipient_local_holder(&owner, &realm_config, local_node_id)
             {
                 return NotificationTransportMessage::Reject(reason);
+            }
+
+            match authorize_forwarded_watch(
+                context,
+                realm_id,
+                owner,
+                &path_prefix,
+                event_mask,
+                &authorization,
+            )
+            .await
+            {
+                Ok(WatchAuthorization::Authorized) => {}
+                Ok(WatchAuthorization::Denied(reason)) => {
+                    return NotificationTransportMessage::Reject(format!(
+                        "{WATCH_SUBSCRIPTION_UNAUTHORIZED}: {}",
+                        reason.metric_reason().as_str()
+                    ));
+                }
+                Ok(WatchAuthorization::Unavailable(_)) => {
+                    return NotificationTransportMessage::Reject(format!(
+                        "{WATCH_SUBSCRIPTION_UNAUTHORIZED}: {}",
+                        aruna_core::metrics::WatchAuthorizationMetricReason::AuthorizationUnavailable
+                            .as_str()
+                    ));
+                }
+                Err(error) => return NotificationTransportMessage::Reject(error),
             }
 
             match create_replicated_watch_subscription(
@@ -734,6 +764,7 @@ mod tests {
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
     };
+    use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::{
         Actor, GroupAuthorizationDocument, NotificationClass, NotificationKind, NotificationRecord,
         PathRestriction, Permission, RealmAuthorizationDocument, RealmNodeKind, TokenRevocation,
@@ -1759,7 +1790,10 @@ mod tests {
             owner,
             prefix.clone(),
             mask,
-            WatchAuthorizationBinding::default(),
+            WatchAuthorizationBinding {
+                watch_path_prefix: prefix.clone(),
+                ..Default::default()
+            },
         )
         .await
         .expect("create succeeds");
@@ -1885,6 +1919,128 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn policy_denies_watch() {
+        let realm_id = RealmId::from_bytes([88u8; 32]);
+        let a = spawn(realm_id, [88u8; 32]).await;
+        let b = spawn(realm_id, [89u8; 32]).await;
+        connect(&a, &b).await;
+        let config = install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+        let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
+        install_watch_authorization(&b, realm_id, owner, &[]).await;
+        let existing_prefix = data_path("existing");
+        let existing = create_watch_remote(
+            &a.net,
+            b.net.node_id(),
+            owner,
+            existing_prefix.clone(),
+            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            WatchAuthorizationBinding {
+                watch_path_prefix: existing_prefix,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("existing watch creates");
+
+        let mut denied = config;
+        denied.request_policies.push(RequestPolicy {
+            policy_id: Ulid::from_bytes([88u8; 16]),
+            name: "deny-watches".to_string(),
+            kind: PolicyKind::Deny,
+            when: None,
+            expression: "operation == 'notifications.create_watch'".to_string(),
+            enabled: true,
+        });
+        write_config(&b, realm_id, &denied).await;
+
+        let prefix = data_path("policy");
+        let error = create_watch_remote(
+            &a.net,
+            b.net.node_id(),
+            owner,
+            prefix.clone(),
+            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            WatchAuthorizationBinding {
+                watch_path_prefix: prefix,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("the holder policy must deny forwarded create");
+        assert_eq!(
+            error,
+            format!("{WATCH_SUBSCRIPTION_UNAUTHORIZED}: permission_denied")
+        );
+        assert_eq!(
+            list_watches_remote(&a.net, b.net.node_id(), owner)
+                .await
+                .expect("list remains available"),
+            vec![existing.clone()]
+        );
+        delete_watch_remote(&a.net, b.net.node_id(), owner, existing.watch_id)
+            .await
+            .expect("delete remains available");
+        assert!(
+            list_watch_subscriptions(&b.context.storage_handle, owner)
+                .await
+                .expect("list succeeds")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_path_rejected() {
+        let realm_id = RealmId::from_bytes([89u8; 32]);
+        let a = spawn(realm_id, [90u8; 32]).await;
+        let b = spawn(realm_id, [91u8; 32]).await;
+        connect(&a, &b).await;
+        let config = install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+        let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
+        install_watch_authorization(&b, realm_id, owner, &[]).await;
+
+        let prefix = data_path("requested");
+        let error = create_watch_remote(
+            &a.net,
+            b.net.node_id(),
+            owner,
+            prefix,
+            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            WatchAuthorizationBinding {
+                watch_path_prefix: data_path("bound"),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a binding for another path must be rejected");
+        assert_eq!(
+            error,
+            format!("{WATCH_SUBSCRIPTION_UNAUTHORIZED}: invalid_state")
+        );
+        assert!(
+            list_watch_subscriptions(&b.context.storage_handle, owner)
+                .await
+                .expect("list succeeds")
+                .is_empty()
+        );
+    }
+
     // Enumeration shares the delivery authorization result: once READ is revoked
     // only an opaque cleanup id remains visible for the stored row.
     #[tokio::test]
@@ -1911,7 +2067,10 @@ mod tests {
             owner,
             data_path("prefix"),
             WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
-            WatchAuthorizationBinding::default(),
+            WatchAuthorizationBinding {
+                watch_path_prefix: data_path("prefix"),
+                ..Default::default()
+            },
         )
         .await
         .expect("authorized create succeeds");
