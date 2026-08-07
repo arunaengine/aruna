@@ -113,7 +113,7 @@ impl AuditPageBatch {
                 + postcard::to_allocvec(&entry.record)
                     .map_err(|_| AuditPageError::TooLarge)?
                     .len();
-            if self.bytes + entry_bytes > MAX_AUDIT_BATCH_BYTES {
+            if self.bytes.saturating_add(entry_bytes) > MAX_AUDIT_BATCH_BYTES {
                 self.mark_missing(node);
                 return Err(AuditPageError::TooLarge);
             }
@@ -126,7 +126,11 @@ impl AuditPageBatch {
                     });
                 }
                 std::collections::btree_map::Entry::Occupied(mut slot) => {
-                    if slot.get().entry.record != entry.record {
+                    if slot.get().entry.record == entry.record {
+                        if node.as_bytes() < slot.get().source.as_bytes() {
+                            slot.get_mut().source = node;
+                        }
+                    } else {
                         self.conflict = true;
                         let candidate = postcard::to_allocvec(&entry.record)
                             .map_err(|_| AuditPageError::TooLarge)?;
@@ -135,6 +139,19 @@ impl AuditPageBatch {
                         let replace = (candidate, node.as_bytes().to_vec())
                             < (current, slot.get().source.as_bytes().to_vec());
                         if replace {
+                            let current_bytes = slot.get().entry.key.len()
+                                + postcard::to_allocvec(&slot.get().entry.record)
+                                    .map_err(|_| AuditPageError::TooLarge)?
+                                    .len();
+                            if entry_bytes > current_bytes
+                                && self.bytes.saturating_add(entry_bytes - current_bytes)
+                                    > MAX_AUDIT_BATCH_BYTES
+                            {
+                                self.mark_missing(node);
+                                continue;
+                            }
+                            self.bytes = self.bytes.saturating_sub(current_bytes);
+                            self.bytes = self.bytes.saturating_add(entry_bytes);
                             slot.insert(AuditBatchEntry {
                                 source: node,
                                 entry,
@@ -150,7 +167,9 @@ impl AuditPageBatch {
 
     pub fn merge(&mut self, other: AuditPageBatch) {
         self.completed_nodes.extend(other.completed_nodes);
-        self.missing_nodes.extend(other.missing_nodes);
+        for node in other.missing_nodes {
+            self.mark_missing(node);
+        }
         self.conflict |= other.conflict;
         if let Some(horizon) = other.horizon {
             self.horizon = Some(match self.horizon.take() {
@@ -163,7 +182,7 @@ impl AuditPageBatch {
                 + postcard::to_allocvec(&candidate.entry.record)
                     .map(|bytes| bytes.len())
                     .unwrap_or(usize::MAX);
-            if self.bytes + entry_bytes > MAX_AUDIT_BATCH_BYTES {
+            if self.bytes.saturating_add(entry_bytes) > MAX_AUDIT_BATCH_BYTES {
                 self.mark_missing(candidate.source);
                 continue;
             }
@@ -173,7 +192,11 @@ impl AuditPageBatch {
                     slot.insert(candidate);
                 }
                 std::collections::btree_map::Entry::Occupied(mut slot) => {
-                    if slot.get().entry.record != candidate.entry.record {
+                    if slot.get().entry.record == candidate.entry.record {
+                        if candidate.source.as_bytes() < slot.get().source.as_bytes() {
+                            slot.get_mut().source = candidate.source;
+                        }
+                    } else {
                         self.conflict = true;
                         let replace = postcard::to_allocvec(&candidate.entry.record)
                             .unwrap_or_default()
@@ -189,6 +212,12 @@ impl AuditPageBatch {
                             })
                             .is_lt();
                         if replace {
+                            let current_bytes = slot.get().entry.key.len()
+                                + postcard::to_allocvec(&slot.get().entry.record)
+                                    .map(|bytes| bytes.len())
+                                    .unwrap_or(usize::MAX);
+                            self.bytes = self.bytes.saturating_sub(current_bytes);
+                            self.bytes = self.bytes.saturating_add(entry_bytes);
                             slot.insert(candidate);
                         }
                     }
@@ -241,6 +270,12 @@ impl AuditPageBatch {
     }
 }
 
+impl Default for AuditPageBatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AuditPageError {
     #[error("invalid audit key")]
@@ -284,7 +319,7 @@ pub fn validate_page(
                 .document_id
                 .is_some_and(|document_id| entry.record.document_id != document_id)
             || entry.record.user_id.realm_id != request.realm_id
-            || entry.graph_iri_is_invalid()
+            || invalid_iri(&entry.record)
         {
             return Err(AuditPageError::InvalidRecord);
         }
@@ -336,12 +371,6 @@ fn page_bytes(page: &AuditPageResponse) -> Result<usize, AuditPageError> {
         .map_err(|_| AuditPageError::TooLarge)
 }
 
-trait AuditRecordExt {
-    fn graph_iri_is_invalid(&self) -> bool;
-}
-
-impl AuditRecordExt for MetadataAuditRecord {
-    fn graph_iri_is_invalid(&self) -> bool {
-        self.graph_iri.trim().is_empty() || oxrdf::NamedNode::new(&self.graph_iri).is_err()
-    }
+fn invalid_iri(record: &MetadataAuditRecord) -> bool {
+    record.graph_iri.trim().is_empty() || oxrdf::NamedNode::new(&record.graph_iri).is_err()
 }

@@ -125,6 +125,9 @@ async fn nonholder_audit_trail() -> TestResult<()> {
         FAN_OUT_DEADLINE,
         drive(
             ListAuditOperation::new(
+                realm.realm_id,
+                reader.node_id(),
+                true,
                 group_id,
                 None,
                 peers,
@@ -243,7 +246,13 @@ async fn create_document(
 
 async fn audit_has_document(node: &TestNode, group_id: Ulid, document_id: Ulid) -> bool {
     drive(
-        LocalAuditPageOperation::new(group_id, Some(document_id), None, MAX_AUDIT_PAGE_SIZE),
+        LocalAuditPageOperation::new(
+            *node.net.realm_id(),
+            group_id,
+            Some(document_id),
+            None,
+            MAX_AUDIT_PAGE_SIZE,
+        ),
         node.context.as_ref(),
     )
     .await

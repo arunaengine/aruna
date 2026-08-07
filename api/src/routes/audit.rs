@@ -62,8 +62,7 @@ pub struct AuditPageResponse {
     pub records: Vec<AuditRecordResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
-    /// True when a required realm node could not be reached or attested, so the
-    /// page may be missing records from the nodes listed in `missing_nodes`.
+    /// True when the result may be missing records from listed nodes.
     pub partial: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub missing_nodes: Vec<String>,
@@ -139,6 +138,7 @@ pub async fn list_audit(
     )
     .await
     .map_err(|error| match error {
+        ListAuditError::Unauthorized => ServerError::Unauthorized,
         ListAuditError::InvalidCursor => ServerError::BadRequest,
         ListAuditError::Storage(message) => ServerError::InternalError(message),
     })?;
