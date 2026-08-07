@@ -17,8 +17,10 @@ pub struct ListUserAccessInput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ListUserAccessState {
     Init,
+    StartTransaction,
     ReadOwnerIndex,
     ReadCredentials,
+    CommitTransaction,
     Finish,
     Error,
 }
@@ -46,6 +48,7 @@ pub struct ListUserAccessOperation {
     input: ListUserAccessInput,
     access_keys: Vec<String>,
     credentials: Vec<UserAccess>,
+    txn_id: Option<ulid::Ulid>,
     state: ListUserAccessState,
     output: Option<Result<Vec<UserAccess>, ListUserAccessError>>,
 }
@@ -56,23 +59,40 @@ impl ListUserAccessOperation {
             input,
             access_keys: Vec::new(),
             credentials: Vec::new(),
+            txn_id: None,
             state: ListUserAccessState::Init,
             output: None,
         }
     }
 
     fn emit_error(&mut self, error: ListUserAccessError) -> Effects {
+        let effects = self.abort();
         self.state = ListUserAccessState::Error;
         self.output = Some(Err(error));
-        smallvec![]
+        effects
     }
 
     fn handle_init(&mut self) -> Effects {
+        self.state = ListUserAccessState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: true
+        })]
+    }
+
+    fn handle_transaction_started(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
+            return self.emit_error(ListUserAccessError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::TransactionStarted)",
+                received: event,
+            });
+        };
+        self.txn_id = Some(txn_id);
         self.state = ListUserAccessState::ReadOwnerIndex;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: USER_ACCESS_OWNER_KEYSPACE.to_string(),
             key: owner_key(self.input.user_identity),
-            txn_id: None,
+            txn_id: Some(txn_id),
         })]
     }
 
@@ -88,10 +108,15 @@ impl ListUserAccessOperation {
             Ok(index) => index,
             Err(error) => return self.emit_error(error.into()),
         };
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(ListUserAccessError::StorageError(
+                StorageError::TransactionNotFound,
+            ));
+        };
         if index.is_empty() {
-            self.state = ListUserAccessState::Finish;
             self.output = Some(Ok(Vec::new()));
-            return smallvec![];
+            self.state = ListUserAccessState::CommitTransaction;
+            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
         }
         self.access_keys = index.into_iter().collect();
         self.state = ListUserAccessState::ReadCredentials;
@@ -107,7 +132,7 @@ impl ListUserAccessOperation {
             .collect();
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads,
-            txn_id: None,
+            txn_id: Some(txn_id),
         })]
     }
 
@@ -140,6 +165,25 @@ impl ListUserAccessOperation {
         }
         self.state = ListUserAccessState::Finish;
         self.output = Some(Ok(std::mem::take(&mut self.credentials)));
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(ListUserAccessError::StorageError(
+                StorageError::TransactionNotFound,
+            ));
+        };
+        self.state = ListUserAccessState::CommitTransaction;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+
+    fn handle_transaction_committed(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
+            return self.emit_error(ListUserAccessError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
+                received: event,
+            });
+        };
+        self.txn_id = None;
+        self.state = ListUserAccessState::Finish;
         smallvec![]
     }
 }
@@ -153,10 +197,15 @@ impl Operation for ListUserAccessOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = event {
+            return self.emit_error(error.into());
+        }
         match self.state {
             ListUserAccessState::Init => self.handle_init(),
+            ListUserAccessState::StartTransaction => self.handle_transaction_started(event),
             ListUserAccessState::ReadOwnerIndex => self.handle_index(event),
             ListUserAccessState::ReadCredentials => self.handle_credentials(event),
+            ListUserAccessState::CommitTransaction => self.handle_transaction_committed(event),
             ListUserAccessState::Finish | ListUserAccessState::Error => smallvec![],
         }
     }
@@ -179,7 +228,11 @@ impl Operation for ListUserAccessOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        smallvec![]
+        self.txn_id
+            .take()
+            .map_or_else(smallvec::SmallVec::new, |txn_id| {
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            })
     }
 }
 
@@ -199,7 +252,19 @@ mod tests {
             .map(|index| format!("key{index}"))
             .collect::<std::collections::BTreeSet<_>>();
         let mut operation = ListUserAccessOperation::new(ListUserAccessInput { user_identity });
-        operation.start();
+        assert!(matches!(
+            operation.start().as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction {
+                read: true
+            })]
+        ));
+        let txn_id = Ulid::generate();
+        assert!(matches!(
+            operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id })),
+            [Effect::Storage(StorageEffect::Read {
+                txn_id: Some(observed), ..
+            })] if observed == txn_id
+        ));
         let index = encode_index(&keys).unwrap();
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: owner_key(user_identity),
@@ -207,8 +272,11 @@ mod tests {
         }));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchRead { reads, .. })]
-                if reads.len() == MAX_ACTIVE_CREDENTIALS
+            [Effect::Storage(StorageEffect::BatchRead {
+                reads,
+                txn_id: Some(observed),
+            })]
+                if observed == txn_id && reads.len() == MAX_ACTIVE_CREDENTIALS
         ));
         let values = keys
             .iter()
@@ -226,7 +294,14 @@ mod tests {
                 (key.clone().into(), Some(access.to_bytes().unwrap().into()))
             })
             .collect();
-        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+        assert!(matches!(
+            operation.step(Event::Storage(StorageEvent::BatchReadResult { values })),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: observed })]
+                if observed == txn_id
+        ));
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
         let credentials = operation.finalize().unwrap();
         assert_eq!(credentials.len(), MAX_ACTIVE_CREDENTIALS);
     }
