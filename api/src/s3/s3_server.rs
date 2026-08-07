@@ -1406,7 +1406,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn sibling_does_not_refresh() {
+    async fn sibling_not_refresh() {
         let stalled = Arc::new(ConnectionActivity::default());
         let sibling = Arc::new(ConnectionActivity::default());
         let stalled_task = tokio::spawn(stalled.clone().wait_idle());
