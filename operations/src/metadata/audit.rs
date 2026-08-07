@@ -3,7 +3,8 @@
 //! realm node for its local page and merging the pages by their raw storage key.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use aruna_core::audit::{
     AUDIT_KEY_BYTES, AuditPageBatch, AuditPageEntry, AuditPageRequest, AuditPageResponse,
@@ -20,11 +21,12 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
+use tokio::sync::Semaphore;
 use ulid::Ulid;
 
 use super::api::load_realm_config;
 use super::protocol::{MetadataReadError, MetadataTransportMessage};
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, drive_until};
 use crate::request_authorization::{AuthorizeError, authorize};
 use crate::request_policy::PolicyRequestExtras;
 
@@ -33,6 +35,10 @@ pub const DEFAULT_AUDIT_PAGE_SIZE: usize = 50;
 const AUDIT_CURSOR_VERSION: u8 = 1;
 const MAX_AUDIT_CURSOR_BYTES: usize = 256;
 const MAX_AUDIT_CURSOR_CHARS: usize = 384;
+const AUDIT_ADMISSION_LIMIT: usize = 16;
+const AUDIT_DEADLINE_SECS: u64 = 30;
+static AUDIT_ADMISSION: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(AUDIT_ADMISSION_LIMIT)));
 
 #[derive(Debug, Clone)]
 pub struct ListAuditRequest {
@@ -40,6 +46,7 @@ pub struct ListAuditRequest {
     pub document_id: Option<Ulid>,
     pub cursor: Option<String>,
     pub limit: Option<usize>,
+    pub local_authorized: bool,
 }
 
 /// A partial result has no cursor because records may be missing or conflicting.
@@ -54,6 +61,8 @@ pub struct AuditAggregate {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ListAuditError {
+    #[error("audit read unavailable")]
+    Unavailable,
     #[error("audit authorization requires a bearer token")]
     Unauthorized,
     #[error("invalid audit cursor")]
@@ -192,6 +201,7 @@ impl LocalAuditPageOperation {
         start_after: Option<Vec<u8>>,
         limit: usize,
     ) -> Self {
+        let limit = limit.clamp(1, MAX_AUDIT_PAGE_SIZE);
         Self {
             realm_id,
             group_id,
@@ -275,6 +285,45 @@ enum FanState {
     Done,
 }
 
+fn remember_peer(peers: &mut BTreeSet<NodeId>, node: NodeId) {
+    if peers.len() < MAX_AUDIT_PEERS {
+        peers.insert(node);
+    }
+}
+
+fn select_peers(peers: Vec<NodeId>, limit: usize) -> (Vec<NodeId>, BTreeSet<NodeId>, usize) {
+    let mut selected = Vec::with_capacity(limit.min(MAX_AUDIT_PEERS));
+    let mut omitted = BTreeSet::new();
+    let mut candidates = 0usize;
+    for node in peers {
+        if selected.contains(&node) || omitted.contains(&node) {
+            continue;
+        }
+        candidates = candidates.saturating_add(1);
+        if selected.len() < limit {
+            selected.push(node);
+            continue;
+        }
+        let Some((index, last)) = selected
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.as_bytes().cmp(right.as_bytes()))
+        else {
+            remember_peer(&mut omitted, node);
+            continue;
+        };
+        if node.as_bytes() < last.as_bytes() {
+            let evicted = selected.swap_remove(index);
+            remember_peer(&mut omitted, evicted);
+            selected.push(node);
+        } else {
+            remember_peer(&mut omitted, node);
+        }
+    }
+    selected.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    (selected, omitted, candidates.saturating_sub(selected.len()))
+}
+
 /// Gathers a group's audit trail across realm nodes as a sans-I/O operation: it
 /// scans the local keyspace and emits one audit-page request per peer, then
 /// merges the pages. Node selection is supplied by the caller.
@@ -294,6 +343,7 @@ pub struct ListAuditOperation {
     started: bool,
     pending: usize,
     local_done: bool,
+    local_failed: bool,
     responded: BTreeSet<NodeId>,
     batch: AuditPageBatch,
     error: Option<ListAuditError>,
@@ -313,18 +363,20 @@ impl ListAuditOperation {
         auth_token: Option<MetadataAuthToken>,
         config_digest: [u8; 32],
     ) -> Self {
-        let mut selected = Vec::new();
+        let limit = limit.clamp(1, MAX_AUDIT_PAGE_SIZE);
+        let peer_limit = if include_local {
+            MAX_AUDIT_PEERS.saturating_sub(1)
+        } else {
+            MAX_AUDIT_PEERS
+        };
+        let (selected, omitted, missing_count) = select_peers(peers, peer_limit);
         let mut batch = AuditPageBatch::with_limit(limit);
-        let mut peers = peers;
-        peers.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-        peers.dedup();
-        for (index, node) in peers.into_iter().enumerate() {
-            if index >= MAX_AUDIT_PEERS {
-                batch.mark_missing(node);
-            } else {
-                selected.push(node);
-            }
+        for node in omitted {
+            batch.mark_missing(node);
         }
+        batch.missing_overflow = batch
+            .missing_overflow
+            .saturating_add(missing_count.saturating_sub(batch.missing_nodes.len()));
         Self {
             realm_id,
             local_node,
@@ -340,6 +392,7 @@ impl ListAuditOperation {
             started: false,
             pending: 0,
             local_done: !include_local,
+            local_failed: false,
             responded: BTreeSet::new(),
             batch,
             error: None,
@@ -508,6 +561,7 @@ impl Operation for ListAuditOperation {
         };
         let missing: Vec<NodeId> = self.batch.missing_nodes.iter().copied().collect();
         let partial = !missing.is_empty() || self.batch.missing_overflow > 0 || self.batch.conflict;
+        let partial = partial || self.local_failed;
         Ok(AuditAggregate {
             records,
             next_cursor: if partial {
@@ -530,6 +584,9 @@ impl Operation for ListAuditOperation {
     }
 
     fn abort(&mut self) -> Effects {
+        if self.include_local && !self.local_done {
+            self.local_failed = true;
+        }
         let pending: Vec<NodeId> = self
             .peers
             .iter()
@@ -554,6 +611,10 @@ pub async fn list_audit(
     auth_token: Option<MetadataAuthToken>,
     request: ListAuditRequest,
 ) -> Result<AuditAggregate, ListAuditError> {
+    let _admission = AUDIT_ADMISSION
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ListAuditError::Unavailable)?;
     let limit = request
         .limit
         .unwrap_or(DEFAULT_AUDIT_PAGE_SIZE)
@@ -591,8 +652,13 @@ pub async fn list_audit(
                 .find(|node| node.node_id == local_node.to_string())
             {
                 Some(node) => {
-                    user_origin = matches!(&node.kind, aruna_core::structs::RealmNodeKind::User);
-                    include_local = !user_origin;
+                    let current_local_authorized =
+                        !matches!(&node.kind, aruna_core::structs::RealmNodeKind::User);
+                    user_origin = !current_local_authorized;
+                    include_local = request.local_authorized && current_local_authorized;
+                    if request.local_authorized != current_local_authorized {
+                        partial = true;
+                    }
                 }
                 None => partial = true,
             }
@@ -633,7 +699,8 @@ pub async fn list_audit(
         auth_token,
         config_digest,
     );
-    let mut aggregate = drive(operation, context).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(AUDIT_DEADLINE_SECS);
+    let mut aggregate = drive_until(operation, context, deadline).await?;
     aggregate.partial |= partial;
     if aggregate.partial {
         aggregate.next_cursor = None;
@@ -742,10 +809,11 @@ pub(crate) async fn send_audit_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditPageEntry, AuditPageResponse, Effect, Event, ListAuditOperation,
-        LocalAuditPageOperation, MAX_AUDIT_CURSOR_CHARS, MAX_AUDIT_PEERS, MetadataReadError,
-        NetEffect, NetEvent, Operation, StorageEvent, authorize_admin, decode_cursor,
-        encode_cursor,
+        AUDIT_ADMISSION, AUDIT_ADMISSION_LIMIT, AuditPageEntry, AuditPageResponse, Effect, Event,
+        ListAuditError, ListAuditOperation, ListAuditRequest, LocalAuditPageOperation,
+        MAX_AUDIT_CURSOR_CHARS, MAX_AUDIT_PAGE_SIZE, MAX_AUDIT_PEERS, MetadataReadError, NetEffect,
+        NetEvent, Operation, StorageEvent, authorize_admin, decode_cursor, drive_until,
+        encode_cursor, list_audit,
     };
     use crate::driver::DriverContext;
     use crate::metadata::repository::{metadata_audit_key, write_audit_effect};
@@ -762,6 +830,7 @@ mod tests {
     use aruna_core::structs::{MetadataAuditOperation, MetadataAuditRecord, RealmId};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
+    use std::time::Duration;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -863,6 +932,166 @@ mod tests {
         assert!(aggregate.partial);
         assert_eq!(aggregate.missing_nodes.len(), unique.len());
         assert!(aggregate.records.is_empty());
+    }
+
+    #[test]
+    fn peer_budget() {
+        let realm_id = RealmId([1u8; 32]);
+        let local = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let peers: Vec<_> = (2u8..=u8::try_from(MAX_AUDIT_PEERS + 2).unwrap())
+            .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
+            .collect();
+        let mut local_operation = ListAuditOperation::new(
+            realm_id,
+            local,
+            true,
+            Ulid::from_bytes([2u8; 16]),
+            None,
+            peers.clone(),
+            None,
+            10,
+            None,
+            [0u8; 32],
+        );
+        local_operation.start();
+        let effects = local_operation.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+        let Effect::Net(NetEffect::AuditPage(effect)) = &effects[0] else {
+            panic!("local page must precede peer fan-out");
+        };
+        assert_eq!(effect.nodes.len(), MAX_AUDIT_PEERS - 1);
+
+        let mut remote_operation = ListAuditOperation::new(
+            realm_id,
+            local,
+            false,
+            Ulid::from_bytes([2u8; 16]),
+            None,
+            peers,
+            None,
+            10,
+            None,
+            [0u8; 32],
+        );
+        let effects = remote_operation.start();
+        let Effect::Net(NetEffect::AuditPage(effect)) = &effects[0] else {
+            panic!("remote page must fan out directly");
+        };
+        assert_eq!(effect.nodes.len(), MAX_AUDIT_PEERS);
+    }
+
+    #[test]
+    fn limit_clamps() {
+        let node = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let mut operation = ListAuditOperation::new(
+            RealmId([1u8; 32]),
+            node,
+            true,
+            Ulid::from_bytes([2u8; 16]),
+            None,
+            Vec::new(),
+            None,
+            usize::MAX,
+            None,
+            [0u8; 32],
+        );
+        let effects = operation.start();
+        let Effect::Storage(StorageEffect::Iter { limit, .. }) = &effects[0] else {
+            panic!("local page must use storage iteration");
+        };
+        assert_eq!(*limit, MAX_AUDIT_PAGE_SIZE);
+    }
+
+    #[test]
+    fn local_abort_partial() {
+        let node = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let mut operation = ListAuditOperation::new(
+            RealmId([1u8; 32]),
+            node,
+            true,
+            Ulid::from_bytes([2u8; 16]),
+            None,
+            Vec::new(),
+            None,
+            10,
+            None,
+            [0u8; 32],
+        );
+        operation.start();
+        operation.abort();
+        let result = operation.finalize().unwrap();
+        assert!(result.partial);
+        assert!(result.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn admission_fails() {
+        let permits: Vec<_> = (0..AUDIT_ADMISSION_LIMIT)
+            .map(|_| AUDIT_ADMISSION.clone().try_acquire_owned().unwrap())
+            .collect();
+        let directory = tempdir().unwrap();
+        let context = DriverContext {
+            storage_handle: FjallStorage::open(directory.path().to_str().unwrap()).unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let node = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let result = list_audit(
+            &context,
+            RealmId([1u8; 32]),
+            node,
+            None,
+            ListAuditRequest {
+                group_id: Ulid::from_bytes([2u8; 16]),
+                document_id: None,
+                cursor: None,
+                limit: Some(10),
+                local_authorized: true,
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(ListAuditError::Unavailable)));
+        drop(permits);
+    }
+
+    #[tokio::test]
+    async fn local_deadline() {
+        let directory = tempdir().unwrap();
+        let context = DriverContext {
+            storage_handle: FjallStorage::open(directory.path().to_str().unwrap()).unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let node = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let operation = ListAuditOperation::new(
+            RealmId([1u8; 32]),
+            node,
+            true,
+            Ulid::from_bytes([2u8; 16]),
+            None,
+            Vec::new(),
+            None,
+            10,
+            None,
+            [0u8; 32],
+        );
+        let result = drive_until(
+            operation,
+            &context,
+            tokio::time::Instant::now() - Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(result.partial);
+        assert!(result.next_cursor.is_none());
     }
 
     #[test]

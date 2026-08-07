@@ -190,6 +190,7 @@ fn request(
         document_id,
         cursor,
         limit: Some(limit),
+        local_authorized: true,
     }
 }
 

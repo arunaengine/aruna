@@ -149,10 +149,12 @@ pub async fn list_audit(
             document_id,
             cursor: query.cursor,
             limit: query.limit,
+            local_authorized: !user_origin,
         },
     )
     .await
     .map_err(|error| match error {
+        ListAuditError::Unavailable => ServerError::ServiceUnavailable,
         ListAuditError::Unauthorized => ServerError::Unauthorized,
         ListAuditError::InvalidCursor => ServerError::BadRequest,
         ListAuditError::Storage(message) => ServerError::InternalError(message),
