@@ -27,6 +27,7 @@ use aruna_core::structs::{
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::{GroupId, TxnId};
 use aruna_core::{MetaResourceId, NodeId, StructuredId};
+use aruna_storage::StorageHandle;
 use futures_util::StreamExt;
 use futures_util::future::{BoxFuture, FutureExt};
 use futures_util::stream;
@@ -1773,6 +1774,7 @@ pub async fn references_metadata(
         .map_err(map_metadata_internal_error)?;
 
     if request.resolve {
+        let registry = filter_live_records(&context.storage_handle, registry.as_ref()).await?;
         let entry = resolve_graph_reference(context, realm_id, &request, registry.as_ref()).await?;
         return Ok(MetadataReferencesExecution {
             references: entry.into_iter().collect(),
@@ -1836,8 +1838,10 @@ pub async fn references_metadata(
     }
 
     if references.is_empty()
-        && let Some(entry) =
+        && let Some(entry) = {
+            let registry = filter_live_records(&context.storage_handle, registry.as_ref()).await?;
             resolve_graph_reference(context, realm_id, &request, registry.as_ref()).await?
+        }
     {
         references.push(entry);
     }
@@ -2028,13 +2032,125 @@ async fn load_group_records(
         }
         records
     };
-    let mut visible = Vec::with_capacity(records.len());
+    filter_live_records(&context.storage_handle, &records).await
+}
+
+pub(crate) async fn filter_live_records(
+    storage: &StorageHandle,
+    records: &[MetadataRegistryRecord],
+) -> Result<Vec<MetadataRegistryRecord>, MetadataApiError> {
+    if records.len() > METADATA_REGISTRY_CANDIDATE_LIMIT {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut reads = Vec::with_capacity(records.len().saturating_mul(2));
     for record in records {
-        if !record_deleted(context, &record).await? {
-            visible.push(record);
+        reads.push((
+            METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+            metadata_graph_lifecycle_key(&record.graph_iri),
+        ));
+        reads.push((
+            METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
+            metadata_document_lifecycle_key(record.document_id),
+        ));
+    }
+    let values = match storage
+        .send_storage_effect(StorageEffect::BatchRead {
+            reads,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
+        Event::Storage(StorageEvent::Error { error }) => {
+            return Err(MetadataApiError::Internal(error.to_string()));
+        }
+        other => return Err(MetadataApiError::Internal(format!("{other:?}"))),
+    };
+    if values.len() != records.len().saturating_mul(2) {
+        return Err(MetadataApiError::Internal(format!(
+            "metadata lifecycle batch returned {} values for {} records",
+            values.len(),
+            records.len()
+        )));
+    }
+
+    let mut live = Vec::with_capacity(records.len());
+    for (record, pair) in records.iter().zip(values.chunks_exact(2)) {
+        let (graph_key, graph_value) = &pair[0];
+        if graph_key != &metadata_graph_lifecycle_key(&record.graph_iri) {
+            return Err(MetadataApiError::Internal(
+                "metadata graph lifecycle batch key mismatch".to_string(),
+            ));
+        }
+        let graph_deleted = graph_value
+            .as_ref()
+            .map(|value| graph_lifecycle_deleted(record, value))
+            .transpose()?
+            .unwrap_or(false);
+
+        let (document_key, document_value) = &pair[1];
+        if document_key != &metadata_document_lifecycle_key(record.document_id) {
+            return Err(MetadataApiError::Internal(
+                "metadata document lifecycle batch key mismatch".to_string(),
+            ));
+        }
+        let document_deleted = document_value
+            .as_ref()
+            .map(|value| document_lifecycle_deleted(record, value))
+            .transpose()?
+            .unwrap_or(false);
+        if !graph_deleted && !document_deleted {
+            live.push(record.clone());
         }
     }
-    Ok(visible)
+    Ok(live)
+}
+
+fn graph_lifecycle_deleted(
+    record: &MetadataRegistryRecord,
+    value: &[u8],
+) -> Result<bool, MetadataApiError> {
+    let lifecycle: MetadataGraphLifecycleRecord = postcard::from_bytes(value)
+        .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+    if lifecycle.graph_iri != record.graph_iri
+        || lifecycle.realm_id != record.realm_id
+        || lifecycle.group_id != record.group_id
+        || lifecycle.document_id != record.document_id
+    {
+        return Err(MetadataApiError::Internal(
+            "metadata graph lifecycle record mismatch".to_string(),
+        ));
+    }
+    Ok(lifecycle.is_deleted())
+}
+
+fn document_lifecycle_deleted(
+    record: &MetadataRegistryRecord,
+    value: &[u8],
+) -> Result<bool, MetadataApiError> {
+    let lifecycle: MetadataDocumentLifecycleRecord = postcard::from_bytes(value)
+        .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+    let matches = match &lifecycle {
+        MetadataDocumentLifecycleRecord::Upsert { event } => &event.record,
+        MetadataDocumentLifecycleRecord::Delete { event } => &event.tombstone,
+    };
+    if matches.document_id != record.document_id
+        || matches.graph_iri != record.graph_iri
+        || matches.realm_id != record.realm_id
+        || matches.group_id != record.group_id
+    {
+        return Err(MetadataApiError::Internal(
+            "metadata document lifecycle record mismatch".to_string(),
+        ));
+    }
+    Ok(matches!(
+        lifecycle,
+        MetadataDocumentLifecycleRecord::Delete { .. }
+    ))
 }
 
 async fn load_claim_records(
@@ -2193,60 +2309,10 @@ async fn load_pending_records(
         return Ok(HashMap::new());
     }
 
-    let lifecycle_reads = pending
-        .iter()
-        .map(|record| {
-            (
-                METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-                metadata_graph_lifecycle_key(&record.graph_iri),
-            )
-        })
-        .collect::<Vec<_>>();
-    let lifecycle_values = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchRead {
-            reads: lifecycle_reads,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchReadResult { values })
-            if values.len() == pending.len() =>
-        {
-            values
-        }
-        Event::Storage(StorageEvent::BatchReadResult { values }) => {
-            return Err(MetadataApiError::Internal(format!(
-                "metadata pending lifecycle batch returned {} values for {} records",
-                values.len(),
-                pending.len()
-            )));
-        }
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(MetadataApiError::Internal(error.to_string()));
-        }
-        other => return Err(MetadataApiError::Internal(format!("{other:?}"))),
-    };
-
+    let pending = filter_live_records(&context.storage_handle, &pending).await?;
     let mut records: HashMap<GroupId, Vec<MetadataRegistryRecord>> = HashMap::new();
     let mut count = 0usize;
-    for (record, (key, value)) in pending.into_iter().zip(lifecycle_values) {
-        if key != metadata_graph_lifecycle_key(&record.graph_iri) {
-            return Err(MetadataApiError::Internal(
-                "metadata pending lifecycle batch key mismatch".to_string(),
-            ));
-        }
-        let deleted = value
-            .map(|value| {
-                postcard::from_bytes::<MetadataGraphLifecycleRecord>(&value)
-                    .map(|record| record.is_deleted())
-                    .map_err(|error| MetadataApiError::Internal(error.to_string()))
-            })
-            .transpose()?
-            .unwrap_or(false);
-        if deleted || document_deleted(context, record.document_id).await? {
-            continue;
-        }
+    for record in pending {
         if count >= limit {
             return Err(MetadataApiError::ServiceUnavailable);
         }
@@ -2274,6 +2340,11 @@ async fn metadata_graph_is_deleted(
         }) => {
             let record: MetadataGraphLifecycleRecord = postcard::from_bytes(&value)
                 .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+            if record.graph_iri != graph_iri {
+                return Err(MetadataApiError::Internal(
+                    "metadata graph lifecycle record mismatch".to_string(),
+                ));
+            }
             Ok(record.is_deleted())
         }
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(false),
@@ -2315,11 +2386,11 @@ async fn load_record_by_document(
 ) -> Result<MetadataRegistryRecord, MetadataApiError> {
     match load_metadata_record_by_document(context, document_id).await {
         Ok(Some(record)) => {
-            if record_deleted(context, &record).await? {
-                Err(MetadataApiError::NotFound)
-            } else {
-                Ok(record)
-            }
+            filter_live_records(&context.storage_handle, std::slice::from_ref(&record))
+                .await?
+                .into_iter()
+                .next()
+                .ok_or(MetadataApiError::NotFound)
         }
         Ok(None) => Err(MetadataApiError::NotFound),
         Err(StorageReadError::Storage(error)) => Err(MetadataApiError::Internal(error.to_string())),
@@ -2354,44 +2425,32 @@ async fn load_record_txn(
     }
 }
 
-async fn record_deleted(
-    context: &DriverContext,
-    record: &MetadataRegistryRecord,
-) -> Result<bool, MetadataApiError> {
-    Ok(metadata_graph_is_deleted(context, &record.graph_iri).await?
-        || document_deleted(context, record.document_id).await?)
-}
-
 async fn record_deleted_txn(
     context: &DriverContext,
     record: &MetadataRegistryRecord,
     txn_id: TxnId,
 ) -> Result<bool, MetadataApiError> {
-    Ok(graph_deleted_txn(context, &record.graph_iri, txn_id).await?
-        || document_deleted_txn(context, record.document_id, txn_id).await?)
+    Ok(graph_deleted_txn(context, record, txn_id).await?
+        || document_deleted_txn(context, record, txn_id).await?)
 }
 
 async fn graph_deleted_txn(
     context: &DriverContext,
-    graph_iri: &str,
+    record: &MetadataRegistryRecord,
     txn_id: TxnId,
 ) -> Result<bool, MetadataApiError> {
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-            key: metadata_graph_lifecycle_key(graph_iri),
+            key: metadata_graph_lifecycle_key(&record.graph_iri),
             txn_id: Some(txn_id),
         })
         .await
     {
         Event::Storage(StorageEvent::ReadResult {
             value: Some(value), ..
-        }) => {
-            let record: MetadataGraphLifecycleRecord = postcard::from_bytes(&value)
-                .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-            Ok(record.is_deleted())
-        }
+        }) => graph_lifecycle_deleted(record, &value),
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(false),
         Event::Storage(StorageEvent::Error { error }) => {
             Err(MetadataApiError::Internal(error.to_string()))
@@ -2402,59 +2461,21 @@ async fn graph_deleted_txn(
 
 async fn document_deleted_txn(
     context: &DriverContext,
-    document_id: Ulid,
+    record: &MetadataRegistryRecord,
     txn_id: TxnId,
 ) -> Result<bool, MetadataApiError> {
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
-            key: metadata_document_lifecycle_key(document_id),
+            key: metadata_document_lifecycle_key(record.document_id),
             txn_id: Some(txn_id),
         })
         .await
     {
         Event::Storage(StorageEvent::ReadResult {
             value: Some(value), ..
-        }) => {
-            let record: MetadataDocumentLifecycleRecord = postcard::from_bytes(&value)
-                .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-            Ok(matches!(
-                record,
-                MetadataDocumentLifecycleRecord::Delete { .. }
-            ))
-        }
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(false),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(MetadataApiError::Internal(error.to_string()))
-        }
-        other => Err(MetadataApiError::Internal(format!("{other:?}"))),
-    }
-}
-
-async fn document_deleted(
-    context: &DriverContext,
-    document_id: Ulid,
-) -> Result<bool, MetadataApiError> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
-            key: metadata_document_lifecycle_key(document_id),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => {
-            let record: MetadataDocumentLifecycleRecord = postcard::from_bytes(&value)
-                .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-            Ok(matches!(
-                record,
-                MetadataDocumentLifecycleRecord::Delete { .. }
-            ))
-        }
+        }) => document_lifecycle_deleted(record, &value),
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(false),
         Event::Storage(StorageEvent::Error { error }) => {
             Err(MetadataApiError::Internal(error.to_string()))
@@ -3871,13 +3892,17 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::metadata::MetadataCreateEventPayload;
-    use aruna_core::storage_entries::metadata_create_event_and_pending_projection_write_entries;
+    use aruna_core::storage_entries::{
+        metadata_create_event_and_pending_projection_write_entries,
+        metadata_document_lifecycle_write_entry, metadata_graph_lifecycle_write_entry,
+    };
     use aruna_core::structs::{
         Actor, Group, GroupAuthorizationDocument, PlacementRef, RealmAuthorizationDocument, Role,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::types::{Key, RoleId};
     use aruna_storage::storage;
+    use byteview::ByteView;
     use tempfile::{TempDir, tempdir};
 
     use crate::metadata::MetadataHandle;
@@ -4014,6 +4039,101 @@ mod tests {
                 other => panic!("unexpected write event: {other:?}"),
             }
         }
+    }
+
+    async fn write_entry(test: &MetadataTest, entry: (String, ByteView, ByteView)) {
+        let (key_space, key, value) = entry;
+        match test
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected write event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn filters_graph_delete() {
+        let test = metadata_test();
+        let group_id = Ulid::generate();
+        let live = public_record(group_id, Ulid::generate());
+        let deleted = public_record(group_id, Ulid::generate());
+        let tombstone = MetadataGraphLifecycleRecord::deleted(
+            deleted.graph_iri.clone(),
+            deleted.realm_id,
+            deleted.group_id,
+            deleted.document_id,
+            2,
+        );
+        write_entry(
+            &test,
+            metadata_graph_lifecycle_write_entry(&tombstone).expect("lifecycle entry"),
+        )
+        .await;
+
+        let records = filter_live_records(&test.context.storage_handle, &[live.clone(), deleted])
+            .await
+            .expect("lifecycle filter succeeds");
+        assert_eq!(records, vec![live]);
+    }
+
+    #[tokio::test]
+    async fn filters_document_delete() {
+        let test = metadata_test();
+        let group_id = Ulid::generate();
+        let deleted = public_record(group_id, Ulid::generate());
+        let tombstone = MetadataGraphLifecycleRecord::deleted(
+            deleted.graph_iri.clone(),
+            deleted.realm_id,
+            deleted.group_id,
+            deleted.document_id,
+            2,
+        );
+        let lifecycle = aruna_core::metadata::MetadataDocumentLifecycleRecord::Delete {
+            event: aruna_core::metadata::MetadataDocumentDeleteRecord {
+                event_id: Ulid::generate(),
+                tombstone,
+                deleted_after_event_id: deleted.last_event_id,
+            },
+        };
+        write_entry(
+            &test,
+            metadata_document_lifecycle_write_entry(&lifecycle).expect("lifecycle entry"),
+        )
+        .await;
+
+        let records = filter_live_records(&test.context.storage_handle, &[deleted])
+            .await
+            .expect("lifecycle filter succeeds");
+        assert!(records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_bad_lifecycle() {
+        let test = metadata_test();
+        let record = public_record(Ulid::generate(), Ulid::generate());
+        write_entry(
+            &test,
+            (
+                METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+                metadata_graph_lifecycle_key(&record.graph_iri),
+                ByteView::from(vec![1u8]),
+            ),
+        )
+        .await;
+
+        assert!(
+            filter_live_records(&test.context.storage_handle, &[record])
+                .await
+                .is_err()
+        );
     }
 
     #[test]
