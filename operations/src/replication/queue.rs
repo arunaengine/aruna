@@ -1148,14 +1148,14 @@ pub async fn process_blob_replication_batch(
 
     let mut succeeded = 0usize;
     let mut failed = 0usize;
-    let relationships = read_job_relationships(&context.storage_handle, &scan.jobs).await?;
+    let mut relationships = read_job_relationships(&context.storage_handle, &scan.jobs).await?;
     for (job_key, job) in scan.jobs {
         let relationship = job.relationship_id.and_then(|relationship_id| {
             relationships
                 .get(&(job.input.bucket.clone(), relationship_id))
                 .cloned()
         });
-        match process_blob_replication_job(context, &job, relationship).await {
+        match process_blob_replication_job(context, &job, relationship, &mut relationships).await {
             Ok(BlobReplicationJobOutcome::Succeeded) => {
                 delete_blob_replication_job(&context.storage_handle, job_key).await?;
                 succeeded = succeeded.saturating_add(1);
@@ -1348,6 +1348,7 @@ async fn process_blob_replication_job(
     context: &DriverContext,
     job: &BlobReplicationJobRecord,
     stored_relationship: Option<SyncRelationship>,
+    relationships: &mut HashMap<(String, Ulid), SyncRelationship>,
 ) -> Result<BlobReplicationJobOutcome, String> {
     let routing = match quota_marked_routing(context).await {
         Ok(routing) => routing,
@@ -1403,7 +1404,9 @@ async fn process_blob_replication_job(
                     reason: "access_denied".to_string(),
                 };
                 mark_failure(&mut relationship, "access_denied");
-                if store_relationship(context, relationship.clone()).await? {
+                let stored = store_relationship(context, relationship.clone()).await?;
+                cache_relationship(relationships, job, &relationship, stored);
+                if stored {
                     emit_sync_watch(context, &relationship, group_id, 0, Some("access_denied"))
                         .await;
                 }
@@ -1412,9 +1415,9 @@ async fn process_blob_replication_job(
             Err((SourceAuthorizationError::Unavailable(error), group_id)) => {
                 let mut relationship = relationship;
                 mark_failure(&mut relationship, &error);
-                if store_relationship(context, relationship.clone()).await?
-                    && let Some(group_id) = group_id
-                {
+                let stored = store_relationship(context, relationship.clone()).await?;
+                cache_relationship(relationships, job, &relationship, stored);
+                if stored && let Some(group_id) = group_id {
                     emit_sync_watch(context, &relationship, group_id, 0, Some(&error)).await;
                 }
                 return Err(error);
@@ -1465,6 +1468,7 @@ async fn process_blob_replication_job(
             if let Some(relationship) = relationship.as_mut() {
                 mark_success(relationship, result.replicated, result.replicated_bytes);
                 let stored = store_relationship(context, relationship.clone()).await?;
+                cache_relationship(relationships, job, relationship, stored);
                 if stored && let Some(group_id) = watch_group_id {
                     emit_sync_watch(context, relationship, group_id, result.replicated, None).await;
                 }
@@ -1498,6 +1502,7 @@ async fn process_blob_replication_job(
                 };
                 mark_failure(relationship, "access_denied");
                 let stored = store_relationship(context, relationship.clone()).await?;
+                cache_relationship(relationships, job, relationship, stored);
                 if stored && let Some(group_id) = watch_group_id {
                     emit_sync_watch(context, relationship, group_id, 0, Some("access_denied"))
                         .await;
@@ -1519,11 +1524,29 @@ async fn process_blob_replication_job(
         }
         mark_failure(relationship, &error);
         let stored = store_relationship(context, relationship.clone()).await?;
+        cache_relationship(relationships, job, relationship, stored);
         if stored && let Some(group_id) = watch_group_id {
             emit_sync_watch(context, relationship, group_id, 0, Some(&error)).await;
         }
     }
     Err(error)
+}
+
+fn cache_relationship(
+    relationships: &mut HashMap<(String, Ulid), SyncRelationship>,
+    job: &BlobReplicationJobRecord,
+    relationship: &SyncRelationship,
+    stored: bool,
+) {
+    let Some(relationship_id) = job.relationship_id else {
+        return;
+    };
+    let key = (job.input.bucket.clone(), relationship_id);
+    if stored {
+        relationships.insert(key, relationship.clone());
+    } else {
+        relationships.remove(&key);
+    }
 }
 
 async fn read_job_relationships(
