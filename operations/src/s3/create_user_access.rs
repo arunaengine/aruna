@@ -329,7 +329,7 @@ impl CreateUserAccessOperation {
                 smallvec![]
             }
             Event::Storage(StorageEvent::Error { error }) => {
-                if !matches!(&error, StorageError::QueueFull) {
+                if !matches!(&error, &StorageError::QueueFull) {
                     self.txn_id = None;
                 }
                 self.handle_error(error.into())

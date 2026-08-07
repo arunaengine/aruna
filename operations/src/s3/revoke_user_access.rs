@@ -191,7 +191,7 @@ impl RevokeUserAccessOperation {
                 smallvec![]
             }
             Event::Storage(StorageEvent::Error { error }) => {
-                if !matches!(&error, StorageError::QueueFull) {
+                if !matches!(&error, &StorageError::QueueFull) {
                     self.txn_id = None;
                 }
                 self.emit_error(error.into())
