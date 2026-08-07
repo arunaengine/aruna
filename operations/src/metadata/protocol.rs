@@ -210,6 +210,7 @@ pub enum MetadataTransportMessage {
     },
     ForwardedTokenRevoked,
     ForwardedTokenRevocationCapacity,
+    ForwardedMetadataHistoryCapacity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -554,6 +555,14 @@ mod tests {
                 response
             );
         }
+    }
+
+    #[test]
+    fn history_capacity_roundtrip() {
+        let message = MetadataTransportMessage::ForwardedMetadataHistoryCapacity;
+        let bytes = postcard::to_allocvec(&message).unwrap();
+
+        assert_eq!(postcard::from_bytes(&bytes).unwrap(), message);
     }
 
     #[test]

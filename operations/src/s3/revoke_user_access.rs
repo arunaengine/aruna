@@ -178,7 +178,7 @@ impl RevokeUserAccessOperation {
         })]
     }
 
-    fn handle_user_access_deleted(&mut self, event: Event) -> Effects {
+    fn handle_access_deleted(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
             return self.emit_error(RevokeUserAccessError::InvalidOperationState);
         };
@@ -223,7 +223,7 @@ impl Operation for RevokeUserAccessOperation {
             RevokeUserAccessState::ReadUserAccess => self.handle_user_access_read(event),
             RevokeUserAccessState::ReadOwnerIndex => self.handle_index_read(event),
             RevokeUserAccessState::WriteUserAccess => self.handle_user_access_written(event),
-            RevokeUserAccessState::DeleteUserAccess => self.handle_user_access_deleted(event),
+            RevokeUserAccessState::DeleteUserAccess => self.handle_access_deleted(event),
             RevokeUserAccessState::CommitTransaction => self.handle_transaction_committed(event),
             RevokeUserAccessState::Finish => smallvec![],
             RevokeUserAccessState::Error => self.abort(),

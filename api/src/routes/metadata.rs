@@ -1747,6 +1747,7 @@ pub(super) fn map_create_error(error: CreateMetadataDocumentError) -> ServerErro
         CreateMetadataDocumentError::ClockHealth(_) => {
             ServerError::ServiceUnavailableReason("structured_id_clock_unhealthy".to_string())
         }
+        CreateMetadataDocumentError::RawLimit => ServerError::ServiceUnavailable,
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -1754,6 +1755,7 @@ pub(super) fn map_create_error(error: CreateMetadataDocumentError) -> ServerErro
 fn map_update_metadata_error(error: UpdateMetadataDocumentError) -> ServerError {
     match error {
         UpdateMetadataDocumentError::DocumentNotFound => ServerError::NotFound,
+        UpdateMetadataDocumentError::RawLimit => ServerError::ServiceUnavailable,
         UpdateMetadataDocumentError::MetadataError(metadata_error) => {
             map_metadata_error(metadata_error)
         }

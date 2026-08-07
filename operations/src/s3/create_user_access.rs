@@ -709,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_user_access_invalid_steps() {
+    fn rejects_invalid_steps() {
         let user_identity = make_user_identity();
         let group_id = Ulid::generate();
 

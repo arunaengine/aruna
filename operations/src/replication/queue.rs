@@ -1098,7 +1098,7 @@ pub async fn next_blob_replication_timer_after(
     }
 
     let now_ms = unix_timestamp_millis();
-    let scan = scan_due_blob_replication_jobs(storage, now_ms, 1).await?;
+    let scan = scan_due_jobs(storage, now_ms, 1).await?;
     if !scan.jobs.is_empty() || scan.has_more_due {
         if scan.jobs.is_empty() {
             advance_replication_cursor(storage, scan.next_cursor).await?;
@@ -1138,11 +1138,9 @@ pub async fn process_blob_replication_batch(
     context: &DriverContext,
 ) -> Result<BlobReplicationDrainResult, BlobReplicationQueueError> {
     let batch_started = Instant::now();
-    let repair = process_live_replication_obligations(context).await?;
+    let repair = process_live_obligations(context).await?;
     let now_ms = unix_timestamp_millis();
-    let scan =
-        scan_due_blob_replication_jobs(&context.storage_handle, now_ms, REPLICATION_BATCH_SIZE)
-            .await?;
+    let scan = scan_due_jobs(&context.storage_handle, now_ms, REPLICATION_BATCH_SIZE).await?;
     let mut next_due_at_ms = scan.next_due_at_ms;
     let has_more_due = repair.has_more || scan.has_more_due;
     let scan_elapsed = batch_started.elapsed();
@@ -1626,11 +1624,10 @@ async fn read_job_relationships(
     Ok(relationships)
 }
 
-async fn process_live_replication_obligations(
+async fn process_live_obligations(
     context: &DriverContext,
 ) -> Result<LiveReplicationRepairResult, BlobReplicationQueueError> {
-    let (obligations, has_more) =
-        read_live_replication_obligations(&context.storage_handle).await?;
+    let (obligations, has_more) = read_live_obligations(&context.storage_handle).await?;
     let mut starts = HashMap::<String, Option<Vec<u8>>>::new();
     for (_, obligation) in &obligations {
         if obligation
@@ -1728,7 +1725,7 @@ async fn process_live_replication_obligations(
     Ok(result)
 }
 
-async fn read_live_replication_obligations(
+async fn read_live_obligations(
     storage: &StorageHandle,
 ) -> Result<(Vec<(Vec<u8>, LiveReplicationObligationRecord)>, bool), BlobReplicationQueueError> {
     match storage
@@ -2473,7 +2470,7 @@ async fn advance_replication_cursor(
     }
 }
 
-async fn scan_due_blob_replication_jobs(
+async fn scan_due_jobs(
     storage: &StorageHandle,
     now_ms: u64,
     limit: usize,
@@ -3111,7 +3108,7 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         };
-        process_live_replication_obligations(&context)
+        process_live_obligations(&context)
             .await
             .expect("live obligation repairs");
     }
@@ -4187,7 +4184,7 @@ mod tests {
             .expect("job writes");
 
         let before = storage.snapshot_metrics().requests_total;
-        let scan = scan_due_blob_replication_jobs(&storage, unix_timestamp_millis(), 1)
+        let scan = scan_due_jobs(&storage, unix_timestamp_millis(), 1)
             .await
             .expect("job scan succeeds");
 
@@ -4217,14 +4214,14 @@ mod tests {
             .await
             .expect("second job writes");
 
-        let first_scan = scan_due_blob_replication_jobs(&storage, unix_timestamp_millis(), 1)
+        let first_scan = scan_due_jobs(&storage, unix_timestamp_millis(), 1)
             .await
             .expect("first cursor scan succeeds");
         advance_replication_cursor(&storage, first_scan.next_cursor.clone())
             .await
             .expect("first cursor persists");
         let before = storage.snapshot_metrics().requests_total;
-        let second_scan = scan_due_blob_replication_jobs(&storage, unix_timestamp_millis(), 1)
+        let second_scan = scan_due_jobs(&storage, unix_timestamp_millis(), 1)
             .await
             .expect("second cursor scan succeeds");
         advance_replication_cursor(&storage, second_scan.next_cursor.clone())
@@ -4239,7 +4236,7 @@ mod tests {
         assert_eq!(second_scan.jobs.len(), 1);
         assert_ne!(first_scan.jobs[0].0, second_scan.jobs[0].0);
 
-        let wrapped = scan_due_blob_replication_jobs(&storage, unix_timestamp_millis(), 1)
+        let wrapped = scan_due_jobs(&storage, unix_timestamp_millis(), 1)
             .await
             .expect("cursor wrap succeeds");
         assert!(wrapped.jobs.is_empty());
@@ -4247,7 +4244,7 @@ mod tests {
         advance_replication_cursor(&storage, wrapped.next_cursor)
             .await
             .expect("wrapped cursor persists");
-        let restarted = scan_due_blob_replication_jobs(&storage, unix_timestamp_millis(), 1)
+        let restarted = scan_due_jobs(&storage, unix_timestamp_millis(), 1)
             .await
             .expect("wrapped scan restarts");
         assert_eq!(restarted.jobs.len(), 1);
@@ -4272,7 +4269,7 @@ mod tests {
         .await
         .expect("job writes");
 
-        let scan = scan_due_blob_replication_jobs(&storage, unix_timestamp_millis(), 1)
+        let scan = scan_due_jobs(&storage, unix_timestamp_millis(), 1)
             .await
             .expect("malformed cursor resets");
         assert_eq!(scan.jobs.len(), 1);
@@ -4304,7 +4301,7 @@ mod tests {
         )
         .await;
 
-        let scan = scan_due_blob_replication_jobs(&storage, unix_timestamp_millis(), 2)
+        let scan = scan_due_jobs(&storage, unix_timestamp_millis(), 2)
             .await
             .expect("duplicate repair succeeds");
 

@@ -1612,6 +1612,7 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardedAuditPage { .. }
             | MetadataTransportMessage::ForwardedTokenRevoked
             | MetadataTransportMessage::ForwardedTokenRevocationCapacity
+            | MetadataTransportMessage::ForwardedMetadataHistoryCapacity
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -4329,6 +4330,9 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedTokenRevoked => "forwarded_token_revoked",
         MetadataTransportMessage::ForwardedTokenRevocationCapacity => {
             "forwarded_token_revocation_capacity"
+        }
+        MetadataTransportMessage::ForwardedMetadataHistoryCapacity => {
+            "forwarded_metadata_history_capacity"
         }
     }
 }

@@ -19,15 +19,16 @@ use crate::keyspaces::{
     METADATA_MATERIALIZATION_DEAD_LETTER_KEYSPACE, METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
     METADATA_MATERIALIZATION_JOB_KEYSPACE, METADATA_MATERIALIZATION_PRUNE_KEYSPACE,
     METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
-    NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
-    NOTIFICATION_OUTBOX_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
-    SHARD_MANIFEST_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
+    METADATA_RAW_BUDGET_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
+    NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE,
+    NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
+    USER_SUBJECT_INDEX_KEYSPACE,
 };
 use crate::metadata::{
     MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
     MetadataGraphPruneJobRecord, MetadataIriReferenceIndexRecord,
     MetadataMaterializationDeadLetterRecord, MetadataMaterializationJobRecord,
-    MetadataMaterializationStatusRecord,
+    MetadataMaterializationStatusRecord, MetadataRawOriginBudget,
 };
 use crate::structs::{
     MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, PlacementRef, User,
@@ -197,6 +198,13 @@ pub fn raw_revision_key(document_id: Ulid) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
 }
 
+pub fn raw_budget_key(document_id: Ulid, node_id: NodeId) -> Key {
+    let mut bytes = Vec::with_capacity(48);
+    bytes.extend_from_slice(&document_id.to_bytes());
+    bytes.extend_from_slice(node_id.as_bytes());
+    ByteView::from(bytes)
+}
+
 pub fn metadata_materialization_document_job_prefix(document_id: Ulid) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
 }
@@ -281,6 +289,16 @@ pub fn metadata_create_event_write_entry(
         METADATA_EVENT_LOG_KEYSPACE.to_string(),
         metadata_event_log_key(event.record.document_id, event.event_id),
         postcard::to_allocvec(event)?.into(),
+    ))
+}
+
+pub fn raw_budget_entry(
+    budget: &MetadataRawOriginBudget,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        METADATA_RAW_BUDGET_KEYSPACE.to_string(),
+        raw_budget_key(budget.document_id, budget.node_id),
+        postcard::to_allocvec(budget)?.into(),
     ))
 }
 
