@@ -576,6 +576,9 @@ impl RevokeTokenOperation {
         let Some(txn_id) = self.txn_id else {
             return self.fail(RevokeTokenError::MissingTransaction);
         };
+        if self.output.is_none() {
+            self.output = Some(Ok(document.clone()));
+        }
         self.state = RevokeTokenState::CommitNoop { document };
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -1173,6 +1176,19 @@ mod tests {
         assert_eq!(read.revoked_tokens.len(), 2);
         assert!(read.token_revoked(&first, 1_000));
         assert!(read.token_revoked(&second, 1_000));
+    }
+
+    #[tokio::test]
+    async fn repeat_noop_succeeds() {
+        let (_dir, context, actor) = setup_realm().await;
+        let token_hash = bearer_token_hash("repeat-noop");
+        let config = revocation(&actor, &token_hash, 2_000, 1_000);
+        drive(RevokeTokenOperation::new(config.clone()), &context)
+            .await
+            .unwrap();
+        drive(RevokeTokenOperation::new(config), &context)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
