@@ -270,7 +270,7 @@ impl ArunaS3Service {
             &AuthContext {
                 user_id: user_access.user_identity,
                 realm_id: user_access.user_identity.realm_id,
-                path_restrictions: None,
+                path_restrictions: user_access.path_restrictions.clone(),
             },
             &blob_bucket_permission_path(self.realm_id, bucket_info.group_id, self.node_id, bucket),
             &Permission::READ,
@@ -3422,9 +3422,10 @@ mod tests {
     use aruna_core::structs::{
         Actor, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
         BlobVersionState, CurrentVersionPointer, GroupAuthorizationDocument, NotificationClass,
-        NotificationKind, NotificationRecord, PortableSourceDescriptor, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmNodeKind, SourceConnectorKind, SourceMetadata, StagingStrategy,
-        VersionKey, VersionSourceBinding, WatchEventMask, WatchInterestEntry, WatchInterestTable,
+        NotificationKind, NotificationRecord, PathRestriction, PortableSourceDescriptor,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind, SourceConnectorKind,
+        SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding, WatchEventMask,
+        WatchInterestEntry, WatchInterestTable,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::{DriverContext, drive};
@@ -4338,6 +4339,79 @@ mod tests {
             issued_by: [0u8; 32],
             revoked_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn filters_bucket_scope() {
+        let realm_id = RealmId([43u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[43u8; 32]).public();
+        let (_storage_dir, service) = parser_service(realm_id, node_id);
+        let group_id = Ulid::generate();
+        let mut user_access = test_user_access(group_id, realm_id);
+        let actor = Actor {
+            node_id,
+            user_id: user_access.user_identity,
+            realm_id,
+        };
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let group_auth = GroupAuthorizationDocument::new_default_group_doc(
+            user_access.user_identity,
+            realm_id,
+            group_id,
+        );
+        write_storage_value(
+            &service.state.storage_handle,
+            AUTH_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            realm_auth.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        write_storage_value(
+            &service.state.storage_handle,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            group_auth.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        for bucket in ["allowed", "hidden"] {
+            write_storage_value(
+                &service.state.storage_handle,
+                S3_BUCKET_KEYSPACE,
+                bucket.as_bytes().to_vec(),
+                test_bucket_info(group_id, user_access.user_identity)
+                    .to_bytes()
+                    .unwrap(),
+            )
+            .await;
+        }
+        user_access.path_restrictions = Some(vec![PathRestriction {
+            pattern: blob_bucket_permission_path(realm_id, group_id, node_id, "allowed"),
+            permission: Permission::READ,
+        }]);
+
+        let mut extensions = Extensions::new();
+        extensions.insert(user_access);
+        extensions.insert(PolicyRequestExtras::operation("s3.ListBuckets"));
+        let request = S3Request {
+            input: ListBucketsInput::default(),
+            method: Method::GET,
+            uri: Uri::from_static("/"),
+            headers: HeaderMap::new(),
+            extensions,
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let response = service.list_buckets(request).await.unwrap();
+        let names = response
+            .output
+            .buckets
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|bucket| bucket.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["allowed"]);
     }
 
     fn test_bucket_info(group_id: Ulid, created_by: UserId) -> BucketInfo {

@@ -1,3 +1,4 @@
+use crate::auth::require_unrestricted_realm_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::structs::{
@@ -216,10 +217,7 @@ pub async fn list_s3_credentials(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<ListS3CredentialsResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
-    if auth.realm_id != state.get_realm_id() {
-        return Err(ServerError::Forbidden);
-    }
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
 
     let credentials = drive(
         ListUserAccessOperation::new(ListUserAccessInput {
@@ -676,18 +674,52 @@ fn parse_permission(permission: &str) -> ServerResult<Permission> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CreateS3PathRestriction, DelegationScope, NormalizedRestriction,
-        merge_effective_restrictions, normalize_auth_restrictions,
-        normalize_requested_restrictions, parse_permission,
-    };
+    use super::*;
     use crate::error::ServerError;
     use aruna_core::UserId;
+    use aruna_core::structs::NodeCapabilities;
     use aruna_core::structs::RealmId;
     use aruna_core::structs::{
         AuthContext, PathRestriction, Permission, blob_group_permission_path,
     };
+    use aruna_operations::driver::DriverContext;
+    use aruna_operations::jobs::runtime::JobsRuntime;
+    use aruna_storage::storage::FjallStorage;
+    use std::sync::Arc;
+    use tempfile::TempDir;
     use ulid::Ulid;
+
+    async fn test_state() -> (TempDir, Arc<ServerState>, AuthContext) {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let state = Arc::new(
+            ServerState::new(
+                Arc::new(DriverContext {
+                    storage_handle: storage,
+                    net_handle: None,
+                    blob_handle: None,
+                    metadata_handle: None,
+                    task_handle: None,
+                    compute_handle: None,
+                }),
+                realm_id,
+                node_id,
+                NodeCapabilities::local_node(realm_id).unwrap(),
+                false,
+                None,
+                JobsRuntime::new(),
+            )
+            .await,
+        );
+        let auth = AuthContext {
+            user_id: UserId::new(Ulid::from_bytes([3u8; 16]), realm_id),
+            realm_id,
+            path_restrictions: None,
+        };
+        (storage_dir, state, auth)
+    }
 
     fn test_auth_context(path_restrictions: Option<Vec<PathRestriction>>) -> AuthContext {
         let realm_id = RealmId::from_bytes([1u8; 32]);
@@ -843,6 +875,31 @@ mod tests {
             normalize_auth_restrictions(&auth, "/realm/g/group/data/node").unwrap(),
             Some(Vec::new())
         );
+    }
+
+    #[tokio::test]
+    async fn list_rejects_scope() {
+        let (_storage_dir, state, auth) = test_state().await;
+        for restrictions in [
+            Some(vec![PathRestriction {
+                pattern: "/restricted/**".to_string(),
+                permission: Permission::READ,
+            }]),
+            Some(Vec::new()),
+        ] {
+            let mut restricted = auth.clone();
+            restricted.path_restrictions = restrictions;
+            let error = list_s3_credentials(State(state.clone()), Extension(Some(restricted)))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ServerError::Forbidden));
+        }
+
+        let (status, Json(response)) = list_s3_credentials(State(state), Extension(Some(auth)))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert!(response.credentials.is_empty());
     }
 
     #[test]
