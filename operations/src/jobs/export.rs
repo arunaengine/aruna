@@ -16,7 +16,7 @@ use aruna_core::structs::{
     Permission, RealmId, ReasonCode, RoCrateCheckpointRefs, VersionKey, VersionedObjectArn,
     W3idDataIdentifier, blob_object_permission_path, ensure_confined_relative_path,
 };
-use aruna_core::types::{Key, NodeId, Value};
+use aruna_core::types::{GroupId, Key, NodeId, Value};
 use aruna_core::util::unix_timestamp_millis;
 use async_zip::{Compression, ZipEntryBuilder};
 #[cfg(test)]
@@ -50,6 +50,9 @@ use crate::metadata::api::{
 use crate::metadata::forward::export_rocrate_routed;
 use crate::replication::bao_read::{BaoReadError, BaoReadOperation, BaoReadOutput};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
+use crate::request_policy::{
+    PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
+};
 
 const METADATA_PATH: &str = "ro-crate-metadata.json";
 const REPORT_PATH: &str = "aruna-export-report.json";
@@ -138,7 +141,11 @@ struct ExportCandidate {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum CandidateSource {
-    Local(BackendLocation),
+    Local {
+        location: BackendLocation,
+        group_id: GroupId,
+        permission_path: String,
+    },
     RemoteExact {
         node_id: NodeId,
         target: VersionedObjectArn,
@@ -235,6 +242,7 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
     }
     let mut probed = None;
     let mut candidate_failures = BTreeMap::<usize, BTreeMap<usize, OpenStatus>>::new();
+    let mut policies = BTreeMap::<GroupId, std::sync::Arc<PolicyEvaluator>>::new();
 
     loop {
         if ctx.cancel.is_cancelled() {
@@ -244,16 +252,22 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
         if ctx.shutdown.is_cancelled() {
             return JobRunOutcome::Interrupted;
         }
+        if let Err(error) = load_candidate_policies(ctx, spec, &checkpoint, &mut policies).await {
+            return finish_export(ctx, &mut checkpoint, error).await;
+        }
 
         let result = match checkpoint.phase {
             ExportPhase::Snapshot => snapshot_export(ctx, spec, &mut checkpoint).await,
-            ExportPhase::Resolve => resolve_entries(ctx, spec, &mut checkpoint).await,
+            ExportPhase::Resolve => {
+                resolve_entries(ctx, spec, &mut checkpoint, &mut policies).await
+            }
             ExportPhase::Plan => {
-                match Box::pin(probe_sources(
+                match Box::pin(probe_sources_checked(
                     ctx,
                     spec,
                     &mut checkpoint,
                     &candidate_failures,
+                    &mut policies,
                 ))
                 .await
                 {
@@ -267,11 +281,12 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
             }
             ExportPhase::Assemble => {
                 if probed.is_none() {
-                    match Box::pin(probe_sources(
+                    match Box::pin(probe_sources_checked(
                         ctx,
                         spec,
                         &mut checkpoint,
                         &candidate_failures,
+                        &mut policies,
                     ))
                     .await
                     {
@@ -287,7 +302,7 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
                 let Some(entries) = probed.take() else {
                     return permanent("planned export sources are missing");
                 };
-                match Box::pin(assemble_export(ctx, spec, &checkpoint, entries)).await {
+                match Box::pin(assemble_export(ctx, spec, &checkpoint, entries, &policies)).await {
                     Ok(artifact) => {
                         checkpoint.refs.hidden_locations = vec![artifact.location.clone()];
                         checkpoint.artifact = Some(artifact);
@@ -388,6 +403,7 @@ async fn resolve_entries(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
     checkpoint: &mut ExportCheckpoint,
+    policies: &mut BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
 ) -> Result<(), ExportFailure> {
     for index in 0..checkpoint.entities.len() {
         if ctx.cancel.is_cancelled() {
@@ -421,7 +437,7 @@ async fn resolve_entries(
             .filter(|exact| exact.realm_id == spec.auth_context.realm_id)
         {
             if exact.node_id == ctx.owner_node_id {
-                match resolve_exact(ctx, spec, exact).await? {
+                match resolve_exact(ctx, spec, exact, policies).await? {
                     ResolveResult::Candidate(candidate) => {
                         if hash.is_some_and(|hash| Some(hash) != candidate.expected_blake3) {
                             mismatched = true;
@@ -471,6 +487,7 @@ async fn resolve_entries(
                 exact_version,
                 &mut candidates,
                 &mut denied,
+                policies,
             )
             .await?;
             if unavailable && candidates.is_empty() {
@@ -512,6 +529,7 @@ async fn extend_hash_candidates(
     resolved_version: Option<Ulid>,
     candidates: &mut Vec<ExportCandidate>,
     denied: &mut bool,
+    policies: &mut BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
 ) -> Result<bool, ExportFailure> {
     let aliases = drive(ResolveBlobPermissionPathsOperation::new(hash), &ctx.driver)
         .await
@@ -520,7 +538,7 @@ async fn extend_hash_candidates(
         .into_iter()
         .filter(|alias| alias.realm_id == spec.auth_context.realm_id)
     {
-        match resolve_alias(ctx, spec, &alias).await? {
+        match resolve_alias(ctx, spec, &alias, policies).await? {
             ResolveResult::Candidate(candidate) => {
                 if !candidates.contains(&candidate) {
                     candidates.push(candidate);
@@ -542,7 +560,7 @@ async fn extend_hash_candidates(
     };
     let remote_count = candidates
         .iter()
-        .filter(|candidate| !matches!(candidate.source, CandidateSource::Local(_)))
+        .filter(|candidate| !matches!(candidate.source, CandidateSource::Local { .. }))
         .count();
     let holder_limit = REMOTE_ATTEMPTS.saturating_sub(remote_count);
     for node_id in holders.into_iter().take(holder_limit) {
@@ -563,6 +581,7 @@ async fn resolve_exact(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
     exact: &VersionedObjectArn,
+    policies: &mut BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
 ) -> Result<ResolveResult, ExportFailure> {
     let Some(bucket) = storage_value(
         ctx,
@@ -582,7 +601,8 @@ async fn resolve_exact(
         &exact.bucket,
         &exact.key,
     );
-    if !check_read(ctx, spec, permission_path).await? {
+    let evaluator = load_policy(ctx, spec, policies, bucket.group_id).await?;
+    if !check_read(&ctx.driver, spec, &permission_path, evaluator).await? {
         return Ok(ResolveResult::Denied);
     }
     let key = VersionKey::new(exact.bucket.clone(), exact.key.clone(), exact.version)
@@ -610,7 +630,11 @@ async fn resolve_exact(
         return Ok(ResolveResult::Missing { hash: Some(hash) });
     }
     Ok(ResolveResult::Candidate(ExportCandidate {
-        source: CandidateSource::Local(location),
+        source: CandidateSource::Local {
+            location,
+            group_id: bucket.group_id,
+            permission_path,
+        },
         report_source: ExportReportSource::Local,
         resolved_version: Some(exact.version),
         expected_blake3: Some(hash),
@@ -621,8 +645,11 @@ async fn resolve_alias(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
     alias: &HashPathIndexKey,
+    policies: &mut BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
 ) -> Result<ResolveResult, ExportFailure> {
-    if !check_read(ctx, spec, alias.permission_path()).await? {
+    let permission_path = alias.permission_path();
+    let evaluator = load_policy(ctx, spec, policies, alias.group_id).await?;
+    if !check_read(&ctx.driver, spec, &permission_path, evaluator).await? {
         return Ok(ResolveResult::Denied);
     }
     let key = VersionKey::new(alias.bucket.clone(), alias.key.clone(), alias.version_id)
@@ -650,7 +677,11 @@ async fn resolve_alias(
         return Ok(ResolveResult::Missing { hash: None });
     }
     Ok(ResolveResult::Candidate(ExportCandidate {
-        source: CandidateSource::Local(location),
+        source: CandidateSource::Local {
+            location,
+            group_id: alias.group_id,
+            permission_path,
+        },
         report_source: ExportReportSource::Hash,
         resolved_version: Some(alias.version_id),
         expected_blake3: Some(alias.blake3_hash),
@@ -678,20 +709,75 @@ fn snapshot_read_failure(error: MetadataApiError) -> ExportFailure {
 }
 
 async fn check_read(
-    ctx: &JobContext,
+    ctx: &DriverContext,
     spec: &ExportRoCrateSpec,
-    path: String,
+    path: &str,
+    evaluator: &PolicyEvaluator,
 ) -> Result<bool, ExportFailure> {
-    drive(
+    let allowed = drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: spec.auth_context.clone(),
-            path,
+            path: path.to_string(),
             required_permission: Permission::READ,
         }),
-        &ctx.driver,
+        ctx,
     )
     .await
-    .map_err(|error| ExportFailure::Retryable(error.to_string()))
+    .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+    if !allowed {
+        return Ok(false);
+    }
+    let request = policy_request_with(
+        path,
+        &Permission::READ,
+        Some(&spec.auth_context.user_id),
+        PolicyRequestExtras::operation("s3.GetObject"),
+    );
+    match evaluator.evaluate(&request) {
+        Ok(()) => Ok(true),
+        Err(PolicyEnforcementError::Denied { .. }) => Ok(false),
+        Err(PolicyEnforcementError::Unavailable(error)) => {
+            Err(ExportFailure::Retryable(error.to_string()))
+        }
+    }
+}
+
+async fn load_policy(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    policies: &mut BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
+    group_id: GroupId,
+) -> Result<&PolicyEvaluator, ExportFailure> {
+    if !policies.contains_key(&group_id) {
+        let evaluator =
+            PolicyEvaluator::load(&ctx.driver, spec.auth_context.realm_id, Some(group_id))
+                .await
+                .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+        policies.insert(group_id, std::sync::Arc::new(evaluator));
+    }
+    policies
+        .get(&group_id)
+        .ok_or_else(|| ExportFailure::Retryable("object policy unavailable".to_string()))
+}
+
+async fn load_candidate_policies(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    checkpoint: &ExportCheckpoint,
+    policies: &mut BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
+) -> Result<(), ExportFailure> {
+    let groups = checkpoint.entities.iter().flat_map(|entity| {
+        entity.candidates.iter().filter_map(|candidate| {
+            let CandidateSource::Local { group_id, .. } = &candidate.source else {
+                return None;
+            };
+            Some(*group_id)
+        })
+    });
+    for group_id in groups {
+        load_policy(ctx, spec, policies, group_id).await?;
+    }
+    Ok(())
 }
 
 async fn storage_value(
@@ -750,6 +836,18 @@ async fn probe_sources(
     checkpoint: &mut ExportCheckpoint,
     candidate_failures: &BTreeMap<usize, BTreeMap<usize, OpenStatus>>,
 ) -> Result<Vec<ProbedEntry>, ExportFailure> {
+    let mut policies = BTreeMap::new();
+    load_candidate_policies(ctx, spec, checkpoint, &mut policies).await?;
+    probe_sources_checked(ctx, spec, checkpoint, candidate_failures, &mut policies).await
+}
+
+async fn probe_sources_checked(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    checkpoint: &mut ExportCheckpoint,
+    candidate_failures: &BTreeMap<usize, BTreeMap<usize, OpenStatus>>,
+    policies: &mut BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
+) -> Result<Vec<ProbedEntry>, ExportFailure> {
     let mut probed = Vec::new();
     for index in 0..checkpoint.entities.len() {
         if ctx.cancel.is_cancelled() {
@@ -786,7 +884,15 @@ async fn probe_sources(
             if ctx.shutdown.is_cancelled() {
                 return Err(ExportFailure::Interrupted);
             }
-            match Box::pin(open_candidate(&ctx.driver, spec, &candidate, true)).await? {
+            match Box::pin(open_candidate_checked(
+                &ctx.driver,
+                spec,
+                policies,
+                &candidate,
+                true,
+            ))
+            .await?
+            {
                 CandidateOpen::Opened(BaoReadOutput::Metadata { size, blake3 }) => {
                     if learn_probe_hash(&mut checkpoint.entities[index], candidate_index, blake3) {
                         extend_hash_candidates(
@@ -796,6 +902,7 @@ async fn probe_sources(
                             candidate.resolved_version,
                             &mut checkpoint.entities[index].candidates,
                             &mut denied,
+                            policies,
                         )
                         .await?;
                     }
@@ -864,13 +971,42 @@ async fn open_candidate(
     candidate: &ExportCandidate,
     metadata_only: bool,
 ) -> Result<CandidateOpen, ExportFailure> {
+    let mut policies = BTreeMap::new();
+    if let CandidateSource::Local { group_id, .. } = &candidate.source {
+        let evaluator = PolicyEvaluator::load(driver, spec.auth_context.realm_id, Some(*group_id))
+            .await
+            .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
+        policies.insert(*group_id, std::sync::Arc::new(evaluator));
+    }
+    open_candidate_checked(driver, spec, &policies, candidate, metadata_only).await
+}
+
+async fn open_candidate_checked(
+    driver: &DriverContext,
+    spec: &ExportRoCrateSpec,
+    policies: &BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
+    candidate: &ExportCandidate,
+    metadata_only: bool,
+) -> Result<CandidateOpen, ExportFailure> {
     match &candidate.source {
-        CandidateSource::Local(location) => {
+        CandidateSource::Local {
+            location,
+            group_id,
+            permission_path,
+        } => {
             let Some(blake3) = candidate.expected_blake3 else {
                 return Err(ExportFailure::Permanent(
                     "local export candidate has no BLAKE3 hash".to_string(),
                 ));
             };
+            let Some(evaluator) = policies.get(group_id) else {
+                return Err(ExportFailure::Retryable(
+                    "object policy unavailable".to_string(),
+                ));
+            };
+            if !check_read(driver, spec, permission_path, evaluator).await? {
+                return Ok(CandidateOpen::Status(OpenStatus::Denied));
+            }
             let Some(blob_handle) = driver.blob_handle.as_ref() else {
                 return Err(ExportFailure::Retryable(
                     "blob handle unavailable".to_string(),
@@ -1745,6 +1881,7 @@ async fn assemble_export(
     spec: &ExportRoCrateSpec,
     checkpoint: &ExportCheckpoint,
     opened: Vec<ProbedEntry>,
+    policies: &BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>,
 ) -> Result<ArtifactRef, ExportFailure> {
     let metadata = checkpoint
         .rewritten_jsonld
@@ -1779,6 +1916,7 @@ async fn assemble_export(
         });
     }
     let report = checkpoint.report_json.clone();
+    let policies = std::sync::Arc::new(policies.clone());
     let Some(blob_handle) = ctx.driver.blob_handle.as_ref() else {
         return Err(ExportFailure::Retryable(
             "blob handle unavailable".to_string(),
@@ -1787,8 +1925,8 @@ async fn assemble_export(
     let (writer, reader) = tokio::io::duplex(128 * 1024);
     let cancel = ctx.cancel.clone();
     let shutdown = ctx.shutdown.clone();
-    let writer_task = tokio::spawn(Box::pin(write_archive(
-        writer, metadata, entries, report, cancel, shutdown,
+    let writer_task = tokio::spawn(Box::pin(write_archive_checked(
+        writer, metadata, entries, report, policies, cancel, shutdown,
     )));
     let event = blob_handle
         .send_blob_effect(BlobEffect::SpoolHidden {
@@ -1845,8 +1983,29 @@ async fn assemble_export(
 async fn write_archive(
     writer: tokio::io::DuplexStream,
     metadata: Vec<u8>,
+    entries: Vec<PlannedEntry>,
+    report: Option<Vec<u8>>,
+    cancel: tokio_util::sync::CancellationToken,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(), ExportFailure> {
+    write_archive_checked(
+        writer,
+        metadata,
+        entries,
+        report,
+        std::sync::Arc::new(BTreeMap::new()),
+        cancel,
+        shutdown,
+    )
+    .await
+}
+
+async fn write_archive_checked(
+    writer: tokio::io::DuplexStream,
+    metadata: Vec<u8>,
     mut entries: Vec<PlannedEntry>,
     report: Option<Vec<u8>>,
+    policies: std::sync::Arc<BTreeMap<GroupId, std::sync::Arc<PolicyEvaluator>>>,
     cancel: tokio_util::sync::CancellationToken,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(), ExportFailure> {
@@ -1869,7 +2028,12 @@ async fn write_archive(
                 driver,
                 spec,
                 candidate,
-            } => Box::pin(open_candidate(&driver, &spec, &candidate, false)).await?,
+            } => {
+                Box::pin(open_candidate_checked(
+                    &driver, &spec, &policies, &candidate, false,
+                ))
+                .await?
+            }
             #[cfg(test)]
             PlannedSource::Ready(blob) => CandidateOpen::Opened(BaoReadOutput::Stream {
                 blob,
