@@ -2796,7 +2796,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_includes_writer_auth() {
+    fn manifest_writer_auth() {
         let version_id = Ulid::generate();
         let writer = auth_context();
         let mut op = ReplicateObjectVersionOperation::new(version_request(version_id))
