@@ -412,6 +412,12 @@ mod tests {
         };
 
         assert_eq!(group_ids(&effect), vec![backend_id]);
-        assert!(group_ids(&BlobEffect::ListHidden { namespace: None }).is_empty());
+        assert!(
+            group_ids(&BlobEffect::ListHidden {
+                namespace: None,
+                cursor: None,
+            })
+            .is_empty()
+        );
     }
 }

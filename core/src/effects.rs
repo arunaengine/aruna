@@ -88,6 +88,7 @@ pub enum BlobEffect {
     },
     ListHidden {
         namespace: Option<Ulid>,
+        cursor: Option<Vec<u8>>,
     },
     // ----- Replication -----
     OpenConnection {

@@ -3,8 +3,9 @@ use super::backend::{build_backend_path, build_hidden_path, build_multipart_part
 use super::group::GROUP_WRITE_CHUNK;
 use crate::hash::Hasher;
 use crate::opendal::abort_partial_writer;
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::BlobError;
-use aruna_core::events::BlobEvent;
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::stream::BackendStream;
 use aruna_core::stream::StreamError;
 use aruna_core::structs::{
@@ -13,17 +14,34 @@ use aruna_core::structs::{
 };
 use aruna_core::types::UserId;
 use bytes::Bytes;
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, stream};
 use opendal::{EntryMode, ErrorKind, Operator};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
 use std::ops::RangeBounds;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
 use tokio::time::{Instant, timeout, timeout_at};
 use ulid::Ulid;
+
+const HIDDEN_LIST_PAGE: usize = 128;
+const HIDDEN_BACKEND_LIMIT: usize = 256;
+const HIDDEN_SOURCE_HOPS: usize = 32;
+
+#[derive(Debug, Deserialize, Serialize)]
+enum HiddenCursor {
+    Objects {
+        backend: BackendRef,
+        bucket: Option<String>,
+        start_after: Option<String>,
+    },
+    Reservations {
+        start_after: Option<Vec<u8>>,
+    },
+}
 
 /// Tenant writers open with an explicit chunk so a small-chunk stream cannot
 /// exhaust a provider's per-object block ceiling.
@@ -869,88 +887,138 @@ impl BlobHandler {
         BlobEvent::HiddenDeleted
     }
 
-    /// Sweeps every registered node backend: a demoted default keeps serving its
-    /// stamped objects, so its crash leftovers must stay reachable too.
-    pub async fn list_hidden_blobs(&self, namespace: Option<Ulid>) -> BlobEvent {
-        let prefix = hidden_prefix(namespace);
-        let backends: Vec<BackendRef> = self
-            .registry
-            .entries()
-            .map(|(name, _)| BackendRef::Node(name.clone()))
-            .collect();
-        let mut entries = Vec::new();
-        for backend in backends {
-            if let Err(error) = self.collect_hidden(&backend, &prefix, &mut entries).await {
-                return BlobEvent::Error(error);
-            }
-        }
-        let reservations = match self.hidden_reservations().await {
-            Ok(keys) => keys,
-            Err(error) => return BlobEvent::Error(error),
+    /// Returns one bounded page and an opaque cursor for the next source.
+    pub async fn list_hidden_blobs(
+        &self,
+        namespace: Option<Ulid>,
+        cursor: Option<Vec<u8>>,
+    ) -> BlobEvent {
+        let cursor = match cursor {
+            Some(cursor) => match postcard::from_bytes::<HiddenCursor>(&cursor) {
+                Ok(cursor) => cursor,
+                Err(error) => return BlobEvent::Error(BlobError::ConversionError(error.into())),
+            },
+            None => match self.hidden_backends() {
+                Ok(backends) => match backends.first() {
+                    Some(backend) => HiddenCursor::Objects {
+                        backend: backend.clone(),
+                        bucket: None,
+                        start_after: None,
+                    },
+                    None => match self.list_reservation_page(namespace, None).await {
+                        Ok((entries, next_cursor)) => {
+                            return BlobEvent::HiddenListed {
+                                entries,
+                                next_cursor,
+                            };
+                        }
+                        Err(error) => return BlobEvent::Error(error),
+                    },
+                },
+                Err(error) => return BlobEvent::Error(error),
+            },
         };
-        for key in reservations {
-            let modified_at = hidden_timestamp(&key.backend_path);
-            entries.push(HiddenBlobEntry { key, modified_at });
+        let result = match cursor {
+            HiddenCursor::Objects {
+                backend,
+                bucket,
+                start_after,
+            } => {
+                self.list_object_page(namespace, backend, bucket, start_after)
+                    .await
+            }
+            HiddenCursor::Reservations { start_after } => {
+                self.list_reservation_page(namespace, start_after).await
+            }
+        };
+        match result {
+            Ok((entries, next_cursor)) => BlobEvent::HiddenListed {
+                entries,
+                next_cursor,
+            },
+            Err(error) => BlobEvent::Error(error),
         }
-        entries.sort_by(|left, right| {
-            (
-                &left.key.backend,
-                &left.key.storage_bucket,
-                &left.key.backend_path,
-            )
-                .cmp(&(
-                    &right.key.backend,
-                    &right.key.storage_bucket,
-                    &right.key.backend_path,
-                ))
-        });
-        entries.dedup_by(|left, right| left.key == right.key);
-        BlobEvent::HiddenListed { entries }
     }
 
-    async fn collect_hidden(
+    async fn list_object_page(
         &self,
-        backend: &BackendRef,
-        prefix: &str,
-        entries: &mut Vec<HiddenBlobEntry>,
-    ) -> Result<(), BlobError> {
-        let root = self.registry.config_for(backend)?.root.clone();
-        for bucket in self.hidden_buckets(backend).await? {
-            let operator = self
-                .registry
-                .bucket_operator(backend, &bucket, &self.egress)?;
-            let storage_prefix = PathBuf::from(&bucket).join(prefix);
-            let Some(storage_prefix) = storage_prefix.to_str() else {
-                return Err(BlobError::ListError(
-                    "hidden blob prefix is not valid utf-8".to_string(),
-                ));
+        namespace: Option<Ulid>,
+        mut backend: BackendRef,
+        mut bucket: Option<String>,
+        mut start_after: Option<String>,
+    ) -> Result<(Vec<HiddenBlobEntry>, Option<Vec<u8>>), BlobError> {
+        let backends = self.hidden_backends()?;
+        if backends.is_empty() {
+            return self.list_reservation_page(namespace, None).await;
+        }
+        if !backends.contains(&backend) {
+            let Some(next) =
+                next_backend(&backends, &backend).or_else(|| backends.first().cloned())
+            else {
+                return self.list_reservation_page(namespace, None).await;
             };
-            let mut lister = operator
-                .lister_with(storage_prefix)
-                .recursive(true)
+            backend = next;
+            bucket = None;
+            start_after = None;
+        }
+        for _ in 0..HIDDEN_SOURCE_HOPS {
+            let bucket_name = match bucket.take() {
+                Some(bucket) => bucket,
+                None => match self.hidden_bucket_after(&backend, None).await {
+                    Ok(Some(bucket)) => bucket,
+                    Ok(None) => {
+                        if let Some(next) = next_backend(&backends, &backend) {
+                            backend = next;
+                            start_after = None;
+                            continue;
+                        }
+                        return self.list_reservation_page(namespace, None).await;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%backend, %error, "hidden backend bucket listing failed");
+                        return self.skip_backend(namespace, &backends, &backend).await;
+                    }
+                },
+            };
+            let page = match self
+                .list_bucket_page(&backend, &bucket_name, namespace, start_after.as_deref())
                 .await
-                .map_err(|error| BlobError::ListError(error.to_string()))?;
-            loop {
-                let entry = match lister.try_next().await {
-                    Ok(Some(entry)) => entry,
-                    Ok(None) => break,
-                    Err(error) => return Err(BlobError::ListError(error.to_string())),
-                };
+            {
+                Ok(page) => page,
+                Err(error) => {
+                    tracing::warn!(%backend, bucket = %bucket_name, %error, "hidden backend page failed");
+                    return self.skip_backend(namespace, &backends, &backend).await;
+                }
+            };
+            let last_path = page.last().map(|entry| entry.path().to_string());
+            let mut entries = Vec::with_capacity(page.len());
+            let root = self.registry.config_for(&backend)?.root.clone();
+            let prefix = hidden_prefix(namespace);
+            for entry in &page {
                 if entry.metadata().mode() != EntryMode::FILE {
                     continue;
                 }
-                let listed_path = PathBuf::from(entry.path());
-                let backend_path = listed_path
-                    .strip_prefix(&bucket)
-                    .map_err(|error| BlobError::ListError(error.to_string()))?
+                let listed_path = entry.path();
+                let backend_path = Path::new(listed_path)
+                    .strip_prefix(Path::new(&bucket_name))
+                    .ok_or_else(|| {
+                        BlobError::ListError("hidden blob path is outside bucket".to_string())
+                    })?
                     .to_str()
                     .ok_or_else(|| {
                         BlobError::ListError("hidden blob path is not valid utf-8".to_string())
                     })?
                     .to_string();
-                let key =
-                    HiddenBlobKey::new(backend.clone(), root.clone(), bucket.clone(), backend_path)
-                        .map_err(BlobError::ConversionError)?;
+                if !backend_path.starts_with(&prefix) {
+                    continue;
+                }
+                let key = HiddenBlobKey::new(
+                    backend.clone(),
+                    root.clone(),
+                    bucket_name.clone(),
+                    backend_path,
+                )
+                .map_err(BlobError::ConversionError)?;
                 let modified_at = entry
                     .metadata()
                     .last_modified()
@@ -958,8 +1026,169 @@ impl BlobHandler {
                     .or_else(|| hidden_timestamp(&key.backend_path));
                 entries.push(HiddenBlobEntry { key, modified_at });
             }
+            let next = if page.len() >= HIDDEN_LIST_PAGE {
+                HiddenCursor::Objects {
+                    backend,
+                    bucket: Some(bucket_name),
+                    start_after: last_path,
+                }
+            } else if let Some(next_bucket) = match self
+                .hidden_bucket_after(&backend, Some(&bucket_name))
+                .await
+            {
+                Ok(next_bucket) => next_bucket,
+                Err(error) => {
+                    tracing::warn!(%backend, bucket = %bucket_name, %error, "hidden bucket continuation failed");
+                    return self.skip_backend(namespace, &backends, &backend).await;
+                }
+            } {
+                HiddenCursor::Objects {
+                    backend,
+                    bucket: Some(next_bucket),
+                    start_after: None,
+                }
+            } else if let Some(next_backend) = next_backend(&backends, &backend) {
+                HiddenCursor::Objects {
+                    backend: next_backend,
+                    bucket: None,
+                    start_after: None,
+                }
+            } else {
+                HiddenCursor::Reservations { start_after: None }
+            };
+            if !entries.is_empty() {
+                return Ok((entries, Some(encode_cursor(next)?)));
+            }
+            match next {
+                HiddenCursor::Objects {
+                    backend: next_backend,
+                    bucket: next_bucket,
+                    start_after: next_start_after,
+                } => {
+                    backend = next_backend;
+                    bucket = next_bucket;
+                    start_after = next_start_after;
+                }
+                HiddenCursor::Reservations { start_after } => {
+                    return self.list_reservation_page(namespace, start_after).await;
+                }
+            }
         }
-        Ok(())
+        Ok((
+            Vec::new(),
+            Some(encode_cursor(HiddenCursor::Objects {
+                backend,
+                bucket,
+                start_after,
+            })?),
+        ))
+    }
+
+    async fn skip_backend(
+        &self,
+        namespace: Option<Ulid>,
+        backends: &[BackendRef],
+        backend: &BackendRef,
+    ) -> Result<(Vec<HiddenBlobEntry>, Option<Vec<u8>>), BlobError> {
+        if let Some(next) = next_backend(backends, backend) {
+            return Ok((
+                Vec::new(),
+                Some(encode_cursor(HiddenCursor::Objects {
+                    backend: next,
+                    bucket: None,
+                    start_after: None,
+                })?),
+            ));
+        }
+        self.list_reservation_page(namespace, None).await
+    }
+
+    async fn list_bucket_page(
+        &self,
+        backend: &BackendRef,
+        bucket: &str,
+        namespace: Option<Ulid>,
+        start_after: Option<&str>,
+    ) -> Result<Vec<opendal::Entry>, BlobError> {
+        let operator = self
+            .registry
+            .bucket_operator(backend, bucket, &self.egress)?;
+        let storage_prefix = format!("{bucket}/{}", hidden_prefix(namespace));
+        let mut request = operator
+            .list_with(&storage_prefix)
+            .recursive(true)
+            .limit(HIDDEN_LIST_PAGE);
+        if let Some(start_after) = start_after {
+            request = request.start_after(start_after);
+        }
+        tokio::time::timeout(self.control_plane_io_timeout(), request)
+            .await
+            .map_err(|_| BlobError::ListError("timed out listing hidden blobs".to_string()))?
+            .map_err(|error| BlobError::ListError(error.to_string()))
+    }
+
+    async fn list_reservation_page(
+        &self,
+        namespace: Option<Ulid>,
+        start_after: Option<Vec<u8>>,
+    ) -> Result<(Vec<HiddenBlobEntry>, Option<Vec<u8>>), BlobError> {
+        let event = tokio::time::timeout(
+            self.control_plane_io_timeout(),
+            self.storage
+                .send_effect(Effect::Storage(StorageEffect::Iter {
+                    key_space: aruna_core::keyspaces::BLOB_HIDDEN_RESERVATION_KEYSPACE.to_string(),
+                    prefix: None,
+                    start: start_after.map(|key| IterStart::After(key.into())),
+                    limit: HIDDEN_LIST_PAGE,
+                    txn_id: None,
+                })),
+        )
+        .await
+        .map_err(|_| BlobError::ListError("timed out listing hidden reservations".to_string()))?;
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
+            return Err(BlobError::ListError(
+                "unexpected hidden reservation iteration event".to_string(),
+            ));
+        };
+        let mut entries = Vec::with_capacity(values.len());
+        for (key, _) in values {
+            let key: HiddenBlobKey = postcard::from_bytes(key.as_ref())
+                .map_err(|error| BlobError::ConversionError(error.into()))?;
+            if namespace.is_some_and(|namespace| key.namespace().ok() != Some(namespace)) {
+                continue;
+            }
+            entries.push(HiddenBlobEntry {
+                modified_at: hidden_timestamp(&key.backend_path),
+                key,
+            });
+        }
+        let next = next_start_after
+            .map(|key| {
+                encode_cursor(HiddenCursor::Reservations {
+                    start_after: Some(key.to_vec()),
+                })
+            })
+            .transpose()?;
+        Ok((entries, next))
+    }
+
+    fn hidden_backends(&self) -> Result<Vec<BackendRef>, BlobError> {
+        let mut backends = self
+            .registry
+            .entries()
+            .map(|(name, _)| BackendRef::Node(name.clone()))
+            .collect::<Vec<_>>();
+        if backends.len() > HIDDEN_BACKEND_LIMIT {
+            return Err(BlobError::ListError(
+                "hidden blob backend count exceeds limit".to_string(),
+            ));
+        }
+        backends.sort();
+        Ok(backends)
     }
 
     pub async fn delete_blob(&self, location: BackendLocation) -> BlobEvent {
@@ -999,6 +1228,14 @@ fn hidden_prefix(namespace: Option<Ulid>) -> String {
         Some(namespace) => format!("{HIDDEN_BLOB_PREFIX}/{namespace}/"),
         None => format!("{HIDDEN_BLOB_PREFIX}/"),
     }
+}
+
+fn encode_cursor(cursor: HiddenCursor) -> Result<Vec<u8>, BlobError> {
+    postcard::to_allocvec(&cursor).map_err(|error| BlobError::ConversionError(error.into()))
+}
+
+fn next_backend(backends: &[BackendRef], current: &BackendRef) -> Option<BackendRef> {
+    backends.iter().find(|backend| *backend > current).cloned()
 }
 
 fn hidden_timestamp(path: &str) -> Option<SystemTime> {

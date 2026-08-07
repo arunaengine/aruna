@@ -432,8 +432,8 @@ impl BlobHandler {
                 Box::pin(self.read_hidden_range(location, range)).await
             }
             BlobEffect::DeleteHidden { key } => Box::pin(self.delete_hidden_blob(key)).await,
-            BlobEffect::ListHidden { namespace } => {
-                Box::pin(self.list_hidden_blobs(namespace)).await
+            BlobEffect::ListHidden { namespace, cursor } => {
+                Box::pin(self.list_hidden_blobs(namespace, cursor)).await
             }
             BlobEffect::CheckGroupBackend { record, secret } => {
                 Box::pin(self.check_group_backend(record, secret)).await

@@ -1002,10 +1002,11 @@ async fn hidden_spool_roundtrip() {
         0
     );
 
-    let Event::Blob(BlobEvent::HiddenListed { entries }) = context
+    let Event::Blob(BlobEvent::HiddenListed { entries, .. }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::ListHidden {
             namespace: Some(namespace),
+            cursor: None,
         })
         .await
     else {
@@ -1048,10 +1049,11 @@ async fn hidden_spool_roundtrip() {
     else {
         panic!("hidden delete failed")
     };
-    let Event::Blob(BlobEvent::HiddenListed { entries }) = context
+    let Event::Blob(BlobEvent::HiddenListed { entries, .. }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::ListHidden {
             namespace: Some(namespace),
+            cursor: None,
         })
         .await
     else {
@@ -1099,10 +1101,11 @@ async fn hidden_spool_limits() {
             .await,
         Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { limit: 3 }))
     ));
-    let Event::Blob(BlobEvent::HiddenListed { entries }) = context
+    let Event::Blob(BlobEvent::HiddenListed { entries, .. }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::ListHidden {
             namespace: Some(namespace),
+            cursor: None,
         })
         .await
     else {
@@ -1169,9 +1172,10 @@ async fn sweeps_demoted_backend() {
     )
     .await
     .unwrap();
-    let Event::Blob(BlobEvent::HiddenListed { entries }) = after
+    let Event::Blob(BlobEvent::HiddenListed { entries, .. }) = after
         .send_blob_effect(BlobEffect::ListHidden {
             namespace: Some(namespace),
+            cursor: None,
         })
         .await
     else {

@@ -236,41 +236,6 @@ impl BlobHandler {
         ))
     }
 
-    pub(super) async fn hidden_reservations(&self) -> Result<Vec<HiddenBlobKey>, BlobError> {
-        let mut keys = Vec::new();
-        let mut start_after = None;
-        loop {
-            let event = self
-                .storage
-                .send_effect(Effect::Storage(StorageEffect::Iter {
-                    key_space: BLOB_HIDDEN_RESERVATION_KEYSPACE.to_string(),
-                    prefix: None,
-                    start: start_after.clone().map(IterStart::After),
-                    limit: 1024,
-                    txn_id: None,
-                }))
-                .await;
-            let Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) = event
-            else {
-                return Err(BlobError::ReadError(
-                    "unexpected hidden reservation iteration event".to_string(),
-                ));
-            };
-            for (key, _) in values {
-                let key: HiddenBlobKey = postcard::from_bytes(key.as_ref())
-                    .map_err(|error| BlobError::ConversionError(error.into()))?;
-                keys.push(key);
-            }
-            let Some(next_start_after) = next_start_after else {
-                return Ok(keys);
-            };
-            start_after = Some(next_start_after);
-        }
-    }
-
     async fn try_reserve_key(
         &self,
         backend: &BackendRef,
@@ -801,24 +766,48 @@ impl BlobHandler {
             .operator_for(&key.backend, &key.root, &key.storage_bucket, &self.egress)
     }
 
-    pub(super) async fn hidden_buckets(
+    pub(super) async fn hidden_bucket_after(
         &self,
         backend: &BackendRef,
-    ) -> Result<Vec<String>, BlobError> {
-        if let Some(bucket) = self
-            .registry
-            .config_for(backend)?
-            .service_config
-            .get("bucket")
-        {
-            return Ok(vec![bucket.clone()]);
+        start_after: Option<&str>,
+    ) -> Result<Option<String>, BlobError> {
+        let config = self.registry.config_for(backend)?;
+        if let Some(bucket) = config.service_config.get("bucket") {
+            return Ok((start_after.is_none()).then(|| bucket.clone()));
         }
-        Ok(self
-            .fetch_bucket_stats(backend)
-            .await?
-            .into_iter()
-            .map(|bucket| bucket.name)
-            .collect())
+        let prefix = stats_prefix(backend, config.bucket_prefix.as_deref());
+        let start = start_after.map(|bucket| IterStart::After(stats_key(backend, bucket).into()));
+        let event = tokio::time::timeout(
+            self.control_plane_io_timeout(),
+            self.storage
+                .send_effect(Effect::Storage(StorageEffect::Iter {
+                    key_space: BUCKET_STATS_DB.to_string(),
+                    prefix: Some(prefix.clone().into()),
+                    start,
+                    limit: 1,
+                    txn_id: None,
+                })),
+        )
+        .await
+        .map_err(|_| BlobError::ReadError("timed out reading hidden bucket stats".to_string()))?;
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+            return Err(BlobError::ReadError(
+                "unexpected hidden bucket iteration event".to_string(),
+            ));
+        };
+        values
+            .first()
+            .map(|(key, _)| {
+                String::from_utf8(
+                    key.as_ref()
+                        .get(prefix.len()..)
+                        .unwrap_or_default()
+                        .to_vec(),
+                )
+                .map_err(ConversionError::from)
+            })
+            .transpose()
+            .map_err(BlobError::ConversionError)
     }
 }
 

@@ -90,6 +90,7 @@ pub enum BlobEvent {
     HiddenDeleted,
     HiddenListed {
         entries: Vec<HiddenBlobEntry>,
+        next_cursor: Option<Vec<u8>>,
     },
     ConnectionEstablished {
         stream_id: Ulid,
